@@ -287,6 +287,7 @@ class PollingTelegramTransport(TelegramTransport):
         retry_base_delay_seconds: float = 0.2,
         retry_max_delay_seconds: float = 5.0,
         seen_capacity: int = 5000,
+        drop_pending_updates: bool = False,
     ) -> None:
         if not token:
             raise ValueError("Telegram bot token is required")
@@ -307,6 +308,7 @@ class PollingTelegramTransport(TelegramTransport):
         self._retry_base_delay = retry_base_delay_seconds
         self._retry_max_delay = retry_max_delay_seconds
         self._seen_capacity = seen_capacity
+        self._drop_pending_updates = drop_pending_updates
         self._seen_ids: set[int] = set()
         self._seen_order: collections.deque[int] = collections.deque()
         self._offset: int | None = None
@@ -366,18 +368,34 @@ class PollingTelegramTransport(TelegramTransport):
         logger.info("telegram polling started")
 
     async def stop(self) -> None:
-        """Interrupt polling cleanly (idempotent)."""
+        """Stop polling without losing an update that was already handled.
+
+        Prefer allowing the in-flight long poll to return naturally. This
+        avoids leaving a cancelled urllib worker thread issuing getUpdates in
+        parallel with shutdown acknowledgement.
+        """
         self._stop_event.set()
         task = self._poll_task
         self._poll_task = None
+        clean_shutdown = True
         if task is not None:
-            task.cancel()
             try:
-                await task
+                # Give a handler / short poll a chance to finish, but keep
+                # operator-triggered stop responsive.
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            except TimeoutError:
+                clean_shutdown = False
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
-                pass
+                clean_shutdown = False
             except Exception:
                 logger.warning("telegram polling task ended with error")
+        if clean_shutdown:
+            await self._acknowledge_offset()
         self._running = False
         logger.info("telegram polling stopped")
 
@@ -404,7 +422,7 @@ class PollingTelegramTransport(TelegramTransport):
         )
         await self._call_with_retry(
             "deleteWebhook",
-            {"drop_pending_updates": True},
+            {"drop_pending_updates": self._drop_pending_updates},
             max_retries=self._max_bootstrap_retries,
         )
         await self._call_with_retry(
@@ -488,7 +506,19 @@ class PollingTelegramTransport(TelegramTransport):
                 for raw in batch:
                     if self._stop_event.is_set():
                         break
-                    await self._process_raw_update(raw)
+                    handled = await self._process_raw_update(raw)
+                    if not handled:
+                        # Do not advance past a failed update. Telegram will
+                        # redeliver it because the offset is committed only
+                        # after successful handling.
+                        try:
+                            await asyncio.wait_for(
+                                self._stop_event.wait(),
+                                timeout=self._backoff_delay(1),
+                            )
+                        except TimeoutError:
+                            pass
+                        break
         except asyncio.CancelledError:
             pass
         finally:
@@ -510,31 +540,53 @@ class PollingTelegramTransport(TelegramTransport):
         return result
 
     def _is_duplicate(self, update_id: int) -> bool:
-        if update_id in self._seen_ids:
-            return True
-        self._seen_ids.add(update_id)
-        self._seen_order.append(update_id)
-        while len(self._seen_order) > self._seen_capacity:
-            oldest = self._seen_order.popleft()
-            self._seen_ids.discard(oldest)
-        return False
+        return update_id in self._seen_ids
 
-    async def _process_raw_update(self, raw: Any) -> None:
+    def _commit_update_id(self, update_id: int) -> None:
+        """Mark one update handled and advance the next polling offset."""
+        if update_id not in self._seen_ids:
+            self._seen_ids.add(update_id)
+            self._seen_order.append(update_id)
+            while len(self._seen_order) > self._seen_capacity:
+                oldest = self._seen_order.popleft()
+                self._seen_ids.discard(oldest)
+        next_offset = update_id + 1
+        self._offset = next_offset if self._offset is None else max(self._offset, next_offset)
+
+    async def _acknowledge_offset(self) -> None:
+        """Best-effort Telegram acknowledgement for already handled updates."""
+        if self._offset is None:
+            return
+        payload: dict[str, Any] = {
+            "offset": self._offset,
+            "limit": 1,
+            "timeout": 0,
+            "allowed_updates": ["message"],
+        }
+        try:
+            await self._api.call("getUpdates", payload)
+        except TelegramAuthError:
+            logger.warning("telegram final acknowledgement unauthorized")
+        except (TelegramApiError, TimeoutError, OSError):
+            logger.warning("telegram final acknowledgement failed")
+
+    async def _process_raw_update(self, raw: Any) -> bool:
         update_id = raw.get("update_id") if isinstance(raw, dict) else None
-        if isinstance(update_id, int):
-            next_offset = update_id + 1
-            self._offset = next_offset if self._offset is None else max(self._offset, next_offset)
-            if self._is_duplicate(update_id):
-                logger.info("telegram duplicate update skipped", extra={"update_id": update_id})
-                return
+        if not isinstance(update_id, int):
+            logger.info("telegram update without id skipped")
+            return True
+        if self._is_duplicate(update_id):
+            self._commit_update_id(update_id)
+            logger.info("telegram duplicate update skipped", extra={"update_id": update_id})
+            return True
+
         parsed = parse_update(raw)
         if parsed is None:
-            return
-        # Offset already advanced above; keep a fallback for unparsable ids.
-        if update_id is None:
-            logger.info("telegram update without id skipped")
-            return
-        self._received.append(parsed)
+            # Unsupported update types are intentionally consumed so they do
+            # not poison the polling queue forever.
+            self._commit_update_id(update_id)
+            return True
+
         logger.info(
             "telegram update received",
             extra={
@@ -545,18 +597,23 @@ class PollingTelegramTransport(TelegramTransport):
                 "command": parsed.command or "",
             },
         )
-        await self._dispatch(parsed)
+        if not await self._dispatch(parsed):
+            return False
+        self._received.append(parsed)
+        self._commit_update_id(update_id)
+        return True
 
-    async def _dispatch(self, incoming: TelegramIncoming) -> None:
+    async def _dispatch(self, incoming: TelegramIncoming) -> bool:
         handler: UpdateHandler | None = None
         if incoming.command is not None:
             handler = self._command_handlers.get(incoming.command)
         if handler is None:
             handler = self._update_handler
         if handler is None:
-            return
+            return True
         try:
             await handler(incoming)
+            return True
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -568,3 +625,4 @@ class PollingTelegramTransport(TelegramTransport):
                     "command": incoming.command or "",
                 },
             )
+            return False
