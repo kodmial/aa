@@ -114,9 +114,7 @@ class Settings:
                 aa_corpus_version=_get_str("AA_CORPUS_VERSION", "local"),
                 opencode_agent=_get_str("OPENCODE_AGENT", DEFAULT_AA_AGENT),
                 opencode_model=_get_str("OPENCODE_MODEL", DEFAULT_PRIMARY_MODEL),
-                opencode_fallback_model=_get_str(
-                    "OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL
-                ),
+                opencode_fallback_model=_get_str("OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL),
                 opencode_context_limit_tokens=int(
                     source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0
                 ),
@@ -135,9 +133,7 @@ class Settings:
             aa_corpus_version=source.get("AA_CORPUS_VERSION", "local"),
             opencode_agent=source.get("OPENCODE_AGENT", DEFAULT_AA_AGENT),
             opencode_model=source.get("OPENCODE_MODEL", DEFAULT_PRIMARY_MODEL),
-            opencode_fallback_model=source.get(
-                "OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL
-            ),
+            opencode_fallback_model=source.get("OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL),
             opencode_context_limit_tokens=int(source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0),
             opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
