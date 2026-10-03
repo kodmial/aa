@@ -8,3 +8,11 @@
 /corpus/source/raw/
 /corpus/source/fetch-state.json
 /corpus/generated/
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
