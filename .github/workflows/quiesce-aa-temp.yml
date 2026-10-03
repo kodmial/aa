@@ -1,0 +1,33 @@
+name: Temporary quiesce AA automation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/quiesce-aa-temp.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  quiesce:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cancel all other active runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          self="${GITHUB_RUN_ID}"
+          for status in queued in_progress; do
+            gh api "repos/${repo}/actions/runs?status=${status}&per_page=100" --paginate               --jq '.workflow_runs[].id' |
+            while read -r run_id; do
+              [[ -n "$run_id" ]] || continue
+              [[ "$run_id" == "$self" ]] && continue
+              gh api --method POST "repos/${repo}/actions/runs/${run_id}/cancel" >/dev/null 2>&1 || true
+            done
+          done
+          echo "Quiesce requests submitted."
