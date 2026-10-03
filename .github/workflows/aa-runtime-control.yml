@@ -1,0 +1,154 @@
+name: AA runtime control
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Control command, e.g. /bot status"
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: aa-runtime-control
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       !github.event.issue.pull_request &&
+       github.event.issue.number == 31 &&
+       github.actor == github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Process runtime command
+        uses: actions/github-script@v7
+        env:
+          CONTROL_ISSUE: "31"
+          DISPATCH_COMMAND: ${{ inputs.command }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const controlIssue = Number(process.env.CONTROL_ISSUE);
+            const command = (
+              context.eventName === 'workflow_dispatch'
+                ? process.env.DISPATCH_COMMAND
+                : context.payload.comment?.body
+            || '').trim();
+
+            if (!command.startsWith('/bot')) {
+              core.info('Not a bot control command; ignoring.');
+              return;
+            }
+
+            const start = command.match(/^\/bot start (15m|1h|2h|3h)$/);
+            const isStop = command === '/bot stop';
+            const isStatus = command === '/bot status';
+            if (!start && !isStop && !isStatus) {
+              if (context.eventName === 'issue_comment') {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: controlIssue,
+                  body: 'Invalid command. Use `/bot start 15m|1h|2h|3h`, `/bot stop`, or `/bot status`.',
+                });
+              }
+              core.setFailed('Invalid AA runtime control command.');
+              return;
+            }
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: 'aa-runtime.yml',
+              per_page: 100,
+            });
+            const active = data.workflow_runs.filter(
+              run => run.conclusion === null &&
+                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
+            );
+
+            const comment = async body => {
+              if (context.eventName !== 'issue_comment') return;
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: controlIssue,
+                body,
+              });
+            };
+
+            if (start) {
+              if (active.length) {
+                const run = active.sort((a, b) => a.id - b.id)[0];
+                await comment(
+                  `Start rejected: AA runtime #${run.id} is already ${run.status}. Use `/bot status` or `/bot stop`.`
+                );
+                return;
+              }
+
+              const duration = start[1];
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-runtime.yml',
+                ref: 'main',
+                inputs: { duration },
+              });
+
+              // Give GitHub a short moment to create the run so the operator
+              // gets an authoritative run id in the control issue.
+              await new Promise(resolve => setTimeout(resolve, 1500));
+              const latest = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: 'aa-runtime.yml',
+                event: 'workflow_dispatch',
+                per_page: 10,
+              });
+              const run = latest.data.workflow_runs[0];
+              await comment(
+                run
+                  ? `AA runtime start requested for **${duration}**. Run #${run.id}: ${run.html_url}`
+                  : `AA runtime start requested for **${duration}**.`
+              );
+              return;
+            }
+
+            if (isStop) {
+              if (!active.length) {
+                await comment('No active AA runtime.');
+                return;
+              }
+              for (const run of active) {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+              }
+              await comment(
+                `Stop requested for AA runtime run(s): ${active.map(run => '#' + run.id).join(', ')}.`
+              );
+              return;
+            }
+
+            if (!active.length) {
+              await comment('AA runtime is not active.');
+              return;
+            }
+            const lines = active
+              .sort((a, b) => a.id - b.id)
+              .map(run => `- #${run.id}: **${run.status}** — ${run.html_url}`);
+            await comment(['Active AA runtime:', ...lines].join('\n'));
