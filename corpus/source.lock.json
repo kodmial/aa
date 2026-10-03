@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "edition": "Alcoholics Anonymous, First Edition (1939)",
+  "policy": {
+    "raw_source_is_immutable": true,
+    "curation_mode": "deletion-only",
+    "paraphrase_allowed": false
+  },
+  "sources": [
+    {
+      "id": "core-pages-1-164",
+      "url": "https://anonpress.org/plain_text/AA.txt",
+      "format": "text/plain",
+      "covers": ["Chapter 1", "Chapter 2", "Chapter 3", "Chapter 4", "Chapter 5", "Chapter 6", "Chapter 7", "Chapter 8", "Chapter 9", "Chapter 10", "Chapter 11"],
+      "raw_path": "corpus/source/raw/AA.txt"
+    },
+    {
+      "id": "doctors-opinion",
+      "url": "https://jeopardaa.com/big-book/doctors-opinion",
+      "format": "text/html",
+      "covers": ["The Doctor's Opinion"],
+      "raw_path": "corpus/source/raw/doctors-opinion.html"
+    }
+  ]
+}
