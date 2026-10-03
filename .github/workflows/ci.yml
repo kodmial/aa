@@ -20,13 +20,5 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-      - name: Boot check (no secrets, loopback OpenCode only)
-        run: python -m aa --check
-      - name: Run tests
-        run: pytest -q
-      - name: Ruff check
-        run: ruff check .
-      - name: Ruff format check
-        run: ruff format --check .
-      - name: Type check
-        run: mypy src tests
+      - name: Run canonical project verification
+        run: bash scripts/verify.sh
