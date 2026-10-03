@@ -135,9 +135,9 @@ jobs:
       # literal. An empty passthrough is what lets the engine fall back to the
       # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
       # override that repository variable for every installed caller.
-      wip_limit: "${{ inputs.wip_limit }}"
+      wip_limit: "${{ inputs.wip_limit || '8' }}"
       lease_minutes: "${{ inputs.lease_minutes }}"
-      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts || '5' }}"
       dispatch_marker: "${{ inputs.dispatch_marker }}"
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
@@ -155,5 +155,5 @@ jobs:
       opencode_dispatch: "${{ inputs.opencode_dispatch }}"
       execution_label_routes: "${{ inputs.execution_label_routes }}"
       child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
-      count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip }}"
-      pause_on_failure: "${{ inputs.pause_on_failure }}"
+      count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip || 'false' }}"
+      pause_on_failure: "${{ inputs.pause_on_failure || 'false' }}"
