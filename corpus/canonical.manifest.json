@@ -1,0 +1,120 @@
+{
+  "format": "aa-canonical-manifest/1",
+  "builder_version": 1,
+  "edition": "Alcoholics Anonymous, First Edition (1939)",
+  "scope": "The Doctor's Opinion + Chapters 1-11 only. Front matter, publishing/history material, later personal stories and appendices are excluded.",
+  "sources": [
+    {
+      "id": "core-pages-1-164",
+      "url": "https://anonpress.org/plain_text/AA.txt",
+      "raw_path": "corpus/source/raw/AA.txt",
+      "sha256": "7cef8d8642f8dcb7a46dd525c69a9ef5f8d5596812ca98b688dd1149ece11788",
+      "bytes": 260330
+    },
+    {
+      "id": "doctors-opinion",
+      "url": "https://jeopardaa.com/big-book/doctors-opinion",
+      "raw_path": "corpus/source/raw/doctors-opinion.html",
+      "sha256": "311ebcc803e37a30d7a990c504ccafe52e35fa533ec2603a70089d9c219dda1d",
+      "bytes": 48912
+    }
+  ],
+  "sections": [
+    {
+      "id": "doctors-opinion",
+      "title": "The Doctor's Opinion",
+      "source_id": "doctors-opinion",
+      "paragraphs": ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p12", "p13", "p14", "p15", "p16", "p17", "p18", "p19", "p20", "p21", "p22", "p23", "p24", "p25", "p26", "p27", "p28", "p29", "p30", "p31", "p32", "p33", "p34", "p35", "p36", "p37", "p38", "p39", "p40", "p41"],
+      "text_sha256": "434a829d6142de2882924965a6ee0048244d5e7f40ade2eb2b8ceb670379b54f"
+    },
+    {
+      "id": "chapter-1",
+      "title": "BILL'S STORY",
+      "source_id": "core-pages-1-164",
+      "byte_start": 332,
+      "byte_end": 25876,
+      "text_sha256": "c6d87cfa1bc910e4a943790959cb284ce9290476b737c4b66f14342944deb4a9"
+    },
+    {
+      "id": "chapter-2",
+      "title": "THERE IS A SOLUTION",
+      "source_id": "core-pages-1-164",
+      "byte_start": 25876,
+      "byte_end": 46560,
+      "text_sha256": "b0e5ae9a6b9a9c38f521b888aa4eb08e6d11422f361c1c5caac03fc9eb10cf94"
+    },
+    {
+      "id": "chapter-3",
+      "title": "MORE ABOUT ALCOHOLISM",
+      "source_id": "core-pages-1-164",
+      "byte_start": 46560,
+      "byte_end": 69462,
+      "text_sha256": "369467756afc3ecc332b044ab50350934ea1b5ac696b1472288a7d3a409f6703"
+    },
+    {
+      "id": "chapter-4",
+      "title": "WE AGNOSTICS",
+      "source_id": "core-pages-1-164",
+      "byte_start": 69462,
+      "byte_end": 91489,
+      "text_sha256": "bc92f9cae50b98677cc2162f6f8accd5e4af952a9b1993c4de7a3e84cabd0691"
+    },
+    {
+      "id": "chapter-5",
+      "title": "HOW IT WORKS",
+      "source_id": "core-pages-1-164",
+      "byte_start": 91489,
+      "byte_end": 112627,
+      "text_sha256": "936b2326b9b4ec792ec52b906ea6bc362d506c237dfca952a6cbaa35c98f88b6"
+    },
+    {
+      "id": "chapter-6",
+      "title": "INTO ACTION",
+      "source_id": "core-pages-1-164",
+      "byte_start": 112627,
+      "byte_end": 139807,
+      "text_sha256": "8693706f7739851c1d9f6670120715943e349b9aaf0fa7147535b6671affade3"
+    },
+    {
+      "id": "chapter-7",
+      "title": "WORKING WITH OTHERS",
+      "source_id": "core-pages-1-164",
+      "byte_start": 139807,
+      "byte_end": 164068,
+      "text_sha256": "9992636788dae8ba30df118eabc4e2ec56ecb3f0aa6168a49185d40b58b6b924"
+    },
+    {
+      "id": "chapter-8",
+      "title": "TO WIVES",
+      "source_id": "core-pages-1-164",
+      "byte_start": 164068,
+      "byte_end": 192427,
+      "text_sha256": "c0c7b99b73462a8e6d038c7d570aff79af4b0121b6938523317c35dde5c31e07"
+    },
+    {
+      "id": "chapter-9",
+      "title": "THE FAMILY AFTERWARD",
+      "source_id": "core-pages-1-164",
+      "byte_start": 192427,
+      "byte_end": 215264,
+      "text_sha256": "183f0dc16bbbb766bc3312255c10e96cc2910618504a6207c416ddb17fd4a12a"
+    },
+    {
+      "id": "chapter-10",
+      "title": "TO EMPLOYERS",
+      "source_id": "core-pages-1-164",
+      "byte_start": 215264,
+      "byte_end": 238386,
+      "text_sha256": "042c318d1ea57062bfec734efebd11da287dd08bf0bd9309acfdbd9b1c2fc725"
+    },
+    {
+      "id": "chapter-11",
+      "title": "A VISION FOR YOU",
+      "source_id": "core-pages-1-164",
+      "byte_start": 238386,
+      "byte_end": 260330,
+      "text_sha256": "a3ce0778038ae1aef767f1aafe71e502c8b3a3b28d5ae92d32c0fb44a499799e"
+    }
+  ],
+  "artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b"
+}
