@@ -1,0 +1,46 @@
+[project]
+name = "aa-telegram-worker"
+version = "0.1.0"
+description = "Minimal Python asyncio worker foundation for the AA Telegram bot."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "AA" }]
+keywords = ["telegram", "asyncio", "worker"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.8",
+  "mypy>=1.11",
+]
+
+[project.scripts]
+aa-worker = "aa.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+show_error_codes = true
+explicit_package_bases = true
+mypy_path = "src"
