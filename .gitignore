@@ -1,19 +1,10 @@
-# Secrets / local configuration
-.env
-.env.*
-!.env.example
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-
-# Local runtime / generated artifacts
-.tmp/
-.cache/
-dist/
-build/
+/vendor/
+/.env
+/.env.*
+!/.env.example
+/storage/*.key
+/node_modules/
+/.phpunit.cache/
+/corpus/source/raw/
+/corpus/source/fetch-state.json
+/corpus/generated/
