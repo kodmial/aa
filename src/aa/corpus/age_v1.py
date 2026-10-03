@@ -338,7 +338,22 @@ def _split_header(data: bytes) -> tuple[list[tuple[list[str], bytes]], bytes, in
     """Split the age header into stanzas; returns (stanzas, rest, hdr_end)."""
     if not data.startswith(VERSION_LINE):
         raise AgeError("unsupported age version line")
-    lines = data.split(b"\n")
+    # Only the header is ASCII lines; the binary payload may contain 0x0A.
+    # Split incrementally and stop at the MAC line instead of splitting all of data.
+    lines: list[bytes] = []
+    pos = 0
+    while True:
+        nxt = data.find(b"\n", pos)
+        if nxt < 0:
+            raise AgeError("age header is missing its MAC line")
+        lines.append(data[pos:nxt])
+        pos = nxt + 1
+        if lines[-1].startswith(b"--- "):
+            break
+        if len(lines) > 64 or pos > 64 * 1024:
+            raise AgeError("age header is too large")
+        if pos >= len(data):
+            raise AgeError("age header is missing its MAC line")
     # lines[0] is the version line without its newline.
     stanzas: list[tuple[list[str], bytes]] = []
     index = 1

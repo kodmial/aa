@@ -184,37 +184,49 @@ def main(argv: list[str] | None = None) -> int:
     archive = args.encrypted_dir / ARCHIVE_NAME
     metadata_path = args.encrypted_dir / METADATA_NAME
     identity = _read_identity(identity_file=args.identity_file)
+    snapshot_error: str | None = None
     if archive.exists() and identity:
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
-            return _fail(f"snapshot metadata is missing or invalid: {exc}")
-        if metadata.get("canonical_sha256") != expected_sha:
-            return _fail("snapshot metadata canonical SHA does not match the manifest")
-        try:
-            encrypted = archive.read_bytes()
-        except OSError as exc:
-            return _fail(f"cannot read encrypted snapshot: {exc}")
-        expected_encrypted_sha = metadata.get("encrypted_sha256")
-        if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
-            return _fail("snapshot encrypted SHA does not match metadata")
-        try:
-            tar_zst = decrypt_bytes(encrypted, [identity])
-            canonical_bytes, _ = extract_tar_zst(tar_zst)
-        except (AgeError, ValueError) as exc:
-            return _fail(f"snapshot decrypt failed: {exc}")
-        if _write_verified(args.output, canonical_bytes, expected_sha=expected_sha):
-            print(
-                json.dumps(
-                    {
-                        "restored": "decrypted",
-                        "artifact_sha256": expected_sha,
-                        "artifact_bytes": len(canonical_bytes),
-                    }
+            metadata = None  # type: ignore[assignment]
+            snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
+        if snapshot_error is None:
+            if not isinstance(metadata, dict) or metadata.get("canonical_sha256") != expected_sha:
+                snapshot_error = "snapshot metadata canonical SHA does not match the manifest"
+        encrypted: bytes | None = None
+        if snapshot_error is None:
+            try:
+                encrypted = archive.read_bytes()
+            except OSError as exc:
+                snapshot_error = f"cannot read encrypted snapshot: {exc}"
+        if snapshot_error is None:
+            assert encrypted is not None
+            expected_encrypted_sha = metadata.get("encrypted_sha256")
+            if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
+                snapshot_error = "snapshot encrypted SHA does not match metadata"
+        if snapshot_error is None:
+            assert encrypted is not None
+            try:
+                tar_zst = decrypt_bytes(encrypted, [identity])
+                canonical_bytes, _ = extract_tar_zst(tar_zst)
+            except (AgeError, ValueError) as exc:
+                snapshot_error = f"snapshot decrypt failed: {exc}"
+        if snapshot_error is None:
+            if _write_verified(args.output, canonical_bytes, expected_sha=expected_sha):
+                print(
+                    json.dumps(
+                        {
+                            "restored": "decrypted",
+                            "artifact_sha256": expected_sha,
+                            "artifact_bytes": len(canonical_bytes),
+                        }
+                    )
                 )
-            )
-            return 0
-        return _fail("decrypted snapshot failed SHA/section verification")
+                return 0
+            snapshot_error = "decrypted snapshot failed SHA/section verification"
+        if snapshot_error is not None:
+            print(f"snapshot restore failed: {snapshot_error}", file=sys.stderr)
 
     # 3. Deterministic network fetch/build fallback when explicitly allowed.
     allow_network = _network_allowed(flag=args.allow_network_fallback)
@@ -230,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     elif not identity:
         reasons.append(f"{IDENTITY_ENV} is not set")
     else:
-        reasons.append("encrypted snapshot could not be verified")
+        reasons.append(snapshot_error or "encrypted snapshot could not be verified")
     reasons.append("network fallback was not explicitly allowed")
     return _fail("; ".join(reasons))
 

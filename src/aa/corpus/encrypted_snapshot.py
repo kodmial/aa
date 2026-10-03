@@ -113,7 +113,11 @@ def extract_tar_zst(data: bytes) -> tuple[bytes, dict[str, Any]]:
     buffer = io.BytesIO(decompressed)
     try:
         with tarfile.open(fileobj=buffer, mode="r") as tar:
-            members = {m.name: m for m in tar.getmembers()}
+            raw_members = tar.getmembers()
+            names = [m.name for m in raw_members]
+            if len(raw_members) != 2 or len(set(names)) != 2:
+                raise ValueError(f"unexpected snapshot members: {sorted(names)}")
+            members = {m.name: m for m in raw_members}
             if set(members) != {"canonical.json", "provenance.json"}:
                 raise ValueError(f"unexpected snapshot members: {sorted(members)}")
             if any(not m.isreg() for m in members.values()):
