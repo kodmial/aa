@@ -11,7 +11,11 @@ from aa.corpus.context import CorpusContext
 from aa.opencode.runtime import OpenCodeConfig, OpenCodeRuntime, StubOpenCodeRuntime
 from aa.safety.router import SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
-from aa.telegram.transport import StubTelegramTransport, TelegramTransport
+from aa.telegram.transport import (
+    PollingTelegramTransport,
+    StubTelegramTransport,
+    TelegramTransport,
+)
 
 logger = logging.getLogger("aa.app")
 
@@ -112,4 +116,9 @@ class Application:
 
 def create_application(settings: Settings) -> Application:
     """Factory used by the entrypoint and tests."""
-    return Application(settings)
+    transport: TelegramTransport
+    if settings.has_bot_token:
+        transport = PollingTelegramTransport(token=settings.telegram_bot_token)
+    else:
+        transport = StubTelegramTransport()
+    return Application(settings, transport=transport)
