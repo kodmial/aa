@@ -26,9 +26,7 @@ def main() -> int:
     expected = manifest.get("source_sha256")
     actual = digest(source)
     if not expected or expected != actual:
-        raise SystemExit(
-            f"source checksum mismatch: expected={expected!r} actual={actual!r}"
-        )
+        raise SystemExit(f"source checksum mismatch: expected={expected!r} actual={actual!r}")
 
     ranges = manifest.get("keep_ranges")
     if not isinstance(ranges, list) or not ranges:
@@ -61,7 +59,7 @@ def main() -> int:
 
     # Strong postcondition: output is exactly the concatenation of selected
     # source byte ranges. There is no decode/encode, normalization, or rewrite.
-    expected_output = b"".join(source[r["start"]:r["end"]] for r in ranges)
+    expected_output = b"".join(source[r["start"] : r["end"]] for r in ranges)
     if args.output.read_bytes() != expected_output:
         raise AssertionError("written output differs from selected source bytes")
 
