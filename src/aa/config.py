@@ -1,0 +1,162 @@
+"""Environment-backed configuration for the AA Telegram worker.
+
+The worker intentionally owns only transport/session/corpus settings plus
+pointer settings owned by the OpenCode runtime (endpoint, model and limit
+hints). It must not own Zen credentials and must not implement a second
+LLM client; therefore no ``ZEN_*``, ``ANTHROPIC_*`` or ``OPENAI_*`` style
+settings may be added here.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+def _get_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _get_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
+
+
+def _get_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be a number, got {raw!r}") from exc
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Resolved worker configuration.
+
+    All values come from the environment with safe local defaults so the
+    worker can boot (and tests can run) without secrets or network access.
+    """
+
+    # Telegram transport.
+    telegram_bot_token: str = ""
+
+    # OpenCode local endpoint/process configuration (pointers only; the
+    # OpenCode runtime owns credentials, model execution and limits).
+    opencode_base_url: str = "http://127.0.0.1:4096"
+    opencode_command: str = "opencode"
+    opencode_workdir: str = "."
+
+    # Requested bot session duration in seconds. ``0`` means "run until
+    # stopped" (used by tests); positive values set a shutdown deadline.
+    bot_session_duration_seconds: float = 0.0
+
+    # AA corpus location/version pointer.
+    aa_corpus_path: str = "./corpus"
+    aa_corpus_version: str = "local"
+
+    # Model/context/output limits where owned by the OpenCode runtime.
+    # These are hints passed through to OpenCode, not a second LLM client.
+    opencode_model: str = ""
+    opencode_context_limit_tokens: int = 0
+    opencode_max_output_tokens: int = 0
+
+    # Logging.
+    log_level: str = "INFO"
+
+    # Reserved names (authoritative contract). Any rename must stay in sync
+    # with ``.env.example`` and the README.
+    RESERVED_ENV_NAMES: tuple[str, ...] = field(
+        default=(
+            "TELEGRAM_BOT_TOKEN",
+            "OPENCODE_BASE_URL",
+            "OPENCODE_COMMAND",
+            "OPENCODE_WORKDIR",
+            "BOT_SESSION_DURATION_SECONDS",
+            "AA_CORPUS_PATH",
+            "AA_CORPUS_VERSION",
+            "OPENCODE_MODEL",
+            "OPENCODE_CONTEXT_LIMIT_TOKENS",
+            "OPENCODE_MAX_OUTPUT_TOKENS",
+            "LOG_LEVEL",
+        ),
+        compare=False,
+        repr=False,
+    )
+
+    @classmethod
+    def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
+        """Build settings from the process environment (or a mapping)."""
+        source = os.environ if environ is None else environ
+        if environ is None:
+            return cls(
+                telegram_bot_token=_get_str("TELEGRAM_BOT_TOKEN", ""),
+                opencode_base_url=_get_str("OPENCODE_BASE_URL", "http://127.0.0.1:4096"),
+                opencode_command=_get_str("OPENCODE_COMMAND", "opencode"),
+                opencode_workdir=_get_str("OPENCODE_WORKDIR", "."),
+                bot_session_duration_seconds=_get_float("BOT_SESSION_DURATION_SECONDS", 0.0),
+                aa_corpus_path=_get_str("AA_CORPUS_PATH", "./corpus"),
+                aa_corpus_version=_get_str("AA_CORPUS_VERSION", "local"),
+                opencode_model=_get_str("OPENCODE_MODEL", ""),
+                opencode_context_limit_tokens=int(
+                    source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0
+                ),
+                opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
+                log_level=_get_str("LOG_LEVEL", "INFO").upper(),
+            )
+        return cls(
+            telegram_bot_token=source.get("TELEGRAM_BOT_TOKEN", ""),
+            opencode_base_url=source.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096"),
+            opencode_command=source.get("OPENCODE_COMMAND", "opencode"),
+            opencode_workdir=source.get("OPENCODE_WORKDIR", "."),
+            bot_session_duration_seconds=float(
+                source.get("BOT_SESSION_DURATION_SECONDS", "") or 0.0
+            ),
+            aa_corpus_path=source.get("AA_CORPUS_PATH", "./corpus"),
+            aa_corpus_version=source.get("AA_CORPUS_VERSION", "local"),
+            opencode_model=source.get("OPENCODE_MODEL", ""),
+            opencode_context_limit_tokens=int(source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0),
+            opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
+            log_level=source.get("LOG_LEVEL", "INFO").upper(),
+        )
+
+    @property
+    def has_bot_token(self) -> bool:
+        """Whether a Telegram bot token is configured."""
+        return bool(self.telegram_bot_token)
+
+    def validate(self, *, require_bot_token: bool = False) -> None:
+        """Validate settings, raising ``ValueError`` on misuse."""
+        if self.bot_session_duration_seconds < 0:
+            raise ValueError("BOT_SESSION_DURATION_SECONDS must be >= 0")
+        if self.opencode_context_limit_tokens < 0:
+            raise ValueError("OPENCODE_CONTEXT_LIMIT_TOKENS must be >= 0")
+        if self.opencode_max_output_tokens < 0:
+            raise ValueError("OPENCODE_MAX_OUTPUT_TOKENS must be >= 0")
+        if require_bot_token and not self.has_bot_token:
+            raise ValueError("TELEGRAM_BOT_TOKEN is required but missing or empty")
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return a log-safe snapshot with secrets redacted."""
+        from aa.logging import redact_secret
+
+        return {
+            "telegram_bot_token": redact_secret(self.telegram_bot_token),
+            "opencode_base_url": self.opencode_base_url,
+            "opencode_command": self.opencode_command,
+            "opencode_workdir": self.opencode_workdir,
+            "bot_session_duration_seconds": self.bot_session_duration_seconds,
+            "aa_corpus_path": self.aa_corpus_path,
+            "aa_corpus_version": self.aa_corpus_version,
+            "opencode_model": self.opencode_model,
+            "opencode_context_limit_tokens": self.opencode_context_limit_tokens,
+            "opencode_max_output_tokens": self.opencode_max_output_tokens,
+            "log_level": self.log_level,
+        }
