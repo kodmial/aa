@@ -160,8 +160,13 @@ def main(argv: list[str] | None = None) -> int:
         print("decrypt verification skipped (no identity provided)")
         return 0
 
-    identity = _read_identity(identity_file=args.identity_file)
+    try:
+        identity = _read_identity(identity_file=args.identity_file)
+    except OSError as exc:
+        return _fail(f"cannot read identity file: {exc}")
     if not identity:
+        if args.identity_file is not None:
+            return _fail(f"identity file is missing or empty: {args.identity_file}")
         print("decrypt verification skipped (AA_BOOK_AGE_IDENTITY is not set)")
         return 0
     try:

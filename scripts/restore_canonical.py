@@ -121,6 +121,13 @@ def _network_allowed(*, flag: bool) -> bool:
 
 
 def _run_network_fallback(*, output: Path, manifest: Path) -> int:
+    if output != DEFAULT_OUTPUT or manifest != DEFAULT_MANIFEST:
+        print(
+            "canonical restore failed: network fallback supports only "
+            f"default --output/--manifest (got {output} / {manifest})",
+            file=sys.stderr,
+        )
+        return 1
     fetch = ROOT / "scripts" / "fetch_aa_source.py"
     build = ROOT / "scripts" / "build_canonical.py"
     for step in ([sys.executable, str(fetch)], [sys.executable, str(build)]):

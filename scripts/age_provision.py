@@ -34,6 +34,11 @@ from aa.corpus.age_v1 import generate_identity, parse_identity, parse_recipient 
 
 
 def main(argv: list[str] | None = None) -> int:
+    import os
+
+    if os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"):
+        print("age_provision must run locally, never in CI", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--write-recipient",

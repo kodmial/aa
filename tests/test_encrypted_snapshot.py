@@ -341,7 +341,12 @@ def test_provision_generates_valid_pair_without_storing_identity(
 ) -> None:
     provision = _repo_root() / "scripts" / "age_provision.py"
     recipient_path = tmp_path / "recipient.txt"
-    proc = _run_script(provision, ["--write-recipient", str(recipient_path)], env_extra={})
+    # age_provision must refuse CI execution; simulate a local run.
+    proc = _run_script(
+        provision,
+        ["--write-recipient", str(recipient_path)],
+        env_extra={"CI": "", "GITHUB_ACTIONS": ""},
+    )
     assert proc.returncode == 0, proc.stderr
     recipient = recipient_path.read_text(encoding="utf-8").strip()
     assert recipient.startswith("age1")
