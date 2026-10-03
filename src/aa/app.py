@@ -9,7 +9,7 @@ from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
 from aa.corpus.context import CorpusContext
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
-from aa.safety.router import SafetyRouter
+from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
     PollingTelegramTransport,
@@ -114,6 +114,39 @@ class Application:
                 await asyncio.sleep(0.05)
         finally:
             await self.stop()
+
+    async def respond(self, chat_id: int, text: str) -> str:
+        """Answer one inbound message with emergency precedence.
+
+        The deterministic safety layer runs first: when it takes the
+        emergency route, the bounded safe reply is returned immediately
+        and no OpenCode work is scheduled (the LLM never decides whether
+        the emergency route is taken). Otherwise the message is forwarded
+        to the OpenCode runtime bound to ``chat_id``.
+
+        Only message lengths and routing decisions are logged, never the
+        message body.
+        """
+        result, emergency_reply = self.safety.route(text)
+        if result.decision is SafetyDecision.EMERGENCY and emergency_reply is not None:
+            logger.info(
+                "emergency response served",
+                extra={"chat_id": chat_id, "reason": result.reason},
+            )
+            return emergency_reply
+        if result.decision is SafetyDecision.BLOCK:
+            logger.info("blocked message refused", extra={"chat_id": chat_id})
+            raise ValueError("refusing to answer an empty message")
+        session_id = await self.sessions.ensure_opencode_session(
+            chat_id, self.opencode_runtime.client
+        )
+        reply = await self.opencode_runtime.client.send_message(
+            session_id,
+            text,
+            model=self.settings.opencode_model,
+        )
+        logger.info("normal response served", extra={"chat_id": chat_id})
+        return reply
 
     async def __aenter__(self) -> Application:
         await self.start()
