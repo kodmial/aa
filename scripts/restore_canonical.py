@@ -95,6 +95,10 @@ def _write_verified(path: Path, payload: bytes, *, expected_sha: str) -> bool:
     try:
         load_canonical(path, expected_sha256=expected_sha)
     except CanonicalCorpusError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return False
     return True
 
@@ -121,10 +125,12 @@ def _run_network_fallback(*, output: Path, manifest: Path) -> int:
     build = ROOT / "scripts" / "build_canonical.py"
     for step in ([sys.executable, str(fetch)], [sys.executable, str(build)]):
         proc = subprocess.run(step, capture_output=True, text=True, cwd=ROOT)  # noqa: S603
-        # Never echo raw stdout that could carry book text; report only status.
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "")[-2000:]
-            print(f"network fallback step failed: {' '.join(step)}: {tail}", file=sys.stderr)
+            step_name = Path(step[1]).name
+            print(
+                f"network fallback step failed: {step_name}: exit={proc.returncode}",
+                file=sys.stderr,
+            )
             return proc.returncode or 1
     try:
         expected = _manifest_artifact_sha(manifest)

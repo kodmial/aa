@@ -379,13 +379,7 @@ def _split_header(data: bytes) -> tuple[list[tuple[list[str], bytes]], bytes, in
             continue
         if line.startswith(b"--- "):
             if current_args is not None:
-                # A stanza body ends with a short line; a MAC line also ends
-                # the stanza. The accumulated body is complete.
-                body = b64decode_nopad(current_body) if current_body else b""
-                # Re-validate wrapping: body must have been wrapped at 64 cols.
-                stanzas.append((current_args, body))
-                current_args = None
-                current_body = ""
+                raise AgeError("malformed stanza: missing short-line terminator")
             try:
                 mac_text = line[4:].decode("ascii")
             except UnicodeDecodeError as exc:
