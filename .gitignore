@@ -19,3 +19,11 @@
 /corpus/source/encrypted/plaintext/
 *.tar.zst
 !/corpus/source/encrypted/.gitkeep
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
