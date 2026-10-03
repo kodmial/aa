@@ -1,0 +1,66 @@
+name: PR Agent (OpenCode backend)
+
+run-name: >-
+  PR-Agent PR #${{ inputs.pr_number || github.event.issue.number || 'unknown' }}
+  [${{ inputs.recovery_kind || 'review' }}:${{ inputs.retry_attempt || '0' }}]
+  head=${{ inputs.expected_head_sha || 'event' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number for a bounded PR-Agent retry
+        required: false
+        type: string
+      expected_head_sha:
+        description: Exact PR HEAD the retry is allowed to review
+        required: false
+        type: string
+      retry_attempt:
+        description: Bounded retry attempt number
+        required: false
+        default: '0'
+        type: string
+      retry_workflow:
+        description: Caller workflow filename used for isolated PR-Agent retries
+        required: false
+        type: string
+      recovery_kind:
+        description: Recovery operation identity for bounded automatic retries
+        required: false
+        default: review
+        type: choice
+        options:
+          - review
+          - repair
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+concurrency:
+  group: pr-agent-caller-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  call:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       github.actor == github.repository_owner &&
+       contains(github.event.comment.body, '/review'))
+    uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      pr_number: "${{ inputs.pr_number }}"
+      expected_head_sha: "${{ inputs.expected_head_sha }}"
+      retry_attempt: "${{ inputs.retry_attempt }}"
+      retry_workflow: "${{ inputs.retry_workflow }}"
+      recovery_kind: "${{ inputs.recovery_kind || 'review' }}"
+

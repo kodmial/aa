@@ -1,0 +1,38 @@
+name: Retry CodeRabbit after rate limit
+
+on:
+  # Any new/edited CodeRabbit rate-limit response wakes the global controller.
+  issue_comment:
+    types: [created, edited]
+
+  # A completed CodeRabbit review consumes the shared included-review quota.
+  # Wake the controller so it can move the next queued PR behind the global
+  # cooldown instead of immediately burning another retry.
+  pull_request_review:
+    types: [submitted]
+
+  # A CodeRabbit finding verdict is a lifecycle transition too. Wake the
+  # serialized queue immediately after RESOLVED/UNRESOLVED instead of waiting
+  # for cron or an unrelated status/review event.
+  pull_request_review_comment:
+    types: [created, edited]
+
+  # Manual/safety-net reconciliation.
+  workflow_dispatch:
+
+permissions:
+  # Keep the caller compatible with already-open PR branches. The review
+  # queue only reads Actions state; exact-finding verification remains owned by
+  # the existing auto-merge reconciler.
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: read
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-coderabbit-retry.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main

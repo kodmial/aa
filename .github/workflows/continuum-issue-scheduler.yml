@@ -1,0 +1,159 @@
+name: Issue scheduler
+
+on:
+  workflow_dispatch:
+    inputs:
+      wip_limit:
+        description: "Concurrent in-progress issues"
+        required: false
+        type: string
+      lease_minutes:
+        description: "Reservation lease in minutes"
+        required: false
+        type: string
+      max_dispatch_attempts:
+        description: "Dispatch attempts before pausing"
+        required: false
+        type: string
+      dispatch_marker:
+        description: "Dispatch comment marker"
+        required: false
+        type: string
+      in_progress_label:
+        description: "Reservation label"
+        required: false
+        type: string
+      pause_marker:
+        description: "Pause label"
+        required: false
+        type: string
+      qualifying_label:
+        description: "Label marking capabilities waiting on mandatory qualification"
+        required: false
+        type: string
+      blocked_label:
+        description: "Label marking capabilities whose qualification failed"
+        required: false
+        type: string
+      post_pause_comment:
+        description: "Comment when pausing an issue"
+        required: false
+        type: string
+      reset_markers:
+        description: "Clear dispatch markers before dispatching"
+        required: false
+        type: string
+      require_priority_label:
+        description: "Dispatch only labelled issues"
+        required: false
+        type: string
+      command_grace_minutes:
+        description: "Race window after a manual owner command"
+        required: false
+        type: string
+      child_owned_marker:
+        description: "Marker reserving an issue for a child worker"
+        required: false
+        type: string
+      legacy_child_owned_marker:
+        description: "Legacy child-worker marker"
+        required: false
+        type: string
+      opencode_workflow_name:
+        description: "`name:` of the local OpenCode caller"
+        required: false
+        type: string
+      opencode_workflow_path:
+        description: "Path of the local OpenCode caller"
+        required: false
+        type: string
+      dispatch_ref:
+        description: "Git ref every dispatch targets"
+        required: false
+        type: string
+      opencode_dispatch:
+        description: "How a ready issue reaches OpenCode: comment or workflow"
+        required: false
+        type: string
+      execution_label_routes:
+        description: "Label-driven execution routes, one per line"
+        required: false
+        type: string
+      child_dispatch_workflow:
+        description: "Downstream dispatcher woken after each reconcile pass"
+        type: string
+      count_open_prs_as_wip:
+        description: "Count open implementation PRs against WIP"
+        required: false
+        type: string
+      pause_on_failure:
+        description: "Pause after exhausted/closed failed automation"
+        required: false
+        type: string
+  # Parent repositories poll delegated child issues here. Keep this wake-up
+  # independent of child Actions so private children do not spend Actions minutes.
+  # Use an offset from the busy :00/:15/:30/:45 boundaries to reduce delayed or
+  # dropped GitHub scheduled events.
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  # Preserve the legacy dispatcher wake-up on parent control-plane updates.
+  push:
+    branches: [main]
+  issues:
+    types: [opened, reopened, closed, labeled, unlabeled]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [closed]
+  workflow_run:
+    workflows:
+      - OpenCode agent
+      - SubTask
+      - SubTask review
+      - SubTask PR review
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  call:
+    # A manual owner `/oc` is in-flight work the scheduler must reserve. Gate the
+    # event trigger the way the engine's own `issue_comment` branch expects, so an
+    # unrelated comment costs a skipped run and not a full reconciliation.
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (github.event_name != 'issue_comment' ||
+       (github.actor == github.repository_owner &&
+        (contains(github.event.comment.body, '/oc') ||
+         contains(github.event.comment.body, '/opencode'))))
+    uses: kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      # Every knob below is forwarded as a bare `inputs.*` passthrough, never a
+      # literal. An empty passthrough is what lets the engine fall back to the
+      # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
+      # override that repository variable for every installed caller.
+      wip_limit: "${{ inputs.wip_limit }}"
+      lease_minutes: "${{ inputs.lease_minutes }}"
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      dispatch_marker: "${{ inputs.dispatch_marker }}"
+      in_progress_label: "${{ inputs.in_progress_label }}"
+      pause_marker: "${{ inputs.pause_marker }}"
+      qualifying_label: "${{ inputs.qualifying_label }}"
+      blocked_label: "${{ inputs.blocked_label }}"
+      post_pause_comment: "${{ inputs.post_pause_comment }}"
+      reset_markers: "${{ inputs.reset_markers }}"
+      require_priority_label: "${{ inputs.require_priority_label }}"
+      command_grace_minutes: "${{ inputs.command_grace_minutes }}"
+      child_owned_marker: "${{ inputs.child_owned_marker }}"
+      legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
+      opencode_workflow_name: "${{ inputs.opencode_workflow_name }}"
+      opencode_workflow_path: "${{ inputs.opencode_workflow_path }}"
+      dispatch_ref: "${{ inputs.dispatch_ref }}"
+      opencode_dispatch: "${{ inputs.opencode_dispatch }}"
+      execution_label_routes: "${{ inputs.execution_label_routes }}"
+      child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
+      count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip }}"
+      pause_on_failure: "${{ inputs.pause_on_failure }}"
