@@ -7,6 +7,7 @@ import logging
 
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
+from aa.corpus.budget import MIN_EFFECTIVE_CONTEXT_TOKENS
 from aa.corpus.context import CorpusContext
 from aa.opencode.runtime import OpenCodeConfig, OpenCodeRuntime, StubOpenCodeRuntime
 from aa.safety.router import SafetyRouter
@@ -43,7 +44,13 @@ class Application:
             )
         )
         self.corpus = corpus or CorpusContext(
-            path=settings.aa_corpus_path, version=settings.aa_corpus_version
+            path=settings.aa_corpus_path,
+            version=settings.aa_corpus_version,
+            effective_context_tokens=(
+                settings.opencode_context_limit_tokens
+                if settings.opencode_context_limit_tokens > 0
+                else MIN_EFFECTIVE_CONTEXT_TOKENS
+            ),
         )
         self.sessions = sessions or SessionCoordinator()
         self.safety = safety or SafetyRouter()
