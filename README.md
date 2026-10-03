@@ -16,6 +16,47 @@ Local OpenCode runtime integration (loopback `opencode serve`, per-chat
 sessions, failure taxonomy, persistence/recovery) is documented in
 [`docs/opencode-runtime.md`](docs/opencode-runtime.md).
 
+## Bounded live runtime
+
+Live/test sessions are controlled from repository issue **#31** with owner-only
+commands:
+
+```text
+/bot start 15m
+/bot start 1h
+/bot start 2h
+/bot start 3h
+/bot stop
+/bot status
+```
+
+A start dispatches one bounded GitHub Actions job. The job bootstraps and
+validates the AA knowledge artifacts, starts the local OpenCode runtime, waits
+for readiness, starts Telegram long polling, and only then arms the requested
+15-minute/1-hour/2-hour/3-hour live window. Duplicate runtime starts are
+rejected so only one poller can own the bot token.
+
+Telegram uses outbound `getUpdates` long polling; there is no inbound web
+server. Pending Telegram updates are preserved across normal offline periods
+instead of being deliberately discarded. An update offset is committed only
+after application handling succeeds, reducing message loss across transient
+failures and shutdowns.
+
+The live workflow fails closed before polling if the canonical source,
+hierarchical corpus, retrieval index, dedicated AA OpenCode agent, or required
+read-only book tools are missing/stale. This means the runtime-control
+infrastructure can exist before the remaining retrieval issues are complete
+without accidentally launching an ungrounded assistant.
+
+The user-facing OpenCode agent is `aa`, backed by
+`prompts/aa-agent-system.md`. Its runtime model defaults are:
+
+- primary: `opencode/muse-spark-1.3-contributor-free`;
+- technical fallback: `opencode/space-bunny-free`.
+
+These are AA-assistant runtime models; they do not define the model Continuum
+uses to implement repository tasks.
+
 ## AA knowledge architecture
 
 The bot uses **agentic RAG**, not a permanently shortened book and not a
