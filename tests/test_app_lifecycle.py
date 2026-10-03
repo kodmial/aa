@@ -6,6 +6,7 @@ import asyncio
 
 from aa.app import Application, create_application
 from aa.config import Settings
+from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, StubOpenCodeRuntime
 
 
 def _settings(**overrides: object) -> Settings:
@@ -13,13 +14,20 @@ def _settings(**overrides: object) -> Settings:
     return Settings.from_env(base)
 
 
+def _stub_runtime() -> StubOpenCodeRuntime:
+    return StubOpenCodeRuntime(
+        OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
+    )
+
+
 async def test_lifecycle_starts_and_shuts_down_cleanly() -> None:
-    app = create_application(_settings())
+    app = Application(_settings(), opencode_runtime=_stub_runtime())
     assert not app.running
     await app.start()
     assert app.running
     assert app.transport.running
     assert app.opencode_runtime.running
+    assert app.opencode_runtime.ready
     assert app.sessions.running
     assert app.safety.running
     assert app.controller.running
@@ -32,7 +40,7 @@ async def test_lifecycle_starts_and_shuts_down_cleanly() -> None:
 
 
 async def test_stop_is_idempotent() -> None:
-    app = create_application(_settings())
+    app = Application(_settings(), opencode_runtime=_stub_runtime())
     await app.start()
     await app.stop()
     await app.stop()
@@ -41,13 +49,13 @@ async def test_stop_is_idempotent() -> None:
 
 async def test_run_respects_session_duration() -> None:
     settings = Settings.from_env({"BOT_SESSION_DURATION_SECONDS": "0.05"})
-    app = Application(settings)
+    app = Application(settings, opencode_runtime=_stub_runtime())
     await asyncio.wait_for(app.run(), timeout=5.0)
     assert not app.running
 
 
 async def test_context_manager_lifecycle() -> None:
-    app = create_application(_settings())
+    app = Application(_settings(), opencode_runtime=_stub_runtime())
     async with app as started:
         assert started.running
     assert not app.running
@@ -57,3 +65,8 @@ def test_check_boot_path() -> None:
     from aa.__main__ import main
 
     assert main(["--check"]) == 0
+
+
+def test_default_runtime_is_local_opencode() -> None:
+    app = create_application(_settings())
+    assert isinstance(app.opencode_runtime, LocalOpenCodeRuntime)

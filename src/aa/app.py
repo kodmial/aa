@@ -8,7 +8,7 @@ import logging
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
 from aa.corpus.context import CorpusContext
-from aa.opencode.runtime import OpenCodeConfig, OpenCodeRuntime, StubOpenCodeRuntime
+from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.safety.router import SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import StubTelegramTransport, TelegramTransport
@@ -32,7 +32,7 @@ class Application:
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
-        self.opencode_runtime = opencode_runtime or StubOpenCodeRuntime(
+        self.opencode_runtime = opencode_runtime or LocalOpenCodeRuntime(
             OpenCodeConfig(
                 base_url=settings.opencode_base_url,
                 command=settings.opencode_command,
@@ -65,7 +65,16 @@ class Application:
         logger.info("starting worker", extra={"config": self.settings.to_safe_dict()})
         await self.controller.start()
         await self.corpus.load()
-        await self.opencode_runtime.start()
+        try:
+            await self.opencode_runtime.start()
+            # Readiness gate: no Telegram traffic is accepted until the
+            # local OpenCode runtime has proven healthy.
+            await self.opencode_runtime.ensure_ready()
+        except Exception:
+            await self.opencode_runtime.stop()
+            await self.corpus.unload()
+            await self.controller.stop()
+            raise
         await self.sessions.start()
         await self.safety.start()
         await self.transport.start()
