@@ -377,21 +377,25 @@ class PollingTelegramTransport(TelegramTransport):
         self._stop_event.set()
         task = self._poll_task
         self._poll_task = None
+        clean_shutdown = True
         if task is not None:
-            wait_seconds = max(45.0, float(self._poll_timeout_seconds) + 5.0)
             try:
-                await asyncio.wait_for(task, timeout=wait_seconds)
+                # Give a handler / short poll a chance to finish, but keep
+                # operator-triggered stop responsive.
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
             except TimeoutError:
+                clean_shutdown = False
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
             except asyncio.CancelledError:
-                pass
+                clean_shutdown = False
             except Exception:
                 logger.warning("telegram polling task ended with error")
-        await self._acknowledge_offset()
+        if clean_shutdown:
+            await self._acknowledge_offset()
         self._running = False
         logger.info("telegram polling stopped")
 
