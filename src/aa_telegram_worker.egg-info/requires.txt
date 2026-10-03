@@ -1,8 +1,0 @@
-cryptography>=41
-zstandard>=0.22
-
-[dev]
-pytest>=8
-pytest-asyncio>=0.23
-ruff>=0.8
-mypy>=1.11
