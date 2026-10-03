@@ -195,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             encrypted = archive.read_bytes()
         except OSError as exc:
             return _fail(f"cannot read encrypted snapshot: {exc}")
-        if metadata.get("encrypted_sha256") not in (None, hashlib.sha256(encrypted).hexdigest()):
+        expected_encrypted_sha = metadata.get("encrypted_sha256")
+        if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
             return _fail("snapshot encrypted SHA does not match metadata")
         try:
             tar_zst = decrypt_bytes(encrypted, [identity])

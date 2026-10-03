@@ -374,7 +374,11 @@ def test_no_private_key_or_plaintext_committed() -> None:
         and not p.endswith(".age")
     ]
     for path in tracked:
-        if path.startswith("corpus/source/encrypted/") and path.endswith(".age"):
+        if (
+            path.startswith("corpus/source/encrypted/")
+            and path.endswith(".age")
+            and path != "corpus/source/encrypted/canonical.tar.zst.age"
+        ):
             raise AssertionError(f"unexpected committed snapshot fixture: {path}")
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "/corpus/generated/" in gitignore

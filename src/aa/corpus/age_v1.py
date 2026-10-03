@@ -455,7 +455,7 @@ def decrypt_bytes(ciphertext: bytes, identities: list[str]) -> bytes:
 def _decrypt_with_file_key(ciphertext: bytes, rest: bytes, file_key: bytes) -> bytes:
     # Verify header MAC before touching the payload.
     header_end = len(ciphertext) - len(rest)
-    header_prefix_end = ciphertext.rfind(b"\n--- ")
+    header_prefix_end = ciphertext.rfind(b"\n--- ", 0, header_end)
     if header_end <= 0 or header_prefix_end < 0:
         raise AgeError("malformed age header")
     mac_line = ciphertext[header_prefix_end + len(b"\n--- ") : header_end].rstrip(b"\n")

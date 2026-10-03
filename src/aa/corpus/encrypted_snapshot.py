@@ -113,11 +113,13 @@ def extract_tar_zst(data: bytes) -> tuple[bytes, dict[str, Any]]:
     buffer = io.BytesIO(decompressed)
     try:
         with tarfile.open(fileobj=buffer, mode="r") as tar:
-            names = set(tar.getnames())
-            if names != {"canonical.json", "provenance.json"}:
-                raise ValueError(f"unexpected snapshot members: {sorted(names)}")
-            canonical_member = tar.extractfile("canonical.json")
-            provenance_member = tar.extractfile("provenance.json")
+            members = {m.name: m for m in tar.getmembers()}
+            if set(members) != {"canonical.json", "provenance.json"}:
+                raise ValueError(f"unexpected snapshot members: {sorted(members)}")
+            if any(not m.isreg() for m in members.values()):
+                raise ValueError("snapshot members must be regular files")
+            canonical_member = tar.extractfile(members["canonical.json"])
+            provenance_member = tar.extractfile(members["provenance.json"])
             if canonical_member is None or provenance_member is None:
                 raise ValueError("snapshot is missing required members")
             canonical_bytes = canonical_member.read()
