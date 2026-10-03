@@ -12,6 +12,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+DEFAULT_AA_AGENT = "aa"
+DEFAULT_PRIMARY_MODEL = "opencode/muse-spark-1.3-contributor-free"
+DEFAULT_FALLBACK_MODEL = "opencode/space-bunny-free"
+
 
 def _get_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
@@ -64,7 +68,9 @@ class Settings:
 
     # Model/context/output limits where owned by the OpenCode runtime.
     # These are hints passed through to OpenCode, not a second LLM client.
-    opencode_model: str = ""
+    opencode_agent: str = DEFAULT_AA_AGENT
+    opencode_model: str = DEFAULT_PRIMARY_MODEL
+    opencode_fallback_model: str = DEFAULT_FALLBACK_MODEL
     opencode_context_limit_tokens: int = 0
     opencode_max_output_tokens: int = 0
 
@@ -82,7 +88,9 @@ class Settings:
             "BOT_SESSION_DURATION_SECONDS",
             "AA_CORPUS_PATH",
             "AA_CORPUS_VERSION",
+            "OPENCODE_AGENT",
             "OPENCODE_MODEL",
+            "OPENCODE_FALLBACK_MODEL",
             "OPENCODE_CONTEXT_LIMIT_TOKENS",
             "OPENCODE_MAX_OUTPUT_TOKENS",
             "LOG_LEVEL",
@@ -104,7 +112,11 @@ class Settings:
                 bot_session_duration_seconds=_get_float("BOT_SESSION_DURATION_SECONDS", 0.0),
                 aa_corpus_path=_get_str("AA_CORPUS_PATH", "./corpus"),
                 aa_corpus_version=_get_str("AA_CORPUS_VERSION", "local"),
-                opencode_model=_get_str("OPENCODE_MODEL", ""),
+                opencode_agent=_get_str("OPENCODE_AGENT", DEFAULT_AA_AGENT),
+                opencode_model=_get_str("OPENCODE_MODEL", DEFAULT_PRIMARY_MODEL),
+                opencode_fallback_model=_get_str(
+                    "OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL
+                ),
                 opencode_context_limit_tokens=int(
                     source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0
                 ),
@@ -121,7 +133,11 @@ class Settings:
             ),
             aa_corpus_path=source.get("AA_CORPUS_PATH", "./corpus"),
             aa_corpus_version=source.get("AA_CORPUS_VERSION", "local"),
-            opencode_model=source.get("OPENCODE_MODEL", ""),
+            opencode_agent=source.get("OPENCODE_AGENT", DEFAULT_AA_AGENT),
+            opencode_model=source.get("OPENCODE_MODEL", DEFAULT_PRIMARY_MODEL),
+            opencode_fallback_model=source.get(
+                "OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL
+            ),
             opencode_context_limit_tokens=int(source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0),
             opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
@@ -136,6 +152,12 @@ class Settings:
         """Validate settings, raising ``ValueError`` on misuse."""
         if self.bot_session_duration_seconds < 0:
             raise ValueError("BOT_SESSION_DURATION_SECONDS must be >= 0")
+        if not self.opencode_agent.strip():
+            raise ValueError("OPENCODE_AGENT must not be empty")
+        if not self.opencode_model.strip():
+            raise ValueError("OPENCODE_MODEL must not be empty")
+        if not self.opencode_fallback_model.strip():
+            raise ValueError("OPENCODE_FALLBACK_MODEL must not be empty")
         if self.opencode_context_limit_tokens < 0:
             raise ValueError("OPENCODE_CONTEXT_LIMIT_TOKENS must be >= 0")
         if self.opencode_max_output_tokens < 0:
@@ -155,7 +177,9 @@ class Settings:
             "bot_session_duration_seconds": self.bot_session_duration_seconds,
             "aa_corpus_path": self.aa_corpus_path,
             "aa_corpus_version": self.aa_corpus_version,
+            "opencode_agent": self.opencode_agent,
             "opencode_model": self.opencode_model,
+            "opencode_fallback_model": self.opencode_fallback_model,
             "opencode_context_limit_tokens": self.opencode_context_limit_tokens,
             "opencode_max_output_tokens": self.opencode_max_output_tokens,
             "log_level": self.log_level,
