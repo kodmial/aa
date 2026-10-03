@@ -33,6 +33,38 @@ unrelated appendices are outside the MVP corpus.
 Issue #3 owns deterministic extraction/validation of this scope and records
 source provenance and checksums.
 
+## Canonical build (The Doctor's Opinion + Chapters 1-11)
+
+`scripts/build_canonical.py` is the single deterministic builder for the
+canonical runtime artifact. It reuses the acquisition path above and never
+downloads anything itself:
+
+- reads `corpus/source/raw/AA.txt` and `corpus/source/raw/doctors-opinion.html` read-only;
+- validates both files against `corpus/source/fetch-state.json` and the
+  committed `corpus/canonical.manifest.json` (SHA-256, byte lengths, paths);
+- converts The Doctor's Opinion HTML to readable literary text
+  deterministically (article paragraphs `p1`..`p41` in order, entities
+  unescaped, wording untouched);
+- slices Chapters 1-11 contiguously from the plain-text source, validating
+  chapter numbers, titles, order and boundaries while excluding the
+  publisher preamble;
+- verifies every derived section SHA and the whole-artifact SHA against the
+  manifest, then writes `corpus/generated/canonical.json` (ignored by Git).
+
+Any stale or mismatched source fails closed with a non-zero exit status and
+no artifact is written. Rebuilding while sources are unchanged produces
+byte-identical output.
+
+Run:
+
+```bash
+python3 scripts/fetch_aa_source.py
+python3 scripts/build_canonical.py
+```
+
+Runtime context budgets for the retrieval system are documented in
+`docs/context-budget.md`.
+
 ## Derived artifacts
 
 Later stages may derive navigation and retrieval metadata without changing the
