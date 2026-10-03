@@ -486,6 +486,8 @@ def build_structure(
                 run_len = 0
                 for sent_id, (rel_start, rel_end) in zip(sent_ids, rel_spans, strict=False):
                     sent_text = para.text[rel_start:rel_end]
+                    if len(sent_text) > MAX_CHUNK_CHARS:
+                        raise ValueError(f"{para_id}: single sentence exceeds MAX_CHUNK_CHARS")
                     # +1 separator allowance inside the run mirrors the gap.
                     add = len(sent_text) + (1 if run else 0)
                     if run and run_len + add > MAX_CHUNK_CHARS:
@@ -699,6 +701,18 @@ def build_structure(
         )
         section_byte_start = entry.get("byte_start")
         section_byte_end = entry.get("byte_end")
+        if section_byte_start is None and section_byte_end is None:
+            pass
+        else:
+            if (
+                not isinstance(section_byte_start, int)
+                or not isinstance(section_byte_end, int)
+                or isinstance(section_byte_start, bool)
+                or isinstance(section_byte_end, bool)
+            ):
+                raise ValueError(f"{section_id}: canonical section lacks byte offsets")
+            if not (0 <= section_byte_start < section_byte_end):
+                raise ValueError(f"{section_id}: canonical byte offsets are malformed")
         section_rows.append(
             {
                 "id": section_id,
@@ -1081,7 +1095,7 @@ def main(argv: list[str] | None = None) -> int:
             canonical_bytes=len(canonical_text),
         )
         report_bytes = serialize_json(report)
-    except ValueError as exc:
+    except (ValueError, KeyError, StopIteration, IndexError, TypeError) as exc:
         return fail(str(exc))
 
     # All validation passed: write every output (no partial writes before this).
