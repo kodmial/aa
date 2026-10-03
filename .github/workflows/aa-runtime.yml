@@ -134,6 +134,12 @@ jobs:
             }
           done
 
+          [[ -f scripts/verify_runtime_qualification.py ]] || {
+            echo "::error::AA runtime qualification gate is missing; issues #19/#9 are not ready."
+            exit 1
+          }
+          python scripts/verify_runtime_qualification.py
+
       - name: Run bounded Telegram poller and OpenCode
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
