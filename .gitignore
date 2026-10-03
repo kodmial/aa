@@ -1,18 +1,19 @@
-/vendor/
-/.env
-/.env.*
-!/.env.example
-/storage/*.key
-/node_modules/
-/.phpunit.cache/
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-htmlcov/
-.coverage
+.venv/
+venv/
+
+# Local runtime / generated artifacts
+.tmp/
+.cache/
 dist/
 build/
-*.egg-info/
-.venv/
