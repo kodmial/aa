@@ -1,0 +1,189 @@
+{
+  "book_map": {
+    "budget_tokens": 6000,
+    "chars": 9617,
+    "est_tokens": 2405,
+    "fits_budget": true
+  },
+  "bytes": {
+    "canonical_json": 281291,
+    "chunks_json": 304736,
+    "structure_json": 2896038
+  },
+  "canonical": {
+    "artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
+    "format": "aa-canonical/1"
+  },
+  "chunking": {
+    "max_chunk_chars": 1200,
+    "min_chunk_chars": 500,
+    "tail_merge_chars": 250
+  },
+  "counts": {
+    "chunks": 361,
+    "paragraphs": 658,
+    "sections": 12,
+    "sentences": 3392
+  },
+  "format": "aa-corpus-structure-report/1",
+  "sections": [
+    {
+      "chars": 12434,
+      "chunk_count": 18,
+      "chunk_range": [
+        "doctors-opinion:c001",
+        "doctors-opinion:c018"
+      ],
+      "est_tokens": 3109,
+      "id": "doctors-opinion",
+      "paragraph_count": 41,
+      "sentence_count": 115,
+      "title": "The Doctor's Opinion"
+    },
+    {
+      "chars": 25544,
+      "chunk_count": 34,
+      "chunk_range": [
+        "chapter-1:c001",
+        "chapter-1:c034"
+      ],
+      "est_tokens": 6386,
+      "id": "chapter-1",
+      "paragraph_count": 75,
+      "sentence_count": 383,
+      "title": "BILL'S STORY"
+    },
+    {
+      "chars": 20684,
+      "chunk_count": 27,
+      "chunk_range": [
+        "chapter-2:c001",
+        "chapter-2:c027"
+      ],
+      "est_tokens": 5171,
+      "id": "chapter-2",
+      "paragraph_count": 52,
+      "sentence_count": 211,
+      "title": "THERE IS A SOLUTION"
+    },
+    {
+      "chars": 22902,
+      "chunk_count": 29,
+      "chunk_range": [
+        "chapter-3:c001",
+        "chapter-3:c029"
+      ],
+      "est_tokens": 5726,
+      "id": "chapter-3",
+      "paragraph_count": 41,
+      "sentence_count": 257,
+      "title": "MORE ABOUT ALCOHOLISM"
+    },
+    {
+      "chars": 22027,
+      "chunk_count": 28,
+      "chunk_range": [
+        "chapter-4:c001",
+        "chapter-4:c028"
+      ],
+      "est_tokens": 5507,
+      "id": "chapter-4",
+      "paragraph_count": 49,
+      "sentence_count": 254,
+      "title": "WE AGNOSTICS"
+    },
+    {
+      "chars": 21138,
+      "chunk_count": 30,
+      "chunk_range": [
+        "chapter-5:c001",
+        "chapter-5:c030"
+      ],
+      "est_tokens": 5285,
+      "id": "chapter-5",
+      "paragraph_count": 82,
+      "sentence_count": 318,
+      "title": "HOW IT WORKS"
+    },
+    {
+      "chars": 27180,
+      "chunk_count": 37,
+      "chunk_range": [
+        "chapter-6:c001",
+        "chapter-6:c037"
+      ],
+      "est_tokens": 6795,
+      "id": "chapter-6",
+      "paragraph_count": 52,
+      "sentence_count": 366,
+      "title": "INTO ACTION"
+    },
+    {
+      "chars": 24261,
+      "chunk_count": 30,
+      "chunk_range": [
+        "chapter-7:c001",
+        "chapter-7:c030"
+      ],
+      "est_tokens": 6066,
+      "id": "chapter-7",
+      "paragraph_count": 48,
+      "sentence_count": 296,
+      "title": "WORKING WITH OTHERS"
+    },
+    {
+      "chars": 28359,
+      "chunk_count": 37,
+      "chunk_range": [
+        "chapter-8:c001",
+        "chapter-8:c037"
+      ],
+      "est_tokens": 7090,
+      "id": "chapter-8",
+      "paragraph_count": 63,
+      "sentence_count": 377,
+      "title": "TO WIVES"
+    },
+    {
+      "chars": 22837,
+      "chunk_count": 29,
+      "chunk_range": [
+        "chapter-9:c001",
+        "chapter-9:c029"
+      ],
+      "est_tokens": 5710,
+      "id": "chapter-9",
+      "paragraph_count": 47,
+      "sentence_count": 261,
+      "title": "THE FAMILY AFTERWARD"
+    },
+    {
+      "chars": 23122,
+      "chunk_count": 32,
+      "chunk_range": [
+        "chapter-10:c001",
+        "chapter-10:c032"
+      ],
+      "est_tokens": 5781,
+      "id": "chapter-10",
+      "paragraph_count": 51,
+      "sentence_count": 271,
+      "title": "TO EMPLOYERS"
+    },
+    {
+      "chars": 21944,
+      "chunk_count": 30,
+      "chunk_range": [
+        "chapter-11:c001",
+        "chapter-11:c030"
+      ],
+      "est_tokens": 5486,
+      "id": "chapter-11",
+      "paragraph_count": 57,
+      "sentence_count": 283,
+      "title": "A VISION FOR YOU"
+    }
+  ],
+  "structure_builder_version": 1,
+  "structure_format": "aa-corpus-structure/1"
+}

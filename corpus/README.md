@@ -65,20 +65,49 @@ python3 scripts/build_canonical.py
 Runtime context budgets for the retrieval system are documented in
 `docs/context-budget.md`.
 
-## Derived artifacts
+## Derived artifacts (issue #8)
 
-Later stages may derive navigation and retrieval metadata without changing the
-literary source:
+`scripts/build_corpus_structure.py` is the single deterministic builder for
+the hierarchical navigation layer. It reads only the validated canonical
+artifact and the committed manifest (no network, no paraphrase) and writes:
 
-- stable chapter/paragraph/sentence/chunk IDs;
-- exact source offsets and parent/neighbor links;
-- a compact book map;
-- lexical and multilingual semantic indexes;
-- ranking/reranking metadata.
+Public, versioned in Git (navigation metadata only, no literary text):
 
-Every retrieval unit must map back to exact canonical source text. Generated
-book-map text, embeddings, scores, contextual metadata and reranker output are
-navigation aids only and must never be quoted or presented as the book.
+- `corpus/structure.json` — stable `book -> section -> paragraph ->
+  sentence -> chunk` hierarchy with IDs, exact canonical offsets,
+  parent/previous/next links, and provenance checksums;
+- `corpus/book-map.md` — compact always-loaded section/topic map with
+  stable IDs and chunk ranges (~2405 of 6000 budgeted tokens);
+- `corpus/structure-report.json` — deterministic size/token report.
+
+Private runtime workspace, ignored by Git (may contain substantial text):
+
+- `corpus/generated/corpus-chunks.json` — retrieval chunks with exact
+  source text for downstream indexes and read tools.
+
+Every chunk round-trips to exact canonical text
+(`corpus/generated/canonical.json` slice by offsets). The map is a routing
+layer only; substantive answers must read original passages.
+
+Regenerate (deterministic; fails closed on checksum mismatch):
+
+```bash
+python3 scripts/fetch_aa_source.py
+python3 scripts/build_canonical.py
+python3 scripts/build_corpus_structure.py
+```
+
+If the unified restore entry point from #24 is available, it becomes the
+preferred bootstrap path; the fetch/build chain above remains the explicit
+fallback. Runtime helpers live in `src/aa/corpus/structure.py` and are
+covered by `tests/test_corpus_structure.py`.
+
+Later stages (#17/#19) may add lexical and multilingual semantic indexes
+plus ranking/reranking metadata on top of these chunk IDs without changing
+the literary source. Every retrieval unit must map back to exact canonical
+source text. Generated book-map text, embeddings, scores, contextual
+metadata and reranker output are navigation aids only and must never be
+quoted or presented as the book.
 
 ## Runtime access
 
