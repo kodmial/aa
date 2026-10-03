@@ -66,8 +66,7 @@ Recovery contract for the worker:
 ## Configuration ownership
 
 Model/provider (Zen) configuration lives entirely on the OpenCode side
-(`~/.config/opencode/opencode.jsonc`, provider credentials via `opencode
-auth`, environment of the job). The worker owns no `ZEN_*`, `ANTHROPIC_*`
-or `OPENAI_*` settings and sends no credentials; it forwards at most the
-opaque `OPENCODE_MODEL` `provider/model` pointer, and omits the model field
-otherwise so the server (Zen) default applies.
+(`~/.config/opencode/opencode.jsonc` and the job environment). The AA runtime
+uses the anonymous/keyless OpenCode free tier and must not require an OpenCode
+or Zen account, API key, provider credential, or authentication secret. The
+worker forwards at most the opaque `OPENCODE_MODEL` `provider/model` pointer.
