@@ -162,6 +162,26 @@ Steady context contains only:
 Retrieved passages may not be silently truncated. Context limits and expansion
 bounds are measured and fixed by #3/#19.
 
+## Hybrid whole-book grounding
+
+The compact book map is an always-loaded routing layer only. It must never be used as the sole basis of a substantive answer.
+
+For every substantive personal/support request, the agent performs coverage-oriented retrieval across the canonical book:
+
+1. interpret the user's situation and derive multiple search aspects when needed;
+2. use the book map to route toward likely sections and alternative perspectives;
+3. run hybrid search across the whole corpus;
+4. diversify and deduplicate candidates across distinct source regions;
+5. read exact passages from multiple materially distinct candidates;
+6. expand neighboring context where the local argument requires it;
+7. run a coverage check and a second search pass for missing aspects;
+8. stop when further retrieval adds no materially new support or the explicit source budget is reached;
+9. synthesize the final answer only from retrieved canonical material.
+
+The quality target is therefore not "one relevant chunk found". It is the best practical approximation of the answer a careful reader could derive after consulting the relevant portions of the whole book.
+
+If the source-token budget prevents complete coverage, the response must narrow/qualify its claims rather than fill gaps from model memory.
+
 ## Grounding contract
 
 For substantive AA/recovery claims the agent:

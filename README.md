@@ -45,6 +45,12 @@ project-local read-only tools:
 The book map and retrieval metadata are navigation aids, never evidentiary
 source text. Substantive AA claims must be grounded in source-exact passages.
 
+For broad personal/support questions, retrieval is coverage-oriented: OpenCode
+uses the map to plan multiple searches across the whole book, reads exact
+passages from distinct relevant regions, checks for missing perspectives, and
+only then synthesizes the answer. One top hit is not treated as sufficient
+grounding when the question spans multiple parts of the book.
+
 The dedicated AA agent uses a deny-by-default tool policy: unrelated shell,
 write/edit, arbitrary web and coding capabilities are not available to the
 conversational agent unless a separate runtime requirement explicitly needs
