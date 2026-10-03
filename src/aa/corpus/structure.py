@@ -238,6 +238,8 @@ def load_structure(path: str | Path) -> CorpusStructure:
             raise CorpusStructureError(
                 f"node {node.id!r} has an unknown next neighbor {node.next_id!r}"
             )
+        if node.char_start < 0:
+            raise CorpusStructureError(f"node {node.id!r} has a negative offset")
         if node.char_end <= node.char_start:
             raise CorpusStructureError(f"node {node.id!r} has an empty offset range")
         children.setdefault(node.parent_id, []).append(node.id)

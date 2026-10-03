@@ -536,14 +536,19 @@ def build_structure(
                     pending_len = 0
                 section_chunks.append((cs, ce, pids, sids))
                 continue
-            add = (ce - cs) + (pending_len and 1 or 0)
-            if pending and pending_len + add > MAX_CHUNK_CHARS:
+            add = 0
+            if pending:
+                gap = cs - pending[-1][2]
+                candidate_len = pending_len + gap + (ce - cs)
+            else:
+                candidate_len = ce - cs
+            if pending and candidate_len > MAX_CHUNK_CHARS:
                 section_chunks.append(_flush_pending(text, pending))
                 pending = []
                 pending_len = 0
-                add = ce - cs
+                candidate_len = ce - cs
             pending.append(unit)
-            pending_len += add
+            pending_len = candidate_len
             if pending_len >= MIN_CHUNK_CHARS:
                 section_chunks.append(_flush_pending(text, pending))
                 pending = []
@@ -554,22 +559,26 @@ def build_structure(
         # Merge a tiny trailing chunk into its predecessor (same section only).
         if len(section_chunks) >= 2:
             last = section_chunks[-1]
+            paragraph_starts = {para.char_start for para in paragraphs}
             if (
                 (last[1] - last[0]) < TAIL_MERGE_CHARS
                 and len(last[2]) == 1
-                and len(section_chunks[-2][2]) >= 1
+                and last[0] in paragraph_starts
+                and last[1] in paragraph_ends
             ):
                 prev = section_chunks[-2]
-                # Merge only whole-paragraph units and only when the merged
-                # span stays within MAX_CHUNK_CHARS.
-                if last[1] - prev[0] <= MAX_CHUNK_CHARS:
-                    section_chunks[-2] = (
-                        prev[0],
-                        last[1],
-                        prev[2] + last[2],
-                        prev[3] + last[3],
-                    )
-                    section_chunks.pop()
+                # Merge only whole-paragraph chunks so a partial sentence-split
+                # tail never claims a full paragraph id or duplicates it.
+                if prev[0] in paragraph_starts and prev[1] in paragraph_ends:
+                    if last[1] - prev[0] <= MAX_CHUNK_CHARS:
+                        merged_pids = prev[2] + [pid for pid in last[2] if pid not in prev[2]]
+                        section_chunks[-2] = (
+                            prev[0],
+                            last[1],
+                            merged_pids,
+                            prev[3] + last[3],
+                        )
+                        section_chunks.pop()
 
         # ---- emit paragraph / sentence / chunk rows
         for position, para in enumerate(paragraphs):
