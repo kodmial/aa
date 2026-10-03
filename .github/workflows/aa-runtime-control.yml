@@ -93,7 +93,7 @@ jobs:
               if (active.length) {
                 const run = active.sort((a, b) => a.id - b.id)[0];
                 await comment(
-                  `Start rejected: AA runtime #${run.id} is already ${run.status}. Use `/bot status` or `/bot stop`.`
+                  `Start rejected: AA runtime #${run.id} is already ${run.status}. Use /bot status or /bot stop.`
                 );
                 return;
               }
