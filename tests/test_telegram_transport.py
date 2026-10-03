@@ -130,7 +130,7 @@ async def test_bootstrap_performs_startup_contract_in_order() -> None:
         ]
         assert "getUpdates" in order[5:]
         delete_payloads = api.payloads_for("deleteWebhook")
-        assert delete_payloads and delete_payloads[0].get("drop_pending_updates") is True
+        assert delete_payloads and delete_payloads[0].get("drop_pending_updates") is False
         commands_payloads = api.payloads_for("setMyCommands")
         assert commands_payloads
         configured = {c["command"] for c in commands_payloads[0]["commands"]}
@@ -210,6 +210,27 @@ async def test_duplicate_updates_are_idempotent() -> None:
         assert len(transport.received) == 1
         # Offset still advances past the duplicate redelivery.
         assert transport.offset == 21
+    finally:
+        await transport.stop()
+
+
+async def test_failed_handler_is_not_acknowledged_and_is_redelivered() -> None:
+    update = _private_message(25, 9, 1, "retry-handler")
+    api = FakeTelegramApi(get_updates_scripts=[[update], [update]])
+    attempts = 0
+
+    async def _handler(incoming: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient handler failure")
+
+    transport = _fast_transport(api, update_handler=_handler)
+    await transport.start()
+    try:
+        await _wait_for(lambda: attempts >= 2)
+        assert transport.offset == 26
+        assert len(transport.received) == 1
     finally:
         await transport.stop()
 
