@@ -1,0 +1,156 @@
+name: AA bot runtime
+run-name: AA bot runtime ${{ inputs.duration }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Bounded live runtime duration"
+        required: true
+        type: choice
+        options:
+          - 15m
+          - 1h
+          - 2h
+          - 3h
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - name: Reject duplicate runtime
+        uses: actions/github-script@v7
+        env:
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const current = Number(process.env.CURRENT_RUN_ID);
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: 'aa-runtime.yml',
+              per_page: 100,
+            });
+            const active = data.workflow_runs.filter(
+              run => run.conclusion === null &&
+                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
+            );
+            const authoritative = active.sort((a, b) => a.id - b.id)[0];
+            if (authoritative && authoritative.id !== current) {
+              core.setFailed(
+                `AA runtime #${authoritative.id} is already active; rejecting duplicate #${current}.`
+              );
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve bounded duration
+        id: duration
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.duration }}" in
+            15m) seconds=900 ;;
+            1h) seconds=3600 ;;
+            2h) seconds=7200 ;;
+            3h) seconds=10800 ;;
+            *)
+              echo "::error::Unsupported runtime duration."
+              exit 1
+              ;;
+          esac
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+
+      - name: Validate required application secret
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+            echo "::error::TELEGRAM_BOT_TOKEN is not configured."
+            exit 1
+          fi
+
+      - name: Install worker
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
+              bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Build and validate AA knowledge runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetch_aa_source.py
+          python scripts/build_canonical.py
+
+          [[ -f scripts/build_corpus_structure.py ]] || {
+            echo "::error::AA hierarchy builder is missing; issue #8 is not ready."
+            exit 1
+          }
+          python scripts/build_corpus_structure.py
+
+          [[ -f scripts/build_retrieval_index.py ]] || {
+            echo "::error::AA retrieval index builder is missing; issue #17 is not ready."
+            exit 1
+          }
+          python scripts/build_retrieval_index.py
+
+          for tool in book_search book_read book_expand book_section; do
+            [[ -f ".opencode/tools/${tool}.ts" ]] || {
+              echo "::error::Missing OpenCode AA tool: ${tool} (issue #18 is not ready)."
+              exit 1
+            }
+          done
+
+      - name: Run bounded Telegram poller and OpenCode
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_SESSION_DURATION_SECONDS: ${{ steps.duration.outputs.seconds }}
+          OPENCODE_BASE_URL: http://127.0.0.1:4096
+          OPENCODE_COMMAND: opencode
+          OPENCODE_WORKDIR: .
+          OPENCODE_AGENT: aa
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_CONTEXT_LIMIT_TOKENS: "200000"
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          LOG_LEVEL: INFO
+        run: python -m aa
+
+      - name: Record bounded completion
+        if: success()
+        run: |
+          echo "AA runtime completed its requested ${{ inputs.duration }} live window." >> "$GITHUB_STEP_SUMMARY"
