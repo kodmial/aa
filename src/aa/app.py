@@ -8,16 +8,26 @@ import logging
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
 from aa.corpus.context import CorpusContext
+from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
     PollingTelegramTransport,
     StubTelegramTransport,
+    TelegramIncoming,
+    TelegramReply,
     TelegramTransport,
 )
 
 logger = logging.getLogger("aa.app")
+
+_START_REPLY = "Бот готов. Напишите сообщение. / Bot is ready. Send a message."
+_NEW_REPLY = "Новая беседа начата. / New conversation started."
+_TEMPORARY_ERROR_REPLY = (
+    "Не удалось обработать сообщение. Попробуйте ещё раз. / "
+    "Could not process the message. Please try again."
+)
 
 
 class Application:
@@ -55,6 +65,7 @@ class Application:
             session_duration_seconds=settings.bot_session_duration_seconds
         )
         self._running = False
+        self._wire_transport_handlers()
 
     @property
     def running(self) -> bool:
@@ -62,26 +73,35 @@ class Application:
         return self._running
 
     async def start(self) -> None:
-        """Start all components in dependency order."""
+        """Start all components in dependency order.
+
+        The bounded runtime clock is armed only after OpenCode and Telegram
+        are ready, so bootstrap time never consumes the requested live window.
+        """
         if self._running:
             return
         self.settings.validate(require_bot_token=False)
         logger.info("starting worker", extra={"config": self.settings.to_safe_dict()})
-        await self.controller.start()
         await self.corpus.load()
         try:
             await self.opencode_runtime.start()
             # Readiness gate: no Telegram traffic is accepted until the
             # local OpenCode runtime has proven healthy.
             await self.opencode_runtime.ensure_ready()
+            await self.sessions.start()
+            await self.safety.start()
+            await self.transport.start()
+            # Start the requested 15m/1h/2h/3h window only after the poller
+            # is live and all dependencies have completed bootstrap.
+            await self.controller.start()
         except Exception:
+            await self.transport.stop()
+            await self.safety.stop()
+            await self.sessions.stop()
             await self.opencode_runtime.stop()
             await self.corpus.unload()
             await self.controller.stop()
             raise
-        await self.sessions.start()
-        await self.safety.start()
-        await self.transport.start()
         self._running = True
         logger.info("worker started")
 
@@ -115,6 +135,63 @@ class Application:
         finally:
             await self.stop()
 
+    def _wire_transport_handlers(self) -> None:
+        """Connect the concrete polling transport to application behavior."""
+        if not isinstance(self.transport, PollingTelegramTransport):
+            return
+        self.transport.on_update(self._handle_telegram_update)
+        self.transport.on_command("start", self._handle_start_command)
+        self.transport.on_command("new", self._handle_new_command)
+
+    async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
+        await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_START_REPLY))
+
+    async def _handle_new_command(self, incoming: TelegramIncoming) -> None:
+        try:
+            await self.sessions.reset_opencode_session(
+                incoming.chat_id, self.opencode_runtime.client
+            )
+            reply = _NEW_REPLY
+        except OpenCodeError:
+            logger.warning("telegram new-session reset failed", extra={"chat_id": incoming.chat_id})
+            reply = _TEMPORARY_ERROR_REPLY
+        await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+
+    async def _handle_telegram_update(self, incoming: TelegramIncoming) -> None:
+        """Process one private text update and always emit a bounded reply."""
+        self.sessions.record_message(incoming.chat_id)
+        try:
+            reply = await self.respond(incoming.chat_id, incoming.text)
+            if not reply.strip():
+                raise OpenCodeError("opencode returned an empty response")
+        except (OpenCodeError, ValueError):
+            logger.warning(
+                "telegram message processing failed",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+            )
+            reply = _TEMPORARY_ERROR_REPLY
+        await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+
+    async def _send_grounded_message(self, session_id: str, text: str) -> str:
+        """Send through the named AA agent with a technical model fallback only."""
+        try:
+            return await self.opencode_runtime.client.send_message(
+                session_id,
+                text,
+                agent=self.settings.opencode_agent,
+                model=self.settings.opencode_model,
+            )
+        except OpenCodeError as exc:
+            if not exc.transient:
+                raise
+            logger.warning("primary AA model unavailable; trying fallback")
+            return await self.opencode_runtime.client.send_message(
+                session_id,
+                text,
+                agent=self.settings.opencode_agent,
+                model=self.settings.opencode_fallback_model,
+            )
+
     async def respond(self, chat_id: int, text: str) -> str:
         """Answer one inbound message with emergency precedence.
 
@@ -140,11 +217,15 @@ class Application:
         session_id = await self.sessions.ensure_opencode_session(
             chat_id, self.opencode_runtime.client
         )
-        reply = await self.opencode_runtime.client.send_message(
-            session_id,
-            text,
-            model=self.settings.opencode_model,
-        )
+        try:
+            reply = await self._send_grounded_message(session_id, text)
+        except OpenCodeSessionNotFoundError:
+            # A local chat mapping can outlive an OpenCode session after a
+            # runtime restart. Rebind once and retry against a fresh session.
+            session_id = await self.sessions.reset_opencode_session(
+                chat_id, self.opencode_runtime.client, delete_remote=False
+            )
+            reply = await self._send_grounded_message(session_id, text)
         logger.info("normal response served", extra={"chat_id": chat_id})
         return reply
 

@@ -47,6 +47,26 @@ async def test_stop_is_idempotent() -> None:
     assert not app.running
 
 
+async def test_session_window_starts_after_runtime_readiness() -> None:
+    class SlowReadyRuntime(StubOpenCodeRuntime):
+        async def ensure_ready(self, timeout: float | None = None) -> None:
+            await asyncio.sleep(0.08)
+            await super().ensure_ready(timeout)
+
+    settings = Settings.from_env({"BOT_SESSION_DURATION_SECONDS": "0.2"})
+    runtime = SlowReadyRuntime(
+        OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
+    )
+    app = Application(settings, opencode_runtime=runtime)
+    await app.start()
+    try:
+        remaining = app.controller.time_remaining()
+        assert remaining is not None
+        assert remaining > 0.15
+    finally:
+        await app.stop()
+
+
 async def test_run_respects_session_duration() -> None:
     settings = Settings.from_env({"BOT_SESSION_DURATION_SECONDS": "0.05"})
     app = Application(settings, opencode_runtime=_stub_runtime())

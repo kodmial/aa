@@ -15,6 +15,9 @@ def test_from_env_defaults_without_secrets() -> None:
     assert settings.bot_session_duration_seconds == 0.0
     assert settings.aa_corpus_path == "./corpus"
     assert settings.aa_corpus_version == "local"
+    assert settings.opencode_agent == "aa"
+    assert settings.opencode_model == "opencode/muse-spark-1.3-contributor-free"
+    assert settings.opencode_fallback_model == "opencode/space-bunny-free"
     assert not settings.has_bot_token
     settings.validate()
 
@@ -29,7 +32,9 @@ def test_from_env_reads_reserved_names() -> None:
             "BOT_SESSION_DURATION_SECONDS": "30",
             "AA_CORPUS_PATH": "./corpus-test",
             "AA_CORPUS_VERSION": "v1",
-            "OPENCODE_MODEL": "test-model",
+            "OPENCODE_AGENT": "aa-test",
+            "OPENCODE_MODEL": "opencode/test-model",
+            "OPENCODE_FALLBACK_MODEL": "opencode/test-fallback",
             "OPENCODE_CONTEXT_LIMIT_TOKENS": "1000",
             "OPENCODE_MAX_OUTPUT_TOKENS": "200",
             "LOG_LEVEL": "debug",
@@ -42,7 +47,9 @@ def test_from_env_reads_reserved_names() -> None:
     assert settings.bot_session_duration_seconds == 30.0
     assert settings.aa_corpus_path == "./corpus-test"
     assert settings.aa_corpus_version == "v1"
-    assert settings.opencode_model == "test-model"
+    assert settings.opencode_agent == "aa-test"
+    assert settings.opencode_model == "opencode/test-model"
+    assert settings.opencode_fallback_model == "opencode/test-fallback"
     assert settings.opencode_context_limit_tokens == 1000
     assert settings.opencode_max_output_tokens == 200
     assert settings.log_level == "DEBUG"
@@ -59,7 +66,9 @@ def test_reserved_names_cover_contract() -> None:
     assert "BOT_SESSION_DURATION_SECONDS" in reserved
     assert "AA_CORPUS_PATH" in reserved
     assert "AA_CORPUS_VERSION" in reserved
+    assert "OPENCODE_AGENT" in reserved
     assert "OPENCODE_MODEL" in reserved
+    assert "OPENCODE_FALLBACK_MODEL" in reserved
     assert "OPENCODE_CONTEXT_LIMIT_TOKENS" in reserved
     assert "OPENCODE_MAX_OUTPUT_TOKENS" in reserved
 
