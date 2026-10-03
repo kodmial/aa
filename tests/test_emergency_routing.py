@@ -14,6 +14,7 @@ import pytest
 
 from aa.app import Application
 from aa.config import Settings
+from aa.opencode.client import FakeOpenCodeClient
 from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
 from aa.safety.emergency import EmergencyCategory, classify_emergency
 from aa.safety.response import (
@@ -371,10 +372,12 @@ async def test_emergency_path_precedes_opencode_and_skips_llm() -> None:
         reply = await app.respond(123, "I want to kill myself tonight")
         assert "emergency" in reply.lower()
         # No OpenCode session must have been created and no prompt sent.
-        assert runtime.client._sessions == {}  # type: ignore[union-attr]
+        client = runtime.client
+        assert isinstance(client, FakeOpenCodeClient)
+        assert client._sessions == {}
         normal = await app.respond(123, "What does the Big Book say about fear?")
         assert normal.startswith("fake-reply-")
-        assert len(runtime.client._sessions) == 1  # type: ignore[union-attr]
+        assert len(client._sessions) == 1
     finally:
         await app.stop()
 
