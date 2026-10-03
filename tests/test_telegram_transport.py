@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 
 from aa import logging as aa_logging
-from aa.app import create_application
+from aa.app import Application, create_application
 from aa.config import Settings
+from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
 from aa.telegram.transport import (
     SUPPORTED_COMMANDS,
     PollingTelegramTransport,
@@ -130,7 +131,7 @@ async def test_bootstrap_performs_startup_contract_in_order() -> None:
         ]
         assert "getUpdates" in order[5:]
         delete_payloads = api.payloads_for("deleteWebhook")
-        assert delete_payloads and delete_payloads[0].get("drop_pending_updates") is True
+        assert delete_payloads and delete_payloads[0].get("drop_pending_updates") is False
         commands_payloads = api.payloads_for("setMyCommands")
         assert commands_payloads
         configured = {c["command"] for c in commands_payloads[0]["commands"]}
@@ -210,6 +211,27 @@ async def test_duplicate_updates_are_idempotent() -> None:
         assert len(transport.received) == 1
         # Offset still advances past the duplicate redelivery.
         assert transport.offset == 21
+    finally:
+        await transport.stop()
+
+
+async def test_failed_handler_is_not_acknowledged_and_is_redelivered() -> None:
+    update = _private_message(25, 9, 1, "retry-handler")
+    api = FakeTelegramApi(get_updates_scripts=[[update], [update]])
+    attempts = 0
+
+    async def _handler(incoming: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient handler failure")
+
+    transport = _fast_transport(api, update_handler=_handler)
+    await transport.start()
+    try:
+        await _wait_for(lambda: attempts >= 2)
+        assert transport.offset == 26
+        assert len(transport.received) == 1
     finally:
         await transport.stop()
 
@@ -373,6 +395,61 @@ async def test_logs_contain_no_token_or_message_bodies() -> None:
     assert secret_text not in output
     assert "TEST-TOKEN-SECRET" not in output
     assert "super-secret-user-body" not in output
+
+
+async def test_application_routes_polling_message_to_opencode_and_back() -> None:
+    api = FakeTelegramApi(get_updates_scripts=[[_private_message(80, 42, 1, "hello")]])
+    transport = _fast_transport(api)
+    runtime = StubOpenCodeRuntime(
+        OpenCodeConfig(
+            base_url="http://127.0.0.1:4096",
+            command="opencode",
+            workdir=".",
+        )
+    )
+    app = Application(Settings.from_env({}), transport=transport, opencode_runtime=runtime)
+    await app.start()
+    try:
+        await _wait_for(lambda: len(api.sent_payloads) == 1)
+        assert api.sent_payloads[0]["chat_id"] == 42
+        assert api.sent_payloads[0]["text"] == "fake-reply-1"
+        assert app.sessions.session_count() == 1
+    finally:
+        await app.stop()
+
+
+async def test_application_new_command_resets_only_that_chat() -> None:
+    api = FakeTelegramApi(
+        get_updates_scripts=[
+            [
+                _private_message(90, 7, 1, "first"),
+                _private_message(91, 8, 1, "other"),
+                _private_message(92, 7, 2, "/new"),
+                _private_message(93, 7, 3, "second"),
+            ]
+        ]
+    )
+    transport = _fast_transport(api)
+    runtime = StubOpenCodeRuntime(
+        OpenCodeConfig(
+            base_url="http://127.0.0.1:4096",
+            command="opencode",
+            workdir=".",
+        )
+    )
+    app = Application(Settings.from_env({}), transport=transport, opencode_runtime=runtime)
+    await app.start()
+    try:
+        await _wait_for(lambda: len(api.sent_payloads) == 4)
+        replies = [payload["text"] for payload in api.sent_payloads]
+        assert replies[0] == "fake-reply-1"
+        assert replies[1] == "fake-reply-1"
+        assert "New conversation started" in replies[2]
+        # Chat 7 gets a fresh OpenCode session after /new.
+        assert replies[3] == "fake-reply-1"
+        assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)
+    finally:
+        await app.stop()
 
 
 def test_application_wires_polling_transport_when_token_present() -> None:
