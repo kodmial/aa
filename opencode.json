@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "default_agent": "aa",
   "agent": {
     "aa": {
       "description": "Closed-book AA literature support assistant",
