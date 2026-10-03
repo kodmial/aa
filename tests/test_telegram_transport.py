@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 
 from aa import logging as aa_logging
-from aa.app import create_application
+from aa.app import Application, create_application
 from aa.config import Settings
+from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
 from aa.telegram.transport import (
     SUPPORTED_COMMANDS,
     PollingTelegramTransport,
@@ -394,6 +395,61 @@ async def test_logs_contain_no_token_or_message_bodies() -> None:
     assert secret_text not in output
     assert "TEST-TOKEN-SECRET" not in output
     assert "super-secret-user-body" not in output
+
+
+async def test_application_routes_polling_message_to_opencode_and_back() -> None:
+    api = FakeTelegramApi(get_updates_scripts=[[_private_message(80, 42, 1, "hello")]])
+    transport = _fast_transport(api)
+    runtime = StubOpenCodeRuntime(
+        OpenCodeConfig(
+            base_url="http://127.0.0.1:4096",
+            command="opencode",
+            workdir=".",
+        )
+    )
+    app = Application(Settings.from_env({}), transport=transport, opencode_runtime=runtime)
+    await app.start()
+    try:
+        await _wait_for(lambda: len(api.sent_payloads) == 1)
+        assert api.sent_payloads[0]["chat_id"] == 42
+        assert api.sent_payloads[0]["text"] == "fake-reply-1"
+        assert app.sessions.session_count() == 1
+    finally:
+        await app.stop()
+
+
+async def test_application_new_command_resets_only_that_chat() -> None:
+    api = FakeTelegramApi(
+        get_updates_scripts=[
+            [
+                _private_message(90, 7, 1, "first"),
+                _private_message(91, 8, 1, "other"),
+                _private_message(92, 7, 2, "/new"),
+                _private_message(93, 7, 3, "second"),
+            ]
+        ]
+    )
+    transport = _fast_transport(api)
+    runtime = StubOpenCodeRuntime(
+        OpenCodeConfig(
+            base_url="http://127.0.0.1:4096",
+            command="opencode",
+            workdir=".",
+        )
+    )
+    app = Application(Settings.from_env({}), transport=transport, opencode_runtime=runtime)
+    await app.start()
+    try:
+        await _wait_for(lambda: len(api.sent_payloads) == 4)
+        replies = [payload["text"] for payload in api.sent_payloads]
+        assert replies[0] == "fake-reply-1"
+        assert replies[1] == "fake-reply-1"
+        assert "New conversation started" in replies[2]
+        # Chat 7 gets a fresh OpenCode session after /new.
+        assert replies[3] == "fake-reply-1"
+        assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)
+    finally:
+        await app.stop()
 
 
 def test_application_wires_polling_transport_when_token_present() -> None:
