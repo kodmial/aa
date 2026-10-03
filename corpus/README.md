@@ -65,6 +65,18 @@ python3 scripts/build_canonical.py
 Runtime context budgets for the retrieval system are documented in
 `docs/context-budget.md`.
 
+## Encrypted snapshot and restore (issue #24)
+
+The reproducible encrypted snapshot in `corpus/source/encrypted/` is the
+durable cross-run cache for this small corpus. Plaintext book text and
+plaintext retrieval indexes are never stored in Git or in GitHub Actions
+cache. `scripts/restore_canonical.py` is the single restore entry point:
+it reuses a valid `corpus/generated/canonical.json`, otherwise decrypts
+the committed snapshot with `AA_BOOK_AGE_IDENTITY`, otherwise falls back
+to the deterministic #3 fetch/build only when explicitly allowed, and
+fails closed otherwise. Production activation is deferred to #28. See
+`docs/encrypted-snapshot.md`.
+
 ## Derived artifacts
 
 Later stages may derive navigation and retrieval metadata without changing the
