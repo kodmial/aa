@@ -1,10 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "edition": "Alcoholics Anonymous, First Edition (1939)",
   "policy": {
     "raw_source_is_immutable": true,
-    "curation_mode": "deletion-only",
-    "paraphrase_allowed": false
+    "canonical_source_is_never_permanently_reduced": true,
+    "source_paraphrase_allowed": false,
+    "runtime_access": "hierarchical-agentic-rag"
   },
   "sources": [
     {
