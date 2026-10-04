@@ -189,24 +189,29 @@ def fit_passages(
     explicitly re-rank and re-request a smaller set; this function never
     truncates a passage and never silently drops trailing passages.
 
-    ``chars_per_token`` selects the estimator: canonical English evidence
-    uses the default, Russian text must pass ``RU_CHARS_PER_TOKEN``.
+    ``chars_per_token`` is retained for backward compatibility and only
+    tightens the budget: the effective estimate for each passage is
+    ``max(ceil(len / chars_per_token), estimate_text_tokens(passage))``,
+    so the default (English rate) can no longer undercount Russian or
+    mixed-language text. New callers should omit it and rely on the
+    language-aware :func:`estimate_text_tokens` ceiling.
     """
     if budget_tokens < 0:
         raise ValueError("budget_tokens must be >= 0")
     if chars_per_token <= 0:
         raise ValueError("chars_per_token must be > 0")
 
-    def estimate(char_count: int) -> int:
-        return -(-char_count // chars_per_token)
+    def estimate(passage: str) -> int:
+        legacy = -(-len(passage) // chars_per_token)
+        return max(legacy, estimate_text_tokens(passage))
 
     for index, passage in enumerate(passages):
-        if estimate(len(passage)) > budget_tokens:
+        if estimate(passage) > budget_tokens:
             raise TruncationRefusedError(
-                f"passage {index} needs {estimate(len(passage))} tokens "
+                f"passage {index} needs {estimate(passage)} tokens "
                 f"but the retrieved-passages budget is {budget_tokens}"
             )
-    total = sum(estimate(len(passage)) for passage in passages)
+    total = sum(estimate(passage) for passage in passages)
     if total > budget_tokens:
         raise TruncationRefusedError(
             f"{len(passages)} passages need {total} tokens "
