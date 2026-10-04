@@ -30,8 +30,17 @@ jobs:
         run: |
           test -f corpus/source/encrypted/recipient.txt
           grep -q '^age1' corpus/source/encrypted/recipient.txt
-      - name: Fetch Russian TXT source (#50 bootstrap)
-        run: python3 scripts/fetch_ru_source.py --bootstrap-from-provider
+      - name: Fetch Russian TXT source (#50 reuse-by-default)
+        # Reuse the pinned TXT without network; bootstrap from the provider
+        # only to provision a missing TXT (intentional requalification).
+        # Source drift still fails closed in build_canonical_ru.py via the
+        # manifest SHA check, so a drifted re-download never publishes.
+        run: |
+          if [ -f corpus/source/raw-ru/aa-big-book.txt ]; then
+            python3 scripts/fetch_ru_source.py
+          else
+            python3 scripts/fetch_ru_source.py --bootstrap-from-provider
+          fi
       - name: Build Russian canonical artifact (#50)
         run: python3 scripts/build_canonical_ru.py
       - name: Refresh Russian encrypted snapshot

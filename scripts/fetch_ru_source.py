@@ -314,6 +314,15 @@ def _reuse_existing() -> int:
 
 
 def _bootstrap() -> int:
+    # Preserve-bytes: never re-download over a trusted preserved TXT.
+    # Reuse it without network; intentional requalification deletes the
+    # file first and then bootstraps explicitly.
+    if RAW_TXT.exists():
+        return _fail(
+            "aa-big-book.txt already exists; refusing to overwrite preserved bytes "
+            "(run without --bootstrap-from-provider to reuse, or delete the file "
+            "for intentional requalification)"
+        )
     try:
         config = json.loads(LOCK.read_text(encoding="utf-8"))
     except FileNotFoundError:

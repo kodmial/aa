@@ -169,10 +169,14 @@ def _run_network_fallback(*, output: Path, manifest: Path, lang: str = "en") -> 
         return 1
     steps: list[list[str]] = []
     if lang == "ru":
-        steps = [
-            [sys.executable, str(fetch), "--bootstrap-from-provider"],
-            [sys.executable, str(build)],
-        ]
+        # Preserve-bytes/reuse semantics: never re-download over a trusted
+        # preserved TXT. Reuse it without network; bootstrap from the
+        # provider only to provision a missing TXT.
+        raw_txt = ROOT / "corpus" / "source" / "raw-ru" / "aa-big-book.txt"
+        fetch_step = [sys.executable, str(fetch)]
+        if not raw_txt.exists():
+            fetch_step = [sys.executable, str(fetch), "--bootstrap-from-provider"]
+        steps = [fetch_step, [sys.executable, str(build)]]
     else:
         steps = [[sys.executable, str(fetch)], [sys.executable, str(build)]]
     for step in steps:
@@ -306,6 +310,26 @@ def main(argv: list[str] | None = None) -> int:
         if snapshot_error is None:
             if not isinstance(metadata, dict) or metadata.get("canonical_sha256") != expected_sha:
                 snapshot_error = "snapshot metadata canonical SHA does not match the manifest"
+        if snapshot_error is None:
+            assert isinstance(metadata, dict)
+            version = metadata.get("metadata_version")
+            if version is not None and version not in (1, 2):
+                snapshot_error = f"unsupported snapshot metadata version: {version!r}"
+        if snapshot_error is None:
+            assert isinstance(metadata, dict)
+            member = metadata.get("canonical_member")
+            if member is not None and member != canonical_name:
+                snapshot_error = "snapshot metadata canonical member does not match language"
+        if snapshot_error is None:
+            assert isinstance(metadata, dict)
+            encrypted_file = metadata.get("encrypted_file")
+            if (
+                isinstance(encrypted_file, str)
+                and encrypted_file
+                and not encrypted_file.endswith(f"/{archive_name}")
+                and encrypted_file != archive_name
+            ):
+                snapshot_error = "snapshot metadata encrypted file does not match archive"
         encrypted: bytes | None = None
         if snapshot_error is None:
             try:
