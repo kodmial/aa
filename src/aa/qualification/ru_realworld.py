@@ -113,10 +113,12 @@ INPUT_FORBIDDEN_KEYS = frozenset(
         "audience",
         "book_relevance",
         "context_dependent",
+        "expected_emergency_categories",
         "expected_response_mode",
         "expected_route",
         "expected_safety_decision",
         "forbidden_inferences",
+        "perspective",
         "provenance_ids",
         "requests_exact_quote",
         "requires_context",
@@ -528,6 +530,11 @@ RELATIVE_JOURNEYS = frozenset(
     }
 )
 RELATIVE_TOPICS = frozenset({"relative_help", "partner_conflict"})
+# Kinship/partner terms only. Bare ``тайно`` ("secretly") is deliberately
+# excluded: secrecy alone carries no perspective evidence, and a
+# self-drinking utterance such as ``пью тайно`` must fall through to the
+# self/general rules below. Genuine relative cases are covered by the
+# topic/journey taxonomy above or by a kinship term alongside ``тайно``.
 RELATIVE_UTTERANCE_MARKERS = (
     "муж",
     "жена",
@@ -552,7 +559,6 @@ RELATIVE_UTTERANCE_MARKERS = (
     "семье",
     "семью",
     "семей",
-    "тайно",
 )
 SELF_UTTERANCE_MARKERS = (
     "мне",
@@ -1486,14 +1492,18 @@ def _check_audience_evidence(
 
     This validator is intentionally decoupled from the builder helper
     ``_audience_for`` (used by :func:`build_projections` to assign oracle
-    audiences). It does not call the builder, does not read the builder's
-    ``RELATIVE_*``/``SELF_*`` tables and does not reuse its first-person
-    helper: the audit tables below are separately maintained from the
-    reviewed topic/journey taxonomy and the frozen corpus review, and the
-    audit matcher is implemented locally with word-boundary handling. A
-    systematic builder misclassification of self vs relative/partner vs
-    general therefore cannot validate against itself; it surfaces here as a
-    stored-label contradiction.
+    audiences). It does not call the builder and does not reuse its
+    first-person helper: the audit taxonomy, evidence sets and matcher below
+    are separately maintained from the reviewed topic/journey taxonomy and
+    the frozen corpus review. Structurally the audit differs from the
+    builder: instead of recomputing a label with the builder's
+    relative-before-self priority, it checks the evidence required by the
+    *stored* label itself, and its relative evidence is restricted to
+    kinship/partner terms. A builder misclassification therefore surfaces
+    here as a stored-label contradiction instead of validating against
+    itself -- in particular, ``тайно`` ("secretly") is not relative
+    evidence, so a self-drinking utterance carrying only ``тайно`` cannot
+    pass as ``relative/partner``.
     """
     # Independently maintained audit taxonomy (reviewed assignments, not
     # builder references; keep in sync with the corpus review, never import
@@ -1509,6 +1519,9 @@ def _check_audience_evidence(
         }
     )
     audit_relative_topics = frozenset({"relative_help", "partner_conflict"})
+    # Strong relative evidence: kinship/partner terms only. ``тайно`` is
+    # excluded on purpose -- secrecy alone carries no perspective evidence,
+    # so it must never justify a stored ``relative/partner`` label.
     audit_relative_markers = (
         "муж",
         "жена",
@@ -1533,7 +1546,6 @@ def _check_audience_evidence(
         "семье",
         "семью",
         "семей",
-        "тайно",
     )
     audit_self_markers = (
         "мне",
@@ -1582,34 +1594,42 @@ def _check_audience_evidence(
             )
         return
     text = _audit_normalize(utterance)
-    has_relative = any(_audit_found(text, marker) for marker in audit_relative_markers)
+    has_strong_relative = any(_audit_found(text, marker) for marker in audit_relative_markers)
     has_self = re.compile(r"(?<!\w)я(?!\w)").search(text) is not None or any(
         _audit_found(text, marker) for marker in audit_self_markers
     )
-    if has_relative:
-        if audience != "relative/partner":
+    # Per-label evidence requirements (no builder-priority recomputation):
+    # each stored audience must carry its own evidence in the utterance.
+    if audience == "relative/partner":
+        if not has_strong_relative:
             raise RuRealWorldCorpusError(
-                f"{owner}: audience {audience!r} lacks relative/partner evidence "
-                "in the utterance despite a relative marker"
+                f"{owner}: audience 'relative/partner' has no kinship/partner "
+                "evidence in the utterance (secrecy alone does not qualify)"
             )
-    elif has_self:
-        if audience != "self":
+    elif audience == "self":
+        if not has_self:
             raise RuRealWorldCorpusError(
-                f"{owner}: audience {audience!r} contradicts self help-seeking "
+                f"{owner}: audience 'self' has no first-person help-seeking "
                 "evidence in the utterance"
             )
-    elif audience != "general":
-        raise RuRealWorldCorpusError(
-            f"{owner}: audience {audience!r} has no self or relative/partner "
-            "evidence in the utterance, expected 'general'"
-        )
+    elif audience == "general":
+        if has_strong_relative or has_self:
+            raise RuRealWorldCorpusError(
+                f"{owner}: audience 'general' contradicts self or relative/partner "
+                "evidence in the utterance"
+            )
+    else:
+        raise RuRealWorldCorpusError(f"{owner}: unknown audience {audience!r}")
 
 
 # Past-tense framing for the historical-discussion exemption. Ordinary
 # historical discussion must not become ``emergency`` merely by naming a
 # severe symptom: when an allow/block utterance carries a past marker and no
 # current-acute marker, the emergency-classifier guard is skipped (mirrors
-# the deterministic classifier's historical-without-acute rule).
+# the deterministic classifier's historical-without-acute rule). Recurrence
+# markers (``вчера``, ``опять``, ``снова``, ``теперь``, ``на днях``) count as
+# current-acute: past framing plus recent recurrence of severe-symptom
+# language must run the emergency-classifier guard, never bypass it.
 _HISTORICAL_MARK_RE = re.compile(
     r"назад|раньше|в\s+прошлом|тогда|давно|когда-то|в\s+молодости|в\s+детстве|"
     r"прошлый|в\s+прошлый\s+раз|много\s+лет\s+назад|years?\s+ago|in\s+the\s+past|"
@@ -1619,6 +1639,7 @@ _HISTORICAL_MARK_RE = re.compile(
 _HISTORICAL_ACUTE_MARK_RE = re.compile(
     r"прямо\s+сейчас|сейчас|сегодня|только\s+что|вдруг|внезапно|"
     r"минут\w*\s+назад|час\w*\s+назад|продолжается|до\s+сих\s+пор|"
+    r"вчера|опять|снова|теперь|на\s+днях|"
     r"в\s+данный\s+момент|right\s+now|\bnow\b|currently|suddenly|just\s+now|"
     r"\btoday\b|\btonight\b",
     re.IGNORECASE,
@@ -2305,6 +2326,11 @@ __all__ = [
     "EXPECTED_TOTAL_SUBSTANTIVE",
     "INPUT_REL",
     "INPUT_SCHEMA_VERSION",
+    "INPUT_SINGLE_KEYS",
+    "INPUT_JOURNEY_KEYS",
+    "INPUT_USER_TURN_KEYS",
+    "INPUT_CONTROL_TURN_KEYS",
+    "INPUT_FORBIDDEN_KEYS",
     "ORACLE_REL",
     "ORACLE_SCHEMA_VERSION",
     "ORACLE_SINGLE_KEYS",

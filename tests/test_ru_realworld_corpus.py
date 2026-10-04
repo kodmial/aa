@@ -178,24 +178,62 @@ def test_malformed_control_event_and_new_as_turn_fail() -> None:
 
 
 def test_input_oracle_separation_without_generator_leak() -> None:
+    from aa.qualification.ru_realworld import (
+        INPUT_CONTROL_TURN_KEYS,
+        INPUT_FORBIDDEN_KEYS,
+        INPUT_JOURNEY_KEYS,
+        INPUT_SINGLE_KEYS,
+        INPUT_USER_TURN_KEYS,
+    )
+
     root = _root()
     _, input_singles, input_journeys = load_input(root / INPUT_REL)
     _, oracle_singles, oracle_journeys = load_oracle(root / ORACLE_REL)
-    oracle_only = {
+    # Complete oracle-side boundary: every evaluation-only key plus legacy
+    # aliases must never appear in generator-visible input. The set is
+    # anchored on the module boundary (not a hand-picked subset) so a leak
+    # of audience/perspective, forbidden_inferences, safety_boundary_tags,
+    # requests_exact_quote, expected_emergency_categories or provenance
+    # details fails instead of passing silently.
+    oracle_only = set(INPUT_FORBIDDEN_KEYS) | {
+        "expected_answer",
+        "assistant_response",
+        "desired_response",
+        "ideal_answer",
+        "expected_emergency_categories",
+        "perspective",
+        "provenance",
+        "sources",
+    }
+    for required in (
+        "audience",
+        "perspective",
         "expected_safety_decision",
         "expected_response_mode",
+        "expected_emergency_categories",
         "topic",
         "provenance_ids",
         "rubric_tags",
         "book_relevance",
         "stage",
         "requires_context",
-    }
+        "requests_exact_quote",
+        "forbidden_inferences",
+        "safety_boundary_tags",
+    ):
+        assert required in oracle_only, f"leak check must cover {required!r}"
     for record in input_singles:
+        assert tuple(sorted(record.keys())) == tuple(sorted(INPUT_SINGLE_KEYS))
         assert not (set(record.keys()) & oracle_only)
         assert "expected_route" not in record
     for record in input_journeys:
+        assert tuple(sorted(record.keys())) == tuple(sorted(INPUT_JOURNEY_KEYS))
+        assert not (set(record.keys()) & oracle_only)
         for turn in record["turns"]:
+            if turn.get("kind") == "control":
+                assert tuple(sorted(turn.keys())) == tuple(sorted(INPUT_CONTROL_TURN_KEYS))
+            else:
+                assert tuple(sorted(turn.keys())) == tuple(sorted(INPUT_USER_TURN_KEYS))
             assert not (set(turn.keys()) & oracle_only)
             assert "expected_route" not in turn
     for record in oracle_singles:
