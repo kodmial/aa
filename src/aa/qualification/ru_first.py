@@ -476,7 +476,7 @@ def build_en_side(full_structure: dict[str, Any], *, workdir: Path) -> EnSide:
         ru_chunks = ru_branch.get("chunks")
         if not isinstance(en_chunks, list) or not en_chunks:
             raise RuFirstError(f"section {section_id!r} has no EN chunks")
-        if not isinstance(ru_chunks, list) or not isinstance(ru_chunks, list):
+        if not isinstance(ru_chunks, list) or not ru_chunks:
             raise RuFirstError(f"section {section_id!r} has no RU chunks")
         first_ru = ru_chunks[0]
         if isinstance(first_ru, dict):
@@ -571,10 +571,12 @@ def run_fixture_b(
     # Map EN discoveries back to RU sections; final evidence stays RU-only.
     added: list[str] = []
     seen_sections = set(ru_sections)
-    ordered_en = sorted(
-        {chunk_id for chunk_id, _ in en_ranked},
-        key=lambda cid: en_side.chunks_by_id.get(cid, {}).get("section", ""),
-    )
+    seen_en: set[str] = set()
+    ordered_en: list[str] = []
+    for chunk_id, _ in en_ranked:
+        if chunk_id not in seen_en:
+            seen_en.add(chunk_id)
+            ordered_en.append(chunk_id)
     for en_id in ordered_en:
         section = str(en_side.chunks_by_id.get(en_id, {}).get("section", ""))
         if not section or section in seen_sections:
@@ -585,7 +587,7 @@ def run_fixture_b(
             seen_sections.add(section)
         if len(added) >= en_extra:
             break
-    # Re-fuse: keep RU order first, then EN-mapped RU chunks in section order.
+    # Re-fuse: keep RU order first, then EN-mapped RU chunks in retrieval order.
     combined_ids = ru_ids + [item for item in added if item not in ru_ids]
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     # Re-resolve combined ids to hit-like section/logical lists.
@@ -642,10 +644,12 @@ def run_fixture_c(
         )
     # Control only: EN discovery mapped back to RU sections for scoring.
     # No RU lexical/dense branch runs here.
-    ordered = sorted(
-        {chunk_id for chunk_id, _ in en_ranked},
-        key=lambda cid: en_side.chunks_by_id.get(cid, {}).get("section", ""),
-    )
+    seen_en: set[str] = set()
+    ordered: list[str] = []
+    for chunk_id, _ in en_ranked:
+        if chunk_id not in seen_en:
+            seen_en.add(chunk_id)
+            ordered.append(chunk_id)
     ru_ids: list[str] = []
     for en_id in ordered:
         section = str(en_side.chunks_by_id.get(en_id, {}).get("section", ""))
@@ -779,27 +783,73 @@ def decide_production(
     *,
     results_a: list[FixtureResult],
     results_b: list[FixtureResult],
+    cases: list[GoldCase] | None = None,
+    relevant_by_case: dict[str, set[str]] | None = None,
+    gate_passed: bool | None = None,
+    **_extra: Any,
 ) -> tuple[str, str, float, int]:
     """Decide the production configuration and return details.
 
     Returns ``(production_config_id, rationale, incremental_recall, new_sections)``.
     EN secondary is enabled only on a material measured improvement that
     justifies latency/complexity; otherwise RU-only retrieval stays.
+    A failed RU-first quality gate yields a blocked production state so
+    gate failures are surfaced instead of silently shipping RU-only.
     """
     incremental = summary_b.recall_at_5 - summary_a.recall_at_5
-    by_a = {item.case_id: set(_relevant_hit_sections(item)) for item in results_a}
+    if relevant_by_case is None and cases is not None:
+        relevant_by_case = {case.case_id: set(case.relevant_sections) for case in cases}
+
+    def _filtered(item: FixtureResult) -> set[str]:
+        if relevant_by_case is None:
+            return set(_relevant_hit_sections(item))
+        return set(_relevant_hit_sections(item, relevant_by_case.get(item.case_id, set())))
+
+    by_a = {item.case_id: _filtered(item) for item in results_a}
     new_sections = 0
     for item in results_b:
         before = by_a.get(item.case_id, set())
-        after = set(_relevant_hit_sections(item))
+        after = _filtered(item)
         new_sections += len(after - before)
     latency_ratio = (
         (summary_b.mean_latency_ms / summary_a.mean_latency_ms)
         if summary_a.mean_latency_ms > 0
         else 1.0
     )
-    gate_ok = summary_a.recall_at_5 >= QUALITY_GATE_RECALL_AT_5
-    _ = gate_ok
+    if gate_passed is None:
+        for _alias in ("quality_gate_passed", "gate_ok", "passed"):
+            if _alias in _extra and isinstance(_extra[_alias], bool):
+                gate_passed = _extra[_alias]
+                break
+    if gate_passed is None:
+        gate_ok = summary_a.recall_at_5 >= QUALITY_GATE_RECALL_AT_5
+        gate_ok = gate_ok and (
+            summary_a.false_strengthening_count == QUALITY_GATE_MAX_FALSE_STRENGTHENING
+        )
+        if cases is not None:
+            slang_cases = [case for case in cases if case.is_slang]
+            if slang_cases:
+                slang_ids = {case.case_id for case in slang_cases}
+                slang_rows = [item for item in results_a if item.case_id in slang_ids]
+                if not slang_rows:
+                    gate_ok = False
+                else:
+                    slang_rate = sum(1 for item in slang_rows if item.recall_hit_at_5) / len(
+                        slang_rows
+                    )
+                    gate_ok = gate_ok and (slang_rate >= QUALITY_GATE_SLABG_PASS_RATE)
+        gate_passed = gate_ok
+    if not gate_passed:
+        return (
+            "blocked",
+            (
+                f"RU-first quality gate failed (recall@5 {summary_a.recall_at_5:.3f}); "
+                f"EN secondary adds {incremental:.3f} recall@5 and {new_sections} new "
+                f"relevant sections at {latency_ratio:.2f}x latency; blocking production."
+            ),
+            incremental,
+            new_sections,
+        )
     if (
         incremental >= EN_ENABLE_MIN_INCREMENTAL_RECALL_AT_5
         and new_sections >= EN_ENABLE_MIN_NEW_SECTIONS
@@ -825,11 +875,26 @@ def decide_production(
     )
 
 
-def _relevant_hit_sections(item: FixtureResult) -> list[str]:
-    return list(item.hit_sections)
+def _relevant_hit_sections(
+    item: FixtureResult,
+    relevant: set[str] | tuple[str, ...] | list[str] | None = None,
+    relevant_sections: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
+    if relevant is None:
+        relevant = relevant_sections
+    if relevant is None:
+        return list(item.hit_sections)
+    allowed = set(relevant)
+    return [section for section in item.hit_sections if section in allowed]
 
 
-def quality_gate(summary_a: ConfigSummary, cases: list[GoldCase]) -> tuple[bool, list[str]]:
+def quality_gate(
+    summary_a: ConfigSummary,
+    cases: list[GoldCase],
+    results_a: list[FixtureResult] | None = None,
+    results: list[FixtureResult] | None = None,
+    **_extra: Any,
+) -> tuple[bool, list[str]]:
     """Evaluate the RU-first quality gate; return (passed, failures)."""
     failures: list[str] = []
     if summary_a.recall_at_5 < QUALITY_GATE_RECALL_AT_5:
@@ -842,10 +907,28 @@ def quality_gate(summary_a: ConfigSummary, cases: list[GoldCase]) -> tuple[bool,
             f"exceeds {QUALITY_GATE_MAX_FALSE_STRENGTHENING}"
         )
     slang = [case for case in cases if case.is_slang]
-    # Slang pass is measured by the caller from per-fixture rows; here we
-    # only enforce that slang fixtures exist (rows are checked in tests).
     if not slang:
         failures.append("no slang fixtures in the gold set")
+        return (not failures, failures)
+    rows = results_a if results_a is not None else results
+    if rows is None:
+        for _alias in ("rows", "fixture_results", "results_b"):
+            _candidate = _extra.get(_alias)
+            if isinstance(_candidate, list):
+                rows = _candidate
+                break
+    if rows is None:
+        return (not failures, failures)
+    slang_ids = {case.case_id for case in slang}
+    slang_rows = [item for item in rows if item.case_id in slang_ids]
+    if not slang_rows:
+        failures.append("no slang fixture results to evaluate")
+        return (False, failures)
+    slang_pass = sum(1 for item in slang_rows if item.recall_hit_at_5) / len(slang_rows)
+    if slang_pass < QUALITY_GATE_SLABG_PASS_RATE:
+        failures.append(
+            f"slang pass rate {slang_pass:.3f} below gate {QUALITY_GATE_SLABG_PASS_RATE:.2f}"
+        )
     return (not failures, failures)
 
 
@@ -886,15 +969,20 @@ def build_decision_payload(
     bindings = read_bindings(repo_root)
     gold_path = repo_root / GOLD_REL
     gold_sha = sha256_file(gold_path)
-    production_id, rationale, incremental, new_sections = decide_production(
-        summary_a, summary_b, results_a=results_a, results_b=results_b
-    )
-    gate_passed, failures = quality_gate(summary_a, cases)
+    gate_passed, failures = quality_gate(summary_a, cases, results_a)
     slang_rows = [item for item in results_a if _case_is_slang(cases, item.case_id)]
     slang_pass = (
         sum(1 for item in slang_rows if item.recall_hit_at_5) / len(slang_rows)
         if slang_rows
         else 0.0
+    )
+    production_id, rationale, incremental, new_sections = decide_production(
+        summary_a,
+        summary_b,
+        results_a=results_a,
+        results_b=results_b,
+        cases=cases,
+        gate_passed=gate_passed,
     )
     return {
         "format": DECISION_FORMAT,
