@@ -354,8 +354,35 @@ def _non_empty_file(path: Path) -> bool:
         return False
 
 
+def _is_sha256_hex(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+    )
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Return the hex SHA-256 of ``path`` without loading it fully into memory."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def verify_gigaam_model(model_dir: str | Path, lock: dict[str, Any]) -> bool:
-    """Return True only when cached GigaAM files match the pinned lock."""
+    """Return True only when cached GigaAM files match the pinned lock.
+
+    Both files are hashed and compared against the digests recorded in
+    the sidecar marker (written after a verified provisioning). Any
+    truncation or bit-corruption after caching changes the digest and is
+    rejected so the prefetch flow can prune and re-download. Markers
+    without content digests (written by older code) never verify.
+    """
     gigaam = lock.get("gigaam")
     if not isinstance(gigaam, dict):
         return False
@@ -376,11 +403,29 @@ def verify_gigaam_model(model_dir: str | Path, lock: dict[str, Any]) -> bool:
         return False
     if marker.get("model_id") != gigaam.get("model_id"):
         return False
+    if marker.get("lock_sha256") != voice_lock_digest(lock):
+        return False
+    expected_model = marker.get("model_sha256")
+    expected_tokens = marker.get("tokens_sha256")
+    if not _is_sha256_hex(expected_model) or not _is_sha256_hex(expected_tokens):
+        return False
+    actual_model = _sha256_file(root / "model.int8.onnx")
+    if actual_model is None or actual_model.lower() != str(expected_model).lower():
+        return False
+    actual_tokens = _sha256_file(root / "tokens.txt")
+    if actual_tokens is None or actual_tokens.lower() != str(expected_tokens).lower():
+        return False
     return True
 
 
 def verify_tts_model(model_path: str | Path, lock: dict[str, Any]) -> bool:
-    """Return True only when the cached Silero file matches the pinned lock."""
+    """Return True only when the cached Silero file matches the pinned lock.
+
+    The file bytes are hashed and compared against the digest recorded
+    in the sidecar marker. Truncation or bit-corruption after caching is
+    rejected so the prefetch flow can prune and re-download. Markers
+    without a content digest never verify.
+    """
     silero = lock.get("silero")
     if not isinstance(silero, dict):
         return False
@@ -395,6 +440,14 @@ def verify_tts_model(model_path: str | Path, lock: dict[str, Any]) -> bool:
     if marker.get("model_id") != silero.get("model_id"):
         return False
     if marker.get("url") != silero.get("url"):
+        return False
+    if marker.get("lock_sha256") != voice_lock_digest(lock):
+        return False
+    expected = marker.get("sha256")
+    if not _is_sha256_hex(expected):
+        return False
+    actual = _sha256_file(path)
+    if actual is None or actual.lower() != str(expected).lower():
         return False
     return True
 
@@ -423,34 +476,51 @@ def verify_presentation_model(model_path: str | Path, lock: dict[str, Any]) -> b
         return False
     if str(marker.get("sha256")).lower() != expected.lower():
         return False
+    if marker.get("lock_sha256") != voice_lock_digest(lock):
+        return False
     return True
 
 
 def write_gigaam_marker(model_dir: str | Path, lock: dict[str, Any]) -> Path:
-    """Record the verified GigaAM revision next to the cached model files."""
+    """Record the verified GigaAM revision next to the cached model files.
+
+    The SHA-256 of each file is stored so later verification hashes the
+    bytes instead of trusting non-empty files with a matching marker.
+    """
     gigaam = lock["gigaam"]
     assert isinstance(gigaam, dict)
+    root = Path(model_dir)
+    model_digest = _sha256_file(root / "model.int8.onnx") or ""
+    tokens_digest = _sha256_file(root / "tokens.txt") or ""
     return _write_marker(
-        Path(model_dir),
+        root,
         {
             "family": "gigaam",
             "model_id": str(gigaam["model_id"]),
             "revision": str(gigaam["revision"]),
+            "model_sha256": model_digest.lower(),
+            "tokens_sha256": tokens_digest.lower(),
             "lock_sha256": voice_lock_digest(lock),
         },
     )
 
 
 def write_tts_marker(model_path: str | Path, lock: dict[str, Any]) -> Path:
-    """Record the verified Silero identity next to the cached model file."""
+    """Record the verified Silero identity next to the cached model file.
+
+    The file SHA-256 is stored so later verification hashes the bytes
+    instead of trusting any non-empty file with a matching marker.
+    """
     silero = lock["silero"]
     assert isinstance(silero, dict)
+    digest = _sha256_file(Path(model_path)) or ""
     return _write_marker(
         Path(model_path).parent,
         {
             "family": "silero",
             "model_id": str(silero["model_id"]),
             "url": str(silero["url"]),
+            "sha256": digest.lower(),
             "lock_sha256": voice_lock_digest(lock),
         },
     )

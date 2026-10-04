@@ -88,6 +88,7 @@ jobs:
 
       - name: Compute voice cache keys
         id: voice-cache-keys
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -99,19 +100,24 @@ jobs:
           # single source of truth. Speech dependency wheels reuse the #59
           # public pip cache above (pyproject.toml pins sherpa-onnx, torch
           # and onnxruntime); no second dependency cache is introduced.
+          # Key computation is non-fatal: any lock/key error behaves like
+          # a total cache miss so runtime startup is never blocked.
           echo "gigaam-dir=models/gigaam" >> "$GITHUB_OUTPUT"
           echo "tts-dir=models/tts" >> "$GITHUB_OUTPUT"
           echo "presentation-dir=models/voice-presentation" >> "$GITHUB_OUTPUT"
-          payload=$(python scripts/prefetch_voice_assets.py --print-keys \
+          if payload=$(python scripts/prefetch_voice_assets.py --print-keys \
             --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
-            --deps-hash "${{ hashFiles('pyproject.toml', 'corpus/voice.lock.json') }}")
-          echo "$payload"
-          gigaam=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['gigaam'])" "$payload")
-          silero=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['silero'])" "$payload")
-          presentation=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['presentation'])" "$payload")
-          echo "gigaam-key=$gigaam" >> "$GITHUB_OUTPUT"
-          echo "silero-key=$silero" >> "$GITHUB_OUTPUT"
-          echo "presentation-key=$presentation" >> "$GITHUB_OUTPUT"
+            --deps-hash "${{ hashFiles('pyproject.toml', 'corpus/voice.lock.json') }}"); then
+            echo "$payload"
+            gigaam=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['gigaam'])" "$payload")
+            silero=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['silero'])" "$payload")
+            presentation=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['presentation'])" "$payload")
+            echo "gigaam-key=$gigaam" >> "$GITHUB_OUTPUT"
+            echo "silero-key=$silero" >> "$GITHUB_OUTPUT"
+            echo "presentation-key=$presentation" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Voice cache key computation failed; continuing with a total miss."
+          fi
 
       - name: Restore public pip cache
         id: restore-public-pip
