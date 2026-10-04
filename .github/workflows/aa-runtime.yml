@@ -155,6 +155,37 @@ jobs:
           path: ${{ steps.public-cache-keys.outputs.model-dir }}
           key: ${{ steps.public-cache-keys.outputs.model-key }}
 
+      - name: Compute derived retrieval cache key
+        id: derived-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #58: exact content-addressed key for the encrypted derived
+          # retrieval bundle (schema + RU/EN canonical SHA + structure +
+          # #47 retrieval config + embedding lock + ABI + OS/arch). No branch,
+          # run id, timestamp, or hostname enters the key.
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          echo "derived-dir=$derived_dir" >> "$GITHUB_OUTPUT"
+          payload=$(python scripts/manage_derived_cache.py --mode print-key \
+            --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
+            --cache-dir "$derived_dir")
+          echo "$payload"
+          key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_key'])" "$payload")
+          fingerprint=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_fingerprint'])" "$payload")
+          echo "derived-key=$key" >> "$GITHUB_OUTPUT"
+          echo "derived-fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted derived retrieval cache
+        id: restore-derived
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # Exact key only: a stale or foreign bundle must miss safely and
+          # rebuild deterministically. No restore-keys fallback here.
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.derived-key }}
+          fail-on-cache-miss: false
+
       - name: Install pinned OpenCode
         shell: bash
         run: |
@@ -196,7 +227,11 @@ jobs:
             echo "::error::AA retrieval index builder is missing; issue #17 is not ready."
             exit 1
           }
-          python scripts/build_retrieval_index.py
+          # Issue #58: encrypted disposable derived retrieval cache.
+          # Exact lookup only; miss/stale/corrupt/unavailable transparently
+          # rebuilds from the canonical corpus. Disabled cache boots cleanly.
+          python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache"
 
           for tool in book_search book_read book_expand book_section; do
             [[ -f ".opencode/tools/${tool}.ts" ]] || {
@@ -210,6 +245,29 @@ jobs:
             exit 1
           }
           python scripts/verify_runtime_qualification.py
+
+      - name: Save encrypted derived retrieval cache
+        # Trusted save only: this workflow is workflow_dispatch-only, so
+        # low-trust pull-request workflows cannot poison the derived cache.
+        # Only the encrypted package + non-secret metadata enters the cache;
+        # plaintext corpus/index, secrets, and session state never do.
+        # Save failure is non-fatal; the runtime already started.
+        if: success() && steps.restore-derived.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/manage_derived_cache.py --mode save \
+            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache" || true
+
+      - name: Upload encrypted derived retrieval cache
+        if: success() && steps.restore-derived.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          # Exact content-addressed key only; no restore-keys fallback.
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.derived-key }}
 
       - name: Run bounded Telegram poller and OpenCode
         env:
