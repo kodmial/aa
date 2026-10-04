@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from aa.opencode.chat_model import HIDDEN_SESSION_TITLE, OpenCodeChatModel
 from aa.opencode.client import (
     ChatMessage,
     FakeOpenCodeClient,
@@ -33,9 +34,11 @@ from aa.opencode.runtime import (
 __all__ = [
     "ChatMessage",
     "FakeOpenCodeClient",
+    "HIDDEN_SESSION_TITLE",
     "HealthInfo",
     "HttpOpenCodeClient",
     "LocalOpenCodeRuntime",
+    "OpenCodeChatModel",
     "OpenCodeClient",
     "OpenCodeConfig",
     "OpenCodeDeterministicError",
