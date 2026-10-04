@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "language": "ru",
+  "edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+  "catalog": {
+    "title": "Russian Big Book",
+    "sku": "RUSSB-30",
+    "approval": "General Service Conference-approved",
+    "language": "Russian",
+    "binding": "softcover",
+    "note": "AAWS catalog lists 228 pages; the Russian imprint states 192 pages (Фонд «Единство», 2013). The ebook-program gap is why this text-native licensed path exists (issue #50)."
+  },
+  "rights": {
+    "basis": "Owner confirms permission for the Russian edition. No additional licensing approval is required for this implementation.",
+    "holder": "Alcoholics Anonymous World Services, Inc. (A.A.W.S.)",
+    "imprint": "Фонд «Единство», 2013",
+    "isbn": "978-5-906531-01-8",
+    "permission_line": "Издано с разрешения Alcoholics Anonymous World Services, Inc. (A.A.W.S.)",
+    "constraints": [
+      "private server-side retrieval/indexing only",
+      "bounded passage retrieval per request",
+      "no public redistribution of the source file",
+      "Russian-language AA support bot",
+      "immutable source storage with checksum/version controls"
+    ]
+  },
+  "provider": {
+    "group": "Группа АА «Контакт», Хельсинки",
+    "edition_root": "https://aarus.fi/read/bigbook/",
+    "note": "Text-native Russian Fourth Edition pages. The Conference-approved BigBook-4th.pdf linked by the same group is a verification/control source only; OCR is not the primary pipeline."
+  },
+  "policy": {
+    "raw_source_is_immutable": true,
+    "canonical_source_is_never_permanently_reduced": true,
+    "source_paraphrase_allowed": false,
+    "translation_substitution_allowed": false,
+    "runtime_access": "hierarchical-agentic-rag",
+    "primary_evidence_language_for_russian_users": "ru"
+  },
+  "sources": [
+    {
+      "id": "edition",
+      "section": "edition",
+      "url": "https://aarus.fi/read/bigbook/edition/",
+      "format": "text/html",
+      "covers": ["edition validation only"],
+      "raw_path": "corpus/source/raw-ru/edition.html",
+      "required": true
+    },
+    {
+      "id": "doctors-opinion",
+      "section": "nXXVII",
+      "url": "https://aarus.fi/read/bigbook/nXXVII/",
+      "format": "text/html",
+      "covers": ["Мнение доктора"],
+      "raw_path": "corpus/source/raw-ru/nXXVII.html",
+      "required": true
+    },
+    {
+      "id": "chapter-1",
+      "section": "n1",
+      "url": "https://aarus.fi/read/bigbook/n1/",
+      "format": "text/html",
+      "covers": ["Глава 1. Рассказ Билла"],
+      "raw_path": "corpus/source/raw-ru/n1.html",
+      "required": true
+    },
+    {
+      "id": "chapter-2",
+      "section": "n16",
+      "url": "https://aarus.fi/read/bigbook/n16/",
+      "format": "text/html",
+      "covers": ["Глава 2. Выход есть"],
+      "raw_path": "corpus/source/raw-ru/n16.html",
+      "required": true
+    },
+    {
+      "id": "chapter-3",
+      "section": "n29",
+      "url": "https://aarus.fi/read/bigbook/n29/",
+      "format": "text/html",
+      "covers": ["Глава 3. Еще об алкоголизме"],
+      "raw_path": "corpus/source/raw-ru/n29.html",
+      "required": true
+    },
+    {
+      "id": "chapter-4",
+      "section": "n43",
+      "url": "https://aarus.fi/read/bigbook/n43/",
+      "format": "text/html",
+      "covers": ["Глава 4. А как быть агностикам?"],
+      "raw_path": "corpus/source/raw-ru/n43.html",
+      "required": true
+    },
+    {
+      "id": "chapter-5",
+      "section": "n56",
+      "url": "https://aarus.fi/read/bigbook/n56/",
+      "format": "text/html",
+      "covers": ["Глава 5. Программа в действии"],
+      "raw_path": "corpus/source/raw-ru/n56.html",
+      "required": true
+    },
+    {
+      "id": "chapter-6",
+      "section": "n70",
+      "url": "https://aarus.fi/read/bigbook/n70/",
+      "format": "text/html",
+      "covers": ["Глава 6. За работу!"],
+      "raw_path": "corpus/source/raw-ru/n70.html",
+      "required": true
+    },
+    {
+      "id": "chapter-7",
+      "section": "n86",
+      "url": "https://aarus.fi/read/bigbook/n86/",
+      "format": "text/html",
+      "covers": ["Глава 7. Работая с другими"],
+      "raw_path": "corpus/source/raw-ru/n86.html",
+      "required": true
+    },
+    {
+      "id": "chapter-8",
+      "section": "n101",
+      "url": "https://aarus.fi/read/bigbook/n101/",
+      "format": "text/html",
+      "covers": ["Глава 8. Обращение к женам"],
+      "raw_path": "corpus/source/raw-ru/n101.html",
+      "required": true
+    },
+    {
+      "id": "chapter-9",
+      "section": "n118",
+      "url": "https://aarus.fi/read/bigbook/n118/",
+      "format": "text/html",
+      "covers": ["Глава 9. Новые отношения в семье"],
+      "raw_path": "corpus/source/raw-ru/n118.html",
+      "required": true
+    },
+    {
+      "id": "chapter-10",
+      "section": "n132",
+      "url": "https://aarus.fi/read/bigbook/n132/",
+      "format": "text/html",
+      "covers": ["Глава 10. Обращение к работодателям"],
+      "raw_path": "corpus/source/raw-ru/n132.html",
+      "required": true
+    },
+    {
+      "id": "chapter-11",
+      "section": "n147",
+      "url": "https://aarus.fi/read/bigbook/n147/",
+      "format": "text/html",
+      "covers": ["Глава 11. Заглянем в ваше будущее"],
+      "raw_path": "corpus/source/raw-ru/n147.html",
+      "required": true
+    }
+  ],
+  "control": {
+    "id": "bigbook-4th-pdf",
+    "note": "Conference-approved BigBook-4th.pdf linked by the same AA group (see https://aarus.fi/books/) is a verification/control source only. It is not fetched by the deterministic pipeline and OCR is never the primary path while the text-native source is available.",
+    "required": false
+  }
+}

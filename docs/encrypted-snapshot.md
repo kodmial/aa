@@ -19,6 +19,8 @@ Only the encrypted snapshot is committed:
 corpus/source/encrypted/
   canonical.tar.zst.age
   metadata.json
+  canonical.ru.tar.zst.age   # Russian (issue #50), same recipient
+  metadata.ru.json           # Russian (issue #50), same recipient
   recipient.txt
 ```
 
@@ -66,6 +68,13 @@ python3 scripts/age_provision.py \
 7. updates only the encrypted archive + non-secret metadata in Git;
 8. keeps logs free of plaintext corpus and private key material (only
    paths, sizes, and SHA-256 digests are logged).
+
+The Russian counterpart (issue #50,
+`.github/workflows/encrypted-corpus-refresh-ru.yml`) mirrors this flow
+with `fetch_ru_source.py` / `build_canonical_ru.py`,
+`corpus/canonical.ru.manifest.json`, and the independently versioned
+`canonical.ru.tar.zst.age` + `metadata.ru.json` pair encrypted to the same
+recipient. See `docs/russian-corpus.md`.
 
 ## Runtime restore
 

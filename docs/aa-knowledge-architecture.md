@@ -88,7 +88,13 @@ The map must fit the explicit context budget established by #3.
 
 ## Retrieval baseline
 
-The canonical text is English, while users may ask in Russian or English.
+The English canonical text covers Chapters 1-11 and The Doctor's Opinion,
+while users may ask in Russian or English. Issue #50 adds the Russian
+Fourth Edition canonical source (`corpus/generated/canonical.ru.json`,
+`docs/russian-corpus.md`) as the primary source/evidence language for
+Russian users; English remains a separately versioned control/reference
+corpus, and generated translation is never silently substituted for a
+source-exact Russian quotation.
 Cross-lingual retrieval is therefore mandatory.
 
 Issue #17 first implements and measures the simplest strong baseline:

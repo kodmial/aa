@@ -77,6 +77,40 @@ to the deterministic #3 fetch/build only when explicitly allowed, and
 fails closed otherwise. Production activation is deferred to #28. See
 `docs/encrypted-snapshot.md`.
 
+## Russian canonical source (issue #50)
+
+Russian canonical evidence is mandatory for production; the production bot
+must not depend on LLM translation of the English Big Book for normal
+Russian quotations or Russian-source retrieval.
+
+The Russian pipeline mirrors the English one with independently versioned
+artifacts encrypted to the same age recipient:
+
+- lock: `corpus/source.ru.lock.json` (Russian Fourth Edition,
+  SKU `RUSSB-30`, `Фонд «Единство», 2013`, ISBN `978-5-906531-01-8`,
+  owner-confirmed rights basis);
+- manifest: `corpus/canonical.ru.manifest.json` (pinned source/canonical
+  SHA-256);
+- fetch: `python3 scripts/fetch_ru_source.py` (text-native pages
+  `nXXVII` + `n1`/`n16`/`n29`/`n43`/`n56`/`n70`/`n86`/`n101`/`n118`/`n132`/`n147`,
+  edition-validated, raw HTML only under ignored `corpus/source/raw-ru/`);
+- build: `python3 scripts/build_canonical.py` is English-only;
+  `python3 scripts/build_canonical_ru.py` writes the ignored
+  `corpus/generated/canonical.ru.json` (Мнение доктора + Chapters 1-11,
+  Russian `html` fields only; English parallel text, alternative
+  renderings, and UI chrome are discarded);
+- refresh: same `scripts/refresh_encrypted_snapshot.py` with
+  `--archive-name canonical.ru.tar.zst.age --metadata-name metadata.ru.json
+  --canonical-name canonical.ru.json`, or the manually dispatched
+  `.github/workflows/encrypted-corpus-refresh-ru.yml` workflow;
+- restore: `python3 scripts/restore_canonical.py --lang ru` (once per
+  job/startup; never per message).
+
+The Conference-approved `BigBook-4th.pdf` linked by the same AA group is a
+verification/control source only; OCR is never the primary pipeline. See
+`docs/russian-corpus.md` and never silently substitute generated
+translation for a source-exact Russian quotation in production.
+
 ## Derived artifacts
 
 Later stages may derive navigation and retrieval metadata without changing the

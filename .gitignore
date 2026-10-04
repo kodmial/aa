@@ -6,7 +6,9 @@
 /node_modules/
 /.phpunit.cache/
 /corpus/source/raw/
+/corpus/source/raw-ru/
 /corpus/source/fetch-state.json
+/corpus/source/fetch-ru-state.json
 /corpus/generated/
 # Issue #24: never commit private age identities, plaintext snapshots, or
 # plaintext retrieval indexes. Only the encrypted snapshot
