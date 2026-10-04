@@ -277,6 +277,23 @@ def load_structure(path: str | Path) -> CorpusStructure:
             if nxt.section_id == node.section_id and node.char_end > nxt.char_start:
                 raise CorpusStructureError(f"node {node.id!r} overlaps its next neighbor")
 
+    # Bounds and reference integrity: offsets must lie inside their section
+    # and chunk membership lists must reference existing nodes.
+    section_bounds = {
+        entry["id"]: _require_int(entry, "char_end", str(entry.get("id")))
+        for entry in artifact["sections"]
+        if isinstance(entry, dict)
+    }
+    for node in nodes.values():
+        if node.kind in ("paragraph", "sentence", "chunk"):
+            limit = section_bounds.get(node.section_id)
+            if limit is None or not (0 <= node.char_start < node.char_end <= limit):
+                raise CorpusStructureError(f"node {node.id!r} has offsets outside its section")
+        if node.kind == "chunk":
+            for key in ("paragraph_ids", "sentence_ids"):
+                refs = node.raw.get(key)
+                if not isinstance(refs, list) or not refs or any(r not in nodes for r in refs):
+                    raise CorpusStructureError(f"node {node.id!r} has dangling {key}")
     # Provenance: every node pins the canonical version checksum.
     for node in nodes.values():
         if node.raw.get("canonical_artifact_sha256") != artifact_sha:

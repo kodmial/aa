@@ -150,7 +150,12 @@ def fail(message: str) -> int:
 
 def _is_abbreviation_split(left: str) -> bool:
     """Return True when the split point follows a known abbreviation."""
-    token = left.rstrip().rsplit(None, 1)[-1] if left.strip() else ""
+    stripped = left.rstrip()
+    if re.search(r"(?:[A-Za-z]\.){2,}[\"'\"'\u201d\u2019]?$", stripped):
+        return True
+    if re.search(r"\b[A-Z]\.[\"'\"'\u201d\u2019]?$", stripped):
+        return True
+    token = stripped.rsplit(None, 1)[-1] if stripped else ""
     while token and token[-1] in "\"'\"'\u201d\u2019])}.,:;":
         token = token[:-1]
     core = token[:-1] if token.endswith(".") else token
@@ -488,8 +493,8 @@ def build_structure(
                     sent_text = para.text[rel_start:rel_end]
                     if len(sent_text) > MAX_CHUNK_CHARS:
                         raise ValueError(f"{para_id}: single sentence exceeds MAX_CHUNK_CHARS")
-                    # +1 separator allowance inside the run mirrors the gap.
-                    add = len(sent_text) + (1 if run else 0)
+                    gap = rel_start - run[-1][1] if run else 0
+                    add = len(sent_text) + gap
                     if run and run_len + add > MAX_CHUNK_CHARS:
                         first = run[0]
                         last = run[-1]
