@@ -166,8 +166,9 @@ jobs:
         shell: bash
         run: |
           set +e
-          kill "$OPENCODE_PID" 2>/dev/null
-          wait "$OPENCODE_PID" 2>/dev/null
+          kill "$OPENCODE_PID" 2>/dev/null || true
+          wait "$OPENCODE_PID" 2>/dev/null || true
+          exit 0
 
       - name: Record canary summary
         if: always()
