@@ -68,6 +68,10 @@ class Settings:
 
     # Model/context/output limits where owned by the OpenCode runtime.
     # These are hints passed through to OpenCode, not a second LLM client.
+    # ``opencode_max_output_tokens`` is a bounded prompt-advertised
+    # generation budget (issue #83; default 256 when unset): the pinned
+    # OpenCode message API exposes no per-message max-tokens field, so the
+    # deterministic character validator stays authoritative.
     opencode_agent: str = DEFAULT_AA_AGENT
     opencode_model: str = DEFAULT_PRIMARY_MODEL
     opencode_fallback_model: str = DEFAULT_FALLBACK_MODEL

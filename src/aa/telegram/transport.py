@@ -34,6 +34,36 @@ DEFAULT_BASE_URL = "https://api.telegram.org"
 DEFAULT_POLL_TIMEOUT_SECONDS = 25
 DEFAULT_POLL_LIMIT = 100
 
+# Authoritative user-facing output envelope (issue #83). The transport is
+# the final defense-in-depth guard: it never splits overflow into multiple
+# messages and never logs response text (lengths/categories only).
+TELEGRAM_HARD_CHARS = 900
+TELEGRAM_HARD_WORDS = 130
+
+
+def _check_outbound_envelope(text: str) -> None:
+    """Fail closed when ``text`` exceeds the hard Telegram envelope.
+
+    Raises :class:`TelegramApiError` before any network I/O, without
+    including or logging the response text. Overflow is never split.
+    """
+    from aa.conversation.output_limits import check_envelope
+
+    result = check_envelope(text)
+    if result["passed"]:
+        return
+    logger.warning(
+        "telegram outbound envelope violation blocked",
+        extra={
+            "category": result["category"],
+            "graphemes": result["graphemes"],
+            "words": result["words"],
+            "quoted": result["quoted"],
+        },
+    )
+    raise TelegramApiError(f"telegram reply exceeds output envelope [{result['category']}]")
+
+
 SUPPORTED_COMMANDS: tuple[tuple[str, str], ...] = (
     ("start", "Start the bot"),
     ("new", "Start a new session"),
@@ -169,6 +199,7 @@ class StubTelegramTransport(TelegramTransport):
         self._running = False
 
     async def send(self, reply: TelegramReply) -> None:
+        _check_outbound_envelope(reply.text)
         self.sent.append(reply)
 
     @property
@@ -400,7 +431,13 @@ class PollingTelegramTransport(TelegramTransport):
         logger.info("telegram polling stopped")
 
     async def send(self, reply: TelegramReply) -> None:
-        """Deliver one reply via ``sendMessage`` with bounded retry."""
+        """Deliver one reply via ``sendMessage`` with bounded retry.
+
+        The #83 transport guard runs first: any ``text`` over the hard
+        envelope fails closed here (typed error, no network call, no
+        split into multiple messages, response text never logged).
+        """
+        _check_outbound_envelope(reply.text)
         payload: dict[str, Any] = {"chat_id": reply.chat_id, "text": reply.text}
         await self._call_with_retry("sendMessage", payload, max_retries=self._max_send_retries)
         self._sent.append(reply)

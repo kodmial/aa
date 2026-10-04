@@ -15,6 +15,11 @@ from aa.conversation.orchestrator import (
     is_substantive,
     run_trivial_turn,
 )
+from aa.conversation.output_limits import (
+    compact_text_to_envelope,
+    envelope_passes,
+    resolve_generation_budget,
+)
 from aa.corpus.context import CorpusContext
 from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
@@ -25,6 +30,7 @@ from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
     PollingTelegramTransport,
     StubTelegramTransport,
+    TelegramApiError,
     TelegramIncoming,
     TelegramReply,
     TelegramTransport,
@@ -179,7 +185,13 @@ class Application:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
 
     async def _handle_telegram_update(self, incoming: TelegramIncoming) -> None:
-        """Process one private text update and always emit a bounded reply."""
+        """Process one private text update and always emit a bounded reply.
+
+        Exactly one Telegram message is delivered per update: overflow is
+        never split into multiple messages. When the final transport guard
+        blocks an escaped overlong payload, a single bounded fallback is
+        delivered instead.
+        """
         self.sessions.record_message(incoming.chat_id)
         try:
             reply = await self.respond(incoming.chat_id, incoming.text)
@@ -191,7 +203,16 @@ class Application:
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
             reply = _TEMPORARY_ERROR_REPLY
-        await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+        try:
+            await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+        except TelegramApiError:
+            logger.warning(
+                "telegram outbound reply blocked by envelope guard",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+            )
+            await self.transport.send(
+                TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
+            )
 
     async def _send_grounded_message(self, session_id: str, text: str) -> str:
         """Send through the named AA agent with a technical model fallback only."""
@@ -252,6 +273,9 @@ class Application:
             agent=self.settings.opencode_agent,
             primary_model=self.settings.opencode_model,
             fallback_model=self.settings.opencode_fallback_model,
+            generation_budget_tokens=resolve_generation_budget(
+                self.settings.opencode_max_output_tokens
+            ),
         )
         if runner.index is not None:
             self._turn_runner = runner
@@ -320,6 +344,14 @@ class Application:
 
         Only message lengths and routing decisions are logged, never the
         message body.
+
+        Every returned reply is deterministically confined to the #83
+        hard Telegram envelope (``<= 900`` graphemes / ``<= 130`` words,
+        verbatim quote aggregate ``<= 300`` chars). The orchestrator owns
+        compact regeneration for grounded turns; this boundary applies a
+        final complete-unit compaction so emergency, trivial, grounded,
+        and fail-closed paths all satisfy the same cap. Replies are
+        returned as a single message; overflow is never split.
         """
         result, emergency_reply = self.safety.route(text)
         if result.decision is SafetyDecision.EMERGENCY and emergency_reply is not None:
@@ -327,7 +359,7 @@ class Application:
                 "emergency response served",
                 extra={"chat_id": chat_id, "reason": result.reason},
             )
-            return emergency_reply
+            return self._fit_envelope(emergency_reply)
         if result.decision is SafetyDecision.BLOCK:
             logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
@@ -352,7 +384,7 @@ class Application:
                     else:
                         raise
                 logger.info("trivial response served", extra={"chat_id": chat_id})
-                return trivial_reply
+                return self._fit_envelope(trivial_reply)
             try:
                 reply = await self._run_grounded_turn(session_id, text)
             except TurnFailed as exc:
@@ -403,7 +435,7 @@ class Application:
                     )
                     return FAIL_CLOSED_REPLY
                 logger.info("trivial response served", extra={"chat_id": chat_id})
-                return trivial_retry
+                return self._fit_envelope(trivial_retry)
             try:
                 reply = await self._run_grounded_turn(session_id, text)
             except TurnFailed as exc:
@@ -419,7 +451,22 @@ class Application:
                 )
                 return FAIL_CLOSED_REPLY
         logger.info("normal response served", extra={"chat_id": chat_id})
-        return reply
+        return self._fit_envelope(reply)
+
+    @staticmethod
+    def _fit_envelope(reply: str) -> str:
+        """Confine ``reply`` to the hard envelope (complete-unit safe).
+
+        The orchestrator already applies compact regeneration upstream;
+        this is the final deterministic guard so every path served here
+        satisfies the same cap. Only lengths are logged on compaction,
+        never message text.
+        """
+        if envelope_passes(reply):
+            return reply
+        compacted = compact_text_to_envelope(reply)
+        logger.info("application reply compacted to envelope")
+        return compacted
 
     async def __aenter__(self) -> Application:
         await self.start()
