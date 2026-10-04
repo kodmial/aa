@@ -18,6 +18,10 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: aa-runtime
+  cancel-in-progress: false
+
 jobs:
   runtime:
     runs-on: ubuntu-latest
@@ -109,11 +113,17 @@ jobs:
           done
 
       - name: Build and validate AA knowledge runtime
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_ALLOW_NETWORK_FETCH: "0"
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/fetch_aa_source.py
-          python scripts/build_canonical.py
+          # Production encrypted-snapshot path from #28 (issue #6 DoD):
+          # restore/validate the canonical artifact on a fresh runner and
+          # fail closed when the snapshot is missing. No silent fallback to
+          # the stale plaintext fetch/build path.
+          python scripts/restore_canonical.py
 
           [[ -f scripts/build_corpus_structure.py ]] || {
             echo "::error::AA hierarchy builder is missing; issue #8 is not ready."
