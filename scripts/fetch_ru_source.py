@@ -341,8 +341,12 @@ def _bootstrap() -> int:
             if canonical is None:
                 return _fail(f"lock has no section for provider page {provider_section!r}")
             sections.append((str(canonical["id"]), str(canonical["title"]), blocks))
-        if [sid for sid, _, _ in sections] != [f"chapter-{i}" if i > 0 else "" for i in range(0)]:
-            pass  # order is fixed by BOOTSTRAP_SECTIONS; validated below by the builder.
+        expected_ids = ["doctors-opinion"] + [f"chapter-{i}" for i in range(1, 12)]
+        if [sid for sid, _, _ in sections] != expected_ids:
+            raise ValueError(
+                "assembled sections are not exactly "
+                f"doctors-opinion + chapters 1-11: {[sid for sid, _, _ in sections]!r}"
+            )
         assembled = assemble_txt(edition_text=edition_text, sections=sections)
     except (RuntimeError, ValueError) as exc:
         return _fail(str(exc))
