@@ -1,0 +1,859 @@
+name: AA conversation eval
+
+# Reusable exact-main Russian conversation benchmark harness (#72).
+# Evaluation infrastructure only: this workflow executes the frozen #61
+# corpus against the transport-independent production turn boundary
+# (safety gating + session coordination + planner/retrieval/evidence/
+# synthesis/grounding behind the OpenCode runtime). It never sends bulk
+# cases through the public Telegram Bot API and never routes #62 through
+# the ordinary issue-scheduler OpenCode implementation.
+# Canonical #62 marker carries result=complete|incomplete|stale.
+
+on:
+  workflow_dispatch:
+    inputs:
+      exact_sha:
+        description: "Exact main SHA to evaluate (defaults to current #40 PASS SHA)"
+        required: false
+        type: string
+      shard_count:
+        description: "Deterministic shard count (1-8, default 4)"
+        required: false
+        type: string
+      max_parallel:
+        description: "Bounded parallelism (default 2, max 4)"
+        required: false
+        type: string
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: aa-conversation-eval
+  cancel-in-progress: false
+
+env:
+  EVAL_SHARD_COUNT: "4"
+  EVAL_MAX_PARALLEL: "2"
+
+jobs:
+  # Lightweight readiness gate (read-only). Every automatic wake-up re-fetches
+  # #40/#61/#72 and no-ops unless all are closed/current. Closing #72 is
+  # sufficient to trigger the first authoritative run when #40 already
+  # passed before #72 merged.
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      exact_sha: ${{ steps.gate.outputs.exact_sha }}
+      corpus_sha: ${{ steps.gate.outputs.corpus_sha }}
+      reason: ${{ steps.gate.outputs.reason }}
+      shard_count: ${{ steps.gate.outputs.shard_count }}
+      shard_matrix: ${{ steps.gate.outputs.shard_matrix }}
+    steps:
+      - name: Re-fetch prerequisite tracker state (#40/#61/#72) and decide
+        id: gate
+        env:
+          INPUT_SHARD_COUNT: ${{ inputs.shard_count }}
+          VARS_SHARD_COUNT: ${{ vars.EVAL_SHARD_COUNT }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // Resolve the deterministic shard count from the dispatch input
+            // first, then the repo variable, then the default. The shard
+            // matrix below is derived from this single value so runner
+            // sharding can never diverge from executed shards.
+            function resolveShardCount() {
+              const raw = (process.env.INPUT_SHARD_COUNT || process.env.VARS_SHARD_COUNT || '4').trim();
+              const n = Number.parseInt(raw, 10);
+              if (!Number.isInteger(n) || n < 1 || n > 8) return 0;
+              return n;
+            }
+            function setShardOutputs(n) {
+              core.setOutput('shard_count', String(n));
+              core.setOutput('shard_matrix', JSON.stringify(Array.from({ length: n }, (_, i) => i)));
+            }
+            const eventName = context.eventName;
+            // Manual dispatch satisfies the same exact-main/current-PASS
+            // contract as automatic runs: fetch the current trusted #40 PASS
+            // SHA, require the requested SHA (or default) to equal it, and
+            // resolve the frozen corpus checksum. Arbitrary SHAs never proceed.
+            if (eventName === 'workflow_dispatch') {
+              const n = resolveShardCount();
+              if (!n) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: invalid shard_count (must be 1-8)');
+                setShardOutputs(4);
+                return;
+              }
+              const requested = ((context.payload.inputs && context.payload.inputs.exact_sha) || '').trim();
+              // Manual dispatches enforce the same closed prerequisites as
+              // automatic runs: #40/#61/#72 must all be closed/current.
+              async function getDispatchIssue(num) {
+                const { data } = await github.rest.issues.get({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: num,
+                });
+                return data;
+              }
+              const [d40, d61, d72] = await Promise.all([
+                getDispatchIssue(40), getDispatchIssue(61), getDispatchIssue(72),
+              ]);
+              if (d61.state !== 'closed') {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
+                core.notice('aa-conversation-eval no-op: #61 not closed (manual dispatch).');
+                setShardOutputs(n);
+                return;
+              }
+              if (d72.state !== 'closed') {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: #72 harness is not merged/closed');
+                core.notice('aa-conversation-eval no-op: #72 not closed (manual dispatch).');
+                setShardOutputs(n);
+                return;
+              }
+              if (d40.state !== 'closed') {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
+                core.notice('aa-conversation-eval no-op: #40 not closed (manual dispatch).');
+                setShardOutputs(n);
+                return;
+              }
+              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+              let passShaDispatch = '';
+              for await (const { data: comments } of github.paginate.iterator(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+              )) {
+                for (const c of comments) {
+                  const assocDispatch = c.author_association || '';
+                  const isTrustedDispatch = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assocDispatch);
+                  if (!isTrustedDispatch) continue;
+                  const m = (c.body || '').match(markerReDispatch);
+                  if (m) {
+                    if (m[2] === 'pass') passShaDispatch = m[1];
+                    else passShaDispatch = '';
+                  }
+                }
+              }
+              if (!passShaDispatch) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
+                core.notice('aa-conversation-eval no-op: no #40 PASS SHA for manual dispatch.');
+                setShardOutputs(n);
+                return;
+              }
+              const exactShaDispatch = requested || passShaDispatch;
+              if (exactShaDispatch !== passShaDispatch) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: manual exact_sha is not the current trusted #40 PASS SHA');
+                core.notice('aa-conversation-eval no-op: manual SHA is not current #40 PASS.');
+                setShardOutputs(n);
+                return;
+              }
+              let corpusShaDispatch = '';
+              try {
+                const { data: content } = await github.rest.repos.getContent({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: 'qualification/ru_realworld_alcohol_help.v1_1.input.jsonl',
+                  ref: passShaDispatch,
+                });
+                const raw = Buffer.from(content.content, 'base64');
+                corpusShaDispatch = require('crypto').createHash('sha256').update(raw).digest('hex');
+              } catch (error) {
+                core.warning(`could not hash frozen corpus at ${passShaDispatch}: ${error.message}`);
+              }
+              if (!/^[0-9a-f]{64}$/.test(corpusShaDispatch)) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: frozen corpus checksum unavailable at PASS SHA');
+                core.notice('aa-conversation-eval no-op: corpus checksum missing.');
+                setShardOutputs(n);
+                return;
+              }
+              // Idempotency: manual dispatches enforce the same #62 COMPLETE
+              // check as automatic runs so an already-COMPLETE SHA+corpus
+              // tuple never runs twice.
+              const evalReDispatch = /aa-conversation-eval-result\s+issue=62\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+result=(complete|incomplete|stale)\s+run=(\S+)/;
+              for await (const { data: comments } of github.paginate.iterator(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, per_page: 100 },
+              )) {
+                for (const c of comments) {
+                  const assoc62d = c.author_association || '';
+                  const isTrusted62d = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc62d);
+                  if (!isTrusted62d) continue;
+                  const m = (c.body || '').match(evalReDispatch);
+                  if (m && m[3] === 'complete' && m[1] === passShaDispatch && m[2] === corpusShaDispatch) {
+                    core.setOutput('proceed', 'false');
+                    core.setOutput('exact_sha', '');
+                    core.setOutput('corpus_sha', '');
+                    core.setOutput('reason', `no-op: exact SHA+corpus tuple already verified COMPLETE on #62 (sha=${passShaDispatch})`);
+                    core.notice('aa-conversation-eval no-op: tuple already verified COMPLETE (manual dispatch).');
+                    setShardOutputs(n);
+                    return;
+                  }
+                }
+              }
+              core.setOutput('proceed', 'true');
+              core.setOutput('exact_sha', passShaDispatch);
+              core.setOutput('corpus_sha', corpusShaDispatch);
+              core.setOutput('reason', `ready: manual dispatch validated against current #40 PASS sha=${passShaDispatch}`);
+              setShardOutputs(n);
+              return;
+            }
+            // Automatic wake-ups only react to prerequisite tracker closures.
+            const issueNumber = context.payload.issue ? context.payload.issue.number : 0;
+            if (eventName !== 'issues' || ![40, 61, 72].includes(issueNumber)) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', `no-op: wake-up is not a #40/#61/#72 closure (issue ${issueNumber})`);
+              core.notice('aa-conversation-eval no-op: unrelated issue event.');
+              setShardOutputs(4);
+              return;
+            }
+            async function getIssue(n) {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+              });
+              return data;
+            }
+            const [i40, i61, i72] = await Promise.all([getIssue(40), getIssue(61), getIssue(72)]);
+            // Every automatic wake-up must re-fetch #40/#61/#72 and no-op
+            // unless all are closed/current.
+            if (i61.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
+              core.notice('aa-conversation-eval no-op: #61 not closed.');
+              setShardOutputs(4);
+              return;
+            }
+            if (i72.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #72 harness is not merged/closed');
+              core.notice('aa-conversation-eval no-op: #72 not closed.');
+              setShardOutputs(4);
+              return;
+            }
+            if (i40.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
+              core.notice('aa-conversation-eval no-op: #40 not closed.');
+              setShardOutputs(4);
+              return;
+            }
+            // Find the latest trusted #40 PASS marker for the exact SHA.
+            // A later FAIL supersedes any earlier PASS, so a FAIL clears the
+            // recorded passSha instead of leaving a stale PASS current.
+            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            let passSha = '';
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc = c.author_association || '';
+                const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+                if (!isTrusted) continue;
+                const m = (c.body || '').match(markerRe);
+                if (m) {
+                  if (m[2] === 'pass') passSha = m[1];
+                  else passSha = '';
+                }
+              }
+            }
+            if (!passSha) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
+              core.notice('aa-conversation-eval no-op: no #40 PASS SHA.');
+              setShardOutputs(4);
+              return;
+            }
+            // Idempotency: if the same exact SHA + corpus checksum already
+            // has a verified COMPLETE result on #62, no-op (any matching
+            // tuple, not just the latest marker, so an earlier COMPLETE for
+            // the current tuple is never missed when a newer tuple exists).
+            const evalRe = /aa-conversation-eval-result\s+issue=62\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+result=(complete|incomplete|stale)\s+run=(\S+)/;
+            // Resolve the current frozen corpus checksum at the PASS SHA
+            // first so idempotency compares the current tuple (not a stale
+            // marker corpus) and the published marker carries the frozen
+            // checksum.
+            const shardCount = resolveShardCount();
+            if (!shardCount) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: invalid shard_count (must be 1-8)');
+              setShardOutputs(4);
+              return;
+            }
+            let corpusSha = '';
+            try {
+              const { data: content } = await github.rest.repos.getContent({
+                owner: context.repo.owner, repo: context.repo.repo,
+                path: 'qualification/ru_realworld_alcohol_help.v1_1.input.jsonl',
+                ref: passSha,
+              });
+              const raw = Buffer.from(content.content, 'base64');
+              corpusSha = require('crypto').createHash('sha256').update(raw).digest('hex');
+            } catch (error) {
+              core.warning(`could not hash frozen corpus at ${passSha}: ${error.message}`);
+            }
+            // Fail closed: without the frozen corpus checksum no COMPLETE
+            // result may be published (preserves exactly-once idempotency and
+            // the required corpus identity in the #62 marker).
+            if (!/^[0-9a-f]{64}$/.test(corpusSha)) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: frozen corpus checksum unavailable at PASS SHA');
+              core.notice('aa-conversation-eval no-op: corpus checksum missing.');
+              setShardOutputs(shardCount);
+              return;
+            }
+            let alreadyComplete = false;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc62 = c.author_association || '';
+                const isTrusted62 = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc62);
+                if (!isTrusted62) continue;
+                const m = (c.body || '').match(evalRe);
+                if (m && m[3] === 'complete' && m[1] === passSha && m[2] === corpusSha) { alreadyComplete = true; break; }
+              }
+              if (alreadyComplete) break;
+            }
+            if (alreadyComplete) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', `no-op: exact SHA+corpus tuple already verified COMPLETE on #62 (sha=${passSha})`);
+              core.notice('aa-conversation-eval no-op: tuple already verified COMPLETE.');
+              setShardOutputs(shardCount);
+              return;
+            }
+            core.setOutput('proceed', 'true');
+            core.setOutput('exact_sha', passSha);
+            core.setOutput('corpus_sha', corpusSha);
+            core.setOutput('reason', `ready: #40 PASS sha=${passSha}; closing #72 triggers first run; later #40 cycles rerun exactly once per SHA+corpus tuple`);
+            core.notice(`aa-conversation-eval ready at exact SHA ${passSha}.`);
+            setShardOutputs(shardCount);
+
+  # Validate the frozen #61 schema/checksums and the current #40 PASS SHA,
+  # then check out and verify that exact SHA before any execution.
+  validate:
+    needs: readiness
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Check out and verify exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checked-out SHA equals trusted #40 PASS SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ needs.readiness.outputs.exact_sha }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
+          echo "exact-main checkout verified: $(git rev-parse HEAD)"
+      - name: Verify exact SHA is current trusted #40 PASS SHA with corpus checksum
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const exactSha = '${{ needs.readiness.outputs.exact_sha }}';
+            const corpusSha = '${{ needs.readiness.outputs.corpus_sha }}';
+            if (!/^[0-9a-f]{40}$/.test(exactSha)) {
+              core.setFailed(`exact SHA is not a valid 40-hex SHA: ${exactSha}`);
+              return;
+            }
+            if (!/^[0-9a-f]{64}$/.test(corpusSha)) {
+              core.setFailed('corpus_sha is not a valid 64-hex frozen corpus checksum; refusing unqualified run');
+              return;
+            }
+            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            let passSha = '';
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assocValidate = c.author_association || '';
+                const isTrustedValidate = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assocValidate);
+                if (!isTrustedValidate) continue;
+                const m = (c.body || '').match(trustedRe);
+                if (m) {
+                  if (m[2] === 'pass') passSha = m[1];
+                  else passSha = '';
+                }
+              }
+            }
+            if (!passSha) {
+              core.setFailed('no current trusted #40 PASS SHA; refusing run');
+              return;
+            }
+            if (exactSha !== passSha) {
+              core.setFailed(`exact SHA ${exactSha} is not the current trusted #40 PASS SHA ${passSha}`);
+              return;
+            }
+            core.notice(`exact SHA verified as current trusted #40 PASS with corpus ${corpusSha.slice(0, 16)}…`);
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Validate frozen #61 schema and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_ru_realworld_corpus.py
+          python scripts/validate_ru_realworld_corpus.py
+      - name: Validate harness contract without running the benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_conversation_eval.py tests/test_conversation_eval_workflow.py
+
+  # Deterministic shards: each multi-turn journey stays atomic in one shard;
+  # single-turn cases shard deterministically by stable ID. Each shard emits
+  # a privacy-safe manifest plus its already compressed + age-encrypted
+  # response/transcript bundle. Plaintext bundles are never uploaded.
+  # Bounded parallelism: matrix max-parallel 2 (conservative default).
+  shards:
+    needs: [readiness, validate]
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        # Derived from the single resolved shard count (dispatch input, then
+        # repo variable, then default) so runner sharding always matches
+        # executed shards for any supported shard count 1-8.
+        shard-index: ${{ fromJson(needs.readiness.outputs.shard_matrix || '[0,1,2,3]') }}
+    steps:
+      - name: Check out exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha }}
+          fetch-depth: 0
+      - name: Verify exact SHA before shard execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e "."
+      - name: Run deterministic shard (production turn boundary, no Telegram transport)
+        env:
+          AA_EVAL_RECIPIENT: ${{ secrets.AA_EVAL_AGE_RECIPIENT }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          OPENCODE_FALLBACK_MODEL: ${{ vars.OPENCODE_FALLBACK_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AA_EVAL_RECIPIENT"
+          python scripts/run_conversation_eval.py \
+            --shard-index "${{ matrix.shard-index }}" \
+            --shard-count "${{ needs.readiness.outputs.shard_count }}" \
+            --max-parallel 2 \
+            --out-dir eval-out \
+            --recipient "$AA_EVAL_RECIPIENT" \
+            --main-sha "${{ needs.readiness.outputs.exact_sha }}"
+          # Successful shards are resumable only when exact SHA + corpus
+          # checksum + runtime config + model config all match (enforced by
+          # the harness is_resumable check in the merge job).
+      - name: Upload already-encrypted shard bundle (never plaintext)
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-shard-${{ matrix.shard-index }}-encrypted
+          path: |
+            eval-out/shard-${{ matrix.shard-index }}.tar.zst.age
+            eval-out/shard-${{ matrix.shard-index }}-manifest.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # Merge/validate completeness, encrypt/upload the full result, publish the
+  # compact manifest outside main, and post the canonical #62 marker.
+  # Main is revalidated at publication time: a moved main yields stale.
+  merge-publish:
+    needs: [readiness, validate, shards]
+    if: always() && needs.readiness.outputs.proceed == 'true' && needs.validate.result == 'success' && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    steps:
+      - name: Check out exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha }}
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e "."
+      - name: Download encrypted shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: eval-shard-*-encrypted
+          merge-multiple: true
+          path: eval-in
+      - name: Merge shards, validate completeness, build encrypted result
+        id: merge
+        env:
+          AA_EVAL_RECIPIENT: ${{ secrets.AA_EVAL_AGE_RECIPIENT }}
+          EXACT_SHA: ${{ needs.readiness.outputs.exact_sha }}
+          SHARD_COUNT: ${{ needs.readiness.outputs.shard_count }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from aa.qualification.conversation_eval import (
+              ConversationEvalError,
+              EvalIdentity,
+              ShardManifest,
+              build_compact_manifest,
+              collect_eval_identity,
+              compress_and_encrypt,
+              corpus_checksums,
+              expected_case_ids,
+              is_resumable,
+              load_generator_views,
+              merge_manifests,
+              summarize_run,
+          )
+
+          exact_sha = os.environ["EXACT_SHA"]
+          shard_count = int(os.environ["SHARD_COUNT"])
+          recipient = os.environ["AA_EVAL_RECIPIENT"]
+          out_dir = Path("eval-out")
+          out_dir.mkdir(exist_ok=True)
+
+          result = "complete"
+          reason = "all shards merged"
+          bundle_sha = ""
+          try:
+              raw = [
+                  json.loads(Path(p).read_text(encoding="utf-8"))
+                  for p in sorted(glob.glob("eval-in/shard-*-manifest.json"))
+              ]
+              if len(raw) != shard_count:
+                  raise ConversationEvalError(
+                      f"expected {shard_count} shard manifests, found {len(raw)}"
+                  )
+              manifests = [
+                  ShardManifest(
+                      shard_index=int(m["shard_index"]),
+                      shard_count=int(m["shard_count"]),
+                      case_ids=tuple(m["case_ids"]),
+                      turn_rows=tuple(m["turn_rows"]),
+                      bundle_sha256=str(m["bundle_sha256"]),
+                      eval_identity=dict(m["eval_identity"]),
+                  )
+                  for m in raw
+              ]
+              # Completeness: merge rejects missing/duplicate/unexpected case
+              # ids against the full frozen corpus (expected size enforced).
+              singles, journeys = load_generator_views()
+              merged = merge_manifests(
+                  manifests, expected_case_ids=expected_case_ids(singles, journeys)
+              )
+              # Resumability tuple: shards must agree with each other and pin
+              # the exact SHA plus the frozen corpus checksums under test.
+              base_identity = manifests[0].eval_identity
+              for other in manifests[1:]:
+                  if not is_resumable(base_identity, other.eval_identity):
+                      raise ConversationEvalError("shard eval-identity drift across shards")
+              if base_identity.get("main_sha") != exact_sha:
+                  raise ConversationEvalError("shard identity main_sha is not the exact SHA")
+              frozen = corpus_checksums()
+              if base_identity.get("corpus_input_sha256") != frozen["input"]:
+                  raise ConversationEvalError("shard corpus input checksum is stale")
+              if base_identity.get("corpus_oracle_sha256") != frozen["oracle"]:
+                  raise ConversationEvalError("shard corpus oracle checksum is stale")
+              # Provider/infrastructure outcomes are segmented, never quality:
+              # any turn that did not cleanly complete on the primary model
+              # (including fallback-used) makes the run INCOMPLETE, not failed.
+              rows = list(merged["turn_rows"])
+              summary = summarize_run(rows)
+              unclean = [
+                  r for r in rows if str(r.get("error_category", "ok")) != "ok"
+              ]
+              if unclean or summary["completed_turns"] != summary["total_turns"]:
+                  result = "incomplete"
+                  reason = (
+                      f"{len(unclean)} unclean turn(s), "
+                      f"{summary['completed_turns']}/{summary['total_turns']} clean"
+                  )
+              # Merged encrypted result: privacy-safe compact manifest,
+              # compressed + age-encrypted with a recorded checksum. The
+              # per-shard encrypted transcript bundles are preserved alongside
+              # this merged payload in the 90-day full artifact so full
+              # transcript durability never depends on 30-day shard artifacts.
+              # The plaintext compact manifest is also written for publication
+              # to the qualification-results branch keyed by SHA+corpus+run.
+              identity = EvalIdentity(
+                  main_sha=str(base_identity["main_sha"]),
+                  corpus_input_sha256=str(base_identity["corpus_input_sha256"]),
+                  corpus_oracle_sha256=str(base_identity["corpus_oracle_sha256"]),
+                  runtime_version=str(base_identity["runtime_version"]),
+                  prompt_version=str(base_identity["prompt_version"]),
+                  retrieval_version=str(base_identity["retrieval_version"]),
+                  index_version=str(base_identity["index_version"]),
+                  primary_model=str(base_identity["primary_model"]),
+                  fallback_model=str(base_identity["fallback_model"]),
+              )
+              compact = build_compact_manifest(
+                  eval_identity=identity,
+                  shard_manifests=sorted(manifests, key=lambda m: m.shard_index),
+                  run_id=str(os.environ.get("GITHUB_RUN_ID", "0")),
+                  result=result,
+              )
+              payload = json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")
+              encrypted = compress_and_encrypt(payload, recipient=recipient)
+              bundle_sha = hashlib.sha256(encrypted).hexdigest()
+              (out_dir / "aa-conversation-eval-full.tar.zst.age").write_bytes(encrypted)
+              (out_dir / "aa-conversation-eval-full.tar.zst.age.sha256").write_text(
+                  bundle_sha + "\n", encoding="utf-8"
+              )
+              (out_dir / "aa-conversation-eval-compact.json").write_text(
+                  json.dumps(compact, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              print(f"merged {len(manifests)} shards covering {len(merged['case_ids'])} cases")
+          except ConversationEvalError as exc:
+              result = "incomplete"
+              reason = str(exc)
+              print(f"merge incomplete: {reason}")
+          except Exception as exc:  # noqa: BLE001 -- any other merge failure
+              # Missing/invalid manifest JSON, missing keys, encryption
+              # failures, etc. must still produce GITHUB_OUTPUT + the #62
+              # canonical marker instead of aborting before evidence.
+              result = "incomplete"
+              reason = f"{type(exc).__name__}: {exc}"
+              print(f"merge incomplete: {reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"result={result}\n")
+              handle.write(f"bundle_sha256={bundle_sha}\n")
+              handle.write(f"reason={reason}\n")
+          PY
+          ls eval-in
+      - name: Upload full compressed + age-encrypted transcript bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-conversation-eval-full-encrypted
+          path: |
+            eval-out/aa-conversation-eval-full.tar.zst.age
+            eval-out/aa-conversation-eval-full.tar.zst.age.sha256
+            eval-out/aa-conversation-eval-compact.json
+            eval-in/shard-*.tar.zst.age
+            eval-in/shard-*-manifest.json
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Revalidate main at publication time and publish results
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const testedSha = '${{ needs.readiness.outputs.exact_sha }}';
+            // Main is revalidated at publication time; a moved main cannot
+            // produce a current COMPLETE result (stale instead).
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+            });
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const currentMain = mainRef.object.sha;
+            const mergeResult = '${{ steps.merge.outputs.result }}' || 'incomplete';
+            let result = mergeResult;
+            if (currentMain !== testedSha) result = 'stale';
+            // Revalidate the current trusted #40 PASS marker at publication
+            // time: a FAIL superseding the PASS after shards start must not
+            // still publish COMPLETE.
+            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            let passShaPublish = '';
+            for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 })) {
+              for (const c of comments) {
+                const assocP = c.author_association || '';
+                const isTrustedP = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assocP);
+                if (!isTrustedP) continue;
+                const m = (c.body || '').match(trustedRePublish);
+                if (m) { if (m[2] === 'pass') passShaPublish = m[1]; else passShaPublish = ''; }
+              }
+            }
+            if (passShaPublish !== testedSha && result === 'complete') result = 'stale';
+            // Fail closed on corpus identity: without a 64-hex frozen corpus
+            // checksum no COMPLETE result may be published, preserving
+            // exactly-once detection on the SHA+corpus tuple.
+            const rawCorpus = '${{ needs.readiness.outputs.corpus_sha }}';
+            const corpusOk = /^[0-9a-f]{64}$/.test(rawCorpus);
+            if (!corpusOk && result === 'complete') result = 'incomplete';
+            const corpus = corpusOk ? rawCorpus : '0'.repeat(64);
+            // Compact non-sensitive manifest/summary persisted outside
+            // production main (dedicated qualification-results branch), keyed
+            // by exact main SHA + corpus checksum + run ID. Benchmark outputs
+            // never mutate production main.
+            const runId = `${context.runId}`;
+            const manifestPath = `aa-conversation-eval/sha=${testedSha}/corpus=${corpus}/run=${runId}/compact-manifest.json`;
+            try {
+              const fs = require('fs');
+              if (!fs.existsSync('eval-out/aa-conversation-eval-compact.json')) {
+                core.warning('compact manifest file missing; skipping qualification-results publication');
+              } else {
+                const compactText = fs.readFileSync('eval-out/aa-conversation-eval-compact.json', 'utf8');
+                const branch = 'qualification-results';
+                try {
+                  await github.rest.repos.getBranch({
+                    owner: context.repo.owner, repo: context.repo.repo, branch,
+                  });
+                } catch (branchError) {
+                  if (branchError.status === 404) {
+                    await github.rest.git.createRef({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      ref: `refs/heads/${branch}`, sha: currentMain,
+                    });
+                    core.notice(`created ${branch} branch from main ${currentMain}`);
+                  } else {
+                    throw branchError;
+                  }
+                }
+                let existingSha;
+                try {
+                  const { data: existing } = await github.rest.repos.getContent({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    path: manifestPath, ref: branch,
+                  });
+                  if (!Array.isArray(existing) && existing.sha) existingSha = existing.sha;
+                } catch (contentError) {
+                  if (contentError.status !== 404) throw contentError;
+                }
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: manifestPath,
+                  message: `aa-conversation-eval manifest sha=${testedSha} corpus=${corpus.slice(0, 16)} run=${runId} result=${result}`,
+                  content: Buffer.from(compactText, 'utf8').toString('base64'),
+                  branch,
+                  ...(existingSha ? { sha: existingSha } : {}),
+                });
+                core.notice(`compact manifest persisted to ${branch}/${manifestPath}`);
+              }
+            } catch (publishError) {
+              core.warning(`could not persist compact manifest to qualification-results: ${publishError.message}`);
+            }
+            core.notice(`publication decision: result=${result} tested=${testedSha} main=${currentMain}`);
+            const marker = `<!-- aa-conversation-eval-result issue=62 sha=${testedSha} corpus=${corpus} result=${result} run=${runId} -->`;
+            const body = result === 'complete'
+              ? `${marker}\n\nAuthoritative benchmark harness run is COMPLETE. Full transcript is the compressed + age-encrypted workflow artifact above (checksum recorded). Compact manifest is on the qualification-results branch keyed by SHA+corpus+run. Answer quality grading is owned by #63.`
+              : result === 'stale'
+                ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #62 stays open for a fresh #40-qualified SHA.`
+                : `${marker}\n\nBenchmark run is INCOMPLETE: required cases could not be completed (provider/infrastructure failures are segmented, not quality failures; fallback output never counts as primary). #62 stays open.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, body,
+            });
+            if (result === 'complete') {
+              // On COMPLETE, close #62 so #63 can proceed.
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, state: 'closed',
+                state_reason: 'completed',
+              });
+              // After a verified COMPLETE result, explicitly workflow_dispatch
+              // the evaluator workflow from #73 when it exists. Do not rely
+              // on the #62 issue-close event (a close with GITHUB_TOKEN is
+              // not a reliable workflow trigger).
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  workflow_id: 'aa-answer-quality-eval.yml', ref: 'main',
+                  inputs: { benchmark_run_id: `${context.runId}`, benchmark_sha: testedSha },
+                });
+                core.notice('dispatched aa-answer-quality-eval.yml for the verified COMPLETE tuple.');
+              } catch (error) {
+                core.warning(`evaluator workflow from #73 not dispatched (may not exist yet): ${error.message}`);
+              }
+            } else {
+              // On INCOMPLETE or stale, leave #62 open and record why.
+              // If a newer exact-main #40 PASS needs a fresh run, reopen #62.
+              try {
+                const { data: i62 } = await github.rest.issues.get({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: 62,
+                });
+                if (i62.state === 'closed' && result !== 'complete') {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, state: 'open',
+                  });
+                }
+              } catch (error) {
+                core.warning(`could not ensure #62 open state: ${error.message}`);
+              }
+            }
