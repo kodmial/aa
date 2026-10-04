@@ -152,7 +152,7 @@ jobs:
       opencode_workflow_name: "${{ inputs.opencode_workflow_name }}"
       opencode_workflow_path: "${{ inputs.opencode_workflow_path }}"
       dispatch_ref: "${{ inputs.dispatch_ref }}"
-      opencode_dispatch: "${{ inputs.opencode_dispatch }}"
+      opencode_dispatch: "${{ inputs.opencode_dispatch || 'workflow' }}"
       execution_label_routes: "${{ inputs.execution_label_routes }}"
       child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
       count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip || 'false' }}"
