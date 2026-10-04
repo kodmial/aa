@@ -59,6 +59,7 @@ from aa.telegram.tts import (
     TtsPipeline,
     build_tts_pipeline,
     resolve_tts_voice,
+    voice_for_presentation,
 )
 from aa.telegram.voice import (
     FfmpegDecoder,
@@ -67,6 +68,10 @@ from aa.telegram.voice import (
     VoicePipeline,
     build_pipeline,
     voice_error_reply,
+)
+from aa.telegram.voice_presentation import (
+    PresentationError,
+    VoicePresentationClassifier,
 )
 
 logger = logging.getLogger("aa.app")
@@ -93,6 +98,7 @@ class Application:
         grounding: GroundingGate | None = None,
         voice_pipeline: VoicePipeline | None = None,
         tts_pipeline: TtsPipeline | None = None,
+        presentation_classifier: VoicePresentationClassifier | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
@@ -132,6 +138,20 @@ class Application:
         # reused. ``None`` means voice replies fall back to text; the
         # text poller is unaffected.
         self._tts_pipeline: TtsPipeline | None = tts_pipeline
+        # Ephemeral acoustic routing (issue #78): loaded once per worker.
+        # ``None`` (or any classifier error) deterministically defaults to
+        # ``xenia``. The result lives only in a per-turn local variable,
+        # never in sessions/history/profiles/logs.
+        self._presentation_classifier: VoicePresentationClassifier | None = presentation_classifier
+        if (
+            self._presentation_classifier is not None
+            and self._voice_pipeline is not None
+            and getattr(self._voice_pipeline, "presentation_classifier", None) is None
+        ):
+            try:
+                self._voice_pipeline.presentation_classifier = self._presentation_classifier
+            except Exception:
+                pass
         self._running = False
         # Transport/orchestration only: the dispatcher calls the production
         # #9 turn orchestrator via ``respond`` and never creates another
@@ -197,8 +217,49 @@ class Application:
             fetcher=_TransportFetcher(),
             decoder=FfmpegDecoder(),
             recognizer=recognizer,
+            presentation_classifier=self._presentation_classifier,
         )
         logger.info("voice capability ready", extra={"injected": False})
+
+    async def _init_presentation_capability(self) -> None:
+        """Load the pinned presentation classifier once; default to xenia on error."""
+        if self._presentation_classifier is not None:
+            logger.info("presentation capability ready", extra={"injected": True})
+            self._attach_presentation_classifier()
+            return
+        if not isinstance(self.transport, PollingTelegramTransport):
+            logger.info("presentation capability disabled without polling transport")
+            return
+        if not self.settings.telegram_bot_token:
+            logger.info("presentation capability disabled without bot token")
+            return
+        try:
+            classifier = VoicePresentationClassifier(
+                Path(self.settings.aa_voice_presentation_model_path)
+            )
+            await asyncio.to_thread(classifier.ensure_loaded)
+        except PresentationError as exc:
+            logger.warning("presentation capability disabled", extra={"category": exc.category})
+            return
+        except Exception:
+            logger.warning(
+                "presentation capability disabled", extra={"category": "model-unavailable"}
+            )
+            return
+        self._presentation_classifier = classifier
+        self._attach_presentation_classifier()
+        logger.info("presentation capability ready", extra={"injected": False})
+
+    def _attach_presentation_classifier(self) -> None:
+        """Attach the classifier to the voice pipeline without persisting turns."""
+        pipeline = self._voice_pipeline
+        if pipeline is None or self._presentation_classifier is None:
+            return
+        try:
+            if getattr(pipeline, "presentation_classifier", None) is None:
+                pipeline.presentation_classifier = self._presentation_classifier
+        except Exception:
+            pass
 
     async def _init_tts_capability(self) -> None:
         """Load the pinned Silero synthesizer once; fallback to text on error."""
@@ -247,7 +308,9 @@ class Application:
             await self.dispatcher.start()
             # Voice capability loads once here and is reused for all turns.
             # Initialization failure disables voice only, never the poller.
+            await self._init_presentation_capability()
             await self._init_voice_capability()
+            self._attach_presentation_classifier()
             # TTS capability loads once here and is reused for voice replies.
             # Initialization failure falls back to text, never the poller.
             await self._init_tts_capability()
@@ -399,7 +462,10 @@ class Application:
         used by text messages, marked ``voice_input=True``. Any
         download/decode/ASR failure sends one short Russian text error to
         that user and leaves the poller alive. Temporary audio files are
-        removed by the pipeline in ``finally``.
+        removed by the pipeline in ``finally``. Acoustic presentation is
+        classified ephemerally from the already-decoded audio for
+        opposite-voice TTS routing only; it is never logged, persisted,
+        or exposed to the user.
         """
         attachment = incoming.voice
         if attachment is None:
@@ -413,11 +479,22 @@ class Application:
             await self._send_text_reply(incoming, voice_error_reply("voice-disabled"))
             return
         try:
-            transcript = await pipeline.transcribe_voice(
-                file_id=attachment.file_id,
-                file_size_bytes=attachment.file_size_bytes,
-                duration_seconds=attachment.duration_seconds,
+            transcribe_with_presentation = getattr(
+                pipeline, "transcribe_voice_with_presentation", None
             )
+            if callable(transcribe_with_presentation):
+                transcript, presentation = await transcribe_with_presentation(
+                    file_id=attachment.file_id,
+                    file_size_bytes=attachment.file_size_bytes,
+                    duration_seconds=attachment.duration_seconds,
+                )
+            else:
+                transcript = await pipeline.transcribe_voice(
+                    file_id=attachment.file_id,
+                    file_size_bytes=attachment.file_size_bytes,
+                    duration_seconds=attachment.duration_seconds,
+                )
+                presentation = "unknown"
         except VoiceError as exc:
             logger.warning(
                 "voice turn failed",
@@ -440,10 +517,18 @@ class Application:
             )
             await self._send_text_reply(incoming, voice_error_reply("voice-failed"))
             return
-        await self._respond_and_deliver(incoming, text=transcript, voice_input=True)
+        # Ephemeral only: a per-turn local, never stored in sessions/history.
+        await self._respond_and_deliver(
+            incoming, text=transcript, voice_input=True, voice_presentation=presentation
+        )
 
     async def _respond_and_deliver(
-        self, incoming: TelegramIncoming, *, text: str, voice_input: bool
+        self,
+        incoming: TelegramIncoming,
+        *,
+        text: str,
+        voice_input: bool,
+        voice_presentation: str | None = None,
     ) -> None:
         """Run :meth:`respond` for one turn and deliver exactly one reply.
 
@@ -451,7 +536,9 @@ class Application:
         already-generated answer is synthesized locally and delivered via
         ``sendVoice``. Any TTS/encoding/delivery failure deterministically
         falls back to the same answer as text; the response is never
-        dropped. Text turns always receive text output.
+        dropped. Text turns always receive text output. ``voice_presentation``
+        is an ephemeral acoustic routing signal for the current turn only
+        (never persisted); ``None``/``unknown``/error defaults to ``xenia``.
         """
         self.sessions.record_message(incoming.chat_id)
         try:
@@ -476,32 +563,44 @@ class Application:
             )
             reply = _TEMPORARY_ERROR_REPLY
         if voice_input:
-            delivered = await self._send_voice_reply(incoming, reply)
+            delivered = await self._send_voice_reply(
+                incoming, reply, voice_presentation=voice_presentation
+            )
             if delivered:
                 return
         await self._send_text_reply(incoming, reply)
 
-    def _resolve_voice_for_turn(self) -> str:
-        """Resolve the TTS voice for one turn (issue #77 default).
+    def _resolve_voice_for_turn(self, presentation: str | None = None) -> str:
+        """Resolve the TTS voice for one turn (issue #78 opposite-voice rule).
 
-        Issue #78 will provide acoustic presentation routing; until then
-        every turn deterministically uses the default voice. Only
-        ``xenia``/``eugene`` are ever returned.
+        ``male-presenting`` -> ``xenia``, ``female-presenting`` ->
+        ``eugene``, and ``unknown``/``None``/error -> ``xenia``. Only
+        ``xenia``/``eugene`` are ever returned. The presentation is an
+        ephemeral acoustic signal for the current turn only and is never
+        logged, persisted, or exposed to the user.
         """
-        return resolve_tts_voice(None)
+        voice = voice_for_presentation(presentation)
+        return resolve_tts_voice(voice)
 
-    async def _send_voice_reply(self, incoming: TelegramIncoming, reply: str) -> bool:
+    async def _send_voice_reply(
+        self,
+        incoming: TelegramIncoming,
+        reply: str,
+        *,
+        voice_presentation: str | None = None,
+    ) -> bool:
         """Synthesize and deliver one voice reply; ``False`` means fallback.
 
         Returns ``True`` when the voice was delivered via ``sendVoice``.
         Any TTS, encoding, or delivery failure logs only categories/sizes
         and returns ``False`` so the caller sends the same answer as text.
+        The presentation routing signal is ephemeral and never logged.
         """
         pipeline = self._tts_pipeline
         if pipeline is None or not self.tts_available:
             logger.info("voice reply fallback to text", extra={"chat_id": incoming.chat_id})
             return False
-        voice = self._resolve_voice_for_turn()
+        voice = self._resolve_voice_for_turn(voice_presentation)
         if voice not in (DEFAULT_VOICE, "eugene"):
             voice = DEFAULT_VOICE
         try:
