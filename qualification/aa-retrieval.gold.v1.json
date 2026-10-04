@@ -649,7 +649,7 @@
       "language": "ru",
       "plan_queries_ru": [
         "как создавалась книга история",
-        "история создания книги фиктивна",
+        "история создания книги повествование",
         "рассказ Билла история поворота"
       ],
       "planner_meaning": "question about the history of the book",
@@ -1151,16 +1151,16 @@
       "is_unsupported": false,
       "language": "ru",
       "plan_queries_ru": [
-        "начальник недоволен боюсь увольнения",
+        "на работе напряжённо тревожно за место",
         "рабочий конфликт страх увольнения",
-        "обращение к работодателям"
+        "на работе проблемы боюсь потерять место"
       ],
       "planner_meaning": "implicit workplace concern about dismissal",
       "relevant_sections": [
         "chapter-10"
       ],
       "requires_context": false,
-      "utterance": "начальник недоволен, боюсь увольнения"
+      "utterance": "на работе напряжённо, тревожно за своё место"
     },
     {
       "allowed_interpretations": [

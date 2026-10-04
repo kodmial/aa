@@ -1135,10 +1135,13 @@ def build_artifact_payload(
             "max_per_section": MAX_PER_SECTION,
             "chunk_max_chars": 1500,
             "embedding_backend": "hashing-char-token/1",
+            "production_validated": False,
+            "hermetic_only": True,
             "note": (
                 "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; "
                 "production e5 uses the pinned lock. Chunking groups whole sentences "
-                "within one paragraph up to 1500 chars."
+                "within one paragraph up to 1500 chars. Hermetic-only: recall/latency "
+                "are not production validation for intfloat/multilingual-e5-base."
             ),
         },
         "tool_config": {
@@ -1275,6 +1278,14 @@ def validate_artifact_payload(payload: object, *, repo_root: Path) -> None:
         raise AaRetrievalError("artifact must carry retrieval metrics")
     if float(retrieval.get("recall_at_5", 0.0)) < RECALL_GATE_AT_5:
         raise AaRetrievalError("artifact recall@5 is below the 0.95 gate")
+    if float(retrieval.get("coverage", 0.0)) < COVERAGE_GATE:
+        raise AaRetrievalError("artifact coverage is below the gate")
+    if float(retrieval.get("source_support_success_rate", 0.0)) < SUPPORT_GATE:
+        raise AaRetrievalError("artifact support success is below the gate")
+    if float(retrieval.get("duplicate_rate", 1.0)) > MAX_DUPLICATE_RATE:
+        raise AaRetrievalError("artifact duplicate rate exceeds the gate")
+    if int(retrieval.get("false_strengthening_count", 1)) != 0:
+        raise AaRetrievalError("artifact false strengthening must be 0")
     for key in ("stale_index", "fidelity", "en_control"):
         if key not in payload:
             raise AaRetrievalError(f"artifact is missing {key!r}")
