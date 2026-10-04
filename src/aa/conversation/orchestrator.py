@@ -605,7 +605,7 @@ def search_first_round(index: HybridIndex, plan: QueryPlan) -> dict[str, list[Re
     """Run RU-first whole-corpus search for every planned aspect."""
     try:
         return search_plan(index, plan)
-    except ValueError as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         raise TurnFailed("retrieval-failed", str(exc)) from exc
 
 
