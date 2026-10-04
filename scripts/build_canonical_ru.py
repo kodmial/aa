@@ -45,6 +45,14 @@ MANIFEST_FORMAT = "aa-canonical-manifest-ru/1"
 
 RAW_PATH = "corpus/source/raw-ru/aa-big-book.txt"
 SOURCE_ID = "ru-fourth-edition-txt"
+# Stable per-section provenance for the single-TXT source (issue #50): every
+# section shares the pinned edition-page URL from
+# ``corpus/source.ru.lock.json`` (``sources[0].url``), exactly as the English
+# builder shares one source URL across chapters from a single raw file.
+# Per-section binding additionally comes from ``source_id``/``source_file``,
+# ``char_start``/``char_end`` offsets, and ``text_sha256``; the URL must
+# never be empty.
+SOURCE_URL = "https://aarus.fi/read/bigbook/edition/"
 
 IDENTITY_MARKERS = (
     "АНОНИМНЫЕ АЛКОГОЛИКИ",
@@ -322,6 +330,7 @@ def build_artifact(
                 "id": section_id,
                 "title": item["title"],
                 "source_id": SOURCE_ID,
+                "source_url": SOURCE_URL,
                 "source_file": RAW_PATH,
                 "source_sha256": digest,
                 "char_start": item["char_start"],

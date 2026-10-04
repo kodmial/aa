@@ -138,19 +138,15 @@ def load_canonical(
             raise CanonicalCorpusError("canonical artifact has an empty section text")
         if _digest(text.encode("utf-8")) != entry.get("text_sha256"):
             raise CanonicalCorpusError(f"canonical section checksum mismatch: {entry.get('id')!r}")
-        for key in ("id", "title", "source_id", "source_file"):
+        for key in ("id", "title", "source_id", "source_url", "source_file"):
             if not isinstance(entry.get(key), str) or not entry.get(key):
                 raise CanonicalCorpusError(f"canonical section is missing {key}")
-        source_url = entry.get("source_url")
-        if expected_format == ARTIFACT_FORMAT:
-            if not isinstance(source_url, str) or not source_url:
-                raise CanonicalCorpusError("canonical section is missing source_url")
         sections.append(
             CanonicalSection(
                 id=str(entry["id"]),
                 title=str(entry["title"]),
                 source_id=str(entry["source_id"]),
-                source_url=str(source_url) if isinstance(source_url, str) else "",
+                source_url=str(entry["source_url"]),
                 source_file=str(entry["source_file"]),
                 text=text,
             )
