@@ -167,7 +167,15 @@ def _run_network_fallback(*, output: Path, manifest: Path, lang: str = "en") -> 
             file=sys.stderr,
         )
         return 1
-    for step in ([sys.executable, str(fetch)], [sys.executable, str(build)]):
+    steps: list[list[str]] = []
+    if lang == "ru":
+        steps = [
+            [sys.executable, str(fetch), "--bootstrap-from-provider"],
+            [sys.executable, str(build)],
+        ]
+    else:
+        steps = [[sys.executable, str(fetch)], [sys.executable, str(build)]]
+    for step in steps:
         proc = subprocess.run(step, capture_output=True, text=True, cwd=ROOT)  # noqa: S603
         if proc.returncode != 0:
             step_name = Path(step[1]).name
