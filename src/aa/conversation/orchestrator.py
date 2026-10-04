@@ -31,6 +31,25 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from aa.conversation.output_limits import (
+    ENVELOPE_FALLBACK_REPLY,
+    HARD_CHARS,
+    HARD_WORDS,
+    MAX_COMPACT_REGENERATIONS,
+    QUOTE_BUDGET_CHARS,
+    TARGET_CHARS,
+    TARGET_WORDS,
+    aggregate_quote_chars,
+    compact_retry_instruction,
+    compact_text_to_envelope,
+    count_graphemes,
+    count_words,
+    envelope_passes,
+    generation_budget_instruction,
+    is_bulk_reproduction_request,
+    is_continuation_request,
+    resolve_generation_budget,
+)
 from aa.corpus.budget import RETRIEVED_PASSAGES_BUDGET_TOKENS, estimate_text_tokens
 from aa.grounding.gate import EntailmentFn, check_grounding, default_entails
 from aa.grounding.quotes import (
@@ -885,13 +904,25 @@ def fit_evidence_budget(pack: EvidencePack, *, budget_tokens: int) -> EvidencePa
     )
 
 
-def build_synthesis_prompt(*, user_text: str, pack: EvidencePack, repair: str = "") -> str:
+def build_synthesis_prompt(
+    *, user_text: str, pack: EvidencePack, repair: str = "", generation_budget_tokens: int = 0
+) -> str:
     """Build the synthesis prompt sent to the named ``aa`` agent.
 
     The prompt carries the validated evidence pack with pinned provenance
     and requires citations per claim. Planner/search metadata is never
     included. The caller must never log the returned prompt.
+
+    The prompt also carries the concise output policy (#83): short
+    conversational answers, the ordinary target, the hard envelope, and
+    the anti-corpus-dump rule. ``generation_budget_tokens`` is an
+    efficiency hint only (``0`` selects the conservative default); the
+    deterministic character validator stays authoritative.
     """
+    try:
+        budget = resolve_generation_budget(generation_budget_tokens)
+    except ValueError:
+        budget = resolve_generation_budget(0)
     lines: list[str] = [
         "Ответь по-русски, используя ТОЛЬКО приведённые ниже точные отрывки.",
         "Каждое существенное утверждение снабди цитатой-ссылкой вида [source/section#chunk].",
@@ -899,15 +930,34 @@ def build_synthesis_prompt(*, user_text: str, pack: EvidencePack, repair: str = 
         "Если отрывки не подтверждают просьбу, так и скажи и предложи только близкий",
         "подтверждённый материал. Не выдумывай факты и цитаты.",
         "",
-        "ТОЧНЫЕ ОТРЫВКИ:",
+        "ФОРМАТ ОТВЕТА (обязательно): отвечай кратко, как в переписке, "
+        "обычно 2-5 коротких предложений. Обычная цель: не более "
+        f"{TARGET_CHARS} символов и {TARGET_WORDS} слов. "
+        f"Жёсткий предел: не более {HARD_CHARS} символов и {HARD_WORDS} слов "
+        "в одном сообщении. Один главный смысл и не более одного "
+        "уточняющего вопроса. Не дели ответ на несколько сообщений.",
+        "НИКОГДА не воспроизводи главу, раздел или длинный связный отрывок "
+        "целиком. Просьбу выдать главу/большой кусок преврати в краткое "
+        "изложение своими словами и при необходимости добавь одну короткую "
+        "точную цитату. Суммарно все дословные цитаты корпуса в ответе — "
+        f"не более {QUOTE_BUDGET_CHARS} символов.",
+        generation_budget_instruction(budget),
     ]
+    if repair:
+        lines.extend(["", "ИСПРАВЛЕНИЕ (обязательно):", repair])
+    if is_bulk_reproduction_request(user_text) or is_continuation_request(user_text):
+        lines.append(
+            "Просьба пользователя касается выдачи главы/большого куска или "
+            "продолжения печати: останься в режиме краткого обсуждения — "
+            "дай сжатое изложение и предложи разобрать конкретную тему. "
+            "Не листай канонический текст по частям."
+        )
+    lines.extend(["", "ТОЧНЫЕ ОТРЫВКИ:"])
     for unit in pack.units:
         provenance = unit.provenance
         lines.append(
             f"[{provenance.source_id}/{provenance.section_id}#{provenance.chunk_id}] {unit.text}"
         )
-    if repair:
-        lines.extend(["", "ИСПРАВЛЕНИЕ: предыдущий ответ содержал неподтверждённые места.", repair])
     lines.extend(["", "ВОПРОС ПОЛЬЗОВАТЕЛЯ:", user_text])
     return "\n".join(lines)
 
@@ -1085,6 +1135,159 @@ def build_grounded_response(
     return GroundedResponse(text=answer, units=tuple(units), evidence=pack, diagnostics=merged)
 
 
+def response_quote_chars(response: GroundedResponse) -> int:
+    """Return aggregate verbatim quoted characters in a grounded response."""
+    return aggregate_quote_chars(response.text)
+
+
+def response_envelope_ok(response: GroundedResponse) -> bool:
+    """Whether a grounded response fits the hard Telegram envelope."""
+    return envelope_passes(response.text)
+
+
+def compact_grounded_response(response: GroundedResponse) -> GroundedResponse:
+    """Deterministically keep leading complete units that fit the hard cap.
+
+    Lower-priority (trailing) units are dropped first; every retained unit
+    keeps its validated provenance and grounding verdict. Cuts happen only
+    at complete-unit boundaries, so quotations, Markdown constructs, URLs,
+    and combining sequences stay intact. Raises :class:`TurnFailed` when
+    even the first unit cannot fit (the caller fails closed to a bounded
+    operational reply instead of emitting partial text).
+    """
+    if envelope_passes(response.text):
+        return response
+    kept: list[ResponseUnit] = []
+    for unit in response.units:
+        candidate_units = [*kept, unit]
+        candidate_text = " ".join(item.text for item in candidate_units)
+        if not envelope_passes(candidate_text):
+            break
+        kept.append(unit)
+    if not kept:
+        raise TurnFailed("output-envelope", "no complete unit fits the hard envelope")
+    compacted_text = " ".join(item.text for item in kept)
+    if compact_text_to_envelope(response.text) == ENVELOPE_FALLBACK_REPLY:
+        # String-level compaction agrees nothing beyond the fallback fits;
+        # unit-level kept prefix is still authoritative when it passes.
+        if not envelope_passes(compacted_text):
+            raise TurnFailed("output-envelope", "no complete unit fits the hard envelope")
+    logger.info(
+        "grounded response compacted to envelope",
+        extra={
+            "kept_units": len(kept),
+            "total_units": len(response.units),
+            "graphemes": count_graphemes(compacted_text),
+            "words": count_words(compacted_text),
+            "quoted": aggregate_quote_chars(compacted_text),
+        },
+    )
+    return GroundedResponse(
+        text=compacted_text,
+        units=tuple(kept),
+        evidence=response.evidence,
+        diagnostics=response.diagnostics,
+    )
+
+
+async def enforce_grounded_envelope(
+    response: GroundedResponse,
+    *,
+    user_text: str,
+    pack: EvidencePack,
+    session_id: str,
+    send: Callable[..., Awaitable[str]],
+    agent: str,
+    primary_model: str,
+    fallback_model: str,
+    entails: EntailmentFn | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    generation_budget_tokens: int = 0,
+) -> tuple[GroundedResponse, int]:
+    """Enforce the #83 envelope with at most one compact regeneration.
+
+    Uses the same validated ``pack`` (no new retrieval, no new claims)
+    and an explicit remaining size budget. Returns ``(response, extra_sends)``
+    where ``extra_sends`` is ``0`` (first answer fit) or ``1`` (exactly one
+    compact regeneration was performed). When the regenerated answer still
+    exceeds the hard envelope, deterministic complete-unit compaction
+    applies. No synthetic user turn enters Telegram-visible history: the
+    repair is an internal synthesis retry on the same OpenCode session.
+    """
+    if envelope_passes(response.text):
+        return response, 0
+    logger.info(
+        "grounded answer exceeds envelope; compact regeneration",
+        extra={
+            "graphemes": count_graphemes(response.text),
+            "words": count_words(response.text),
+            "quoted": aggregate_quote_chars(response.text),
+        },
+    )
+    repair = compact_retry_instruction(
+        remaining_chars=HARD_CHARS,
+        remaining_words=HARD_WORDS,
+        quote_remaining=QUOTE_BUDGET_CHARS,
+    )
+    repair_prompt = build_synthesis_prompt(
+        user_text=user_text,
+        pack=pack,
+        repair=repair,
+        generation_budget_tokens=generation_budget_tokens,
+    )
+    try:
+        repaired = await send_with_fallback(
+            send,
+            session_id,
+            repair_prompt,
+            agent=agent,
+            primary_model=primary_model,
+            fallback_model=fallback_model,
+            sleep=sleep,
+        )
+    except OpenCodeSessionNotFoundError as exc:
+        raise TurnFailed("session-not-found", "opencode session is gone") from exc
+    repaired_diag = TurnDiagnostics(
+        substantive=response.diagnostics.substantive,
+        aspects=response.diagnostics.aspects,
+        retrieval_rounds=response.diagnostics.retrieval_rounds,
+        candidates=response.diagnostics.candidates,
+        evidence_chunks=len(pack.units),
+        evidence_tokens=pack.token_count,
+        tool_call_count=response.diagnostics.tool_call_count + 1,
+        coverage_gaps=response.diagnostics.coverage_gaps,
+        regeneration_count=response.diagnostics.regeneration_count + MAX_COMPACT_REGENERATIONS,
+        grounding_passed=None,
+        served_model=repaired.served_model,
+        fallback_used=repaired.fallback_used,
+        error_category=repaired.error_category,
+        retry_count=repaired.retry_count,
+    )
+    second = build_grounded_response(
+        answer=repaired.text,
+        pack=pack,
+        diagnostics=repaired_diag,
+        entails=entails,
+    )
+    unsupported = [unit for unit in second.units if unit.grounding_passed is False]
+    if unsupported:
+        raise TurnFailed(
+            "grounding-failed",
+            f"{len(unsupported)} regenerated unit(s) lack semantic support",
+        )
+    if envelope_passes(second.text):
+        logger.info(
+            "compact regeneration fit the envelope",
+            extra={
+                "graphemes": count_graphemes(second.text),
+                "words": count_words(second.text),
+            },
+        )
+        return second, 1
+    compacted = compact_grounded_response(second)
+    return compacted, 1
+
+
 def _classify_send_error(exc: BaseException) -> str:
     text = str(exc).casefold()
     if re.search(r"(?<!\d)429(?!\d)", text) is not None or "too many requests" in text:
@@ -1197,6 +1400,7 @@ class TurnRunner:
     primary_model: str = ""
     fallback_model: str = ""
     entails: EntailmentFn | None = None
+    generation_budget_tokens: int = 0
 
     def require_index(self) -> HybridIndex:
         """Return the opened RU index or fail closed on stale/missing corpus."""
@@ -1334,7 +1538,20 @@ class TurnRunner:
                     "fallback": synthesis.fallback_used,
                 },
             )
-            return first
+            enveloped, _extra = await enforce_grounded_envelope(
+                first,
+                user_text=text,
+                pack=pack,
+                session_id=session_id,
+                send=send,
+                agent=self.agent,
+                primary_model=self.primary_model,
+                fallback_model=self.fallback_model,
+                entails=self.entails,
+                sleep=sleep,
+                generation_budget_tokens=self.generation_budget_tokens,
+            )
+            return enveloped
         # One bounded regeneration for unsupported units, else fail closed.
         logger.info(
             "grounded turn regenerating unsupported units",
@@ -1399,7 +1616,20 @@ class TurnRunner:
                 "fallback": repaired.fallback_used,
             },
         )
-        return response
+        enveloped, _extra = await enforce_grounded_envelope(
+            response,
+            user_text=text,
+            pack=pack,
+            session_id=session_id,
+            send=send,
+            agent=self.agent,
+            primary_model=self.primary_model,
+            fallback_model=self.fallback_model,
+            entails=self.entails,
+            sleep=sleep,
+            generation_budget_tokens=self.generation_budget_tokens,
+        )
+        return enveloped
 
 
 async def run_trivial_turn(
@@ -1416,7 +1646,7 @@ async def run_trivial_turn(
     if not text.strip():
         raise TurnFailed("empty-turn", "refusing an empty turn")
     try:
-        return await send_with_fallback(
+        result = await send_with_fallback(
             send,
             session_id,
             text,
@@ -1427,6 +1657,23 @@ async def run_trivial_turn(
         )
     except OpenCodeSessionNotFoundError as exc:
         raise TurnFailed("session-not-found", "opencode session is gone") from exc
+    if not envelope_passes(result.text):
+        compacted = compact_text_to_envelope(result.text)
+        logger.info(
+            "trivial turn compacted to envelope",
+            extra={
+                "graphemes": count_graphemes(compacted),
+                "words": count_words(compacted),
+            },
+        )
+        return SynthesisResult(
+            text=compacted,
+            served_model=result.served_model,
+            fallback_used=result.fallback_used,
+            error_category=result.error_category,
+            retry_count=result.retry_count,
+        )
+    return result
 
 
 __all__ = [
@@ -1453,11 +1700,15 @@ __all__ = [
     "build_local_plan_payload",
     "build_synthesis_prompt",
     "check_coverage",
+    "compact_grounded_response",
     "deduplicate_cross_aspect",
+    "enforce_grounded_envelope",
     "fit_evidence_budget",
     "is_substantive",
     "judge_unit",
     "load_exact_evidence",
+    "response_envelope_ok",
+    "response_quote_chars",
     "run_planner",
     "run_trivial_turn",
     "search_first_round",
