@@ -308,28 +308,36 @@ def main(argv: list[str] | None = None) -> int:
             metadata = None  # type: ignore[assignment]
             snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
         if snapshot_error is None:
-            if not isinstance(metadata, dict) or metadata.get("canonical_sha256") != expected_sha:
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            elif metadata.get("canonical_sha256") != expected_sha:
                 snapshot_error = "snapshot metadata canonical SHA does not match the manifest"
         if snapshot_error is None:
-            assert isinstance(metadata, dict)
-            version = metadata.get("metadata_version")
-            if version is not None and version not in (1, 2):
-                snapshot_error = f"unsupported snapshot metadata version: {version!r}"
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                version = metadata.get("metadata_version")
+                if version is not None and version not in (1, 2):
+                    snapshot_error = f"unsupported snapshot metadata version: {version!r}"
         if snapshot_error is None:
-            assert isinstance(metadata, dict)
-            member = metadata.get("canonical_member")
-            if member is not None and member != canonical_name:
-                snapshot_error = "snapshot metadata canonical member does not match language"
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                member = metadata.get("canonical_member")
+                if member is not None and member != canonical_name:
+                    snapshot_error = "snapshot metadata canonical member does not match language"
         if snapshot_error is None:
-            assert isinstance(metadata, dict)
-            encrypted_file = metadata.get("encrypted_file")
-            if (
-                isinstance(encrypted_file, str)
-                and encrypted_file
-                and not encrypted_file.endswith(f"/{archive_name}")
-                and encrypted_file != archive_name
-            ):
-                snapshot_error = "snapshot metadata encrypted file does not match archive"
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                encrypted_file = metadata.get("encrypted_file")
+                if (
+                    isinstance(encrypted_file, str)
+                    and encrypted_file
+                    and not encrypted_file.endswith(f"/{archive_name}")
+                    and encrypted_file != archive_name
+                ):
+                    snapshot_error = "snapshot metadata encrypted file does not match archive"
         encrypted: bytes | None = None
         if snapshot_error is None:
             try:
@@ -337,19 +345,25 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as exc:
                 snapshot_error = f"cannot read encrypted snapshot: {exc}"
         if snapshot_error is None:
-            assert encrypted is not None
-            expected_encrypted_sha = metadata.get("encrypted_sha256")
-            if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
-                snapshot_error = "snapshot encrypted SHA does not match metadata"
+            if encrypted is None:
+                snapshot_error = "snapshot encrypted payload is missing"
+            elif not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                expected_encrypted_sha = metadata.get("encrypted_sha256")
+                if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
+                    snapshot_error = "snapshot encrypted SHA does not match metadata"
         if snapshot_error is None:
-            assert encrypted is not None
-            try:
-                tar_zst = decrypt_bytes(encrypted, [identity])
-                canonical_bytes, _ = extract_tar_zst(
-                    tar_zst, expected_canonical_name=canonical_name
-                )
-            except (AgeError, ValueError) as exc:
-                snapshot_error = f"snapshot decrypt failed: {exc}"
+            if encrypted is None:
+                snapshot_error = "snapshot encrypted payload is missing"
+            else:
+                try:
+                    tar_zst = decrypt_bytes(encrypted, [identity])
+                    canonical_bytes, _ = extract_tar_zst(
+                        tar_zst, expected_canonical_name=canonical_name
+                    )
+                except (AgeError, ValueError) as exc:
+                    snapshot_error = f"snapshot decrypt failed: {exc}"
         if snapshot_error is None:
             if _write_verified(args.output, canonical_bytes, expected_sha=expected_sha, lang=lang):
                 print(

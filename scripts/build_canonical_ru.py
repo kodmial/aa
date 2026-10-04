@@ -35,6 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "corpus" / "canonical.ru.manifest.json"
 DEFAULT_FETCH_STATE = ROOT / "corpus" / "source" / "fetch-ru-state.json"
+DEFAULT_SOURCE_LOCK = ROOT / "corpus" / "source.ru.lock.json"
 DEFAULT_RAW = ROOT / "corpus" / "source" / "raw-ru" / "aa-big-book.txt"
 DEFAULT_OUTPUT = ROOT / "corpus" / "generated" / "canonical.ru.json"
 DEFAULT_TEXT_OUTPUT = ROOT / "corpus" / "generated" / "canonical.ru.txt"
@@ -45,14 +46,38 @@ MANIFEST_FORMAT = "aa-canonical-manifest-ru/1"
 
 RAW_PATH = "corpus/source/raw-ru/aa-big-book.txt"
 SOURCE_ID = "ru-fourth-edition-txt"
-# Stable per-section provenance for the single-TXT source (issue #50): every
-# section shares the pinned edition-page URL from
-# ``corpus/source.ru.lock.json`` (``sources[0].url``), exactly as the English
-# builder shares one source URL across chapters from a single raw file.
-# Per-section binding additionally comes from ``source_id``/``source_file``,
-# ``char_start``/``char_end`` offsets, and ``text_sha256``; the URL must
-# never be empty.
+# Fallback edition-page URL only used when no source lock is supplied
+# (fixture/test calls). Production builds always bind ``source_url`` from
+# ``corpus/source.ru.lock.json`` via ``_resolve_source_url`` and fail closed
+# on a missing/empty/divergent URL, so a lock change can never silently
+# publish stale provenance.
 SOURCE_URL = "https://aarus.fi/read/bigbook/edition/"
+
+
+def _resolve_source_url(source_lock: dict[str, object] | None) -> str:
+    """Bind the per-section ``source_url`` to the committed source lock.
+
+    Returns the pinned edition-page URL for ``SOURCE_ID``. Fails closed when
+    the lock is malformed or the URL is missing/empty so artifacts never carry
+    stale hardcoded provenance.
+    """
+    if source_lock is None:
+        return SOURCE_URL
+    sources = source_lock.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("source.ru.lock has no sources")
+    entry: dict[str, object] | None = None
+    for item in sources:
+        if isinstance(item, dict) and item.get("id") == SOURCE_ID:
+            entry = item
+            break
+    if entry is None:
+        raise ValueError(f"source.ru.lock has no source {SOURCE_ID!r}")
+    url = entry.get("url")
+    if not isinstance(url, str) or not url:
+        raise ValueError("source.ru.lock source url is missing or empty; refusing stale provenance")
+    return url
+
 
 IDENTITY_MARKERS = (
     "АНОНИМНЫЕ АЛКОГОЛИКИ",
@@ -256,6 +281,7 @@ def build_artifact(
     sections: list[dict[str, object]],
     canonical_txt: str,
     enriched: list[dict[str, object]],
+    source_lock: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the canonical artifact dict, failing closed on any mismatch."""
     # Re-check the caller-derived identity inputs against the raw bytes so a
@@ -313,6 +339,8 @@ def build_artifact(
     if sorted(expected_by_id) != sorted(SECTION_IDS):
         raise ValueError("manifest sections are not exactly Мнение доктора + Chapters 1-11")
 
+    source_url = _resolve_source_url(source_lock)
+
     artifact_sections: list[dict[str, object]] = []
     for item in enriched:
         section_id = str(item["id"])
@@ -330,7 +358,7 @@ def build_artifact(
                 "id": section_id,
                 "title": item["title"],
                 "source_id": SOURCE_ID,
-                "source_url": SOURCE_URL,
+                "source_url": source_url,
                 "source_file": RAW_PATH,
                 "source_sha256": digest,
                 "char_start": item["char_start"],
@@ -369,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build the Russian canonical artifact.")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--fetch-state", type=Path, default=DEFAULT_FETCH_STATE)
+    parser.add_argument("--source-lock", type=Path, default=DEFAULT_SOURCE_LOCK)
     parser.add_argument("--raw", type=Path, default=DEFAULT_RAW)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--text-output", type=Path, default=DEFAULT_TEXT_OUTPUT)
@@ -381,6 +410,14 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"required input file is missing: {exc.filename}")
     except json.JSONDecodeError as exc:
         return fail(f"required input file is not valid JSON: {exc}")
+    try:
+        source_lock = json.loads(args.source_lock.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        return fail(f"source lock is missing: {exc.filename}")
+    except json.JSONDecodeError as exc:
+        return fail(f"source lock is not valid JSON: {exc}")
+    if not isinstance(source_lock, dict):
+        return fail("source lock is malformed")
 
     try:
         raw = args.raw.read_bytes()
@@ -403,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             sections=sections,
             canonical_txt=canonical_txt,
             enriched=enriched,
+            source_lock=source_lock,
         )
     except ValueError as exc:
         return fail(str(exc))
