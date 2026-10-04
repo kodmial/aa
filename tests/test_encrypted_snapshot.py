@@ -375,20 +375,81 @@ def test_no_private_key_or_plaintext_committed() -> None:
         not in (
             "corpus/source/encrypted/README.md",
             "corpus/source/encrypted/metadata.json",
+            "corpus/source/encrypted/metadata.ru.json",
         )
         and not p.endswith(".age")
+    ]
+    assert not [
+        p
+        for p in tracked
+        if p.startswith("corpus/source/encrypted/")
+        and p.endswith(".txt")
+        and p != "corpus/source/encrypted/recipient.txt"
     ]
     for path in tracked:
         if (
             path.startswith("corpus/source/encrypted/")
             and path.endswith(".age")
-            and path != "corpus/source/encrypted/canonical.tar.zst.age"
+            and path
+            not in (
+                "corpus/source/encrypted/canonical.tar.zst.age",
+                "corpus/source/encrypted/canonical.ru.tar.zst.age",
+            )
         ):
             raise AssertionError(f"unexpected committed snapshot fixture: {path}")
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "/corpus/generated/" in gitignore
     assert "/corpus/source/raw/" in gitignore
+    assert "/corpus/source/raw-ru/" in gitignore
     assert "AGE-SECRET-KEY" in gitignore
+
+
+def test_en_ru_share_single_recipient() -> None:
+    """EN (#24) and RU (#50) share one committed recipient; no second key.
+
+    The public recipient is provisioned once by the repository owner in #28
+    and is absent until then, so this test skips pre-activation while still
+    forbidding any second recipient file.
+    """
+    root = _repo_root()
+    recipient_path = root / "corpus" / "source" / "encrypted" / "recipient.txt"
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        check=True,
+    ).stdout.splitlines()
+    recipient_files = [p for p in tracked if "recipient" in p.lower()]
+    assert recipient_files in (
+        [],
+        ["corpus/source/encrypted/recipient.txt"],
+    ), f"EN and RU must share one recipient file, found: {recipient_files}"
+    if not recipient_path.is_file():
+        pytest.skip("no provisioned recipient yet (production activation is tracked in #28)")
+    text = recipient_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    lines = text.splitlines()
+    assert len(lines) == 1
+    recipient = lines[0].strip()
+    assert recipient.startswith("age1")
+    age_v1.parse_recipient(recipient)
+    # One recipient filename constant is shared by both snapshots.
+    assert snap.RECIPIENT_NAME == "recipient.txt"
+    assert snap.ARCHIVE_NAME == "canonical.tar.zst.age"
+    assert snap.RU_ARCHIVE_NAME == "canonical.ru.tar.zst.age"
+    assert snap.RU_ARCHIVE_NAME != snap.ARCHIVE_NAME
+    for workflow in (
+        "encrypted-corpus-refresh.yml",
+        "encrypted-corpus-refresh-ru.yml",
+    ):
+        workflow_text = (root / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "corpus/source/encrypted/recipient.txt" in workflow_text
+        lowered = workflow_text.lower()
+        assert "recipient-ru" not in lowered
+        assert "recipient_ru" not in lowered
+    russian_doc = (root / "docs" / "russian-corpus.md").read_text(encoding="utf-8")
+    assert "no second" in russian_doc.lower()
 
 
 def test_refresh_workflow_is_manual_trusted_and_cache_safe() -> None:

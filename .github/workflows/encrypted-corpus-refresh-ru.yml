@@ -1,0 +1,97 @@
+name: Encrypted corpus refresh (Russian)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: encrypted-corpus-refresh-ru
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    # Trusted repository context only: manual dispatch on the main branch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Check public recipient exists
+        run: |
+          test -f corpus/source/encrypted/recipient.txt
+          test "$(wc -l < corpus/source/encrypted/recipient.txt)" -eq 1
+          grep -Eq '^age1[0-9a-z]+$' corpus/source/encrypted/recipient.txt
+      - name: Fetch Russian TXT source (#50 reuse-by-default)
+        # Reuse the pinned TXT without network; bootstrap from the provider
+        # only to provision a missing TXT (intentional requalification).
+        # Source drift still fails closed in build_canonical_ru.py via the
+        # manifest SHA check, so a drifted re-download never publishes.
+        run: |
+          if [ -f corpus/source/raw-ru/aa-big-book.txt ]; then
+            python3 scripts/fetch_ru_source.py
+          else
+            python3 scripts/fetch_ru_source.py --bootstrap-from-provider
+          fi
+      - name: Build Russian canonical artifact (#50)
+        run: python3 scripts/build_canonical_ru.py
+      - name: Refresh Russian encrypted snapshot
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        run: |
+          python3 scripts/refresh_encrypted_snapshot.py \
+            --manifest corpus/canonical.ru.manifest.json \
+            --source-lock corpus/source.ru.lock.json \
+            --canonical corpus/generated/canonical.ru.json \
+            --recipient-file corpus/source/encrypted/recipient.txt \
+            --archive-name canonical.ru.tar.zst.age \
+            --metadata-name metadata.ru.json \
+            --canonical-name canonical.ru.json
+      - name: Verify restore from snapshot
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_ALLOW_NETWORK_FETCH: "0"
+        run: |
+          rm -rf corpus/generated
+          python3 scripts/restore_canonical.py --lang ru
+          python3 -c "from pathlib import Path; print('restored bytes:', Path('corpus/generated/canonical.ru.json').stat().st_size)"
+      - name: Ensure no plaintext corpus is staged
+        run: |
+          git status --porcelain
+          if git ls-files --others --exclude-standard | grep -E 'canonical\.ru\.json$|canonical\.ru\.txt$|aa-big-book\.txt$|fetch-ru-state\.json$|\.tar\.zst$|AGE-SECRET-KEY' ; then
+            echo "refusing to commit plaintext corpus or private key material" >&2
+            exit 1
+          fi
+          if git diff --name-only | grep -E 'canonical\.ru\.json$|canonical\.ru\.txt$|aa-big-book\.txt$|fetch-ru-state\.json$|\.tar\.zst$|AGE-SECRET-KEY' ; then
+            echo "refusing to commit plaintext corpus or private key material" >&2
+            exit 1
+          fi
+          if git diff --cached --name-only | grep -E 'canonical\.ru\.json$|canonical\.ru\.txt$|aa-big-book\.txt$|fetch-ru-state\.json$|\.tar\.zst$|AGE-SECRET-KEY' ; then
+            echo "refusing to commit plaintext corpus or private key material" >&2
+            exit 1
+          fi
+          if git diff --cached --name-only | grep -qx 'corpus/source/encrypted/recipient.txt' ; then
+            echo "refusing to commit recipient.txt from refresh (production activation #28 only)" >&2
+            exit 1
+          fi
+          git diff --name-only
+      - name: Commit Russian encrypted snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add corpus/source/encrypted/canonical.ru.tar.zst.age corpus/source/encrypted/metadata.ru.json corpus/canonical.ru.manifest.json corpus/source.ru.lock.json
+          if git diff --cached --quiet; then
+            echo "russian encrypted snapshot is already up to date"
+          else
+            git commit -m "chore: refresh Russian encrypted canonical snapshot"
+            git push origin HEAD:main
+          fi

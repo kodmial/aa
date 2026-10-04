@@ -1,0 +1,116 @@
+{
+  "artifact_sha256": "0a0cf5feee03792d314936b27e4366c41002eadecfc2e9e60fbdf398cdb92967",
+  "builder_version": 1,
+  "control_passage_sha256": [
+    {
+      "section": "doctors-opinion",
+      "sha256": "1cd5f8818cac8fb6d195ed0fd7d9b0b05f08d8481338e8f401691f2f514b55b1"
+    },
+    {
+      "section": "chapter-5",
+      "sha256": "85ae83a4c3ae4c38fca37c4039f6f1ca8024b32be1131a3572e349373af0d1c9"
+    },
+    {
+      "section": "chapter-11",
+      "sha256": "13c01de65a5889df38295cd27f83f334910e49c9efabfb2c55833c5cfb741349"
+    }
+  ],
+  "edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+  "format": "aa-canonical-manifest-ru/1",
+  "identity_markers": [
+    "АНОНИМНЫЕ АЛКОГОЛИКИ",
+    "4-е издание",
+    "Четвертое издание",
+    "Перевод с английского",
+    "Alcoholics Anonymous World Services",
+    "Фонд «Единство», 2013",
+    "978-5-906531-01-8",
+    "с разрешения Alcoholics Anonymous World Services"
+  ],
+  "language": "ru",
+  "rights_basis": "Owner confirms permission for project use/storage. No licensing blocker.",
+  "scope": "Мнение доктора + Chapters 1-11 only (Russian Fourth Edition). Front matter, publishing/history material, later personal stories and appendices are excluded.",
+  "sections": [
+    {
+      "chars": 13724,
+      "id": "doctors-opinion",
+      "text_sha256": "a33faec79892b839eb14d28fd5f6eb36297c755aed5e73bf08419f17fafc6558",
+      "title": "Мнение доктора"
+    },
+    {
+      "chars": 26542,
+      "id": "chapter-1",
+      "text_sha256": "b0f3c8848eceb0cd216f699164118b75c84363e2396b2ab695c49b9f7a993829",
+      "title": "Глава 1. Рассказ Билла"
+    },
+    {
+      "chars": 22408,
+      "id": "chapter-2",
+      "text_sha256": "a44a3a60932bf6a65171c5dd3ccd595d93894f06b5d3e87b2c4e53be1b7ddfa6",
+      "title": "Глава 2. Выход есть"
+    },
+    {
+      "chars": 24194,
+      "id": "chapter-3",
+      "text_sha256": "9e3b2bbbea7bca9f7aa98edfe374278af0ccfa05bcd2d8aed6da4b278d88276a",
+      "title": "Глава 3. Еще об алкоголизме"
+    },
+    {
+      "chars": 22958,
+      "id": "chapter-4",
+      "text_sha256": "4b6c5c509ab6e3888e9a66f8d3539daf85ed0d2e083322db7b7202c45630f9a0",
+      "title": "Глава 4. А как быть агностикам?"
+    },
+    {
+      "chars": 23143,
+      "id": "chapter-5",
+      "text_sha256": "e47abf9dc375a864c4627ed2d36c2ade280c1757cf67487c6e46b2a7f370dc4c",
+      "title": "Глава 5. Программа в действии"
+    },
+    {
+      "chars": 28725,
+      "id": "chapter-6",
+      "text_sha256": "82b1f0596edbe2219a9de6716a817b8b3d0439a796ca2d2dc40c99aaa9d13599",
+      "title": "Глава 6. За работу!"
+    },
+    {
+      "chars": 26464,
+      "id": "chapter-7",
+      "text_sha256": "1ad8428400bae6720ed7ce95bf78b13173cb9a66869ff2446b7b674bbc01ab0c",
+      "title": "Глава 7. Работая с другими"
+    },
+    {
+      "chars": 30687,
+      "id": "chapter-8",
+      "text_sha256": "8e28618a0ab56cf2355c0e6f1231ef382c5b3a6ae5f259b9afb89ddfcc694d21",
+      "title": "Глава 8. Обращение к женам"
+    },
+    {
+      "chars": 24270,
+      "id": "chapter-9",
+      "text_sha256": "05eccf2e2f1a2cea3352b1bdc69601329797fb1fa0d0d4d53a635dcd6edbc88e",
+      "title": "Глава 9. Новые отношения в семье"
+    },
+    {
+      "chars": 25408,
+      "id": "chapter-10",
+      "text_sha256": "51a2e18300e2c02a3935ce8e589107cc62cf63382d0c4cadfc59a72bc5f66632",
+      "title": "Глава 10. Обращение к работодателям"
+    },
+    {
+      "chars": 24084,
+      "id": "chapter-11",
+      "text_sha256": "4f230e3245036f5ba1899ac0549f23e5578b7202f111400ad0ead61dd03613db",
+      "title": "Глава 11. Заглянем в ваше будущее"
+    }
+  ],
+  "sources": [
+    {
+      "bytes": 534488,
+      "id": "ru-fourth-edition-txt",
+      "raw_path": "corpus/source/raw-ru/aa-big-book.txt",
+      "sha256": "bb58e90796e8f91fe8785cbad8bba452b9b2715078e6b0a4660842d9c4336d13"
+    }
+  ],
+  "text_artifact_sha256": "902983c56d532b8eb1d70d7a8afac8440a613645ba7ee7954bf7cdef342f9713"
+}

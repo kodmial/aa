@@ -31,9 +31,20 @@ ENCRYPTION_FORMAT = "age-encryption.org/v1/X25519"
 ENCRYPTION_IMPL = "aa-age-v1-py/1"
 ARCHIVE_FORMAT = "canonical-tar-zst/1"
 ARCHIVE_NAME = "canonical.tar.zst.age"
+CANONICAL_NAME = "canonical.json"
 METADATA_NAME = "metadata.json"
 RECIPIENT_NAME = "recipient.txt"
+# Russian snapshot (issue #50): independently versioned artifact encrypted to
+# the same age recipient/identity contract as EN. Never a second password/key.
+RU_ARCHIVE_NAME = "canonical.ru.tar.zst.age"
+RU_CANONICAL_NAME = "canonical.ru.json"
+RU_METADATA_NAME = "metadata.ru.json"
+# English metadata stays at version 1 with its exact historical shape so an
+# EN refresh never re-publishes/re-qualifies strict version/shape consumers.
+# Russian metadata (issue #50) is version 2 and additionally carries
+# ``canonical_member`` plus an explicit ``encrypted_file``. Readers accept 1/2.
 METADATA_VERSION = 1
+RU_METADATA_VERSION = 2
 MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 
 
@@ -71,6 +82,7 @@ def create_tar_zst(
     *,
     manifest: dict[str, Any],
     source_lock: dict[str, Any] | None = None,
+    canonical_name: str = CANONICAL_NAME,
 ) -> bytes:
     """Pack the canonical artifact plus provenance into deterministic tar.zst."""
     canonical_sha = sha256_bytes(canonical_bytes)
@@ -82,7 +94,7 @@ def create_tar_zst(
     ).encode("utf-8")
 
     members: list[tuple[str, bytes]] = [
-        ("canonical.json", canonical_bytes),
+        (canonical_name, canonical_bytes),
         ("provenance.json", provenance_bytes),
     ]
     tar_buffer = io.BytesIO()
@@ -102,7 +114,9 @@ def create_tar_zst(
     return compressor.compress(tar_buffer.getvalue())
 
 
-def extract_tar_zst(data: bytes) -> tuple[bytes, dict[str, Any]]:
+def extract_tar_zst(
+    data: bytes, *, expected_canonical_name: str = CANONICAL_NAME
+) -> tuple[bytes, dict[str, Any]]:
     """Unpack tar.zst bytes into ``(canonical_bytes, provenance)``."""
     try:
         decompressed = zstd.ZstdDecompressor().decompress(
@@ -118,11 +132,11 @@ def extract_tar_zst(data: bytes) -> tuple[bytes, dict[str, Any]]:
             if len(raw_members) != 2 or len(set(names)) != 2:
                 raise ValueError(f"unexpected snapshot members: {sorted(names)}")
             members = {m.name: m for m in raw_members}
-            if set(members) != {"canonical.json", "provenance.json"}:
+            if set(members) != {expected_canonical_name, "provenance.json"}:
                 raise ValueError(f"unexpected snapshot members: {sorted(members)}")
             if any(not m.isreg() for m in members.values()):
                 raise ValueError("snapshot members must be regular files")
-            canonical_member = tar.extractfile(members["canonical.json"])
+            canonical_member = tar.extractfile(members[expected_canonical_name])
             provenance_member = tar.extractfile(members["provenance.json"])
             if canonical_member is None or provenance_member is None:
                 raise ValueError("snapshot is missing required members")
@@ -144,13 +158,49 @@ def build_metadata(
     manifest: dict[str, Any],
     source_lock: dict[str, Any] | None,
     recipient: str,
+    encrypted_file: str | None = None,
+    canonical_name: str = CANONICAL_NAME,
 ) -> dict[str, Any]:
-    """Build the committed non-secret ``metadata.json`` payload."""
+    """Build the committed non-secret ``metadata.json`` payload.
+
+    English (``canonical_name == CANONICAL_NAME``) keeps the exact version-1
+    shape. Russian uses version 2 with ``canonical_member`` plus an explicit
+    ``encrypted_file``.
+    """
+    default_en_file = f"corpus/source/encrypted/{ARCHIVE_NAME}"
+    is_english = canonical_name == CANONICAL_NAME
+    if is_english:
+        return {
+            "metadata_version": METADATA_VERSION,
+            "canonical_sha256": canonical_sha256,
+            "encrypted_sha256": encrypted_sha256,
+            "encrypted_file": encrypted_file or default_en_file,
+            "manifest_format": manifest.get("format"),
+            "manifest_builder_version": manifest.get("builder_version"),
+            "manifest_artifact_sha256": manifest.get("artifact_sha256"),
+            "source_lock_version": (source_lock or {}).get("version"),
+            "source_lock_edition": (source_lock or {}).get("edition"),
+            "encryption_format": ENCRYPTION_FORMAT,
+            "encryption_impl": ENCRYPTION_IMPL,
+            "archive_format": ARCHIVE_FORMAT,
+            "recipient_hint": recipient[-16:] if len(recipient) >= 16 else "unknown",
+            "creation_update": (
+                "Regenerate via the manually dispatched "
+                ".github/workflows/encrypted-corpus-refresh.yml workflow, or locally: "
+                "python3 scripts/fetch_aa_source.py && "
+                "python3 scripts/build_canonical.py && "
+                "python3 scripts/refresh_encrypted_snapshot.py --recipient-file "
+                "corpus/source/encrypted/recipient.txt "
+                "(decrypt verification needs AA_BOOK_AGE_IDENTITY). "
+                "Production activation (key/secret/snapshot) is tracked in #28."
+            ),
+        }
     return {
-        "metadata_version": METADATA_VERSION,
+        "metadata_version": RU_METADATA_VERSION,
         "canonical_sha256": canonical_sha256,
+        "canonical_member": canonical_name,
         "encrypted_sha256": encrypted_sha256,
-        "encrypted_file": f"corpus/source/encrypted/{ARCHIVE_NAME}",
+        "encrypted_file": encrypted_file or f"corpus/source/encrypted/{RU_ARCHIVE_NAME}",
         "manifest_format": manifest.get("format"),
         "manifest_builder_version": manifest.get("builder_version"),
         "manifest_artifact_sha256": manifest.get("artifact_sha256"),
