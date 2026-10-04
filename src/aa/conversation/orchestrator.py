@@ -1154,6 +1154,7 @@ async def send_with_fallback(
                 if attempt < MAX_SEND_ATTEMPTS:
                     await sleeper(SEND_RETRY_DELAYS[min(attempt - 1, len(SEND_RETRY_DELAYS) - 1)])
                     continue
+                break
             raise TurnFailed("synthesis-failed", category) from exc
     if last_error is not None:
         try:

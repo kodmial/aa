@@ -340,10 +340,15 @@ class Application:
                     trivial_reply = await self._run_trivial_turn(session_id, text)
                 except TurnFailed as exc:
                     if exc.category == "session-not-found":
-                        session_id = await self.sessions.reset_opencode_session(
-                            chat_id, self.opencode_runtime.client, delete_remote=False
-                        )
-                        trivial_reply = await self._run_trivial_turn(session_id, text)
+                        try:
+                            session_id = await self.sessions.reset_opencode_session(
+                                chat_id, self.opencode_runtime.client, delete_remote=False
+                            )
+                            trivial_reply = await self._run_trivial_turn(session_id, text)
+                        except OpenCodeSessionNotFoundError as exc2:
+                            raise TurnFailed(
+                                "session-not-found", "opencode session is gone"
+                            ) from exc2
                     else:
                         raise
                 logger.info("trivial response served", extra={"chat_id": chat_id})
@@ -352,10 +357,13 @@ class Application:
                 reply = await self._run_grounded_turn(session_id, text)
             except TurnFailed as exc:
                 if exc.category == "session-not-found":
-                    session_id = await self.sessions.reset_opencode_session(
-                        chat_id, self.opencode_runtime.client, delete_remote=False
-                    )
-                    reply = await self._run_grounded_turn(session_id, text)
+                    try:
+                        session_id = await self.sessions.reset_opencode_session(
+                            chat_id, self.opencode_runtime.client, delete_remote=False
+                        )
+                        reply = await self._run_grounded_turn(session_id, text)
+                    except OpenCodeSessionNotFoundError as exc2:
+                        raise TurnFailed("session-not-found", "opencode session is gone") from exc2
                 else:
                     raise
         except TurnFailed as exc:
@@ -369,9 +377,16 @@ class Application:
             # runtime restart. Rebind once and retry against a fresh session,
             # preserving the original routing: non-substantive greetings retry
             # through the direct trivial path (never the RU grounded pipeline).
-            session_id = await self.sessions.reset_opencode_session(
-                chat_id, self.opencode_runtime.client, delete_remote=False
-            )
+            try:
+                session_id = await self.sessions.reset_opencode_session(
+                    chat_id, self.opencode_runtime.client, delete_remote=False
+                )
+            except OpenCodeSessionNotFoundError:
+                logger.warning(
+                    "grounded turn failed closed after rebind",
+                    extra={"chat_id": chat_id, "category": "session-not-found"},
+                )
+                return FAIL_CLOSED_REPLY
             if not is_substantive(text):
                 try:
                     trivial_retry = await self._run_trivial_turn(session_id, text)
