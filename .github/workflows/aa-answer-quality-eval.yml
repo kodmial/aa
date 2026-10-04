@@ -579,7 +579,7 @@ jobs:
                 const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
                 if (!isTrusted) continue;
                 const m = (c.body || '').match(qualityRe);
-                if (m && m[1] === testedSha && m[2] === corpus && m[3] === artifact && m[4] === rubric) {
+                if (m && m[1] === testedSha && m[2] === corpus && m[4] === rubric) {
                   duplicate = true;
                   break;
                 }

@@ -138,10 +138,13 @@ def run_transcript(
     sources = payload.get("source_texts", {})
     if not isinstance(sources, dict):
         raise AnswerQualityError("transcript source_texts must be an object")
-    raw_valid = payload.get("valid_locators", [])
-    if not isinstance(raw_valid, list) or not all(isinstance(item, str) for item in raw_valid):
-        raise AnswerQualityError("transcript valid_locators must hold strings")
-    valid_locators = frozenset(str(item) for item in raw_valid)
+    calibration_for_locators = load_calibration()
+    trusted_valid = calibration_for_locators.get("valid_locators", [])
+    if not isinstance(trusted_valid, list) or not all(
+        isinstance(item, str) for item in trusted_valid
+    ):
+        raise AnswerQualityError("trusted valid_locators index is malformed")
+    valid_locators = frozenset(str(item) for item in trusted_valid)
     grades = []
     for entry in turns:
         if not isinstance(entry, dict):
@@ -194,6 +197,8 @@ def run_transcript(
         completeness_ok=completeness_ok,
         completeness_reason=completeness_reason,
     )
+    if verdict.verdict == "rejected":
+        raise AnswerQualityError(f"refusing to grade rejected artifact: {verdict.reasons}")
     entry = BenchmarkTuple(
         main_sha=tested_sha,
         corpus_sha=corpus_sha,
