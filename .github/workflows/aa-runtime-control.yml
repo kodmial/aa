@@ -131,8 +131,7 @@ jobs:
                 .filter(t => Number.isFinite(t));
               for (let i = 0; i < runTimes.length; i++) {
                 const candidate = runTimes[i];
-                const horizon = i + 1 < runTimes.length ? runTimes[i + 1] : null;
-                if (stopTimes.some(s => s > candidate && (horizon === null || s < horizon))) continue;
+                if (stopTimes.some(s => s > candidate)) continue;
                 if (nowMs - candidate >= DAY_MS) continue;
                 if (createdTimes.filter(t => t > candidate).length >= MAX_STARTS) continue;
                 return candidate;

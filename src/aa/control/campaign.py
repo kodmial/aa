@@ -156,6 +156,16 @@ def resolve_active_start(
             continue
         if count_starts_after(run_created_at, candidate) >= MAX_STARTS:
             continue
+        exhausted_before = False
+        for prev in ordered:
+            if prev >= candidate:
+                break
+            prev_runs = sorted(t for t in run_created_at if t > prev)
+            if len(prev_runs) >= MAX_STARTS and candidate <= prev_runs[MAX_STARTS - 1]:
+                exhausted_before = True
+                break
+        if exhausted_before:
+            continue
         return candidate
     return None
 
