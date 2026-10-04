@@ -129,11 +129,22 @@ jobs:
               const createdTimes = runs
                 .map(r => Date.parse(r.created_at))
                 .filter(t => Number.isFinite(t));
+              const sortedCreated = [...createdTimes].sort((a, b) => a - b);
               for (let i = 0; i < runTimes.length; i++) {
                 const candidate = runTimes[i];
                 if (stopTimes.some(s => s > candidate)) continue;
                 if (nowMs - candidate >= DAY_MS) continue;
-                if (createdTimes.filter(t => t > candidate).length >= MAX_STARTS) continue;
+                if (sortedCreated.filter(t => t > candidate).length >= MAX_STARTS) continue;
+                let exhaustedBefore = false;
+                for (let j = 0; j < i; j++) {
+                  const prev = runTimes[j];
+                  const prevRuns = sortedCreated.filter(t => t > prev);
+                  if (prevRuns.length >= MAX_STARTS && candidate <= prevRuns[MAX_STARTS - 1]) {
+                    exhaustedBefore = true;
+                    break;
+                  }
+                }
+                if (exhaustedBefore) continue;
                 return candidate;
               }
               return null;
