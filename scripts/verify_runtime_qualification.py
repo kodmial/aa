@@ -234,6 +234,14 @@ def main() -> int:
         from aa.retrieval.planner import SCHEMA_VERSION as planner_schema
     except Exception as exc:
         return _fail(f"conversation runtime is not importable: {exc}")
+    try:
+        from aa.qualification.product_fingerprint import compute_product_fingerprint
+    except Exception as exc:
+        return _fail(f"product fingerprint module is not importable: {exc}")
+    try:
+        product_fingerprint = compute_product_fingerprint(ROOT)
+    except Exception as exc:
+        return _fail(f"product fingerprint is not computable: {exc}")
     bindings = aa_payload.get("bindings", {})
     if not isinstance(bindings, dict) or bindings.get("ru_artifact_sha256") != ru_full:
         return _fail("#19 RU bindings do not match the live RU manifest")
@@ -253,6 +261,7 @@ def main() -> int:
                 "agent_model": prompt_info["model"],
                 "planner_schema": planner_schema,
                 "runtime": RUNTIME_VERSION,
+                "product_fingerprint": product_fingerprint,
                 "status": "qualified",
             },
             sort_keys=True,
