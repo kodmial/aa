@@ -258,6 +258,13 @@ class HttpOpenCodeClient(OpenCodeClient):
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         quoted = urllib.parse.quote(session_id, safe="")
+        # The pinned OpenCode ``POST /session/{id}/message`` surface
+        # exposes no per-message max-token field, so no output-token
+        # budget is serialized here: inventing one would be silently
+        # ignored. Generation cost is bounded by configuration
+        # (``OPENCODE_MAX_OUTPUT_TOKENS``, default 256) as an efficiency
+        # guard only; the deterministic character envelope in
+        # ``aa.output_limits`` is the authoritative product contract.
         body: dict[str, object] = {"parts": [{"type": "text", "text": text}]}
         if agent:
             body["agent"] = agent

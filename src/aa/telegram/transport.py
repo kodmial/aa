@@ -28,6 +28,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from aa.output_limits import assess as _assess_limits
+
 logger = logging.getLogger("aa.telegram.transport")
 
 DEFAULT_BASE_URL = "https://api.telegram.org"
@@ -47,6 +49,33 @@ RECOGNIZED_COMMANDS = frozenset({"start", "new"})
 
 class TelegramApiError(Exception):
     """Transient or permanent Telegram Bot API failure."""
+
+
+class TelegramReplyTooLongError(TelegramApiError):
+    """User-facing reply escaped upstream enforcement above the hard cap."""
+
+
+def check_outbound_reply(reply: TelegramReply) -> None:
+    """Fail closed when ``reply`` exceeds the hard output envelope.
+
+    Never splits overflow and never logs response text; only lengths
+    and the verdict are logged. Raises
+    :class:`TelegramReplyTooLongError` so callers emit a bounded
+    fallback instead of delivering the oversized payload.
+    """
+    assessment = _assess_limits(reply.text)
+    if assessment.acceptable:
+        return
+    logger.warning(
+        "telegram reply rejected by output envelope",
+        extra={
+            "chat_id": reply.chat_id,
+            "graphemes": assessment.graphemes,
+            "words": assessment.words,
+            "quoted_chars": assessment.quoted_chars,
+        },
+    )
+    raise TelegramReplyTooLongError("telegram reply exceeds the 900-character / 130-word hard cap")
 
 
 class TelegramAuthError(TelegramApiError):
@@ -169,6 +198,7 @@ class StubTelegramTransport(TelegramTransport):
         self._running = False
 
     async def send(self, reply: TelegramReply) -> None:
+        check_outbound_reply(reply)
         self.sent.append(reply)
 
     @property
@@ -401,6 +431,7 @@ class PollingTelegramTransport(TelegramTransport):
 
     async def send(self, reply: TelegramReply) -> None:
         """Deliver one reply via ``sendMessage`` with bounded retry."""
+        check_outbound_reply(reply)
         payload: dict[str, Any] = {"chat_id": reply.chat_id, "text": reply.text}
         await self._call_with_retry("sendMessage", payload, max_retries=self._max_send_retries)
         self._sent.append(reply)

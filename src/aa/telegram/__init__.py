@@ -11,9 +11,11 @@ from aa.telegram.transport import (
     TelegramAuthError,
     TelegramIncoming,
     TelegramReply,
+    TelegramReplyTooLongError,
     TelegramTransport,
     TelegramUpdate,
     UrllibTelegramApi,
+    check_outbound_reply,
     parse_command,
 )
 
@@ -26,8 +28,10 @@ __all__ = [
     "TelegramAuthError",
     "TelegramIncoming",
     "TelegramReply",
+    "TelegramReplyTooLongError",
     "TelegramTransport",
     "TelegramUpdate",
     "UrllibTelegramApi",
+    "check_outbound_reply",
     "parse_command",
 ]

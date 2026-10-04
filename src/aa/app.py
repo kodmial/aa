@@ -11,6 +11,17 @@ from aa.corpus.context import CorpusContext
 from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
+from aa.output_limits import (
+    OVERLONG_FALLBACK_TEXT,
+    assess,
+    bulk_export_summary_reply,
+    compact_to_hard_cap,
+    detect_language,
+    enforce_async,
+    is_bulk_export_request,
+    is_continuation_request,
+    resolve_generation_budget,
+)
 from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
@@ -18,6 +29,7 @@ from aa.telegram.transport import (
     StubTelegramTransport,
     TelegramIncoming,
     TelegramReply,
+    TelegramReplyTooLongError,
     TelegramTransport,
 )
 
@@ -74,7 +86,25 @@ class Application:
         # user-facing duties and defers enforcement to this gate.
         self.grounding = grounding or GroundingGate(corpus_version=settings.aa_corpus_version)
         self._running = False
+        # Chats whose last turn was served in bulk-export summary mode.
+        # A continuation/paging request while flagged stays in summary
+        # mode so serial "continue/next part" turns cannot page through
+        # canonical text across turns.
+        self._bulk_export_chats: set[int] = set()
         self._wire_transport_handlers()
+
+    @property
+    def generation_budget_tokens(self) -> int:
+        """Bounded output-token efficiency guard (not the product contract).
+
+        The pinned OpenCode ``POST /session/{id}/message`` surface
+        exposes no per-message max-token field, so this budget cannot be
+        enforced as an API parameter without inventing an unsupported
+        field or a second provider client. It sizes cost/latency
+        expectations only; the deterministic character validator in
+        :mod:`aa.output_limits` is the authoritative enforcement.
+        """
+        return resolve_generation_budget(self.settings.opencode_max_output_tokens)
 
     @property
     def running(self) -> bool:
@@ -167,7 +197,13 @@ class Application:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
 
     async def _handle_telegram_update(self, incoming: TelegramIncoming) -> None:
-        """Process one private text update and always emit a bounded reply."""
+        """Process one private text update and always emit a bounded reply.
+
+        Exactly one Telegram message is ever emitted per inbound update:
+        overflow is compacted upstream and never auto-split here. A
+        transport envelope rejection degrades to one bounded fallback
+        message rather than a split or an oversized delivery.
+        """
         self.sessions.record_message(incoming.chat_id)
         try:
             reply = await self.respond(incoming.chat_id, incoming.text)
@@ -179,7 +215,16 @@ class Application:
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
             reply = _TEMPORARY_ERROR_REPLY
-        await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+        try:
+            await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+        except TelegramReplyTooLongError:
+            logger.warning(
+                "telegram oversized reply replaced with fallback",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+            )
+            await self.transport.send(
+                TelegramReply(chat_id=incoming.chat_id, text=OVERLONG_FALLBACK_TEXT)
+            )
 
     async def _send_grounded_message(self, session_id: str, text: str) -> str:
         """Send through the named AA agent with a technical model fallback only."""
@@ -207,8 +252,12 @@ class Application:
         The deterministic safety layer runs first: when it takes the
         emergency route, the bounded safe reply is returned immediately
         and no OpenCode work is scheduled (the LLM never decides whether
-        the emergency route is taken). Otherwise the message is forwarded
-        to the OpenCode runtime bound to ``chat_id``.
+        the emergency route is taken). Bulk corpus-reproduction requests
+        are served in summary mode without emitting source bulk text.
+        Otherwise the message is forwarded to the OpenCode runtime bound
+        to ``chat_id`` and the result passes the deterministic output
+        envelope (at most one compact regeneration, then complete-unit
+        compaction) before it is returned.
 
         Only message lengths and routing decisions are logged, never the
         message body.
@@ -219,24 +268,56 @@ class Application:
                 "emergency response served",
                 extra={"chat_id": chat_id, "reason": result.reason},
             )
-            return emergency_reply
+            if assess(emergency_reply).acceptable:
+                return emergency_reply
+            return compact_to_hard_cap(emergency_reply)
         if result.decision is SafetyDecision.BLOCK:
             logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
+        if is_bulk_export_request(text):
+            self._bulk_export_chats.add(chat_id)
+            summary = bulk_export_summary_reply(detect_language(text))
+            logger.info("bulk export request served in summary mode", extra={"chat_id": chat_id})
+            return summary
+        if chat_id in self._bulk_export_chats and is_continuation_request(text):
+            summary = bulk_export_summary_reply(detect_language(text))
+            logger.info("bulk export continuation kept in summary mode", extra={"chat_id": chat_id})
+            return summary
+        self._bulk_export_chats.discard(chat_id)
+        _ = self.generation_budget_tokens
         session_id = await self.sessions.ensure_opencode_session(
             chat_id, self.opencode_runtime.client
         )
         try:
-            reply = await self._send_grounded_message(session_id, text)
+            first = await self._send_grounded_message(session_id, text)
         except OpenCodeSessionNotFoundError:
             # A local chat mapping can outlive an OpenCode session after a
             # runtime restart. Rebind once and retry against a fresh session.
             session_id = await self.sessions.reset_opencode_session(
                 chat_id, self.opencode_runtime.client, delete_remote=False
             )
-            reply = await self._send_grounded_message(session_id, text)
-        logger.info("normal response served", extra={"chat_id": chat_id})
-        return reply
+            first = await self._send_grounded_message(session_id, text)
+
+        async def _regenerate(_budget_instruction: str) -> str:
+            # Same validated evidence (same OpenCode session history) with
+            # an explicit remaining size budget; grounding is not bypassed.
+            return await self._send_grounded_message(session_id, _budget_instruction)
+
+        outcome = await enforce_async(first, _regenerate)
+        logger.info(
+            "normal response served",
+            extra={
+                "chat_id": chat_id,
+                "regenerations": outcome.regenerations,
+                "compacted": outcome.compacted,
+            },
+        )
+        if assess(outcome.text).acceptable and outcome.text.strip():
+            return outcome.text
+        fallback = compact_to_hard_cap(outcome.text) if outcome.text.strip() else ""
+        if fallback and assess(fallback).acceptable:
+            return fallback
+        return OVERLONG_FALLBACK_TEXT
 
     async def __aenter__(self) -> Application:
         await self.start()
