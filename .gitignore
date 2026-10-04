@@ -6,11 +6,17 @@
 /node_modules/
 /.phpunit.cache/
 /corpus/source/raw/
+/corpus/source/raw-ru/
 /corpus/source/fetch-state.json
+/corpus/source/fetch-ru-state.json
 /corpus/generated/
 # Issue #24: never commit private age identities, plaintext snapshots, or
 # plaintext retrieval indexes. Only the encrypted snapshot
 # (corpus/source/encrypted/*.age), recipient.txt, and metadata.json are public.
+# Issue #50: same rule for the Russian snapshot (canonical.ru.tar.zst.age,
+# metadata.ru.json, shared recipient.txt). The Russian TXT
+# (corpus/source/raw-ru/aa-big-book.txt) and generated canonical.ru.* are
+# never committed.
 *.age-key
 *AGE-SECRET-KEY*
 /corpus/source/encrypted/*.key

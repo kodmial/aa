@@ -19,6 +19,8 @@ Only the encrypted snapshot is committed:
 corpus/source/encrypted/
   canonical.tar.zst.age
   metadata.json
+  canonical.ru.tar.zst.age
+  metadata.ru.json
   recipient.txt
 ```
 
@@ -27,7 +29,10 @@ canonical artifact, or a plaintext retrieval index.
 
 `metadata.json` records at least the canonical artifact SHA-256, the
 encrypted archive SHA-256, the source/manifest version, the encryption
-format/version, and creation/update instructions.
+format/version, and creation/update instructions. The Russian counterparts
+(`canonical.ru.tar.zst.age` + `metadata.ru.json`, issue #50) use the same
+age recipient/identity contract with independently versioned artifact
+metadata/checksums; see `docs/russian-corpus.md`.
 
 ## One-time production setup (owner action, tracked in #28)
 
@@ -70,7 +75,10 @@ python3 scripts/age_provision.py \
 ## Runtime restore
 
 `scripts/restore_canonical.py` is the single canonical bootstrap/restore
-entry point. Later tasks must call it instead of inventing their own
+entry point (`--lang ru` selects the Russian artifact from
+`corpus/canonical.ru.manifest.json` into
+`corpus/generated/canonical.ru.json` via `canonical.ru.tar.zst.age`).
+Later tasks must call it instead of inventing their own
 source-loading path.
 
 Runtime order:

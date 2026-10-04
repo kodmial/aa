@@ -375,19 +375,32 @@ def test_no_private_key_or_plaintext_committed() -> None:
         not in (
             "corpus/source/encrypted/README.md",
             "corpus/source/encrypted/metadata.json",
+            "corpus/source/encrypted/metadata.ru.json",
         )
         and not p.endswith(".age")
+    ]
+    assert not [
+        p
+        for p in tracked
+        if p.startswith("corpus/source/encrypted/")
+        and p.endswith(".txt")
+        and p != "corpus/source/encrypted/recipient.txt"
     ]
     for path in tracked:
         if (
             path.startswith("corpus/source/encrypted/")
             and path.endswith(".age")
-            and path != "corpus/source/encrypted/canonical.tar.zst.age"
+            and path
+            not in (
+                "corpus/source/encrypted/canonical.tar.zst.age",
+                "corpus/source/encrypted/canonical.ru.tar.zst.age",
+            )
         ):
             raise AssertionError(f"unexpected committed snapshot fixture: {path}")
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "/corpus/generated/" in gitignore
     assert "/corpus/source/raw/" in gitignore
+    assert "/corpus/source/raw-ru/" in gitignore
     assert "AGE-SECRET-KEY" in gitignore
 
 

@@ -1,10 +1,16 @@
 """Runtime access to the canonical AA artifact (no silent truncation).
 
-The artifact is produced by ``scripts/build_canonical.py`` into the ignored
+The artifact is produced by ``scripts/build_canonical.py`` (English) or
+``scripts/build_canonical_ru.py`` (Russian, issue #50) into the ignored
 ``corpus/generated/`` workspace; this module only reads it. Every load
 re-verifies per-section SHA-256 digests, and every read enforces exact
 bounds, so a corrupt artifact or an out-of-range request fails closed
 instead of returning silently truncated text.
+
+Production source policy (issue #50): Russian is the primary
+source/evidence language for Russian users; English remains a separately
+versioned control/reference corpus. Generated translation must never be
+silently substituted for a source-exact Russian quotation.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ARTIFACT_FORMAT = "aa-canonical/1"
+RU_ARTIFACT_FORMAT = "aa-canonical-ru/1"
 
 EXPECTED_SECTION_IDS = (
     "doctors-opinion",
@@ -30,6 +37,11 @@ EXPECTED_SECTION_IDS = (
     "chapter-10",
     "chapter-11",
 )
+
+# The Russian canonical scope mirrors the English one: Мнение доктора plus
+# Chapters 1-11 of the Russian Fourth Edition (issue #50), with
+# language-neutral section ids.
+RU_EXPECTED_SECTION_IDS = EXPECTED_SECTION_IDS
 
 
 class CanonicalCorpusError(ValueError):
@@ -91,7 +103,13 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def load_canonical(path: str | Path, *, expected_sha256: str | None = None) -> CanonicalCorpus:
+def load_canonical(
+    path: str | Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_format: str = ARTIFACT_FORMAT,
+    expected_section_ids: tuple[str, ...] = EXPECTED_SECTION_IDS,
+) -> CanonicalCorpus:
     """Load and validate the canonical artifact (fails closed on mismatch)."""
     raw_path = Path(path)
     try:
@@ -103,7 +121,7 @@ def load_canonical(path: str | Path, *, expected_sha256: str | None = None) -> C
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CanonicalCorpusError(f"canonical artifact is not valid JSON: {exc}") from exc
 
-    if not isinstance(artifact, dict) or artifact.get("format") != ARTIFACT_FORMAT:
+    if not isinstance(artifact, dict) or artifact.get("format") != expected_format:
         raise CanonicalCorpusError(f"unsupported canonical artifact format: {raw_path}")
     if expected_sha256 is not None and _digest(payload) != expected_sha256:
         raise CanonicalCorpusError(f"canonical artifact checksum mismatch: {raw_path}")
@@ -120,21 +138,32 @@ def load_canonical(path: str | Path, *, expected_sha256: str | None = None) -> C
             raise CanonicalCorpusError("canonical artifact has an empty section text")
         if _digest(text.encode("utf-8")) != entry.get("text_sha256"):
             raise CanonicalCorpusError(f"canonical section checksum mismatch: {entry.get('id')!r}")
-        for key in ("id", "title", "source_id", "source_url", "source_file"):
+        for key in ("id", "title", "source_id", "source_file"):
             if not isinstance(entry.get(key), str) or not entry.get(key):
                 raise CanonicalCorpusError(f"canonical section is missing {key}")
+        source_url = entry.get("source_url")
         sections.append(
             CanonicalSection(
                 id=str(entry["id"]),
                 title=str(entry["title"]),
                 source_id=str(entry["source_id"]),
-                source_url=str(entry["source_url"]),
+                source_url=str(source_url) if isinstance(source_url, str) else "",
                 source_file=str(entry["source_file"]),
                 text=text,
             )
         )
 
     corpus = CanonicalCorpus(sections=tuple(sections))
-    if corpus.ids() != EXPECTED_SECTION_IDS:
+    if corpus.ids() != expected_section_ids:
         raise CanonicalCorpusError(f"canonical section order mismatch: {corpus.ids()!r}")
     return corpus
+
+
+def load_canonical_ru(path: str | Path, *, expected_sha256: str | None = None) -> CanonicalCorpus:
+    """Load and validate the Russian canonical artifact (issue #50)."""
+    return load_canonical(
+        path,
+        expected_sha256=expected_sha256,
+        expected_format=RU_ARTIFACT_FORMAT,
+        expected_section_ids=RU_EXPECTED_SECTION_IDS,
+    )

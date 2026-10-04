@@ -65,16 +65,46 @@ python3 scripts/build_canonical.py
 Runtime context budgets for the retrieval system are documented in
 `docs/context-budget.md`.
 
-## Encrypted snapshot and restore (issue #24)
+## Russian canonical build (issue #50)
 
-The reproducible encrypted snapshot in `corpus/source/encrypted/` is the
+The Russian Fourth Edition pipeline mirrors the English one but its single
+canonical input is the normalized TXT `corpus/source/raw-ru/aa-big-book.txt`
+(ignored by Git). PDF extraction and OCR are never part of the canonical path.
+
+- `scripts/fetch_ru_source.py` reuses the TXT in the trusted runtime, or
+  assembles it once via `--bootstrap-from-provider` from the text-native
+  provider pages pinned by `corpus/source.ru.lock.json`, recording SHA-256
+  in the ignored `corpus/source/fetch-ru-state.json`;
+- `scripts/build_canonical_ru.py` reads only that TXT: deterministic UTF-8
+  decoding (BOM stripped), NFC/newline transport normalization, Fourth
+  Edition / 2013 / ISBN `978-5-906531-01-8` identity validation, exact
+  Мнение доктора + Chapters 1-11 order/boundaries/headings/control passages,
+  then writes `corpus/generated/canonical.ru.json` and
+  `corpus/generated/canonical.ru.txt` (both ignored by Git) after verifying
+  every section SHA and both artifact SHAs against the committed
+  `corpus/canonical.ru.manifest.json`.
+
+```bash
+python3 scripts/fetch_ru_source.py --bootstrap-from-provider
+python3 scripts/build_canonical_ru.py
+```
+
+See `docs/russian-corpus.md` for the full contract.
+
+## Encrypted snapshot and restore (issues #24, #50)
+
+The reproducible encrypted snapshots in `corpus/source/encrypted/` are the
 durable cross-run cache for this small corpus. Plaintext book text and
 plaintext retrieval indexes are never stored in Git or in GitHub Actions
-cache. `scripts/restore_canonical.py` is the single restore entry point:
+cache. `scripts/restore_canonical.py` is the single restore entry point
+(`--lang ru` selects the Russian artifact):
 it reuses a valid `corpus/generated/canonical.json`, otherwise decrypts
 the committed snapshot with `AA_BOOK_AGE_IDENTITY`, otherwise falls back
 to the deterministic #3 fetch/build only when explicitly allowed, and
-fails closed otherwise. Production activation is deferred to #28. See
+fails closed otherwise. The Russian counterpart
+(`corpus/generated/canonical.ru.json` via `canonical.ru.tar.zst.age` +
+`metadata.ru.json`, same age recipient, no second key) works the same way.
+Production activation is deferred to #28. See
 `docs/encrypted-snapshot.md`.
 
 ## Derived artifacts

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Refresh the encrypted canonical-book snapshot (issue #24).
+"""Refresh the encrypted canonical-book snapshot (issues #24, #50).
 
-Reads the validated canonical artifact from ``scripts/build_canonical.py``,
+Reads the validated canonical artifact from ``scripts/build_canonical.py``
+(English) or ``scripts/build_canonical_ru.py`` (Russian, via ``--manifest`` /
+``--source-lock`` / ``--canonical`` / ``--archive-name`` / ``--metadata-name``
+/ ``--canonical-name`` overrides),
 packs the exact artifact bytes plus minimum provenance metadata into a
 deterministic ``tar.zst`` archive, encrypts it with the committed public age
 recipient, and writes only the encrypted archive plus non-secret
@@ -38,6 +41,7 @@ from aa.corpus.age_v1 import (  # noqa: E402
 )
 from aa.corpus.encrypted_snapshot import (  # noqa: E402
     ARCHIVE_NAME,
+    CANONICAL_NAME,
     METADATA_NAME,
     RECIPIENT_NAME,
     build_metadata,
@@ -87,6 +91,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recipient-file", type=Path, default=None)
     parser.add_argument("--identity-file", type=Path, default=None)
     parser.add_argument("--skip-decrypt-verify", action="store_true")
+    parser.add_argument(
+        "--archive-name",
+        type=str,
+        default=ARCHIVE_NAME,
+        help="Encrypted archive file name inside --encrypted-dir (RU: canonical.ru.tar.zst.age).",
+    )
+    parser.add_argument(
+        "--metadata-name",
+        type=str,
+        default=METADATA_NAME,
+        help="Metadata file name inside --encrypted-dir (RU: metadata.ru.json).",
+    )
+    parser.add_argument(
+        "--canonical-name",
+        type=str,
+        default=CANONICAL_NAME,
+        help="Canonical member name inside the tar.zst archive (RU: canonical.ru.json).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -120,7 +142,12 @@ def main(argv: list[str] | None = None) -> int:
     except AgeError as exc:
         return _fail(f"invalid age recipient: {exc}")
 
-    tar_zst = create_tar_zst(canonical_bytes, manifest=manifest, source_lock=source_lock)
+    tar_zst = create_tar_zst(
+        canonical_bytes,
+        manifest=manifest,
+        source_lock=source_lock,
+        canonical_name=args.canonical_name,
+    )
     try:
         encrypted = encrypt_bytes(tar_zst, [recipient])
     except AgeError as exc:
@@ -142,14 +169,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         try:
             recovered_zst = decrypt_bytes(encrypted, [identity])
-            recovered_canonical, _ = extract_tar_zst(recovered_zst)
+            recovered_canonical, _ = extract_tar_zst(
+                recovered_zst, expected_canonical_name=args.canonical_name
+            )
         except (AgeError, ValueError) as exc:
             return _fail(f"decrypt verification failed: {exc}")
         if sha256_bytes(recovered_canonical) != actual_sha:
             return _fail("decrypt verification failed: canonical SHA mismatch after round-trip")
 
     args.encrypted_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = args.encrypted_dir / ARCHIVE_NAME
+    archive_path = args.encrypted_dir / args.archive_name
     tmp_path = archive_path.with_name(archive_path.name + ".tmp")
     tmp_path.write_bytes(encrypted)
     if tmp_path.read_bytes() != encrypted:
@@ -167,8 +196,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest=manifest,
         source_lock=source_lock,
         recipient=recipient,
+        encrypted_file=f"corpus/source/encrypted/{args.archive_name}",
+        canonical_name=args.canonical_name,
     )
-    metadata_path = args.encrypted_dir / METADATA_NAME
+    metadata_path = args.encrypted_dir / args.metadata_name
     tmp_metadata = metadata_path.with_name(metadata_path.name + ".tmp")
     metadata_text = json.dumps(metadata, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
     tmp_metadata.write_text(metadata_text, encoding="utf-8")
