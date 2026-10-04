@@ -930,6 +930,10 @@ def _check_oracle_manifest(manifest: dict[str, Any]) -> None:
     coverage = (
         str(manifest.get("coverage_note", "")) + " " + str(manifest.get("note", ""))
     ).casefold()
+    if "coverage-balanced" not in coverage or "not population prevalence" not in coverage:
+        raise RuRealWorldCorpusError(
+            "oracle manifest must state coverage-balanced fixture is not prevalence/pass-rate"
+        )
     if "session-reset" not in coverage and "session_reset" not in coverage:
         raise RuRealWorldCorpusError(
             "oracle manifest must document the /new session-reset reclassification "
@@ -1432,6 +1436,48 @@ def _check_oracle_label_distinctness(
         seen[label] = str(record.get("id"))
 
 
+def _check_audience_evidence(
+    audience: str, utterance: str, topic: str, journey: str, owner: str
+) -> None:
+    """Validate a stored oracle audience against independent review evidence.
+
+    This must stay independent of the builder helper ``_audience_for`` (used
+    by :func:`build_projections` to assign oracle audiences): it justifies
+    the stored label from visible topic/journey assignments and utterance
+    markers instead of recomputing the builder heuristic, so a systematic
+    builder misclassification of self vs relative/partner vs general cannot
+    validate against itself.
+    """
+    if journey in RELATIVE_JOURNEYS or topic in RELATIVE_TOPICS:
+        if audience != "relative/partner":
+            raise RuRealWorldCorpusError(
+                f"{owner}: audience {audience!r} contradicts reviewed "
+                f"relative topic/journey (topic={topic!r} journey={journey!r})"
+            )
+        return
+    text = utterance.casefold()
+    has_relative = any(marker in text for marker in RELATIVE_UTTERANCE_MARKERS)
+    tokens = text.split()
+    has_self = "я" in tokens or any(marker in text for marker in SELF_UTTERANCE_MARKERS)
+    if has_relative:
+        if audience != "relative/partner":
+            raise RuRealWorldCorpusError(
+                f"{owner}: audience {audience!r} lacks relative/partner evidence "
+                "in the utterance despite a relative marker"
+            )
+    elif has_self:
+        if audience != "self":
+            raise RuRealWorldCorpusError(
+                f"{owner}: audience {audience!r} contradicts self help-seeking "
+                "evidence in the utterance"
+            )
+    elif audience != "general":
+        raise RuRealWorldCorpusError(
+            f"{owner}: audience {audience!r} has no self or relative/partner "
+            "evidence in the utterance, expected 'general'"
+        )
+
+
 def _check_review_semantics(
     oracle_singles: list[Any],
     oracle_journeys: list[Any],
@@ -1495,15 +1541,13 @@ def _check_review_semantics(
                 )
         # Per-utterance audience guard: topic-clustered singles (e.g. the
         # RU-S-001..010 quit_control block) legitimately share identical
-        # oracle metadata, but the stored audience must still match the
-        # utterance-derived perspective for every individual case.
+        # oracle metadata, but the stored audience must still be justified by
+        # independent utterance/topic evidence for every individual case
+        # (see _check_audience_evidence; never recompute the builder helper).
         utterance = input_utterances.get(str(record["id"]), "")
-        expected_audience = _audience_for(utterance, topic, "")
-        if str(record.get("audience")) != expected_audience:
-            raise RuRealWorldCorpusError(
-                f"{record['id']}: audience {record.get('audience')!r} does not match "
-                f"utterance-derived audience {expected_audience!r}"
-            )
+        _check_audience_evidence(
+            str(record.get("audience")), utterance, topic, "", str(record["id"])
+        )
     _check_oracle_label_distinctness(oracle_singles, input_utterances)
     oracle_by_id = {str(r["id"]): r for r in oracle_journeys if isinstance(r, dict)}
     if len(oracle_by_id) != len(oracle_journeys):
@@ -1540,13 +1584,13 @@ def _check_review_semantics(
                         f"the emergency classifier ({classifiers(classification)})"
                     )
             utterance = input_utterances.get(f"{record['id']}#{turn['turn']}", "")
-            expected_audience = _audience_for(utterance, "", str(record["journey"]))
-            if str(turn.get("audience")) != expected_audience:
-                raise RuRealWorldCorpusError(
-                    f"{record['id']} turn {turn['turn']}: audience "
-                    f"{turn.get('audience')!r} does not match utterance-derived "
-                    f"audience {expected_audience!r}"
-                )
+            _check_audience_evidence(
+                str(turn.get("audience")),
+                utterance,
+                "",
+                str(record["journey"]),
+                f"{record['id']} turn {turn['turn']}",
+            )
     _require_three_state_coverage(oracle_singles, oracle_journeys)
 
 

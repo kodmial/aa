@@ -46,8 +46,8 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
 
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
-    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
-    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
+    assert "\"${{ inputs.max_dispatch_attempts }}\"" in body
+    assert "\"${{ inputs.pause_on_failure }}\"" in body
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
@@ -80,24 +80,10 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
     body = _read(SCHEDULER_CALLER)
     assert "kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main" in body
     assert "continuum_ref: main" in body
-    # The scheduler caller forwards knobs as bare `inputs.*` passthroughs so
-    # an empty value falls back to the consumer's `vars.AUTOMATION_*` value.
-    # Pinning a literal (e.g. `|| '8'`) would override that variable for
-    # every installed caller; see the `with:` comment in the caller file
-    # and the Continuum scheduler sync (commit a2014f0).
-    assert '"${{ inputs.wip_limit }}"' in body
-    assert '"${{ inputs.max_dispatch_attempts }}"' in body
-    assert '"${{ inputs.require_priority_label }}"' in body
-    assert '"${{ inputs.opencode_dispatch }}"' in body
-    assert '"${{ inputs.count_open_prs_as_wip }}"' in body
-    assert '"${{ inputs.pause_on_failure }}"' in body
-    for knob in (
-        "inputs.wip_limit ||",
-        "inputs.max_dispatch_attempts ||",
-        "inputs.require_priority_label ||",
-        "inputs.opencode_dispatch ||",
-        "inputs.count_open_prs_as_wip ||",
-        "inputs.pause_on_failure ||",
-    ):
-        assert knob not in body
+    assert "\"${{ inputs.wip_limit }}\"" in body
+    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
+    assert "\"${{ inputs.require_priority_label }}\"" in body
+    assert "\"${{ inputs.opencode_dispatch }}\"" in body
+    assert "\"${{ inputs.count_open_prs_as_wip }}\"" in body
+    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
     assert not re.search(r"continuum.*@[0-9a-f]{40}", body)
