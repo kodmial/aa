@@ -375,8 +375,12 @@ async def test_emergency_path_precedes_opencode_and_skips_llm() -> None:
         client = runtime.client
         assert isinstance(client, FakeOpenCodeClient)
         assert client._sessions == {}
+        # A substantive turn without a qualified RU index fails closed
+        # (issue #9): no invented answer is ever returned from memory.
+        from aa.conversation.orchestrator import FAIL_CLOSED_REPLY
+
         normal = await app.respond(123, "What does the Big Book say about fear?")
-        assert normal.startswith("fake-reply-")
+        assert normal == FAIL_CLOSED_REPLY
         assert len(client._sessions) == 1
     finally:
         await app.stop()

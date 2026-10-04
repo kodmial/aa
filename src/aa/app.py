@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
+from aa.conversation.orchestrator import (
+    FAIL_CLOSED_REPLY,
+    TurnFailed,
+    TurnRunner,
+    is_substantive,
+    run_trivial_turn,
+)
 from aa.corpus.context import CorpusContext
 from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
+from aa.retrieval.index import HybridIndex, open_hybrid_index
 from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
@@ -73,6 +82,9 @@ class Application:
         # a caller explicitly allows it. The agent prompt states the
         # user-facing duties and defers enforcement to this gate.
         self.grounding = grounding or GroundingGate(corpus_version=settings.aa_corpus_version)
+        self._turn_runner: TurnRunner | None = None
+        self._index: HybridIndex | None = None
+        self._index_error: str | None = None
         self._running = False
         self._wire_transport_handlers()
 
@@ -201,14 +213,110 @@ class Application:
                 model=self.settings.opencode_fallback_model,
             )
 
+    def _turn_index(self) -> HybridIndex:
+        """Open (once) the RU-first hybrid index or fail closed.
+
+        The opened index is reused across ordinary turns; provider
+        failures never invalidate or rebuild it here.
+        """
+        if self._index is not None:
+            return self._index
+        if self._index_error is not None:
+            raise TurnFailed("corpus-unavailable", self._index_error)
+        try:
+            corpus_root = Path(self.settings.aa_corpus_path)
+            index_dir = corpus_root / "generated" / "retrieval"
+            self._index = open_hybrid_index(
+                index_dir,
+                ru_manifest_path=corpus_root / "canonical.ru.manifest.json",
+                en_manifest_path=corpus_root / "canonical.manifest.json",
+                lock_path=corpus_root / "embedding.lock.json",
+            )
+            return self._index
+        except (ValueError, OSError, RuntimeError) as exc:
+            self._index_error = str(exc)
+            raise TurnFailed("corpus-unavailable", self._index_error) from exc
+
+    def _get_turn_runner(self) -> TurnRunner:
+        """Build the deterministic turn runner for the pinned runtime."""
+        if self._turn_runner is not None and self._turn_runner.index is not None:
+            return self._turn_runner
+        self._index_error = None
+        try:
+            index: HybridIndex | None = self._turn_index()
+        except TurnFailed:
+            index = None
+        runner = TurnRunner(
+            index=index,
+            ru_corpus_version=self.settings.aa_corpus_version,
+            agent=self.settings.opencode_agent,
+            primary_model=self.settings.opencode_model,
+            fallback_model=self.settings.opencode_fallback_model,
+        )
+        if runner.index is not None:
+            self._turn_runner = runner
+        return runner
+
+    async def _run_trivial_turn(self, session_id: str, text: str) -> str:
+        """Execute the direct bounded agent path for one non-substantive turn."""
+        client = self.opencode_runtime.client
+
+        async def _trivial_send(
+            sid: str,
+            prompt: str,
+            *,
+            agent: str = "",
+            model: str = "",
+            timeout: float | None = None,
+        ) -> str:
+            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
+
+        synthesis = await run_trivial_turn(
+            text,
+            session_id=session_id,
+            send=_trivial_send,
+            agent=self.settings.opencode_agent,
+            primary_model=self.settings.opencode_model,
+            fallback_model=self.settings.opencode_fallback_model,
+        )
+        return synthesis.text
+
+    async def _run_grounded_turn(self, session_id: str, text: str) -> str:
+        """Execute the production grounded pipeline for one substantive turn."""
+        runner = self._get_turn_runner()
+        if runner.index is None:
+            raise TurnFailed("corpus-unavailable", "RU corpus/index is unavailable")
+        client = self.opencode_runtime.client
+
+        async def _send(
+            sid: str,
+            prompt: str,
+            *,
+            agent: str = "",
+            model: str = "",
+            timeout: float | None = None,
+        ) -> str:
+            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
+
+        try:
+            response = await runner.run_grounded_turn(text, session_id=session_id, send=_send)
+        except TurnFailed as exc:
+            if exc.category == "session-not-found":
+                raise
+            raise
+        return response.text
+
     async def respond(self, chat_id: int, text: str) -> str:
         """Answer one inbound message with emergency precedence.
 
         The deterministic safety layer runs first: when it takes the
         emergency route, the bounded safe reply is returned immediately
         and no OpenCode work is scheduled (the LLM never decides whether
-        the emergency route is taken). Otherwise the message is forwarded
-        to the OpenCode runtime bound to ``chat_id``.
+        the emergency route is taken). Substantive turns run the full
+        Russian-first grounded pipeline (issue #9); non-substantive
+        greetings take a direct bounded agent path. Retrieval/grounding
+        failures fail closed with a fixed message instead of an invented
+        answer.
 
         Only message lengths and routing decisions are logged, never the
         message body.
@@ -227,14 +335,89 @@ class Application:
             chat_id, self.opencode_runtime.client
         )
         try:
-            reply = await self._send_grounded_message(session_id, text)
+            if not is_substantive(text):
+                try:
+                    trivial_reply = await self._run_trivial_turn(session_id, text)
+                except TurnFailed as exc:
+                    if exc.category == "session-not-found":
+                        try:
+                            session_id = await self.sessions.reset_opencode_session(
+                                chat_id, self.opencode_runtime.client, delete_remote=False
+                            )
+                            trivial_reply = await self._run_trivial_turn(session_id, text)
+                        except OpenCodeSessionNotFoundError as exc2:
+                            raise TurnFailed(
+                                "session-not-found", "opencode session is gone"
+                            ) from exc2
+                    else:
+                        raise
+                logger.info("trivial response served", extra={"chat_id": chat_id})
+                return trivial_reply
+            try:
+                reply = await self._run_grounded_turn(session_id, text)
+            except TurnFailed as exc:
+                if exc.category == "session-not-found":
+                    try:
+                        session_id = await self.sessions.reset_opencode_session(
+                            chat_id, self.opencode_runtime.client, delete_remote=False
+                        )
+                        reply = await self._run_grounded_turn(session_id, text)
+                    except OpenCodeSessionNotFoundError as exc2:
+                        raise TurnFailed("session-not-found", "opencode session is gone") from exc2
+                else:
+                    raise
+        except TurnFailed as exc:
+            logger.warning(
+                "grounded turn failed closed",
+                extra={"chat_id": chat_id, "category": exc.category},
+            )
+            return FAIL_CLOSED_REPLY
         except OpenCodeSessionNotFoundError:
             # A local chat mapping can outlive an OpenCode session after a
-            # runtime restart. Rebind once and retry against a fresh session.
-            session_id = await self.sessions.reset_opencode_session(
-                chat_id, self.opencode_runtime.client, delete_remote=False
-            )
-            reply = await self._send_grounded_message(session_id, text)
+            # runtime restart. Rebind once and retry against a fresh session,
+            # preserving the original routing: non-substantive greetings retry
+            # through the direct trivial path (never the RU grounded pipeline).
+            try:
+                session_id = await self.sessions.reset_opencode_session(
+                    chat_id, self.opencode_runtime.client, delete_remote=False
+                )
+            except OpenCodeSessionNotFoundError:
+                logger.warning(
+                    "grounded turn failed closed after rebind",
+                    extra={"chat_id": chat_id, "category": "session-not-found"},
+                )
+                return FAIL_CLOSED_REPLY
+            if not is_substantive(text):
+                try:
+                    trivial_retry = await self._run_trivial_turn(session_id, text)
+                except TurnFailed as exc:
+                    logger.warning(
+                        "trivial turn failed closed after rebind",
+                        extra={"chat_id": chat_id, "category": exc.category},
+                    )
+                    return FAIL_CLOSED_REPLY
+                except OpenCodeSessionNotFoundError:
+                    logger.warning(
+                        "trivial turn failed closed after rebind",
+                        extra={"chat_id": chat_id, "category": "session-not-found"},
+                    )
+                    return FAIL_CLOSED_REPLY
+                logger.info("trivial response served", extra={"chat_id": chat_id})
+                return trivial_retry
+            try:
+                reply = await self._run_grounded_turn(session_id, text)
+            except TurnFailed as exc:
+                logger.warning(
+                    "grounded turn failed closed after rebind",
+                    extra={"chat_id": chat_id, "category": exc.category},
+                )
+                return FAIL_CLOSED_REPLY
+            except OpenCodeSessionNotFoundError:
+                logger.warning(
+                    "grounded turn failed closed after rebind",
+                    extra={"chat_id": chat_id, "category": "session-not-found"},
+                )
+                return FAIL_CLOSED_REPLY
         logger.info("normal response served", extra={"chat_id": chat_id})
         return reply
 
