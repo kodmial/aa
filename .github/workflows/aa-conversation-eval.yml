@@ -26,6 +26,34 @@ on:
         type: string
   issues:
     types: [closed]
+  # Automatic requalification: a product-qualification input change that
+  # advances main must rerun #62 for the new trusted #40 PASS SHA instead
+  # of stranding downstream work. Unrelated scheduler/docs-only commits
+  # no-op at readiness because the product fingerprint is unchanged.
+  push:
+    branches: [main]
+    paths:
+      - "src/aa/conversation/**"
+      - "src/aa/retrieval/**"
+      - "src/aa/grounding/**"
+      - "src/aa/corpus/**"
+      - "src/aa/safety/**"
+      - "src/aa/sessions/**"
+      - "src/aa/telegram/**"
+      - "src/aa/qualification/**"
+      - "src/aa/app.py"
+      - "src/aa/config.py"
+      - "src/aa/__main__.py"
+      - "prompts/aa-agent-system.md"
+      - "opencode.json"
+      - "corpus/**"
+      - "qualification/**"
+      - "qualification/production_boundary.v1.json"
+      - "scripts/verify_runtime_qualification.py"
+      - ".opencode/tools/book_search.ts"
+      - ".opencode/tools/book_read.ts"
+      - ".opencode/tools/book_expand.ts"
+      - ".opencode/tools/book_section.ts"
 
 permissions:
   contents: read
@@ -41,10 +69,13 @@ env:
   EVAL_MAX_PARALLEL: "2"
 
 jobs:
-  # Lightweight readiness gate (read-only). Every automatic wake-up re-fetches
-  # #40/#61/#72 and no-ops unless all are closed/current. Closing #72 is
-  # sufficient to trigger the first authoritative run when #40 already
-  # passed before #72 merged.
+  # Lightweight readiness gate (read-only). Every automatic wake-up uses
+  # trusted result state, never issue closed state: #40 is a reusable
+  # tracker that stays open across many SHAs, so readiness requires the
+  # current trusted #40 PASS tuple (not `#40.state == closed`) plus frozen
+  # #61 corpus and merged #72 harness readiness. Closing #72 is sufficient
+  # to trigger the first authoritative run when #40 already passed before
+  # #72 merged.
   readiness:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -98,16 +129,19 @@ jobs:
                 return;
               }
               const requested = ((context.payload.inputs && context.payload.inputs.exact_sha) || '').trim();
-              // Manual dispatches enforce the same closed prerequisites as
-              // automatic runs: #40/#61/#72 must all be closed/current.
+              // Manual dispatches enforce the same result-state contract as
+              // automatic runs: the frozen #61 corpus and merged #72
+              // harness must be ready, and a current trusted #40 PASS tuple
+              // must exist. #40 stays open as a reusable tracker, so its
+              // closed state is never required.
               async function getDispatchIssue(num) {
                 const { data } = await github.rest.issues.get({
                   owner: context.repo.owner, repo: context.repo.repo, issue_number: num,
                 });
                 return data;
               }
-              const [d40, d61, d72] = await Promise.all([
-                getDispatchIssue(40), getDispatchIssue(61), getDispatchIssue(72),
+              const [d61, d72] = await Promise.all([
+                getDispatchIssue(61), getDispatchIssue(72),
               ]);
               if (d61.state !== 'closed') {
                 core.setOutput('proceed', 'false');
@@ -127,16 +161,9 @@ jobs:
                 setShardOutputs(n);
                 return;
               }
-              if (d40.state !== 'closed') {
-                core.setOutput('proceed', 'false');
-                core.setOutput('exact_sha', '');
-                core.setOutput('corpus_sha', '');
-                core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
-                core.notice('aa-conversation-eval no-op: #40 not closed (manual dispatch).');
-                setShardOutputs(n);
-                return;
-              }
-              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+              // #40 is reusable and stays open: readiness uses the trusted
+              // PASS tuple below, never the tracker closed state.
+              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
               let passShaDispatch = '';
               for await (const { data: comments } of github.paginate.iterator(
                 github.rest.issues.listComments,
@@ -224,13 +251,19 @@ jobs:
               setShardOutputs(n);
               return;
             }
-            // Automatic wake-ups only react to prerequisite tracker closures.
+            // Automatic wake-ups react to prerequisite readiness and to
+            // product-input pushes: #61/#72 closures plus main pushes
+            // touching the product-qualification input set. #40 stays open
+            // as a reusable tracker, so its closed state is never required;
+            // readiness below uses the current trusted #40 PASS tuple.
             const issueNumber = context.payload.issue ? context.payload.issue.number : 0;
-            if (eventName !== 'issues' || ![40, 61, 72].includes(issueNumber)) {
+            if (eventName === 'push') {
+              core.notice('aa-conversation-eval: product-input push wakes revalidation.');
+            } else if (eventName !== 'issues' || ![61, 72, 40].includes(issueNumber)) {
               core.setOutput('proceed', 'false');
               core.setOutput('exact_sha', '');
               core.setOutput('corpus_sha', '');
-              core.setOutput('reason', `no-op: wake-up is not a #40/#61/#72 closure (issue ${issueNumber})`);
+              core.setOutput('reason', `no-op: wake-up is not a #61/#72 readiness event or product push (issue ${issueNumber})`);
               core.notice('aa-conversation-eval no-op: unrelated issue event.');
               setShardOutputs(4);
               return;
@@ -241,9 +274,10 @@ jobs:
               });
               return data;
             }
-            const [i40, i61, i72] = await Promise.all([getIssue(40), getIssue(61), getIssue(72)]);
-            // Every automatic wake-up must re-fetch #40/#61/#72 and no-op
-            // unless all are closed/current.
+            const [i61, i72] = await Promise.all([getIssue(61), getIssue(72)]);
+            // Every automatic wake-up revalidates frozen corpus/harness
+            // readiness and the current trusted #40 PASS tuple below. #40
+            // may remain open/reusable; only its PASS tuple matters.
             if (i61.state !== 'closed') {
               core.setOutput('proceed', 'false');
               core.setOutput('exact_sha', '');
@@ -262,19 +296,11 @@ jobs:
               setShardOutputs(4);
               return;
             }
-            if (i40.state !== 'closed') {
-              core.setOutput('proceed', 'false');
-              core.setOutput('exact_sha', '');
-              core.setOutput('corpus_sha', '');
-              core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
-              core.notice('aa-conversation-eval no-op: #40 not closed.');
-              setShardOutputs(4);
-              return;
-            }
             // Find the latest trusted #40 PASS marker for the exact SHA.
             // A later FAIL supersedes any earlier PASS, so a FAIL clears the
             // recorded passSha instead of leaving a stale PASS current.
-            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            // #40 stays open/reusable: only this tuple gates execution.
+            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
@@ -410,7 +436,7 @@ jobs:
               core.setFailed('corpus_sha is not a valid 64-hex frozen corpus checksum; refusing unqualified run');
               return;
             }
-            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
@@ -741,7 +767,7 @@ jobs:
             // Revalidate the current trusted #40 PASS marker at publication
             // time: a FAIL superseding the PASS after shards start must not
             // still publish COMPLETE.
-            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passShaPublish = '';
             for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 })) {
               for (const c of comments) {

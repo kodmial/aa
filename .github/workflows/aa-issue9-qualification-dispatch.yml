@@ -3,7 +3,11 @@ name: AA issue-9 qualification dispatch
 # After the #9 grounded conversational runtime merges to main, automatically
 # dispatch the exact-main #40 qualification (continuum-opencode
 # qualification mode: capability #9, qualification #40) at the merged SHA.
-# Validation only; product code is never repaired here.
+# Validation only; product code is never repaired here. The path filter is
+# the deterministic product-qualification input set: runtime code, prompt,
+# retrieval/grounding, corpus/index bindings, Telegram production adapter
+# and relevant config. Unrelated scheduler/docs-only commits never dispatch
+# here and never stale product qualification.
 
 on:
   push:
@@ -11,10 +15,20 @@ on:
       - main
     paths:
       - "src/aa/conversation/**"
+      - "src/aa/retrieval/**"
+      - "src/aa/grounding/**"
+      - "src/aa/corpus/**"
+      - "src/aa/safety/**"
+      - "src/aa/sessions/**"
+      - "src/aa/telegram/**"
+      - "src/aa/qualification/**"
       - "src/aa/app.py"
+      - "src/aa/config.py"
       - "scripts/verify_runtime_qualification.py"
       - "prompts/aa-agent-system.md"
       - "opencode.json"
+      - "qualification/production_boundary.v1.json"
+      - ".opencode/tools/book_*.ts"
   workflow_dispatch:
     inputs:
       required_sha:

@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from aa.conversation.meta import is_meta_capability_request
 from aa.conversation.output_limits import (
     ENVELOPE_FALLBACK_REPLY,
     HARD_CHARS,
@@ -483,12 +484,17 @@ def is_substantive(text: str) -> bool:
     """Return whether ``text`` needs the full grounded pipeline.
 
     Empty text is not substantive (the safety layer blocks it first).
-    Exact trivial greetings/thanks bypass retrieval; short follow-up
-    questions and interrogatives (``почему?``, ``а дальше?``) always
-    take the full state machine so no substantive turn skips grounding.
+    Meta/capability/identity questions (``А что ты можешь?``) are
+    conversational turns and never enter the grounded pipeline, so they
+    cannot fail closed as unsupported book answers. Exact trivial
+    greetings/thanks bypass retrieval; short follow-up questions and
+    interrogatives (``почему?``, ``а дальше?``) always take the full
+    state machine so no substantive turn skips grounding.
     """
     stripped = text.strip()
     if not stripped:
+        return False
+    if is_meta_capability_request(stripped):
         return False
     normalized = normalize_ru(stripped)
     if normalized in _TRIVIAL_NORMALIZED:

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
+from aa.conversation.meta import META_CAPABILITY_REPLY, is_meta_capability_request
 from aa.conversation.orchestrator import (
     FAIL_CLOSED_REPLY,
     TurnFailed,
@@ -811,6 +812,14 @@ class Application:
         if result.decision is SafetyDecision.BLOCK:
             logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
+        # Meta/capability/identity turns are conversational, never
+        # book-grounded: serve the bounded deterministic capability reply
+        # without retrieval, grounding, or model dependence so they cannot
+        # fail closed as unsupported book answers (issues #105/#106).
+        if is_meta_capability_request(text):
+            await self.sessions.ensure_opencode_session(chat_id, self.opencode_runtime.client)
+            logger.info("meta capability response served", extra={"chat_id": chat_id})
+            return self._fit_envelope(META_CAPABILITY_REPLY)
         session_id = await self.sessions.ensure_opencode_session(
             chat_id, self.opencode_runtime.client
         )
