@@ -282,11 +282,10 @@ class EvidencePack:
         mapping: dict[str, EvidenceUnit] = {}
         for unit in self.units:
             provenance = unit.provenance
-            short = f"{provenance.source_id}/{provenance.section_id}"
-            if provenance.chunk_id:
-                short = f"{short}#{provenance.chunk_id}"
+            if not provenance.chunk_id:
+                continue
+            short = f"{provenance.source_id}/{provenance.section_id}#{provenance.chunk_id}"
             mapping[short] = unit
-            mapping[f"{provenance.source_id}/{provenance.section_id}"] = unit
         return mapping
 
 
@@ -524,10 +523,15 @@ async def run_planner(
                     text, utterance_id=utterance_id
                 )
             else:
-                produced = planner_fn(text)
-                if isinstance(produced, Awaitable):
-                    produced = await produced
-                payload = _coerce_mapping(produced, owner="planner")
+                try:
+                    produced = planner_fn(text)
+                    if isinstance(produced, Awaitable):
+                        produced = await produced
+                    payload = _coerce_mapping(produced, owner="planner")
+                except PlannerError:
+                    raise
+                except Exception as exc:
+                    raise PlannerError(f"planner failed: {exc}") from exc
             return validate_plan(dict(payload), original_query=text)
         except PlannerError as exc:
             last_error = exc
@@ -960,18 +964,21 @@ def _quote_kind_for_unit(unit: AnswerUnit, pack: EvidencePack) -> QuoteKind:
 
 def _resolve_cited(
     citations: Sequence[str], pack: EvidencePack
-) -> tuple[list[Provenance], list[EvidenceUnit]]:
+) -> tuple[list[Provenance], list[EvidenceUnit], list[str]]:
     mapping = pack.by_locator()
     provenances: list[Provenance] = []
     units: list[EvidenceUnit] = []
+    validated: list[str] = []
     for citation in citations:
+        if "#" not in citation:
+            continue
         unit = mapping.get(citation)
-        if unit is None and "/" in citation:
-            unit = mapping.get(citation.split("#")[0])
-        if unit is not None:
-            provenances.append(unit.provenance)
-            units.append(unit)
-    return provenances, units
+        if unit is None:
+            continue
+        provenances.append(unit.provenance)
+        units.append(unit)
+        validated.append(citation)
+    return provenances, units, validated
 
 
 def judge_unit(
@@ -983,7 +990,7 @@ def judge_unit(
     """Judge one answer unit; return ``(passed, source_exact, kind, cited)``."""
     if not unit.substantive:
         return True, False, QuoteKind.TRANSLATION, ()
-    provenances, cited_units = _resolve_cited(unit.citations, pack)
+    provenances, cited_units, validated = _resolve_cited(unit.citations, pack)
     if not provenances:
         return False, False, QuoteKind.TRANSLATION, ()
     quoted = _CITATION_RE.sub("", unit.text).strip()
@@ -1002,7 +1009,7 @@ def judge_unit(
         entails=entails if entails is not None else default_entails,
     )
     _ = cited_units
-    return verdict.passed, verdict.source_exact, kind, unit.citations
+    return verdict.passed, verdict.source_exact, kind, tuple(validated)
 
 
 def build_grounded_response(
