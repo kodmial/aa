@@ -399,11 +399,19 @@ class _SlowMarkerClient(FakeOpenCodeClient):
         timeout: float | None = None,
         agent: str = "",
         model: str = "",
+        system: str = "",
+        format: dict[str, object] | None = None,
     ) -> str:
         if "slow-marker" in text:
             await asyncio.sleep(0.4)
         return await super().send_message(
-            session_id, text, timeout=timeout, agent=agent, model=model
+            session_id,
+            text,
+            timeout=timeout,
+            agent=agent,
+            model=model,
+            system=system,
+            format=format,
         )
 
 
@@ -529,6 +537,8 @@ class _AlwaysFailingClient(FakeOpenCodeClient):
         timeout: float | None = None,
         agent: str = "",
         model: str = "",
+        system: str = "",
+        format: dict[str, object] | None = None,
     ) -> str:
         raise OpenCodeTransientError("provider down")
 

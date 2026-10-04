@@ -104,6 +104,20 @@ def _extract_text(parts: object) -> str:
     return "\n".join(chunks)
 
 
+def _extract_structured(payload: object) -> dict[str, object] | None:
+    """Extract the native structured-output object from a prompt response."""
+    if not isinstance(payload, dict):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    for key in ("structured_output", "structured", "structuredOutput"):
+        value = info.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return None
+
+
 class OpenCodeClient(ABC):
     """Interface for the local OpenCode HTTP boundary (fakeable for tests)."""
 
@@ -136,8 +150,37 @@ class OpenCodeClient(ABC):
         timeout: float | None = None,
         agent: str = "",
         model: str = "",
+        system: str = "",
+        format: dict[str, object] | None = None,
     ) -> str:
-        """Send one user message and return the assistant text reply."""
+        """Send one user message and return the assistant text reply.
+
+        ``system`` is delivered through OpenCode's native system layer,
+        never flattened into ``parts`` text. ``format`` carries an
+        optional native output-format object (for example a
+        ``json_schema`` request).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def send_structured_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        timeout: float | None = None,
+        agent: str = "",
+        model: str = "",
+        system: str = "",
+        schema: dict[str, object],
+        retry_count: int = 2,
+    ) -> dict[str, object]:
+        """Send one message with native ``json_schema`` output and return it.
+
+        The returned value is the structured-output object produced by
+        OpenCode (``info.structured_output``/``info.structured``); callers
+        Pydantic-validate it. No JSON text parsing happens here.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -254,6 +297,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         timeout: float | None = None,
         agent: str = "",
         model: str = "",
+        system: str = "",
+        format: dict[str, object] | None = None,
     ) -> str:
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
@@ -261,6 +306,10 @@ class HttpOpenCodeClient(OpenCodeClient):
         body: dict[str, object] = {"parts": [{"type": "text", "text": text}]}
         if agent:
             body["agent"] = agent
+        if system.strip():
+            body["system"] = system
+        if format is not None:
+            body["format"] = format
         parsed_model = model_payload(model)
         if parsed_model is not None:
             body["model"] = parsed_model
@@ -282,6 +331,55 @@ class HttpOpenCodeClient(OpenCodeClient):
         # Never log the prompt or the reply; only the fact of completion.
         logger.info("opencode message completed")
         return reply
+
+    async def send_structured_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        timeout: float | None = None,
+        agent: str = "",
+        model: str = "",
+        system: str = "",
+        schema: dict[str, object],
+        retry_count: int = 2,
+    ) -> dict[str, object]:
+        """Send one native ``json_schema`` request and return its object."""
+        if not text or not text.strip():
+            raise OpenCodeDeterministicError("refusing to send an empty prompt")
+        if retry_count < 0:
+            raise ValueError("retry_count must be >= 0")
+        quoted = urllib.parse.quote(session_id, safe="")
+        body: dict[str, object] = {
+            "parts": [{"type": "text", "text": text}],
+            "format": {"type": "json_schema", "schema": schema, "retryCount": retry_count},
+        }
+        if agent:
+            body["agent"] = agent
+        if system.strip():
+            body["system"] = system
+        parsed_model = model_payload(model)
+        if parsed_model is not None:
+            body["model"] = parsed_model
+        saved_timeout = self._request_timeout
+        if timeout is not None:
+            if timeout <= 0:
+                raise ValueError("timeout must be > 0")
+            self._request_timeout = timeout
+        try:
+            payload = await self._call("POST", f"/session/{quoted}/message", body)
+        finally:
+            self._request_timeout = saved_timeout
+        if not isinstance(payload, dict):
+            raise OpenCodeDeterministicError("opencode prompt returned invalid data")
+        info = payload.get("info")
+        if isinstance(info, dict) and info.get("error") not in (None, False):
+            raise classify_provider_error(info.get("error"))
+        structured = _extract_structured(payload)
+        if structured is None:
+            raise OpenCodeDeterministicError("opencode structured output missing")
+        logger.info("opencode structured message completed")
+        return structured
 
     async def list_messages(self, session_id: str, *, limit: int = 50) -> list[ChatMessage]:
         if limit < 0:
@@ -368,11 +466,14 @@ class FakeOpenCodeClient(OpenCodeClient):
         timeout: float | None = None,
         agent: str = "",
         model: str = "",
+        system: str = "",
+        format: dict[str, object] | None = None,
     ) -> str:
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         # Validate the model hint exactly like the real client.
         model_payload(model)
+        _ = (system, format)
         await self._settle(timeout)
         record = self._sessions.get(session_id)
         if record is None:
@@ -382,6 +483,41 @@ class FakeOpenCodeClient(OpenCodeClient):
         history.append({"role": "user"})
         reply = f"Фиктивный ответ {len(history)}"
         history.append({"role": "assistant", "text": reply})
+        return reply
+
+    async def send_structured_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        timeout: float | None = None,
+        agent: str = "",
+        model: str = "",
+        system: str = "",
+        schema: dict[str, object],
+        retry_count: int = 2,
+    ) -> dict[str, object]:
+        """Fake native structured output: returns the queued object or empty plan."""
+        if not text or not text.strip():
+            raise OpenCodeDeterministicError("refusing to send an empty prompt")
+        model_payload(model)
+        _ = (system, schema, retry_count)
+        await self._settle(timeout)
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise OpenCodeSessionNotFoundError("opencode session not found: fake...")
+        history = record["messages"]
+        assert isinstance(history, list)
+        history.append({"role": "user"})
+        queued = getattr(self, "structured_queue", None)
+        if isinstance(queued, list) and queued:
+            reply_obj = queued.pop(0)
+            if not isinstance(reply_obj, dict):
+                raise OpenCodeDeterministicError("fake structured queue must hold dicts")
+            reply: dict[str, object] = dict(reply_obj)
+        else:
+            reply = {"queries": []}
+        history.append({"role": "assistant", "text": "", "structured": reply})
         return reply
 
     async def list_messages(self, session_id: str, *, limit: int = 50) -> list[ChatMessage]:
