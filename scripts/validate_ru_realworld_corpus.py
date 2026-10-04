@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Validate the authoritative Russian real-world v1 corpus (issue #61).
+"""Validate the Russian real-world v1_1 corpus (issue #61).
 
-Machine entry point for CI and for downstream issue #62: validates schema,
-ids, counts, UTF-8, deduplication, provenance resolution, #21 routing review
-and #46 meaning-preservation anchors, then checks the stable version record.
+Machine entry point for CI and for downstream issues #62/#72/#73/#63:
+validates the successor allow/emergency/block oracle, the input/oracle
+split, the session-reset control event, ids, counts, UTF-8, deduplication,
+provenance resolution, #21 routing review and #46 meaning-preservation
+anchors, then checks the stable version record.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aa.qualification.ru_realworld import (  # noqa: E402
     CORPUS_REL,
+    INPUT_REL,
+    ORACLE_REL,
     SOURCES_REL,
     VERSION_REL,
     RuRealWorldCorpusError,
@@ -51,14 +55,19 @@ def main() -> int:
             {
                 "status": "ok",
                 "corpus": CORPUS_REL,
+                "input": INPUT_REL,
+                "oracle": ORACLE_REL,
                 "sources": SOURCES_REL,
                 "corpus_sha256": summary.corpus_sha256,
+                "input_sha256": summary.input_sha256,
+                "oracle_sha256": summary.oracle_sha256,
                 "sources_sha256": summary.sources_sha256,
                 "counts": {
                     "single_turn": summary.single_turn,
                     "multi_turn_journeys": summary.journeys,
-                    "multi_turn_user_turns": summary.journey_turns,
-                    "total_user_utterances": summary.total_utterances,
+                    "multi_turn_substantive_turns": summary.substantive_journey_turns,
+                    "control_events": summary.control_events,
+                    "total_substantive_utterances": summary.total_substantive,
                 },
             },
             ensure_ascii=False,
