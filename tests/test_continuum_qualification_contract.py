@@ -81,9 +81,9 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
     assert "kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main" in body
     assert "continuum_ref: main" in body
     assert "\"${{ inputs.wip_limit }}\"" in body
-    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
+    assert "\"${{ inputs.max_dispatch_attempts }}\"" in body
     assert "\"${{ inputs.require_priority_label }}\"" in body
     assert "\"${{ inputs.opencode_dispatch }}\"" in body
     assert "\"${{ inputs.count_open_prs_as_wip }}\"" in body
-    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
+    assert "\"${{ inputs.pause_on_failure }}\"" in body
     assert not re.search(r"continuum.*@[0-9a-f]{40}", body)
