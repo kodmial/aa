@@ -427,14 +427,33 @@ def test_no_verbatim_copy_search_stats_or_encoded_answers() -> None:
             if turn.get("kind") != "user":
                 continue
             assert not _is_verbatim_copy(str(turn["utterance"]), theme_texts)
-    for record in (*oracle_singles, *oracle_journeys):
+    for record in oracle_singles:
         for key in record:
             assert key not in (
                 "expected_answer",
                 "assistant_response",
                 "desired_response",
                 "ideal_answer",
+                "utterance",
             )
+    for record in oracle_journeys:
+        for key in record:
+            assert key not in (
+                "expected_answer",
+                "assistant_response",
+                "desired_response",
+                "ideal_answer",
+                "utterance",
+            )
+        for turn in record["turns"]:
+            for key in turn:
+                assert key not in (
+                    "expected_answer",
+                    "assistant_response",
+                    "desired_response",
+                    "ideal_answer",
+                    "utterance",
+                )
 
 
 def test_allow_inputs_stay_off_emergency_path() -> None:
