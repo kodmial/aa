@@ -220,6 +220,19 @@ def parse_recipient(text: str) -> bytes:
     return raw
 
 
+def recipient_from_identity(identity: str) -> str:
+    """Derive the public ``age1...`` recipient for an identity.
+
+    Used by production activation (#28) to validate that the configured
+    ``AA_BOOK_AGE_IDENTITY`` matches the committed public recipient
+    without logging or persisting the private identity itself.
+    """
+    secret = parse_identity(identity)
+    private = X25519PrivateKey.from_private_bytes(secret)
+    public = private.public_key().public_bytes_raw()
+    return _bech32_encode(RECIPIENT_HRP, public, upper=False)
+
+
 def _hkdf(ikm: bytes, salt: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(ikm)
 
