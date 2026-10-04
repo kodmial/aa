@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Deterministic canonical bootstrap/restore entry point (issue #24).
+"""Deterministic canonical bootstrap/restore entry point (issues #24, #50).
 
-Runtime order:
+Runtime order (``--lang en`` default; ``--lang ru`` restores the Russian
+artifact from ``corpus/canonical.ru.manifest.json`` into
+``corpus/generated/canonical.ru.json`` via the ``canonical.ru.tar.zst.age``
+snapshot encrypted to the same age recipient):
 
 1. Reuse the decrypted ``corpus/generated/canonical.json`` when it already
    exists in the current runner workspace and verifies against the committed
@@ -39,16 +42,25 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aa.corpus.age_v1 import AgeError, decrypt_bytes  # noqa: E402
-from aa.corpus.canonical import CanonicalCorpusError, load_canonical  # noqa: E402
+from aa.corpus.canonical import (  # noqa: E402
+    CanonicalCorpusError,
+    load_canonical,
+    load_canonical_ru,
+)
 from aa.corpus.encrypted_snapshot import (  # noqa: E402
     ARCHIVE_NAME,
     METADATA_NAME,
+    RU_ARCHIVE_NAME,
+    RU_CANONICAL_NAME,
+    RU_METADATA_NAME,
     extract_tar_zst,
     sha256_bytes,
 )
 
 DEFAULT_MANIFEST = ROOT / "corpus" / "canonical.manifest.json"
 DEFAULT_OUTPUT = ROOT / "corpus" / "generated" / "canonical.json"
+DEFAULT_RU_MANIFEST = ROOT / "corpus" / "canonical.ru.manifest.json"
+DEFAULT_RU_OUTPUT = ROOT / "corpus" / "generated" / "canonical.ru.json"
 DEFAULT_ENCRYPTED_DIR = ROOT / "corpus" / "source" / "encrypted"
 
 IDENTITY_ENV = "AA_BOOK_AGE_IDENTITY"
@@ -73,7 +85,7 @@ def _manifest_artifact_sha(manifest_path: Path) -> str:
     return sha
 
 
-def _valid_existing(path: Path, *, expected_sha: str) -> bool:
+def _valid_existing(path: Path, *, expected_sha: str, lang: str = "en") -> bool:
     try:
         payload = path.read_bytes()
     except OSError:
@@ -81,13 +93,16 @@ def _valid_existing(path: Path, *, expected_sha: str) -> bool:
     if hashlib.sha256(payload).hexdigest() != expected_sha:
         return False
     try:
-        load_canonical(path, expected_sha256=expected_sha)
+        if lang == "ru":
+            load_canonical_ru(path, expected_sha256=expected_sha)
+        else:
+            load_canonical(path, expected_sha256=expected_sha)
     except CanonicalCorpusError:
         return False
     return True
 
 
-def _write_verified(path: Path, payload: bytes, *, expected_sha: str) -> bool:
+def _write_verified(path: Path, payload: bytes, *, expected_sha: str, lang: str = "en") -> bool:
     if sha256_bytes(payload) != expected_sha:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,7 +116,10 @@ def _write_verified(path: Path, payload: bytes, *, expected_sha: str) -> bool:
         return False
     os.replace(tmp_path, path)
     try:
-        load_canonical(path, expected_sha256=expected_sha)
+        if lang == "ru":
+            load_canonical_ru(path, expected_sha256=expected_sha)
+        else:
+            load_canonical(path, expected_sha256=expected_sha)
     except CanonicalCorpusError:
         try:
             path.unlink()
@@ -130,10 +148,18 @@ def _network_allowed(*, flag: bool) -> bool:
     return os.environ.get(NETWORK_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
-def _run_network_fallback(*, output: Path, manifest: Path) -> int:
+def _run_network_fallback(*, output: Path, manifest: Path, lang: str = "en") -> int:
+    if lang == "ru":
+        allowed_output, allowed_manifest = DEFAULT_RU_OUTPUT, DEFAULT_RU_MANIFEST
+        fetch = ROOT / "scripts" / "fetch_ru_source.py"
+        build = ROOT / "scripts" / "build_canonical_ru.py"
+    else:
+        allowed_output, allowed_manifest = DEFAULT_OUTPUT, DEFAULT_MANIFEST
+        fetch = ROOT / "scripts" / "fetch_aa_source.py"
+        build = ROOT / "scripts" / "build_canonical.py"
     if (
-        Path(output).resolve() != DEFAULT_OUTPUT.resolve()
-        or Path(manifest).resolve() != DEFAULT_MANIFEST.resolve()
+        Path(output).resolve() != allowed_output.resolve()
+        or Path(manifest).resolve() != allowed_manifest.resolve()
     ):
         print(
             "canonical restore failed: network fallback supports only "
@@ -141,9 +167,19 @@ def _run_network_fallback(*, output: Path, manifest: Path) -> int:
             file=sys.stderr,
         )
         return 1
-    fetch = ROOT / "scripts" / "fetch_aa_source.py"
-    build = ROOT / "scripts" / "build_canonical.py"
-    for step in ([sys.executable, str(fetch)], [sys.executable, str(build)]):
+    steps: list[list[str]] = []
+    if lang == "ru":
+        # Preserve-bytes/reuse semantics: never re-download over a trusted
+        # preserved TXT. Reuse it without network; bootstrap from the
+        # provider only to provision a missing TXT.
+        raw_txt = ROOT / "corpus" / "source" / "raw-ru" / "aa-big-book.txt"
+        fetch_step = [sys.executable, str(fetch)]
+        if not raw_txt.exists():
+            fetch_step = [sys.executable, str(fetch), "--bootstrap-from-provider"]
+        steps = [fetch_step, [sys.executable, str(build)]]
+    else:
+        steps = [[sys.executable, str(fetch)], [sys.executable, str(build)]]
+    for step in steps:
         proc = subprocess.run(step, capture_output=True, text=True, cwd=ROOT)  # noqa: S603
         if proc.returncode != 0:
             step_name = Path(step[1]).name
@@ -156,18 +192,35 @@ def _run_network_fallback(*, output: Path, manifest: Path) -> int:
         expected = _manifest_artifact_sha(manifest)
     except ValueError as exc:
         return _fail(str(exc))
-    if not _valid_existing(output, expected_sha=expected):
+    if not _valid_existing(output, expected_sha=expected, lang=lang):
         return _fail("network fallback produced an unverified artifact")
     print(
         json.dumps(
             {
                 "restored": "network-fallback",
+                "language": lang,
                 "artifact_sha256": expected,
                 "artifact_bytes": output.stat().st_size,
             }
         )
     )
     return 0
+
+
+def _resolve_lang(*, manifest: Path, output: Path, explicit: str | None) -> str:
+    if explicit is not None:
+        return explicit
+    try:
+        if Path(manifest).resolve() == DEFAULT_RU_MANIFEST.resolve():
+            return "ru"
+    except OSError:
+        pass
+    try:
+        if Path(output).resolve() == DEFAULT_RU_OUTPUT.resolve():
+            return "ru"
+    except OSError:
+        pass
+    return "en"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,9 +230,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--encrypted-dir", type=Path, default=DEFAULT_ENCRYPTED_DIR)
     parser.add_argument("--identity-file", type=Path, default=None)
     parser.add_argument(
+        "--archive-name",
+        type=str,
+        default=None,
+        help="Encrypted archive file name (default follows --lang; "
+        "RU default: canonical.ru.tar.zst.age).",
+    )
+    parser.add_argument(
+        "--metadata-name",
+        type=str,
+        default=None,
+        help="Snapshot metadata file name (default follows --lang; RU default: metadata.ru.json).",
+    )
+    parser.add_argument(
+        "--lang",
+        type=str,
+        choices=("en", "ru"),
+        default=None,
+        help="Corpus language. Defaults to Russian when --manifest/--output "
+        "are the RU defaults, English otherwise. --lang ru alone also "
+        "selects the RU manifest/output defaults.",
+    )
+    parser.add_argument(
         "--allow-network-fallback",
         action="store_true",
-        help="Permit the deterministic #3 network fetch/build fallback.",
+        help="Permit the deterministic network fetch/build fallback.",
     )
     parser.add_argument(
         "--no-network-fallback",
@@ -188,17 +263,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    lang = _resolve_lang(manifest=args.manifest, output=args.output, explicit=args.lang)
+    if lang == "ru":
+        if Path(args.manifest).resolve() == DEFAULT_MANIFEST.resolve():
+            args.manifest = DEFAULT_RU_MANIFEST
+        if Path(args.output).resolve() == DEFAULT_OUTPUT.resolve():
+            args.output = DEFAULT_RU_OUTPUT
+    archive_name = args.archive_name or (RU_ARCHIVE_NAME if lang == "ru" else ARCHIVE_NAME)
+    metadata_name = args.metadata_name or (RU_METADATA_NAME if lang == "ru" else METADATA_NAME)
+    canonical_name = RU_CANONICAL_NAME if lang == "ru" else "canonical.json"
+
     try:
         expected_sha = _manifest_artifact_sha(args.manifest)
     except ValueError as exc:
         return _fail(str(exc))
 
     # 1. Reuse a valid decrypted artifact already present in this workspace.
-    if _valid_existing(args.output, expected_sha=expected_sha):
+    if _valid_existing(args.output, expected_sha=expected_sha, lang=lang):
         print(
             json.dumps(
                 {
                     "restored": "reused",
+                    "language": lang,
                     "artifact_sha256": expected_sha,
                     "artifact_bytes": args.output.stat().st_size,
                 }
@@ -207,8 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # 2. Decrypt the committed encrypted snapshot when possible.
-    archive = args.encrypted_dir / ARCHIVE_NAME
-    metadata_path = args.encrypted_dir / METADATA_NAME
+    archive = args.encrypted_dir / archive_name
+    metadata_path = args.encrypted_dir / metadata_name
     identity: str | None
     try:
         identity = _read_identity(identity_file=args.identity_file)
@@ -222,8 +308,36 @@ def main(argv: list[str] | None = None) -> int:
             metadata = None  # type: ignore[assignment]
             snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
         if snapshot_error is None:
-            if not isinstance(metadata, dict) or metadata.get("canonical_sha256") != expected_sha:
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            elif metadata.get("canonical_sha256") != expected_sha:
                 snapshot_error = "snapshot metadata canonical SHA does not match the manifest"
+        if snapshot_error is None:
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                version = metadata.get("metadata_version")
+                if version is not None and version not in (1, 2):
+                    snapshot_error = f"unsupported snapshot metadata version: {version!r}"
+        if snapshot_error is None:
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                member = metadata.get("canonical_member")
+                if member is not None and member != canonical_name:
+                    snapshot_error = "snapshot metadata canonical member does not match language"
+        if snapshot_error is None:
+            if not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                encrypted_file = metadata.get("encrypted_file")
+                if (
+                    isinstance(encrypted_file, str)
+                    and encrypted_file
+                    and not encrypted_file.endswith(f"/{archive_name}")
+                    and encrypted_file != archive_name
+                ):
+                    snapshot_error = "snapshot metadata encrypted file does not match archive"
         encrypted: bytes | None = None
         if snapshot_error is None:
             try:
@@ -231,23 +345,32 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as exc:
                 snapshot_error = f"cannot read encrypted snapshot: {exc}"
         if snapshot_error is None:
-            assert encrypted is not None
-            expected_encrypted_sha = metadata.get("encrypted_sha256")
-            if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
-                snapshot_error = "snapshot encrypted SHA does not match metadata"
+            if encrypted is None:
+                snapshot_error = "snapshot encrypted payload is missing"
+            elif not isinstance(metadata, dict):
+                snapshot_error = "snapshot metadata is malformed"
+            else:
+                expected_encrypted_sha = metadata.get("encrypted_sha256")
+                if expected_encrypted_sha != hashlib.sha256(encrypted).hexdigest():
+                    snapshot_error = "snapshot encrypted SHA does not match metadata"
         if snapshot_error is None:
-            assert encrypted is not None
-            try:
-                tar_zst = decrypt_bytes(encrypted, [identity])
-                canonical_bytes, _ = extract_tar_zst(tar_zst)
-            except (AgeError, ValueError) as exc:
-                snapshot_error = f"snapshot decrypt failed: {exc}"
+            if encrypted is None:
+                snapshot_error = "snapshot encrypted payload is missing"
+            else:
+                try:
+                    tar_zst = decrypt_bytes(encrypted, [identity])
+                    canonical_bytes, _ = extract_tar_zst(
+                        tar_zst, expected_canonical_name=canonical_name
+                    )
+                except (AgeError, ValueError) as exc:
+                    snapshot_error = f"snapshot decrypt failed: {exc}"
         if snapshot_error is None:
-            if _write_verified(args.output, canonical_bytes, expected_sha=expected_sha):
+            if _write_verified(args.output, canonical_bytes, expected_sha=expected_sha, lang=lang):
                 print(
                     json.dumps(
                         {
                             "restored": "decrypted",
+                            "language": lang,
                             "artifact_sha256": expected_sha,
                             "artifact_bytes": len(canonical_bytes),
                         }
@@ -263,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_network_fallback:
         allow_network = False
     if allow_network:
-        return _run_network_fallback(output=args.output, manifest=args.manifest)
+        return _run_network_fallback(output=args.output, manifest=args.manifest, lang=lang)
 
     # 4. Fail closed.
     reasons = []

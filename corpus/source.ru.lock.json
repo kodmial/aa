@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "language": "ru",
+  "edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+  "catalog": {
+    "title": "АНОНИМНЫЕ АЛКОГОЛИКИ",
+    "edition": "Fourth Edition / Четвертое издание, Russian translation",
+    "publisher": "Alcoholics Anonymous World Services, Inc. / Фонд «Единство»",
+    "publication_lineage": "2013",
+    "isbn": "978-5-906531-01-8",
+    "scope": "Мнение доктора + Chapters 1-11"
+  },
+  "rights": {
+    "basis": "Owner confirms permission for project use/storage. No licensing blocker.",
+    "holder": "Alcoholics Anonymous World Services, Inc. (A.A.W.S.)",
+    "imprint": "Фонд «Единство», 2013",
+    "isbn": "978-5-906531-01-8",
+    "permission_line": "Издано с разрешения Alcoholics Anonymous World Services, Inc. (A.A.W.S.)",
+    "constraints": [
+      "private server-side retrieval/indexing only",
+      "bounded passage retrieval per request",
+      "no public redistribution of the source file",
+      "Russian-language AA support bot",
+      "immutable source storage with checksum/version controls"
+    ]
+  },
+  "provider": {
+    "note": "Text-native Russian Fourth Edition provider used only for the one-time trusted TXT bootstrap. The canonical build reads only aa-big-book.txt; PDF/OCR are never part of the canonical path.",
+    "edition_root": "https://aarus.fi/read/bigbook/",
+    "edition_page": "https://aarus.fi/read/bigbook/edition/",
+    "section_pages": [
+      "https://aarus.fi/read/bigbook/nXXVII/",
+      "https://aarus.fi/read/bigbook/n1/",
+      "https://aarus.fi/read/bigbook/n16/",
+      "https://aarus.fi/read/bigbook/n29/",
+      "https://aarus.fi/read/bigbook/n43/",
+      "https://aarus.fi/read/bigbook/n56/",
+      "https://aarus.fi/read/bigbook/n70/",
+      "https://aarus.fi/read/bigbook/n86/",
+      "https://aarus.fi/read/bigbook/n101/",
+      "https://aarus.fi/read/bigbook/n118/",
+      "https://aarus.fi/read/bigbook/n132/",
+      "https://aarus.fi/read/bigbook/n147/"
+    ]
+  },
+  "policy": {
+    "raw_source_is_immutable": true,
+    "canonical_source_is_never_permanently_reduced": true,
+    "source_paraphrase_allowed": false,
+    "translation_substitution_allowed": false,
+    "runtime_access": "hierarchical-agentic-rag",
+    "primary_evidence_language_for_russian_users": "ru",
+    "single_canonical_input": "corpus/source/raw-ru/aa-big-book.txt",
+    "no_pdf_no_ocr": true
+  },
+  "sources": [
+    {
+      "id": "ru-fourth-edition-txt",
+      "url": "https://aarus.fi/read/bigbook/edition/",
+      "format": "text/plain",
+      "covers": [
+        "Мнение доктора",
+        "Глава 1",
+        "Глава 2",
+        "Глава 3",
+        "Глава 4",
+        "Глава 5",
+        "Глава 6",
+        "Глава 7",
+        "Глава 8",
+        "Глава 9",
+        "Глава 10",
+        "Глава 11"
+      ],
+      "raw_path": "corpus/source/raw-ru/aa-big-book.txt"
+    }
+  ],
+  "sections": [
+    {"id": "doctors-opinion", "section": "nXXVII", "title": "Мнение доктора"},
+    {"id": "chapter-1", "section": "n1", "title": "Глава 1. Рассказ Билла"},
+    {"id": "chapter-2", "section": "n16", "title": "Глава 2. Выход есть"},
+    {"id": "chapter-3", "section": "n29", "title": "Глава 3. Еще об алкоголизме"},
+    {"id": "chapter-4", "section": "n43", "title": "Глава 4. А как быть агностикам?"},
+    {"id": "chapter-5", "section": "n56", "title": "Глава 5. Программа в действии"},
+    {"id": "chapter-6", "section": "n70", "title": "Глава 6. За работу!"},
+    {"id": "chapter-7", "section": "n86", "title": "Глава 7. Работая с другими"},
+    {"id": "chapter-8", "section": "n101", "title": "Глава 8. Обращение к женам"},
+    {"id": "chapter-9", "section": "n118", "title": "Глава 9. Новые отношения в семье"},
+    {"id": "chapter-10", "section": "n132", "title": "Глава 10. Обращение к работодателям"},
+    {"id": "chapter-11", "section": "n147", "title": "Глава 11. Заглянем в ваше будущее"}
+  ],
+  "control": {
+    "id": "bigbook-4th-pdf",
+    "note": "The Conference-approved BigBook-4th.pdf is a verification/control artifact only. It is never fetched by the deterministic pipeline; PDF extraction and OCR are never part of the canonical path.",
+    "required": false
+  }
+}
