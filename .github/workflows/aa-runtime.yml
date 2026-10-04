@@ -86,6 +86,39 @@ jobs:
           echo "pip-restore=aa-public-pip-v1-${{ runner.os }}-${{ runner.arch }}-py3.12-" >> "$GITHUB_OUTPUT"
           echo "model-key=aa-public-model-v1-${{ runner.os }}-${{ runner.arch }}-intfloat-multilingual-e5-base-${{ hashFiles('corpus/embedding.lock.json') }}" >> "$GITHUB_OUTPUT"
 
+      - name: Compute voice cache keys
+        id: voice-cache-keys
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #79: one exact content/compatibility key per voice model
+          # family (runner OS/arch, Python 3.12, fixed model
+          # identity/revision or checksum from corpus/voice.lock.json, and
+          # the pyproject + voice-lock dependency hash). Keys are computed
+          # by scripts/prefetch_voice_assets.py so the lock file stays the
+          # single source of truth. Speech dependency wheels reuse the #59
+          # public pip cache above (pyproject.toml pins sherpa-onnx, torch
+          # and onnxruntime); no second dependency cache is introduced.
+          # Key computation is non-fatal: any lock/key error behaves like
+          # a total cache miss so runtime startup is never blocked.
+          echo "gigaam-dir=models/gigaam" >> "$GITHUB_OUTPUT"
+          echo "tts-dir=models/tts" >> "$GITHUB_OUTPUT"
+          echo "presentation-dir=models/voice-presentation" >> "$GITHUB_OUTPUT"
+          if payload=$(python scripts/prefetch_voice_assets.py --print-keys \
+            --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
+            --deps-hash "${{ hashFiles('pyproject.toml', 'corpus/voice.lock.json') }}"); then
+            echo "$payload"
+            gigaam=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['gigaam'])" "$payload")
+            silero=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['silero'])" "$payload")
+            presentation=$(python -c "import json,sys; print(json.loads(sys.argv[1])['keys']['presentation'])" "$payload")
+            echo "gigaam-key=$gigaam" >> "$GITHUB_OUTPUT"
+            echo "silero-key=$silero" >> "$GITHUB_OUTPUT"
+            echo "presentation-key=$presentation" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Voice cache key computation failed; continuing with a total miss."
+          fi
+
       - name: Restore public pip cache
         id: restore-public-pip
         continue-on-error: true
@@ -107,12 +140,56 @@ jobs:
           key: ${{ steps.public-cache-keys.outputs.model-key }}
           fail-on-cache-miss: false
 
+      - name: Restore GigaAM voice model cache
+        id: restore-voice-gigaam
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # Exact key only: a wrong GigaAM revision must miss safely.
+          # No restore-keys here; the check-only step below prunes stale
+          # content and the prefetch step re-downloads the fixed artifact.
+          path: ${{ steps.voice-cache-keys.outputs.gigaam-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.gigaam-key }}
+          fail-on-cache-miss: false
+
+      - name: Restore Silero voice model cache
+        id: restore-voice-silero
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # Exact key only: a wrong Silero identity must miss safely.
+          # No restore-keys here.
+          path: ${{ steps.voice-cache-keys.outputs.tts-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.silero-key }}
+          fail-on-cache-miss: false
+
+      - name: Restore voice presentation model cache
+        id: restore-voice-presentation
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # Exact key only: a wrong classifier checksum must miss safely.
+          # No restore-keys here.
+          path: ${{ steps.voice-cache-keys.outputs.presentation-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.presentation-key }}
+          fail-on-cache-miss: false
+
       - name: Verify pinned public assets
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           python scripts/prefetch_public_assets.py --check-only
+
+      - name: Verify pinned voice assets
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #79: restore -> verify identity/checksum -> use.
+          # Missing/stale/corrupt entries are pruned here so the prefetch
+          # step below re-downloads the fixed artifact and revalidates.
+          python scripts/prefetch_voice_assets.py --check-only
 
       - name: Resolve bounded duration
         id: duration
@@ -153,6 +230,36 @@ jobs:
           set -euo pipefail
           python scripts/prefetch_public_assets.py
 
+      - name: Prefetch pinned voice models
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #79: caching is acceleration only. A total cache miss
+          # behaves exactly like a first clean installation: this step
+          # reuses a verified hit, otherwise downloads the fixed artifacts
+          # normally and revalidates before use. Save failure is non-fatal.
+          payload=$(python scripts/prefetch_voice_assets.py)
+          echo "$payload"
+          python -c "
+          import json, sys
+          payload = json.loads(sys.argv[1])
+          lines = ['Voice model cache (issue #79): overall ' + str(payload.get('status')) + '.']
+          for family, item in payload.get('families', {}).items():
+              lines.append(
+                  '- ' + str(family) + ': ' + str(item.get('status'))
+                  + ' (category ' + str(item.get('category')) + ', '
+                  + str(item.get('downloaded_bytes')) + ' bytes downloaded of '
+                  + str(item.get('snapshot_bytes')) + ' snapshot bytes, '
+                  + str(item.get('duration_ms')) + ' ms, peak RSS '
+                  + str(item.get('peak_rss_mb')) + ' MiB).'
+              )
+          with open('voice_cache_summary.md', 'w', encoding='utf-8') as handle:
+              handle.write('\n'.join(lines) + '\n')
+          " "$payload"
+          cat voice_cache_summary.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f voice_cache_summary.md
+
       - name: Save public pip cache
         if: success() && steps.restore-public-pip.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -168,6 +275,30 @@ jobs:
         with:
           path: ${{ steps.public-cache-keys.outputs.model-dir }}
           key: ${{ steps.public-cache-keys.outputs.model-key }}
+
+      - name: Save GigaAM voice model cache
+        if: success() && steps.restore-voice-gigaam.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.voice-cache-keys.outputs.gigaam-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.gigaam-key }}
+
+      - name: Save Silero voice model cache
+        if: success() && steps.restore-voice-silero.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.voice-cache-keys.outputs.tts-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.silero-key }}
+
+      - name: Save voice presentation model cache
+        if: success() && steps.restore-voice-presentation.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.voice-cache-keys.outputs.presentation-dir }}
+          key: ${{ steps.voice-cache-keys.outputs.presentation-key }}
 
       - name: Compute derived retrieval cache key
         id: derived-cache-key

@@ -1,0 +1,31 @@
+{
+  "format": "aa-voice-lock/1",
+  "gigaam": {
+    "model_id": "fussraider/GigaAM-Multilingual-sherpa-onnx-ctc",
+    "revision": "9f5a77e8975211abe8511693accd3a63ee1e9f43",
+    "model_file": "large/model.int8.onnx",
+    "tokens_file": "large/tokens.txt",
+    "runtime": "sherpa-onnx==1.13.8"
+  },
+  "silero": {
+    "model_id": "v5_5_ru",
+    "url": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
+    "runtime": "torch==2.14.1"
+  },
+  "presentation": {
+    "model_id": "Alice-Sabrina-Ivy/voice-gender-classifier-onnx-q8-v2",
+    "model_file": "onnx/model_quantized.onnx",
+    "sha256": "fdc2dbdcf99b9217977f7472f7d677dd48219c4759ca3f38d0626b600d86c252",
+    "runtime": "onnxruntime==1.30.0"
+  },
+  "policy": {
+    "public_only": true,
+    "never_cache": [
+      "Telegram voice/PCM/OGG",
+      "transcripts or generated answers",
+      "speaker probabilities/classes/features",
+      "session/user data",
+      "secrets"
+    ]
+  }
+}
