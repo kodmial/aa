@@ -12,6 +12,13 @@ The steady LLM context contains only bounded, explicitly budgeted parts:
 Retrieved passages are packed atomically: a passage either fits entirely or
 the call fails with :class:`TruncationRefusedError`. Silent truncation or
 silent dropping of passages is never allowed.
+
+Token estimates are calibrated by the pinned-runtime measurement in
+``docs/context-cost-measurement.md`` (issue #49): English text budgets
+three characters per token, Cyrillic (Russian) text budgets two. Both
+ceilings cover every measured payload on the pinned primary model, and the
+Russian ceiling additionally covers the fallback model, where dense
+Russian evidence measured 2.66 chars/token.
 """
 
 from __future__ import annotations
@@ -29,8 +36,23 @@ provided through ``OPENCODE_CONTEXT_LIMIT_TOKENS``; see
 :func:`resolve_effective_context`.
 """
 
-CHARS_PER_TOKEN = 4
-"""Conservative English-prose estimator: four characters per token."""
+CHARS_PER_TOKEN = 3
+"""Conservative estimator: three characters per token.
+
+Measured floor on the pinned runtime is 3.31 chars/token for English
+(structured planner JSON) and 3.02 for Russian, so ``ceil(chars / 3)``
+is a true ceiling for every primary-model payload in
+``docs/context-cost-measurement.md``. Cyrillic text must use
+:const:`RU_CHARS_PER_TOKEN` instead.
+"""
+
+RU_CHARS_PER_TOKEN = 2
+"""Conservative estimator for Cyrillic (Russian) text: two chars per token.
+
+Russian measured 3.02-4.62 chars/token on the pinned primary model but
+2.66 on the fallback spot-check (dense translated evidence), so Russian
+budgets use ``ceil(chars / 2)`` to stay a ceiling on both models.
+"""
 
 SYSTEM_POLICY_BUDGET_TOKENS = 6_000
 BOOK_MAP_BUDGET_TOKENS = 6_000
@@ -52,6 +74,39 @@ def estimate_tokens(char_count: int) -> int:
     if char_count < 0:
         raise ValueError("char_count must be >= 0")
     return -(-char_count // CHARS_PER_TOKEN)
+
+
+def estimate_tokens_ru(char_count: int) -> int:
+    """Estimate tokens for Cyrillic (Russian) ``char_count`` (ceiling)."""
+    if char_count < 0:
+        raise ValueError("char_count must be >= 0")
+    return -(-char_count // RU_CHARS_PER_TOKEN)
+
+
+def _is_cyrillic(char: str) -> bool:
+    """Whether ``char`` falls in a Cyrillic Unicode block."""
+    code = ord(char)
+    return (
+        0x0400 <= code <= 0x04FF
+        or 0x0500 <= code <= 0x052F
+        or 0x2DE0 <= code <= 0x2DFF
+        or 0xA640 <= code <= 0xA69F
+    )
+
+
+def estimate_text_tokens(text: str) -> int:
+    """Estimate tokens for mixed-language ``text`` (conservative ceiling).
+
+    Cyrillic characters budget :const:`RU_CHARS_PER_TOKEN`; every other
+    character budgets :const:`CHARS_PER_TOKEN`. Pure-English input matches
+    :func:`estimate_tokens` exactly, pure-Cyrillic matches
+    :func:`estimate_tokens_ru`, and mixed turns (Russian history plus
+    English evidence) budget each span at its measured rate. Conversation
+    history, which arrives in the user's language, must be budgeted with
+    this function rather than :func:`estimate_tokens`.
+    """
+    cyrillic = sum(1 for char in text if _is_cyrillic(char))
+    return estimate_tokens(len(text) - cyrillic) + estimate_tokens_ru(cyrillic)
 
 
 def resolve_effective_context(configured_limit_tokens: int) -> int:
@@ -124,23 +179,39 @@ def default_budget(configured_limit_tokens: int = 0) -> ContextBudget:
     return budget
 
 
-def fit_passages(passages: list[str], budget_tokens: int) -> list[str]:
+def fit_passages(
+    passages: list[str], budget_tokens: int, *, chars_per_token: int = CHARS_PER_TOKEN
+) -> list[str]:
     """Accept ``passages`` only when they all fit atomically.
 
     Every passage is either carried in full or the whole call fails with
     :class:`TruncationRefusedError`. Callers that need fewer passages must
     explicitly re-rank and re-request a smaller set; this function never
     truncates a passage and never silently drops trailing passages.
+
+    ``chars_per_token`` is retained for backward compatibility and only
+    tightens the budget: the effective estimate for each passage is
+    ``max(ceil(len / chars_per_token), estimate_text_tokens(passage))``,
+    so the default (English rate) can no longer undercount Russian or
+    mixed-language text. New callers should omit it and rely on the
+    language-aware :func:`estimate_text_tokens` ceiling.
     """
     if budget_tokens < 0:
         raise ValueError("budget_tokens must be >= 0")
+    if chars_per_token <= 0:
+        raise ValueError("chars_per_token must be > 0")
+
+    def estimate(passage: str) -> int:
+        legacy = -(-len(passage) // chars_per_token)
+        return max(legacy, estimate_text_tokens(passage))
+
     for index, passage in enumerate(passages):
-        if estimate_tokens(len(passage)) > budget_tokens:
+        if estimate(passage) > budget_tokens:
             raise TruncationRefusedError(
-                f"passage {index} needs {estimate_tokens(len(passage))} tokens "
+                f"passage {index} needs {estimate(passage)} tokens "
                 f"but the retrieved-passages budget is {budget_tokens}"
             )
-    total = sum(estimate_tokens(len(passage)) for passage in passages)
+    total = sum(estimate(passage) for passage in passages)
     if total > budget_tokens:
         raise TruncationRefusedError(
             f"{len(passages)} passages need {total} tokens "
