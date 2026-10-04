@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 
+from aa.control.campaign import RUNTIME_SECONDS
+
 
 class RuntimeController:
     """Tracks session deadlines and stop requests."""
@@ -16,6 +18,10 @@ class RuntimeController:
     def __init__(self, session_duration_seconds: float = 0.0) -> None:
         if session_duration_seconds < 0:
             raise ValueError("session_duration_seconds must be >= 0")
+        if session_duration_seconds > float(RUNTIME_SECONDS):
+            raise ValueError(
+                f"session_duration_seconds must be <= {RUNTIME_SECONDS} (5h campaign max)"
+            )
         self.session_duration_seconds = session_duration_seconds
         self._deadline: float | None = None
         self._stop_requested = False
