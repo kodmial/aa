@@ -411,8 +411,6 @@ jobs:
           from aa.qualification.conversation_eval import (
               collect_eval_identity,
               decrypt_and_decompress,
-              expected_case_ids,
-              load_generator_views,
           )
           from aa.qualification.ru_realworld import find_repo_root, sha256_file
 
@@ -456,11 +454,32 @@ jobs:
           manifest_fallback = str(compact.get("fallback_model", "")).strip()
           manifest_runtime = str(compact.get("runtime_version", "")).strip()
 
+          # Frozen oracle at the tested SHA (never current-main labels): the
+          # oracle under test, not whatever main holds now.
+          import subprocess as _sp
+
+          oracle_raw = _sp.run(
+              ["git", "show", f"{tested_sha}:qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          oracle_by_case: dict[str, dict] = {}
+          for line in oracle_raw.splitlines():
+              record = json.loads(line)
+              rtype = record.get("type")
+              if rtype == "single_turn":
+                  oracle_by_case[str(record["id"])] = record
+              elif rtype == "multi_turn_journey":
+                  for turn in record.get("turns", []):
+                      oracle_by_case[f"{record['id']}#{turn['turn']}"] = {
+                          **{k: v for k, v in record.items() if k != "turns"},
+                          **turn,
+                      }
+
           # Completeness manifest: every frozen case id must have a clean
           # primary-model turn row; provider/infrastructure fallout makes the
           # artifact ungradable (rejected, never silently partial).
-          singles, journeys = load_generator_views()
-          wanted = set(expected_case_ids(singles, journeys))
+          # Completeness anchored to the frozen oracle at tested_sha, not current-main views.
+          wanted = {cid.split("#")[0] for cid in oracle_by_case.keys()}
           rows = compact.get("turn_rows", [])
           seen = {str(r.get("case_id")) for r in rows if isinstance(r, dict)}
           # Compact rows are per-turn while completeness is per case: journey
@@ -508,27 +527,6 @@ jobs:
           if verdict.verdict == "rejected":
               raise AnswerQualityError(f"artifact rejected: {'; '.join(verdict.reasons)}")
           currency = "current" if verdict.verdict == "current" else "stale"
-
-          # Frozen oracle at the tested SHA (never current-main labels): the
-          # oracle under test, not whatever main holds now.
-          import subprocess as _sp
-
-          oracle_raw = _sp.run(
-              ["git", "show", f"{tested_sha}:qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl"],
-              capture_output=True, text=True, check=True,
-          ).stdout
-          oracle_by_case: dict[str, dict] = {}
-          for line in oracle_raw.splitlines():
-              record = json.loads(line)
-              rtype = record.get("type")
-              if rtype == "single_turn":
-                  oracle_by_case[str(record["id"])] = record
-              elif rtype == "multi_turn_journey":
-                  for turn in record.get("turns", []):
-                      oracle_by_case[f"{record['id']}#{turn['turn']}"] = {
-                          **{k: v for k, v in record.items() if k != "turns"},
-                          **turn,
-                      }
 
           # Qualified RU source index for exact-quote verification, restored
           # from the version-pinned canonical artifact when available. Without
