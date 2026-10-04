@@ -80,5 +80,5 @@ jobs:
             echo "russian encrypted snapshot is already up to date"
           else
             git commit -m "chore: refresh Russian encrypted canonical snapshot"
-            git push
+            git push origin HEAD:main
           fi

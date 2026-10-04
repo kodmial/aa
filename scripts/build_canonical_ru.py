@@ -250,6 +250,24 @@ def build_artifact(
     enriched: list[dict[str, object]],
 ) -> dict[str, object]:
     """Build the canonical artifact dict, failing closed on any mismatch."""
+    # Re-check the caller-derived identity inputs against the raw bytes so a
+    # drifted preamble/normalized/sections/canonical view cannot succeed when
+    # only ``enriched`` is consistent.
+    validate_preamble(preamble)
+    decoded_check, _ = decode_txt(raw)
+    if normalize_text(decoded_check) != normalized:
+        raise ValueError("normalized text mismatch against raw TXT")
+    preamble_check, raw_sections_check = split_sections(normalized)
+    if preamble_check != preamble:
+        raise ValueError("preamble mismatch against normalized TXT")
+    revalidated = validate_sections(raw_sections_check)
+    if revalidated != sections:
+        raise ValueError("sections mismatch against normalized TXT")
+    rebuilt_txt, rebuilt_enriched = build_canonical_text(sections)
+    if rebuilt_txt != canonical_txt:
+        raise ValueError("canonical text mismatch against sections")
+    if rebuilt_enriched != enriched:
+        raise ValueError("enriched sections mismatch against canonical text")
     if manifest.get("builder_version") != BUILDER_VERSION:
         raise ValueError("manifest builder_version is not supported by this builder")
     if manifest.get("format") != MANIFEST_FORMAT:

@@ -228,7 +228,7 @@ def _extract_blocks(
     if section == "n147":
         while texts and PART_DIVIDER_RE.match(texts[-1]):
             dropped.append(texts.pop())
-    elif any(PART_DIVIDER_RE.match(line) for text in texts for line in text.split("\n")):
+    if any(PART_DIVIDER_RE.match(line) for text in texts for line in text.split("\n")):
         raise ValueError(f"section {section!r} contains an unexpected part divider")
     if not texts:
         raise ValueError(f"section {section!r} has no Russian text")
