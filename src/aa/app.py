@@ -8,6 +8,7 @@ import logging
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
 from aa.corpus.context import CorpusContext
+from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.safety.router import SafetyDecision, SafetyRouter
@@ -43,6 +44,7 @@ class Application:
         sessions: SessionCoordinator | None = None,
         safety: SafetyRouter | None = None,
         controller: RuntimeController | None = None,
+        grounding: GroundingGate | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
@@ -64,6 +66,13 @@ class Application:
         self.controller = controller or RuntimeController(
             session_duration_seconds=settings.bot_session_duration_seconds
         )
+        # Deterministic Russian quotation/grounding policy owned by the
+        # Python orchestrator (aa.grounding). Production fails closed:
+        # exact Russian quotations require the version-pinned Russian
+        # corpus (issue #50); translation fallback stays disabled unless
+        # a caller explicitly allows it. The agent prompt states the
+        # user-facing duties and defers enforcement to this gate.
+        self.grounding = grounding or GroundingGate(corpus_version=settings.aa_corpus_version)
         self._running = False
         self._wire_transport_handlers()
 
