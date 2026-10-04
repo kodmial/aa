@@ -160,7 +160,7 @@ jobs:
       # literal. An empty passthrough is what lets the engine fall back to the
       # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
       # override that repository variable for every installed caller.
-      wip_limit: "${{ inputs.wip_limit }}"
+      wip_limit: "${{ inputs.wip_limit || '3' }}"
       lease_minutes: "${{ inputs.lease_minutes }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
       dispatch_marker: "${{ inputs.dispatch_marker }}"
@@ -171,6 +171,7 @@ jobs:
       post_pause_comment: "${{ inputs.post_pause_comment }}"
       reset_markers: "${{ inputs.reset_markers }}"
       require_priority_label: "${{ inputs.require_priority_label }}"
+      ready_label: "automation:ready"
       command_grace_minutes: "${{ inputs.command_grace_minutes }}"
       child_owned_marker: "${{ inputs.child_owned_marker }}"
       legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
