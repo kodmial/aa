@@ -588,7 +588,10 @@ def run_fixture_b(
         if len(added) >= en_extra:
             break
     # Re-fuse: keep RU order first, then EN-mapped RU chunks in retrieval order.
-    combined_ids = ru_ids + [item for item in added if item not in ru_ids]
+    # Reserve room so EN discoveries stay within top_k instead of being truncated.
+    extra_ids = [item for item in added if item not in ru_ids][:en_extra]
+    keep_ru = max(0, top_k - len(extra_ids))
+    combined_ids = ru_ids[:keep_ru] + extra_ids
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     # Re-resolve combined ids to hit-like section/logical lists.
     sections: list[str] = []

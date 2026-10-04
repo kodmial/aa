@@ -12,34 +12,34 @@
   },
   "configs": {
     "a_ru_first": {
-      "both_branch_rate": 0.575,
+      "both_branch_rate": 0.5541666666666667,
       "config_id": "a_ru_first",
       "coverage": 1.0,
       "dense_hit_rate": 1.0,
       "duplicate_rate": 0.0,
       "false_strengthening_count": 0,
       "fixtures": 20,
-      "lexical_hit_rate": 0.575,
-      "mean_evidence_tokens": 512.75,
-      "mean_latency_ms": 2.6597336499946778,
-      "mean_planner_cost_tokens": 144.85,
+      "lexical_hit_rate": 0.5541666666666667,
+      "mean_evidence_tokens": 512.4,
+      "mean_latency_ms": 1.2769050999999365,
+      "mean_planner_cost_tokens": 145.2,
       "missed_relevant_region_rate": 0.0,
       "recall_at_1": 0.9,
       "recall_at_12": 1.0,
       "recall_at_5": 1.0
     },
     "b_ru_first_plus_en_secondary": {
-      "both_branch_rate": 0.575,
+      "both_branch_rate": 0.5541666666666667,
       "config_id": "b_ru_first_plus_en_secondary",
       "coverage": 1.0,
       "dense_hit_rate": 1.0,
       "duplicate_rate": 0.0,
       "false_strengthening_count": 0,
       "fixtures": 20,
-      "lexical_hit_rate": 0.575,
-      "mean_evidence_tokens": 512.75,
-      "mean_latency_ms": 4.510889649998262,
-      "mean_planner_cost_tokens": 144.85,
+      "lexical_hit_rate": 0.5541666666666667,
+      "mean_evidence_tokens": 521.35,
+      "mean_latency_ms": 2.0395496499993726,
+      "mean_planner_cost_tokens": 145.2,
       "missed_relevant_region_rate": 0.0,
       "recall_at_1": 0.9,
       "recall_at_12": 1.0,
@@ -55,23 +55,23 @@
       "fixtures": 20,
       "lexical_hit_rate": 0.0,
       "mean_evidence_tokens": 565.0,
-      "mean_latency_ms": 1.6203120000028548,
-      "mean_planner_cost_tokens": 144.85,
+      "mean_latency_ms": 0.7457965499988006,
+      "mean_planner_cost_tokens": 145.2,
       "missed_relevant_region_rate": 0.0,
-      "recall_at_1": 0.3,
+      "recall_at_1": 0.95,
       "recall_at_12": 1.0,
-      "recall_at_5": 0.75
+      "recall_at_5": 1.0
     }
   },
   "en_secondary": {
     "decision": "disabled",
     "incremental_recall_at_5": 0.0,
-    "latency_ratio_b_over_a": 1.695992999151358,
+    "latency_ratio_b_over_a": 1.597260164439373,
     "new_relevant_sections": 0
   },
   "format": "ru-first-retrieval-decision/1",
   "gold_fixtures": 20,
-  "gold_sha256": "377f1626a881e15f7d348535325cdaed6732fc31847867e69843e0224e812697",
+  "gold_sha256": "2a0c6fe6336c0567ca35fcc1e54f7837453478c9767c9a3fb23ba90567198b47",
   "gold_version": "ru-first-gold-v1",
   "index_config": {
     "dense_top_k": 40,
@@ -103,10 +103,10 @@
       "b_recall_at_5": true,
       "c_hit_sections": [
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-6",
+        "chapter-8",
+        "doctors-opinion",
+        "chapter-9"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-001",
@@ -134,10 +134,10 @@
       "b_recall_at_5": true,
       "c_hit_sections": [
         "chapter-1",
+        "chapter-9",
         "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-8"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-002",
@@ -164,10 +164,10 @@
       "b_recall_at_5": true,
       "c_hit_sections": [
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
         "chapter-2",
-        "chapter-3"
+        "chapter-8",
+        "chapter-10",
+        "chapter-9"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-003",
@@ -193,13 +193,13 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
+        "chapter-8",
+        "chapter-9",
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-4"
       ],
-      "c_recall_at_5": false,
+      "c_recall_at_5": true,
       "case_id": "RU-RF-004",
       "relevant_sections": [
         "chapter-8"
@@ -223,13 +223,13 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-8",
+        "chapter-9",
+        "doctors-opinion",
+        "chapter-4",
+        "chapter-5"
       ],
-      "c_recall_at_5": false,
+      "c_recall_at_5": true,
       "case_id": "RU-RF-005",
       "relevant_sections": [
         "chapter-8",
@@ -254,11 +254,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-3",
+        "chapter-8",
+        "doctors-opinion",
+        "chapter-4",
+        "chapter-5"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-006",
@@ -284,11 +284,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
+        "chapter-3",
+        "chapter-9",
         "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-5",
+        "doctors-opinion"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-007",
@@ -315,10 +315,10 @@
       "b_recall_at_5": true,
       "c_hit_sections": [
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-6",
+        "chapter-8",
+        "doctors-opinion",
+        "chapter-9"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-008",
@@ -345,11 +345,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-3",
+        "chapter-8",
+        "chapter-5",
+        "chapter-4"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-009",
@@ -375,11 +375,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
+        "chapter-3",
+        "chapter-8",
         "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-10",
+        "chapter-9"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-010",
@@ -390,29 +390,29 @@
     },
     {
       "a_hit_sections": [
+        "chapter-8",
         "chapter-9",
-        "chapter-8",
-        "chapter-8",
         "chapter-11",
+        "chapter-8",
         "chapter-10"
       ],
       "a_recall_at_5": true,
       "b_hit_sections": [
+        "chapter-8",
         "chapter-9",
-        "chapter-8",
-        "chapter-8",
         "chapter-11",
+        "chapter-8",
         "chapter-10"
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
+        "chapter-9",
+        "chapter-8",
         "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-1",
+        "doctors-opinion"
       ],
-      "c_recall_at_5": false,
+      "c_recall_at_5": true,
       "case_id": "RU-RF-011",
       "relevant_sections": [
         "chapter-8",
@@ -423,25 +423,25 @@
       "a_hit_sections": [
         "chapter-10",
         "chapter-3",
-        "chapter-7",
-        "chapter-6",
-        "chapter-10"
+        "chapter-10",
+        "chapter-3",
+        "chapter-9"
       ],
       "a_recall_at_5": true,
       "b_hit_sections": [
         "chapter-10",
         "chapter-3",
-        "chapter-7",
-        "chapter-6",
-        "chapter-10"
+        "chapter-10",
+        "chapter-3",
+        "chapter-9"
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
         "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-3",
+        "chapter-5",
+        "chapter-8",
+        "chapter-9"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-012",
@@ -467,11 +467,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-3",
+        "chapter-6",
+        "chapter-5",
+        "chapter-2"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-013",
@@ -498,11 +498,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
+        "chapter-8",
         "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-9",
+        "chapter-1",
+        "doctors-opinion"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-014",
@@ -530,13 +530,13 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-5",
+        "chapter-6",
+        "chapter-3",
+        "doctors-opinion",
+        "chapter-2"
       ],
-      "c_recall_at_5": false,
+      "c_recall_at_5": true,
       "case_id": "RU-RF-015",
       "relevant_sections": [
         "chapter-5"
@@ -560,11 +560,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
         "chapter-2",
-        "chapter-3"
+        "chapter-11",
+        "chapter-1",
+        "chapter-8",
+        "doctors-opinion"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-016",
@@ -590,11 +590,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
         "chapter-2",
-        "chapter-3"
+        "chapter-11",
+        "doctors-opinion",
+        "chapter-8",
+        "chapter-5"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-017",
@@ -620,11 +620,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
+        "chapter-8",
+        "chapter-9",
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-4"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-018",
@@ -651,11 +651,11 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
-        "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "chapter-3",
+        "chapter-6",
+        "chapter-5",
+        "doctors-opinion",
+        "chapter-2"
       ],
       "c_recall_at_5": true,
       "case_id": "RU-RF-019",
@@ -682,13 +682,13 @@
       ],
       "b_recall_at_5": true,
       "c_hit_sections": [
+        "chapter-8",
+        "chapter-9",
         "chapter-1",
-        "chapter-10",
-        "chapter-11",
-        "chapter-2",
-        "chapter-3"
+        "doctors-opinion",
+        "chapter-4"
       ],
-      "c_recall_at_5": false,
+      "c_recall_at_5": true,
       "case_id": "RU-RF-020",
       "relevant_sections": [
         "chapter-8"
@@ -701,7 +701,7 @@
     "config_version": "ru-first-production-v1",
     "evidence_language": "ru",
     "evidence_rule": "All final Russian answer evidence resolves to exact RU canonical text.",
-    "rationale": "EN secondary adds 0.000 recall@5 and 0 new relevant sections at 1.70x latency; keeping RU-only.",
+    "rationale": "EN secondary adds 0.000 recall@5 and 0 new relevant sections at 1.60x latency; keeping RU-only.",
     "ru_only": true
   },
   "quality_gate": {
