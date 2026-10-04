@@ -167,6 +167,7 @@ class FixtureResult:
     second_pass_recovered: bool
     support_success: bool
     false_strengthening: bool
+    raw_utterance_recall_at_5: bool
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ class ConfigSummary:
     recall_at_12: float
     lexical_recall_at_5: float
     dense_recall_at_5: float
+    raw_utterance_recall_at_5: float
     coverage: float
     missed_region_rate: float
     corpus_section_coverage: float
@@ -620,13 +622,19 @@ def _hit_at(sections: tuple[str, ...], case: GoldCase, k: int) -> bool:
     return any(section in case.relevant_sections for section in sections[:k])
 
 
-def _lexical_sections(index: HybridIndex, queries: list[str], *, top_k: int = 5) -> tuple[str, ...]:
+def _lexical_sections(
+    index: HybridIndex,
+    queries: list[str],
+    *,
+    top_k: int = 5,
+    search_top_k: int = LEXICAL_TOP_K,
+) -> tuple[str, ...]:
     from collections import Counter
 
     counter: Counter[str] = Counter()
     lexical_path = index.directory / "lexical.db"
     for query in queries:
-        for chunk_id, _ in lexical_search(lexical_path, query, top_k=LEXICAL_TOP_K):
+        for chunk_id, _ in lexical_search(lexical_path, query, top_k=search_top_k):
             record = index.chunks.get(chunk_id)
             if record is not None:
                 counter[record.section] += 1
@@ -634,13 +642,19 @@ def _lexical_sections(index: HybridIndex, queries: list[str], *, top_k: int = 5)
     return tuple(ordered)
 
 
-def _dense_sections(index: HybridIndex, queries: list[str], *, top_k: int = 5) -> tuple[str, ...]:
+def _dense_sections(
+    index: HybridIndex,
+    queries: list[str],
+    *,
+    top_k: int = 5,
+    search_top_k: int = DENSE_TOP_K,
+) -> tuple[str, ...]:
     from collections import Counter
 
     counter: Counter[str] = Counter()
     for query in queries:
         vector = hashing_embed("query: " + query, dim=index.dense.dim)
-        for chunk_id, _ in index.dense.search(vector, top_k=min(DENSE_TOP_K, len(index.chunks))):
+        for chunk_id, _ in index.dense.search(vector, top_k=min(search_top_k, len(index.chunks))):
             record = index.chunks.get(chunk_id)
             if record is not None:
                 counter[record.section] += 1
@@ -649,10 +663,14 @@ def _dense_sections(index: HybridIndex, queries: list[str], *, top_k: int = 5) -
 
 
 def _p95(values: list[float]) -> float:
+    """Nearest-rank 95th percentile over the observed values."""
+    import math
+
     if not values:
         return 0.0
     ordered = sorted(values)
-    pos = max(0, min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1)))))
+    rank = math.ceil(0.95 * len(ordered))
+    pos = max(0, min(len(ordered) - 1, rank - 1))
     return float(ordered[pos])
 
 
@@ -687,8 +705,8 @@ def run_case(
     logicals = tuple(hit.logical_chunk_id for hit in hits)
     sections_5 = sections[:5]
     sections_12 = sections[:12]
-    lexical_secs = _lexical_sections(index, queries)
-    dense_secs = _dense_sections(index, queries)
+    lexical_secs = _lexical_sections(index, queries, search_top_k=lexical_top_k)
+    dense_secs = _dense_sections(index, queries, search_top_k=dense_top_k)
     lexical_hit = (
         any(s in case.relevant_sections for s in lexical_secs) if not case.is_unsupported else False
     )
@@ -704,9 +722,9 @@ def run_case(
     fidelity_ok = True
     if not case.is_unsupported and logicals:
         for logical_id in logicals[:2]:
+            tool_calls += 1
             try:
                 read = book_read(index, logical_id)
-                tool_calls += 1
                 text = str(read.get("text", ""))
                 evidence_tokens += estimate_text_tokens(text)
                 source_tokens += estimate_text_tokens(text)
@@ -716,19 +734,19 @@ def run_case(
             except Exception:
                 fidelity_ok = False
         if case.category in ("multi-theme", "terse-followup", "ambiguous-sorvalsya"):
+            tool_calls += 1
             try:
                 expanded = book_expand(index, logicals[0], before=1, after=1)
-                tool_calls += 1
                 for item in expanded.get("chunks", []):
                     if isinstance(item, dict):
                         source_tokens += estimate_text_tokens(str(item.get("text", "")))
             except Exception:
                 pass
         if case.category in ("exact-phrase", "exact-fact", "book-purpose", "book-history"):
+            tool_calls += 1
             try:
                 section_id = case.relevant_sections[0] if case.relevant_sections else sections_5[0]
                 section = book_section(index, section_id, chunk_offset=0, chunk_limit=2)
-                tool_calls += 1
                 source_tokens += int(section.get("source_tokens", 0))
             except Exception:
                 pass
@@ -755,6 +773,23 @@ def run_case(
         support = True  # correctly abstains: no evidence promoted
     else:
         support = any(s in case.relevant_sections for s in sections_5) and fidelity_ok
+    # Raw-utterance-only diagnostic: search with the uncorrected utterance
+    # alone (no planner rewrites) so typo/transposition robustness is measured
+    # separately instead of being masked by corrected plan queries.
+    try:
+        raw_hits = _search(
+            index,
+            [case.utterance],
+            lexical_top_k=lexical_top_k,
+            dense_top_k=dense_top_k,
+            rrf_k=rrf_k,
+            max_n=max_n,
+            max_per_section=max_per_section,
+        )
+        raw_sections = tuple(hit.section for hit in raw_hits)[:5]
+        raw_hit = _hit_at(raw_sections, case, 5)
+    except Exception:
+        raw_hit = False
     return FixtureResult(
         case_id=case.case_id,
         hit_sections_5=tuple(sections_5),
@@ -776,6 +811,7 @@ def run_case(
         second_pass_recovered=recovered,
         support_success=support,
         false_strengthening=_false_strengthening(case),
+        raw_utterance_recall_at_5=raw_hit,
     )
 
 
@@ -857,6 +893,7 @@ def summarize(results: list[FixtureResult], *, config_id: str) -> ConfigSummary:
     recall_12 = sum(1 for r in results if r.recall_at_12) / max(1, len(supported))
     lex_5 = sum(1 for r in results if r.lexical_recall_at_5) / max(1, len(supported))
     dense_5 = sum(1 for r in results if r.dense_recall_at_5) / max(1, len(supported))
+    raw_5 = sum(1 for r in results if r.raw_utterance_recall_at_5) / max(1, len(supported))
     covered = sum(r.coverage_found for r in results)
     relevant = sum(r.coverage_total for r in results)
     coverage = (covered / relevant) if relevant else 1.0
@@ -895,6 +932,7 @@ def summarize(results: list[FixtureResult], *, config_id: str) -> ConfigSummary:
         recall_at_12=recall_12,
         lexical_recall_at_5=lex_5,
         dense_recall_at_5=dense_5,
+        raw_utterance_recall_at_5=raw_5,
         coverage=coverage,
         missed_region_rate=1.0 - coverage,
         corpus_section_coverage=corpus_cov,
@@ -1074,6 +1112,7 @@ def _summary_to_dict(summary: ConfigSummary) -> dict[str, Any]:
         "recall_at_12": summary.recall_at_12,
         "lexical_recall_at_5": summary.lexical_recall_at_5,
         "dense_recall_at_5": summary.dense_recall_at_5,
+        "raw_utterance_recall_at_5": summary.raw_utterance_recall_at_5,
         "coverage": summary.coverage,
         "missed_relevant_region_rate": summary.missed_region_rate,
         "corpus_section_coverage": summary.corpus_section_coverage,
@@ -1137,6 +1176,7 @@ def build_artifact_payload(
             "embedding_backend": "hashing-char-token/1",
             "production_validated": False,
             "hermetic_only": True,
+            "production_promotion_blocked": True,
             "note": (
                 "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; "
                 "production e5 uses the pinned lock. Chunking groups whole sentences "
@@ -1212,6 +1252,7 @@ def build_artifact_payload(
                 "recall_at_5": r.recall_at_5,
                 "lexical_recall_at_5": r.lexical_recall_at_5,
                 "dense_recall_at_5": r.dense_recall_at_5,
+                "raw_utterance_recall_at_5": r.raw_utterance_recall_at_5,
                 "hit_sections_5": list(r.hit_sections_5),
                 "tool_calls": r.tool_calls,
                 "source_tokens": r.source_tokens,
@@ -1286,6 +1327,10 @@ def validate_artifact_payload(payload: object, *, repo_root: Path) -> None:
         raise AaRetrievalError("artifact duplicate rate exceeds the gate")
     if int(retrieval.get("false_strengthening_count", 1)) != 0:
         raise AaRetrievalError("artifact false strengthening must be 0")
+    if float(gate.get("slang_pass_rate_measured", 0.0)) < SLANG_GATE:
+        raise AaRetrievalError("artifact slang pass rate is below the 1.0 gate")
+    if float(gate.get("slang_pass_rate_required", 0.0)) < SLANG_GATE:
+        raise AaRetrievalError("artifact slang gate threshold was lowered")
     for key in ("stale_index", "fidelity", "en_control"):
         if key not in payload:
             raise AaRetrievalError(f"artifact is missing {key!r}")
