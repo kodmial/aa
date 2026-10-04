@@ -63,7 +63,7 @@ def _read_recipient(*, recipient_value: str | None, recipient_file: Path | None)
     path = recipient_file or (DEFAULT_ENCRYPTED_DIR / RECIPIENT_NAME)
     try:
         return path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -170,10 +170,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     metadata_path = args.encrypted_dir / METADATA_NAME
     tmp_metadata = metadata_path.with_name(metadata_path.name + ".tmp")
-    tmp_metadata.write_text(
-        json.dumps(metadata, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    metadata_text = json.dumps(metadata, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    tmp_metadata.write_text(metadata_text, encoding="utf-8")
+    if tmp_metadata.read_text(encoding="utf-8") != metadata_text:
+        try:
+            tmp_metadata.unlink()
+        except OSError:
+            pass
+        return _fail("written metadata differs from the expected payload")
     os.replace(tmp_metadata, metadata_path)
 
     print(

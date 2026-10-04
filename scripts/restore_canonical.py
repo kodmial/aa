@@ -76,7 +76,7 @@ def _manifest_artifact_sha(manifest_path: Path) -> str:
 def _valid_existing(path: Path, *, expected_sha: str) -> bool:
     try:
         payload = path.read_bytes()
-    except FileNotFoundError:
+    except OSError:
         return False
     if hashlib.sha256(payload).hexdigest() != expected_sha:
         return False
