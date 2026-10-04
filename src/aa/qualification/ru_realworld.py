@@ -506,18 +506,170 @@ def _audience_for(utterance: str, topic: str, journey: str) -> str:
     return "general"
 
 
-def _turn_provenance(provenance: list[str], turn: int) -> list[str]:
-    """Derive a turn-relevant provenance subset from the journey umbrella.
+_TURN_SOURCE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "SV_QUIT_1": (
+        "броси",
+        "броса",
+        "трезв",
+        "срыв",
+        "сорв",
+        "стыд",
+        "непью",
+        "не пью",
+        "quit",
+        "readiness",
+        "relapse_shame",
+        "denial",
+        "moderation",
+        "urge",
+    ),
+    "SV_EVENING_1": (
+        "вечер",
+        "веч",
+        "пив",
+        "привыч",
+        "тяга",
+        "кроет",
+        "дети",
+        "вина",
+        "evening",
+        "craving",
+        "typo",
+    ),
+    "SV_DAILY_1": (
+        "ежедневн",
+        "каждый день",
+        "бессонница",
+        "сон",
+        "давление",
+        "тахикардия",
+        "сердце",
+        "нервн",
+        "мозг",
+        "daily",
+        "sleep",
+        "withdrawal_boundary",
+        "stress",
+        "work",
+    ),
+    "SV_RELAPSE_1": (
+        "срыв",
+        "сорв",
+        "снова",
+        "вчера",
+        "страх",
+        "страш",
+        "влечен",
+        "тяга",
+        "удержал",
+        "relapse",
+        "slang_sorvalsya",
+        "ambiguous",
+        "sorvalsya",
+    ),
+    "SV_FAMILY_1": (
+        "муж",
+        "жена",
+        "семья",
+        "семьи",
+        "семье",
+        "родствен",
+        "близк",
+        "мама",
+        "отец",
+        "сын",
+        "дочь",
+        "партнер",
+        "партнёр",
+        "тайно",
+        "relative",
+        "family",
+        "partner",
+    ),
+    "SV_WITHDRAWAL_1": (
+        "запой",
+        "запоя",
+        "отмена",
+        "ломка",
+        "судорог",
+        "психоз",
+        "тряс",
+        "пот",
+        "опасно",
+        "капельниц",
+        "таблетк",
+        "доза",
+        "врач",
+        "withdrawal",
+        "escalation",
+        "emergency",
+        "medical",
+        "sleep_med",
+    ),
+    "AA_SELF_1": (
+        "аа",
+        "собрани",
+        "анонимн",
+        "книга",
+        "высшая сила",
+        "бог",
+        "шаг",
+        "контроль",
+        "последств",
+        "самоопредел",
+        "aa",
+        "book",
+        "agnostic",
+        "higher_power",
+        "newcomer",
+        "anonymity",
+        "session_reset",
+        "new_session",
+    ),
+}
 
-    Each substantive turn keeps a deterministic rotating window into the
-    journey-level source list so oracle turns never all repeat the same
-    generic umbrella list verbatim.
+
+def _score_source(source_id: str, haystack: str) -> int:
+    keywords = _TURN_SOURCE_KEYWORDS.get(source_id, ())
+    return sum(1 for marker in keywords if marker in haystack)
+
+
+def _turn_provenance(
+    provenance: list[str],
+    turn: int,
+    utterance: str = "",
+    journey: str = "",
+) -> list[str]:
+    """Derive a turn/topic-relevant provenance subset from the journey umbrella.
+
+    Scores each umbrella source against the journey slug plus the turn
+    utterance (casefolded substring hits from ``_TURN_SOURCE_KEYWORDS``) and
+    keeps the highest-scoring sources.  Ties break by umbrella order, then by
+    turn offset, so the result is deterministic but driven by turn/topic
+    relevance instead of a generic rotating window.  The result is always a
+    non-empty proper subset of a multi-source umbrella, never a verbatim
+    copy of the umbrella list.
     """
     if not provenance:
         return []
-    size = min(len(provenance), 2 + (turn % 2))
-    start = (turn - 1) % len(provenance)
-    return [provenance[(start + offset) % len(provenance)] for offset in range(size)]
+    if len(provenance) == 1:
+        return list(provenance)
+    haystack = f"{journey} {utterance}".casefold()
+    scored = [
+        (_score_source(source_id, haystack), index, source_id)
+        for index, source_id in enumerate(provenance)
+    ]
+    size = min(len(provenance) - 1, 2 + (turn % 2))
+    size = max(1, size)
+    # Highest score first; umbrella order breaks ties; turn rotates residual ties.
+    scored.sort(key=lambda item: (-item[0], (item[1] - (turn - 1)) % len(provenance)))
+    selected = sorted(
+        (item[2] for item in scored[:size]),
+        key=lambda source_id: provenance.index(source_id),
+    )
+    if not selected:
+        selected = [provenance[(turn - 1) % len(provenance)]]
+    return selected
 
 
 def build_projections(
@@ -527,7 +679,8 @@ def build_projections(
     input_records: list[dict[str, Any]] = []
     oracle_records: list[dict[str, Any]] = []
     for record in seed_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("seed single record must be an object")
         record_id = str(record["id"])
         utterance = str(record["utterance"])
         topic = str(record.get("topic", ""))
@@ -554,14 +707,16 @@ def build_projections(
             }
         )
     for record in seed_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("seed journey record must be an object")
         journey_id = str(record["id"])
         slug = str(record["journey"])
         provenance = list(record.get("provenance_ids", []))
         input_turns: list[dict[str, Any]] = []
         oracle_turns: list[dict[str, Any]] = []
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{journey_id}: journey turn must be an object")
             number = int(turn["turn"])
             utterance = str(turn["utterance"])
             legacy = str(turn.get("expected_route", "ordinary"))
@@ -595,7 +750,7 @@ def build_projections(
                     "book_relevance": _book_relevance_for(mode, slug, "", number),
                     "forbidden_inferences": _forbidden_inferences_for(mode),
                     "safety_boundary_tags": _boundary_tags_for(mode),
-                    "provenance_ids": _turn_provenance(provenance, number),
+                    "provenance_ids": _turn_provenance(provenance, number, utterance, slug),
                     "rubric_tags": _journey_rubric_tags(slug, mode),
                 }
             )
@@ -637,6 +792,12 @@ def _check_input_manifest(manifest: dict[str, Any]) -> None:
     }
     if not isinstance(counts, dict) or {k: counts.get(k) for k in expected} != expected:
         raise RuRealWorldCorpusError(f"input manifest counts must equal {expected}")
+    note = str(manifest.get("note", ""))
+    coverage = (str(manifest.get("coverage_note", "")) + " " + note).casefold()
+    if "coverage-balanced" not in coverage or "not population prevalence" not in coverage:
+        raise RuRealWorldCorpusError(
+            "input manifest must state coverage-balanced fixture is not prevalence/pass-rate"
+        )
 
 
 def _check_oracle_manifest(manifest: dict[str, Any]) -> None:
@@ -759,7 +920,8 @@ def _check_input_journey(record: dict[str, Any], index: int) -> None:
                 )
     if record["id"] == CONTROL_JOURNEY_ID:
         control = turns[CONTROL_TURN_NUMBER - 1]
-        assert isinstance(control, dict)
+        if not isinstance(control, dict):
+            raise RuRealWorldCorpusError("RU-J-027 control entry must be an object")
         if control.get("kind") != "control":
             raise RuRealWorldCorpusError("RU-J-027 must hold the session-reset control event")
 
@@ -809,6 +971,11 @@ def _check_oracle_single(record: dict[str, Any], index: int) -> None:
     if "russian_realworld" not in record["rubric_tags"]:
         raise RuRealWorldCorpusError(
             f"{record['id']}: rubric_tags must include 'russian_realworld'"
+        )
+    if mode == "medical_refusal_boundary" and decision != "allow":
+        raise RuRealWorldCorpusError(
+            f"{record['id']}: medical_refusal_boundary pairs with router decision "
+            "'allow'; refusal is expressed via the response mode"
         )
 
 
@@ -920,6 +1087,16 @@ def _check_oracle_journey(record: dict[str, Any], index: int) -> None:
             raise RuRealWorldCorpusError(
                 f"{record['id']} turn {number}: provenance must subset the journey umbrella"
             )
+        if len(provenance) > 1 and set(turn["provenance_ids"]) >= umbrella:
+            raise RuRealWorldCorpusError(
+                f"{record['id']} turn {number}: provenance must be a proper turn-relevant "
+                "subset, never a verbatim copy of the journey umbrella"
+            )
+        if mode == "medical_refusal_boundary" and decision != "allow":
+            raise RuRealWorldCorpusError(
+                f"{record['id']} turn {number}: medical_refusal_boundary pairs with "
+                "router decision 'allow'; refusal is expressed via the response mode"
+            )
     numbers = sorted(seen_numbers)
     if record["id"] == CONTROL_JOURNEY_ID:
         if numbers != [1, 2, 4, 5]:
@@ -927,14 +1104,16 @@ def _check_oracle_journey(record: dict[str, Any], index: int) -> None:
     elif numbers != [1, 2, 3, 4, 5]:
         raise RuRealWorldCorpusError(f"{record['id']}: oracle turn numbers must run 1..5")
     first = next(t for t in turns if isinstance(t, dict) and t["turn"] == 1)
-    assert isinstance(first, dict)
+    if not isinstance(first, dict):
+        raise RuRealWorldCorpusError(f"{record['id']}: first oracle turn must be an object")
     if first["requires_context"] is not False:
         raise RuRealWorldCorpusError(f"{record['id']}: first turn must not require context")
 
 
 def _check_sources_shape(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     sources = payload["sources"]
-    assert isinstance(sources, list)
+    if not isinstance(sources, list):
+        raise RuRealWorldCorpusError("sources file 'sources' must be a list")
     if len(sources) != EXPECTED_SOURCES:
         raise RuRealWorldCorpusError(f"expected {EXPECTED_SOURCES} sources, got {len(sources)}")
     by_id: dict[str, dict[str, Any]] = {}
@@ -980,16 +1159,20 @@ def _check_review_semantics(
     valid_ids = set(by_source_id)
     input_utterances: dict[str, str] = {}
     for record in input_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input single record must be an object")
         input_utterances[str(record["id"])] = str(record["utterance"])
     for record in input_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input journey record must be an object")
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{record.get('id')}: journey turn must be an object")
             if turn.get("kind") == "user":
                 input_utterances[f"{record['id']}#{turn['turn']}"] = str(turn["utterance"])
     for record in oracle_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("oracle single record must be an object")
         for provenance_id in record["provenance_ids"]:
             if provenance_id not in valid_ids:
                 raise RuRealWorldCorpusError(
@@ -1023,16 +1206,19 @@ def _check_review_semantics(
                     f"classifier ({classifiers(classification)})"
                 )
     oracle_by_id = {str(r["id"]): r for r in oracle_journeys if isinstance(r, dict)}
-    assert len(oracle_by_id) == len(oracle_journeys)
+    if len(oracle_by_id) != len(oracle_journeys):
+        raise RuRealWorldCorpusError("oracle journeys contain duplicate or malformed ids")
     for record in oracle_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("oracle journey record must be an object")
         for provenance_id in record["provenance_ids"]:
             if provenance_id not in valid_ids:
                 raise RuRealWorldCorpusError(
                     f"{record['id']}: provenance id {provenance_id!r} does not resolve"
                 )
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{record.get('id')}: oracle turn must be an object")
             for provenance_id in turn.get("provenance_ids", []):
                 if provenance_id not in valid_ids:
                     raise RuRealWorldCorpusError(
@@ -1064,22 +1250,26 @@ def classifiers(classification: Any) -> str:
 def _check_dedup_input(input_singles: list[Any], input_journeys: list[Any]) -> None:
     seen_ids: set[str] = set()
     for record in (*input_singles, *input_journeys):
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input record must be an object")
         record_id = str(record["id"])
         if record_id in seen_ids:
             raise RuRealWorldCorpusError(f"duplicate id {record_id!r}")
         seen_ids.add(record_id)
     seen_utterances: dict[str, str] = {}
     for record in input_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input single record must be an object")
         norm = _norm_utterance(str(record["utterance"]))
         if norm in seen_utterances:
             raise RuRealWorldCorpusError(f"duplicate single-turn utterance in {record['id']}")
         seen_utterances[norm] = str(record["id"])
     for record in input_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input journey record must be an object")
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{record.get('id')}: journey turn must be an object")
             if turn.get("kind") != "user":
                 continue
             norm = _norm_utterance(str(turn["utterance"]))
@@ -1109,7 +1299,8 @@ def _check_meaning_preservation_anchors(
         if record is None:
             raise RuRealWorldCorpusError(f"missing slang fixture {slang_id}")
         tags = record.get("rubric_tags", [])
-        assert isinstance(tags, list)
+        if not isinstance(tags, list):
+            raise RuRealWorldCorpusError(f"{slang_id}: rubric_tags must be a list")
         if "slang" not in tags or "meaning_preservation" not in tags:
             raise RuRealWorldCorpusError(f"{slang_id}: slang fixtures must keep both tags")
         if record.get("expected_safety_decision") != "allow":
@@ -1130,7 +1321,8 @@ def _check_meaning_preservation_anchors(
         if journey_id not in journeys_by_id:
             raise RuRealWorldCorpusError(f"missing journey fixture {journey_id}")
     ambiguous = journeys_by_id["RU-J-013"]
-    assert isinstance(ambiguous, dict)
+    if not isinstance(ambiguous, dict):
+        raise RuRealWorldCorpusError("RU-J-013 fixture must be an object")
     ambiguous_turns = {int(t["turn"]): t for t in ambiguous["turns"] if isinstance(t, dict)}
     first = ambiguous_turns.get(1)
     if first is None:
@@ -1145,31 +1337,37 @@ def _check_meaning_preservation_anchors(
     new_session_input = input_by_id.get("RU-J-027")
     if new_session_input is None:
         raise RuRealWorldCorpusError("missing journey fixture RU-J-027")
-    assert isinstance(new_session_input, dict)
+    if not isinstance(new_session_input, dict):
+        raise RuRealWorldCorpusError("RU-J-027 input fixture must be an object")
     new_entries = list(new_session_input["turns"])
     control = new_entries[CONTROL_TURN_NUMBER - 1]
-    assert isinstance(control, dict)
+    if not isinstance(control, dict):
+        raise RuRealWorldCorpusError("RU-J-027 control entry must be an object")
     if control.get("kind") != "control" or control.get("control") != SESSION_RESET_CONTROL:
         raise RuRealWorldCorpusError("RU-J-027 must keep the session-reset control event")
     for entry in new_entries:
-        assert isinstance(entry, dict)
+        if not isinstance(entry, dict):
+            raise RuRealWorldCorpusError("RU-J-027 entry must be an object")
         if entry.get("kind") == "user" and str(entry.get("utterance", "")).strip() == "/new":
             raise RuRealWorldCorpusError("RU-J-027 must not send /new as a substantive message")
     new_session_oracle = journeys_by_id["RU-J-027"]
-    assert isinstance(new_session_oracle, dict)
+    if not isinstance(new_session_oracle, dict):
+        raise RuRealWorldCorpusError("RU-J-027 oracle fixture must be an object")
     oracle_turns = {int(t["turn"]): t for t in new_session_oracle["turns"] if isinstance(t, dict)}
     post_reset = oracle_turns.get(CONTROL_TURN_NUMBER + 1)
     if post_reset is None or post_reset.get("requires_context") is not False:
         raise RuRealWorldCorpusError("RU-J-027 turn after reset must be marked context-independent")
     secret_med = journeys_by_id["RU-J-017"]
-    assert isinstance(secret_med, dict)
+    if not isinstance(secret_med, dict):
+        raise RuRealWorldCorpusError("RU-J-017 fixture must be an object")
     secret_modes = [str(item.get("expected_response_mode")) for item in secret_med["turns"]]
     if "medical_refusal_boundary" not in secret_modes:
         raise RuRealWorldCorpusError(
             "RU-J-017 must keep refusal-boundary turns for secret medication"
         )
     for item in secret_med["turns"]:
-        assert isinstance(item, dict)
+        if not isinstance(item, dict):
+            raise RuRealWorldCorpusError("RU-J-017 turn must be an object")
         if item.get("expected_safety_decision") not in ("allow", "block"):
             raise RuRealWorldCorpusError("RU-J-017 turns must not be emergency")
         if item.get("expected_safety_decision") == "allow" and item.get(
@@ -1177,14 +1375,16 @@ def _check_meaning_preservation_anchors(
         ) not in ("medical_refusal_boundary", "medical_boundary_clarification", "ordinary_support"):
             raise RuRealWorldCorpusError("RU-J-017 has an unexpected response mode")
     quote_journey = journeys_by_id["RU-J-023"]
-    assert isinstance(quote_journey, dict)
+    if not isinstance(quote_journey, dict):
+        raise RuRealWorldCorpusError("RU-J-023 fixture must be an object")
     quote_turns = {int(t["turn"]): t for t in quote_journey["turns"] if isinstance(t, dict)}
     if quote_turns.get(2, {}).get("requests_exact_quote") is not True:
         raise RuRealWorldCorpusError("RU-J-023 turn 2 must request an exact quotation")
     if quote_turns.get(2, {}).get("book_relevance") != "required":
         raise RuRealWorldCorpusError("RU-J-023 exact-quote turn must mark book_relevance=required")
     for item in oracle_singles:
-        assert isinstance(item, dict)
+        if not isinstance(item, dict):
+            raise RuRealWorldCorpusError("oracle single record must be an object")
         for key in ORACLE_FORBIDDEN_KEYS:
             if key in item:
                 raise RuRealWorldCorpusError(f"{item.get('id')}: oracle must not carry {key!r}")
@@ -1203,7 +1403,8 @@ def _check_seed_alignment(
             f"seed: expected {EXPECTED_SINGLE_TURNS} single turns, got {len(seed_utterances)}"
         )
     for record in input_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input single record must be an object")
         seed_text = seed_utterances.get(str(record["id"]))
         if seed_text is None:
             raise RuRealWorldCorpusError(f"input {record['id']}: no matching seed single")
@@ -1213,17 +1414,20 @@ def _check_seed_alignment(
             )
     seed_journey_turns: dict[str, dict[int, str]] = {}
     for record in seed_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("seed journey record must be an object")
         seed_journey_turns[str(record["id"])] = {
             int(t["turn"]): str(t["utterance"]) for t in record["turns"]
         }
     for record in input_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input journey record must be an object")
         seed_turns = seed_journey_turns.get(str(record["id"]))
         if seed_turns is None:
             raise RuRealWorldCorpusError(f"input {record['id']}: no matching seed journey")
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{record.get('id')}: journey turn must be an object")
             number = int(turn["turn"])
             if turn.get("kind") == "control":
                 if str(record["id"]) != CONTROL_JOURNEY_ID or number != CONTROL_TURN_NUMBER:
@@ -1256,7 +1460,8 @@ def _check_cross_ids(
     if input_journey_ids != oracle_journey_ids:
         raise RuRealWorldCorpusError("oracle/input journey ID mismatch")
     for input_record, oracle_record in zip(input_journeys, oracle_journeys, strict=True):
-        assert isinstance(input_record, dict) and isinstance(oracle_record, dict)
+        if not isinstance(input_record, dict) or not isinstance(oracle_record, dict):
+            raise RuRealWorldCorpusError("journey alignment records must be objects")
         input_user_turns = sorted(
             int(t["turn"])
             for t in input_record["turns"]
@@ -1356,15 +1561,18 @@ def validate(root: Path | None = None) -> CorpusSummary:
     )
     # Verbatim / answer hygiene on generator-visible utterances.
     for record in input_singles:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input single record must be an object")
         if str(record["utterance"]).strip() in sources_text:
             raise RuRealWorldCorpusError(
                 f"{record['id']}: utterance is copied verbatim from the sources file"
             )
     for record in input_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("input journey record must be an object")
         for turn in record["turns"]:
-            assert isinstance(turn, dict)
+            if not isinstance(turn, dict):
+                raise RuRealWorldCorpusError(f"{record.get('id')}: journey turn must be an object")
             if turn.get("kind") != "user":
                 continue
             if str(turn["utterance"]).strip() in sources_text:
@@ -1374,7 +1582,8 @@ def validate(root: Path | None = None) -> CorpusSummary:
                 )
     referenced = {item for record in oracle_singles for item in record["provenance_ids"]}
     for record in oracle_journeys:
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuRealWorldCorpusError("oracle journey record must be an object")
         referenced.update(record["provenance_ids"])
     unreferenced = sorted(set(by_source_id) - referenced)
     if unreferenced:
