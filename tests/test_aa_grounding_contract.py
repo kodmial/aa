@@ -45,6 +45,7 @@ def test_authoritative_prompt_is_committed_verbatim() -> None:
     assert "Do not provide medication dosing" in text
     assert "sponsor-style" in text
     assert "not role-play deception" in text
+    assert "only the read-only AA book tools" in text
 
 
 def test_grounding_contract_covers_orchestration() -> None:
