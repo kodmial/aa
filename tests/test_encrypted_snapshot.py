@@ -462,3 +462,180 @@ def test_refresh_workflow_is_manual_trusted_and_cache_safe() -> None:
     assert "actions/cache" not in workflow
     # The default token must not be given secret administration.
     assert "administration" not in workflow.lower()
+
+
+def test_recipient_from_identity_matches_generated_pair() -> None:
+    """Activation helper derives the public recipient without logging secrets."""
+    identity, recipient = age_v1.generate_identity()
+    try:
+        assert age_v1.recipient_from_identity(identity) == recipient.strip()
+        other_identity, _ = age_v1.generate_identity()
+        try:
+            assert age_v1.recipient_from_identity(other_identity) != recipient.strip()
+        finally:
+            other_identity = "destroyed"  # noqa: F841
+        with pytest.raises(AgeError):
+            age_v1.recipient_from_identity("AGE-SECRET-KEY-INVALID")
+        with pytest.raises(AgeError):
+            age_v1.recipient_from_identity("")
+    finally:
+        identity = "destroyed"  # noqa: F841
+
+
+def test_refresh_fails_closed_on_recipient_mismatch(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same existing keypair must protect snapshots; mismatched identity fails."""
+    identity_a, recipient_a = age_v1.generate_identity()
+    identity_b, _ = age_v1.generate_identity()
+    try:
+        payload, _ = _fixture_canonical_payload()
+        canonical_path = tmp_path / "canonical.json"
+        canonical_path.write_bytes(payload)
+        manifest = {
+            "format": "aa-canonical-manifest/1",
+            "builder_version": 1,
+            "edition": "fixture",
+            "artifact_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        lock_path = tmp_path / "lock.json"
+        lock_path.write_text(json.dumps({"version": 2}), encoding="utf-8")
+        encrypted_dir = tmp_path / "encrypted"
+        recipient_path = tmp_path / "recipient.txt"
+        recipient_path.write_text(recipient_a + "\n", encoding="utf-8")
+        identity_path = tmp_path / "identity.txt"
+        identity_path.write_text(identity_b + "\n", encoding="utf-8")
+        monkeypatch.delenv("AA_BOOK_AGE_IDENTITY", raising=False)
+        proc = _run_script(
+            _repo_root() / "scripts" / "refresh_encrypted_snapshot.py",
+            [
+                "--manifest",
+                str(manifest_path),
+                "--source-lock",
+                str(lock_path),
+                "--canonical",
+                str(canonical_path),
+                "--encrypted-dir",
+                str(encrypted_dir),
+                "--recipient-file",
+                str(recipient_path),
+                "--identity-file",
+                str(identity_path),
+            ],
+            env_extra={},
+        )
+        assert proc.returncode != 0
+        assert "does not match the committed public recipient" in proc.stderr
+        assert identity_b not in proc.stdout
+        assert identity_b not in proc.stderr
+        assert not (encrypted_dir / "canonical.tar.zst.age").exists()
+    finally:
+        identity_a = "destroyed"  # noqa: F841
+        identity_b = "destroyed"  # noqa: F841
+
+
+def test_restore_fails_closed_on_recipient_mismatch(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh-runner restore refuses a different keypair without leaking secrets."""
+    identity_a, recipient_a = age_v1.generate_identity()
+    identity_b, _ = age_v1.generate_identity()
+    try:
+        payload, _ = _fixture_canonical_payload()
+        canonical_path = tmp_path / "canonical.json"
+        canonical_path.write_bytes(payload)
+        manifest = {
+            "format": "aa-canonical-manifest/1",
+            "builder_version": 1,
+            "edition": "fixture",
+            "artifact_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        lock_path = tmp_path / "lock.json"
+        lock_path.write_text(json.dumps({"version": 2}), encoding="utf-8")
+        encrypted_dir = tmp_path / "encrypted"
+        recipient_path = tmp_path / "recipient.txt"
+        recipient_path.write_text(recipient_a + "\n", encoding="utf-8")
+        identity_a_path = tmp_path / "identity-a.txt"
+        identity_a_path.write_text(identity_a + "\n", encoding="utf-8")
+        identity_b_path = tmp_path / "identity-b.txt"
+        identity_b_path.write_text(identity_b + "\n", encoding="utf-8")
+        monkeypatch.delenv("AA_BOOK_AGE_IDENTITY", raising=False)
+        refresh = _repo_root() / "scripts" / "refresh_encrypted_snapshot.py"
+        proc = _run_script(
+            refresh,
+            [
+                "--manifest",
+                str(manifest_path),
+                "--source-lock",
+                str(lock_path),
+                "--canonical",
+                str(canonical_path),
+                "--encrypted-dir",
+                str(encrypted_dir),
+                "--recipient-file",
+                str(recipient_path),
+                "--identity-file",
+                str(identity_a_path),
+            ],
+            env_extra={},
+        )
+        assert proc.returncode == 0, proc.stderr
+        # Production layout keeps the public recipient inside the encrypted dir;
+        # mirror it there so fresh-runner restore validates the shared keypair.
+        (encrypted_dir / "recipient.txt").write_text(recipient_a + "\n", encoding="utf-8")
+        restore = _repo_root() / "scripts" / "restore_canonical.py"
+        output = tmp_path / "out.json"
+        proc = _run_script(
+            restore,
+            [
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(output),
+                "--encrypted-dir",
+                str(encrypted_dir),
+                "--identity-file",
+                str(identity_b_path),
+                "--no-network-fallback",
+            ],
+            env_extra={},
+        )
+        assert proc.returncode != 0
+        assert "does not match the committed public recipient" in proc.stderr
+        assert identity_b not in proc.stdout
+        assert identity_b not in proc.stderr
+    finally:
+        identity_a = "destroyed"  # noqa: F841
+        identity_b = "destroyed"  # noqa: F841
+
+
+def test_activation_workflows_verify_identity_recipient_match() -> None:
+    """Both refresh workflows must validate the shared keypair in trusted runs."""
+    root = _repo_root()
+    for workflow in (
+        "encrypted-corpus-refresh.yml",
+        "encrypted-corpus-refresh-ru.yml",
+    ):
+        text = (root / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "recipient_from_identity" in text
+        assert "AA_BOOK_AGE_IDENTITY" in text
+        assert "matches committed" in text
+
+
+def test_runtime_restores_en_ru_and_fails_closed_without_translation() -> None:
+    """Russian production startup requires the qualified RU snapshot (#28)."""
+    text = (_repo_root() / ".github" / "workflows" / "aa-runtime.yml").read_text(encoding="utf-8")
+    assert "AA_BOOK_AGE_IDENTITY" in text
+    assert "scripts/restore_canonical.py --no-network-fallback" in text
+    assert "scripts/restore_canonical.py --lang ru --no-network-fallback" in text
+    # RU fails closed with an explicit guard; no silent translation fallback.
+    assert "never fall back to generated translation" in text
+    assert "translate.py" not in text.lower()
+    assert "allow-translation" not in text.lower()
+    # Production must restore from snapshots, not re-fetch sources per run.
+    assert "scripts/fetch_aa_source.py" not in text
+    assert "scripts/build_canonical.py" not in text

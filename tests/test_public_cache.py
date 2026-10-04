@@ -284,8 +284,10 @@ def test_workflow_runtime_semantics_are_unchanged() -> None:
         "actions/checkout",
         'python-version: "3.12"',
         "pip install -e .",
-        "scripts/fetch_aa_source.py",
-        "scripts/build_canonical.py",
+        # Production activation (#28): verified EN + RU restore from the
+        # committed encrypted snapshots; RU fails closed without translation.
+        "scripts/restore_canonical.py --no-network-fallback",
+        "scripts/restore_canonical.py --lang ru --no-network-fallback",
         "python -m aa",
     ):
         assert required in workflow

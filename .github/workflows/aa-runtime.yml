@@ -173,11 +173,18 @@ jobs:
           done
 
       - name: Build and validate AA knowledge runtime
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_ALLOW_NETWORK_FETCH: "0"
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/fetch_aa_source.py
-          python scripts/build_canonical.py
+          # Production activation (#28): restore the verified EN + RU canonical
+          # artifacts from the committed encrypted snapshots. RU fails closed
+          # here when the qualified snapshot cannot be restored/validated;
+          # never fall back to generated translation of EN.
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
 
           [[ -f scripts/build_corpus_structure.py ]] || {
             echo "::error::AA hierarchy builder is missing; issue #8 is not ready."

@@ -30,6 +30,31 @@ jobs:
         run: |
           test -f corpus/source/encrypted/recipient.txt
           grep -q '^age1' corpus/source/encrypted/recipient.txt
+      - name: Verify identity matches committed recipient (#28)
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, "src")
+          from aa.corpus.age_v1 import recipient_from_identity
+          identity = os.environ.get("AA_BOOK_AGE_IDENTITY", "").strip()
+          if not identity:
+              print("AA_BOOK_AGE_IDENTITY is not configured", file=sys.stderr)
+              raise SystemExit(1)
+          committed = open("corpus/source/encrypted/recipient.txt", encoding="utf-8").read().strip()
+          derived = recipient_from_identity(identity)
+          if derived.strip() != committed:
+              print(
+                  f"configured identity does not match committed recipient "
+                  f"(committed_hint={committed[-16:]})",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          print(f"identity matches committed recipient (hint={committed[-16:]})")
+          PY
       - name: Fetch canonical sources (#3 bootstrap)
         run: python3 scripts/fetch_aa_source.py
       - name: Build canonical artifact (#3 bootstrap)

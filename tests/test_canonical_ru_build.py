@@ -668,6 +668,47 @@ def test_real_manifest_is_pinned_and_text_free() -> None:
     assert len(text.encode("utf-8")) < 20_000
 
 
+def test_real_txt_build_matches_pinned_manifest_when_available() -> None:
+    """Stale RU manifest artifact SHA must fail closed in trusted runs (#28).
+
+    When the real Fourth Edition TXT is present (trusted refresh/runtime),
+    the deterministic builder must reproduce the pinned artifact SHA. CI
+    without the ignored TXT skips; trusted runs with the TXT verify.
+    """
+    root = _repo_root()
+    raw_path = root / "corpus" / "source" / "raw-ru" / "aa-big-book.txt"
+    fetch_state_path = root / "corpus" / "source" / "fetch-ru-state.json"
+    if not raw_path.is_file() or not fetch_state_path.is_file():
+        pytest.skip("real RU TXT is not present (trusted runtime only)")
+    build = _load_build()
+    manifest = json.loads((root / "corpus" / "canonical.ru.manifest.json").read_text())
+    fetch_state = json.loads(fetch_state_path.read_text(encoding="utf-8"))
+    source_lock = json.loads((root / "corpus" / "source.ru.lock.json").read_text())
+    raw = raw_path.read_bytes()
+    decoded, _ = build.decode_txt(raw)
+    normalized = build.normalize_text(decoded)
+    preamble, raw_sections = build.split_sections(normalized)
+    sections = build.validate_sections(raw_sections)
+    canonical_txt, enriched = build.build_canonical_text(sections)
+    artifact = build.build_artifact(
+        manifest=manifest,
+        fetch_state=fetch_state,
+        raw=raw,
+        normalized=normalized,
+        preamble=preamble,
+        sections=sections,
+        canonical_txt=canonical_txt,
+        enriched=enriched,
+        source_lock=source_lock,
+    )
+    payload = build.serialize_artifact(artifact)
+    assert hashlib.sha256(payload).hexdigest() == manifest["artifact_sha256"]
+    assert (
+        hashlib.sha256(canonical_txt.encode("utf-8")).hexdigest()
+        == manifest["text_artifact_sha256"]
+    )
+
+
 def test_golden_normalization_is_deterministic() -> None:
     build = _load_build()
     decomposed = "é"
