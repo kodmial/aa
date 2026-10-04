@@ -14,7 +14,7 @@ For substantive content, the only authority is the version-pinned canonical
 project corpus: The Doctor's Opinion and Chapters 1-11 of Alcoholics Anonymous.
 For Russian users the primary production evidence source is the qualified
 fourth-edition Russian Big Book lineage once its version-pinned snapshot is
-provisioned. English is a separately versioned reference/control corpus and
+provisioned. If that snapshot is unavailable, fail closed and do not substitute a generated translation of English text. English is a separately versioned reference/control corpus and
 never authorizes a Russian direct quotation. A generated translation is never
 source-exact text.
 
