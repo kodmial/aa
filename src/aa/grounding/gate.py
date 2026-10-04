@@ -40,6 +40,7 @@ from aa.grounding.quotes import (
     QuoteKind,
     contains_translation_label,
 )
+from aa.retrieval.normalize import ru_stem
 
 EntailmentFn = Callable[[str, str], bool]
 """Predicate over ``(russian_claim, source_text)`` reporting support."""
@@ -77,17 +78,26 @@ def normalize_for_support(text: str) -> str:
 
 def _significant_tokens(text: str) -> set[str]:
     normalized = normalize_for_support(text)
-    return {token for token in _TOKEN_PATTERN.findall(normalized) if len(token) >= 4}
+    stems: set[str] = set()
+    for token in _TOKEN_PATTERN.findall(normalized):
+        if len(token) < 4:
+            continue
+        stem = ru_stem(token)
+        if len(stem) >= 3:
+            stems.add(stem)
+    return stems
 
 
 def default_entails(russian_claim: str, source_text: str) -> bool:
     """Conservative same-language support check (fail-closed proxy).
 
-    Requires at least two shared significant tokens covering at least
-    half of the claim's significant tokens. Paraphrase or translation
-    beyond that overlap must be judged by a qualified entailment
-    function supplied by the caller; this default never passes
-    cross-language pairs with disjoint vocabularies.
+    Requires at least two shared stemmed significant tokens covering at
+    least half of the claim's significant tokens. Stemming makes
+    inflected Russian forms (``трезвости``/``трезвость``) meet without
+    loosening the overlap threshold. Paraphrase or translation beyond
+    that overlap must be judged by a qualified entailment function
+    supplied by the caller; this default never passes cross-language
+    pairs with disjoint vocabularies.
     """
     claim_tokens = _significant_tokens(russian_claim)
     if len(claim_tokens) < 2:
