@@ -39,7 +39,7 @@ def test_authoritative_prompt_is_committed_verbatim() -> None:
     assert "Never fill missing source support from model memory" in text
     assert "Every substantive claim must be traceable to exact canonical source" in text
     assert "does not establish that answer" in text
-    assert "Never complete missing facts from outside\nthe book" in text
+    assert "Never complete missing facts from outside the book" in " ".join(text.split())
     assert "Russian and English are first-class" in text
     assert "deterministic safety layer is authoritative" in text
     assert "Do not provide medication dosing" in text
@@ -95,7 +95,7 @@ def test_opencode_config_binds_named_aa_agent() -> None:
     payload = json.loads(_read(OPENCODE_CONFIG_PATH))
     agent = payload["agent"]["aa"]
     assert agent["mode"] == "primary"
-    assert "aa-agent-system.md" in str(agent["prompt"])
+    assert str(agent["prompt"]) == "{file:./prompts/aa-agent-system.md}"
     permission = agent["permission"]
     assert permission["*"] == "deny"
     for tool in ("book_search", "book_read", "book_expand", "book_section"):

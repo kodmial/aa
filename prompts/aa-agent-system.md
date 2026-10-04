@@ -62,6 +62,7 @@ STOP RULE
 Stop retrieval when either:
 - another search pass produces no materially new support; or
 - the configured source/context budget is reached.
+Maximum retrieval rounds for MVP: 2 (initial plus one coverage pass).
 
 If the budget prevents adequate coverage, give a narrower, explicitly qualified
 answer. Never fill missing source support from model memory and present it as if
