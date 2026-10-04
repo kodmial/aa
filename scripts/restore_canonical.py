@@ -109,6 +109,8 @@ def _read_identity(*, identity_file: Path | None) -> str | None:
             text = identity_file.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             return None
+        except (OSError, UnicodeDecodeError):
+            return None
         return text or None
     raw = os.environ.get(IDENTITY_ENV, "").strip()
     return raw or None
@@ -201,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     if archive.exists() and identity:
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             metadata = None  # type: ignore[assignment]
             snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
         if snapshot_error is None:

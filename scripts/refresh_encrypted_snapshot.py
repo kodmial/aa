@@ -127,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args.encrypted_dir.mkdir(parents=True, exist_ok=True)
     archive_path = args.encrypted_dir / ARCHIVE_NAME
-    archive_path.write_bytes(encrypted)
+    tmp_path = archive_path.with_name(archive_path.name + ".tmp")
+    tmp_path.write_bytes(encrypted)
+    os.replace(tmp_path, archive_path)
     if archive_path.read_bytes() != encrypted:
         return _fail("written archive differs from the encrypted payload")
 
