@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import posixpath
 import re
 import time
 from dataclasses import dataclass, field
@@ -1115,6 +1116,9 @@ def validate_files_do_not_mutate_main(paths: list[str]) -> None:
         while normalized.startswith("./"):
             normalized = normalized[2:]
         normalized = normalized.lstrip("/")
+        normalized = posixpath.normpath(normalized)
+        if normalized in (".", "") or normalized == ".." or normalized.startswith("../"):
+            raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
         for directory in protected_dirs:
             if normalized == directory or normalized.startswith(directory + "/"):
                 raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")

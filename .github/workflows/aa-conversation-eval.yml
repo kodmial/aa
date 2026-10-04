@@ -110,6 +110,7 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', `no-op: wake-up is not a #40/#61/#72 closure (issue ${issueNumber})`);
               core.notice('aa-conversation-eval no-op: unrelated issue event.');
+              setShardOutputs(4);
               return;
             }
             async function getIssue(n) {
@@ -127,6 +128,7 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
               core.notice('aa-conversation-eval no-op: #61 not closed.');
+              setShardOutputs(4);
               return;
             }
             if (i72.state !== 'closed') {
@@ -135,6 +137,7 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', 'no-op: #72 harness is not merged/closed');
               core.notice('aa-conversation-eval no-op: #72 not closed.');
+              setShardOutputs(4);
               return;
             }
             if (i40.state !== 'closed') {
@@ -143,9 +146,12 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
               core.notice('aa-conversation-eval no-op: #40 not closed.');
+              setShardOutputs(4);
               return;
             }
             // Find the latest trusted #40 PASS marker for the exact SHA.
+            // A later FAIL supersedes any earlier PASS, so a FAIL clears the
+            // recorded passSha instead of leaving a stale PASS current.
             const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
@@ -154,7 +160,10 @@ jobs:
             )) {
               for (const c of comments) {
                 const m = (c.body || '').match(markerRe);
-                if (m && m[2] === 'pass') passSha = m[1];
+                if (m) {
+                  if (m[2] === 'pass') passSha = m[1];
+                  else passSha = '';
+                }
               }
             }
             if (!passSha) {
@@ -163,6 +172,7 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
               core.notice('aa-conversation-eval no-op: no #40 PASS SHA.');
+              setShardOutputs(4);
               return;
             }
             // Idempotency: if the same exact SHA + corpus checksum already
@@ -282,7 +292,7 @@ jobs:
         # Derived from the single resolved shard count (dispatch input, then
         # repo variable, then default) so runner sharding always matches
         # executed shards for any supported shard count 1-8.
-        shard-index: ${{ fromJson(needs.readiness.outputs.shard_matrix) }}
+        shard-index: ${{ fromJson(needs.readiness.outputs.shard_matrix || '[0,1,2,3]') }}
     steps:
       - name: Check out exact main SHA
         uses: actions/checkout@v4
@@ -493,6 +503,13 @@ jobs:
               result = "incomplete"
               reason = str(exc)
               print(f"merge incomplete: {reason}")
+          except Exception as exc:  # noqa: BLE001 -- any other merge failure
+              # Missing/invalid manifest JSON, missing keys, encryption
+              # failures, etc. must still produce GITHUB_OUTPUT + the #62
+              # canonical marker instead of aborting before evidence.
+              result = "incomplete"
+              reason = f"{type(exc).__name__}: {exc}"
+              print(f"merge incomplete: {reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
               handle.write(f"result={result}\n")
               handle.write(f"bundle_sha256={bundle_sha}\n")
@@ -507,7 +524,7 @@ jobs:
             eval-out/aa-conversation-eval-full.tar.zst.age
             eval-out/aa-conversation-eval-full.tar.zst.age.sha256
           retention-days: 90
-          if-no-files-found: error
+          if-no-files-found: warn
       - name: Revalidate main at publication time and publish results
         uses: actions/github-script@v7
         with:
