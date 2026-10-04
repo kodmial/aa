@@ -15,22 +15,28 @@
   "chunking": {
     "probes": [
       {
+        "en_chunks": 24,
         "max_chars": 1000,
         "mean_source_tokens": 224.34782608695653,
-        "recall_at_5": 1.0
+        "recall_at_5": 1.0,
+        "ru_chunks": 24
       },
       {
+        "en_chunks": 24,
         "max_chars": 1500,
         "mean_source_tokens": 224.34782608695653,
-        "recall_at_5": 1.0
+        "recall_at_5": 1.0,
+        "ru_chunks": 24
       },
       {
+        "en_chunks": 24,
         "max_chars": 2400,
         "mean_source_tokens": 224.34782608695653,
-        "recall_at_5": 1.0
+        "recall_at_5": 1.0,
+        "ru_chunks": 24
       }
     ],
-    "rationale": "1500 groups whole sentences within one paragraph; 1000 fragments evidence without recall gain, 2400 inflates source tokens.",
+    "rationale": "At fixture scale every probe width collapses to identical whole-paragraph chunking with equal recall and source tokens; 1500 is retained as the middle ground grouping whole sentences within one paragraph.",
     "selected_max_chars": 1500
   },
   "en_control": {
@@ -80,7 +86,7 @@
         "doctors-opinion",
         "chapter-4"
       ],
-      "latency_ms": 2.785958999993454,
+      "latency_ms": 2.101221000032183,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -99,7 +105,7 @@
         "chapter-6",
         "chapter-5"
       ],
-      "latency_ms": 2.6355090001288772,
+      "latency_ms": 2.2060970000552516,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -118,7 +124,7 @@
         "chapter-7",
         "chapter-5"
       ],
-      "latency_ms": 2.613909000046988,
+      "latency_ms": 2.0389489999956822,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -137,7 +143,7 @@
         "chapter-5",
         "chapter-1"
       ],
-      "latency_ms": 2.601406000167117,
+      "latency_ms": 2.011047999985749,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -156,7 +162,7 @@
         "chapter-3",
         "doctors-opinion"
       ],
-      "latency_ms": 2.5582860000668006,
+      "latency_ms": 1.9874820000040927,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -175,7 +181,7 @@
         "chapter-3",
         "chapter-10"
       ],
-      "latency_ms": 2.5477659999069147,
+      "latency_ms": 2.0161150000035377,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -194,7 +200,7 @@
         "chapter-3",
         "chapter-4"
       ],
-      "latency_ms": 2.5229399998352164,
+      "latency_ms": 1.9133420000230217,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -213,7 +219,7 @@
         "chapter-3",
         "chapter-9"
       ],
-      "latency_ms": 2.6060249999773077,
+      "latency_ms": 1.9990490000054706,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -232,7 +238,7 @@
         "chapter-7",
         "chapter-4"
       ],
-      "latency_ms": 2.654946000120617,
+      "latency_ms": 1.9775470000240603,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -251,7 +257,7 @@
         "chapter-1",
         "chapter-3"
       ],
-      "latency_ms": 2.593221000097401,
+      "latency_ms": 1.9823540000061257,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -270,7 +276,7 @@
         "chapter-1",
         "chapter-5"
       ],
-      "latency_ms": 2.613749999909487,
+      "latency_ms": 2.0414019999748234,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -289,7 +295,7 @@
         "chapter-6",
         "chapter-1"
       ],
-      "latency_ms": 2.6973740000357793,
+      "latency_ms": 2.0442869999897084,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -308,7 +314,7 @@
         "chapter-8",
         "chapter-6"
       ],
-      "latency_ms": 2.6512890001413325,
+      "latency_ms": 2.0241369999780545,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -327,7 +333,7 @@
         "chapter-9",
         "chapter-9"
       ],
-      "latency_ms": 2.5754280000001017,
+      "latency_ms": 2.043915999990986,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -346,7 +352,7 @@
         "chapter-1",
         "chapter-9"
       ],
-      "latency_ms": 2.6812050000444287,
+      "latency_ms": 2.101390999996511,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -365,7 +371,7 @@
         "chapter-7",
         "chapter-9"
       ],
-      "latency_ms": 2.677216999927623,
+      "latency_ms": 2.097515000002659,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -384,7 +390,7 @@
         "chapter-5",
         "chapter-8"
       ],
-      "latency_ms": 2.6177360000474437,
+      "latency_ms": 2.0297549999668263,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -403,7 +409,7 @@
         "chapter-5",
         "chapter-9"
       ],
-      "latency_ms": 2.615602000105355,
+      "latency_ms": 2.0075919999840153,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -422,7 +428,7 @@
         "chapter-3",
         "chapter-6"
       ],
-      "latency_ms": 2.6387650000287977,
+      "latency_ms": 2.5398530000302344,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -441,7 +447,7 @@
         "chapter-7",
         "chapter-3"
       ],
-      "latency_ms": 2.6142399999571353,
+      "latency_ms": 2.0911670000032245,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -460,7 +466,7 @@
         "chapter-3",
         "chapter-10"
       ],
-      "latency_ms": 2.6784089998272975,
+      "latency_ms": 2.1120170000017424,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -479,7 +485,7 @@
         "chapter-9",
         "chapter-1"
       ],
-      "latency_ms": 2.6887179999448563,
+      "latency_ms": 2.1954810000011094,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -498,7 +504,7 @@
         "chapter-5",
         "doctors-opinion"
       ],
-      "latency_ms": 2.6013159999820346,
+      "latency_ms": 1.99905899995656,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -517,7 +523,7 @@
         "chapter-5",
         "chapter-11"
       ],
-      "latency_ms": 2.5916179999967426,
+      "latency_ms": 2.0121190000281786,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -536,7 +542,7 @@
         "chapter-4",
         "chapter-3"
       ],
-      "latency_ms": 2.56681199994091,
+      "latency_ms": 1.9849380000209749,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -555,7 +561,7 @@
         "chapter-6",
         "chapter-10"
       ],
-      "latency_ms": 2.5844849999430153,
+      "latency_ms": 3.2336639999925865,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -574,7 +580,7 @@
         "chapter-1",
         "doctors-opinion"
       ],
-      "latency_ms": 2.583934000085719,
+      "latency_ms": 2.0420129999934034,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -593,7 +599,7 @@
         "chapter-8",
         "chapter-11"
       ],
-      "latency_ms": 2.5689449998935743,
+      "latency_ms": 2.034601999980623,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -612,7 +618,7 @@
         "doctors-opinion",
         "chapter-1"
       ],
-      "latency_ms": 2.5104369999553455,
+      "latency_ms": 1.975033999997322,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -631,7 +637,7 @@
         "chapter-8",
         "doctors-opinion"
       ],
-      "latency_ms": 2.606735999961529,
+      "latency_ms": 1.9304179999721782,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -650,7 +656,7 @@
         "chapter-5",
         "chapter-11"
       ],
-      "latency_ms": 3.7055689999760943,
+      "latency_ms": 1.9548340000028475,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -669,7 +675,7 @@
         "chapter-8",
         "chapter-9"
       ],
-      "latency_ms": 2.5715199999467586,
+      "latency_ms": 2.031638000005387,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -688,7 +694,7 @@
         "chapter-5",
         "chapter-6"
       ],
-      "latency_ms": 2.637434000007488,
+      "latency_ms": 2.0637449999867385,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -707,7 +713,7 @@
         "chapter-3",
         "chapter-5"
       ],
-      "latency_ms": 2.6529320000463485,
+      "latency_ms": 2.028172999985145,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -726,7 +732,7 @@
         "chapter-1",
         "chapter-3"
       ],
-      "latency_ms": 2.4930950000907615,
+      "latency_ms": 1.969084999984716,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -745,7 +751,7 @@
         "chapter-8",
         "chapter-11"
       ],
-      "latency_ms": 2.6378030001978914,
+      "latency_ms": 2.0480520000205615,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -764,7 +770,7 @@
         "chapter-8",
         "chapter-7"
       ],
-      "latency_ms": 2.6437050000822637,
+      "latency_ms": 1.9969960000025822,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -783,7 +789,7 @@
         "chapter-8",
         "chapter-7"
       ],
-      "latency_ms": 2.721850000170889,
+      "latency_ms": 2.0499050000353236,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -802,7 +808,7 @@
         "chapter-1",
         "chapter-9"
       ],
-      "latency_ms": 2.73342200011939,
+      "latency_ms": 2.9281489999561927,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -821,7 +827,7 @@
         "chapter-1",
         "chapter-11"
       ],
-      "latency_ms": 2.604302000008829,
+      "latency_ms": 2.0158549999678144,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -840,7 +846,7 @@
         "chapter-7",
         "chapter-4"
       ],
-      "latency_ms": 2.526266999893778,
+      "latency_ms": 1.9322800000054485,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -859,7 +865,7 @@
         "chapter-6",
         "chapter-8"
       ],
-      "latency_ms": 2.6253510000060487,
+      "latency_ms": 2.0705459999703635,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -878,7 +884,7 @@
         "chapter-5",
         "chapter-10"
       ],
-      "latency_ms": 2.6815950000127486,
+      "latency_ms": 2.047441999991406,
       "lexical_recall_at_5": true,
       "recall_at_5": true,
       "second_pass_recovered": false,
@@ -897,7 +903,7 @@
         "chapter-1",
         "chapter-1"
       ],
-      "latency_ms": 1.7723549999573152,
+      "latency_ms": 1.3606610000351793,
       "lexical_recall_at_5": false,
       "recall_at_5": false,
       "second_pass_recovered": false,
@@ -916,7 +922,7 @@
         "chapter-9",
         "doctors-opinion"
       ],
-      "latency_ms": 1.6996489998746256,
+      "latency_ms": 1.306550000037987,
       "lexical_recall_at_5": false,
       "recall_at_5": false,
       "second_pass_recovered": false,
@@ -935,7 +941,7 @@
         "chapter-3",
         "chapter-1"
       ],
-      "latency_ms": 1.6451989999950456,
+      "latency_ms": 1.2650389999748768,
       "lexical_recall_at_5": false,
       "recall_at_5": false,
       "second_pass_recovered": false,
@@ -948,7 +954,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-2"
+        "chapter-2",
+        "chapter-1",
+        "chapter-11",
+        "chapter-8",
+        "doctors-opinion"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -963,7 +973,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-3"
+        "chapter-3",
+        "doctors-opinion",
+        "chapter-8",
+        "chapter-4",
+        "chapter-5"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -978,7 +992,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-6"
+        "chapter-6",
+        "chapter-5",
+        "chapter-2",
+        "chapter-10",
+        "chapter-11"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -993,7 +1011,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-8"
+        "chapter-8",
+        "chapter-10",
+        "chapter-1",
+        "chapter-9",
+        "chapter-2"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -1008,7 +1030,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-10"
+        "chapter-10",
+        "chapter-11",
+        "chapter-8",
+        "chapter-2",
+        "chapter-1"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -1023,7 +1049,11 @@
       "category": "en-control",
       "dense_recall_at_5": true,
       "hit_sections_5": [
-        "chapter-7"
+        "chapter-7",
+        "doctors-opinion",
+        "chapter-4",
+        "chapter-10",
+        "chapter-8"
       ],
       "latency_ms": 0.0,
       "lexical_recall_at_5": true,
@@ -1069,15 +1099,15 @@
     "false_strengthening_count": 0,
     "fixtures": 46,
     "lexical_recall_at_5": 1.0,
-    "mean_cold_latency_ms": 2.785958999993454,
+    "mean_cold_latency_ms": 2.101221000032183,
     "mean_diversity": 0.7590579710144927,
     "mean_evidence_tokens": 192.04347826086956,
-    "mean_latency_ms": 2.5833919782707713,
+    "mean_latency_ms": 2.040054652173032,
     "mean_planner_cost_tokens": 145.43478260869566,
     "mean_source_tokens": 224.34782608695653,
     "mean_tool_calls": 3.0652173913043477,
     "missed_relevant_region_rate": 0.0,
-    "p95_latency_ms": 2.73342200011939,
+    "p95_latency_ms": 2.5398530000302344,
     "p95_source_tokens": 452.0,
     "p95_tool_calls": 4.0,
     "recall_at_1": 0.9767441860465116,
@@ -1113,7 +1143,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5833919782707713,
+      "mean_latency_ms": 2.040054652173032,
       "mean_source_tokens": 224.34782608695653,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1126,7 +1156,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 60,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5664623043390433,
+      "mean_latency_ms": 1.9971753478263627,
       "mean_source_tokens": 224.34782608695653,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1139,7 +1169,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5547119347740352,
+      "mean_latency_ms": 1.9619150869565918,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1152,7 +1182,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5908682826105216,
+      "mean_latency_ms": 1.9997163478276136,
       "mean_source_tokens": 224.34782608695653,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1165,7 +1195,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 2,
-      "mean_latency_ms": 2.558164326096037,
+      "mean_latency_ms": 1.952766260869695,
       "mean_source_tokens": 224.34782608695653,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1178,7 +1208,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 6,
-      "mean_latency_ms": 2.56956284781411,
+      "mean_latency_ms": 1.9869556739150618,
       "mean_source_tokens": 224.34782608695653,
       "passed": true,
       "recall_at_5": 1.0,

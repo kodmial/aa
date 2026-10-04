@@ -680,10 +680,8 @@ def run_case(
         dense_top_k=dense_top_k,
         rrf_k=rrf_k,
         max_n=max_n,
+        max_per_section=max_per_section,
     )
-    # Diversity cap is enforced inside search_aspect via MAX_PER_SECTION;
-    # the tuning knob is recorded in the artifact for traceability.
-    _ = max_per_section
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     sections = tuple(hit.section for hit in hits)
     logicals = tuple(hit.logical_chunk_id for hit in hits)
@@ -749,6 +747,7 @@ def run_case(
             dense_top_k=dense_top_k,
             rrf_k=rrf_k,
             max_n=max_n,
+            max_per_section=max_per_section,
         )
         retry_sections = tuple(hit.section for hit in retry)[:5]
         recovered = any(s in case.relevant_sections for s in retry_sections)
@@ -780,31 +779,69 @@ def run_case(
     )
 
 
-def run_en_control(index: HybridIndex, en_side: Any, case: GoldCase, *, top_k: int = 5) -> bool:
-    """Evaluate one EN control case via the EN side mapped back to RU sections."""
-    ranked: list[tuple[str, float]] = []
+def run_en_control_detail(en_side: Any, case: GoldCase, *, top_k: int = 5) -> dict[str, Any]:
+    """Evaluate one EN control case with real per-branch retrieval detail.
+
+    Returns the hybrid navigation hit plus the lexical-only and dense-only
+    control hits and the actually retrieved sections. Unsupported cases
+    report no branch hits (navigation only).
+    """
+    lexical_ranked: list[tuple[str, float]] = []
+    dense_ranked: list[tuple[str, float]] = []
     for query in case.en_gloss_queries:
-        ranked.extend(lexical_search(en_side.lexical_db, query, top_k=LEXICAL_TOP_K))
-        ranked.extend(
+        lexical_ranked.extend(lexical_search(en_side.lexical_db, query, top_k=LEXICAL_TOP_K))
+        dense_ranked.extend(
             en_side.dense.search(
                 hashing_embed("query: " + query),
                 top_k=min(DENSE_TOP_K, len(en_side.chunks_by_id)),
             )
         )
-    seen: set[str] = set()
-    ordered_sections: list[str] = []
-    for chunk_id, _ in ranked:
-        if chunk_id in seen:
-            continue
-        seen.add(chunk_id)
-        section = str(en_side.chunks_by_id.get(chunk_id, {}).get("section", ""))
-        if section and section not in ordered_sections:
-            ordered_sections.append(section)
-        if len(ordered_sections) >= top_k:
-            break
+    hybrid_ranked: list[tuple[str, float]] = []
+    for query in case.en_gloss_queries:
+        hybrid_ranked.extend(lexical_search(en_side.lexical_db, query, top_k=LEXICAL_TOP_K))
+        hybrid_ranked.extend(
+            en_side.dense.search(
+                hashing_embed("query: " + query),
+                top_k=min(DENSE_TOP_K, len(en_side.chunks_by_id)),
+            )
+        )
+
+    def _ordered_sections(ranked: list[tuple[str, float]]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for chunk_id, _ in ranked:
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            section = str(en_side.chunks_by_id.get(chunk_id, {}).get("section", ""))
+            if section and section not in ordered:
+                ordered.append(section)
+            if len(ordered) >= top_k:
+                break
+        return ordered
+
+    hybrid_sections = _ordered_sections(hybrid_ranked)
+    lexical_sections = _ordered_sections(lexical_ranked)
+    dense_sections = _ordered_sections(dense_ranked)
     if case.is_unsupported:
-        return True
-    return any(s in case.relevant_sections for s in ordered_sections[:top_k])
+        return {
+            "recall_at_5": True,
+            "lexical_recall_at_5": False,
+            "dense_recall_at_5": False,
+            "hit_sections_5": hybrid_sections[:top_k],
+        }
+    return {
+        "recall_at_5": any(s in case.relevant_sections for s in hybrid_sections[:top_k]),
+        "lexical_recall_at_5": any(s in case.relevant_sections for s in lexical_sections[:top_k]),
+        "dense_recall_at_5": any(s in case.relevant_sections for s in dense_sections[:top_k]),
+        "hit_sections_5": hybrid_sections[:top_k],
+    }
+
+
+def run_en_control(index: HybridIndex, en_side: Any, case: GoldCase, *, top_k: int = 5) -> bool:
+    """Evaluate one EN control case via the EN side mapped back to RU sections."""
+    _ = index
+    return bool(run_en_control_detail(en_side, case, top_k=top_k)["recall_at_5"])
 
 
 def summarize(results: list[FixtureResult], *, config_id: str) -> ConfigSummary:
@@ -1338,16 +1375,36 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
             )
             probe_res = [run_case(probe_index, case) for case in ru_cases]
             probe_sum = summarize(probe_res, config_id=f"chunk-{width}")
+            probe_sections = probe_full.get("sections")
+            ru_chunks = 0
+            en_chunks = 0
+            if isinstance(probe_sections, list):
+                for entry in probe_sections:
+                    if isinstance(entry, dict):
+                        ru_branch = entry.get("ru")
+                        en_branch = entry.get("en")
+                        if isinstance(ru_branch, dict):
+                            ru_list = ru_branch.get("chunks")
+                            if isinstance(ru_list, list):
+                                ru_chunks += len(ru_list)
+                        if isinstance(en_branch, dict):
+                            en_list = en_branch.get("chunks")
+                            if isinstance(en_list, list):
+                                en_chunks += len(en_list)
             chunking["probes"].append(
                 {
                     "max_chars": width,
                     "recall_at_5": probe_sum.recall_at_5,
                     "mean_source_tokens": probe_sum.mean_source_tokens,
+                    "ru_chunks": ru_chunks,
+                    "en_chunks": en_chunks,
                 }
             )
         chunking["rationale"] = (
-            "1500 groups whole sentences within one paragraph; 1000 fragments "
-            "evidence without recall gain, 2400 inflates source tokens."
+            "At fixture scale every probe width collapses to identical "
+            "whole-paragraph chunking with equal recall and source tokens; "
+            "1500 is retained as the middle ground grouping whole sentences "
+            "within one paragraph."
         )
         expansion: dict[str, Any] = {
             "selected_before": 1,
@@ -1358,7 +1415,8 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
                 "2+2/3+3 add source tokens without new relevant sections in probes."
             ),
         }
-        en_flags = [run_en_control(index, en_side, c) for c in en_cases]
+        en_details = [run_en_control_detail(en_side, c) for c in en_cases]
+        en_flags = [bool(detail["recall_at_5"]) for detail in en_details]
         en_hits = sum(1 for flag in en_flags if flag)
         en_control = {
             "fixtures": len(en_cases),
@@ -1371,17 +1429,17 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
             {
                 "case_id": case.case_id,
                 "category": case.category,
-                "recall_at_5": flag,
-                "lexical_recall_at_5": flag,
-                "dense_recall_at_5": flag,
-                "hit_sections_5": list(case.relevant_sections[:5]),
+                "recall_at_5": bool(detail["recall_at_5"]),
+                "lexical_recall_at_5": bool(detail["lexical_recall_at_5"]),
+                "dense_recall_at_5": bool(detail["dense_recall_at_5"]),
+                "hit_sections_5": list(detail["hit_sections_5"]),
                 "tool_calls": 1,
                 "source_tokens": 0,
                 "latency_ms": 0.0,
                 "second_pass_recovered": False,
-                "support_success": True,
+                "support_success": bool(detail["recall_at_5"]),
             }
-            for case, flag in zip(en_cases, en_flags, strict=True)
+            for case, detail in zip(en_cases, en_details, strict=True)
         ]
         stale = check_stale_rejection(index, repo_root)
         fidelity = check_exact_fidelity(index, baseline_results)

@@ -565,6 +565,7 @@ def search_aspect(
     dense_top_k: int = DENSE_TOP_K,
     rrf_k: int = RRF_K,
     max_n: int = MAX_CANDIDATES_PER_ASPECT,
+    max_per_section: int = MAX_PER_SECTION,
 ) -> list[RetrievalHit]:
     """Search one planner aspect (original + rewrites) and fuse to <= max_n hits.
 
@@ -593,7 +594,9 @@ def search_aspect(
     }
     sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
     deduped = deduplicate_overlaps(list(fused.values()), spans=spans)
-    diverse = enforce_diversity(deduped, sections=sections, max_n=max_n)
+    diverse = enforce_diversity(
+        deduped, sections=sections, max_n=max_n, max_per_section=max_per_section
+    )
     hits: list[RetrievalHit] = []
     ru_version = str(index.metadata.get("ru_artifact_sha256", ""))
     embedding_model = (
