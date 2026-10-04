@@ -118,6 +118,21 @@ literary source:
 - lexical and multilingual semantic indexes;
 - ranking/reranking metadata.
 
+Issue #8 builds the aligned RU/EN hierarchy with
+`scripts/build_corpus_structure.py` (`src/aa/corpus/structure.py`):
+
+- `corpus/structure.json` — public metadata-only aligned structure
+  (language-neutral section ids, bilingual display titles, concise English
+  topics, provenance/checksum references, section-only alignment policy);
+- `corpus/book-map.md` — public compact primarily-English routing map
+  (navigation only, within the 6000-token budget);
+- `corpus/generated/corpus_structure.json` — private text-bearing full
+  hierarchy (per-language paragraphs/sentences/chunks with exact offsets,
+  parent/previous/next links, and RU-primary retrieval roles; ignored by Git).
+
+Section alignment is mandatory; paragraph/chunk alignment is never forced
+across languages. Every chunk round-trips to exact source text.
+
 Every retrieval unit must map back to exact canonical source text. Generated
 book-map text, embeddings, scores, contextual metadata and reranker output are
 navigation aids only and must never be quoted or presented as the book.
