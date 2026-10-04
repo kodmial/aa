@@ -100,7 +100,7 @@ async def _execute_shard(
     # Fresh-session semantics: every single-turn case gets its own synthetic
     # chat, disjoint from the journey block, so independent singles never
     # share session state within a shard.
-    single_chat_ids = allocate_chat_ids(list(wanted_singles), base=980000 + shard_index * 10000)
+    single_chat_ids = allocate_chat_ids(list(wanted_singles), base=810000 + shard_index * 10000)
     captures: list[TurnCapture] = []
     policy = RetryPolicy()
     # Production execution must use real exponential backoff; no-sleep is
