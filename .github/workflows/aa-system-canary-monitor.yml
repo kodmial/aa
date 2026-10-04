@@ -38,6 +38,10 @@ jobs:
             let run = null;
             if (context.eventName === 'workflow_run') {
               run = context.payload.workflow_run;
+              if (run && run.head_branch !== 'main') {
+                core.info(`Ignoring canary run #${run.id} on branch ${run.head_branch}; only main counts.`);
+                return;
+              }
             } else {
               const response = await github.rest.actions.listWorkflowRuns({
                 owner,
@@ -128,6 +132,11 @@ jobs:
                 incident = created.data;
                 core.info(`Created canary incident #${incident.number}.`);
               } else {
+                const existingBody = String(incident.body || '');
+                if (existingBody.includes(`- Run ID: ${runId}`)) {
+                  core.info(`Canary incident #${incident.number} already reports run ${runId}; skipping duplicate update.`);
+                  return;
+                }
                 await github.rest.issues.update({
                   owner,
                   repo,
