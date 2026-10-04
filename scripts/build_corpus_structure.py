@@ -661,7 +661,11 @@ def build_structure(
             chunk_text = text[cs:ce]
             if not chunk_text.strip():
                 raise ValueError(f"{chunk_id}: chunk text is blank")
-            # Natural-boundary check: chunks end on paragraph/sentence ends.
+            # Natural-boundary check: chunks start/end on paragraph/sentence boundaries.
+            paragraph_starts = {para.char_start for para in paragraphs}
+            sentence_starts = {start for (start, _, _, _) in abs_sentence_spans}
+            if cs not in paragraph_starts and cs not in sentence_starts:
+                raise ValueError(f"{chunk_id}: chunk starts mid-sentence")
             if ce not in paragraph_ends and ce not in sentence_ends:
                 raise ValueError(f"{chunk_id}: chunk ends mid-sentence")
             byte_start, byte_end = _byte_range(text, cs, ce)

@@ -100,7 +100,11 @@ class CorpusStructure:
     def section_chunks(self, section_id: str) -> tuple[StructureNode, ...]:
         """Return retrieval chunks of one section in canonical order."""
         chunks = [node for node in self.children_of(section_id) if node.kind == "chunk"]
-        chunks.sort(key=lambda node: int(node.raw.get("index_in_section", 0)))
+        for node in chunks:
+            index = node.raw.get("index_in_section")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise CorpusStructureError(f"node {node.id!r} lacks index_in_section")
+        chunks.sort(key=lambda node: int(node.raw["index_in_section"]))
         return tuple(chunks)
 
     def chunk_text(self, chunk_id: str, corpus: CanonicalCorpus) -> str:
@@ -252,9 +256,21 @@ def load_structure(path: str | Path) -> CorpusStructure:
         if node.char_end <= node.char_start:
             raise CorpusStructureError(f"node {node.id!r} has an empty offset range")
         children.setdefault(node.parent_id, []).append(node.id)
-    # Deterministic child order follows canonical offsets.
+    # Deterministic child order follows canonical offsets; sections all start at 0
+    # so the book root follows canonical section order explicitly.
+    section_order = {
+        section_id: position for position, section_id in enumerate(EXPECTED_SECTION_IDS)
+    }
     structure.children = {
-        parent_id: tuple(sorted(child_ids, key=lambda cid: nodes[cid].char_start))
+        parent_id: tuple(
+            sorted(
+                child_ids,
+                key=lambda cid: (
+                    section_order.get(cid, 0) if parent_id == "aa-book" else nodes[cid].char_start,
+                    nodes[cid].char_start,
+                ),
+            )
+        )
         for parent_id, child_ids in children.items()
     }
 
