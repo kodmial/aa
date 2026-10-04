@@ -27,7 +27,7 @@ def test_authoritative_prompt_is_committed_verbatim() -> None:
     assert "grounded in the core text of Alcoholics Anonymous" in text
     assert "Never claim that you are a human" in text
     assert "an AA member, the user's actual sponsor, a clinician" in text
-    assert "personal\nsobriety/lived experience" in text
+    assert "personal sobriety/lived experience" in " ".join(text.split())
     assert "The always-loaded book map is navigation only" in text
     assert "For every substantive user message" in text
     assert "WHOLE-BOOK GROUNDING LOOP" in text
@@ -80,7 +80,7 @@ def test_grounding_contract_covers_orchestration() -> None:
     assert "opencode/space-bunny-free" in text
     assert "no implicit third fallback" in text.lower()
     # Agent binding and tool policy.
-    assert "deny" in text.lower()
+    assert "deny-by-default" in text.lower() or "deny by default" in text.lower()
     for tool in ("book_search", "book_read", "book_expand", "book_section"):
         assert tool in text, f"missing tool: {tool}"
     # Downstream references.
