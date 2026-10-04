@@ -198,7 +198,7 @@ class Application:
             reply = await self.respond(incoming.chat_id, incoming.text)
             if not reply.strip():
                 raise OpenCodeError("opencode returned an empty response")
-            if contains_english_fallback(reply):
+            if not meets_russian_only(reply):
                 logger.warning(
                     "telegram reply failed closed on RU-only contract",
                     extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},

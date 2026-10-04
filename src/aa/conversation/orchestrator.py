@@ -313,6 +313,17 @@ _THEME_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fellowship", ("содруж", "сообществ", "групп", "собран", "спонсор", "служени")),
 )
 
+# Coverage-oriented additive queries for broad/general turns (issue #98).
+# Same-language generic program vocabulary only: no factual strengthening,
+# no diagnosis, no loss-of-control/divorce/medical assumptions. Used to
+# sample distinct book regions when the user wording carries no specific
+# theme marker, so a broad query does not collapse to one top hit.
+_BROAD_COVERAGE_QUERIES: dict[str, tuple[str, ...]] = {
+    "general": (),
+    "program": ("программа трезвость шаги", "трезвость программа выздоровление"),
+    "support": ("сообщество поддержка помощь", "помощь сообщества трезвость"),
+}
+
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:#[A-Za-z0-9_:.\-]+)?)\]")
 # A period followed by a citation belongs to the preceding claim: the split
 # must not strand ``[source/section#chunk]`` away from its sentence.
@@ -522,7 +533,10 @@ def build_local_plan_payload(text: str, *, utterance_id: str = "turn-1") -> dict
     tokens = ru_tokens(stripped)
     themes = _detect_themes(normalized)
     if not themes:
-        themes = ["general"]
+        # Broad/coverage-oriented turn: no specific theme marker. Plan
+        # multiple whole-book searches so retrieval samples distinct
+        # regions instead of collapsing to one top hit (issue #98).
+        themes = ["general", "program", "support"]
 
     ambiguity = "none"
     if any(token in ("сорвался", "сорвусь", "сорваться") for token in tokens):
@@ -545,12 +559,22 @@ def build_local_plan_payload(text: str, *, utterance_id: str = "turn-1") -> dict
             if len(lexical) >= 4:
                 break
             lexical.append(rewrite)
+        for extra in _BROAD_COVERAGE_QUERIES.get(theme, ()):
+            if len(lexical) >= 4:
+                break
+            if extra.casefold() not in {item.casefold() for item in lexical}:
+                lexical.append(extra)
         semantic: list[str] = [stripped]
         if normalized != stripped:
             semantic.append(normalized)
         stemmed = " ".join(ru_stem(token) for token in tokens if token)
         if stemmed and stemmed not in semantic and len(semantic) < 4:
             semantic.append(stemmed)
+        for extra in _BROAD_COVERAGE_QUERIES.get(theme, ()):
+            if len(semantic) >= 4:
+                break
+            if extra.casefold() not in {item.casefold() for item in semantic}:
+                semantic.append(extra)
         aspects.append(
             {
                 "aspect_id": theme if len(themes) > 1 else "main",
@@ -761,6 +785,12 @@ def check_coverage(plan: QueryPlan, merged: Sequence[RetrievalHit]) -> CoverageR
         gaps.append("no candidates retrieved")
     if plan.aspects and len(merged) < len(plan.aspects):
         gaps.append("fewer candidates than planned aspects")
+    aspect_ids = {aspect.aspect_id for aspect in plan.aspects}
+    broad_ids = {"general", "main", "program", "support"}
+    if merged and len(sections) < 2 and (aspect_ids & broad_ids):
+        gaps.append("broad turn needs evidence from at least two sections")
+    if merged and len(plan.aspects) > 1 and len(sections) < min(3, len(plan.aspects)):
+        gaps.append("coverage-oriented turn needs at least three distinct sections")
     payload: dict[str, Any] = {
         "schema_version": COVERAGE_SCHEMA_VERSION,
         "covered": not gaps,
@@ -1120,6 +1150,18 @@ def judge_unit(
     # Citations are provenance pointers, not claim content: semantic support
     # is judged on the citation-stripped claim so locator tokens can never
     # dilute same-language overlap or smuggle cross-language support.
+    if kind is QuoteKind.TRANSLATION:
+        # Same-language Russian prose (own-words summary required by the
+        # anti-corpus-dump policy): grounded by stemmed entailment against
+        # the cited source text. No translation label is required here;
+        # cross-language translation policy stays in ``check_grounding``.
+        # Language purity is enforced separately by ``ensure_russian_only``.
+        support_text = " ".join(item.text for item in cited_units)
+        if not quoted.strip() or not support_text.strip():
+            return False, False, kind, tuple(validated)
+        judge = entails if entails is not None else default_entails
+        passed = bool(judge(quoted, support_text))
+        return passed, False, kind, tuple(validated)
     verdict = check_grounding(
         russian_claim=quoted,
         quoted_text=quoted,
@@ -1130,7 +1172,6 @@ def judge_unit(
         allow_translation_fallback=False,
         entails=entails if entails is not None else default_entails,
     )
-    _ = cited_units
     return verdict.passed, verdict.source_exact, kind, tuple(validated)
 
 
@@ -1505,12 +1546,27 @@ class TurnRunner:
         retrieval_rounds = 1
         if not coverage.covered and MAX_RETRIEVAL_ROUNDS > 1:
             # One bounded second round with broadened additive queries.
-            # The original wording stays; planner meanings only broaden
-            # vocabulary and never strengthen factual meaning.
+            # The original wording stays; only same-language additive
+            # vocabulary (stems, normalized form, broad program terms)
+            # is added and never strengthens factual meaning.
+            normalized_query = normalize_ru(plan.original_query)
+            stemmed_query = " ".join(
+                ru_stem(token) for token in ru_tokens(plan.original_query) if token
+            )
             second_hits: dict[str, list[RetrievalHit]] = {}
             for aspect in plan.aspects:
                 broadened = aspect_search_queries(aspect, original_query=plan.original_query)
-                broadened = [*broadened, f"{plan.original_query} {aspect.meaning}"]
+                seen_queries = {item.casefold() for item in broadened}
+                for extra in (
+                    normalized_query,
+                    stemmed_query,
+                    *_BROAD_COVERAGE_QUERIES.get(aspect.aspect_id, ()),
+                ):
+                    cleaned = extra.strip()
+                    if not cleaned or cleaned.casefold() in seen_queries:
+                        continue
+                    seen_queries.add(cleaned.casefold())
+                    broadened.append(cleaned)
                 try:
                     second_hits[aspect.aspect_id] = search_aspect(index, broadened)
                 except (ValueError, OSError, RuntimeError) as exc:
@@ -1523,11 +1579,12 @@ class TurnRunner:
             coverage = check_coverage(plan, merged)
             retrieval_rounds = 2
 
+        distinct_sections = {hit.section for hit in merged}
         pack, read_calls = load_exact_evidence(
             index,
             merged,
             ru_corpus_version=ru_version,
-            expand_multi_aspect=len(plan.aspects) > 1,
+            expand_multi_aspect=len(plan.aspects) > 1 or len(distinct_sections) < 2,
         )
         tool_calls += read_calls
         pack = fit_evidence_budget(pack, budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS)

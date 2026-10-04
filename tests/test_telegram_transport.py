@@ -412,7 +412,7 @@ async def test_application_routes_polling_message_to_opencode_and_back() -> None
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 1)
         assert api.sent_payloads[0]["chat_id"] == 42
-        assert api.sent_payloads[0]["text"] == "fake-reply-1"
+        assert api.sent_payloads[0]["text"] == "Фиктивный ответ 1"
         assert app.sessions.session_count() == 1
     finally:
         await app.stop()
@@ -442,11 +442,11 @@ async def test_application_new_command_resets_only_that_chat() -> None:
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 4)
         replies = [payload["text"] for payload in api.sent_payloads]
-        assert replies[0] == "fake-reply-1"
-        assert replies[1] == "fake-reply-1"
+        assert replies[0] == "Фиктивный ответ 1"
+        assert replies[1] == "Фиктивный ответ 1"
         assert "Новая беседа начата" in replies[2]
         # Chat 7 gets a fresh OpenCode session after /new.
-        assert replies[3] == "fake-reply-1"
+        assert replies[3] == "Фиктивный ответ 1"
         assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)
     finally:
         await app.stop()
