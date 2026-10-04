@@ -55,11 +55,10 @@ jobs:
             });
             const active = data.workflow_runs.filter(
               run => run.conclusion === null &&
-                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status) &&
-                run.id !== current
+                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
             );
             const authoritative = active.sort((a, b) => a.id - b.id)[0];
-            if (authoritative) {
+            if (authoritative && authoritative.id !== current) {
               core.setFailed(
                 `AA runtime #${authoritative.id} is already ${authoritative.status}; rejecting duplicate #${current}. Use /bot status or /bot stop on control issue #31.`
               );

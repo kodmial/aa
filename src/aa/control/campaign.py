@@ -142,17 +142,14 @@ def resolve_active_start(
     are ``aa-runtime.yml`` run creation epochs, and ``stop_times`` are
     owner ``/bot stop`` epochs. The earliest candidate that is unexpired,
     unterminated and still has starts left wins; duplicates posted while
-    that campaign is active are idempotent no-ops. A stop posted after
-    the accepted ``/run`` (and before any newer ``/run``) terminates
-    that campaign, so later scheduled wake-ups stay permanent no-ops
-    until a fresh owner ``/run``.
+    that campaign is active are idempotent no-ops. Any stop posted after
+    the accepted ``/run`` terminates that campaign, so later scheduled
+    wake-ups stay permanent no-ops until a fresh owner ``/run`` posted
+    after the stop.
     """
     ordered = sorted(run_times)
-    for index, candidate in enumerate(ordered):
-        horizon = ordered[index + 1] if index + 1 < len(ordered) else None
-        relevant_stops = [
-            stop for stop in stop_times if stop > candidate and (horizon is None or stop < horizon)
-        ]
+    for candidate in ordered:
+        relevant_stops = [stop for stop in stop_times if stop > candidate]
         if relevant_stops:
             continue
         if campaign_is_expired(now, candidate):
