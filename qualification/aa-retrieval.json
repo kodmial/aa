@@ -1,0 +1,1188 @@
+{
+  "benchmark_version": "aa-retrieval-benchmark/1",
+  "bindings": {
+    "embedding_model_id": "intfloat/multilingual-e5-base",
+    "embedding_revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+    "en_artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
+    "en_edition": "Alcoholics Anonymous, First Edition (1939)",
+    "en_manifest_format": "aa-canonical-manifest/1",
+    "ru_artifact_sha256": "310367aa06976b66b484ac11f4a4d05131605be29a917e059eb62f8e2b72509b",
+    "ru_edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+    "ru_manifest_format": "aa-canonical-manifest-ru/1",
+    "structure_builder_version": 1,
+    "structure_format": "aa-aligned-structure/1"
+  },
+  "chunking": {
+    "probes": [
+      {
+        "max_chars": 1000,
+        "mean_source_tokens": 224.34782608695653,
+        "recall_at_5": 1.0
+      },
+      {
+        "max_chars": 1500,
+        "mean_source_tokens": 224.34782608695653,
+        "recall_at_5": 1.0
+      },
+      {
+        "max_chars": 2400,
+        "mean_source_tokens": 224.34782608695653,
+        "recall_at_5": 1.0
+      }
+    ],
+    "rationale": "1500 groups whole sentences within one paragraph; 1000 fragments evidence without recall gain, 2400 inflates source tokens.",
+    "selected_max_chars": 1500
+  },
+  "en_control": {
+    "fixtures": 6,
+    "hits": 6,
+    "note": "EN hits are navigation/control only; evidence stays exact RU text.",
+    "recall_at_5": 1.0,
+    "role": "reference-control"
+  },
+  "expansion": {
+    "hard_max": 3,
+    "rationale": "1+1 neighbor expansion suffices for terse/multi-theme follow-ups; 2+2/3+3 add source tokens without new relevant sections in probes.",
+    "selected_after": 1,
+    "selected_before": 1
+  },
+  "fidelity": {
+    "passed": 92,
+    "rate": 1.0,
+    "total": 92
+  },
+  "format": "aa-retrieval-qualification/1",
+  "gold_en_control": 6,
+  "gold_fixtures": 52,
+  "gold_ru_fixtures": 46,
+  "gold_sha256": "f49e610c6cf42063d1a221eef11485712127dbc76fe57232cde8a6cdf5a4705c",
+  "gold_version": "aa-retrieval-gold-v1",
+  "index_config": {
+    "chunk_max_chars": 1500,
+    "dense_top_k": 40,
+    "embedding_backend": "hashing-char-token/1",
+    "lexical_top_k": 40,
+    "max_per_aspect": 12,
+    "max_per_section": 4,
+    "note": "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; production e5 uses the pinned lock. Chunking groups whole sentences within one paragraph up to 1500 chars.",
+    "rrf_k": 60
+  },
+  "notes": "RU-first is fixed and not up for reversal. Legacy RU-to-EN-only cannot become production. EN control is navigation integrity only; final evidence is always exact RU text.",
+  "per_case": [
+    {
+      "case_id": "RU-AA-001",
+      "category": "craving",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "doctors-opinion",
+        "chapter-3",
+        "chapter-3",
+        "doctors-opinion",
+        "chapter-4"
+      ],
+      "latency_ms": 2.785958999993454,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 254,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-002",
+      "category": "drinking",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-1",
+        "chapter-1",
+        "chapter-3",
+        "chapter-6",
+        "chapter-5"
+      ],
+      "latency_ms": 2.6355090001288772,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 162,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-003",
+      "category": "relapse",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "chapter-6",
+        "chapter-1",
+        "chapter-7",
+        "chapter-5"
+      ],
+      "latency_ms": 2.613909000046988,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 298,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-004",
+      "category": "powerlessness",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "doctors-opinion",
+        "chapter-5",
+        "chapter-5",
+        "chapter-1"
+      ],
+      "latency_ms": 2.601406000167117,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 254,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-005",
+      "category": "resentment",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-5",
+        "chapter-6",
+        "chapter-3",
+        "chapter-3",
+        "doctors-opinion"
+      ],
+      "latency_ms": 2.5582860000668006,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 267,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-006",
+      "category": "fear",
+      "dense_recall_at_5": false,
+      "hit_sections_5": [
+        "chapter-5",
+        "chapter-6",
+        "chapter-5",
+        "chapter-3",
+        "chapter-10"
+      ],
+      "latency_ms": 2.5477659999069147,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 188,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-007",
+      "category": "inventory",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-5",
+        "chapter-5",
+        "chapter-3",
+        "chapter-4"
+      ],
+      "latency_ms": 2.5229399998352164,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 267,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-008",
+      "category": "amends",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-6",
+        "chapter-9",
+        "chapter-3",
+        "chapter-9"
+      ],
+      "latency_ms": 2.6060249999773077,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 192,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-009",
+      "category": "prayer",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-6",
+        "chapter-1",
+        "chapter-7",
+        "chapter-4"
+      ],
+      "latency_ms": 2.654946000120617,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 192,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-010",
+      "category": "meditation",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-6",
+        "chapter-1",
+        "chapter-1",
+        "chapter-3"
+      ],
+      "latency_ms": 2.593221000097401,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 192,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-011",
+      "category": "higher-power",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-4",
+        "chapter-2",
+        "chapter-4",
+        "chapter-1",
+        "chapter-5"
+      ],
+      "latency_ms": 2.613749999909487,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 137,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-012",
+      "category": "agnosticism",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-4",
+        "chapter-4",
+        "chapter-5",
+        "chapter-6",
+        "chapter-1"
+      ],
+      "latency_ms": 2.6973740000357793,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 143,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-013",
+      "category": "helping-another",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-7",
+        "chapter-7",
+        "chapter-3",
+        "chapter-8",
+        "chapter-6"
+      ],
+      "latency_ms": 2.6512890001413325,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 132,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-014",
+      "category": "family",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-10",
+        "chapter-8",
+        "chapter-9",
+        "chapter-9"
+      ],
+      "latency_ms": 2.5754280000001017,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 207,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-015",
+      "category": "family-afterward",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-9",
+        "chapter-8",
+        "chapter-8",
+        "chapter-1",
+        "chapter-9"
+      ],
+      "latency_ms": 2.6812050000444287,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 134,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-016",
+      "category": "work",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-10",
+        "chapter-6",
+        "chapter-10",
+        "chapter-7",
+        "chapter-9"
+      ],
+      "latency_ms": 2.677216999927623,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 154,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-017",
+      "category": "employer",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-10",
+        "chapter-3",
+        "chapter-9",
+        "chapter-5",
+        "chapter-8"
+      ],
+      "latency_ms": 2.6177360000474437,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 260,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-018",
+      "category": "membership",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-11",
+        "chapter-2",
+        "chapter-3",
+        "chapter-5",
+        "chapter-9"
+      ],
+      "latency_ms": 2.615602000105355,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 211,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-019",
+      "category": "fellowship",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-11",
+        "chapter-2",
+        "chapter-11",
+        "chapter-3",
+        "chapter-6"
+      ],
+      "latency_ms": 2.6387650000287977,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 211,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-020",
+      "category": "book-purpose",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-11",
+        "chapter-5",
+        "chapter-7",
+        "chapter-7",
+        "chapter-3"
+      ],
+      "latency_ms": 2.6142399999571353,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 395,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-021",
+      "category": "book-history",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-11",
+        "chapter-1",
+        "chapter-5",
+        "chapter-3",
+        "chapter-10"
+      ],
+      "latency_ms": 2.6784089998272975,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 385,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-022",
+      "category": "exact-phrase",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-5",
+        "chapter-4",
+        "chapter-6",
+        "chapter-9",
+        "chapter-1"
+      ],
+      "latency_ms": 2.6887179999448563,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 389,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-023",
+      "category": "exact-fact",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-2",
+        "chapter-2",
+        "chapter-6",
+        "chapter-5",
+        "doctors-opinion"
+      ],
+      "latency_ms": 2.6013159999820346,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 258,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-024",
+      "category": "slang-drinking",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-1",
+        "chapter-1",
+        "chapter-6",
+        "chapter-5",
+        "chapter-11"
+      ],
+      "latency_ms": 2.5916179999967426,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 162,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-025",
+      "category": "slang-drinking",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-1",
+        "chapter-11",
+        "chapter-5",
+        "chapter-4",
+        "chapter-3"
+      ],
+      "latency_ms": 2.56681199994091,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 227,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-026",
+      "category": "slang-drinking",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-1",
+        "chapter-7",
+        "chapter-3",
+        "chapter-6",
+        "chapter-10"
+      ],
+      "latency_ms": 2.5844849999430153,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 210,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-027",
+      "category": "slang-family",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-10",
+        "chapter-5",
+        "chapter-1",
+        "doctors-opinion"
+      ],
+      "latency_ms": 2.583934000085719,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 207,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-028",
+      "category": "diminutive",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-9",
+        "chapter-9",
+        "chapter-8",
+        "chapter-8",
+        "chapter-11"
+      ],
+      "latency_ms": 2.5689449998935743,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 132,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-029",
+      "category": "morphology",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "chapter-3",
+        "doctors-opinion",
+        "doctors-opinion",
+        "chapter-1"
+      ],
+      "latency_ms": 2.5104369999553455,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 198,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-030",
+      "category": "typo",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "chapter-1",
+        "chapter-3",
+        "chapter-8",
+        "doctors-opinion"
+      ],
+      "latency_ms": 2.606735999961529,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 265,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-031",
+      "category": "transposition",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-1",
+        "chapter-1",
+        "chapter-6",
+        "chapter-5",
+        "chapter-11"
+      ],
+      "latency_ms": 3.7055689999760943,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 162,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-032",
+      "category": "typo",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-1",
+        "doctors-opinion",
+        "chapter-8",
+        "chapter-9"
+      ],
+      "latency_ms": 2.5715199999467586,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 212,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-033",
+      "category": "terse-followup",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "doctors-opinion",
+        "chapter-3",
+        "chapter-5",
+        "chapter-6"
+      ],
+      "latency_ms": 2.637434000007488,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 452,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-034",
+      "category": "terse-followup",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-3",
+        "chapter-5",
+        "chapter-3",
+        "chapter-5"
+      ],
+      "latency_ms": 2.6529320000463485,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 490,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-035",
+      "category": "ambiguous-sorvalsya",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3",
+        "chapter-6",
+        "chapter-7",
+        "chapter-1",
+        "chapter-3"
+      ],
+      "latency_ms": 2.4930950000907615,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 496,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-036",
+      "category": "implicit-family",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-10",
+        "chapter-1",
+        "chapter-8",
+        "chapter-11"
+      ],
+      "latency_ms": 2.6378030001978914,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 207,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-037",
+      "category": "implicit-work",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-10",
+        "chapter-3",
+        "chapter-5",
+        "chapter-8",
+        "chapter-7"
+      ],
+      "latency_ms": 2.6437050000822637,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 260,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-038",
+      "category": "implicit-alcohol",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "doctors-opinion",
+        "doctors-opinion",
+        "chapter-1",
+        "chapter-8",
+        "chapter-7"
+      ],
+      "latency_ms": 2.721850000170889,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 145,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-039",
+      "category": "multi-theme",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-10",
+        "chapter-10",
+        "chapter-1",
+        "chapter-9"
+      ],
+      "latency_ms": 2.73342200011939,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 351,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-040",
+      "category": "multi-theme",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8",
+        "chapter-9",
+        "chapter-1",
+        "chapter-1",
+        "chapter-11"
+      ],
+      "latency_ms": 2.604302000008829,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 334,
+      "support_success": true,
+      "tool_calls": 4
+    },
+    {
+      "case_id": "RU-AA-041",
+      "category": "morphology",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-2",
+        "chapter-2",
+        "chapter-11",
+        "chapter-7",
+        "chapter-4"
+      ],
+      "latency_ms": 2.526266999893778,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 129,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-042",
+      "category": "helping-another",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-7",
+        "chapter-7",
+        "chapter-11",
+        "chapter-6",
+        "chapter-8"
+      ],
+      "latency_ms": 2.6253510000060487,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 132,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-043",
+      "category": "inventory",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-5",
+        "chapter-6",
+        "chapter-3",
+        "chapter-5",
+        "chapter-10"
+      ],
+      "latency_ms": 2.6815950000127486,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 267,
+      "support_success": true,
+      "tool_calls": 3
+    },
+    {
+      "case_id": "RU-AA-044",
+      "category": "unsupported-out-of-corpus",
+      "dense_recall_at_5": false,
+      "hit_sections_5": [
+        "chapter-3",
+        "chapter-10",
+        "chapter-8",
+        "chapter-1",
+        "chapter-1"
+      ],
+      "latency_ms": 1.7723549999573152,
+      "lexical_recall_at_5": false,
+      "recall_at_5": false,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "RU-AA-045",
+      "category": "unsupported-out-of-corpus",
+      "dense_recall_at_5": false,
+      "hit_sections_5": [
+        "chapter-10",
+        "chapter-3",
+        "chapter-5",
+        "chapter-9",
+        "doctors-opinion"
+      ],
+      "latency_ms": 1.6996489998746256,
+      "lexical_recall_at_5": false,
+      "recall_at_5": false,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "RU-AA-046",
+      "category": "unsupported-out-of-corpus",
+      "dense_recall_at_5": false,
+      "hit_sections_5": [
+        "chapter-6",
+        "chapter-3",
+        "chapter-10",
+        "chapter-3",
+        "chapter-1"
+      ],
+      "latency_ms": 1.6451989999950456,
+      "lexical_recall_at_5": false,
+      "recall_at_5": false,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-001",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-2"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-002",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-3"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-003",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-6"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-004",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-8"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-005",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-10"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    },
+    {
+      "case_id": "EN-AA-006",
+      "category": "en-control",
+      "dense_recall_at_5": true,
+      "hit_sections_5": [
+        "chapter-7"
+      ],
+      "latency_ms": 0.0,
+      "lexical_recall_at_5": true,
+      "recall_at_5": true,
+      "second_pass_recovered": false,
+      "source_tokens": 0,
+      "support_success": true,
+      "tool_calls": 1
+    }
+  ],
+  "planner_schema": "ru-query-plan-v1",
+  "production": {
+    "config_id": "ru-first-only",
+    "config_version": "aa-retrieval-production-v1",
+    "evidence_language": "ru",
+    "evidence_rule": "All final Russian answer evidence resolves to exact RU canonical text.",
+    "rationale": "Baseline RU-first hybrid (40/40/RRF60/max12/diversity4, chunk 1500, expand 1+1) is the simplest configuration clearing recall>=0.95 with 100% slang, fidelity and stale gates; wider candidates and larger expansion add cost without material yield.",
+    "ru_only": true
+  },
+  "quality_gate": {
+    "coverage_measured": 1.0,
+    "coverage_required": 0.9,
+    "failures": [],
+    "false_strengthening_measured": 0,
+    "fidelity_measured": 1.0,
+    "fidelity_required": 1.0,
+    "passed": true,
+    "recall_at_5_measured": 1.0,
+    "recall_at_5_threshold": 0.95,
+    "slang_pass_rate_measured": 1.0,
+    "slang_pass_rate_required": 1.0,
+    "stale_rejection_measured": 1.0,
+    "stale_rejection_required": 1.0,
+    "support_success_measured": 1.0,
+    "support_success_required": 0.95
+  },
+  "retrieval": {
+    "config_id": "baseline-40-40-rrf60-div4",
+    "corpus_section_coverage": 1.0,
+    "coverage": 1.0,
+    "dense_recall_at_5": 0.9767441860465116,
+    "duplicate_rate": 0.0,
+    "false_strengthening_count": 0,
+    "fixtures": 46,
+    "lexical_recall_at_5": 1.0,
+    "mean_cold_latency_ms": 2.785958999993454,
+    "mean_diversity": 0.7590579710144927,
+    "mean_evidence_tokens": 192.04347826086956,
+    "mean_latency_ms": 2.5833919782707713,
+    "mean_planner_cost_tokens": 145.43478260869566,
+    "mean_source_tokens": 224.34782608695653,
+    "mean_tool_calls": 3.0652173913043477,
+    "missed_relevant_region_rate": 0.0,
+    "p95_latency_ms": 2.73342200011939,
+    "p95_source_tokens": 452.0,
+    "p95_tool_calls": 4.0,
+    "recall_at_1": 0.9767441860465116,
+    "recall_at_12": 1.0,
+    "recall_at_5": 1.0,
+    "second_pass_yield": 0.0,
+    "source_support_success_rate": 1.0
+  },
+  "stale_index": {
+    "details": [
+      "ru-artifact-rotation: rejected",
+      "embedding-revision-rotation: rejected",
+      "stale-expected-version: rejected",
+      "en-artifact-rotation: rejected"
+    ],
+    "passed": 4,
+    "rate": 1.0,
+    "total": 4
+  },
+  "tool_config": {
+    "evidence_language": "ru",
+    "evidence_rule": "All final Russian answer evidence resolves to exact RU canonical text.",
+    "expand_after": 1,
+    "expand_before": 1,
+    "expand_hard_max": 3,
+    "section_chunk_limit": 12
+  },
+  "tuning": [
+    {
+      "candidate": "baseline-40-40-rrf60-div4",
+      "coverage": 1.0,
+      "dense_top_k": 40,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 40,
+      "max_per_section": 4,
+      "mean_latency_ms": 2.5833919782707713,
+      "mean_source_tokens": 224.34782608695653,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 60
+    },
+    {
+      "candidate": "wide-60-60-rrf60-div4",
+      "coverage": 1.0,
+      "dense_top_k": 60,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 60,
+      "max_per_section": 4,
+      "mean_latency_ms": 2.5664623043390433,
+      "mean_source_tokens": 224.34782608695653,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 60
+    },
+    {
+      "candidate": "rrf30",
+      "coverage": 1.0,
+      "dense_top_k": 40,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 40,
+      "max_per_section": 4,
+      "mean_latency_ms": 2.5547119347740352,
+      "mean_source_tokens": 222.97826086956522,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 30
+    },
+    {
+      "candidate": "rrf120",
+      "coverage": 1.0,
+      "dense_top_k": 40,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 40,
+      "max_per_section": 4,
+      "mean_latency_ms": 2.5908682826105216,
+      "mean_source_tokens": 224.34782608695653,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 120
+    },
+    {
+      "candidate": "tight-div2",
+      "coverage": 1.0,
+      "dense_top_k": 40,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 40,
+      "max_per_section": 2,
+      "mean_latency_ms": 2.558164326096037,
+      "mean_source_tokens": 224.34782608695653,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 60
+    },
+    {
+      "candidate": "loose-div6",
+      "coverage": 1.0,
+      "dense_top_k": 40,
+      "duplicate_rate": 0.0,
+      "lexical_top_k": 40,
+      "max_per_section": 6,
+      "mean_latency_ms": 2.56956284781411,
+      "mean_source_tokens": 224.34782608695653,
+      "passed": true,
+      "recall_at_5": 1.0,
+      "rrf_k": 60
+    }
+  ]
+}
