@@ -417,6 +417,12 @@ def _emergency_categories_for(decision: str, utterance: str, topic_or_journey: s
     return sorted(item.value for item in classification.categories)
 
 
+def _format_emergency_categories(classification: Any) -> str:
+    """Render matched emergency categories for an error message."""
+    categories = getattr(classification, "categories", ())
+    return ",".join(getattr(item, "value", str(item)) for item in categories)
+
+
 def _response_mode_for_legacy(
     legacy_route: str, topic: str, journey: str, utterance: str, turn: int = 0
 ) -> str:
@@ -1936,7 +1942,7 @@ def _check_review_semantics(
                 if classification.is_emergency:
                     raise RuRealWorldCorpusError(
                         f"{record['id']}: {decision} utterance triggers the emergency "
-                        f"classifier ({classifiers(classification)})"
+                        f"classifier ({_format_emergency_categories(classification)})"
                     )
         # Per-utterance audience guard: topic-clustered singles (e.g. the
         # RU-S-001..010 quit_control block) legitimately share identical
@@ -1979,9 +1985,10 @@ def _check_review_semantics(
                 if not _is_historical_without_acute(utterance):
                     classification = classify_emergency(utterance)
                     if classification.is_emergency:
+                        rendered = _format_emergency_categories(classification)
                         raise RuRealWorldCorpusError(
-                            f"{record['id']} turn {turn['turn']}: {decision} utterance triggers "
-                            f"the emergency classifier ({classifiers(classification)})"
+                            f"{record['id']} turn {turn['turn']}: {decision} utterance "
+                            f"triggers the emergency classifier ({rendered})"
                         )
             utterance = input_utterances.get(f"{record['id']}#{turn['turn']}", "")
             _check_audience_evidence(
@@ -1992,12 +1999,6 @@ def _check_review_semantics(
                 f"{record['id']} turn {turn['turn']}",
             )
     _require_three_state_coverage(oracle_singles, oracle_journeys)
-
-
-def classifiers(classification: Any) -> str:
-    """Render matched emergency categories for an error message."""
-    categories = getattr(classification, "categories", ())
-    return ",".join(getattr(item, "value", str(item)) for item in categories)
 
 
 def _check_single_provenance_variation(oracle_singles: list[Any], seed_singles: list[Any]) -> None:

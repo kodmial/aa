@@ -158,23 +158,40 @@ def test_new_is_control_event_never_model_turn() -> None:
 
 def test_malformed_control_event_and_new_as_turn_fail() -> None:
     _, input_singles, input_journeys = load_input(_root() / INPUT_REL)
-    bad: dict[str, object] = {
-        "type": "multi_turn_journey",
-        "id": "RU-J-027",
-        "journey": "new_session_reset",
-        "turns": [
-            {"kind": "user", "turn": 1, "utterance": "a"},
-            {"kind": "user", "turn": 2, "utterance": "b"},
-            {"kind": "user", "turn": 3, "utterance": "/new"},
-            {"kind": "user", "turn": 4, "utterance": "c"},
-            {"kind": "user", "turn": 5, "utterance": "d"},
-        ],
-    }
     _ = (input_singles, input_journeys)
     from aa.qualification.ru_realworld import _check_input_journey
 
-    with pytest.raises(RuRealWorldCorpusError):
-        _check_input_journey(bad, 26)
+    def _base_journey(turn_three: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "multi_turn_journey",
+            "id": "RU-J-027",
+            "journey": "new_session_reset",
+            "turns": [
+                {"kind": "user", "turn": 1, "utterance": "a"},
+                {"kind": "user", "turn": 2, "utterance": "b"},
+                turn_three,
+                {"kind": "user", "turn": 4, "utterance": "c"},
+                {"kind": "user", "turn": 5, "utterance": "d"},
+            ],
+        }
+
+    malformed_turns = [
+        # /new must be a control event, never a normal user turn.
+        {"kind": "user", "turn": 3, "utterance": "/new"},
+        # Wrong control value.
+        {"kind": "control", "turn": 3, "control": "reset"},
+        # Wrong kind carrying a control payload.
+        {"kind": "user", "turn": 3, "control": "session_reset"},
+        # Extra keys beyond exactly {control, kind, turn}.
+        {"kind": "control", "turn": 3, "control": "session_reset", "utterance": "x"},
+        # Missing the control key.
+        {"kind": "control", "turn": 3},
+        # Wrong turn number at the control position.
+        {"kind": "control", "turn": 4, "control": "session_reset"},
+    ]
+    for turn_three in malformed_turns:
+        with pytest.raises(RuRealWorldCorpusError):
+            _check_input_journey(_base_journey(turn_three), 26)
 
 
 def test_input_oracle_separation_without_generator_leak() -> None:

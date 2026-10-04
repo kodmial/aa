@@ -33,14 +33,21 @@ def main() -> int:
     try:
         root = find_repo_root()
         summary = validate(root)
-    except RuRealWorldCorpusError as exc:
+    except (RuRealWorldCorpusError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         print(f"ru-realworld corpus INVALID: {exc}", file=sys.stderr)
         return 1
     version_path = root / VERSION_REL
     if not version_path.exists():
         print(f"ru-realworld corpus INVALID: missing {VERSION_REL}", file=sys.stderr)
         return 1
-    recorded = json.loads(version_path.read_text(encoding="utf-8"))
+    try:
+        recorded = json.loads(version_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(
+            f"ru-realworld corpus INVALID: {VERSION_REL} unreadable: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     expected = build_version_payload(summary)
     if recorded != expected:
         print(

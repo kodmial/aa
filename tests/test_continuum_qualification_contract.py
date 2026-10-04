@@ -46,10 +46,8 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
 
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
-    # Issue #61 scope: only assert forwarding, never the exact passthrough
-    # form, so unrelated Continuum default changes do not fail this corpus PR.
-    for knob in ("max_dispatch_attempts", "pause_on_failure"):
-        assert f"inputs.{knob}" in body
+    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
+    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
@@ -82,8 +80,10 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
     body = _read(SCHEDULER_CALLER)
     assert "kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main" in body
     assert "continuum_ref: main" in body
-    # Issue #61 scope: only assert forwarding, never the exact passthrough
-    # form, so unrelated Continuum default changes do not fail this corpus PR.
+    # Bare-passthrough contract synced with Continuum main: every knob is
+    # forwarded as `"${{ inputs.<knob> }}"` with no `|| '<literal>'` default.
+    # An empty passthrough lets the engine fall back to vars.AUTOMATION_*;
+    # pinning a literal here would override that repository variable.
     for knob in (
         "wip_limit",
         "max_dispatch_attempts",
@@ -92,5 +92,6 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
         "count_open_prs_as_wip",
         "pause_on_failure",
     ):
-        assert f"inputs.{knob}" in body
+        assert f'"${{{{ inputs.{knob} }}}}"' in body
+        assert f"inputs.{knob} ||" not in body
     assert not re.search(r"continuum.*@[0-9a-f]{40}", body)
