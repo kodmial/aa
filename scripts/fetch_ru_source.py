@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
 import re
 import sys
@@ -122,7 +121,7 @@ class _PlainText(HTMLParser):
 
     def text(self) -> str:
         """Return the deterministic plain-text rendering of the block."""
-        raw = html.unescape("".join(self._chunks))
+        raw = "".join(self._chunks)
         lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in raw.split("\n")]
         return "\n".join(line for line in lines if line)
 
@@ -189,7 +188,8 @@ def _parse_section_payload(page_html: bytes, *, section: str) -> dict[str, objec
     if not isinstance(payload, dict) or not isinstance(payload.get("section"), dict):
         raise ValueError(f"section {section!r} payload has no section object")
     result = payload["section"]
-    assert isinstance(result, dict)
+    if not isinstance(result, dict):
+        raise ValueError(f"section {section!r} payload has no section object")
     return result
 
 
