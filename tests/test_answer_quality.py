@@ -489,7 +489,11 @@ def test_judge_evidence_excludes_hidden_state_and_expected_scores() -> None:
         "generated_answer",
         "evidence_snippets",
         "evidence_locators",
+        "rubric_dimensions",
     }
+    assert [dim["id"] for dim in clean["rubric_dimensions"]] == [
+        dim["id"] for dim in rubric["soft_dimensions"]
+    ]
     with pytest.raises(AnswerQualityError):
         assert_judge_evidence_clean({"chain_of_thought": "secret"})
     with pytest.raises(AnswerQualityError):

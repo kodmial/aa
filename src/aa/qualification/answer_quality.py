@@ -771,6 +771,8 @@ def score_provisional(
             scores["book_fidelity_quote"] = 3
         elif book_applicability == "required":
             scores["book_fidelity_quote"] = 1
+        else:
+            scores["book_fidelity_quote"] = 2
     if _has_any(folded, _PREACHING_MARKERS):
         scores["belief_sensitivity"] = 0
     elif _has_any(folded, _IMPOSING_MARKERS):
@@ -897,7 +899,7 @@ def grade_turn(
             synthetic_input=ctx.synthetic_input,
             history=list(ctx.history),
             generated_answer=ctx.generated_answer,
-            evidence_snippets={},
+            evidence_snippets=dict(ctx.source_texts),
             evidence_locators=list(ctx.evidence_locators),
         )
         scores = judge_fn(evidence)
@@ -942,13 +944,23 @@ def build_judge_evidence(
     Allowlist keys only: input, bounded history, answer, exact evidence
     snippets/locators, and frozen rubric dimensions. Anything else fails.
     """
-    _ = rubric
+    dimension_ids = rubric_dimension_ids(rubric)
+    frozen_dimensions: list[dict[str, Any]] = []
+    for dim in rubric.get("soft_dimensions", []):
+        if not isinstance(dim, dict):
+            raise AnswerQualityError("frozen rubric dimension is malformed")
+        if str(dim.get("id")) not in dimension_ids:
+            raise AnswerQualityError("frozen rubric dimension id mismatch")
+        frozen_dimensions.append(
+            {"id": str(dim.get("id")), "anchors": dict(dim.get("anchors", {}))}
+        )
     evidence: dict[str, Any] = {
         "synthetic_input": synthetic_input,
         "history": list(history[-10:]),
         "generated_answer": generated_answer,
         "evidence_snippets": dict(evidence_snippets),
         "evidence_locators": list(evidence_locators),
+        "rubric_dimensions": frozen_dimensions,
     }
     assert_judge_evidence_clean(evidence)
     return evidence
@@ -1352,7 +1364,8 @@ def grade_batch(
     failed_turns = 0
     hard_fail_turns = 0
     for grade in grades:
-        means.append(grade.soft_mean)
+        if grade.applicable:
+            means.append(grade.soft_mean)
         if not grade.turn_pass:
             failed_turns += 1
         if not grade.hard_passed:
@@ -1367,7 +1380,7 @@ def grade_batch(
                         detail=hard_result.detail,
                     )
                 )
-        batch_mean = sum(means) / len(means) if means else 0.0
+    batch_mean = sum(means) / len(means) if means else SOFT_PASS_MEAN
     if hard_fail_turns > 0:
         batch_result = "fail"
     elif batch_mean < SOFT_PASS_MEAN:

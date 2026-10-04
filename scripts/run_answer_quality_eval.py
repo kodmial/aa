@@ -123,6 +123,10 @@ def run_transcript(
     trusted_pass_sha: str,
     corpus_sha: str,
     artifact_sha: str,
+    expected_corpus_sha: str = "",
+    expected_artifact_sha: str = "",
+    completeness_ok: bool = False,
+    completeness_reason: str = "completeness not verified",
 ) -> dict[str, object]:
     """Grade a decrypted transcript and write result + clusters (no bodies on stdout)."""
     rubric_sha = verify_rubric_bound()
@@ -132,7 +136,12 @@ def run_transcript(
     if not isinstance(turns, list) or not turns:
         raise AnswerQualityError("transcript holds no turns; refusing to grade")
     sources = payload.get("source_texts", {})
-    valid_locators = frozenset(payload.get("valid_locators", []))
+    if not isinstance(sources, dict):
+        raise AnswerQualityError("transcript source_texts must be an object")
+    raw_valid = payload.get("valid_locators", [])
+    if not isinstance(raw_valid, list) or not all(isinstance(item, str) for item in raw_valid):
+        raise AnswerQualityError("transcript valid_locators must hold strings")
+    valid_locators = frozenset(str(item) for item in raw_valid)
     grades = []
     for entry in turns:
         if not isinstance(entry, dict):
@@ -140,15 +149,25 @@ def run_transcript(
         oracle = entry.get("oracle", {})
         if not isinstance(oracle, dict):
             raise AnswerQualityError("transcript turn lacks oracle metadata")
+        history = entry.get("history", [])
+        claimed = entry.get("claimed_quotes", [])
+        locators = entry.get("evidence_locators", [])
+        spans = entry.get("forbidden_spans", [])
+        if not isinstance(history, list) or not isinstance(claimed, list):
+            raise AnswerQualityError("transcript turn lists must be lists")
+        if not isinstance(locators, list) or not isinstance(spans, list):
+            raise AnswerQualityError("transcript turn lists must be lists")
+        if not all(isinstance(item, str) for item in locators + claimed + spans + history):
+            raise AnswerQualityError("transcript turn lists must hold strings")
         ctx = HardCheckContext(
             synthetic_input=str(entry.get("synthetic_input", "")),
-            history=tuple(entry.get("history", [])),
+            history=tuple(str(item) for item in history),
             generated_answer=str(entry.get("generated_answer", "")),
-            captured_safety_decision=str(entry.get("safety_decision", "allow")),
-            claimed_quotes=tuple(entry.get("claimed_quotes", [])),
-            evidence_locators=tuple(entry.get("evidence_locators", [])),
+            captured_safety_decision=str(entry.get("safety_decision", "")),
+            claimed_quotes=tuple(str(item) for item in claimed),
+            evidence_locators=tuple(str(item) for item in locators),
             evidence_book_claim=bool(entry.get("evidence_book_claim", False)),
-            forbidden_spans=tuple(entry.get("forbidden_spans", [])),
+            forbidden_spans=tuple(str(item) for item in spans),
             source_texts={str(k): str(v) for k, v in sources.items()},
             valid_locators=valid_locators,
             oracle=dict(oracle),
@@ -169,10 +188,11 @@ def run_transcript(
         current_main_sha=current_main_sha,
         trusted_pass_sha=trusted_pass_sha,
         corpus_sha=corpus_sha,
-        expected_corpus_sha=corpus_sha,
+        expected_corpus_sha=expected_corpus_sha,
         artifact_sha=artifact_sha,
-        expected_artifact_sha=artifact_sha,
-        completeness_ok=True,
+        expected_artifact_sha=expected_artifact_sha,
+        completeness_ok=completeness_ok,
+        completeness_reason=completeness_reason,
     )
     entry = BenchmarkTuple(
         main_sha=tested_sha,
@@ -242,6 +262,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trusted-pass-sha", default="")
     parser.add_argument("--corpus-sha", default="0" * 64)
     parser.add_argument("--artifact-sha", default="0" * 64)
+    parser.add_argument("--expected-corpus-sha", default="")
+    parser.add_argument("--expected-artifact-sha", default="")
+    parser.add_argument("--completeness-ok", action="store_true")
+    parser.add_argument("--completeness-reason", default="completeness not verified")
     args = parser.parse_args(argv)
     if args.calibration:
         summary = run_calibration(
@@ -262,6 +286,10 @@ def main(argv: list[str] | None = None) -> int:
             trusted_pass_sha=args.trusted_pass_sha or args.main_sha,
             corpus_sha=args.corpus_sha,
             artifact_sha=args.artifact_sha,
+            expected_corpus_sha=args.expected_corpus_sha,
+            expected_artifact_sha=args.expected_artifact_sha,
+            completeness_ok=bool(args.completeness_ok),
+            completeness_reason=args.completeness_reason,
         )
         return 0
     print("error: pass --calibration or --transcript PATH", file=sys.stderr)

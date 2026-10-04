@@ -476,16 +476,15 @@ jobs:
                   )
               ctx = HardCheckContext(
                   synthetic_input=str(entry.get("synthetic_input", "")),
-                  history=(),
+                  history=tuple(entry.get("history", ())),
                   generated_answer=str(entry.get("generated_answer", "")),
-                  captured_safety_decision=str(entry.get("safety_decision", "allow")),
-                  claimed_quotes=(),
+                  captured_safety_decision=str(entry.get("safety_decision", "")),
+                  claimed_quotes=tuple(entry.get("claimed_quotes", ())),
                   evidence_locators=tuple(entry.get("evidence_locators", [])),
-                  evidence_book_claim=bool(oracle.get("book_relevance") == "required")
-                  and ("«" in str(entry.get("generated_answer", ""))),
-                  forbidden_spans=(),
+                  evidence_book_claim=bool(oracle.get("book_relevance") == "required"),
+                  forbidden_spans=tuple(entry.get("forbidden_spans", ())),
                   source_texts=dict(source_texts),
-                  valid_locators=frozenset(entry.get("evidence_locators", []))
+                  valid_locators=frozenset(source_texts.keys())
                   if source_texts else frozenset(),
                   oracle=dict(oracle),
               )
