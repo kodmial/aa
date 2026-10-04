@@ -84,11 +84,68 @@ MAX_EVIDENCE_CHUNKS = 8
 MAX_READ_PER_TURN = 6
 
 FAIL_CLOSED_REPLY = (
-    "Не могу дать обоснованный ответ по имеющимся отрывкам книги. "
-    "Попробуйте уточнить вопрос. / "
-    "I cannot give a grounded answer from the available book passages. "
-    "Please refine your question."
+    "Не могу дать обоснованный ответ по имеющимся отрывкам книги. Попробуйте уточнить вопрос."
 )
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+
+_EN_FALLBACK_PATTERNS = (
+    r"cannot\s+provide",
+    r"grounded\s+answer",
+    r"available\s+book",
+    r"book\s+passages",
+    r"refine\s+your\s+question",
+    r"please\s+refine",
+    r"please\s+try\s+again",
+    r"could\s+not\s+process",
+    r"bot\s+is\s+ready",
+    r"new\s+conversation",
+    r"send\s+a\s+message",
+    r"i\s+cannot\s+give",
+    r"ask\s+.*clarif",
+    r"insufficient\s+grounding",
+    r"fail[-\s]?closed",
+    r"opencode",
+    r"model\s+unavailable",
+    r"provider\s+error",
+    r"http\s*=",
+    r"transient",
+)
+
+_EN_FALLBACK_RES = tuple(re.compile(item, re.IGNORECASE) for item in _EN_FALLBACK_PATTERNS)
+
+
+def _strip_citations_for_language_check(text: str) -> str:
+    """Remove ``[source/section#chunk]`` pointers before language checks."""
+    return _CITATION_RE.sub(" ", text)
+
+
+def contains_english_fallback(text: str) -> bool:
+    """Return whether ``text`` leaks an English error/fallback fragment."""
+    cleaned = _strip_citations_for_language_check(text)
+    return any(item.search(cleaned) is not None for item in _EN_FALLBACK_RES)
+
+
+def meets_russian_only(text: str) -> bool:
+    """Return whether user-visible ``text`` obeys the RU-only contract.
+
+    Citations are pointers, not prose: they are stripped first. Valid
+    Russian text must contain Cyrillic and must not contain any English
+    error/fallback fragment or internal provider token.
+    """
+    cleaned = _strip_citations_for_language_check(text)
+    if contains_english_fallback(text):
+        return False
+    if _CYRILLIC_RE.search(cleaned) is None:
+        return False
+    return True
+
+
+def ensure_russian_only(text: str) -> None:
+    """Raise :class:`TurnFailed` when ``text`` violates the RU-only contract."""
+    if not meets_russian_only(text):
+        raise TurnFailed("language-violation", "synthesis violated the RU-only contract")
+
 
 _TRIVIAL_NORMALIZED = frozenset(
     {
@@ -893,11 +950,16 @@ def build_synthesis_prompt(*, user_text: str, pack: EvidencePack, repair: str = 
     included. The caller must never log the returned prompt.
     """
     lines: list[str] = [
-        "Ответь по-русски, используя ТОЛЬКО приведённые ниже точные отрывки.",
+        "Ответь ТОЛЬКО по-русски, используя ТОЛЬКО приведённые ниже точные отрывки.",
+        "Весь видимый ответ — на русском языке; английский текст запрещён.",
         "Каждое существенное утверждение снабди цитатой-ссылкой вида [source/section#chunk].",
         "Прямые цитаты — дословный русский текст отрывков без изменений.",
         "Если отрывки не подтверждают просьбу, так и скажи и предложи только близкий",
         "подтверждённый материал. Не выдумывай факты и цитаты.",
+        "Если обоснованный ответ невозможен, ответи строго: "
+        "Не могу дать обоснованный ответ по имеющимся отрывкам книги. "
+        "Попробуйте уточнить вопрос.",
+        "Никогда не отвечай по-английски и не сообщай технические детали.",
         "",
         "ТОЧНЫЕ ОТРЫВКИ:",
     ]
@@ -1320,8 +1382,17 @@ class TurnRunner:
                 extra={"aspects": len(plan.aspects), "evidence": len(pack.units)},
             )
             raise
+        try:
+            ensure_russian_only(synthesis.text)
+            language_ok_first = True
+        except TurnFailed:
+            logger.warning(
+                "grounded turn synthesis violated RU-only contract",
+                extra={"aspects": len(plan.aspects), "evidence": len(pack.units)},
+            )
+            language_ok_first = False
         unsupported_first = [unit for unit in first.units if unit.grounding_passed is False]
-        if not unsupported_first:
+        if language_ok_first and not unsupported_first:
             logger.info(
                 "grounded turn completed",
                 extra={
@@ -1341,10 +1412,10 @@ class TurnRunner:
             extra={"unsupported": len(unsupported_first), "evidence": len(pack.units)},
         )
         repair_note = (
-            "Перепиши ответ, опираясь только на отрывки. "
+            "Перепиши ответ ТОЛЬКО по-русски, опираясь только на отрывки. "
             f"Неподтверждённых мест: {len(unsupported_first)}. "
             "Каждое существенное утверждение — с ссылкой; "
-            "прямые цитаты — дословно."
+            "прямые цитаты — дословно. Английский текст запрещён."
         )
         repair_prompt = build_synthesis_prompt(user_text=text, pack=pack, repair=repair_note)
         try:
@@ -1375,6 +1446,7 @@ class TurnRunner:
             error_category=repaired.error_category,
             retry_count=repaired.retry_count,
         )
+        ensure_russian_only(repaired.text)
         response = build_grounded_response(
             answer=repaired.text,
             pack=pack,
@@ -1387,6 +1459,7 @@ class TurnRunner:
                 "grounding-failed",
                 f"{len(unsupported)} answer unit(s) lack semantic support",
             )
+        ensure_russian_only(response.text)
         logger.info(
             "grounded turn completed after regeneration",
             extra={
@@ -1402,6 +1475,15 @@ class TurnRunner:
         return response
 
 
+def build_trivial_prompt(*, user_text: str) -> str:
+    """Build the RU-only prompt for a non-substantive turn."""
+    return (
+        "Ответь ТОЛЬКО по-русски. Весь видимый ответ — на русском языке; "
+        "английский текст запрещён.\n"
+        f"{user_text}"
+    )
+
+
 async def run_trivial_turn(
     text: str,
     *,
@@ -1412,14 +1494,20 @@ async def run_trivial_turn(
     fallback_model: str,
     sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> SynthesisResult:
-    """Answer a non-substantive turn directly through the named agent."""
+    """Answer a non-substantive turn directly through the named agent.
+
+    The prompt demands a Russian-only reply. Any English fallback, error,
+    or provider fragment in the synthesis fails the turn closed for a
+    deterministic Russian fallback upstream; plain conversational replies
+    pass through so trivial greetings keep their established behavior.
+    """
     if not text.strip():
         raise TurnFailed("empty-turn", "refusing an empty turn")
     try:
-        return await send_with_fallback(
+        result = await send_with_fallback(
             send,
             session_id,
-            text,
+            build_trivial_prompt(user_text=text),
             agent=agent,
             primary_model=primary_model,
             fallback_model=fallback_model,
@@ -1427,6 +1515,9 @@ async def run_trivial_turn(
         )
     except OpenCodeSessionNotFoundError as exc:
         raise TurnFailed("session-not-found", "opencode session is gone") from exc
+    if contains_english_fallback(result.text):
+        raise TurnFailed("language-violation", "trivial synthesis leaked English fallback")
+    return result
 
 
 __all__ = [
@@ -1452,12 +1543,16 @@ __all__ = [
     "build_grounded_response",
     "build_local_plan_payload",
     "build_synthesis_prompt",
+    "build_trivial_prompt",
     "check_coverage",
+    "contains_english_fallback",
     "deduplicate_cross_aspect",
+    "ensure_russian_only",
     "fit_evidence_budget",
     "is_substantive",
     "judge_unit",
     "load_exact_evidence",
+    "meets_russian_only",
     "run_planner",
     "run_trivial_turn",
     "search_first_round",

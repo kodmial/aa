@@ -1,7 +1,10 @@
-"""Bounded emergency response path (Russian + English).
+"""Bounded emergency response path (Russian production, English retained).
 
 The templates below are the only text the deterministic safety layer may
-produce. They deliberately contain:
+produce. The production Telegram runtime always serves the Russian
+template (RU-only user-facing contract); the English template exists for
+language detection coverage and non-production callers only.
+They deliberately contain:
 
 - direction to immediate local emergency/medical help;
 - a prompt to involve a trusted nearby person;

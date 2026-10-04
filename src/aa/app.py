@@ -12,7 +12,9 @@ from aa.conversation.orchestrator import (
     FAIL_CLOSED_REPLY,
     TurnFailed,
     TurnRunner,
+    contains_english_fallback,
     is_substantive,
+    meets_russian_only,
     run_trivial_turn,
 )
 from aa.corpus.context import CorpusContext
@@ -20,6 +22,7 @@ from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.retrieval.index import HybridIndex, open_hybrid_index
+from aa.safety.response import build_emergency_response
 from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
 from aa.telegram.transport import (
@@ -32,12 +35,9 @@ from aa.telegram.transport import (
 
 logger = logging.getLogger("aa.app")
 
-_START_REPLY = "Бот готов. Напишите сообщение. / Bot is ready. Send a message."
-_NEW_REPLY = "Новая беседа начата. / New conversation started."
-_TEMPORARY_ERROR_REPLY = (
-    "Не удалось обработать сообщение. Попробуйте ещё раз. / "
-    "Could not process the message. Please try again."
-)
+_START_REPLY = "Бот готов. Напишите сообщение."
+_NEW_REPLY = "Новая беседа начата."
+_TEMPORARY_ERROR_REPLY = "Не удалось обработать сообщение. Попробуйте ещё раз."
 
 
 class Application:
@@ -185,6 +185,12 @@ class Application:
             reply = await self.respond(incoming.chat_id, incoming.text)
             if not reply.strip():
                 raise OpenCodeError("opencode returned an empty response")
+            if contains_english_fallback(reply):
+                logger.warning(
+                    "telegram reply failed closed on RU-only contract",
+                    extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+                )
+                reply = FAIL_CLOSED_REPLY
         except (OpenCodeError, ValueError):
             logger.warning(
                 "telegram message processing failed",
@@ -321,13 +327,16 @@ class Application:
         Only message lengths and routing decisions are logged, never the
         message body.
         """
-        result, emergency_reply = self.safety.route(text)
-        if result.decision is SafetyDecision.EMERGENCY and emergency_reply is not None:
+        result, _emergency_reply = self.safety.route(text)
+        if result.decision is SafetyDecision.EMERGENCY and result.classification is not None:
+            # Production Telegram runtime is RU-only: the emergency reply
+            # is always the deterministic Russian template, regardless of
+            # the detected input language. No English fallback may leak.
             logger.info(
                 "emergency response served",
                 extra={"chat_id": chat_id, "reason": result.reason},
             )
-            return emergency_reply
+            return build_emergency_response(result.classification, language="ru")
         if result.decision is SafetyDecision.BLOCK:
             logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
@@ -351,6 +360,12 @@ class Application:
                             ) from exc2
                     else:
                         raise
+                if contains_english_fallback(trivial_reply):
+                    logger.warning(
+                        "trivial turn failed closed on RU-only contract",
+                        extra={"chat_id": chat_id},
+                    )
+                    return FAIL_CLOSED_REPLY
                 logger.info("trivial response served", extra={"chat_id": chat_id})
                 return trivial_reply
             try:
@@ -402,6 +417,12 @@ class Application:
                         extra={"chat_id": chat_id, "category": "session-not-found"},
                     )
                     return FAIL_CLOSED_REPLY
+                if contains_english_fallback(trivial_retry):
+                    logger.warning(
+                        "trivial turn failed closed on RU-only contract after rebind",
+                        extra={"chat_id": chat_id},
+                    )
+                    return FAIL_CLOSED_REPLY
                 logger.info("trivial response served", extra={"chat_id": chat_id})
                 return trivial_retry
             try:
@@ -418,6 +439,12 @@ class Application:
                     extra={"chat_id": chat_id, "category": "session-not-found"},
                 )
                 return FAIL_CLOSED_REPLY
+        if not meets_russian_only(reply):
+            logger.warning(
+                "grounded turn failed closed on RU-only contract",
+                extra={"chat_id": chat_id},
+            )
+            return FAIL_CLOSED_REPLY
         logger.info("normal response served", extra={"chat_id": chat_id})
         return reply
 

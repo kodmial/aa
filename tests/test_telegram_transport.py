@@ -444,7 +444,7 @@ async def test_application_new_command_resets_only_that_chat() -> None:
         replies = [payload["text"] for payload in api.sent_payloads]
         assert replies[0] == "fake-reply-1"
         assert replies[1] == "fake-reply-1"
-        assert "New conversation started" in replies[2]
+        assert "Новая беседа начата" in replies[2]
         # Chat 7 gets a fresh OpenCode session after /new.
         assert replies[3] == "fake-reply-1"
         assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)

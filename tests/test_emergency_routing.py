@@ -370,7 +370,13 @@ async def test_emergency_path_precedes_opencode_and_skips_llm() -> None:
     await app.start()
     try:
         reply = await app.respond(123, "I want to kill myself tonight")
-        assert "emergency" in reply.lower()
+        # Production Telegram runtime is RU-only (issue #98): even an
+        # English emergency turn receives the deterministic Russian reply.
+        assert "112" in reply
+        assert "экстренной" in reply or "скорой" in reply
+        from aa.conversation.orchestrator import contains_english_fallback
+
+        assert not contains_english_fallback(reply)
         # No OpenCode session must have been created and no prompt sent.
         client = runtime.client
         assert isinstance(client, FakeOpenCodeClient)
