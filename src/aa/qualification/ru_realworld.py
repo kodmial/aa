@@ -551,6 +551,8 @@ RELATIVE_UTTERANCE_MARKERS = (
     "партнер",
     "партнёр",
     "близк",
+    "близким",
+    "близких",
     "родствен",
     "родные",
     "мама",
@@ -560,6 +562,7 @@ RELATIVE_UTTERANCE_MARKERS = (
     "сын",
     "дочь",
     "дочк",
+    "женушка",
     "семья",
     "семьи",
     "семье",
@@ -577,6 +580,7 @@ SELF_UTTERANCE_MARKERS = (
     "себе",
     "себя",
     "сам",
+    "самому",
     "хочу",
     "могу",
     "боюсь",
@@ -592,6 +596,7 @@ SELF_UTTERANCE_MARKERS = (
     "непью",
     "не пью",
     "сорвал",
+    "сорвался",
 )
 
 
@@ -603,28 +608,29 @@ def _normalize_audience_text(text: str) -> str:
 _marker_regex_cache: dict[str, re.Pattern[str]] = {}
 
 
-def _marker_at_word_start(text_normalized: str, marker_normalized: str) -> bool:
-    """Return True when ``marker`` opens a word in normalized ``text``.
+def _marker_as_whole_word(text_normalized: str, marker_normalized: str) -> bool:
+    """Return True when ``marker`` occurs as a whole word in normalized ``text``.
 
     Bare ``marker in text`` substring tests overmatch inside unrelated words
     (``мать`` in ``думать``/``поймать``/``понимать``, ``меня`` in ``поменять``,
-    ``мой`` in ``домой``, ``пил`` in ``накопились``). Requiring a left word
-    boundary keeps legitimate prefix/inflection matches (``близк`` in
-    ``близким``, ``жену`` in ``женушка``, ``семью`` as a whole word) while
-    rejecting mid-word accidents. First-person prefixed drinking verbs that
-    would otherwise rely on suffix accidents (``выпью``, ``напиться``,
-    ``непью``) are listed explicitly in ``SELF_UTTERANCE_MARKERS``.
+    ``мой`` in ``домой``, ``пил`` in ``накопились``), and a left-only word
+    boundary still overmatches when the marker opens a longer unrelated word
+    (``пил`` in ``пилюли``/``пилит``, ``меня`` in ``меняется``/``менять``,
+    ``сам`` in ``самоуничтожения``). Requiring both word boundaries keeps
+    only whole-word evidence; legitimate inflections are listed explicitly
+    as whole-word markers (``близким``/``близких``, ``самому``,
+    ``сорвался``, ``женушка``) instead of relying on prefix matches.
     """
     pattern = _marker_regex_cache.get(marker_normalized)
     if pattern is None:
-        pattern = re.compile(r"(?<!\w)" + re.escape(marker_normalized))
+        pattern = re.compile(r"(?<!\w)" + re.escape(marker_normalized) + r"(?!\w)")
         _marker_regex_cache[marker_normalized] = pattern
     return pattern.search(text_normalized) is not None
 
 
 def _contains_builder_marker(text_normalized: str, marker: str) -> bool:
     """Check a builder marker with word-boundary handling."""
-    return _marker_at_word_start(text_normalized, _normalize_audience_text(marker))
+    return _marker_as_whole_word(text_normalized, _normalize_audience_text(marker))
 
 
 # Standalone first-person singular pronoun. ``str.split()`` misses ``я,`` /
@@ -645,9 +651,10 @@ def _audience_for(utterance: str, topic: str, journey: str) -> str:
     someone else, ``general`` asks detached information without a
     first-person stake.
 
-    Utterance markers are matched at word starts (see
-    ``_marker_at_word_start``), never as bare substrings, so short Russian
-    fragments cannot force a label from inside an unrelated word.
+    Utterance markers are matched as whole words (see
+    ``_marker_as_whole_word``), never as bare substrings or word prefixes,
+    so short Russian fragments cannot force a label from inside or at the
+    start of an unrelated word.
     """
     if journey in RELATIVE_JOURNEYS or topic in RELATIVE_TOPICS:
         return "relative/partner"
@@ -1714,7 +1721,12 @@ def _check_oracle_label_distinctness(
 
 
 def _check_audience_evidence(
-    audience: str, utterance: str, topic: str, journey: str, owner: str
+    audience: str,
+    utterance: str,
+    topic: str,
+    journey: str,
+    owner: str,
+    requires_context: bool = False,
 ) -> None:
     """Validate a stored oracle audience against independent review evidence.
 
@@ -1732,6 +1744,15 @@ def _check_audience_evidence(
     itself -- in particular, ``тайно`` ("secretly") is not relative
     evidence, so a self-drinking utterance carrying only ``тайно`` cannot
     pass as ``relative/partner``.
+
+    Context-dependent journey turns (``requires_context=True``) inherit
+    their perspective from prior turns, so a bare fragment such as ``то же
+    самое`` carries no standalone first-person marker. Whole-word matching
+    must not manufacture one from a longer word (``сам`` in ``самое``,
+    ``меня`` in ``менять``), so for such turns a stored ``self`` label is
+    accepted when nothing contradicts it (no kinship/partner evidence)
+    instead of demanding standalone evidence the schema says the fragment
+    cannot carry alone.
     """
     # Independently maintained audit taxonomy (reviewed assignments, not
     # builder references; keep in sync with the corpus review, never import
@@ -1760,6 +1781,8 @@ def _check_audience_evidence(
         "партнер",
         "партнёр",
         "близк",
+        "близким",
+        "близких",
         "родствен",
         "родные",
         "мама",
@@ -1769,6 +1792,7 @@ def _check_audience_evidence(
         "сын",
         "дочь",
         "дочк",
+        "женушка",
         "семья",
         "семьи",
         "семье",
@@ -1786,6 +1810,7 @@ def _check_audience_evidence(
         "себе",
         "себя",
         "сам",
+        "самому",
         "хочу",
         "могу",
         "боюсь",
@@ -1801,18 +1826,26 @@ def _check_audience_evidence(
         "непью",
         "не пью",
         "сорвал",
+        "сорвался",
     )
 
     def _audit_normalize(text: str) -> str:
         return text.casefold().replace("ё", "е")
 
     def _audit_found(text_normalized: str, marker: str) -> bool:
-        # Word-start matching implemented locally (no builder helper reuse):
-        # the marker must open a word so ``мать`` cannot match inside
+        # Whole-word matching implemented locally (no builder helper reuse):
+        # the marker must be a whole word so ``мать`` cannot match inside
         # ``думать``/``поймать``/``понимать``, ``меня`` inside ``поменять``,
-        # ``мой`` inside ``домой`` or ``пил`` inside ``накопились``.
+        # ``мой`` inside ``домой``, ``пил`` inside ``накопились``, and a
+        # word-start prefix cannot count either (``пил`` in ``пилюли``,
+        # ``меня`` in ``меняется``, ``сам`` in ``самоуничтожения``).
+        # Legitimate inflections are listed explicitly as whole-word audit
+        # markers, mirroring the builder tables.
         marker_norm = marker.casefold().replace("ё", "е")
-        return re.compile(r"(?<!\w)" + re.escape(marker_norm)).search(text_normalized) is not None
+        return (
+            re.compile(r"(?<!\w)" + re.escape(marker_norm) + r"(?!\w)").search(text_normalized)
+            is not None
+        )
 
     if journey in audit_relative_journeys or topic in audit_relative_topics:
         if audience != "relative/partner":
@@ -1836,6 +1869,11 @@ def _check_audience_evidence(
             )
     elif audience == "self":
         if not has_self:
+            if requires_context and not has_strong_relative:
+                # Context-dependent fragment with no standalone first-person
+                # marker and no contradicting kinship/partner evidence:
+                # the perspective lives in the journey context.
+                return
             raise RuRealWorldCorpusError(
                 f"{owner}: audience 'self' has no first-person help-seeking "
                 "evidence in the utterance"
@@ -1997,6 +2035,7 @@ def _check_review_semantics(
                 "",
                 str(record["journey"]),
                 f"{record['id']} turn {turn['turn']}",
+                bool(turn.get("requires_context", False)),
             )
     _require_three_state_coverage(oracle_singles, oracle_journeys)
 

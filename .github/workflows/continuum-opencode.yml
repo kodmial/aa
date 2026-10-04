@@ -154,8 +154,12 @@ jobs:
       dispatch_marker: "${{ inputs.dispatch_marker }}"
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
-      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts || '5' }}"
-      pause_on_failure: "${{ inputs.pause_on_failure || 'false' }}"
+      # Bare `inputs.*` passthrough, never a `|| '<literal>'` default: an
+      # empty passthrough lets the engine fall back to vars.AUTOMATION_*,
+      # while pinning a literal here would override that repository
+      # variable (same contract as the issue-scheduler caller).
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      pause_on_failure: "${{ inputs.pause_on_failure }}"
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
       capability_number: "${{ inputs.capability_number }}"
