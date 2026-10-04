@@ -15,7 +15,8 @@ on:
           - 3h
 
 permissions:
-  actions: read
+  # Cache save needs write; restore needs read. Runtime itself stays read-only.
+  actions: write
   contents: read
 
 jobs:
@@ -58,6 +59,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Compute public cache keys
+        id: public-cache-keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "pip-dir=$HOME/.cache/pip" >> "$GITHUB_OUTPUT"
+          echo "hf-dir=$HOME/.cache/huggingface/hub" >> "$GITHUB_OUTPUT"
+          echo "model-dir=$HOME/.cache/huggingface/hub/models--intfloat--multilingual-e5-base" >> "$GITHUB_OUTPUT"
+          echo "pip-key=aa-public-pip-v1-${{ runner.os }}-${{ runner.arch }}-py3.12-${{ hashFiles('pyproject.toml') }}" >> "$GITHUB_OUTPUT"
+          echo "pip-restore=aa-public-pip-v1-${{ runner.os }}-${{ runner.arch }}-py3.12-" >> "$GITHUB_OUTPUT"
+          echo "model-key=aa-public-model-v1-${{ runner.os }}-${{ runner.arch }}-intfloat-multilingual-e5-base-${{ hashFiles('corpus/embedding.lock.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore public pip cache
+        id: restore-public-pip
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.public-cache-keys.outputs.pip-dir }}
+          key: ${{ steps.public-cache-keys.outputs.pip-key }}
+          restore-keys: ${{ steps.public-cache-keys.outputs.pip-restore }}
+          fail-on-cache-miss: false
+
+      - name: Restore public embedding model cache
+        id: restore-public-model
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # Exact key only: a wrong model revision must miss safely.
+          # No restore-keys here; pip fallback above is revalidated before use.
+          path: ${{ steps.public-cache-keys.outputs.model-dir }}
+          key: ${{ steps.public-cache-keys.outputs.model-key }}
+          fail-on-cache-miss: false
+
+      - name: Verify pinned public assets
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prefetch_public_assets.py --check-only
+
       - name: Resolve bounded duration
         id: duration
         shell: bash
@@ -90,6 +131,29 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+
+      - name: Prefetch pinned embedding model
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prefetch_public_assets.py
+
+      - name: Save public pip cache
+        if: success() && steps.restore-public-pip.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.public-cache-keys.outputs.pip-dir }}
+          key: ${{ steps.public-cache-keys.outputs.pip-key }}
+
+      - name: Save public embedding model cache
+        if: success() && steps.restore-public-model.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.public-cache-keys.outputs.model-dir }}
+          key: ${{ steps.public-cache-keys.outputs.model-key }}
 
       - name: Install pinned OpenCode
         shell: bash
