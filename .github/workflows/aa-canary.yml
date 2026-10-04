@@ -9,13 +9,60 @@ on:
 
 permissions:
   contents: read
+  issues: read
 
 concurrency:
   group: aa-canary
   cancel-in-progress: false
 
 jobs:
+  activation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      active: ${{ steps.gate.outputs.active }}
+    steps:
+      - name: Gate canary on final AA qualification
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            let active = false;
+            let detail = 'qualification #80 is not complete';
+            try {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 80,
+              });
+              active = issue.state === 'closed' && issue.state_reason === 'completed';
+              detail = active
+                ? 'qualification #80 is complete'
+                : `qualification #80 state=${issue.state}, reason=${issue.state_reason || 'none'}`;
+            } catch (error) {
+              core.warning(
+                `Unable to verify final qualification #80; canary stays inactive: ${error.message}`
+              );
+              detail = 'qualification #80 could not be verified';
+            }
+
+            core.setOutput('active', active ? 'true' : 'false');
+            core.notice(
+              active
+                ? 'AA canary activated by completed final qualification #80.'
+                : `AA canary cleanly skipped: ${detail}.`
+            );
+            await core.summary
+              .addHeading('AA canary activation')
+              .addRaw(active ? 'ACTIVE' : 'NOT READY')
+              .addEOL()
+              .addRaw(detail)
+              .write();
+
   canary:
+    needs: activation
+    if: needs.activation.outputs.active == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -110,10 +157,9 @@ jobs:
           {
             echo "## AA canary"
             echo
+            echo "- final activation gate: qualification #80 completed"
             echo "- repository verification: executed"
             echo "- real local OpenCode server lifecycle: executed"
             echo "- Telegram Bot API getMe probe: executed"
             echo "- product release: not performed"
-            echo
-            echo "This canary is a recurring build/smoke signal; final product E2E remains AA qualification #7."
           } >> "$GITHUB_STEP_SUMMARY"
