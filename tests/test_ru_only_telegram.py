@@ -47,10 +47,10 @@ OBSERVED_EN_FALLBACK = (
 
 RU_FIXTURES: dict[str, str] = {
     section: (
-        f"Фиктивный отрывок раздела {section} про трезвость поддержку "
+        f"Фиктивный отрывок раздела {idx + 1} про трезвость поддержку "
         "сообщества утренние собрания.\n\nВторой абзац раздела продолжается."
     )
-    for section in SECTION_IDS
+    for idx, section in enumerate(SECTION_IDS)
 }
 
 

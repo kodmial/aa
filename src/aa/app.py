@@ -22,7 +22,6 @@ from aa.conversation.orchestrator import (
     FAIL_CLOSED_REPLY,
     TurnFailed,
     TurnRunner,
-    contains_english_fallback,
     is_substantive,
     meets_russian_only,
     run_trivial_turn,
@@ -468,7 +467,7 @@ class Application:
                             ) from exc2
                     else:
                         raise
-                if contains_english_fallback(trivial_reply):
+                if not meets_russian_only(trivial_reply):
                     logger.warning(
                         "trivial turn failed closed on RU-only contract",
                         extra={"chat_id": chat_id},
@@ -525,7 +524,7 @@ class Application:
                         extra={"chat_id": chat_id, "category": "session-not-found"},
                     )
                     return FAIL_CLOSED_REPLY
-                if contains_english_fallback(trivial_retry):
+                if not meets_russian_only(trivial_retry):
                     logger.warning(
                         "trivial turn failed closed on RU-only contract after rebind",
                         extra={"chat_id": chat_id},

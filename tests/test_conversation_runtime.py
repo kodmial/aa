@@ -615,7 +615,7 @@ async def test_trivial_turn_uses_named_agent_with_fallback() -> None:
     ) -> str:
         seen.append((agent, model))
         assert "по-русски" in prompt
-        return "hello answer"
+        return "Привет! Чем могу помочь?"
 
     result = await run_trivial_turn(
         "привет",
@@ -626,7 +626,7 @@ async def test_trivial_turn_uses_named_agent_with_fallback() -> None:
         fallback_model=FALLBACK,
         sleep=_noop_sleep,
     )
-    assert result.text == "hello answer"
+    assert result.text == "Привет! Чем могу помочь?"
     assert seen == [(AGENT_NAME, PRIMARY)]
 
 

@@ -107,6 +107,7 @@ FAIL_CLOSED_REPLY = (
 )
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
 
 _EN_FALLBACK_PATTERNS = (
     r"cannot\s+provide",
@@ -149,13 +150,16 @@ def meets_russian_only(text: str) -> bool:
     """Return whether user-visible ``text`` obeys the RU-only contract.
 
     Citations are pointers, not prose: they are stripped first. Valid
-    Russian text must contain Cyrillic and must not contain any English
-    error/fallback fragment or internal provider token.
+    Russian text must contain Cyrillic and must not contain any Latin
+    (visible English) prose, English error/fallback fragment, or
+    internal provider token.
     """
     cleaned = _strip_citations_for_language_check(text)
     if contains_english_fallback(text):
         return False
     if _CYRILLIC_RE.search(cleaned) is None:
+        return False
+    if _LATIN_RE.search(cleaned) is not None:
         return False
     return True
 
@@ -1783,10 +1787,10 @@ async def run_trivial_turn(
 ) -> SynthesisResult:
     """Answer a non-substantive turn directly through the named agent.
 
-    The prompt demands a Russian-only reply. Any English fallback, error,
-    or provider fragment in the synthesis fails the turn closed for a
-    deterministic Russian fallback upstream; plain conversational replies
-    pass through so trivial greetings keep their established behavior.
+    The prompt demands a Russian-only reply. Any synthesis violating
+    the RU-only contract (missing Cyrillic, visible English/Latin, or
+    an English fallback/error/provider fragment) fails the turn closed
+    for a deterministic Russian fallback upstream.
     """
     if not text.strip():
         raise TurnFailed("empty-turn", "refusing an empty turn")
@@ -1802,12 +1806,12 @@ async def run_trivial_turn(
         )
     except OpenCodeSessionNotFoundError as exc:
         raise TurnFailed("session-not-found", "opencode session is gone") from exc
-    if contains_english_fallback(result.text):
-        raise TurnFailed("language-violation", "trivial synthesis leaked English fallback")
+    if not meets_russian_only(result.text):
+        raise TurnFailed("language-violation", "trivial synthesis violated RU-only contract")
     if not envelope_passes(result.text):
         compacted = compact_text_to_envelope(result.text)
-        if contains_english_fallback(compacted):
-            raise TurnFailed("language-violation", "trivial synthesis leaked English fallback")
+        if not meets_russian_only(compacted):
+            raise TurnFailed("language-violation", "trivial synthesis violated RU-only contract")
         logger.info(
             "trivial turn compacted to envelope",
             extra={
