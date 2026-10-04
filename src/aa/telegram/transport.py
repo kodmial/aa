@@ -594,12 +594,8 @@ class PollingTelegramTransport(TelegramTransport):
             try:
                 try:
                     await self._api.send_voice(reply.chat_id, payload_bytes)
-                except NotImplementedError:
-                    await self._call_with_retry(
-                        "sendVoice",
-                        {"chat_id": reply.chat_id},
-                        max_retries=self._max_send_retries,
-                    )
+                except NotImplementedError as exc:
+                    raise TelegramApiError("telegram voice send is not supported") from exc
                 break
             except TelegramAuthError:
                 raise
