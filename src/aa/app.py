@@ -239,20 +239,23 @@ class Application:
 
     def _get_turn_runner(self) -> TurnRunner:
         """Build the deterministic turn runner for the pinned runtime."""
-        if self._turn_runner is not None:
+        if self._turn_runner is not None and self._turn_runner.index is not None:
             return self._turn_runner
+        self._index_error = None
         try:
             index: HybridIndex | None = self._turn_index()
         except TurnFailed:
             index = None
-        self._turn_runner = TurnRunner(
+        runner = TurnRunner(
             index=index,
             ru_corpus_version=self.settings.aa_corpus_version,
             agent=self.settings.opencode_agent,
             primary_model=self.settings.opencode_model,
             fallback_model=self.settings.opencode_fallback_model,
         )
-        return self._turn_runner
+        if runner.index is not None:
+            self._turn_runner = runner
+        return runner
 
     async def _run_trivial_turn(self, session_id: str, text: str) -> str:
         """Execute the direct bounded agent path for one non-substantive turn."""

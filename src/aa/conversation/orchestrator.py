@@ -321,7 +321,7 @@ class GroundedResponse:
             aspects=self.diagnostics.aspects,
             retrieval_rounds=self.diagnostics.retrieval_rounds,
             candidates=self.diagnostics.candidates,
-            evidence_chunks=len(kept),
+            evidence_chunks=self.diagnostics.evidence_chunks,
             evidence_tokens=self.diagnostics.evidence_tokens,
             tool_call_count=self.diagnostics.tool_call_count,
             coverage_gaps=self.diagnostics.coverage_gaps,
