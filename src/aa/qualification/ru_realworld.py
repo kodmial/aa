@@ -1596,6 +1596,16 @@ def _check_oracle_journey(record: dict[str, Any], index: int) -> None:
         raise RuRealWorldCorpusError(f"{record['id']}: first oracle turn must be an object")
     if first["requires_context"] is not False:
         raise RuRealWorldCorpusError(f"{record['id']}: first turn must not require context")
+    if record["id"] == CONTROL_JOURNEY_ID:
+        post_reset = next(
+            t for t in turns if isinstance(t, dict) and t["turn"] == CONTROL_TURN_NUMBER + 1
+        )
+        if not isinstance(post_reset, dict):
+            raise RuRealWorldCorpusError("RU-J-027 turn after reset must be an object")
+        if post_reset["requires_context"] is not False:
+            raise RuRealWorldCorpusError(
+                "RU-J-027 turn after reset must be marked context-independent"
+            )
 
 
 def _check_sources_shape(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
