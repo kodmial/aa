@@ -33,10 +33,13 @@ from aa.qualification.ru_realworld import (
     SOURCES_REL,
     VERSION_REL,
     RuRealWorldCorpusError,
+    _is_verbatim_copy,
+    _source_theme_texts,
     build_version_payload,
     find_repo_root,
     load_input,
     load_oracle,
+    load_sources,
     sha256_file,
     validate,
 )
@@ -351,9 +354,12 @@ def test_no_verbatim_copy_search_stats_or_encoded_answers() -> None:
     root = _root()
     _, input_singles, input_journeys = load_input(root / INPUT_REL)
     _, oracle_singles, oracle_journeys = load_oracle(root / ORACLE_REL)
-    sources_text = (root / SOURCES_REL).read_text(encoding="utf-8")
+    payload = load_sources(root / SOURCES_REL)
+    sources = payload.get("sources", [])
+    by_source_id = {str(e["id"]): e for e in sources if isinstance(e, dict)}
+    theme_texts = _source_theme_texts(by_source_id)
     for record in input_singles:
-        assert str(record["utterance"]).strip() not in sources_text
+        assert not _is_verbatim_copy(str(record["utterance"]), theme_texts)
         for key in record:
             assert key not in (
                 "expected_answer",
@@ -365,7 +371,7 @@ def test_no_verbatim_copy_search_stats_or_encoded_answers() -> None:
         for turn in record["turns"]:
             if turn.get("kind") != "user":
                 continue
-            assert str(turn["utterance"]).strip() not in sources_text
+            assert not _is_verbatim_copy(str(turn["utterance"]), theme_texts)
     for record in (*oracle_singles, *oracle_journeys):
         for key in record:
             assert key not in (

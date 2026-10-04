@@ -166,7 +166,17 @@ EMERGENCY_CATEGORY_FALLBACK_BY_JOURNEY = {
 }
 
 FORBIDDEN_UTTERANCE_PATTERNS = (
-    re.compile(r"google", re.IGNORECASE),
+    # Only invented search-volume/frequency claims are forbidden: a bare
+    # "google" mention (e.g. "я гуглил/погуглил симптомы") is legitimate
+    # help-seeking, so "google" must co-occur with a volume/frequency claim.
+    re.compile(
+        r"google.{0,80}(search.?volume|volume|frequency|запрос|частот|статистик|%)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"гугл.{0,80}(search.?volume|volume|frequency|запрос|частот|статистик|%)",
+        re.IGNORECASE,
+    ),
     re.compile(r"search.?volume", re.IGNORECASE),
     re.compile(r"запросов в месяц", re.IGNORECASE),
     re.compile(r"частота запросов", re.IGNORECASE),
@@ -232,6 +242,44 @@ def _decode_utf8_strict(path: Path) -> str:
 
 def _norm_utterance(text: str) -> str:
     return " ".join(text.strip().casefold().split())
+
+
+# Minimum normalized length for verbatim-copy detection. Short utterances
+# routinely appear as substrings of URLs, theme fragments or JSON syntax in
+# the raw sources file text, so only substantive utterances are checked.
+MIN_VERBATIM_CHARS = 24
+
+
+def _source_theme_texts(by_source_id: dict[str, dict[str, Any]]) -> list[str]:
+    """Collect normalized source theme strings for verbatim comparison."""
+    texts: list[str] = []
+    for entry in by_source_id.values():
+        themes = entry.get("themes", [])
+        if not isinstance(themes, list):
+            continue
+        for theme in themes:
+            if isinstance(theme, str) and theme.strip():
+                texts.append(_norm_utterance(theme))
+    return texts
+
+
+def _is_verbatim_copy(utterance: str, theme_texts: list[str]) -> bool:
+    """Return True when a substantive utterance copies a source theme verbatim.
+
+    Compares against parsed theme strings (not the whole raw JSON file text)
+    and skips short utterances that match URLs or JSON fragments by accident.
+    A substantive utterance flags only on an exact theme match or when the
+    full utterance appears inside a long theme or vice versa.
+    """
+    norm = _norm_utterance(utterance)
+    if len(norm) < MIN_VERBATIM_CHARS:
+        return False
+    for theme in theme_texts:
+        if len(theme) < MIN_VERBATIM_CHARS:
+            continue
+        if norm == theme or norm in theme or theme in norm:
+            return True
+    return False
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1308,7 +1356,10 @@ def _check_provenance_diversity(
         raise RuRealWorldCorpusError(
             f"provenance must span at least 3 source kinds, got {sorted(distinct)}"
         )
-    dominant = max(distinct, key=kinds.count)
+    # Deterministic tie-break: `distinct` is a set, so iterate it sorted.
+    # On tied most-common kinds the alphabetically-first kind wins, keeping
+    # referenced/non-dominant accounting stable across runs.
+    dominant = max(sorted(distinct), key=kinds.count)
     non_dominant = [sid for sid, e in by_source_id.items() if str(e.get("kind")) != dominant]
     if len(non_dominant) < 2:
         raise RuRealWorldCorpusError("provenance must include at least 2 non-dominant sources")
@@ -1342,6 +1393,43 @@ def _require_three_state_coverage(oracle_singles: list[Any], oracle_journeys: li
                 f"oracle must cover the {required!r} safety decision; "
                 f"observed decisions: {sorted(seen)}"
             )
+
+
+def _check_oracle_label_distinctness(
+    oracle_singles: list[Any], input_utterances: dict[str, str]
+) -> None:
+    """Require distinct utterances behind identical oracle label blocks.
+
+    Same-topic clusters (e.g. RU-S-001..010) legitimately share topic, response
+    mode, audience, book relevance, forbidden inferences, boundary tags,
+    provenance and rubric. That sharing is only valid when the underlying
+    utterances are genuinely distinct per-utterance cases, never duplicated
+    rows behind templated labels.
+    """
+    seen: dict[tuple[Any, ...], str] = {}
+    for record in oracle_singles:
+        if not isinstance(record, dict):
+            continue
+        key = (
+            record.get("topic"),
+            record.get("expected_safety_decision"),
+            record.get("expected_response_mode"),
+            record.get("audience"),
+            record.get("book_relevance"),
+            tuple(record.get("forbidden_inferences", [])),
+            tuple(record.get("safety_boundary_tags", [])),
+            tuple(record.get("provenance_ids", [])),
+            tuple(record.get("rubric_tags", [])),
+        )
+        utterance = _norm_utterance(input_utterances.get(str(record.get("id")), ""))
+        label = (key, utterance)
+        owner = seen.get(label)
+        if owner is not None:
+            raise RuRealWorldCorpusError(
+                f"{record.get('id')}: duplicate utterance behind identical oracle "
+                f"labels (also {owner})"
+            )
+        seen[label] = str(record.get("id"))
 
 
 def _check_review_semantics(
@@ -1405,6 +1493,18 @@ def _check_review_semantics(
                     f"{record['id']}: {decision} utterance triggers the emergency "
                     f"classifier ({classifiers(classification)})"
                 )
+        # Per-utterance audience guard: topic-clustered singles (e.g. the
+        # RU-S-001..010 quit_control block) legitimately share identical
+        # oracle metadata, but the stored audience must still match the
+        # utterance-derived perspective for every individual case.
+        utterance = input_utterances.get(str(record["id"]), "")
+        expected_audience = _audience_for(utterance, topic, "")
+        if str(record.get("audience")) != expected_audience:
+            raise RuRealWorldCorpusError(
+                f"{record['id']}: audience {record.get('audience')!r} does not match "
+                f"utterance-derived audience {expected_audience!r}"
+            )
+    _check_oracle_label_distinctness(oracle_singles, input_utterances)
     oracle_by_id = {str(r["id"]): r for r in oracle_journeys if isinstance(r, dict)}
     if len(oracle_by_id) != len(oracle_journeys):
         raise RuRealWorldCorpusError("oracle journeys contain duplicate or malformed ids")
@@ -1439,6 +1539,14 @@ def _check_review_semantics(
                         f"{record['id']} turn {turn['turn']}: {decision} utterance triggers "
                         f"the emergency classifier ({classifiers(classification)})"
                     )
+            utterance = input_utterances.get(f"{record['id']}#{turn['turn']}", "")
+            expected_audience = _audience_for(utterance, "", str(record["journey"]))
+            if str(turn.get("audience")) != expected_audience:
+                raise RuRealWorldCorpusError(
+                    f"{record['id']} turn {turn['turn']}: audience "
+                    f"{turn.get('audience')!r} does not match utterance-derived "
+                    f"audience {expected_audience!r}"
+                )
     _require_three_state_coverage(oracle_singles, oracle_journeys)
 
 
@@ -1878,11 +1986,15 @@ def validate(root: Path | None = None) -> CorpusSummary:
     _check_meaning_preservation_anchors(
         oracle_singles, oracle_journeys, input_journeys, sources_text
     )
-    # Verbatim / answer hygiene on generator-visible utterances.
+    # Verbatim / answer hygiene on generator-visible utterances. Compare
+    # against parsed theme strings with a minimum-length guard instead of
+    # `utterance.strip() in raw_file_text`, so short utterances cannot match
+    # URLs, descriptions or JSON syntax by accident.
+    theme_texts = _source_theme_texts(by_source_id)
     for record in input_singles:
         if not isinstance(record, dict):
             raise RuRealWorldCorpusError("input single record must be an object")
-        if str(record["utterance"]).strip() in sources_text:
+        if _is_verbatim_copy(str(record["utterance"]), theme_texts):
             raise RuRealWorldCorpusError(
                 f"{record['id']}: utterance is copied verbatim from the sources file"
             )
@@ -1894,7 +2006,7 @@ def validate(root: Path | None = None) -> CorpusSummary:
                 raise RuRealWorldCorpusError(f"{record.get('id')}: journey turn must be an object")
             if turn.get("kind") != "user":
                 continue
-            if str(turn["utterance"]).strip() in sources_text:
+            if _is_verbatim_copy(str(turn["utterance"]), theme_texts):
                 raise RuRealWorldCorpusError(
                     f"{record['id']} turn {turn.get('turn')}: "
                     "utterance is copied verbatim from the sources file"
