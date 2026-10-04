@@ -462,6 +462,17 @@ def _check_meaning_preservation_anchors(
             raise RuRealWorldCorpusError(
                 f"{record['id']}: utterance is copied verbatim from the sources file"
             )
+    for record in journeys:
+        assert isinstance(record, dict)
+        turns = record.get("turns", [])
+        assert isinstance(turns, list)
+        for turn in turns:
+            assert isinstance(turn, dict)
+            if str(turn["utterance"]).strip() in sources_text:
+                raise RuRealWorldCorpusError(
+                    f"{record['id']} turn {turn.get('turn')}: "
+                    "utterance is copied verbatim from the sources file"
+                )
 
 
 def validate(root: Path | None = None) -> CorpusSummary:

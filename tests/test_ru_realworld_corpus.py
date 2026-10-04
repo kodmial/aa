@@ -119,6 +119,8 @@ def test_no_verbatim_copy_search_stats_or_encoded_answers() -> None:
                 "ideal_answer",
             )
     for record in journeys:
+        for turn in record["turns"]:
+            assert str(turn["utterance"]).strip() not in sources_text
         for key in record:
             assert key not in (
                 "expected_answer",
