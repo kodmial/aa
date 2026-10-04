@@ -70,3 +70,23 @@ Model/provider (Zen) configuration lives entirely on the OpenCode side
 uses the anonymous/keyless OpenCode free tier and must not require an OpenCode
 or Zen account, API key, provider credential, or authentication secret. The
 worker forwards at most the opaque `OPENCODE_MODEL` `provider/model` pointer.
+
+## Generation budget (issue #83)
+
+Pinned-runtime finding (OpenCode 1.18.34, verified against `GET /doc`):
+`POST /session/{id}/message` accepts only `parts`/`agent`/`model` (plus
+`messageID`/`noReply`/`tools`/`format`/`system`/`variant`) and exposes no
+documented per-message `max_tokens`/`maxTokens` field; the agent config
+schema likewise exposes no output-token cap (only `model`/`variant`/
+`temperature`/`top_p`/`prompt`/`tools`/`options`/`steps`/`maxSteps`).
+Sending an undocumented token-cap field would risk being silently ignored,
+so the worker deliberately does not send one: `OPENCODE_MAX_OUTPUT_TOKENS`
+is honored as a bounded prompt-advertised generation budget (default 256
+output tokens when unset) plus an explicit concise-answer instruction in
+every synthesis prompt. Token count is never the product contract because
+character/token ratios vary by language and model; the deterministic
+character validator (`aa.conversation.output_limits`, hard cap 900
+graphemes / 130 words, verbatim quote aggregate 300 chars, exactly one
+compact regeneration, then complete-unit compaction, final transport guard)
+is authoritative. Qualification fails if a `max_tokens`-shaped field ever
+appears on the message boundary (see the contract test).
