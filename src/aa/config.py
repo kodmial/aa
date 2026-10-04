@@ -104,6 +104,12 @@ class Settings:
     # per worker; voice replies fall back to text when unavailable.
     aa_tts_model_path: str = "./models/tts/v5_5_ru.pt"
 
+    # Ephemeral acoustic voice-presentation routing (issue #78): filesystem
+    # path holding the pinned gender-presentation ONNX file
+    # (``onnx/model_quantized.onnx``). The classifier is loaded once per
+    # worker; any error deterministically defaults to ``xenia``.
+    aa_voice_presentation_model_path: str = "./models/voice-presentation/model_quantized.onnx"
+
     # Logging.
     log_level: str = "INFO"
 
@@ -127,6 +133,7 @@ class Settings:
             "PER_CHAT_QUEUE_SIZE",
             "AA_VOICE_MODEL_DIR",
             "AA_TTS_MODEL_PATH",
+            "AA_VOICE_PRESENTATION_MODEL_PATH",
             "LOG_LEVEL",
         ),
         compare=False,
@@ -161,6 +168,10 @@ class Settings:
                 ),
                 aa_voice_model_dir=_get_str("AA_VOICE_MODEL_DIR", "./models/gigaam"),
                 aa_tts_model_path=_get_str("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
+                aa_voice_presentation_model_path=_get_str(
+                    "AA_VOICE_PRESENTATION_MODEL_PATH",
+                    "./models/voice-presentation/model_quantized.onnx",
+                ),
                 log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             )
         return cls(
@@ -186,6 +197,10 @@ class Settings:
             ),
             aa_voice_model_dir=source.get("AA_VOICE_MODEL_DIR", "./models/gigaam"),
             aa_tts_model_path=source.get("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
+            aa_voice_presentation_model_path=source.get(
+                "AA_VOICE_PRESENTATION_MODEL_PATH",
+                "./models/voice-presentation/model_quantized.onnx",
+            ),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -222,6 +237,8 @@ class Settings:
             raise ValueError("AA_VOICE_MODEL_DIR must not be empty")
         if not self.aa_tts_model_path.strip():
             raise ValueError("AA_TTS_MODEL_PATH must not be empty")
+        if not self.aa_voice_presentation_model_path.strip():
+            raise ValueError("AA_VOICE_PRESENTATION_MODEL_PATH must not be empty")
         if require_bot_token and not self.has_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required but missing or empty")
 
@@ -246,5 +263,6 @@ class Settings:
             "per_chat_queue_size": self.per_chat_queue_size,
             "aa_voice_model_dir": self.aa_voice_model_dir,
             "aa_tts_model_path": self.aa_tts_model_path,
+            "aa_voice_presentation_model_path": self.aa_voice_presentation_model_path,
             "log_level": self.log_level,
         }
