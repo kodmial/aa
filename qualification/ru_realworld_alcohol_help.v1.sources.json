@@ -1,0 +1,167 @@
+{
+  "schema_version": "ru-realworld-provenance-v1",
+  "note": "Public-source themes used only to synthesize privacy-safe Russian test utterances. No source user's personal story is copied verbatim. No Google search-volume claim is made.",
+  "sources": [
+    {
+      "id": "SV_QUIT_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/356689-ne-mogu-samostoyatelno-brosit-pit",
+      "themes": [
+        "не могу бросить",
+        "цикл трезвость-срыв",
+        "стыд после срыва"
+      ]
+    },
+    {
+      "id": "SV_EVENING_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/1031651-kak-brosit-upotreblyat-alkogol",
+      "themes": [
+        "вечерняя тяга",
+        "пиво как привычка",
+        "вина",
+        "дети замечают"
+      ]
+    },
+    {
+      "id": "SV_DAILY_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/2073435-pytayus-brosit-pit-alkogol",
+      "themes": [
+        "ежедневное употребление",
+        "бессонница",
+        "давление",
+        "тахикардия",
+        "функционирование несмотря на проблему"
+      ]
+    },
+    {
+      "id": "SV_BINGE_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/1234701-u-menya-zapoi",
+      "themes": [
+        "запой",
+        "потеря тормозов",
+        "рвота",
+        "бессонница"
+      ]
+    },
+    {
+      "id": "SV_CRAVING_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/678312-chto-so-mnoy-proishodit",
+      "themes": [
+        "навязчивые мысли об алкоголе",
+        "вечерняя тяга после отказа"
+      ]
+    },
+    {
+      "id": "SV_FAMILY_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/1205574-muzh-pet-chto-delat",
+      "themes": [
+        "муж пьет",
+        "пиво после работы",
+        "нет тормозов",
+        "сон и раздражительность"
+      ]
+    },
+    {
+      "id": "SV_FAMILY_2",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/310884-moy-muzh-pet",
+      "themes": [
+        "родственник не признает проблему",
+        "как заставить бросить"
+      ]
+    },
+    {
+      "id": "SV_ANXIETY_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/489358-priem-antidepressanta",
+      "themes": [
+        "тревога",
+        "плохой сон",
+        "сильное желание выпить",
+        "срыв"
+      ]
+    },
+    {
+      "id": "SV_WITHDRAWAL_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/3559486-kak-vyyti-s-zapoya",
+      "themes": [
+        "выход из запоя",
+        "опасность самостоятельной отмены",
+        "судороги",
+        "психоз"
+      ]
+    },
+    {
+      "id": "SV_WITHDRAWAL_2",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/444146-u-muzha-dlitelnyy-zapoy",
+      "themes": [
+        "неадекватное поведение",
+        "агрессия",
+        "возможный делирий",
+        "родственник"
+      ]
+    },
+    {
+      "id": "SV_DENIAL_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/151118-alkogolizm-ili-net",
+      "themes": [
+        "алкоголизм или нет",
+        "стресс-триггер",
+        "короткие периоды трезвости"
+      ]
+    },
+    {
+      "id": "SV_RELAPSE_1",
+      "kind": "public_narcology_qna",
+      "url": "https://sprosivracha.com/questions/582796-sryv-alkogol-posle-8-mesyacev-bez-narkotikov",
+      "themes": [
+        "срыв после периода трезвости",
+        "страх дальнейшего влечения"
+      ]
+    },
+    {
+      "id": "AA_SELF_1",
+      "kind": "aa_public_faq",
+      "url": "https://www.aa.org/faq/am-i-alcoholic",
+      "themes": [
+        "самоопределение",
+        "потеря контроля",
+        "последствия",
+        "только человек решает сам"
+      ]
+    },
+    {
+      "id": "AA_SELF_2",
+      "kind": "aa_public_self_assessment",
+      "url": "https://www.aacle.org/what-is-aa/am-i-an-alcoholic/",
+      "themes": [
+        "неудачные попытки остановиться",
+        "семейные проблемы",
+        "блэкауты",
+        "работа",
+        "смена напитка"
+      ]
+    },
+    {
+      "id": "MED_BOUNDARY_1",
+      "kind": "public_medical_info",
+      "url": "https://psihiatr.moscow/narkolog/vyvedenie-iz-zapoya",
+      "themes": [
+        "тремор",
+        "потливость",
+        "тревога",
+        "сердцебиение",
+        "спутанность",
+        "судороги"
+      ]
+    }
+  ]
+}
