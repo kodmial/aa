@@ -26,8 +26,18 @@ export default tool({
       lexical_queries_ru: args.lexical_queries_ru,
       lexical_query_en: args.lexical_query_en ?? null,
     })
-    const result =
-      await Bun.$`python3 ${script} book_search --index-dir ${indexDir} --input-json ${input}`.text()
-    return result.trim()
+    const proc = Bun.spawn(
+      ["python3", script, "book_search", "--index-dir", indexDir, "--input-json", input],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    if (exitCode !== 0) {
+      throw new Error(stderr.trim() || `book_search exited with code ${exitCode}`)
+    }
+    return stdout.trim()
   },
 })

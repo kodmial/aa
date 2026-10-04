@@ -19,8 +19,18 @@ export default tool({
       chunk_id: args.chunk_id,
       expected_ru_version: args.expected_ru_version ?? null,
     })
-    const result =
-      await Bun.$`python3 ${script} book_read --index-dir ${indexDir} --input-json ${input}`.text()
-    return result.trim()
+    const proc = Bun.spawn(
+      ["python3", script, "book_read", "--index-dir", indexDir, "--input-json", input],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    if (exitCode !== 0) {
+      throw new Error(stderr.trim() || `book_read exited with code ${exitCode}`)
+    }
+    return stdout.trim()
   },
 })
