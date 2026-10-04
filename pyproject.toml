@@ -12,6 +12,7 @@ dependencies = [
   "zstandard>=0.22",
   "sherpa-onnx==1.13.8",
   "torch==2.14.1",
+  "onnxruntime==1.30.0",
 ]
 
 [project.optional-dependencies]

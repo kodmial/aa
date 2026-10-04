@@ -404,6 +404,13 @@ class VoicePipeline:
     through non-ASR stages while one voice turn is being recognized.
     Temporary audio files live under one per-turn directory that is
     always removed in ``finally``.
+
+    Ephemeral acoustic routing (issue #78): when
+    ``presentation_classifier`` is set, the already-decoded 16 kHz
+    samples are classified in-memory for the current turn only. The
+    result is never logged, never persisted, and never stored in any
+    session/profile; callers keep it in a local variable for opposite-
+    voice TTS selection.
     """
 
     fetcher: VoiceFileFetcher
@@ -411,6 +418,51 @@ class VoicePipeline:
     recognizer: TranscriptRecognizer | None
     asr_gate: asyncio.Semaphore
     work_parent: Path | None = None
+    presentation_classifier: Any | None = None
+
+    def classify_presentation(self, samples: Sequence[float]) -> str:
+        """Classify decoded samples ephemerally; ``unknown`` on any error.
+
+        Never raises, never logs the class/probabilities/audio, and never
+        persists anything. Transcript text is never used here.
+        """
+        classifier = self.presentation_classifier
+        if classifier is None:
+            return "unknown"
+        try:
+            available = classifier.available
+        except Exception:
+            return "unknown"
+        if not available:
+            return "unknown"
+        try:
+            result = classifier.classify(samples)
+        except Exception:
+            return "unknown"
+        if result in ("male-presenting", "female-presenting", "unknown"):
+            return str(result)
+        return "unknown"
+
+    async def transcribe_voice_with_presentation(
+        self,
+        *,
+        file_id: str,
+        file_size_bytes: int | None = None,
+        duration_seconds: int | None = None,
+    ) -> tuple[str, str]:
+        """Transcribe one voice message and route its TTS voice ephemerally.
+
+        Returns ``(transcript, presentation)`` where ``presentation`` is
+        one of ``male-presenting``/``female-presenting``/``unknown`` for
+        the current turn only. Any classifier error yields ``unknown``.
+        """
+        transcript, presentation, _ = await self._run_turn(
+            file_id=file_id,
+            file_size_bytes=file_size_bytes,
+            duration_seconds=duration_seconds,
+            with_presentation=True,
+        )
+        return transcript, presentation
 
     async def transcribe_voice(
         self,
@@ -420,6 +472,23 @@ class VoicePipeline:
         duration_seconds: int | None = None,
     ) -> str:
         """Download, decode and transcribe one voice message to trimmed text."""
+        transcript, _, _ = await self._run_turn(
+            file_id=file_id,
+            file_size_bytes=file_size_bytes,
+            duration_seconds=duration_seconds,
+            with_presentation=False,
+        )
+        return transcript
+
+    async def _run_turn(
+        self,
+        *,
+        file_id: str,
+        file_size_bytes: int | None,
+        duration_seconds: int | None,
+        with_presentation: bool,
+    ) -> tuple[str, str, None]:
+        """Shared download/decode/ASR body with optional ephemeral routing."""
         check_voice_bounds(file_size_bytes=file_size_bytes, duration_seconds=duration_seconds)
         if self.recognizer is None or not self.recognizer.available:
             raise VoiceError("asr-unavailable", "voice recognizer is not ready")
@@ -438,8 +507,24 @@ class VoicePipeline:
                 raise
             except Exception as exc:
                 raise VoiceError("decode-failed", "voice decode failed") from exc
+            finally:
+                del raw
             if not samples:
                 raise VoiceError("decode-failed", "decoded voice is empty")
+            presentation = "unknown"
+            if with_presentation:
+                try:
+                    presentation = await asyncio.to_thread(
+                        self.classify_presentation, list(samples)
+                    )
+                except Exception:
+                    presentation = "unknown"
+                if presentation not in (
+                    "male-presenting",
+                    "female-presenting",
+                    "unknown",
+                ):
+                    presentation = "unknown"
             # Only ASR inference is serialized; download/decode already ran
             # concurrently for other chats before reaching this gate.
             try:
@@ -457,7 +542,7 @@ class VoicePipeline:
             if not transcript:
                 raise VoiceError("empty-transcript", "ASR returned no speech")
             logger.info("voice turn transcribed", extra={"text_len": len(transcript)})
-            return transcript
+            return transcript, presentation, None
         # ``TemporaryDirectory`` removes all staged audio on exit.
 
     async def _fetch_guarded(self, file_id: str) -> bytes:
@@ -475,6 +560,7 @@ def build_pipeline(
     decoder: WaveformDecoder | None = None,
     recognizer: TranscriptRecognizer | None = None,
     work_parent: Path | None = None,
+    presentation_classifier: Any | None = None,
 ) -> VoicePipeline:
     """Build a voice pipeline with a per-worker single-ASR gate."""
     return VoicePipeline(
@@ -483,6 +569,7 @@ def build_pipeline(
         recognizer=recognizer,
         asr_gate=asyncio.Semaphore(1),
         work_parent=work_parent,
+        presentation_classifier=presentation_classifier,
     )
 
 
