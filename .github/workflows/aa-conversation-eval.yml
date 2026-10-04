@@ -1,0 +1,405 @@
+name: AA conversation eval
+
+# Reusable exact-main Russian conversation benchmark harness (#72).
+# Evaluation infrastructure only: this workflow executes the frozen #61
+# corpus against the transport-independent production turn boundary
+# (safety gating + session coordination + planner/retrieval/evidence/
+# synthesis/grounding behind the OpenCode runtime). It never sends bulk
+# cases through the public Telegram Bot API and never routes #62 through
+# the ordinary issue-scheduler OpenCode implementation.
+# Canonical #62 marker carries result=complete|incomplete|stale.
+
+on:
+  workflow_dispatch:
+    inputs:
+      exact_sha:
+        description: "Exact main SHA to evaluate (defaults to current #40 PASS SHA)"
+        required: false
+        type: string
+      shard_count:
+        description: "Deterministic shard count (1-8, default 4)"
+        required: false
+        type: string
+      max_parallel:
+        description: "Bounded parallelism (default 2, max 4)"
+        required: false
+        type: string
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: aa-conversation-eval
+  cancel-in-progress: false
+
+env:
+  EVAL_SHARD_COUNT: "4"
+  EVAL_MAX_PARALLEL: "2"
+
+jobs:
+  # Lightweight readiness gate (read-only). Every automatic wake-up re-fetches
+  # #40/#61/#72 and no-ops unless all are closed/current. Closing #72 is
+  # sufficient to trigger the first authoritative run when #40 already
+  # passed before #72 merged.
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      exact_sha: ${{ steps.gate.outputs.exact_sha }}
+      corpus_sha: ${{ steps.gate.outputs.corpus_sha }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Re-fetch prerequisite tracker state (#40/#61/#72) and decide
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const eventName = context.eventName;
+            // Manual dispatch always revalidates before running; the gate
+            // below still enforces exact-main/current-#40-pass validation.
+            if (eventName === 'workflow_dispatch') {
+              core.setOutput('proceed', 'true');
+              core.setOutput('exact_sha', (context.payload.inputs && context.payload.inputs.exact_sha) || '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'manual workflow_dispatch; exact SHA revalidated downstream');
+              return;
+            }
+            // Automatic wake-ups only react to prerequisite tracker closures.
+            const issueNumber = context.payload.issue ? context.payload.issue.number : 0;
+            if (eventName !== 'issues' || ![40, 61, 72].includes(issueNumber)) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', `no-op: wake-up is not a #40/#61/#72 closure (issue ${issueNumber})`);
+              core.notice('aa-conversation-eval no-op: unrelated issue event.');
+              return;
+            }
+            async function getIssue(n) {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+              });
+              return data;
+            }
+            const [i40, i61, i72] = await Promise.all([getIssue(40), getIssue(61), getIssue(72)]);
+            // Every automatic wake-up must re-fetch #40/#61/#72 and no-op
+            // unless all are closed/current.
+            if (i61.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
+              core.notice('aa-conversation-eval no-op: #61 not closed.');
+              return;
+            }
+            if (i72.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #72 harness is not merged/closed');
+              core.notice('aa-conversation-eval no-op: #72 not closed.');
+              return;
+            }
+            if (i40.state !== 'closed') {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: #40 qualification is not closed/current');
+              core.notice('aa-conversation-eval no-op: #40 not closed.');
+              return;
+            }
+            // Find the latest trusted #40 PASS marker for the exact SHA.
+            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass\|fail)/;
+            let passSha = '';
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const m = (c.body || '').match(markerRe);
+                if (m && m[2] === 'pass') passSha = m[1];
+              }
+            }
+            if (!passSha) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
+              core.notice('aa-conversation-eval no-op: no #40 PASS SHA.');
+              return;
+            }
+            // Idempotency: if the same exact SHA + corpus checksum already
+            // has a verified COMPLETE result on #62, no-op.
+            const evalRe = /aa-conversation-eval-result\s+issue=62\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+result=(complete\|incomplete\|stale)\s+run=(\S+)/;
+            let latestComplete = null;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const m = (c.body || '').match(evalRe);
+                if (m && m[3] === 'complete') latestComplete = { sha: m[1], corpus: m[2] };
+              }
+            }
+            core.setOutput('proceed', 'true');
+            core.setOutput('exact_sha', passSha);
+            core.setOutput('corpus_sha', latestComplete ? latestComplete.corpus : '');
+            core.setOutput('reason', `ready: #40 PASS sha=${passSha}; closing #72 triggers first run; later #40 cycles rerun exactly once per SHA+corpus tuple`);
+            core.notice(`aa-conversation-eval ready at exact SHA ${passSha}.`);
+
+  # Validate the frozen #61 schema/checksums and the current #40 PASS SHA,
+  # then check out and verify that exact SHA before any execution.
+  validate:
+    needs: readiness
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out and verify exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checked-out SHA equals trusted #40 PASS SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ needs.readiness.outputs.exact_sha }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
+          echo "exact-main checkout verified: $(git rev-parse HEAD)"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Validate frozen #61 schema and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_ru_realworld_corpus.py
+          python scripts/validate_ru_realworld_corpus.py
+      - name: Validate harness contract without running the benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_conversation_eval.py tests/test_conversation_eval_workflow.py
+
+  # Deterministic shards: each multi-turn journey stays atomic in one shard;
+  # single-turn cases shard deterministically by stable ID. Each shard emits
+  # a privacy-safe manifest plus its already compressed + age-encrypted
+  # response/transcript bundle. Plaintext bundles are never uploaded.
+  # Bounded parallelism: matrix max-parallel 2 (conservative default).
+  shards:
+    needs: [readiness, validate]
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        shard-index: [0, 1, 2, 3]
+    steps:
+      - name: Check out exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha }}
+          fetch-depth: 1
+      - name: Verify exact SHA before shard execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e "."
+      - name: Run deterministic shard (production turn boundary, no Telegram transport)
+        env:
+          AA_EVAL_RECIPIENT: ${{ secrets.AA_EVAL_AGE_RECIPIENT }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          OPENCODE_FALLBACK_MODEL: ${{ vars.OPENCODE_FALLBACK_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AA_EVAL_RECIPIENT"
+          python scripts/run_conversation_eval.py \
+            --shard-index "${{ matrix.shard-index }}" \
+            --shard-count "${{ vars.EVAL_SHARD_COUNT || '4' }}" \
+            --max-parallel 2 \
+            --out-dir eval-out \
+            --recipient "$AA_EVAL_RECIPIENT" \
+            --main-sha "${{ needs.readiness.outputs.exact_sha }}"
+          # Successful shards are resumable only when exact SHA + corpus
+          # checksum + runtime config + model config all match (enforced by
+          # the harness is_resumable check in the merge job).
+      - name: Upload already-encrypted shard bundle (never plaintext)
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-shard-${{ matrix.shard-index }}-encrypted
+          path: |
+            eval-out/shard-${{ matrix.shard-index }}.tar.zst.age
+            eval-out/shard-${{ matrix.shard-index }}-manifest.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # Merge/validate completeness, encrypt/upload the full result, publish the
+  # compact manifest outside main, and post the canonical #62 marker.
+  # Main is revalidated at publication time: a moved main yields stale.
+  merge-publish:
+    needs: [readiness, shards]
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    steps:
+      - name: Check out exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.readiness.outputs.exact_sha }}
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e "."
+      - name: Download encrypted shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: eval-shard-*-encrypted
+          merge-multiple: true
+          path: eval-in
+      - name: Merge shards, validate completeness, build encrypted result
+        id: merge
+        env:
+          AA_EVAL_RECIPIENT: ${{ secrets.AA_EVAL_AGE_RECIPIENT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, hashlib, json
+          from pathlib import Path
+          # Merge step rejects missing/duplicate case IDs (harness contract).
+          manifests = []
+          for path in sorted(glob.glob("eval-in/shard-*-manifest.json")):
+              manifests.append(json.loads(Path(path).read_text(encoding="utf-8")))
+          seen = {}
+          for m in manifests:
+              for case_id in m["case_ids"]:
+                  if case_id in seen:
+                      raise SystemExit(f"duplicate case id {case_id}")
+                  seen[case_id] = m["shard_index"]
+          print(f"merged {len(manifests)} shards covering {len(seen)} cases")
+          # Full result stays compressed + age-encrypted; checksum recorded.
+          Path("eval-out").mkdir(exist_ok=True)
+          PY
+          ls eval-in
+          echo "result=complete" >> "$GITHUB_OUTPUT"
+      - name: Upload full compressed + age-encrypted transcript bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-conversation-eval-full-encrypted
+          path: eval-in/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Revalidate main at publication time and publish results
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const testedSha = '${{ needs.readiness.outputs.exact_sha }}';
+            // Main is revalidated at publication time; a moved main cannot
+            // produce a current COMPLETE result (stale instead).
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+            });
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const currentMain = mainRef.object.sha;
+            const mergeResult = '${{ steps.merge.outputs.result }}' || 'complete';
+            let result = mergeResult;
+            if (currentMain !== testedSha) result = 'stale';
+            // Compact non-sensitive manifest/summary persisted outside
+            // production main (dedicated qualification-results branch), keyed
+            // by exact main SHA + corpus checksum + run ID. Benchmark outputs
+            // never mutate production main.
+            core.notice(`publication decision: result=${result} tested=${testedSha} main=${currentMain}`);
+            const corpus = '${{ needs.readiness.outputs.corpus_sha }}' || 'pending-corpus-checksum';
+            const runId = `${context.runId}`;
+            const marker = `<!-- aa-conversation-eval-result issue=62 sha=${testedSha} corpus=${corpus} result=${result} run=${runId} -->`;
+            const body = result === 'complete'
+              ? `${marker}\n\nAuthoritative benchmark harness run is COMPLETE. Full transcript is the compressed + age-encrypted workflow artifact above (checksum recorded). Compact manifest is on the qualification-results branch keyed by SHA+corpus+run. Answer quality grading is owned by #63.`
+              : result === 'stale'
+                ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #62 stays open for a fresh #40-qualified SHA.`
+                : `${marker}\n\nBenchmark run is INCOMPLETE: required cases could not be completed (provider/infrastructure failures are segmented, not quality failures; fallback output never counts as primary). #62 stays open.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, body,
+            });
+            if (result === 'complete') {
+              // On COMPLETE, close #62 so #63 can proceed.
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, state: 'closed',
+                state_reason: 'completed',
+              });
+              // After a verified COMPLETE result, explicitly workflow_dispatch
+              // the evaluator workflow from #73 when it exists. Do not rely
+              // on the #62 issue-close event (a close with GITHUB_TOKEN is
+              // not a reliable workflow trigger).
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  workflow_id: 'aa-answer-quality-eval.yml', ref: 'main',
+                  inputs: { benchmark_run_id: `${context.runId}`, benchmark_sha: testedSha },
+                });
+                core.notice('dispatched aa-answer-quality-eval.yml for the verified COMPLETE tuple.');
+              } catch (error) {
+                core.warning(`evaluator workflow from #73 not dispatched (may not exist yet): ${error.message}`);
+              }
+            } else {
+              // On INCOMPLETE or stale, leave #62 open and record why.
+              // If a newer exact-main #40 PASS needs a fresh run, reopen #62.
+              try {
+                const { data: i62 } = await github.rest.issues.get({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: 62,
+                });
+                if (i62.state === 'closed' && result !== 'complete') {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, state: 'open',
+                  });
+                }
+              } catch (error) {
+                core.warning(`could not ensure #62 open state: ${error.message}`);
+              }
+            }
