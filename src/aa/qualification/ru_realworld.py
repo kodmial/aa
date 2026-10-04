@@ -573,8 +573,46 @@ SELF_UTTERANCE_MARKERS = (
     "пью",
     "пил",
     "выпил",
+    "выпью",
+    "выпивки",
+    "напиться",
+    "запой",
+    "непью",
+    "не пью",
     "сорвал",
 )
+
+
+def _normalize_audience_text(text: str) -> str:
+    """Casefold audience text with ``ё`` unified to ``е`` for marker matching."""
+    return text.casefold().replace("ё", "е")
+
+
+_marker_regex_cache: dict[str, re.Pattern[str]] = {}
+
+
+def _marker_at_word_start(text_normalized: str, marker_normalized: str) -> bool:
+    """Return True when ``marker`` opens a word in normalized ``text``.
+
+    Bare ``marker in text`` substring tests overmatch inside unrelated words
+    (``мать`` in ``думать``/``поймать``/``понимать``, ``меня`` in ``поменять``,
+    ``мой`` in ``домой``, ``пил`` in ``накопились``). Requiring a left word
+    boundary keeps legitimate prefix/inflection matches (``близк`` in
+    ``близким``, ``жену`` in ``женушка``, ``семью`` as a whole word) while
+    rejecting mid-word accidents. First-person prefixed drinking verbs that
+    would otherwise rely on suffix accidents (``выпью``, ``напиться``,
+    ``непью``) are listed explicitly in ``SELF_UTTERANCE_MARKERS``.
+    """
+    pattern = _marker_regex_cache.get(marker_normalized)
+    if pattern is None:
+        pattern = re.compile(r"(?<!\w)" + re.escape(marker_normalized))
+        _marker_regex_cache[marker_normalized] = pattern
+    return pattern.search(text_normalized) is not None
+
+
+def _contains_builder_marker(text_normalized: str, marker: str) -> bool:
+    """Check a builder marker with word-boundary handling."""
+    return _marker_at_word_start(text_normalized, _normalize_audience_text(marker))
 
 
 # Standalone first-person singular pronoun. ``str.split()`` misses ``я,`` /
@@ -594,13 +632,19 @@ def _audience_for(utterance: str, topic: str, journey: str) -> str:
     ``self`` is the person drinking, ``relative/partner`` seeks help about
     someone else, ``general`` asks detached information without a
     first-person stake.
+
+    Utterance markers are matched at word starts (see
+    ``_marker_at_word_start``), never as bare substrings, so short Russian
+    fragments cannot force a label from inside an unrelated word.
     """
     if journey in RELATIVE_JOURNEYS or topic in RELATIVE_TOPICS:
         return "relative/partner"
-    text = utterance.casefold()
-    if any(marker in text for marker in RELATIVE_UTTERANCE_MARKERS):
+    text = _normalize_audience_text(utterance)
+    if any(_contains_builder_marker(text, marker) for marker in RELATIVE_UTTERANCE_MARKERS):
         return "relative/partner"
-    if _has_first_person_singular(text) or any(marker in text for marker in SELF_UTTERANCE_MARKERS):
+    if _has_first_person_singular(text) or any(
+        _contains_builder_marker(text, marker) for marker in SELF_UTTERANCE_MARKERS
+    ):
         return "self"
     return "general"
 
@@ -1440,24 +1484,107 @@ def _check_audience_evidence(
 ) -> None:
     """Validate a stored oracle audience against independent review evidence.
 
-    This must stay independent of the builder helper ``_audience_for`` (used
-    by :func:`build_projections` to assign oracle audiences): it justifies
-    the stored label from visible topic/journey assignments and utterance
-    markers instead of recomputing the builder heuristic, so a systematic
-    builder misclassification of self vs relative/partner vs general cannot
-    validate against itself.
+    This validator is intentionally decoupled from the builder helper
+    ``_audience_for`` (used by :func:`build_projections` to assign oracle
+    audiences). It does not call the builder, does not read the builder's
+    ``RELATIVE_*``/``SELF_*`` tables and does not reuse its first-person
+    helper: the audit tables below are separately maintained from the
+    reviewed topic/journey taxonomy and the frozen corpus review, and the
+    audit matcher is implemented locally with word-boundary handling. A
+    systematic builder misclassification of self vs relative/partner vs
+    general therefore cannot validate against itself; it surfaces here as a
+    stored-label contradiction.
     """
-    if journey in RELATIVE_JOURNEYS or topic in RELATIVE_TOPICS:
+    # Independently maintained audit taxonomy (reviewed assignments, not
+    # builder references; keep in sync with the corpus review, never import
+    # the builder tables above).
+    audit_relative_journeys = frozenset(
+        {
+            "relative_boundaries",
+            "relative_secret_medication",
+            "family_member_emergency",
+            "partner_trust",
+            "family_conflict_self",
+            "family_blame_to_agency",
+        }
+    )
+    audit_relative_topics = frozenset({"relative_help", "partner_conflict"})
+    audit_relative_markers = (
+        "муж",
+        "жена",
+        "жены",
+        "мужа",
+        "жене",
+        "жену",
+        "партнер",
+        "партнёр",
+        "близк",
+        "родствен",
+        "родные",
+        "мама",
+        "мать",
+        "отец",
+        "папа",
+        "сын",
+        "дочь",
+        "дочк",
+        "семья",
+        "семьи",
+        "семье",
+        "семью",
+        "семей",
+        "тайно",
+    )
+    audit_self_markers = (
+        "мне",
+        "меня",
+        "мой",
+        "моя",
+        "мою",
+        "мною",
+        "мной",
+        "себе",
+        "себя",
+        "сам",
+        "хочу",
+        "могу",
+        "боюсь",
+        "у меня",
+        "со мной",
+        "пью",
+        "пил",
+        "выпил",
+        "выпью",
+        "выпивки",
+        "напиться",
+        "запой",
+        "непью",
+        "не пью",
+        "сорвал",
+    )
+
+    def _audit_normalize(text: str) -> str:
+        return text.casefold().replace("ё", "е")
+
+    def _audit_found(text_normalized: str, marker: str) -> bool:
+        # Word-start matching implemented locally (no builder helper reuse):
+        # the marker must open a word so ``мать`` cannot match inside
+        # ``думать``/``поймать``/``понимать``, ``меня`` inside ``поменять``,
+        # ``мой`` inside ``домой`` or ``пил`` inside ``накопились``.
+        marker_norm = marker.casefold().replace("ё", "е")
+        return re.compile(r"(?<!\w)" + re.escape(marker_norm)).search(text_normalized) is not None
+
+    if journey in audit_relative_journeys or topic in audit_relative_topics:
         if audience != "relative/partner":
             raise RuRealWorldCorpusError(
                 f"{owner}: audience {audience!r} contradicts reviewed "
                 f"relative topic/journey (topic={topic!r} journey={journey!r})"
             )
         return
-    text = utterance.casefold()
-    has_relative = any(marker in text for marker in RELATIVE_UTTERANCE_MARKERS)
-    has_self = _has_first_person_singular(text) or any(
-        marker in text for marker in SELF_UTTERANCE_MARKERS
+    text = _audit_normalize(utterance)
+    has_relative = any(_audit_found(text, marker) for marker in audit_relative_markers)
+    has_self = re.compile(r"(?<!\w)я(?!\w)").search(text) is not None or any(
+        _audit_found(text, marker) for marker in audit_self_markers
     )
     if has_relative:
         if audience != "relative/partner":
