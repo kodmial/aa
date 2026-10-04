@@ -1,0 +1,24 @@
+{
+  "format": "aa-public-embedding-lock/1",
+  "model_id": "intfloat/multilingual-e5-base",
+  "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+  "sha": "d128750597153bb5987e10b1c3493a34e5a4502a",
+  "required_files": [
+    "config.json",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors"
+  ],
+  "policy": {
+    "public_only": true,
+    "never_cache": [
+      "corpus text",
+      "retrieval indexes",
+      "secrets",
+      "Telegram/user state",
+      "decrypted artifacts"
+    ]
+  }
+}
