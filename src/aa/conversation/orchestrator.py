@@ -943,6 +943,8 @@ def build_synthesis_prompt(
         f"не более {QUOTE_BUDGET_CHARS} символов.",
         generation_budget_instruction(budget),
     ]
+    if repair:
+        lines.extend(["", "ИСПРАВЛЕНИЕ (обязательно):", repair])
     if is_bulk_reproduction_request(user_text) or is_continuation_request(user_text):
         lines.append(
             "Просьба пользователя касается выдачи главы/большого куска или "
@@ -956,8 +958,6 @@ def build_synthesis_prompt(
         lines.append(
             f"[{provenance.source_id}/{provenance.section_id}#{provenance.chunk_id}] {unit.text}"
         )
-    if repair:
-        lines.extend(["", "ИСПРАВЛЕНИЕ: предыдущий ответ содержал неподтверждённые места.", repair])
     lines.extend(["", "ВОПРОС ПОЛЬЗОВАТЕЛЯ:", user_text])
     return "\n".join(lines)
 

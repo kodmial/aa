@@ -31,6 +31,7 @@ from aa.telegram.transport import (
     PollingTelegramTransport,
     StubTelegramTransport,
     TelegramApiError,
+    TelegramEnvelopeError,
     TelegramIncoming,
     TelegramReply,
     TelegramTransport,
@@ -205,13 +206,24 @@ class Application:
             reply = _TEMPORARY_ERROR_REPLY
         try:
             await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
-        except TelegramApiError:
+        except TelegramEnvelopeError:
             logger.warning(
                 "telegram outbound reply blocked by envelope guard",
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
-            await self.transport.send(
-                TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
+            try:
+                await self.transport.send(
+                    TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
+                )
+            except TelegramApiError:
+                logger.warning(
+                    "telegram fallback reply delivery failed",
+                    extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+                )
+        except TelegramApiError:
+            logger.warning(
+                "telegram outbound send failed",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
 
     async def _send_grounded_message(self, session_id: str, text: str) -> str:

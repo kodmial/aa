@@ -61,7 +61,7 @@ def _check_outbound_envelope(text: str) -> None:
             "quoted": result["quoted"],
         },
     )
-    raise TelegramApiError(f"telegram reply exceeds output envelope [{result['category']}]")
+    raise TelegramEnvelopeError(f"telegram reply exceeds output envelope [{result['category']}]")
 
 
 SUPPORTED_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -77,6 +77,10 @@ RECOGNIZED_COMMANDS = frozenset({"start", "new"})
 
 class TelegramApiError(Exception):
     """Transient or permanent Telegram Bot API failure."""
+
+
+class TelegramEnvelopeError(TelegramApiError):
+    """Outbound reply blocked by the hard envelope guard (no network I/O)."""
 
 
 class TelegramAuthError(TelegramApiError):
