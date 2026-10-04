@@ -1149,6 +1149,38 @@ def _check_sources_shape(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return by_id
 
 
+def _check_provenance_diversity(
+    by_source_id: dict[str, dict[str, Any]], referenced: set[str]
+) -> None:
+    """Require provenance diversity beyond a single Q&A source.
+
+    Every referenced id already resolves locally and every source is used;
+    this additionally requires multiple source kinds with at least two
+    non-dominant sources actually referenced, so the 15-source claim stays
+    mechanically enforced.
+    """
+    kinds = [str(entry.get("kind")) for entry in by_source_id.values()]
+    distinct = set(kinds)
+    if len(distinct) < 3:
+        raise RuRealWorldCorpusError(
+            f"provenance must span at least 3 source kinds, got {sorted(distinct)}"
+        )
+    dominant = max(distinct, key=kinds.count)
+    non_dominant = [sid for sid, e in by_source_id.items() if str(e.get("kind")) != dominant]
+    if len(non_dominant) < 2:
+        raise RuRealWorldCorpusError("provenance must include at least 2 non-dominant sources")
+    referenced_non_dominant = [sid for sid in non_dominant if sid in referenced]
+    if len(referenced_non_dominant) < 2:
+        raise RuRealWorldCorpusError(
+            "provenance diversity unverified: fewer than 2 non-dominant sources referenced"
+        )
+    referenced_kinds = {str(by_source_id[sid].get("kind")) for sid in referenced}
+    if len(referenced_kinds) < 2:
+        raise RuRealWorldCorpusError(
+            f"referenced provenance must span at least 2 kinds, got {sorted(referenced_kinds)}"
+        )
+
+
 def _check_review_semantics(
     oracle_singles: list[Any],
     oracle_journeys: list[Any],
@@ -1247,6 +1279,39 @@ def classifiers(classification: Any) -> str:
     return ",".join(getattr(item, "value", str(item)) for item in categories)
 
 
+def _canonical_corpus_id(raw: str) -> str:
+    """Canonicalize a corpus id for near-duplicate detection.
+
+    Sequential ids such as ``RU-S-001``/``RU-S-002`` must stay distinct;
+    only ids that collide after case/whitespace/separator/zero-padding
+    normalization (``RU-S-001`` vs ``ru-s-001`` vs ``RU-S-01``) count as
+    near-duplicates.
+    """
+    text = raw.strip().casefold().replace("_", "-").replace(" ", "-")
+    while "--" in text:
+        text = text.replace("--", "-")
+    parts: list[str] = []
+    for part in text.split("-"):
+        if part.isdigit():
+            parts.append(str(int(part)))
+        else:
+            match = re.match(r"^([a-z]+)0+(\d+)$", part)
+            parts.append(f"{match.group(1)}{match.group(2)}" if match else part)
+    return "-".join(parts)
+
+
+def _check_near_duplicate_ids(ids: list[str], owner: str) -> None:
+    """Reject distinct raw ids that share a canonical form."""
+    seen: dict[str, str] = {}
+    for raw in ids:
+        canonical = _canonical_corpus_id(raw)
+        first = seen.get(canonical)
+        if first is None:
+            seen[canonical] = raw
+        elif first != raw:
+            raise RuRealWorldCorpusError(f"{owner}: near-duplicate ids {first!r} and {raw!r}")
+
+
 def _check_dedup_input(input_singles: list[Any], input_journeys: list[Any]) -> None:
     seen_ids: set[str] = set()
     for record in (*input_singles, *input_journeys):
@@ -1256,6 +1321,7 @@ def _check_dedup_input(input_singles: list[Any], input_journeys: list[Any]) -> N
         if record_id in seen_ids:
             raise RuRealWorldCorpusError(f"duplicate id {record_id!r}")
         seen_ids.add(record_id)
+    _check_near_duplicate_ids(sorted(seen_ids), "input")
     seen_utterances: dict[str, str] = {}
     for record in input_singles:
         if not isinstance(record, dict):
@@ -1473,6 +1539,10 @@ def _check_cross_ids(
                 f"{input_record['id']}: oracle/input turn mismatch: "
                 f"input {input_user_turns} vs oracle {oracle_turns}"
             )
+    _check_near_duplicate_ids(
+        [str(r["id"]) for r in (*oracle_singles, *oracle_journeys)],
+        "oracle",
+    )
 
 
 def validate(root: Path | None = None) -> CorpusSummary:
@@ -1588,6 +1658,7 @@ def validate(root: Path | None = None) -> CorpusSummary:
     unreferenced = sorted(set(by_source_id) - referenced)
     if unreferenced:
         raise RuRealWorldCorpusError(f"unreferenced source ids: {unreferenced}")
+    _check_provenance_diversity(by_source_id, referenced)
     total = len(input_singles) + substantive
     if total != EXPECTED_TOTAL_SUBSTANTIVE:
         raise RuRealWorldCorpusError(

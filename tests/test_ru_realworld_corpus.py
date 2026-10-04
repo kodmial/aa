@@ -391,3 +391,31 @@ def test_stable_version_checksum_matches_validated_corpus() -> None:
 
 def test_validation_is_deterministic() -> None:
     assert validate(_root()) == validate(_root())
+
+
+def test_near_duplicate_ids_fail() -> None:
+    from aa.qualification.ru_realworld import _check_near_duplicate_ids
+
+    with pytest.raises(RuRealWorldCorpusError):
+        _check_near_duplicate_ids(["RU-S-001", "ru-s-001"], "input")
+    with pytest.raises(RuRealWorldCorpusError):
+        _check_near_duplicate_ids(["RU-S-001", "RU-S-01"], "oracle")
+    # Sequential ids remain distinct.
+    _check_near_duplicate_ids(["RU-S-001", "RU-S-002", "RU-J-001"], "input")
+
+
+def test_provenance_diversity_beyond_single_qna_source() -> None:
+    from aa.qualification.ru_realworld import _check_provenance_diversity, load_sources
+
+    root = _root()
+    payload = load_sources(root / SOURCES_REL)
+    by_id = {str(e["id"]): e for e in payload["sources"]}
+    kinds = {str(e["kind"]) for e in payload["sources"]}
+    assert len(payload["sources"]) == 15
+    assert len(kinds) >= 3
+    _, oracle_singles, oracle_journeys = load_oracle(root / ORACLE_REL)
+    referenced = {i for r in oracle_singles for i in r["provenance_ids"]}
+    for r in oracle_journeys:
+        referenced.update(r["provenance_ids"])
+    assert referenced == set(by_id)
+    _check_provenance_diversity(by_id, referenced)
