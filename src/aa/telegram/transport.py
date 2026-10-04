@@ -106,6 +106,14 @@ class TelegramReply:
 
 
 @dataclass(frozen=True)
+class TelegramVoiceReply:
+    """An outbound voice reply carrying OGG/Opus bytes for ``sendVoice``."""
+
+    chat_id: int
+    voice_bytes: bytes
+
+
+@dataclass(frozen=True)
 class VoiceAttachment:
     """A Telegram voice note reference (audio fetched separately)."""
 
@@ -213,6 +221,11 @@ class TelegramTransport(ABC):
         """Queue or deliver an outbound reply."""
         raise NotImplementedError
 
+    @abstractmethod
+    async def send_voice(self, reply: TelegramVoiceReply) -> None:
+        """Deliver one OGG/Opus voice reply via ``sendVoice``."""
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def running(self) -> bool:
@@ -226,6 +239,7 @@ class StubTelegramTransport(TelegramTransport):
     def __init__(self) -> None:
         self._running = False
         self.sent: list[TelegramReply] = []
+        self.sent_voices: list[TelegramVoiceReply] = []
 
     async def start(self) -> None:
         self._running = True
@@ -236,6 +250,15 @@ class StubTelegramTransport(TelegramTransport):
     async def send(self, reply: TelegramReply) -> None:
         _check_outbound_envelope(reply.text)
         self.sent.append(reply)
+
+    async def send_voice(self, reply: TelegramVoiceReply) -> None:
+        if not reply.voice_bytes:
+            raise TelegramApiError("telegram voice payload is empty")
+        self.sent_voices.append(reply)
+        logger.info(
+            "telegram voice message sent",
+            extra={"chat_id": reply.chat_id, "byte_len": len(reply.voice_bytes)},
+        )
 
     @property
     def running(self) -> bool:
@@ -252,6 +275,10 @@ class TelegramApi(ABC):
 
     async def download_file(self, file_path: str) -> bytes:
         """Download file content for a ``getFile`` path (voice notes)."""
+        raise NotImplementedError
+
+    async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
+        """Send OGG/Opus bytes via ``sendVoice`` (multipart file upload)."""
         raise NotImplementedError
 
 
@@ -311,6 +338,50 @@ class UrllibTelegramApi(TelegramApi):
             raise _translate_http_error(exc) from exc
         except OSError as exc:
             raise TelegramApiError("telegram file download network error") from exc
+
+    async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
+        """Upload OGG/Opus bytes through ``sendVoice`` multipart."""
+        if not ogg_bytes:
+            raise TelegramApiError("telegram voice payload is empty")
+        return await asyncio.to_thread(self._send_voice_sync, chat_id, bytes(ogg_bytes))
+
+    def _send_voice_sync(self, chat_id: int, ogg_bytes: bytes) -> Any:
+        import uuid
+
+        boundary = f"----aa-voice-{uuid.uuid4().hex}"
+        url = f"{self._base_url}/bot{self._token}/sendVoice"
+        body = bytearray()
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+        body.extend(f"{chat_id}\r\n".encode())
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            b'Content-Disposition: form-data; name="voice"; '
+            b'filename="voice.ogg"\r\nContent-Type: audio/ogg\r\n\r\n'
+        )
+        body.extend(bytes(ogg_bytes))
+        body.extend(f"\r\n--{boundary}--\r\n".encode())
+        request = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise _translate_http_error(exc) from exc
+        except OSError as exc:
+            raise TelegramApiError("telegram sendVoice network error") from exc
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TelegramApiError("telegram sendVoice bad response") from exc
+        return _translate_envelope("sendVoice", envelope)
 
 
 def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
@@ -401,6 +472,7 @@ class PollingTelegramTransport(TelegramTransport):
         self._offset: int | None = None
         self._received: list[TelegramIncoming] = []
         self._sent: list[TelegramReply] = []
+        self._sent_voices: list[TelegramVoiceReply] = []
         self._bot_info: dict[str, Any] | None = None
         self._running = False
         self._poll_task: asyncio.Task[None] | None = None
@@ -425,6 +497,11 @@ class PollingTelegramTransport(TelegramTransport):
     def sent_messages(self) -> list[TelegramReply]:
         """Replies delivered via ``send`` (for tests)."""
         return list(self._sent)
+
+    @property
+    def sent_voices(self) -> list[TelegramVoiceReply]:
+        """Voice replies delivered via ``sendVoice`` (for tests)."""
+        return list(self._sent_voices)
 
     @property
     def bot_info(self) -> dict[str, Any] | None:
@@ -500,6 +577,47 @@ class PollingTelegramTransport(TelegramTransport):
         logger.info(
             "telegram message sent",
             extra={"chat_id": reply.chat_id, "text_len": len(reply.text)},
+        )
+
+    async def send_voice(self, reply: TelegramVoiceReply) -> None:
+        """Deliver one OGG/Opus voice reply via ``sendVoice``.
+
+        Only sizes are logged, never audio content. Retries are bounded
+        like text sends; an empty payload fails closed without network
+        I/O so the caller can fall back to text.
+        """
+        if not reply.voice_bytes:
+            raise TelegramApiError("telegram voice payload is empty")
+        payload_bytes = bytes(reply.voice_bytes)
+        attempt = 0
+        while True:
+            try:
+                try:
+                    await self._api.send_voice(reply.chat_id, payload_bytes)
+                except NotImplementedError as exc:
+                    raise TelegramApiError("telegram voice send is not supported") from exc
+                break
+            except TelegramAuthError:
+                raise
+            except (TelegramApiError, TimeoutError, OSError) as exc:
+                attempt += 1
+                if attempt > self._max_send_retries:
+                    logger.warning(
+                        "telegram voice send failed",
+                        extra={"chat_id": reply.chat_id, "attempts": attempt},
+                    )
+                    raise
+                delay = self._backoff_delay(attempt)
+                logger.info(
+                    "telegram voice send retrying",
+                    extra={"chat_id": reply.chat_id, "attempt": attempt, "delay": delay},
+                )
+                await asyncio.sleep(delay)
+                _ = exc
+        self._sent_voices.append(reply)
+        logger.info(
+            "telegram voice message sent",
+            extra={"chat_id": reply.chat_id, "byte_len": len(payload_bytes)},
         )
 
     async def fetch_voice_bytes(self, file_id: str) -> bytes:

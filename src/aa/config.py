@@ -99,6 +99,11 @@ class Settings:
     # per worker; voice capability fails closed when unavailable.
     aa_voice_model_dir: str = "./models/gigaam"
 
+    # Local Russian TTS replies (issue #77): filesystem path holding the
+    # pinned Silero ``v5_5_ru`` model file. The synthesizer is loaded once
+    # per worker; voice replies fall back to text when unavailable.
+    aa_tts_model_path: str = "./models/tts/v5_5_ru.pt"
+
     # Logging.
     log_level: str = "INFO"
 
@@ -121,6 +126,7 @@ class Settings:
             "MAX_CONCURRENT_TURNS",
             "PER_CHAT_QUEUE_SIZE",
             "AA_VOICE_MODEL_DIR",
+            "AA_TTS_MODEL_PATH",
             "LOG_LEVEL",
         ),
         compare=False,
@@ -154,6 +160,7 @@ class Settings:
                     source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
                 ),
                 aa_voice_model_dir=_get_str("AA_VOICE_MODEL_DIR", "./models/gigaam"),
+                aa_tts_model_path=_get_str("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
                 log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             )
         return cls(
@@ -178,6 +185,7 @@ class Settings:
                 source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
             ),
             aa_voice_model_dir=source.get("AA_VOICE_MODEL_DIR", "./models/gigaam"),
+            aa_tts_model_path=source.get("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -212,6 +220,8 @@ class Settings:
             raise ValueError("PER_CHAT_QUEUE_SIZE must be > 0")
         if not self.aa_voice_model_dir.strip():
             raise ValueError("AA_VOICE_MODEL_DIR must not be empty")
+        if not self.aa_tts_model_path.strip():
+            raise ValueError("AA_TTS_MODEL_PATH must not be empty")
         if require_bot_token and not self.has_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required but missing or empty")
 
@@ -235,5 +245,6 @@ class Settings:
             "max_concurrent_turns": self.max_concurrent_turns,
             "per_chat_queue_size": self.per_chat_queue_size,
             "aa_voice_model_dir": self.aa_voice_model_dir,
+            "aa_tts_model_path": self.aa_tts_model_path,
             "log_level": self.log_level,
         }
