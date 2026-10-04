@@ -22,3 +22,4 @@ jobs:
     with:
       continuum_ref: main
       watched_workflow: "OpenCode agent"
+      max_recovery_retries: "3"

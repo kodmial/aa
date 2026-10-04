@@ -145,7 +145,7 @@ jobs:
       blocked_label: "${{ inputs.blocked_label }}"
       post_pause_comment: "${{ inputs.post_pause_comment }}"
       reset_markers: "${{ inputs.reset_markers }}"
-      require_priority_label: "${{ inputs.require_priority_label }}"
+      require_priority_label: "${{ inputs.require_priority_label || 'true' }}"
       command_grace_minutes: "${{ inputs.command_grace_minutes }}"
       child_owned_marker: "${{ inputs.child_owned_marker }}"
       legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
