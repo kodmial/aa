@@ -1,0 +1,30 @@
+{
+  "schema_version": "voice-asr-perf-v1",
+  "model_repo": "fussraider/GigaAM-Multilingual-sherpa-onnx-ctc",
+  "model_revision": "9f5a77e8975211abe8511693accd3a63ee1e9f43",
+  "model_file": "large/model.int8.onnx",
+  "tokens_file": "large/tokens.txt",
+  "sherpa_onnx_version": "1.13.8",
+  "installed_sherpa_onnx_version": "1.13.8",
+  "sample_rate_hz": 16000,
+  "feature_dim": 64,
+  "num_threads": 4,
+  "cpu_inference_only": true,
+  "model_bytes": 591645642,
+  "tokens_bytes": 391,
+  "audio_duration_seconds": 10.0,
+  "cold_load_seconds": 29.418607514999962,
+  "warm_asr_latency_seconds": 0.5881876089999878,
+  "warm_latencies_seconds": [
+    0.5899084260000791,
+    0.5823254260000112,
+    0.5881876089999878
+  ],
+  "real_time_factor": 0.05881876089999878,
+  "peak_rss_mb": 786.76953125,
+  "ffmpeg_version": "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers",
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "measured_at": "2026-10-04T19:10:42.810137+00:00",
+  "runner": "ubuntu-latest-equivalent"
+}

@@ -94,6 +94,11 @@ class Settings:
     max_concurrent_turns: int = DEFAULT_MAX_CONCURRENT_TURNS
     per_chat_queue_size: int = DEFAULT_PER_CHAT_QUEUE_SIZE
 
+    # Local Russian voice recognition (issue #76): filesystem directory
+    # holding the pinned GigaAM model files. The recognizer is loaded once
+    # per worker; voice capability fails closed when unavailable.
+    aa_voice_model_dir: str = "./models/gigaam"
+
     # Logging.
     log_level: str = "INFO"
 
@@ -115,6 +120,7 @@ class Settings:
             "OPENCODE_MAX_OUTPUT_TOKENS",
             "MAX_CONCURRENT_TURNS",
             "PER_CHAT_QUEUE_SIZE",
+            "AA_VOICE_MODEL_DIR",
             "LOG_LEVEL",
         ),
         compare=False,
@@ -147,6 +153,7 @@ class Settings:
                 per_chat_queue_size=int(
                     source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
                 ),
+                aa_voice_model_dir=_get_str("AA_VOICE_MODEL_DIR", "./models/gigaam"),
                 log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             )
         return cls(
@@ -170,6 +177,7 @@ class Settings:
             per_chat_queue_size=int(
                 source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
             ),
+            aa_voice_model_dir=source.get("AA_VOICE_MODEL_DIR", "./models/gigaam"),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -202,6 +210,8 @@ class Settings:
             raise ValueError("MAX_CONCURRENT_TURNS must be > 0")
         if self.per_chat_queue_size <= 0:
             raise ValueError("PER_CHAT_QUEUE_SIZE must be > 0")
+        if not self.aa_voice_model_dir.strip():
+            raise ValueError("AA_VOICE_MODEL_DIR must not be empty")
         if require_bot_token and not self.has_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required but missing or empty")
 
@@ -224,5 +234,6 @@ class Settings:
             "opencode_max_output_tokens": self.opencode_max_output_tokens,
             "max_concurrent_turns": self.max_concurrent_turns,
             "per_chat_queue_size": self.per_chat_queue_size,
+            "aa_voice_model_dir": self.aa_voice_model_dir,
             "log_level": self.log_level,
         }

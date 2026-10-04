@@ -15,7 +15,9 @@ from aa.telegram.transport import (
     TelegramTransport,
     TelegramUpdate,
     UrllibTelegramApi,
+    VoiceAttachment,
     parse_command,
+    parse_update,
 )
 
 __all__ = [
@@ -32,5 +34,7 @@ __all__ = [
     "TelegramTransport",
     "TelegramUpdate",
     "UrllibTelegramApi",
+    "VoiceAttachment",
     "parse_command",
+    "parse_update",
 ]
