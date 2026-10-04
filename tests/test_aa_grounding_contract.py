@@ -99,6 +99,12 @@ def test_opencode_config_binds_named_aa_agent() -> None:
     assert permission["*"] == "deny"
     for tool in ("book_search", "book_read", "book_expand", "book_section"):
         assert permission[tool] == "allow"
+    assert {k for k, v in permission.items() if v == "allow"} == {
+        "book_search",
+        "book_read",
+        "book_expand",
+        "book_section",
+    }
 
 
 def test_runtime_defaults_match_model_policy() -> None:
