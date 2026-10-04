@@ -1158,8 +1158,20 @@ def validate_files_do_not_mutate_main(paths: list[str]) -> None:
         "scripts",
         "qualification",
         ".github",
+        "docs",
     )
-    protected_files = ("pyproject.toml", "main")
+    protected_files = (
+        "pyproject.toml",
+        "main",
+        "README.md",
+        "AGENTS.md",
+        "LICENSE",
+        "opencode.json",
+        ".continuum.yml",
+        ".env.example",
+        ".gitignore",
+    )
+    ephemeral_roots = ("eval-out", "eval-in", "tmp")
     for path in paths:
         normalized = path.strip()
         while normalized.startswith("./"):
@@ -1172,6 +1184,16 @@ def validate_files_do_not_mutate_main(paths: list[str]) -> None:
             if normalized == directory or normalized.startswith(directory + "/"):
                 raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
         if normalized in protected_files:
+            raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
+        # Denylists alone cannot enumerate every present or future root
+        # file (README.md, AGENTS.md, LICENSE, ...): any top-level file
+        # lives on production main, so fail closed except for the known
+        # ephemeral benchmark output roots.
+        if "/" not in normalized and normalized not in ephemeral_roots:
+            raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
+        # Any dotfile/dot-directory at any depth is a repo control path
+        # (.github/, .continuum.yml, .env.example, ...), never benchmark output.
+        if normalized.startswith(".") or "/." in normalized:
             raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
 
 

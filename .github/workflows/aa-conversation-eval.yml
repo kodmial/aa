@@ -532,8 +532,8 @@ jobs:
   # compact manifest outside main, and post the canonical #62 marker.
   # Main is revalidated at publication time: a moved main yields stale.
   merge-publish:
-    needs: [readiness, shards]
-    if: needs.readiness.outputs.proceed == 'true'
+    needs: [readiness, validate, shards]
+    if: always() && needs.readiness.outputs.proceed == 'true' && needs.validate.result == 'success' && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
