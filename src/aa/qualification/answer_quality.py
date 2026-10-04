@@ -130,7 +130,7 @@ _DIAGNOSIS_PATTERNS = (
     r"definitive\s+diagnosis",
 )
 
-_QUOTE_SPAN_RE = re.compile(r"[«\"“]([^«»\"“]{20,}?)[»\"”]")
+_QUOTE_SPAN_RE = re.compile(r"[«\"“]([^«»\"“]+?)[»\"”]")
 
 _FORBIDDEN_JUDGE_KEYS = frozenset(
     {
@@ -462,8 +462,17 @@ def check_locator_authentic(ctx: HardCheckContext) -> HardCheckResult:
     for locator in ctx.evidence_locators:
         if locator in ctx.valid_locators:
             continue
-        source_id = locator.split("#")[0] if "#" in locator else locator
-        if source_id in known_sources:
+        # Fragment locators (source#fragment) must match the qualified index
+        # exactly: a known source id alone never authenticates a fragment, so
+        # fabricated fragments such as ``cal-src-01#ch99-fake`` fail closed.
+        if "#" in locator:
+            return HardCheckResult(
+                "locator_authentic",
+                False,
+                f"fabricated locator/source: {locator!r}",
+                "evidence-pack",
+            )
+        if locator in known_sources:
             continue
         return HardCheckResult(
             "locator_authentic",
@@ -902,6 +911,7 @@ def grade_turn(
             evidence_snippets=dict(ctx.source_texts),
             evidence_locators=list(ctx.evidence_locators),
         )
+        assert_judge_evidence_clean(evidence)
         scores = judge_fn(evidence)
     else:
         scores = score_provisional(

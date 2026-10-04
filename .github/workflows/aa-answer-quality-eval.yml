@@ -152,6 +152,8 @@ jobs:
               const runId = ((context.payload.inputs && context.payload.inputs.benchmark_run_id) || '').trim();
               const requestedSha = ((context.payload.inputs && context.payload.inputs.benchmark_sha) || '').trim();
               if (!runId) { noop('manual dispatch without benchmark_run_id'); return; }
+              const tupleForDispatch = await latestCompleteTuple();
+              if (tupleForDispatch && runId !== tupleForDispatch.run) { noop('manual benchmark_run_id is not the trusted #62 COMPLETE run'); return; }
               let rubricSha;
               try { rubricSha = await boundRubricSha(); }
               catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
@@ -192,9 +194,10 @@ jobs:
                 return;
               }
               core.setOutput('proceed', 'true');
+              if (`${run.id}` !== tuple.run) { noop(`benchmark marker not yet posted for run ${run.id}`); return; }
               core.setOutput('tested_sha', tuple.sha);
               core.setOutput('corpus_sha', tuple.corpus);
-              core.setOutput('benchmark_run_id', `${run.id}`);
+              core.setOutput('benchmark_run_id', tuple.run);
               core.setOutput('rubric_sha', rubricSha);
               core.setOutput('evaluator_model', '');
               core.setOutput('reason', `ready: benchmark run ${run.id} completed for sha=${tuple.sha}`);
