@@ -339,7 +339,7 @@ def build_hybrid_index(
     )
 
     vectors, backend_name, used_dim = _embed_backend_vectors(texts, backend=backend, dim=dim)
-    dense_index = ExactIPIndex.build(chunk_ids, vectors)
+    dense_index = ExactIPIndex.build(chunk_ids, vectors, backend=backend_name)
     dense_payload = {
         "format": "aa-dense-vectors/1",
         "backend": backend_name,
@@ -497,7 +497,17 @@ def open_hybrid_index(
     if [str(item) for item in dense_ids] != list(chunks):
         raise HybridIndexError("dense vector ids do not match indexed chunks")
     vectors: list[list[float]] = [[float(value) for value in row] for row in dense_vectors]
-    dense_index = ExactIPIndex.build([str(item) for item in dense_ids], vectors)
+    dense_backend = str(
+        dense_payload.get("backend", metadata.get("embedding_backend", HASHING_BACKEND_NAME))
+    )
+    if dense_backend != str(metadata.get("embedding_backend", dense_backend)):
+        raise HybridIndexError("dense backend does not match index metadata")
+    try:
+        dense_index = ExactIPIndex.build(
+            [str(item) for item in dense_ids], vectors, backend=dense_backend
+        )
+    except DenseError as exc:
+        raise HybridIndexError(str(exc)) from exc
 
     lexical_path = directory_path / LEXICAL_DB_NAME
     if not lexical_path.is_file():

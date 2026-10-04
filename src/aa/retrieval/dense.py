@@ -162,6 +162,15 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
     return vectors
 
 
+def _normalize_backend_name(backend: str) -> str:
+    """Map short/long backend names to the canonical stored backend name."""
+    if backend == "hashing" or backend == HASHING_BACKEND_NAME:
+        return HASHING_BACKEND_NAME
+    if backend == "e5" or backend == E5_BACKEND_NAME:
+        return E5_BACKEND_NAME
+    raise DenseError(f"unknown embedding backend: {backend!r}")
+
+
 @dataclass
 class ExactIPIndex:
     """Exact inner-product index with Faiss-compatible semantics.
@@ -176,10 +185,14 @@ class ExactIPIndex:
     vectors: list[list[float]]
     use_faiss: bool = False
     _faiss_index: object = None
+    backend: str = HASHING_BACKEND_NAME
 
     @classmethod
-    def build(cls, ids: list[str], vectors: list[list[float]]) -> ExactIPIndex:
+    def build(
+        cls, ids: list[str], vectors: list[list[float]], *, backend: str = HASHING_BACKEND_NAME
+    ) -> ExactIPIndex:
         """Build the index (validates normalization and uniqueness)."""
+        normalized_backend = _normalize_backend_name(backend)
         if not ids:
             raise DenseError("refusing to build an empty dense index")
         if len(ids) != len(vectors):
@@ -218,6 +231,7 @@ class ExactIPIndex:
             vectors=[list(v) for v in vectors],
             use_faiss=use_faiss,
             _faiss_index=faiss_index,
+            backend=normalized_backend,
         )
 
     def search(self, query: list[float], *, top_k: int) -> list[tuple[str, float]]:
@@ -252,8 +266,26 @@ class ExactIPIndex:
         return scored[:top_k]
 
     def search_text(
-        self, text: str, *, top_k: int, embed: str = "hashing"
+        self, text: str, *, top_k: int, embed: str | None = None
     ) -> list[tuple[str, float]]:
-        """Embed ``text`` with the hashing backend and search the index."""
-        del embed
-        return self.search(hashing_embed(text, dim=self.dim), top_k=top_k)
+        """Embed ``text`` with the index backend and search the index.
+
+        ``embed`` selects the query backend (``None`` means the index
+        backend; ``"hashing"``/``"e5"`` or the full backend names are
+        also accepted). A request that does not match the index backend
+        is rejected instead of silently ranking across backends.
+        """
+        requested = self.backend if embed is None else _normalize_backend_name(embed)
+        if requested != self.backend:
+            raise DenseError(
+                f"query backend {requested!r} does not match index backend {self.backend!r}"
+            )
+        if requested == HASHING_BACKEND_NAME:
+            return self.search(hashing_embed(text, dim=self.dim), top_k=top_k)
+        if requested == E5_BACKEND_NAME:
+            vectors = e5_embed(["query: " + text])
+            query = l2_normalize(vectors[0])
+            if len(query) != self.dim:
+                raise DenseError("e5 query dimension does not match the index")
+            return self.search(query, top_k=top_k)
+        raise DenseError(f"unsupported index embedding backend: {requested!r}")
