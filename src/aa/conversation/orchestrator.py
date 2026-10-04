@@ -1169,6 +1169,8 @@ async def send_with_fallback(
             )
         except TurnFailed:
             raise
+        except OpenCodeSessionNotFoundError:
+            raise
         except OpenCodeError as exc:
             raise TurnFailed("synthesis-failed", _classify_send_error(exc)) from exc
     raise TurnFailed("synthesis-failed", "synthesis produced no result")
