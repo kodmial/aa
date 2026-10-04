@@ -743,6 +743,10 @@ def load_exact_evidence(
                     source_checksum=str(locator.get("text_sha256", "")),
                     source_language="ru",
                 )
+                try:
+                    provenance.validate()
+                except ValueError as exc:
+                    raise TurnFailed("evidence-provenance", str(exc)) from exc
                 seen.add(chunk_id)
                 collected.append(
                     EvidenceUnit(
@@ -892,7 +896,7 @@ def _quote_kind_for_unit(unit: AnswerUnit, pack: EvidencePack) -> QuoteKind:
         for match in _QUOTED_SPAN_RE.findall(unit.text):
             if match.strip() and match.strip() in evidence.text:
                 return QuoteKind.EXACT_SOURCE
-    return QuoteKind.EXACT_SOURCE
+    return QuoteKind.TRANSLATION
 
 
 def _resolve_cited(
@@ -919,10 +923,10 @@ def judge_unit(
 ) -> tuple[bool, bool, QuoteKind, tuple[str, ...]]:
     """Judge one answer unit; return ``(passed, source_exact, kind, cited)``."""
     if not unit.substantive:
-        return True, False, QuoteKind.EXACT_SOURCE, ()
+        return True, False, QuoteKind.TRANSLATION, ()
     provenances, cited_units = _resolve_cited(unit.citations, pack)
     if not provenances:
-        return False, False, QuoteKind.EXACT_SOURCE, ()
+        return False, False, QuoteKind.TRANSLATION, ()
     quoted = _CITATION_RE.sub("", unit.text).strip()
     kind = _quote_kind_for_unit(unit, pack)
     # Citations are provenance pointers, not claim content: semantic support
@@ -1077,7 +1081,14 @@ async def send_with_fallback(
         except OpenCodeSessionNotFoundError:
             raise
         except OpenCodeError as exc:
-            raise TurnFailed("synthesis-failed", _classify_send_error(exc)) from exc
+            category = _classify_send_error(exc)
+            if category in ("provider-429", "provider-transient", "provider-unavailable"):
+                last_error = OpenCodeTransientError(str(exc))
+                retry_count = attempt
+                if attempt < MAX_SEND_ATTEMPTS:
+                    await sleeper(SEND_RETRY_DELAYS[min(attempt - 1, len(SEND_RETRY_DELAYS) - 1)])
+                    continue
+            raise TurnFailed("synthesis-failed", category) from exc
     if last_error is not None:
         try:
             text = await send(session_id, prompt, agent=agent, model=fallback_model)
