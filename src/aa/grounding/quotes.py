@@ -109,7 +109,7 @@ class EvidenceUnit:
 
 def contains_translation_label(text: str) -> bool:
     """Return whether ``text`` carries an explicit translation label."""
-    return "перевод" in text.lower()
+    return TRANSLATION_MARKER_RU in text
 
 
 def format_russian_quotation(
