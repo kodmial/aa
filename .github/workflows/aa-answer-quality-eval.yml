@@ -18,6 +18,10 @@ on:
         description: "Exact main SHA graded (defaults to the trusted #62 COMPLETE SHA)"
         required: false
         type: string
+      benchmark_artifact_sha:
+        description: "Expected 64-hex SHA-256 of the encrypted benchmark artifact (binds the exact tuple at readiness)"
+        required: false
+        type: string
       evaluator_model:
         description: "Independent evaluator model id (empty keeps provisional heuristic)"
         required: false
@@ -50,10 +54,10 @@ concurrency:
 jobs:
   # Lightweight readiness gate (read-only). Every automatic wake-up refetches
   # #62/#63/#73, binds the frozen rubric by checksum, and no-ops unless a new
-  # verified #62 COMPLETE tuple (SHA + corpus) still lacks a #63 result for
-  # the current rubric. Closing #73 still triggers grading of a trusted #62
-  # artifact that predates this evaluator workflow (catch-up path together
-  # with the push trigger above).
+  # verified #62 COMPLETE tuple (SHA + corpus + artifact) still lacks a #63
+  # result for the current rubric. Closing #73 still triggers grading of a
+  # trusted #62 artifact that predates this evaluator workflow (catch-up
+  # path together with the push trigger above).
   readiness:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -65,9 +69,12 @@ jobs:
       proceed: ${{ steps.gate.outputs.proceed }}
       tested_sha: ${{ steps.gate.outputs.tested_sha }}
       corpus_sha: ${{ steps.gate.outputs.corpus_sha }}
+      artifact_sha: ${{ steps.gate.outputs.artifact_sha }}
       benchmark_run_id: ${{ steps.gate.outputs.benchmark_run_id }}
       rubric_sha: ${{ steps.gate.outputs.rubric_sha }}
       evaluator_model: ${{ steps.gate.outputs.evaluator_model }}
+      expected_generator_model: ${{ steps.gate.outputs.expected_generator_model }}
+      expected_runtime_version: ${{ steps.gate.outputs.expected_runtime_version }}
       reason: ${{ steps.gate.outputs.reason }}
     steps:
       - name: Revalidate evaluator state and decide
@@ -82,9 +89,12 @@ jobs:
               core.setOutput('proceed', 'false');
               core.setOutput('tested_sha', '');
               core.setOutput('corpus_sha', '');
+              core.setOutput('artifact_sha', '');
               core.setOutput('benchmark_run_id', '');
               core.setOutput('rubric_sha', '');
               core.setOutput('evaluator_model', '');
+              core.setOutput('expected_generator_model', '');
+              core.setOutput('expected_runtime_version', '');
               core.setOutput('reason', reason);
               core.notice(`aa-answer-quality-eval no-op: ${reason}`);
             }
@@ -139,12 +149,44 @@ jobs:
               }
               return tuple;
             }
-            // Whether an identical SHA+corpus tuple already has a #63 result
-            // under the current rubric: grade exactly once, stale duplicate
-            // workflow events no-op.
-            async function alreadyGraded(sha, corpus, rubricSha) {
+            // Trusted generator/runtime identity for one benchmark run, read
+            // from the compact manifest the benchmark workflow persisted on
+            // the qualification-results branch (keyed by SHA+corpus+run).
+            // Best-effort: runs predating that persistence carry no external
+            // identity, so grading falls back to in-artifact consistency
+            // checks instead of failing closed here.
+            async function trustedBenchmarkIdentity(sha, corpus, run) {
+              try {
+                const manifestPath = `aa-conversation-eval/sha=${sha}/corpus=${corpus}/run=${run}/compact-manifest.json`;
+                const { data } = await github.rest.repos.getContent({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: manifestPath, ref: 'qualification-results',
+                });
+                const manifest = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+                const generatorModel = (manifest.primary_model || '').trim();
+                const runtimeVersion = (manifest.runtime_version || '').trim();
+                if (!generatorModel || !runtimeVersion) {
+                  return { generatorModel: '', runtimeVersion: '' };
+                }
+                return { generatorModel, runtimeVersion };
+              } catch (error) {
+                core.notice(`trusted benchmark identity unavailable: ${error.message}`);
+                return { generatorModel: '', runtimeVersion: '' };
+              }
+            }
+            // Whether an identical SHA+corpus+artifact tuple already has a
+            // #63 result under the current rubric: grade exactly once, stale
+            // duplicate workflow events no-op. The artifact checksum (m[3])
+            // is part of the key: a rotated benchmark artifact for the same
+            // SHA and corpus is a new tuple and must be graded. When the
+            // candidate artifact checksum is unknown (automatic triggers),
+            // no match is claimed and grading proceeds; the publish step
+            // then enforces exactly-once on the full tuple.
+            async function alreadyGraded(sha, corpus, artifactSha, rubricSha) {
               const markers = await trustedComments(63, QUALITY_RE);
-              return markers.some((m) => m[1] === sha && m[2] === corpus && m[4] === rubricSha);
+              return markers.some(
+                (m) => m[1] === sha && m[2] === corpus && m[3] === artifactSha && m[4] === rubricSha,
+              );
             }
             const eventName = context.eventName;
             const dispatchModel = ((context.payload.inputs && context.payload.inputs.evaluator_model) || '').trim();
@@ -164,16 +206,25 @@ jobs:
                 noop('manual benchmark_sha is not the trusted #62 COMPLETE SHA');
                 return;
               }
-              if (await alreadyGraded(testedSha, tuple.corpus, rubricSha)) {
-                noop(`identical tuple already has a #63 result (sha=${testedSha})`);
+              const requestedArtifact = ((context.payload.inputs && context.payload.inputs.benchmark_artifact_sha) || '').trim();
+              const candidateArtifact = /^[0-9a-f]{64}$/.test(requestedArtifact) ? requestedArtifact : '';
+              if (requestedArtifact && !candidateArtifact) {
+                core.notice('manual benchmark_artifact_sha is malformed; grading proceeds without a readiness artifact binding');
+              }
+              if (await alreadyGraded(testedSha, tuple.corpus, candidateArtifact, rubricSha)) {
+                noop(`identical tuple already has a #63 result (sha=${testedSha} artifact=${candidateArtifact.slice(0, 16)}…)`);
                 return;
               }
+              const dispatchIdentity = await trustedBenchmarkIdentity(testedSha, tuple.corpus, tuple.run);
               core.setOutput('proceed', 'true');
               core.setOutput('tested_sha', testedSha);
               core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('artifact_sha', candidateArtifact);
               core.setOutput('benchmark_run_id', runId);
               core.setOutput('rubric_sha', rubricSha);
               core.setOutput('evaluator_model', dispatchModel);
+              core.setOutput('expected_generator_model', dispatchIdentity.generatorModel);
+              core.setOutput('expected_runtime_version', dispatchIdentity.runtimeVersion);
               core.setOutput('reason', `ready: manual dispatch for #62 COMPLETE sha=${testedSha}`);
               core.notice(`aa-answer-quality-eval ready at ${testedSha}.`);
               return;
@@ -189,17 +240,21 @@ jobs:
               catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
               const tuple = await latestCompleteTuple();
               if (!tuple) { noop('no trusted #62 COMPLETE tuple after benchmark run'); return; }
-              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+              if (await alreadyGraded(tuple.sha, tuple.corpus, '', rubricSha)) {
                 noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
                 return;
               }
               core.setOutput('proceed', 'true');
               if (`${run.id}` !== tuple.run) { noop(`benchmark marker not yet posted for run ${run.id}`); return; }
+              const runIdentity = await trustedBenchmarkIdentity(tuple.sha, tuple.corpus, tuple.run);
               core.setOutput('tested_sha', tuple.sha);
               core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('artifact_sha', '');
               core.setOutput('benchmark_run_id', tuple.run);
               core.setOutput('rubric_sha', rubricSha);
               core.setOutput('evaluator_model', '');
+              core.setOutput('expected_generator_model', runIdentity.generatorModel);
+              core.setOutput('expected_runtime_version', runIdentity.runtimeVersion);
               core.setOutput('reason', `ready: benchmark run ${run.id} completed for sha=${tuple.sha}`);
               core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
               return;
@@ -224,16 +279,20 @@ jobs:
               catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
               const tuple = await latestCompleteTuple();
               if (!tuple) { noop('no trusted #62 COMPLETE tuple to grade'); return; }
-              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+              if (await alreadyGraded(tuple.sha, tuple.corpus, '', rubricSha)) {
                 noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
                 return;
               }
+              const issueIdentity = await trustedBenchmarkIdentity(tuple.sha, tuple.corpus, tuple.run);
               core.setOutput('proceed', 'true');
               core.setOutput('tested_sha', tuple.sha);
               core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('artifact_sha', '');
               core.setOutput('benchmark_run_id', tuple.run);
               core.setOutput('rubric_sha', rubricSha);
               core.setOutput('evaluator_model', '');
+              core.setOutput('expected_generator_model', issueIdentity.generatorModel);
+              core.setOutput('expected_runtime_version', issueIdentity.runtimeVersion);
               core.setOutput('reason', `ready: #${issueNumber} closure grades trusted #62 COMPLETE sha=${tuple.sha}`);
               core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
               return;
@@ -249,16 +308,20 @@ jobs:
               catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
               const tuple = await latestCompleteTuple();
               if (!tuple) { noop('no trusted #62 COMPLETE tuple to grade'); return; }
-              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+              if (await alreadyGraded(tuple.sha, tuple.corpus, '', rubricSha)) {
                 noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
                 return;
               }
+              const pushIdentity = await trustedBenchmarkIdentity(tuple.sha, tuple.corpus, tuple.run);
               core.setOutput('proceed', 'true');
               core.setOutput('tested_sha', tuple.sha);
               core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('artifact_sha', '');
               core.setOutput('benchmark_run_id', tuple.run);
               core.setOutput('rubric_sha', rubricSha);
               core.setOutput('evaluator_model', '');
+              core.setOutput('expected_generator_model', pushIdentity.generatorModel);
+              core.setOutput('expected_runtime_version', pushIdentity.runtimeVersion);
               core.setOutput('reason', `ready: evaluator push catch-up grades trusted #62 COMPLETE sha=${tuple.sha}`);
               core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
               return;
@@ -318,6 +381,8 @@ jobs:
           EXPECTED_CORPUS: ${{ needs.readiness.outputs.corpus_sha }}
           EXPECTED_RUBRIC: ${{ needs.readiness.outputs.rubric_sha }}
           EVALUATOR_MODEL: ${{ needs.readiness.outputs.evaluator_model }}
+          EXPECTED_GENERATOR_MODEL: ${{ needs.readiness.outputs.expected_generator_model }}
+          EXPECTED_RUNTIME_VERSION: ${{ needs.readiness.outputs.expected_runtime_version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -382,6 +447,10 @@ jobs:
           manifest_corpus = str(compact.get("corpus_input_sha256", ""))
           if manifest_corpus != expected_corpus:
               raise AnswerQualityError("benchmark corpus checksum does not match #62 tuple")
+          # Generator/runtime identity recorded by the benchmark run itself.
+          manifest_primary = str(compact.get("primary_model", "")).strip()
+          manifest_fallback = str(compact.get("fallback_model", "")).strip()
+          manifest_runtime = str(compact.get("runtime_version", "")).strip()
 
           # Completeness manifest: every frozen case id must have a clean
           # primary-model turn row; provider/infrastructure fallout makes the
@@ -427,6 +496,10 @@ jobs:
               expected_artifact_sha=recorded,
               completeness_ok=completeness_ok,
               completeness_reason=completeness_reason,
+              generator_model=manifest_primary,
+              expected_generator_model=os.environ.get("EXPECTED_GENERATOR_MODEL", "").strip(),
+              runtime_version=manifest_runtime,
+              expected_runtime_version=os.environ.get("EXPECTED_RUNTIME_VERSION", "").strip(),
           )
           if verdict.verdict == "rejected":
               raise AnswerQualityError(f"artifact rejected: {'; '.join(verdict.reasons)}")
@@ -470,6 +543,22 @@ jobs:
           turns = full.get("turns", [])
           if not isinstance(turns, list) or not turns:
               raise AnswerQualityError("trusted artifact holds no turns")
+          # Generator identity binding: every graded turn must be attributed
+          # to the generator recorded in the trusted compact manifest. A
+          # mixed-generator (or unattributed) transcript fails closed instead
+          # of grading under a single benchmark tuple.
+          if manifest_primary:
+              observed_models = {
+                  str(entry.get("primary_model", "")).strip()
+                  for entry in turns
+                  if isinstance(entry, dict)
+              }
+              known_models = {manifest_primary, manifest_fallback} - {""}
+              if not observed_models or "" in observed_models or not observed_models <= known_models:
+                  raise AnswerQualityError(
+                      "benchmark transcript generator identity does not match "
+                      "the trusted compact manifest"
+                  )
           grades = []
           for entry in turns:
               oracle = oracle_by_case.get(str(entry.get("case_id", "")), {})
@@ -579,7 +668,7 @@ jobs:
                 const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
                 if (!isTrusted) continue;
                 const m = (c.body || '').match(qualityRe);
-                if (m && m[1] === testedSha && m[2] === corpus && m[4] === rubric) {
+                if (m && m[1] === testedSha && m[2] === corpus && m[3] === artifact && m[4] === rubric) {
                   duplicate = true;
                   break;
                 }
@@ -727,9 +816,9 @@ jobs:
             const existing = new Set();
             const blockedMatch = (cap.data.body || '').match(blockedRe);
             if (blockedMatch) {
-              for (const token of blockedMatch[1].split(/[,\\s]+/)) {
+              for (const token of blockedMatch[1].split(/[,\s]+/)) {
                 const cleaned = token.replace(/^#/, '');
-                if (/^\\d+$/.test(cleaned)) existing.add(Number(cleaned));
+                if (/^\d+$/.test(cleaned)) existing.add(Number(cleaned));
               }
             }
             for (const n of blockerNumbers) existing.add(n);

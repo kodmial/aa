@@ -127,6 +127,8 @@ def run_transcript(
     expected_artifact_sha: str = "",
     completeness_ok: bool = False,
     completeness_reason: str = "completeness not verified",
+    expected_generator_model: str = "",
+    expected_runtime_version: str = "",
 ) -> dict[str, object]:
     """Grade a decrypted transcript and write result + clusters (no bodies on stdout)."""
     rubric_sha = verify_rubric_bound()
@@ -138,13 +140,36 @@ def run_transcript(
     sources = payload.get("source_texts", {})
     if not isinstance(sources, dict):
         raise AnswerQualityError("transcript source_texts must be an object")
-    calibration_for_locators = load_calibration()
-    trusted_valid = calibration_for_locators.get("valid_locators", [])
-    if not isinstance(trusted_valid, list) or not all(
-        isinstance(item, str) for item in trusted_valid
-    ):
-        raise AnswerQualityError("trusted valid_locators index is malformed")
-    valid_locators = frozenset(str(item) for item in trusted_valid)
+    # Locator authenticity is judged against the qualified RU source index
+    # shipped inside the benchmark transcript itself (the same index the
+    # workflow grading job restores from the canonical RU corpus), never the
+    # synthetic calibration index: genuine book locators must resolve here.
+    valid_locators = frozenset(str(key) for key in sources.keys()) if sources else frozenset()
+    # Generator/runtime identity recorded by the benchmark artifact itself.
+    identity = payload.get("eval_identity", {})
+    if not isinstance(identity, dict):
+        identity = {}
+    actual_generator = str(
+        identity.get("primary_model")
+        or identity.get("generator_model")
+        or payload.get("generator_model")
+        or ""
+    ).strip()
+    actual_runtime = str(
+        identity.get("runtime_version") or payload.get("runtime_version") or ""
+    ).strip()
+    if not actual_generator:
+        observed = {
+            str(entry.get("primary_model", "")).strip()
+            for entry in turns
+            if isinstance(entry, dict) and str(entry.get("primary_model", "")).strip()
+        }
+        if len(observed) > 1:
+            raise AnswerQualityError(
+                "transcript mixes generator models; refusing to grade unattributed tuple"
+            )
+        if len(observed) == 1:
+            actual_generator = next(iter(observed))
     grades = []
     for entry in turns:
         if not isinstance(entry, dict):
@@ -196,6 +221,10 @@ def run_transcript(
         expected_artifact_sha=expected_artifact_sha,
         completeness_ok=completeness_ok,
         completeness_reason=completeness_reason,
+        generator_model=actual_generator,
+        expected_generator_model=expected_generator_model,
+        runtime_version=actual_runtime,
+        expected_runtime_version=expected_runtime_version,
     )
     if verdict.verdict == "rejected":
         raise AnswerQualityError(f"refusing to grade rejected artifact: {verdict.reasons}")
@@ -271,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-artifact-sha", default="")
     parser.add_argument("--completeness-ok", action="store_true")
     parser.add_argument("--completeness-reason", default="completeness not verified")
+    parser.add_argument("--expected-generator-model", default="")
+    parser.add_argument("--expected-runtime-version", default="")
     args = parser.parse_args(argv)
     if args.calibration:
         summary = run_calibration(
@@ -295,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
             expected_artifact_sha=args.expected_artifact_sha,
             completeness_ok=bool(args.completeness_ok),
             completeness_reason=args.completeness_reason,
+            expected_generator_model=args.expected_generator_model,
+            expected_runtime_version=args.expected_runtime_version,
         )
         return 0
     print("error: pass --calibration or --transcript PATH", file=sys.stderr)
