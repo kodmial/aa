@@ -114,6 +114,47 @@ _TRIVIAL_NORMALIZED = frozenset(
     }
 )
 
+_FOLLOWUP_INTERROGATIVES = (
+    "почему",
+    "зачем",
+    "отчего",
+    "откуда",
+    "куда",
+    "где",
+    "когда",
+    "сколько",
+    "какой",
+    "какая",
+    "какое",
+    "какие",
+    "какого",
+    "что ",
+    "что?",
+    "как ",
+    "как?",
+    "а дальше",
+    "а еще",
+    "а ещ",
+    "а потом",
+    "и дальше",
+    "и потом",
+    "что дальше",
+    "ну и",
+    "и что",
+    "расскажи",
+    "продолж",
+    "поясни",
+    "объясни",
+    "уточни",
+    "поподробн",
+    "правда",
+    "серьезн",
+    "why",
+    "what",
+    "how",
+    "really",
+)
+
 _SUBSTANTIVE_KEYWORDS = (
     "книг",
     "книж",
@@ -352,8 +393,9 @@ def is_substantive(text: str) -> bool:
     """Return whether ``text`` needs the full grounded pipeline.
 
     Empty text is not substantive (the safety layer blocks it first).
-    Short greetings/thanks without book keywords bypass retrieval;
-    everything else takes the full state machine.
+    Exact trivial greetings/thanks bypass retrieval; short follow-up
+    questions and interrogatives (``почему?``, ``а дальше?``) always
+    take the full state machine so no substantive turn skips grounding.
     """
     stripped = text.strip()
     if not stripped:
@@ -361,6 +403,12 @@ def is_substantive(text: str) -> bool:
     normalized = normalize_ru(stripped)
     if normalized in _TRIVIAL_NORMALIZED:
         return False
+    if " ".join(ru_tokens(stripped)) in _TRIVIAL_NORMALIZED:
+        return False
+    if "?" in stripped or "？" in stripped:
+        return True
+    if any(marker in normalized for marker in _FOLLOWUP_INTERROGATIVES):
+        return True
     if len(normalized) <= 24 and not any(key in normalized for key in _SUBSTANTIVE_KEYWORDS):
         return False
     return True
@@ -882,10 +930,17 @@ def _significant_tokens(text: str) -> set[str]:
 
 
 def _is_substantive_unit(text: str) -> bool:
+    """Return whether an answer fragment needs semantic grounding.
+
+    Fail closed: every fragment carrying any alphanumeric claim text --
+    including short factual or imperative claims -- is substantive and
+    must pass citation/entailment validation. Only empty,
+    citation-only, or punctuation-only scaffolding is boilerplate.
+    """
     cleaned = _CITATION_RE.sub("", text).strip()
-    if len(cleaned) < 20:
+    if not cleaned:
         return False
-    return len(_significant_tokens(cleaned)) >= 2
+    return any(ch.isalnum() for ch in cleaned)
 
 
 def _quote_kind_for_unit(unit: AnswerUnit, pack: EvidencePack) -> QuoteKind:
