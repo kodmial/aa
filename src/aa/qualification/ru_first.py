@@ -47,6 +47,11 @@ DECISION_REL = "qualification/ru_first_retrieval.v1.decision.json"
 BENCHMARK_VERSION = "ru-first-retrieval-benchmark/1"
 DECISION_FORMAT = "ru-first-retrieval-decision/1"
 PRODUCTION_CONFIG_VERSION = "ru-first-production-v1"
+ALLOWED_PRODUCTION_CONFIG_IDS = (
+    "ru-first-only",
+    "ru-first-plus-en-secondary",
+    "blocked",
+)
 
 RECALL_KS = (1, 5, 12)
 QUALITY_GATE_RECALL_AT_5 = 0.80
@@ -525,7 +530,16 @@ def _planner_cost_tokens(case: GoldCase) -> int:
 def _false_strengthening(case: GoldCase) -> bool:
     """Return True when planner text strengthens a forbidden inference."""
     haystack = f"{case.planner_meaning} {' '.join(case.plan_queries_ru)}".casefold()
-    return any(item.casefold() in haystack for item in case.forbidden_inferences)
+    for item in case.forbidden_inferences:
+        tag = item.casefold().strip()
+        if tag.startswith("do_not_"):
+            tag = tag[len("do_not_") :]
+        keywords = [part for part in tag.replace("-", "_").split("_") if part]
+        if keywords and all(word in haystack for word in keywords):
+            return True
+        if tag.replace("_", " ") in haystack:
+            return True
+    return False
 
 
 def _evidence_tokens(index: HybridIndex, logical_ids: tuple[str, ...]) -> int:
@@ -607,6 +621,24 @@ def run_fixture_b(
     base = _summarize_hits(index, case, ru_hits, elapsed_ms=elapsed_ms, top_k=top_k)
     merged_sections = tuple(sections)
     merged_logicals = tuple(logicals)
+    # Branch accounting must reflect the merged list: RU prefix keeps its
+    # lexical/dense provenance, EN-mapped tail counts as dense-assisted
+    # discovery so B branch-contribution rates do not silently mirror A.
+    lexical_only = 0
+    dense_only = 0
+    both_branches = 0
+    for hit in ru_hits[:keep_ru]:
+        has_lex = hit.lexical_rank is not None
+        has_dense = hit.dense_rank is not None
+        if has_lex and has_dense:
+            both_branches += 1
+        elif has_lex:
+            lexical_only += 1
+        elif has_dense:
+            dense_only += 1
+    en_added = sum(1 for chunk_id in extra_ids if chunk_id in index.chunks)
+    dense_only += en_added
+    duplicates = len(merged_logicals) - len(set(merged_logicals))
     return FixtureResult(
         case_id=case.case_id,
         hit_sections=merged_sections,
@@ -616,10 +648,10 @@ def run_fixture_b(
         recall_hit_at_12=_hit_at(merged_sections, case, 12),
         coverage_found=sum(1 for item in case.relevant_sections if item in merged_sections),
         coverage_total=len(case.relevant_sections),
-        lexical_only=base.lexical_only,
-        dense_only=base.dense_only,
-        both_branches=base.both_branches,
-        duplicates=base.duplicates,
+        lexical_only=lexical_only,
+        dense_only=dense_only,
+        both_branches=both_branches,
+        duplicates=duplicates,
         latency_ms=elapsed_ms,
         planner_cost_tokens=base.planner_cost_tokens,
         evidence_tokens=_evidence_tokens(index, merged_logicals),
@@ -1136,6 +1168,20 @@ def validate_decision_payload(payload: object, *, repo_root: Path) -> None:
     production = payload.get("production")
     if not isinstance(production, dict) or not production.get("config_id"):
         raise RuFirstError("decision artifact must carry a production configuration")
+    config_id = production.get("config_id")
+    if not isinstance(config_id, str) or not config_id.strip():
+        raise RuFirstError("decision artifact must carry a production configuration")
+    normalized_config_id = config_id.strip()
+    if "legacy" in normalized_config_id.lower():
+        raise RuFirstError(
+            "legacy RU-to-EN-only is benchmark/control only and cannot become "
+            "the production default"
+        )
+    if normalized_config_id not in ALLOWED_PRODUCTION_CONFIG_IDS:
+        raise RuFirstError(
+            f"production config_id {normalized_config_id!r} is not an allowed "
+            "RU-first production configuration"
+        )
     if production.get("evidence_language") != "ru":
         raise RuFirstError("production evidence language must be ru")
     quality_gate_payload = payload.get("quality_gate")
