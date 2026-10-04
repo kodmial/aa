@@ -109,7 +109,11 @@ class CorpusStructure:
         if node.kind != "chunk":
             raise CorpusStructureError(f"not a retrieval chunk: {chunk_id!r}")
         section = corpus.get(node.section_id)
+        if node.char_end > len(section.text):
+            raise CorpusStructureError(f"chunk offsets out of range: {chunk_id!r}")
         text = section.text[node.char_start : node.char_end]
+        if len(text) != node.char_end - node.char_start:
+            raise CorpusStructureError(f"chunk resolves to truncated text: {chunk_id!r}")
         if not text.strip():
             raise CorpusStructureError(f"chunk resolves to blank text: {chunk_id!r}")
         return text
@@ -258,12 +262,20 @@ def load_structure(path: str | Path) -> CorpusStructure:
         raise CorpusStructureError(f"section order mismatch: {section_ids!r}")
     structure.section_ids = section_ids
 
-    # Neighbor links must be reciprocal.
+    # Neighbor links must be reciprocal and ordered.
     for node in nodes.values():
         if node.prev_id is not None and nodes[node.prev_id].next_id != node.id:
             raise CorpusStructureError(f"node {node.id!r} has a broken prev link")
         if node.next_id is not None and nodes[node.next_id].prev_id != node.id:
             raise CorpusStructureError(f"node {node.id!r} has a broken next link")
+        if node.prev_id is not None:
+            prev = nodes[node.prev_id]
+            if prev.section_id == node.section_id and prev.char_end > node.char_start:
+                raise CorpusStructureError(f"node {node.id!r} overlaps its prev neighbor")
+        if node.next_id is not None:
+            nxt = nodes[node.next_id]
+            if nxt.section_id == node.section_id and node.char_end > nxt.char_start:
+                raise CorpusStructureError(f"node {node.id!r} overlaps its next neighbor")
 
     # Provenance: every node pins the canonical version checksum.
     for node in nodes.values():
