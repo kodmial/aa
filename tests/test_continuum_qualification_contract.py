@@ -46,8 +46,10 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
 
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
-    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
-    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
+    assert '"${{ inputs.max_dispatch_attempts }}"' in body
+    assert '"${{ inputs.pause_on_failure }}"' in body
+    assert "inputs.max_dispatch_attempts ||" not in body
+    assert "inputs.pause_on_failure ||" not in body
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
