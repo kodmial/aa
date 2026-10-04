@@ -282,7 +282,7 @@ async def test_app_respond_maps_grounding_failure_to_ru_fail_closed() -> None:
     await app.start()
     try:
 
-        async def _leaking_grounded(_session_id: str, _text: str) -> str:
+        async def _leaking_grounded(_session_id: str, _text: str, **_kw: object) -> str:
             return OBSERVED_EN_FALLBACK
 
         app._run_grounded_turn = _leaking_grounded  # type: ignore[assignment]
@@ -302,7 +302,7 @@ async def test_app_respond_maps_trivial_english_leak_to_ru_fail_closed() -> None
     await app.start()
     try:
 
-        async def _leaking_trivial(_session_id: str, _text: str) -> str:
+        async def _leaking_trivial(_session_id: str, _text: str, **_kw: object) -> str:
             return "Could not process the message. Please try again."
 
         app._run_trivial_turn = _leaking_trivial  # type: ignore[assignment]

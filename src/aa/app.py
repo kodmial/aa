@@ -48,6 +48,16 @@ from aa.telegram.transport import (
     TelegramIncoming,
     TelegramReply,
     TelegramTransport,
+    TelegramVoiceReply,
+)
+from aa.telegram.tts import (
+    DEFAULT_VOICE,
+    FfmpegOpusEncoder,
+    SileroSynthesizer,
+    TtsError,
+    TtsPipeline,
+    build_tts_pipeline,
+    resolve_tts_voice,
 )
 from aa.telegram.voice import (
     FfmpegDecoder,
@@ -81,6 +91,7 @@ class Application:
         controller: RuntimeController | None = None,
         grounding: GroundingGate | None = None,
         voice_pipeline: VoicePipeline | None = None,
+        tts_pipeline: TtsPipeline | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
@@ -116,6 +127,10 @@ class Application:
         # reused for all turns. ``None`` means the voice capability is
         # unavailable; the text poller is unaffected.
         self._voice_pipeline: VoicePipeline | None = voice_pipeline
+        # Local TTS replies (issue #77): Silero loaded once per worker and
+        # reused. ``None`` means voice replies fall back to text; the
+        # text poller is unaffected.
+        self._tts_pipeline: TtsPipeline | None = tts_pipeline
         self._running = False
         # Transport/orchestration only: the dispatcher calls the production
         # #9 turn orchestrator via ``respond`` and never creates another
@@ -139,6 +154,14 @@ class Application:
         if pipeline is None or pipeline.recognizer is None:
             return False
         return pipeline.recognizer.available
+
+    @property
+    def tts_available(self) -> bool:
+        """Whether local TTS voice replies are ready for voice turns."""
+        pipeline = self._tts_pipeline
+        if pipeline is None:
+            return False
+        return pipeline.synthesizer.available
 
     async def _init_voice_capability(self) -> None:
         """Load the pinned GigaAM recognizer once; fail voice-only on error."""
@@ -176,6 +199,32 @@ class Application:
         )
         logger.info("voice capability ready", extra={"injected": False})
 
+    async def _init_tts_capability(self) -> None:
+        """Load the pinned Silero synthesizer once; fallback to text on error."""
+        if self._tts_pipeline is not None:
+            logger.info("tts capability ready", extra={"injected": True})
+            return
+        if not isinstance(self.transport, PollingTelegramTransport):
+            logger.info("tts capability disabled without polling transport")
+            return
+        if not self.settings.telegram_bot_token:
+            logger.info("tts capability disabled without bot token")
+            return
+        try:
+            synthesizer = SileroSynthesizer(Path(self.settings.aa_tts_model_path))
+            await asyncio.to_thread(synthesizer.ensure_loaded)
+        except TtsError as exc:
+            logger.warning("tts capability disabled", extra={"category": exc.category})
+            return
+        except Exception:
+            logger.warning("tts capability disabled", extra={"category": "tts-unavailable"})
+            return
+        self._tts_pipeline = build_tts_pipeline(
+            synthesizer=synthesizer,
+            encoder=FfmpegOpusEncoder(),
+        )
+        logger.info("tts capability ready", extra={"injected": False})
+
     async def start(self) -> None:
         """Start all components in dependency order.
 
@@ -198,6 +247,9 @@ class Application:
             # Voice capability loads once here and is reused for all turns.
             # Initialization failure disables voice only, never the poller.
             await self._init_voice_capability()
+            # TTS capability loads once here and is reused for voice replies.
+            # Initialization failure falls back to text, never the poller.
+            await self._init_tts_capability()
             await self.transport.start()
             # Start the requested fixed 5h window only after the poller
             # is live and all dependencies have completed bootstrap.
@@ -392,7 +444,14 @@ class Application:
     async def _respond_and_deliver(
         self, incoming: TelegramIncoming, *, text: str, voice_input: bool
     ) -> None:
-        """Run :meth:`respond` for one turn and deliver exactly one reply."""
+        """Run :meth:`respond` for one turn and deliver exactly one reply.
+
+        Voice turns (``voice_input=True``) request voice output: the
+        already-generated answer is synthesized locally and delivered via
+        ``sendVoice``. Any TTS/encoding/delivery failure deterministically
+        falls back to the same answer as text; the response is never
+        dropped. Text turns always receive text output.
+        """
         self.sessions.record_message(incoming.chat_id)
         try:
             if voice_input:
@@ -415,7 +474,67 @@ class Application:
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
             reply = _TEMPORARY_ERROR_REPLY
+        if voice_input:
+            delivered = await self._send_voice_reply(incoming, reply)
+            if delivered:
+                return
         await self._send_text_reply(incoming, reply)
+
+    def _resolve_voice_for_turn(self) -> str:
+        """Resolve the TTS voice for one turn (issue #77 default).
+
+        Issue #78 will provide acoustic presentation routing; until then
+        every turn deterministically uses the default voice. Only
+        ``xenia``/``eugene`` are ever returned.
+        """
+        return resolve_tts_voice(None)
+
+    async def _send_voice_reply(self, incoming: TelegramIncoming, reply: str) -> bool:
+        """Synthesize and deliver one voice reply; ``False`` means fallback.
+
+        Returns ``True`` when the voice was delivered via ``sendVoice``.
+        Any TTS, encoding, or delivery failure logs only categories/sizes
+        and returns ``False`` so the caller sends the same answer as text.
+        """
+        pipeline = self._tts_pipeline
+        if pipeline is None or not self.tts_available:
+            logger.info("voice reply fallback to text", extra={"chat_id": incoming.chat_id})
+            return False
+        voice = self._resolve_voice_for_turn()
+        if voice not in (DEFAULT_VOICE, "eugene"):
+            voice = DEFAULT_VOICE
+        try:
+            ogg_bytes = await pipeline.synthesize_voice_ogg(reply, voice)
+        except TtsError as exc:
+            logger.warning(
+                "voice reply synthesis failed; fallback to text",
+                extra={"chat_id": incoming.chat_id, "category": exc.category},
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "voice reply synthesis failed; fallback to text",
+                extra={"chat_id": incoming.chat_id, "category": "tts-failed"},
+            )
+            return False
+        try:
+            await self.transport.send_voice(
+                TelegramVoiceReply(chat_id=incoming.chat_id, voice_bytes=ogg_bytes)
+            )
+        except (TelegramApiError, TelegramEnvelopeError):
+            logger.warning(
+                "voice reply delivery failed; fallback to text",
+                extra={"chat_id": incoming.chat_id},
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "voice reply delivery failed; fallback to text",
+                extra={"chat_id": incoming.chat_id},
+            )
+            return False
+        logger.info("voice reply delivered", extra={"chat_id": incoming.chat_id})
+        return True
 
     async def _send_text_reply(self, incoming: TelegramIncoming, reply: str) -> None:
         """Deliver one bounded text reply with envelope fallback handling."""
@@ -488,7 +607,9 @@ class Application:
             self._turn_runner = runner
         return runner
 
-    async def _run_trivial_turn(self, session_id: str, text: str) -> str:
+    async def _run_trivial_turn(
+        self, session_id: str, text: str, *, voice_mode: bool = False
+    ) -> str:
         """Execute the direct bounded agent path for one non-substantive turn."""
         client = self.opencode_runtime.client
 
@@ -509,10 +630,13 @@ class Application:
             agent=self.settings.opencode_agent,
             primary_model=self.settings.opencode_model,
             fallback_model=self.settings.opencode_fallback_model,
+            voice_mode=voice_mode,
         )
         return synthesis.text
 
-    async def _run_grounded_turn(self, session_id: str, text: str) -> str:
+    async def _run_grounded_turn(
+        self, session_id: str, text: str, *, voice_mode: bool = False
+    ) -> str:
         """Execute the production grounded pipeline for one substantive turn."""
         runner = self._get_turn_runner()
         if runner.index is None:
@@ -530,7 +654,9 @@ class Application:
             return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
 
         try:
-            response = await runner.run_grounded_turn(text, session_id=session_id, send=_send)
+            response = await runner.run_grounded_turn(
+                text, session_id=session_id, send=_send, voice_mode=voice_mode
+            )
         except TurnFailed as exc:
             if exc.category == "session-not-found":
                 raise
@@ -541,8 +667,11 @@ class Application:
         """Answer one inbound message with emergency precedence.
 
         ``voice_input`` marks turns transcribed from Telegram voice notes
-        for downstream voice-reply handling; the production turn boundary
-        is otherwise identical to text messages.
+        and requests voice output. Ordinary non-emergency voice turns use
+        the #77 concise voice mode (2-4 short sentences, at most 4
+        sentences / 80 words, enforced in generation with one compact
+        regeneration); emergency replies may exceed that bound. Text
+        turns always receive text output with the unchanged boundary.
 
         The deterministic safety layer runs first: when it takes the
         emergency route, the bounded safe reply is returned immediately
@@ -586,17 +715,22 @@ class Application:
         session_id = await self.sessions.ensure_opencode_session(
             chat_id, self.opencode_runtime.client
         )
+        voice_mode = bool(voice_input)
         try:
             if not is_substantive(text):
                 try:
-                    trivial_reply = await self._run_trivial_turn(session_id, text)
+                    trivial_reply = await self._run_trivial_turn(
+                        session_id, text, voice_mode=voice_mode
+                    )
                 except TurnFailed as exc:
                     if exc.category == "session-not-found":
                         try:
                             session_id = await self.sessions.reset_opencode_session(
                                 chat_id, self.opencode_runtime.client, delete_remote=False
                             )
-                            trivial_reply = await self._run_trivial_turn(session_id, text)
+                            trivial_reply = await self._run_trivial_turn(
+                                session_id, text, voice_mode=voice_mode
+                            )
                         except OpenCodeSessionNotFoundError as exc2:
                             raise TurnFailed(
                                 "session-not-found", "opencode session is gone"
@@ -612,14 +746,16 @@ class Application:
                 logger.info("trivial response served", extra={"chat_id": chat_id})
                 return self._fit_envelope(trivial_reply)
             try:
-                reply = await self._run_grounded_turn(session_id, text)
+                reply = await self._run_grounded_turn(session_id, text, voice_mode=voice_mode)
             except TurnFailed as exc:
                 if exc.category == "session-not-found":
                     try:
                         session_id = await self.sessions.reset_opencode_session(
                             chat_id, self.opencode_runtime.client, delete_remote=False
                         )
-                        reply = await self._run_grounded_turn(session_id, text)
+                        reply = await self._run_grounded_turn(
+                            session_id, text, voice_mode=voice_mode
+                        )
                     except OpenCodeSessionNotFoundError as exc2:
                         raise TurnFailed("session-not-found", "opencode session is gone") from exc2
                 else:
@@ -647,7 +783,9 @@ class Application:
                 return FAIL_CLOSED_REPLY
             if not is_substantive(text):
                 try:
-                    trivial_retry = await self._run_trivial_turn(session_id, text)
+                    trivial_retry = await self._run_trivial_turn(
+                        session_id, text, voice_mode=voice_mode
+                    )
                 except TurnFailed as exc:
                     logger.warning(
                         "trivial turn failed closed after rebind",
@@ -669,7 +807,7 @@ class Application:
                 logger.info("trivial response served", extra={"chat_id": chat_id})
                 return self._fit_envelope(trivial_retry)
             try:
-                reply = await self._run_grounded_turn(session_id, text)
+                reply = await self._run_grounded_turn(session_id, text, voice_mode=voice_mode)
             except TurnFailed as exc:
                 logger.warning(
                     "grounded turn failed closed after rebind",
