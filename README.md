@@ -18,22 +18,29 @@ sessions, failure taxonomy, persistence/recovery) is documented in
 
 ## Bounded live runtime
 
-Live/test sessions are controlled from repository issue **#31** with owner-only
-commands:
+Live/test sessions are controlled from repository issue **#31** with
+owner-only commands:
 
 ```text
-/bot start 15m
-/bot start 1h
-/bot start 2h
-/bot start 3h
+/run
 /bot stop
 /bot status
 ```
 
+One `/run` starts a single bounded manual-testing campaign: at most four
+fixed 5-hour runs (20 hours aggregate requested runtime) inside an
+unconditional 24-hour wall-clock window, with no automatic renewal or
+rollover. A repeated `/run` while a campaign is active is an idempotent
+no-op; a completed or expired campaign restarts only via a new `/run`.
+A repository-owned scheduled reconciler wakes every 30 minutes solely to
+continue an explicitly activated campaign and is a permanent no-op
+otherwise. Duplicate starts are rejected so only one poller can own the
+bot token.
+
 A start dispatches one bounded GitHub Actions job. The job bootstraps and
 validates the AA knowledge artifacts, starts the local OpenCode runtime, waits
 for readiness, starts Telegram long polling, and only then arms the requested
-15-minute/1-hour/2-hour/3-hour live window. Duplicate runtime starts are
+fixed 5-hour live window. Duplicate runtime starts are
 rejected so only one poller can own the bot token.
 
 Telegram uses outbound `getUpdates` long polling; there is no inbound web

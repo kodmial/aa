@@ -24,9 +24,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
-       !github.event.issue.pull_request &&
-       github.event.issue.number == 31 &&
-       github.actor == github.repository_owner)
+        !github.event.issue.pull_request &&
+        github.event.issue.number == 31 &&
+        github.actor == github.repository_owner)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -35,49 +35,32 @@ jobs:
         env:
           CONTROL_ISSUE: "31"
           DISPATCH_COMMAND: ${{ inputs.command }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
         with:
           github-token: ${{ github.token }}
           script: |
+            // Issue #6 campaign control: one owner `/run` on control issue #31
+            // starts a bounded manual-testing campaign (max 4 x 5h runtimes,
+            // 20h aggregate requested, unconditional 24h wall-clock expiry, no
+            // renewal or rollover). A repeated `/run` while a campaign is
+            // active is an idempotent no-op; a completed/expired/stopped
+            // campaign restarts only via a new owner `/run`. `/bot status`
+            // reports the authoritative run; `/bot stop` cancels it early and
+            // terminates the campaign. Comments carry ids/counters/durations
+            // only, never message text, prompts, corpus dumps or credentials.
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const controlIssue = Number(process.env.CONTROL_ISSUE);
-            const command = (
+            const rawCommand = (
               context.eventName === 'workflow_dispatch'
                 ? process.env.DISPATCH_COMMAND
                 : context.payload.comment?.body
             || '').trim();
 
-            if (!command.startsWith('/bot')) {
-              core.info('Not a bot control command; ignoring.');
-              return;
-            }
-
-            const start = command.match(/^\/bot start (15m|1h|2h|3h)$/);
-            const isStop = command === '/bot stop';
-            const isStatus = command === '/bot status';
-            if (!start && !isStop && !isStatus) {
-              if (context.eventName === 'issue_comment') {
-                await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number: controlIssue,
-                  body: 'Invalid command. Use `/bot start 15m|1h|2h|3h`, `/bot stop`, or `/bot status`.',
-                });
-              }
-              core.setFailed('Invalid AA runtime control command.');
-              return;
-            }
-
-            const { data } = await github.rest.actions.listWorkflowRuns({
-              owner,
-              repo,
-              workflow_id: 'aa-runtime.yml',
-              per_page: 100,
-            });
-            const active = data.workflow_runs.filter(
-              run => run.conclusion === null &&
-                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
-            );
+            const isRun = rawCommand === '/run';
+            const isStop = rawCommand === '/bot stop';
+            const isStatus = rawCommand === '/bot status';
+            const looksLikeCommand = rawCommand.startsWith('/run') || rawCommand.startsWith('/bot');
 
             const comment = async body => {
               if (context.eventName !== 'issue_comment') return;
@@ -89,66 +72,162 @@ jobs:
               });
             };
 
-            if (start) {
-              if (active.length) {
-                const run = active.sort((a, b) => a.id - b.id)[0];
+            if (!isRun && !isStop && !isStatus) {
+              if (looksLikeCommand && context.eventName === 'issue_comment') {
                 await comment(
-                  `Start rejected: AA runtime #${run.id} is already ${run.status}. Use /bot status or /bot stop.`
+                  'Invalid command. Use `/run` to start one bounded 5h-campaign run ' +
+                  '(max 4 starts / 20h requested / 24h wall clock), `/bot stop` to end ' +
+                  'the active runtime early, or `/bot status` for the authoritative state.'
+                );
+              } else {
+                core.info('Not a runtime control command; ignoring.');
+                return;
+              }
+              if (looksLikeCommand) core.setFailed('Invalid AA runtime control command.');
+              return;
+            }
+
+            const ACTIVE = ['queued', 'in_progress', 'waiting', 'requested', 'pending'];
+            const DAY_MS = 24 * 3600 * 1000;
+            const MAX_STARTS = 4;
+
+            const listAllComments = async () => {
+              const comments = [];
+              let page = 1;
+              for (;;) {
+                const { data } = await github.rest.issues.listComments({
+                  owner, repo, issue_number: controlIssue, per_page: 100, page,
+                });
+                comments.push(...data);
+                if (data.length < 100) break;
+                page += 1;
+              }
+              return comments;
+            };
+
+            const listRuntimeRuns = async () => {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'aa-runtime.yml', per_page: 100,
+              });
+              return data.workflow_runs;
+            };
+
+            // Re-read authoritative state immediately before deciding: owner
+            // /run epochs, owner /bot stop epochs, and committed runtime
+            // dispatches. A committed dispatch consumes one campaign start
+            // even when the run later fails or ends early.
+            const resolveCampaign = (comments, runs, nowMs) => {
+              const runTimes = comments
+                .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/run')
+                .map(c => Date.parse(c.created_at))
+                .filter(t => Number.isFinite(t))
+                .sort((a, b) => a - b);
+              const stopTimes = comments
+                .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/bot stop')
+                .map(c => Date.parse(c.created_at))
+                .filter(t => Number.isFinite(t));
+              const createdTimes = runs
+                .map(r => Date.parse(r.created_at))
+                .filter(t => Number.isFinite(t));
+              for (let i = 0; i < runTimes.length; i++) {
+                const candidate = runTimes[i];
+                const horizon = i + 1 < runTimes.length ? runTimes[i + 1] : null;
+                if (stopTimes.some(s => s > candidate && (horizon === null || s < horizon))) continue;
+                if (nowMs - candidate >= DAY_MS) continue;
+                if (createdTimes.filter(t => t > candidate).length >= MAX_STARTS) continue;
+                return candidate;
+              }
+              return null;
+            };
+
+            const activeRunsOf = runs =>
+              runs
+                .filter(r => r.conclusion === null && ACTIVE.includes(r.status))
+                .sort((a, b) => a.id - b.id);
+
+            const describeCampaign = (accepted, runs, active, nowMs) => {
+              const startsUsed = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+              const expiresInH = Math.max(0, (accepted + DAY_MS - nowMs) / 3600000).toFixed(1);
+              const runLines = active.length
+                ? active.map(r => `- #${r.id}: **${r.status}** — ${r.html_url}`).join('\n')
+                : '- none';
+              return [
+                `Active campaign: started ${new Date(accepted).toISOString()}, expires in ~${expiresInH}h.`,
+                `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).`,
+                `Active runtime:\n${runLines}`,
+              ].join('\n');
+            };
+
+            if (isStatus) {
+              const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
+              const active = activeRunsOf(runs);
+              const accepted = resolveCampaign(comments, runs, Date.now());
+              if (accepted === null) {
+                await comment(
+                  'No active campaign. Post `/run` (owner only) to start one bounded 5h run ' +
+                  '(max 4 starts / 20h requested / 24h wall clock).'
                 );
                 return;
               }
-
-              const duration = start[1];
-              await github.rest.actions.createWorkflowDispatch({
-                owner,
-                repo,
-                workflow_id: 'aa-runtime.yml',
-                ref: 'main',
-                inputs: { duration },
-              });
-
-              // Give GitHub a short moment to create the run so the operator
-              // gets an authoritative run id in the control issue.
-              await new Promise(resolve => setTimeout(resolve, 1500));
-              const latest = await github.rest.actions.listWorkflowRuns({
-                owner,
-                repo,
-                workflow_id: 'aa-runtime.yml',
-                event: 'workflow_dispatch',
-                per_page: 10,
-              });
-              const run = latest.data.workflow_runs[0];
-              await comment(
-                run
-                  ? `AA runtime start requested for **${duration}**. Run #${run.id}: ${run.html_url}`
-                  : `AA runtime start requested for **${duration}**.`
-              );
+              await comment(['AA campaign status (authoritative):', describeCampaign(accepted, runs, active, Date.now())].join('\n'));
               return;
             }
 
             if (isStop) {
+              const runs = await listRuntimeRuns();
+              const active = activeRunsOf(runs);
               if (!active.length) {
-                await comment('No active AA runtime.');
+                await comment('No active AA runtime. The campaign, if any, ends via expiry or a new `/run`.');
                 return;
               }
               for (const run of active) {
-                await github.rest.actions.cancelWorkflowRun({
-                  owner,
-                  repo,
-                  run_id: run.id,
-                });
+                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id });
               }
+              // The owner /bot stop comment itself terminates the campaign so
+              // later scheduled wake-ups stay no-ops until a new `/run`.
               await comment(
-                `Stop requested for AA runtime run(s): ${active.map(run => '#' + run.id).join(', ')}.`
+                `Stop requested for AA runtime run(s): ${active.map(run => '#' + run.id).join(', ')}. ` +
+                'The campaign is terminated; post a new `/run` to start another one. ' +
+                'Cancellation stops the Telegram poller and the supervised OpenCode process.'
               );
               return;
             }
 
-            if (!active.length) {
-              await comment('AA runtime is not active.');
+            // isRun: start one bounded campaign run (idempotent no-op when active).
+            const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
+            const active = activeRunsOf(runs);
+            const accepted = resolveCampaign(comments, runs, Date.now());
+            if (accepted !== null) {
+              const startsUsed = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+              await comment(
+                `No-op: a campaign is already active (starts used ${startsUsed}/${MAX_STARTS}). ` +
+                'Repeated `/run` never starts a second poller; use `/bot status` or `/bot stop`.'
+              );
               return;
             }
-            const lines = active
-              .sort((a, b) => a.id - b.id)
-              .map(run => `- #${run.id}: **${run.status}** — ${run.html_url}`);
-            await comment(['Active AA runtime:', ...lines].join('\n'));
+            if (active.length) {
+              const run = active[0];
+              await comment(
+                `Start rejected: AA runtime #${run.id} is already ${run.status}. ` +
+                'Duplicate starts never replace the current runtime; use /bot status or /bot stop.'
+              );
+              return;
+            }
+
+            const duration = '5h';
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration },
+            });
+
+            // Give GitHub a short moment to create the run so the operator
+            // gets an authoritative run id in the control issue.
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            const latest = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 10,
+            });
+            const run = latest.data.workflow_runs[0];
+            await comment(
+              run
+                ? `AA campaign run requested (**${duration}**, fixed 5h window after readiness). Run #${run.id}: ${run.html_url}\nBounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal.`
+                : `AA campaign run requested (**${duration}**, fixed 5h window after readiness).\nBounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal.`
+            );

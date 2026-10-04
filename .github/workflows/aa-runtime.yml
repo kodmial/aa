@@ -1,28 +1,41 @@
 name: AA bot runtime
-run-name: AA bot runtime ${{ inputs.duration }}
+run-name: AA bot runtime 5h (campaign)
 
 on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "Bounded live runtime duration"
+        description: "Bounded live runtime duration (fixed 5h campaign window)"
         required: true
         type: choice
         options:
-          - 15m
-          - 1h
-          - 2h
-          - 3h
+          - 5h
 
 permissions:
-  # Cache save needs write; restore needs read. Runtime itself stays read-only.
+  # Cache save needs write; restore needs read. Runtime itself stays read-only
+  # except for the privacy-safe completion report posted to control issue #31
+  # (run id, duration, outcome and counters only; never message text,
+  # prompts, corpus dumps or credentials).
   actions: write
   contents: read
+  issues: write
+
+# Issue #6 concurrency: there is never a second active poller for the same
+# bot token. Overlapping dispatches serialize here (never replace the
+# running job) and the first step rejects the duplicate explicitly, so a
+# queued duplicate exits before OpenCode or Telegram ever start.
+concurrency:
+  group: aa-bot-runtime
+  cancel-in-progress: false
 
 jobs:
   runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 210
+    # Campaign hard bounds: 5h application runtime per session, 4 starts max,
+    # 20h aggregate requested runtime max, 24h wall-clock campaign max. The
+    # 330-minute job timeout stays below the 6-hour hosted-runner ceiling so
+    # Telegram/OpenCode cleanup always has headroom.
+    timeout-minutes: 330
     steps:
       - name: Reject duplicate runtime
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -42,13 +55,16 @@ jobs:
             });
             const active = data.workflow_runs.filter(
               run => run.conclusion === null &&
-                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
+                ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status) &&
+                run.id !== current
             );
             const authoritative = active.sort((a, b) => a.id - b.id)[0];
-            if (authoritative && authoritative.id !== current) {
+            if (authoritative) {
               core.setFailed(
-                `AA runtime #${authoritative.id} is already active; rejecting duplicate #${current}.`
+                `AA runtime #${authoritative.id} is already ${authoritative.status}; rejecting duplicate #${current}. Use /bot status or /bot stop on control issue #31.`
               );
+            } else {
+              core.info(`No competing AA runtime; #${current} is authoritative.`);
             }
 
       - name: Checkout repository
@@ -104,13 +120,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Issue #6: the campaign runtime is fixed at exactly 5h (18000s).
+          # No other duration is accepted for normal operation.
           case "${{ inputs.duration }}" in
-            15m) seconds=900 ;;
-            1h) seconds=3600 ;;
-            2h) seconds=7200 ;;
-            3h) seconds=10800 ;;
+            5h) seconds=18000 ;;
             *)
-              echo "::error::Unsupported runtime duration."
+              echo "::error::Unsupported runtime duration (only 5h is allowed)."
               exit 1
               ;;
           esac
@@ -244,6 +259,11 @@ jobs:
             echo "::error::AA runtime qualification gate is missing; issues #19/#9 are not ready."
             exit 1
           }
+          # Runtime qualification gate (#9): runs after deterministic
+          # artifact bootstrap/restore and index availability, but before
+          # OpenCode/Telegram readiness is declared. Fails closed on any
+          # stale/missing source, structure, index, tool, prompt/agent or
+          # #19 qualification version, so polling never starts unqualified.
           python scripts/verify_runtime_qualification.py
 
       - name: Save encrypted derived retrieval cache
@@ -288,4 +308,35 @@ jobs:
       - name: Record bounded completion
         if: success()
         run: |
-          echo "AA runtime completed its requested ${{ inputs.duration }} live window." >> "$GITHUB_STEP_SUMMARY"
+          echo "AA runtime completed its requested 5h live window." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report privacy-safe completion to control issue
+        # Best effort: infrastructure failure must terminate cleanly without
+        # resetting campaign counters, and status must never expose message
+        # text, prompts, corpus dumps or credentials (ids/counters only).
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTROL_ISSUE: "31"
+          RUN_CONCLUSION: ${{ job.status }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const controlIssue = Number(process.env.CONTROL_ISSUE);
+            const conclusion = process.env.RUN_CONCLUSION || 'unknown';
+            const runId = context.runId;
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: controlIssue,
+                body: [
+                  'AA runtime run #' + runId + ' finished (' + conclusion + ').',
+                  'Requested window: 5h. Campaign bounds: 4 starts / 20h requested / 24h wall clock.',
+                  'Use `/bot status` for the authoritative campaign state.',
+                ].join('\n'),
+              });
+            } catch (error) {
+              core.warning('Completion report no-op: ' + error.message);
+            }

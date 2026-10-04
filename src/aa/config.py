@@ -180,8 +180,14 @@ class Settings:
 
     def validate(self, *, require_bot_token: bool = False) -> None:
         """Validate settings, raising ``ValueError`` on misuse."""
+        from aa.control.campaign import RUNTIME_SECONDS
+
         if self.bot_session_duration_seconds < 0:
             raise ValueError("BOT_SESSION_DURATION_SECONDS must be >= 0")
+        if self.bot_session_duration_seconds > float(RUNTIME_SECONDS):
+            raise ValueError(
+                f"BOT_SESSION_DURATION_SECONDS must be <= {RUNTIME_SECONDS} (5h campaign max)"
+            )
         if not self.opencode_agent.strip():
             raise ValueError("OPENCODE_AGENT must not be empty")
         if not self.opencode_model.strip():

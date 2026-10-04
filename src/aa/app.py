@@ -143,7 +143,7 @@ class Application:
             await self.safety.start()
             await self.dispatcher.start()
             await self.transport.start()
-            # Start the requested 15m/1h/2h/3h window only after the poller
+            # Start the requested fixed 5h window only after the poller
             # is live and all dependencies have completed bootstrap.
             await self.controller.start()
         except Exception:
