@@ -1,0 +1,111 @@
+name: AA canary monitor
+
+on:
+  workflow_run:
+    workflows: ["AA canary"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: aa-canary-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or refresh one P0 repair issue on canary failure
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const run = context.payload.workflow_run;
+            const actionable = new Set([
+              'failure',
+              'timed_out',
+              'action_required',
+              'startup_failure',
+              'stale',
+            ]);
+
+            if (!actionable.has(String(run.conclusion || ''))) {
+              core.info(`AA canary conclusion is ${run.conclusion}; no repair issue required.`);
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const marker = '<!-- aa-canary-repair:v1 -->';
+            const title = 'P0: Repair recurring AA canary failure';
+            const runUrl = run.html_url || `${context.serverUrl}/${owner}/${repo}/actions/runs/${run.id}`;
+            const body = [
+              marker,
+              '',
+              '## Automatic AA canary repair',
+              '',
+              'The recurring AA build/smoke canary failed and this issue is the single durable repair task for the current failure series.',
+              '',
+              `- latest failing run: ${runUrl}`,
+              `- run id: \`${run.id}\``,
+              `- conclusion: \`${run.conclusion}\``,
+              `- tested head SHA: \`${run.head_sha || 'unknown'}\``,
+              `- event: \`${run.event || 'unknown'}\``,
+              '',
+              '### Required repair behavior',
+              '',
+              '- Diagnose the actual failing step from the workflow run.',
+              '- If it is a deterministic repository defect, fix it without weakening tests or canary coverage.',
+              '- If it is transient infrastructure, do not make speculative product changes; rerun/prove the canary green.',
+              '- Preserve the 4-hour schedule, repository verification, real local OpenCode lifecycle smoke, and Telegram Bot API readiness probe.',
+              '- Do not add release/publish behavior to this canary.',
+              '- Close this issue only after a current-main canary run is green.',
+              '',
+              'This issue is generated and refreshed automatically; duplicate canary failures must reuse it rather than creating issue storms.',
+            ].join('\n');
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = openIssues.find(
+              issue => !issue.pull_request && String(issue.body || '').includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+              const hasP0 = (existing.labels || []).some(label =>
+                (typeof label === 'string' ? label : label.name) === 'priority:p0'
+              );
+              if (!hasP0) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: existing.number,
+                  labels: ['priority:p0'],
+                });
+              }
+              core.info(`Refreshed existing canary repair issue #${existing.number}.`);
+              return;
+            }
+
+            const created = await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: ['priority:p0'],
+            });
+            core.info(`Created canary repair issue #${created.data.number}.`);
