@@ -151,19 +151,11 @@ CONTROL_JOURNEY_ID = "RU-J-027"
 CONTROL_TURN_NUMBER = 3
 SESSION_RESET_CONTROL = "session_reset"
 
-# Deterministic fallback emergency categories for reviewed emergency oracles
-# whose utterances do not trigger the deterministic classifier (the oracle is
-# review-driven, the classifier is a false-positive guard for allow cases).
-EMERGENCY_CATEGORY_FALLBACK_BY_TOPIC = {
-    "withdrawal_emergency": (EmergencyCategory.SEVERE_WITHDRAWAL.value,),
-    "hopeless_selfharm": (EmergencyCategory.SELF_HARM_SUICIDE.value,),
-}
-EMERGENCY_CATEGORY_FALLBACK_BY_JOURNEY = {
-    "sleep_to_withdrawal_boundary": (EmergencyCategory.SEVERE_WITHDRAWAL.value,),
-    "withdrawal_escalation": (EmergencyCategory.SEVERE_WITHDRAWAL.value,),
-    "selfharm_escalation": (EmergencyCategory.SELF_HARM_SUICIDE.value,),
-    "family_member_emergency": (EmergencyCategory.SEVERE_WITHDRAWAL.value,),
-}
+# No topic/journey fallback for emergency categories: the oracle must agree
+# with the deterministic production classifier owned by issue #21. A reviewed
+# emergency label whose utterance does not trigger ``classify_emergency``
+# must not be masked by a mapping; it must fail validation so the acute vs
+# non-acute labeling is fixed instead of silently passing.
 
 FORBIDDEN_UTTERANCE_PATTERNS = (
     # Only invented search-volume/frequency claims are forbidden: a bare
@@ -410,20 +402,16 @@ def _safety_for_oracle(legacy_route: str, response_mode: str) -> str:
 def _emergency_categories_for(decision: str, utterance: str, topic_or_journey: str) -> list[str]:
     """Return deterministic emergency categories for an oracle case.
 
-    Uses the deterministic classifier when it fires; otherwise falls back to
-    the reviewed topic/journey mapping so every emergency oracle carries a
-    non-empty category list. Returns [] for non-emergency decisions.
+    Uses only the deterministic classifier so the oracle agrees with the
+    production issue #21 routing decision. Returns [] for non-emergency
+    decisions and for emergency labels whose utterance does not trigger the
+    classifier (no topic/journey fallback masking); such cases fail the
+    non-empty-category validation by design.
     """
+    del topic_or_journey  # Reviewed topic/journey must not mask the classifier.
     if decision != "emergency":
         return []
     classification = classify_emergency(utterance)
-    if classification.categories:
-        return sorted(item.value for item in classification.categories)
-    fallback = EMERGENCY_CATEGORY_FALLBACK_BY_TOPIC.get(topic_or_journey)
-    if fallback is None:
-        fallback = EMERGENCY_CATEGORY_FALLBACK_BY_JOURNEY.get(topic_or_journey)
-    if fallback is not None:
-        return list(fallback)
     return sorted(item.value for item in classification.categories)
 
 
@@ -589,6 +577,17 @@ SELF_UTTERANCE_MARKERS = (
 )
 
 
+# Standalone first-person singular pronoun. ``str.split()`` misses ``я,`` /
+# ``я.`` / ``я —`` with attached punctuation, so match ``я`` as a separate
+# token with word boundaries instead of exact whitespace-split equality.
+_FIRST_PERSON_SINGULAR_RE = re.compile(r"(?<!\w)я(?!\w)")
+
+
+def _has_first_person_singular(text_casefolded: str) -> bool:
+    """Return True when casefolded ``text`` holds ``я`` as a separate token."""
+    return _FIRST_PERSON_SINGULAR_RE.search(text_casefolded) is not None
+
+
 def _audience_for(utterance: str, topic: str, journey: str) -> str:
     """Derive the help-seeking perspective for an oracle case or turn.
 
@@ -601,7 +600,7 @@ def _audience_for(utterance: str, topic: str, journey: str) -> str:
     text = utterance.casefold()
     if any(marker in text for marker in RELATIVE_UTTERANCE_MARKERS):
         return "relative/partner"
-    if "я" in text.split() or any(marker in text for marker in SELF_UTTERANCE_MARKERS):
+    if _has_first_person_singular(text) or any(marker in text for marker in SELF_UTTERANCE_MARKERS):
         return "self"
     return "general"
 
@@ -1457,8 +1456,9 @@ def _check_audience_evidence(
         return
     text = utterance.casefold()
     has_relative = any(marker in text for marker in RELATIVE_UTTERANCE_MARKERS)
-    tokens = text.split()
-    has_self = "я" in tokens or any(marker in text for marker in SELF_UTTERANCE_MARKERS)
+    has_self = _has_first_person_singular(text) or any(
+        marker in text for marker in SELF_UTTERANCE_MARKERS
+    )
     if has_relative:
         if audience != "relative/partner":
             raise RuRealWorldCorpusError(
@@ -1476,6 +1476,34 @@ def _check_audience_evidence(
             f"{owner}: audience {audience!r} has no self or relative/partner "
             "evidence in the utterance, expected 'general'"
         )
+
+
+# Past-tense framing for the historical-discussion exemption. Ordinary
+# historical discussion must not become ``emergency`` merely by naming a
+# severe symptom: when an allow/block utterance carries a past marker and no
+# current-acute marker, the emergency-classifier guard is skipped (mirrors
+# the deterministic classifier's historical-without-acute rule).
+_HISTORICAL_MARK_RE = re.compile(
+    r"назад|раньше|в\s+прошлом|тогда|давно|когда-то|в\s+молодости|в\s+детстве|"
+    r"прошлый|в\s+прошлый\s+раз|много\s+лет\s+назад|years?\s+ago|in\s+the\s+past|"
+    r"used\s+to|history\s+of|long\s+ago|back\s+then|previously|formerly",
+    re.IGNORECASE,
+)
+_HISTORICAL_ACUTE_MARK_RE = re.compile(
+    r"прямо\s+сейчас|сейчас|сегодня|только\s+что|вдруг|внезапно|"
+    r"минут\w*\s+назад|час\w*\s+назад|продолжается|до\s+сих\s+пор|"
+    r"в\s+данный\s+момент|right\s+now|\bnow\b|currently|suddenly|just\s+now|"
+    r"\btoday\b|\btonight\b",
+    re.IGNORECASE,
+)
+
+
+def _is_historical_without_acute(utterance: str) -> bool:
+    """Return True for past-tense discussion without a current-acute marker."""
+    text = utterance.casefold().replace("ё", "е")
+    return _HISTORICAL_MARK_RE.search(text) is not None and (
+        _HISTORICAL_ACUTE_MARK_RE.search(text) is None
+    )
 
 
 def _check_review_semantics(
@@ -1533,12 +1561,13 @@ def _check_review_semantics(
                 )
         if decision in ("allow", "block"):
             utterance = input_utterances.get(str(record["id"]), "")
-            classification = classify_emergency(utterance)
-            if classification.is_emergency:
-                raise RuRealWorldCorpusError(
-                    f"{record['id']}: {decision} utterance triggers the emergency "
-                    f"classifier ({classifiers(classification)})"
-                )
+            if not _is_historical_without_acute(utterance):
+                classification = classify_emergency(utterance)
+                if classification.is_emergency:
+                    raise RuRealWorldCorpusError(
+                        f"{record['id']}: {decision} utterance triggers the emergency "
+                        f"classifier ({classifiers(classification)})"
+                    )
         # Per-utterance audience guard: topic-clustered singles (e.g. the
         # RU-S-001..010 quit_control block) legitimately share identical
         # oracle metadata, but the stored audience must still be justified by
@@ -1577,12 +1606,13 @@ def _check_review_semantics(
                 )
             if decision in ("allow", "block"):
                 utterance = input_utterances.get(f"{record['id']}#{turn['turn']}", "")
-                classification = classify_emergency(utterance)
-                if classification.is_emergency:
-                    raise RuRealWorldCorpusError(
-                        f"{record['id']} turn {turn['turn']}: {decision} utterance triggers "
-                        f"the emergency classifier ({classifiers(classification)})"
-                    )
+                if not _is_historical_without_acute(utterance):
+                    classification = classify_emergency(utterance)
+                    if classification.is_emergency:
+                        raise RuRealWorldCorpusError(
+                            f"{record['id']} turn {turn['turn']}: {decision} utterance triggers "
+                            f"the emergency classifier ({classifiers(classification)})"
+                        )
             utterance = input_utterances.get(f"{record['id']}#{turn['turn']}", "")
             _check_audience_evidence(
                 str(turn.get("audience")),
