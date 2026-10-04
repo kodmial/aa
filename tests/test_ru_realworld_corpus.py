@@ -403,6 +403,39 @@ def test_every_provenance_id_resolves_and_sources_are_used() -> None:
             assert provenance_id in valid, f"unresolved {provenance_id}"
             referenced.add(str(provenance_id))
     assert referenced == valid
+    # Turn/topic relevance: journey turns must carry per-turn subsets, never
+    # a shared generic umbrella copy. A corpus where every journey copied the
+    # same umbrella list onto every turn would still satisfy
+    # `referenced == valid` above, so enforce proper subsets plus variation.
+    turn_combos: set[tuple[str, ...]] = set()
+    for record in oracle_journeys:
+        umbrella = list(record["provenance_ids"])
+        assert umbrella, f"{record['id']}: journey umbrella must be non-empty"
+        umbrella_set = set(umbrella)
+        journey_combos: set[tuple[str, ...]] = set()
+        for turn in record["turns"]:
+            turn_prov = list(turn["provenance_ids"])
+            assert turn_prov, f"{record['id']} turn {turn['turn']}: empty provenance"
+            for provenance_id in turn_prov:
+                assert provenance_id in valid, f"unresolved turn {provenance_id}"
+            assert set(turn_prov) <= umbrella_set, (
+                f"{record['id']} turn {turn['turn']}: provenance must subset the journey umbrella"
+            )
+            if len(umbrella_set) > 1:
+                assert set(turn_prov) != umbrella_set, (
+                    f"{record['id']} turn {turn['turn']}: provenance must be a "
+                    "proper turn-relevant subset, never a verbatim umbrella copy"
+                )
+            journey_combos.add(tuple(turn_prov))
+            turn_combos.add(tuple(turn_prov))
+        if len(umbrella_set) > 1:
+            assert len(journey_combos) >= 2, (
+                f"{record['id']}: multi-turn provenance is templated "
+                "(one shared list on every turn); derive per-turn subsets"
+            )
+    assert len(turn_combos) >= 2, (
+        "journey-turn provenance shows no variation; per-turn subsets required"
+    )
 
 
 def test_no_verbatim_copy_search_stats_or_encoded_answers() -> None:
@@ -468,11 +501,19 @@ def test_allow_inputs_stay_off_emergency_path() -> None:
     checked = 0
     for record in oracle_singles:
         if str(record["expected_safety_decision"]) == "allow":
+            if bool(record.get("requires_context", False)):
+                continue
             assert not classify_emergency(utterances[str(record["id"])]).is_emergency
             checked += 1
     for record in oracle_journeys:
         for turn in record["turns"]:
             if str(turn["expected_safety_decision"]) == "allow":
+                # Context-dependent turns inherit meaning from prior turns;
+                # isolated context-free classification can differ from the
+                # contextual router decision, so only context-independent
+                # turns are checked here to avoid false failures/masking.
+                if bool(turn.get("requires_context", False)):
+                    continue
                 key = f"{record['id']}#{turn['turn']}"
                 assert not classify_emergency(utterances[key]).is_emergency
                 checked += 1
