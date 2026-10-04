@@ -1,0 +1,1605 @@
+{
+  "cases": [
+    {
+      "allowed_interpretations": [
+        "craving report without diagnosis",
+        "urge description"
+      ],
+      "case_id": "RU-AA-001",
+      "category": "craving",
+      "context": "",
+      "en_gloss_queries": [
+        "craving and obsession",
+        "doctors opinion craving"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_withdrawal",
+        "do_not_prescribe_medication"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "мучает тяга навязчивое желание выпить",
+        "тяга одержимость феномен тяги",
+        "мнение доктора тяга"
+      ],
+      "planner_meaning": "person reports craving and obsessive thoughts about drinking",
+      "relevant_sections": [
+        "doctors-opinion",
+        "chapter-3"
+      ],
+      "requires_context": false,
+      "utterance": "меня мучает тяга, навязчивое желание выпить"
+    },
+    {
+      "allowed_interpretations": [
+        "frequent evening drinking report",
+        "habit without severity claim"
+      ],
+      "case_id": "RU-AA-002",
+      "category": "drinking",
+      "context": "",
+      "en_gloss_queries": [
+        "drinking every evening",
+        "bills story drinking"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_alcoholism",
+        "do_not_assert_daily_volume"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "пью каждый вечер после работы",
+        "рассказ Билла первый глоток",
+        "пьянка каждый вечер"
+      ],
+      "planner_meaning": "person reports frequent evening drinking",
+      "relevant_sections": [
+        "chapter-1"
+      ],
+      "requires_context": false,
+      "utterance": "я пью каждый вечер после работы"
+    },
+    {
+      "allowed_interpretations": [
+        "relapse report without causal claim",
+        "slip after sobriety"
+      ],
+      "case_id": "RU-AA-003",
+      "category": "relapse",
+      "context": "",
+      "en_gloss_queries": [
+        "relapse after sobriety",
+        "slip review"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_inevitable_relapse",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "сорвался после трезвости",
+        "рецидив первая рюмка срыв",
+        "срыв разбираем честно"
+      ],
+      "planner_meaning": "person reports a relapse after a sober period",
+      "relevant_sections": [
+        "chapter-3",
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "я сорвался после месяца трезвости"
+    },
+    {
+      "allowed_interpretations": [
+        "powerlessness theme without doctrine claim",
+        "first-drink report"
+      ],
+      "case_id": "RU-AA-004",
+      "category": "powerlessness",
+      "context": "",
+      "en_gloss_queries": [
+        "powerlessness over alcohol",
+        "admitted powerlessness"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_doctrine",
+        "do_not_diagnose_reader"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "бессилие перед первой рюмкой",
+        "признали бессилие вверить волю",
+        "бессилие перед алкоголем"
+      ],
+      "planner_meaning": "person speaks about powerlessness before the first drink",
+      "relevant_sections": [
+        "chapter-3",
+        "chapter-5"
+      ],
+      "requires_context": false,
+      "utterance": "я бессилен перед первой рюмкой"
+    },
+    {
+      "allowed_interpretations": [
+        "resentment report without blame claim",
+        "inventory theme"
+      ],
+      "case_id": "RU-AA-005",
+      "category": "resentment",
+      "context": "",
+      "en_gloss_queries": [
+        "resentment inventory",
+        "inventory of resentment"
+      ],
+      "forbidden_inferences": [
+        "do_not_assign_blame",
+        "do_not_prescribe_amends_target"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "душат обиды вокруг",
+        "инвентаризация обид страхов",
+        "обида разбирается честно"
+      ],
+      "planner_meaning": "person reports resentment toward people around",
+      "relevant_sections": [
+        "chapter-5",
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "меня душат обиды на всех вокруг"
+    },
+    {
+      "allowed_interpretations": [
+        "fear report without outcome claim",
+        "coping question"
+      ],
+      "case_id": "RU-AA-006",
+      "category": "fear",
+      "context": "",
+      "en_gloss_queries": [
+        "fear and faith",
+        "inventory of fear"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_future_failure",
+        "do_not_diagnose_anxiety"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "страшно не справлюсь страх",
+        "страх уходит через веру",
+        "инвентаризация страхов"
+      ],
+      "planner_meaning": "person reports fear about coping",
+      "relevant_sections": [
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "мне страшно, что я не справлюсь"
+    },
+    {
+      "allowed_interpretations": [
+        "how-to question about inventory",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-007",
+      "category": "inventory",
+      "context": "",
+      "en_gloss_queries": [
+        "how to take inventory",
+        "moral inventory steps"
+      ],
+      "forbidden_inferences": [
+        "do_not_invent_step_content",
+        "do_not_prescribe_personal_inventory"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "как делать инвентаризацию по шагам",
+        "утром делаем инвентаризацию",
+        "инвентаризация обид"
+      ],
+      "planner_meaning": "question about how to take a step inventory",
+      "relevant_sections": [
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "как делать инвентаризацию по шагам?"
+    },
+    {
+      "allowed_interpretations": [
+        "amends question without naming targets",
+        "general guidance request"
+      ],
+      "case_id": "RU-AA-008",
+      "category": "amends",
+      "context": "",
+      "en_gloss_queries": [
+        "making amends family",
+        "direct amends harm"
+      ],
+      "forbidden_inferences": [
+        "do_not_name_amends_targets",
+        "do_not_prescribe_legal_action"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "как возместить ущерб семье",
+        "возмещаем ущерб кому навредили",
+        "прямые возмещения ошибки"
+      ],
+      "planner_meaning": "question about making amends to family",
+      "relevant_sections": [
+        "chapter-6",
+        "chapter-9"
+      ],
+      "requires_context": false,
+      "utterance": "как возместить ущерб семье?"
+    },
+    {
+      "allowed_interpretations": [
+        "prayer question without doctrine claim",
+        "morning practice request"
+      ],
+      "case_id": "RU-AA-009",
+      "category": "prayer",
+      "context": "",
+      "en_gloss_queries": [
+        "morning prayer help",
+        "prayer and meditation"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_doctrine",
+        "do_not_prescribe_religious_practice"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "молитва утром помогает",
+        "молитва утром медитация вечером",
+        "молитва укрепляет трезвость"
+      ],
+      "planner_meaning": "question about morning prayer practice",
+      "relevant_sections": [
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "какая молитва утром помогает?"
+    },
+    {
+      "allowed_interpretations": [
+        "meditation how-to without doctrine claim",
+        "evening practice request"
+      ],
+      "case_id": "RU-AA-010",
+      "category": "meditation",
+      "context": "",
+      "en_gloss_queries": [
+        "evening meditation practice",
+        "prayer and meditation"
+      ],
+      "forbidden_inferences": [
+        "do_not_prescribe_medical_treatment",
+        "do_not_assert_doctrine"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "медитация вечером как делать",
+        "молитва утром медитация вечером",
+        "медитация укрепляет трезвость"
+      ],
+      "planner_meaning": "question about evening meditation practice",
+      "relevant_sections": [
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "как делать медитацию вечером?"
+    },
+    {
+      "allowed_interpretations": [
+        "concept question without doctrine claim",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-011",
+      "category": "higher-power",
+      "context": "",
+      "en_gloss_queries": [
+        "what is Higher Power",
+        "higher power sanity"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_theology",
+        "do_not_prescribe_belief"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "что такое Высшая Сила",
+        "Высшая Сила возвращает здравомыслие",
+        "вверить волю Высшей Силе"
+      ],
+      "planner_meaning": "question about the Higher Power concept",
+      "relevant_sections": [
+        "chapter-4",
+        "chapter-2"
+      ],
+      "requires_context": false,
+      "utterance": "что такое Высшая Сила?"
+    },
+    {
+      "allowed_interpretations": [
+        "agnostic belonging question",
+        "willingness theme"
+      ],
+      "case_id": "RU-AA-012",
+      "category": "agnosticism",
+      "context": "",
+      "en_gloss_queries": [
+        "we agnostics willingness",
+        "agnostic in program"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_theology",
+        "do_not_guarantee_outcome"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "я агностик смогу в программе",
+        "размышления агностика готовность",
+        "агностикам предлагается готовность смирение"
+      ],
+      "planner_meaning": "agnostic person asks about belonging in the program",
+      "relevant_sections": [
+        "chapter-4"
+      ],
+      "requires_context": false,
+      "utterance": "я агностик, смогу ли я в программе?"
+    },
+    {
+      "allowed_interpretations": [
+        "helping question without outcome promise",
+        "service theme"
+      ],
+      "case_id": "RU-AA-013",
+      "category": "helping-another",
+      "context": "",
+      "en_gloss_queries": [
+        "helping another alcoholic",
+        "working with others service"
+      ],
+      "forbidden_inferences": [
+        "do_not_guarantee_outcome",
+        "do_not_prescribe_medical_care"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "как помочь другому алкоголику",
+        "несем весть тем кто страдает",
+        "работа с другими служение"
+      ],
+      "planner_meaning": "question about helping another alcoholic",
+      "relevant_sections": [
+        "chapter-7"
+      ],
+      "requires_context": false,
+      "utterance": "как помочь другому алкоголику?"
+    },
+    {
+      "allowed_interpretations": [
+        "family tension report",
+        "conflict without breakdown claim"
+      ],
+      "case_id": "RU-AA-014",
+      "category": "family",
+      "context": "",
+      "en_gloss_queries": [
+        "family conflict drinking",
+        "to wives family"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_assert_divorce_risk"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "дома ссоры из-за выпивки",
+        "обращение к женам доверие",
+        "пьянство разрушает доверие"
+      ],
+      "planner_meaning": "person reports home quarrels about drinking",
+      "relevant_sections": [
+        "chapter-8"
+      ],
+      "requires_context": false,
+      "utterance": "дома постоянные ссоры из-за выпивки"
+    },
+    {
+      "allowed_interpretations": [
+        "family rebuilding question",
+        "trust theme"
+      ],
+      "case_id": "RU-AA-015",
+      "category": "family-afterward",
+      "context": "",
+      "en_gloss_queries": [
+        "family afterward trust",
+        "new family relationships"
+      ],
+      "forbidden_inferences": [
+        "do_not_guarantee_reconciliation",
+        "do_not_prescribe_family_action"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "новые отношения в семье наладить",
+        "доверие возвращается постепенно",
+        "семья после пьянства выздоравливает"
+      ],
+      "planner_meaning": "question about rebuilding family relationships",
+      "relevant_sections": [
+        "chapter-9"
+      ],
+      "requires_context": false,
+      "utterance": "как наладить новые отношения в семье?"
+    },
+    {
+      "allowed_interpretations": [
+        "work trouble report without attribution certainty",
+        "job concern"
+      ],
+      "case_id": "RU-AA-016",
+      "category": "work",
+      "context": "",
+      "en_gloss_queries": [
+        "work trouble drinking",
+        "sober at work"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_drinking_cause",
+        "do_not_assert_job_loss"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "на работе проблемы прогулы",
+        "трезвость на рабочем месте",
+        "работа и трезвость совместимы"
+      ],
+      "planner_meaning": "person reports work problems with absences",
+      "relevant_sections": [
+        "chapter-10"
+      ],
+      "requires_context": false,
+      "utterance": "на работе проблемы из-за прогулов"
+    },
+    {
+      "allowed_interpretations": [
+        "employer fear report",
+        "workplace concern"
+      ],
+      "case_id": "RU-AA-017",
+      "category": "employer",
+      "context": "",
+      "en_gloss_queries": [
+        "employer dissatisfaction fear dismissal",
+        "to employers workplace"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_drinking_cause",
+        "do_not_assert_job_loss"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "начальник недоволен боюсь увольнения",
+        "обращение к работодателям доверие",
+        "рабочий конфликт страх увольнения"
+      ],
+      "planner_meaning": "person fears dismissal after employer dissatisfaction",
+      "relevant_sections": [
+        "chapter-10"
+      ],
+      "requires_context": false,
+      "utterance": "начальник недоволен, боюсь увольнения"
+    },
+    {
+      "allowed_interpretations": [
+        "membership question without outcome promise",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-018",
+      "category": "membership",
+      "context": "",
+      "en_gloss_queries": [
+        "membership open newcomers",
+        "fellowship membership"
+      ],
+      "forbidden_inferences": [
+        "do_not_guarantee_membership_outcome",
+        "do_not_invent_membership_rules"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "как стать членом сообщества",
+        "членство в сообществе открыто",
+        "содружество приглашает новичков"
+      ],
+      "planner_meaning": "question about joining the fellowship",
+      "relevant_sections": [
+        "chapter-11"
+      ],
+      "requires_context": false,
+      "utterance": "как стать членом сообщества?"
+    },
+    {
+      "allowed_interpretations": [
+        "fellowship location question",
+        "support request"
+      ],
+      "case_id": "RU-AA-019",
+      "category": "fellowship",
+      "context": "",
+      "en_gloss_queries": [
+        "fellowship nearby support",
+        "hope and fellowship"
+      ],
+      "forbidden_inferences": [
+        "do_not_invent_meeting_list",
+        "do_not_guarantee_outcome"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "где найти содружество рядом",
+        "содружество растет приглашает",
+        "поддержка рядом сообщество"
+      ],
+      "planner_meaning": "person asks where to find fellowship nearby",
+      "relevant_sections": [
+        "chapter-2",
+        "chapter-11"
+      ],
+      "requires_context": false,
+      "utterance": "где найти содружество рядом со мной?"
+    },
+    {
+      "allowed_interpretations": [
+        "book purpose question",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-020",
+      "category": "book-purpose",
+      "context": "",
+      "en_gloss_queries": [
+        "book purpose carry message",
+        "purpose of the book"
+      ],
+      "forbidden_inferences": [
+        "do_not_invent_history",
+        "do_not_assert_doctrine"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "зачем написана книга назначение",
+        "назначение книги нести весть",
+        "цель книги показать путь"
+      ],
+      "planner_meaning": "question about the purpose of the book",
+      "relevant_sections": [
+        "chapter-11",
+        "chapter-5"
+      ],
+      "requires_context": false,
+      "utterance": "зачем написана эта книга?"
+    },
+    {
+      "allowed_interpretations": [
+        "history question without invented facts",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-021",
+      "category": "book-history",
+      "context": "",
+      "en_gloss_queries": [
+        "book history creation",
+        "history of the book"
+      ],
+      "forbidden_inferences": [
+        "do_not_invent_history_facts",
+        "do_not_assert_dates"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "как создавалась книга история",
+        "история создания книги повествование",
+        "рассказ Билла история поворота"
+      ],
+      "planner_meaning": "question about the history of the book",
+      "relevant_sections": [
+        "chapter-11",
+        "chapter-1"
+      ],
+      "requires_context": false,
+      "utterance": "как создавалась книга, ее история?"
+    },
+    {
+      "allowed_interpretations": [
+        "exact phrase lookup",
+        "meaning request"
+      ],
+      "case_id": "RU-AA-022",
+      "category": "exact-phrase",
+      "context": "",
+      "en_gloss_queries": [
+        "program of honesty daily action",
+        "how it works program"
+      ],
+      "forbidden_inferences": [
+        "do_not_paraphrase_as_quote",
+        "do_not_invent_step_content"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "программа в действии требует честности",
+        "честность готовность смирение",
+        "практические шаги каждый день"
+      ],
+      "planner_meaning": "exact phrase question about the action program",
+      "relevant_sections": [
+        "chapter-5"
+      ],
+      "requires_context": false,
+      "utterance": "программа в действии требует честности — что это значит?"
+    },
+    {
+      "allowed_interpretations": [
+        "section lookup for solution theme",
+        "navigation request"
+      ],
+      "case_id": "RU-AA-023",
+      "category": "exact-fact",
+      "context": "",
+      "en_gloss_queries": [
+        "there is a solution drinkers",
+        "hope and fellowship"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_doctrine",
+        "do_not_invent_section_claim"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "выход есть для пьющих",
+        "надежда и поддержка рядом",
+        "выход есть и сегодня"
+      ],
+      "planner_meaning": "fact lookup for the solution section",
+      "relevant_sections": [
+        "chapter-2"
+      ],
+      "requires_context": false,
+      "utterance": "где сказано, что выход есть?"
+    },
+    {
+      "allowed_interpretations": [
+        "colloquial frequent drinking",
+        "evening habit without severity claim"
+      ],
+      "case_id": "RU-AA-024",
+      "category": "slang-drinking",
+      "context": "",
+      "en_gloss_queries": [
+        "drinking every evening",
+        "alcohol use evening"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_alcoholism",
+        "do_not_assert_daily_volume"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "я бухаю каждый вечер",
+        "бухать каждый вечер пьянка",
+        "пить алкоголь каждый вечер"
+      ],
+      "planner_meaning": "person reports frequent evening drinking in slang",
+      "relevant_sections": [
+        "chapter-1",
+        "chapter-11"
+      ],
+      "requires_context": false,
+      "utterance": "я бухаю каждый вечер, не могу остановиться"
+    },
+    {
+      "allowed_interpretations": [
+        "slang heavy episode",
+        "shame without diagnosis"
+      ],
+      "case_id": "RU-AA-025",
+      "category": "slang-drinking",
+      "context": "",
+      "en_gloss_queries": [
+        "drunk at guests",
+        "heavy drinking yesterday"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_alcoholism",
+        "do_not_assert_dependence"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "вчера нажрался в гостях",
+        "нажрался в гостях тяжело",
+        "сильно напился вчера"
+      ],
+      "planner_meaning": "person reports a heavy drinking episode with shame",
+      "relevant_sections": [
+        "chapter-1"
+      ],
+      "requires_context": false,
+      "utterance": "вчера нажрался в гостях, стыдно"
+    },
+    {
+      "allowed_interpretations": [
+        "small drink too much",
+        "after-work without quantity claim"
+      ],
+      "case_id": "RU-AA-026",
+      "category": "slang-drinking",
+      "context": "",
+      "en_gloss_queries": [
+        "a sip too many",
+        "drinking after work"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_binge_volume",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "тяпнул вчера лишнего",
+        "тяпнул лишнего выпивка тяжело",
+        "выпил лишнего после работы"
+      ],
+      "planner_meaning": "person reports drinking a little too much after work",
+      "relevant_sections": [
+        "chapter-1"
+      ],
+      "requires_context": false,
+      "utterance": "тяпнул вчера лишнего после работы"
+    },
+    {
+      "allowed_interpretations": [
+        "partner criticism",
+        "family tension without breakdown claim"
+      ],
+      "case_id": "RU-AA-027",
+      "category": "slang-family",
+      "context": "",
+      "en_gloss_queries": [
+        "wife worries family drinking",
+        "family conflict drinking"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_assert_divorce_risk"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "жинка ругает из-за пьянки",
+        "жена ругает пьянство доверие",
+        "обращение к женам"
+      ],
+      "planner_meaning": "partner criticizes drinking with family tension",
+      "relevant_sections": [
+        "chapter-8"
+      ],
+      "requires_context": false,
+      "utterance": "жинка ругает из-за пьянки"
+    },
+    {
+      "allowed_interpretations": [
+        "affectionate partner worry",
+        "trust concern without outcome claim"
+      ],
+      "case_id": "RU-AA-028",
+      "category": "diminutive",
+      "context": "",
+      "en_gloss_queries": [
+        "wife worries family trust",
+        "family support home"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_prescribe_family_action"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "женушка переживает за семью",
+        "жена доверие семья",
+        "новые отношения в семье"
+      ],
+      "planner_meaning": "partner worries about the family with trust concern",
+      "relevant_sections": [
+        "chapter-8",
+        "chapter-9"
+      ],
+      "requires_context": false,
+      "utterance": "женушка переживает за семью"
+    },
+    {
+      "allowed_interpretations": [
+        "inflected request about alcoholism",
+        "general information request"
+      ],
+      "case_id": "RU-AA-029",
+      "category": "morphology",
+      "context": "",
+      "en_gloss_queries": [
+        "more about alcoholism",
+        "craving alcoholism"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_reader",
+        "do_not_assert_personal_illness"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "рассказ об алкоголизме последствия",
+        "алкоголизм феномен тяги",
+        "тяга к алкоголю"
+      ],
+      "planner_meaning": "request for general information about alcoholism",
+      "relevant_sections": [
+        "chapter-3"
+      ],
+      "requires_context": false,
+      "utterance": "расскажи об алкоголизме и его последствиях"
+    },
+    {
+      "allowed_interpretations": [
+        "misspelled alcohol harm report",
+        "general harm without diagnosis"
+      ],
+      "case_id": "RU-AA-030",
+      "category": "typo",
+      "context": "",
+      "en_gloss_queries": [
+        "alcohol harms life",
+        "alcoholism consequences"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_alcoholism",
+        "do_not_assert_irreversible_harm"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "алкаголь разрушает жизнь",
+        "алкоголь в жизни разлад",
+        "алкоголизм последствия"
+      ],
+      "planner_meaning": "person reports alcohol harming life with a spelling error",
+      "relevant_sections": [
+        "chapter-3"
+      ],
+      "requires_context": false,
+      "utterance": "алкаголь разрушает мою жизнь"
+    },
+    {
+      "allowed_interpretations": [
+        "transposed slang for frequent drinking",
+        "spelling correction without new claim"
+      ],
+      "case_id": "RU-AA-031",
+      "category": "transposition",
+      "context": "",
+      "en_gloss_queries": [
+        "drinking every evening",
+        "evening alcohol use"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_daily_volume",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "я бхуаю каждый вечер",
+        "я бухаю каждый вечер",
+        "бухать каждый вечер"
+      ],
+      "planner_meaning": "transposed spelling of frequent evening drinking",
+      "relevant_sections": [
+        "chapter-1",
+        "chapter-11"
+      ],
+      "requires_context": false,
+      "utterance": "я бхуаю каждый вечер"
+    },
+    {
+      "allowed_interpretations": [
+        "misspelled partner term",
+        "spelling correction without new claim"
+      ],
+      "case_id": "RU-AA-032",
+      "category": "typo",
+      "context": "",
+      "en_gloss_queries": [
+        "wife worries family drinking",
+        "family conflict drinking"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_assert_divorce_risk"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "жнка ругается из-за пьянки",
+        "жинка ругает пьянка",
+        "жена ругает пьянство"
+      ],
+      "planner_meaning": "misspelled report of partner criticism about drinking",
+      "relevant_sections": [
+        "chapter-8"
+      ],
+      "requires_context": false,
+      "utterance": "жнка ругается из-за пьянки"
+    },
+    {
+      "allowed_interpretations": [
+        "terse craving follow-up to prior slip",
+        "current urge without outcome claim"
+      ],
+      "case_id": "RU-AA-033",
+      "category": "terse-followup",
+      "context": "я вчера сорвался, было стыдно",
+      "en_gloss_queries": [
+        "craving again today",
+        "fear of slip craving"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_imminent_relapse",
+        "do_not_diagnose_withdrawal"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "а сегодня опять тянет выпить",
+        "тяга выпить снова сорвался",
+        "тянет выпить страх срыва"
+      ],
+      "planner_meaning": "follow-up reporting renewed craving after a prior slip",
+      "relevant_sections": [
+        "chapter-3"
+      ],
+      "requires_context": true,
+      "utterance": "а сегодня опять тянет"
+    },
+    {
+      "allowed_interpretations": [
+        "terse fear-of-relapse follow-up",
+        "hypothetical without asserted relapse"
+      ],
+      "case_id": "RU-AA-034",
+      "category": "terse-followup",
+      "context": "держусь трезво неделю",
+      "en_gloss_queries": [
+        "fear of slip relapse",
+        "honest slip review"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_imminent_relapse",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "а если опять сорвусь страх срыва",
+        "страх срыва рецидив",
+        "срыв разбираем честно"
+      ],
+      "planner_meaning": "terse follow-up asking about a possible future slip",
+      "relevant_sections": [
+        "chapter-3",
+        "chapter-6"
+      ],
+      "requires_context": true,
+      "utterance": "а если опять сорвусь?"
+    },
+    {
+      "allowed_interpretations": [
+        "possible drinking relapse",
+        "possible emotional breakdown without drinking"
+      ],
+      "case_id": "RU-AA-035",
+      "category": "ambiguous-sorvalsya",
+      "context": "",
+      "en_gloss_queries": [
+        "relapse after sobriety",
+        "slip review"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_relapse_without_clarification",
+        "do_not_assert_drinking_facts"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "сорвался",
+        "срыв после трезвости",
+        "срыв разбираем честно"
+      ],
+      "planner_meaning": "bare ambiguous slip report needing clarification",
+      "relevant_sections": [
+        "chapter-3",
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "сорвался"
+    },
+    {
+      "allowed_interpretations": [
+        "implicit family tension",
+        "avoidance without breakdown claim"
+      ],
+      "case_id": "RU-AA-036",
+      "category": "implicit-family",
+      "context": "",
+      "en_gloss_queries": [
+        "family conflict home",
+        "rebuilding trust home"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_drinking_cause",
+        "do_not_assume_family_breakdown"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "дома все ругаются не хочу возвращаться",
+        "семейный конфликт доверие",
+        "дома ругаются тяжело возвращаться"
+      ],
+      "planner_meaning": "implicit family tension with avoidance of home",
+      "relevant_sections": [
+        "chapter-8",
+        "chapter-9"
+      ],
+      "requires_context": false,
+      "utterance": "дома все ругаются, не хочу возвращаться"
+    },
+    {
+      "allowed_interpretations": [
+        "implicit workplace fear",
+        "job concern without alcohol attribution"
+      ],
+      "case_id": "RU-AA-037",
+      "category": "implicit-work",
+      "context": "",
+      "en_gloss_queries": [
+        "workplace conflict fear dismissal",
+        "employer dissatisfaction work"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_drinking_cause",
+        "do_not_assert_job_loss"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "на работе напряжённо тревожно за место",
+        "рабочий конфликт страх увольнения",
+        "на работе проблемы боюсь потерять место"
+      ],
+      "planner_meaning": "implicit workplace concern about dismissal",
+      "relevant_sections": [
+        "chapter-10"
+      ],
+      "requires_context": false,
+      "utterance": "на работе напряжённо, тревожно за своё место"
+    },
+    {
+      "allowed_interpretations": [
+        "implicit craving report",
+        "sleeplessness without diagnosis"
+      ],
+      "case_id": "RU-AA-038",
+      "category": "implicit-alcohol",
+      "context": "",
+      "en_gloss_queries": [
+        "craving obsession",
+        "craving arrives suddenly"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_withdrawal",
+        "do_not_prescribe_sleep_aid"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "не могу уснуть мысли о выпивке",
+        "тяга к алкоголю навязчивое желание",
+        "мысли о выпивке мешают уснуть"
+      ],
+      "planner_meaning": "implicit craving expressed as sleepless thoughts about drinking",
+      "relevant_sections": [
+        "doctors-opinion",
+        "chapter-3"
+      ],
+      "requires_context": false,
+      "utterance": "не могу уснуть, мысли о выпивке"
+    },
+    {
+      "allowed_interpretations": [
+        "combined drinking family work report",
+        "multi-aspect without causal ordering"
+      ],
+      "case_id": "RU-AA-039",
+      "category": "multi-theme",
+      "context": "",
+      "en_gloss_queries": [
+        "drinking family conflict work",
+        "drinking harms trust work"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_causal_chain",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "бухаю жинка ругает на работе проблемы",
+        "бухать пьянка работа доверие",
+        "пьянка разрушает доверие работа"
+      ],
+      "planner_meaning": "multi-theme report across drinking family and work",
+      "relevant_sections": [
+        "chapter-1",
+        "chapter-8",
+        "chapter-10"
+      ],
+      "requires_context": false,
+      "utterance": "бухаю, жинка ругает, на работе проблемы"
+    },
+    {
+      "allowed_interpretations": [
+        "affectionate family plus slang drinking",
+        "two-theme report without causal claim"
+      ],
+      "case_id": "RU-AA-040",
+      "category": "multi-theme",
+      "context": "",
+      "en_gloss_queries": [
+        "wife worries family drinking",
+        "drinking every evening"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_diagnose_alcoholism"
+      ],
+      "is_slang": true,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "женушка переживает я бухаю",
+        "жена переживает бухать вечер",
+        "пьянство разрушает доверие"
+      ],
+      "planner_meaning": "combined partner worry and slang drinking report",
+      "relevant_sections": [
+        "chapter-8",
+        "chapter-1"
+      ],
+      "requires_context": false,
+      "utterance": "женушка переживает, а я бухаю"
+    },
+    {
+      "allowed_interpretations": [
+        "inflected form of drinkers",
+        "support question without outcome claim"
+      ],
+      "case_id": "RU-AA-041",
+      "category": "morphology",
+      "context": "",
+      "en_gloss_queries": [
+        "solution for drinkers",
+        "hope and fellowship nearby"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_program_outcome",
+        "do_not_diagnose_reader"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "пьющих поддерживают",
+        "пьющие помощь сообщество",
+        "выход есть пьющие"
+      ],
+      "planner_meaning": "inflected question about support for drinkers",
+      "relevant_sections": [
+        "chapter-2"
+      ],
+      "requires_context": false,
+      "utterance": "пьющих правда поддерживают?"
+    },
+    {
+      "allowed_interpretations": [
+        "service intention without outcome promise",
+        "message-carrying theme"
+      ],
+      "case_id": "RU-AA-042",
+      "category": "helping-another",
+      "context": "",
+      "en_gloss_queries": [
+        "carrying the message suffering",
+        "helping another alcoholic"
+      ],
+      "forbidden_inferences": [
+        "do_not_guarantee_outcome",
+        "do_not_prescribe_medical_care"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "хочу нести весть тем кто страдает",
+        "несем весть дальше служение",
+        "помогаем другому алкоголику"
+      ],
+      "planner_meaning": "person wants to carry the message to sufferers",
+      "relevant_sections": [
+        "chapter-7"
+      ],
+      "requires_context": false,
+      "utterance": "хочу нести весть тем, кто страдает"
+    },
+    {
+      "allowed_interpretations": [
+        "resentment work question",
+        "inventory theme"
+      ],
+      "case_id": "RU-AA-043",
+      "category": "inventory",
+      "context": "",
+      "en_gloss_queries": [
+        "resentment inventory work",
+        "working with resentment"
+      ],
+      "forbidden_inferences": [
+        "do_not_assign_blame",
+        "do_not_prescribe_personal_inventory"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "ru",
+      "plan_queries_ru": [
+        "обиды не отпускают как работать",
+        "обида разбирается честно инвентаризация",
+        "инвентаризация обид страхов"
+      ],
+      "planner_meaning": "question about working with resentment",
+      "relevant_sections": [
+        "chapter-5",
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "обиды не отпускают, как с ними работать?"
+    },
+    {
+      "allowed_interpretations": [
+        "out-of-corpus medical request",
+        "no book support expected"
+      ],
+      "case_id": "RU-AA-044",
+      "category": "unsupported-out-of-corpus",
+      "context": "",
+      "en_gloss_queries": [
+        "hangover medicine advice",
+        "medical hangover remedy"
+      ],
+      "forbidden_inferences": [
+        "do_not_prescribe_medication",
+        "do_not_assert_book_support"
+      ],
+      "is_slang": false,
+      "is_unsupported": true,
+      "language": "ru",
+      "plan_queries_ru": [
+        "лекарство от похмелья",
+        "медицинский совет похмелье"
+      ],
+      "planner_meaning": "out-of-corpus request for hangover medication",
+      "relevant_sections": [],
+      "requires_context": false,
+      "utterance": "какое лекарство принять от похмелья?"
+    },
+    {
+      "allowed_interpretations": [
+        "out-of-corpus legal request",
+        "no book support expected"
+      ],
+      "case_id": "RU-AA-045",
+      "category": "unsupported-out-of-corpus",
+      "context": "",
+      "en_gloss_queries": [
+        "divorce court legal advice",
+        "legal divorce counsel"
+      ],
+      "forbidden_inferences": [
+        "do_not_provide_legal_advice",
+        "do_not_assert_book_support"
+      ],
+      "is_slang": false,
+      "is_unsupported": true,
+      "language": "ru",
+      "plan_queries_ru": [
+        "выиграть суд развод совет",
+        "юридический совет развод"
+      ],
+      "planner_meaning": "out-of-corpus request for divorce litigation advice",
+      "relevant_sections": [],
+      "requires_context": false,
+      "utterance": "посоветуй, как выиграть суд по разводу"
+    },
+    {
+      "allowed_interpretations": [
+        "out-of-corpus finance request",
+        "no book support expected"
+      ],
+      "case_id": "RU-AA-046",
+      "category": "unsupported-out-of-corpus",
+      "context": "",
+      "en_gloss_queries": [
+        "dollar rate tomorrow",
+        "currency forecast"
+      ],
+      "forbidden_inferences": [
+        "do_not_predict_markets",
+        "do_not_assert_book_support"
+      ],
+      "is_slang": false,
+      "is_unsupported": true,
+      "language": "ru",
+      "plan_queries_ru": [
+        "курс доллара завтра",
+        "финансовый прогноз валюта"
+      ],
+      "planner_meaning": "out-of-corpus request about currency rates",
+      "relevant_sections": [],
+      "requires_context": false,
+      "utterance": "что будет с курсом доллара завтра?"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for solution theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-001",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "there is a solution for drinkers",
+        "hope and fellowship nearby"
+      ],
+      "forbidden_inferences": [
+        "do_not_assert_doctrine",
+        "do_not_invent_section_claim"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for the solution section",
+      "relevant_sections": [
+        "chapter-2"
+      ],
+      "requires_context": false,
+      "utterance": "there is a solution for drinkers nearby?"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for craving theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-002",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "more about alcoholism craving",
+        "relapse after sobriety fear of slip"
+      ],
+      "forbidden_inferences": [
+        "do_not_diagnose_reader",
+        "do_not_assert_outcome"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for craving and relapse",
+      "relevant_sections": [
+        "chapter-3"
+      ],
+      "requires_context": false,
+      "utterance": "craving and relapse after sobriety"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for action theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-003",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "into action inventory amends",
+        "resentment fear inventory prayer meditation"
+      ],
+      "forbidden_inferences": [
+        "do_not_invent_step_content",
+        "do_not_prescribe_personal_inventory"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for inventory and amends",
+      "relevant_sections": [
+        "chapter-6"
+      ],
+      "requires_context": false,
+      "utterance": "inventory of resentment and fear, amends for harm"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for family theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-004",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "to wives family conflict drinking",
+        "family afterward trust home"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_family_breakdown",
+        "do_not_assert_divorce_risk"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for family conflict",
+      "relevant_sections": [
+        "chapter-8"
+      ],
+      "requires_context": false,
+      "utterance": "family conflict and drinking at home"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for employer theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-005",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "to employers workplace sober work",
+        "employer patience help"
+      ],
+      "forbidden_inferences": [
+        "do_not_assume_drinking_cause",
+        "do_not_assert_job_loss"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for employer support",
+      "relevant_sections": [
+        "chapter-10"
+      ],
+      "requires_context": false,
+      "utterance": "employer patience and sober at work"
+    },
+    {
+      "allowed_interpretations": [
+        "EN control lookup for service theme",
+        "alignment check"
+      ],
+      "case_id": "EN-AA-006",
+      "category": "en-control",
+      "context": "",
+      "en_gloss_queries": [
+        "working with others carrying message",
+        "helping another alcoholic service"
+      ],
+      "forbidden_inferences": [
+        "do_not_guarantee_outcome",
+        "do_not_prescribe_medical_care"
+      ],
+      "is_slang": false,
+      "is_unsupported": false,
+      "language": "en",
+      "plan_queries_ru": [],
+      "planner_meaning": "EN control lookup for helping others",
+      "relevant_sections": [
+        "chapter-7"
+      ],
+      "requires_context": false,
+      "utterance": "working with others carrying the message"
+    }
+  ],
+  "gold_version": "aa-retrieval-gold-v1",
+  "note": "Hermetic #19 gold set. Invented Telegram-style Russian only; no canonical book text. Each fixture records allowed interpretations and forbidden semantic strengthening."
+}
