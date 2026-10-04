@@ -627,6 +627,8 @@ def deduplicate_cross_aspect(
             ordered.append(hit)
     ordered.sort(key=lambda item: item.fused_score, reverse=True)
     sections = {hit.chunk_id: hit.section for hit in ordered}
+    if not ordered:
+        return []
     from aa.retrieval.fusion import FusedCandidate, deduplicate_overlaps
 
     fused = [
@@ -641,24 +643,32 @@ def deduplicate_cross_aspect(
         for hit in ordered
     ]
     spans = {hit.chunk_id: (hit.section, hit.char_start, hit.char_end) for hit in ordered}
-    deduped_ids = {item.chunk_id for item in deduplicate_overlaps(fused, spans=spans)}
+    try:
+        deduped_ids = {item.chunk_id for item in deduplicate_overlaps(fused, spans=spans)}
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise TurnFailed("retrieval-failed", str(exc)) from exc
     filtered = [hit for hit in ordered if hit.chunk_id in deduped_ids]
-    diverse = enforce_diversity(
-        [
-            FusedCandidate(
-                chunk_id=hit.chunk_id,
-                fused_score=hit.fused_score,
-                lexical_rank=hit.lexical_rank,
-                dense_rank=hit.dense_rank,
-                lexical_score=hit.lexical_score,
-                dense_score=hit.dense_score,
-            )
-            for hit in filtered
-        ],
-        sections=sections,
-        max_n=min(max_total, len(filtered)) if filtered else 0,
-        max_per_section=MAX_PER_SECTION,
-    )
+    if not filtered:
+        return []
+    try:
+        diverse = enforce_diversity(
+            [
+                FusedCandidate(
+                    chunk_id=hit.chunk_id,
+                    fused_score=hit.fused_score,
+                    lexical_rank=hit.lexical_rank,
+                    dense_rank=hit.dense_rank,
+                    lexical_score=hit.lexical_score,
+                    dense_score=hit.dense_score,
+                )
+                for hit in filtered
+            ],
+            sections=sections,
+            max_n=min(max_total, len(filtered)),
+            max_per_section=MAX_PER_SECTION,
+        )
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise TurnFailed("retrieval-failed", str(exc)) from exc
     wanted = {item.chunk_id for item in diverse}
     result = [hit for hit in filtered if hit.chunk_id in wanted]
     result.sort(key=lambda item: item.fused_score, reverse=True)
@@ -680,7 +690,7 @@ def check_coverage(plan: QueryPlan, merged: Sequence[RetrievalHit]) -> CoverageR
         "covered": not gaps,
         "gaps": gaps,
         "distinct_sections": len(sections),
-        "aspects_covered": len(sections),
+        "aspects_covered": min(len(sections), len(plan.aspects)),
         "aspects_total": len(plan.aspects),
     }
     return validate_coverage_payload(payload)
