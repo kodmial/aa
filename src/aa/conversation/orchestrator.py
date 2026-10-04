@@ -1237,7 +1237,7 @@ class TurnRunner:
                 broadened = [*broadened, f"{plan.original_query} {aspect.meaning}"]
                 try:
                     second_hits[aspect.aspect_id] = search_aspect(index, broadened)
-                except ValueError as exc:
+                except (ValueError, OSError, RuntimeError) as exc:
                     raise TurnFailed("retrieval-failed", str(exc)) from exc
                 tool_calls += 1
             combined: dict[str, list[RetrievalHit]] = {}
