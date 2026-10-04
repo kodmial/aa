@@ -240,7 +240,7 @@ _THEME_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:#[A-Za-z0-9_:.\-]+)?)\]")
 # A period followed by a citation belongs to the preceding claim: the split
 # must not strand ``[source/section#chunk]`` away from its sentence.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?!\s*\[)|\n+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?!\s*\[)|(?<=\])\s+|\n+")
 _QUOTED_SPAN_RE = re.compile(r"[«\"„]([^«»\"]{8,400})[»\"“]")
 
 
