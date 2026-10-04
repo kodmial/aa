@@ -29,7 +29,8 @@ jobs:
       - name: Check public recipient exists
         run: |
           test -f corpus/source/encrypted/recipient.txt
-          grep -q '^age1' corpus/source/encrypted/recipient.txt
+          test "$(wc -l < corpus/source/encrypted/recipient.txt)" = "1"
+          grep -Eq '^age1[0-9a-z]+$' corpus/source/encrypted/recipient.txt
       - name: Fetch Russian TXT source (#50 reuse-by-default)
         # Reuse the pinned TXT without network; bootstrap from the provider
         # only to provision a missing TXT (intentional requalification).
