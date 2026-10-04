@@ -10,10 +10,16 @@ def _read(name: str) -> str:
     return (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
-def test_canary_runs_every_four_hours_and_never_releases() -> None:
+def test_canary_runs_every_four_hours_only_after_final_qualification() -> None:
     text = _read("aa-canary.yml")
     assert 'cron: "17 */4 * * *"' in text
     assert "workflow_dispatch:" in text
+    assert "issue_number: 80" in text
+    assert "issue.state === 'closed'" in text
+    assert "issue.state_reason === 'completed'" in text
+    assert "needs: activation" in text
+    assert "needs.activation.outputs.active == 'true'" in text
+    assert "canary stays inactive" in text
     assert "bash scripts/verify.sh" in text
     assert "test_spawned_server_shuts_down_gracefully" in text
     assert "test_attach_mode_never_kills_foreign_server" in text
