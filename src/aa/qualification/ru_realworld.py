@@ -1044,7 +1044,10 @@ def _ensure_topic_provenance_coverage(
                             set(record["provenance_ids"]) | {missing},
                             key=lambda pid: umbrella.index(pid),
                         )
-                        record["provenance_ids"] = merged[: len(umbrella) - 1]
+                        if len(merged) >= len(umbrella):
+                            kept = [pid for pid in merged if pid != missing][: len(umbrella) - 2]
+                            merged = sorted(kept + [missing], key=lambda pid: umbrella.index(pid))
+                        record["provenance_ids"] = merged
             recount: dict[str, int] = {pid: 0 for pid in umbrella}
             for item in records:
                 for pid in item["provenance_ids"]:
