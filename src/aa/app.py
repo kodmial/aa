@@ -22,7 +22,6 @@ from aa.conversation.orchestrator import (
     FAIL_CLOSED_REPLY,
     TurnFailed,
     TurnRunner,
-    is_substantive,
     meets_russian_only,
     run_trivial_turn,
 )
@@ -31,6 +30,7 @@ from aa.conversation.output_limits import (
     envelope_passes,
     resolve_generation_budget,
 )
+from aa.conversation.routing import TurnRoute, route_turn
 from aa.corpus.context import CorpusContext
 from aa.grounding import GroundingGate
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
@@ -676,11 +676,14 @@ class Application:
         The deterministic safety layer runs first: when it takes the
         emergency route, the bounded safe reply is returned immediately
         and no OpenCode work is scheduled (the LLM never decides whether
-        the emergency route is taken). Substantive turns run the full
-        Russian-first grounded pipeline (issue #9); non-substantive
-        greetings take a direct bounded agent path. Retrieval/grounding
-        failures fail closed with a fixed message instead of an invented
-        answer.
+        the emergency route is taken). The explicit turn-routing contract
+        (issue #105) then separates conversational/meta turns from
+        substantive turns before any retrieval: conversational/meta and
+        control/command turns take the direct bounded ``aa`` agent path
+        with no book-evidence requirement, while substantive
+        AA/recovery/book turns run the full Russian-first grounded
+        pipeline (issue #9). Retrieval/grounding failures fail closed
+        with a fixed message instead of an invented answer.
 
         Only message lengths, routing decisions and the voice flag are
         logged, never the message body.
@@ -712,12 +715,25 @@ class Application:
         if result.decision is SafetyDecision.BLOCK:
             logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
+        decision = route_turn(text, result)
+        logger.info(
+            "turn routed",
+            extra={
+                "chat_id": chat_id,
+                "route": decision.route.value,
+                "reason": decision.reason,
+                "requires_grounding": decision.requires_grounding,
+            },
+        )
+        if decision.route is TurnRoute.BLOCKED:
+            logger.info("blocked message refused", extra={"chat_id": chat_id})
+            raise ValueError("refusing to answer an empty message")
         session_id = await self.sessions.ensure_opencode_session(
             chat_id, self.opencode_runtime.client
         )
         voice_mode = bool(voice_input)
         try:
-            if not is_substantive(text):
+            if decision.route in (TurnRoute.CONVERSATIONAL, TurnRoute.COMMAND):
                 try:
                     trivial_reply = await self._run_trivial_turn(
                         session_id, text, voice_mode=voice_mode
@@ -781,7 +797,7 @@ class Application:
                     extra={"chat_id": chat_id, "category": "session-not-found"},
                 )
                 return FAIL_CLOSED_REPLY
-            if not is_substantive(text):
+            if decision.route in (TurnRoute.CONVERSATIONAL, TurnRoute.COMMAND):
                 try:
                     trivial_retry = await self._run_trivial_turn(
                         session_id, text, voice_mode=voice_mode

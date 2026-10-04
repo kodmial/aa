@@ -482,26 +482,16 @@ class SynthesisResult:
 def is_substantive(text: str) -> bool:
     """Return whether ``text`` needs the full grounded pipeline.
 
-    Empty text is not substantive (the safety layer blocks it first).
-    Exact trivial greetings/thanks bypass retrieval; short follow-up
-    questions and interrogatives (``почему?``, ``а дальше?``) always
-    take the full state machine so no substantive turn skips grounding.
+    Delegates to the explicit turn-routing contract
+    (:mod:`aa.conversation.routing`): only SUBSTANTIVE turns require
+    grounding. Conversational/meta questions never require book
+    retrieval merely because they contain ``?`` or an interrogative
+    such as ``зачем/что/как``; substantive recovery/book turns always
+    do. Empty and command turns are not substantive.
     """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    normalized = normalize_ru(stripped)
-    if normalized in _TRIVIAL_NORMALIZED:
-        return False
-    if " ".join(ru_tokens(stripped)) in _TRIVIAL_NORMALIZED:
-        return False
-    if "?" in stripped or "？" in stripped:
-        return True
-    if any(marker in normalized for marker in _FOLLOWUP_INTERROGATIVES):
-        return True
-    if len(normalized) <= 24 and not any(key in normalized for key in _SUBSTANTIVE_KEYWORDS):
-        return False
-    return True
+    from aa.conversation.routing import TurnRoute, classify_text_kind
+
+    return classify_text_kind(text) is TurnRoute.SUBSTANTIVE
 
 
 def _expand_token_queries(token: str) -> list[str]:
