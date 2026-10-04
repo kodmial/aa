@@ -404,6 +404,45 @@ def test_no_private_key_or_plaintext_committed() -> None:
     assert "AGE-SECRET-KEY" in gitignore
 
 
+def test_en_ru_share_single_recipient() -> None:
+    """EN (#24) and RU (#50) share one committed recipient; no second key."""
+    root = _repo_root()
+    recipient_path = root / "corpus" / "source" / "encrypted" / "recipient.txt"
+    assert recipient_path.is_file()
+    text = recipient_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    lines = text.splitlines()
+    assert len(lines) == 1
+    recipient = lines[0].strip()
+    assert recipient.startswith("age1")
+    age_v1.parse_recipient(recipient)
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        check=True,
+    ).stdout.splitlines()
+    recipient_files = [p for p in tracked if "recipient" in p.lower()]
+    assert recipient_files == ["corpus/source/encrypted/recipient.txt"]
+    # One recipient filename constant is shared by both snapshots.
+    assert snap.RECIPIENT_NAME == "recipient.txt"
+    assert snap.ARCHIVE_NAME == "canonical.tar.zst.age"
+    assert snap.RU_ARCHIVE_NAME == "canonical.ru.tar.zst.age"
+    assert snap.RU_ARCHIVE_NAME != snap.ARCHIVE_NAME
+    for workflow in (
+        "encrypted-corpus-refresh.yml",
+        "encrypted-corpus-refresh-ru.yml",
+    ):
+        workflow_text = (root / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "corpus/source/encrypted/recipient.txt" in workflow_text
+        lowered = workflow_text.lower()
+        assert "recipient-ru" not in lowered
+        assert "recipient_ru" not in lowered
+    russian_doc = (root / "docs" / "russian-corpus.md").read_text(encoding="utf-8")
+    assert "no second" in russian_doc.lower()
+
+
 def test_refresh_workflow_is_manual_trusted_and_cache_safe() -> None:
     workflow = (_repo_root() / ".github" / "workflows" / "encrypted-corpus-refresh.yml").read_text(
         encoding="utf-8"

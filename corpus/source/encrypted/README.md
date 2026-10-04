@@ -28,8 +28,12 @@ corpus/source/encrypted/
   archive SHA-256, manifest/source versions, encryption format/version, and
   creation/update instructions.
 - `metadata.ru.json` — Russian counterpart of `metadata.json`.
-- `recipient.txt` — public `age1...` recipient shared by both snapshots.
-  Safe to commit.
+- `recipient.txt` — the single public `age1...` recipient provisioned once
+  via `python3 scripts/age_provision.py --write-recipient
+  corpus/source/encrypted/recipient.txt` (issue #24 contract, reused by the
+  Russian snapshot in issue #50 — never a second private key/password).
+  Shared by both snapshots. Safe to commit; production activation (#28)
+  stores the matching private identity only in `AA_BOOK_AGE_IDENTITY`.
 
 Security rules:
 
