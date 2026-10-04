@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
+
 from aa.config import Settings
 
 
@@ -99,3 +101,14 @@ def test_safe_dict_redacts_token() -> None:
     # Non-secret pointers remain visible for operability.
     assert safe["opencode_base_url"] == settings.opencode_base_url
     assert safe["aa_corpus_version"] == settings.aa_corpus_version
+
+
+def test_session_duration_rejects_over_three_hours() -> None:
+    settings = Settings.from_env({"BOT_SESSION_DURATION_SECONDS": "10801"})
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_session_duration_accepts_three_hour_maximum() -> None:
+    settings = Settings.from_env({"BOT_SESSION_DURATION_SECONDS": "10800"})
+    settings.validate()

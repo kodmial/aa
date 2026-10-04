@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import time
 
+#: Maximum bounded live session duration in seconds (3 hours).
+#: Live operator runs (``/bot start 15m|1h|2h|3h``) must never exceed this.
+MAX_SESSION_DURATION_SECONDS = 3 * 60 * 60
+
 
 class RuntimeController:
     """Tracks session deadlines and stop requests."""
@@ -16,6 +20,10 @@ class RuntimeController:
     def __init__(self, session_duration_seconds: float = 0.0) -> None:
         if session_duration_seconds < 0:
             raise ValueError("session_duration_seconds must be >= 0")
+        if session_duration_seconds > MAX_SESSION_DURATION_SECONDS:
+            raise ValueError(
+                f"session_duration_seconds must be <= {MAX_SESSION_DURATION_SECONDS} (3 hours)"
+            )
         self.session_duration_seconds = session_duration_seconds
         self._deadline: float | None = None
         self._stop_requested = False

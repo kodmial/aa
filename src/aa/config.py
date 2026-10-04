@@ -148,6 +148,8 @@ class Settings:
         """Validate settings, raising ``ValueError`` on misuse."""
         if self.bot_session_duration_seconds < 0:
             raise ValueError("BOT_SESSION_DURATION_SECONDS must be >= 0")
+        if self.bot_session_duration_seconds > 3 * 60 * 60:
+            raise ValueError("BOT_SESSION_DURATION_SECONDS must be <= 10800 (3 hours)")
         if not self.opencode_agent.strip():
             raise ValueError("OPENCODE_AGENT must not be empty")
         if not self.opencode_model.strip():

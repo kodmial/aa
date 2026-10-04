@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from aa.app import Application, create_application
 from aa.config import Settings
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, StubOpenCodeRuntime
@@ -90,3 +92,42 @@ def test_check_boot_path() -> None:
 def test_default_runtime_is_local_opencode() -> None:
     app = create_application(_settings())
     assert isinstance(app.opencode_runtime, LocalOpenCodeRuntime)
+
+
+async def test_live_start_requires_bounded_duration() -> None:
+    settings = Settings.from_env(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:live-token",
+            "BOT_SESSION_DURATION_SECONDS": "0",
+        }
+    )
+    app = Application(settings, opencode_runtime=_stub_runtime())
+    with pytest.raises(ValueError, match="must be > 0 for live runs"):
+        await app.start()
+    await app.stop()
+
+
+async def test_live_start_rejects_duration_over_three_hours() -> None:
+    settings = Settings.from_env(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:live-token",
+            "BOT_SESSION_DURATION_SECONDS": "10801",
+        }
+    )
+    with pytest.raises(ValueError, match="3 hours"):
+        Application(settings, opencode_runtime=_stub_runtime())
+
+
+async def test_live_start_accepts_bounded_duration() -> None:
+    settings = Settings.from_env(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:live-token",
+            "BOT_SESSION_DURATION_SECONDS": "60",
+        }
+    )
+    app = Application(settings, opencode_runtime=_stub_runtime())
+    await app.start()
+    try:
+        assert app.running
+    finally:
+        await app.stop()

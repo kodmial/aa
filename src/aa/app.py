@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from aa.config import Settings
-from aa.control.runtime_control import RuntimeController
+from aa.control.runtime_control import MAX_SESSION_DURATION_SECONDS, RuntimeController
 from aa.corpus.context import CorpusContext
 from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
@@ -81,6 +81,18 @@ class Application:
         if self._running:
             return
         self.settings.validate(require_bot_token=False)
+        if self.settings.has_bot_token:
+            # Live operator runs must always be bounded: the control plane
+            # only offers 15m/1h/2h/3h, so an unbounded or over-maximum
+            # duration here is a misconfiguration, never a valid live run.
+            duration = self.settings.bot_session_duration_seconds
+            if duration <= 0:
+                raise ValueError("BOT_SESSION_DURATION_SECONDS must be > 0 for live runs")
+            if duration > MAX_SESSION_DURATION_SECONDS:
+                raise ValueError(
+                    "BOT_SESSION_DURATION_SECONDS must be <= "
+                    f"{MAX_SESSION_DURATION_SECONDS} (3 hours)"
+                )
         logger.info("starting worker", extra={"config": self.settings.to_safe_dict()})
         await self.corpus.load()
         try:

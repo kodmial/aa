@@ -18,6 +18,13 @@ permissions:
   actions: read
   contents: read
 
+# Only one live poller may own the bot token at a time. Queued duplicates
+# are rejected by the explicit active-run check below; this group only
+# guarantees they serialize instead of overlapping.
+concurrency:
+  group: aa-bot-runtime
+  cancel-in-progress: false
+
 jobs:
   runtime:
     runs-on: ubuntu-latest

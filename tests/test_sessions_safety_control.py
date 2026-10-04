@@ -54,3 +54,16 @@ async def test_runtime_controller_unbounded_until_stopped() -> None:
 def test_runtime_controller_rejects_negative_duration() -> None:
     with pytest.raises(ValueError):
         RuntimeController(session_duration_seconds=-1)
+
+
+def test_runtime_controller_rejects_duration_over_three_hours() -> None:
+    with pytest.raises(ValueError):
+        RuntimeController(session_duration_seconds=10801)
+
+
+async def test_runtime_controller_accepts_three_hour_maximum() -> None:
+    controller = RuntimeController(session_duration_seconds=10800)
+    await controller.start()
+    assert controller.deadline is not None
+    assert not controller.should_stop()
+    await controller.stop()
