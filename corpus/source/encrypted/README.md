@@ -34,6 +34,9 @@ corpus/source/encrypted/
   Russian snapshot in issue #50 — never a second private key/password).
   Shared by both snapshots. Safe to commit; production activation (#28)
   stores the matching private identity only in `AA_BOOK_AGE_IDENTITY`.
+  The file is created only during #28 production activation: feature work
+  (including #50) must never commit a fresh or test recipient, otherwise
+  EN/RU snapshots diverge and production restore fails.
 
 Security rules:
 

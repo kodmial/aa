@@ -470,12 +470,12 @@ def test_encryption_round_trip_same_recipient_contract(tmp_path: pathlib.Path) -
         assert snap.RU_ARCHIVE_NAME == "canonical.ru.tar.zst.age"
         assert snap.RU_METADATA_NAME == "metadata.ru.json"
         assert snap.RU_CANONICAL_NAME == "canonical.ru.json"
-        # The committed shared recipient parses under the same contract.
-        committed = (
-            (_repo_root() / "corpus" / "source" / "encrypted" / "recipient.txt")
-            .read_text(encoding="utf-8")
-            .strip()
-        )
+        # The committed shared recipient (provisioned once in #28;
+        # absent until then) parses under the same contract.
+        committed_path = _repo_root() / "corpus" / "source" / "encrypted" / "recipient.txt"
+        if not committed_path.is_file():
+            pytest.skip("no provisioned recipient yet (production activation is tracked in #28)")
+        committed = committed_path.read_text(encoding="utf-8").strip()
         assert committed.startswith("age1")
         age_v1.parse_recipient(committed)
     finally:
