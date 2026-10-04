@@ -486,22 +486,12 @@ def check_locator_authentic(ctx: HardCheckContext) -> HardCheckResult:
     """Every cited locator/source must resolve in the qualified RU index."""
     if not ctx.evidence_locators:
         return HardCheckResult("locator_authentic", True, "no locator cited", "evidence-pack")
-    known_sources = set(ctx.source_texts)
     for locator in ctx.evidence_locators:
         if locator in ctx.valid_locators:
             continue
-        # Fragment locators (source#fragment) must match the qualified index
-        # exactly: a known source id alone never authenticates a fragment, so
-        # fabricated fragments such as ``cal-src-01#ch99-fake`` fail closed.
-        if "#" in locator:
-            return HardCheckResult(
-                "locator_authentic",
-                False,
-                f"fabricated locator/source: {locator!r}",
-                "evidence-pack",
-            )
-        if locator in known_sources:
-            continue
+        # Every cited locator must resolve in the qualified RU index exactly:
+        # a known source id alone never authenticates, and fabricated fragments
+        # such as ``cal-src-01#ch99-fake`` fail closed.
         return HardCheckResult(
             "locator_authentic",
             False,

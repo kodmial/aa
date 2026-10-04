@@ -383,6 +383,7 @@ jobs:
           EVALUATOR_MODEL: ${{ needs.readiness.outputs.evaluator_model }}
           EXPECTED_GENERATOR_MODEL: ${{ needs.readiness.outputs.expected_generator_model }}
           EXPECTED_RUNTIME_VERSION: ${{ needs.readiness.outputs.expected_runtime_version }}
+          EXPECTED_ARTIFACT: ${{ needs.readiness.outputs.artifact_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -438,6 +439,9 @@ jobs:
           ).strip().split()[0]
           if artifact_sha != recorded:
               raise AnswerQualityError("benchmark artifact checksum mismatch on download")
+          expected_artifact = os.environ.get("EXPECTED_ARTIFACT", "").strip()
+          if expected_artifact and artifact_sha != expected_artifact:
+              raise AnswerQualityError("benchmark artifact does not match readiness-pinned artifact sha")
 
           raw = decrypt_and_decompress(encrypted, identity=identity)
           full = json.loads(raw.decode("utf-8"))

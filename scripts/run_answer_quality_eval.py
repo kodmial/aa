@@ -144,7 +144,13 @@ def run_transcript(
     # shipped inside the benchmark transcript itself (the same index the
     # workflow grading job restores from the canonical RU corpus), never the
     # synthetic calibration index: genuine book locators must resolve here.
-    valid_locators = frozenset(str(key) for key in sources.keys()) if sources else frozenset()
+    raw_valid = payload.get("valid_locators", None)
+    if isinstance(raw_valid, list) and raw_valid:
+        valid_locators = frozenset(str(item) for item in raw_valid)
+    elif isinstance(raw_valid, (set, tuple, frozenset)):
+        valid_locators = frozenset(str(item) for item in raw_valid)
+    else:
+        valid_locators = frozenset(str(key) for key in sources.keys()) if sources else frozenset()
     # Generator/runtime identity recorded by the benchmark artifact itself.
     identity = payload.get("eval_identity", {})
     if not isinstance(identity, dict):
@@ -318,8 +324,8 @@ def main(argv: list[str] | None = None) -> int:
             evaluator_id=args.evaluator_id,
             out_dir=Path(args.out_dir),
             tested_sha=args.main_sha,
-            current_main_sha=args.current_main_sha or args.main_sha,
-            trusted_pass_sha=args.trusted_pass_sha or args.main_sha,
+            current_main_sha=args.current_main_sha,
+            trusted_pass_sha=args.trusted_pass_sha,
             corpus_sha=args.corpus_sha,
             artifact_sha=args.artifact_sha,
             expected_corpus_sha=args.expected_corpus_sha,
