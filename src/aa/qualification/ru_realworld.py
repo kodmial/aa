@@ -1859,9 +1859,9 @@ def _check_audience_evidence(
 # current-acute: past framing plus recent recurrence of severe-symptom
 # language must run the emergency-classifier guard, never bypass it.
 _HISTORICAL_MARK_RE = re.compile(
-    r"назад|раньше|в\s+прошлом|тогда|давно|когда-то|в\s+молодости|в\s+детстве|"
+    r"(?<!\w)(?:назад|раньше|в\s+прошлом|тогда|давно|когда-то|в\s+молодости|в\s+детстве|"
     r"прошлый|в\s+прошлый\s+раз|много\s+лет\s+назад|years?\s+ago|in\s+the\s+past|"
-    r"used\s+to|history\s+of|long\s+ago|back\s+then|previously|formerly",
+    r"used\s+to|history\s+of|long\s+ago|back\s+then|previously|formerly)(?!\w)",
     re.IGNORECASE,
 )
 _HISTORICAL_ACUTE_MARK_RE = re.compile(
