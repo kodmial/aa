@@ -114,7 +114,10 @@ on:
     types: [completed]
 
 permissions:
+  actions: read
   contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   call:
