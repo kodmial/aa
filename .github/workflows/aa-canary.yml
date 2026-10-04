@@ -1,0 +1,165 @@
+name: AA canary
+
+on:
+  schedule:
+    # Every four hours, offset from the top of the hour to avoid GitHub's
+    # highest scheduled-workflow load.
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: aa-canary
+  cancel-in-progress: false
+
+jobs:
+  activation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      active: ${{ steps.gate.outputs.active }}
+    steps:
+      - name: Gate canary on final AA qualification
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            let active = false;
+            let detail = 'qualification #80 is not complete';
+            try {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 80,
+              });
+              active = issue.state === 'closed' && issue.state_reason === 'completed';
+              detail = active
+                ? 'qualification #80 is complete'
+                : `qualification #80 state=${issue.state}, reason=${issue.state_reason || 'none'}`;
+            } catch (error) {
+              core.warning(
+                `Unable to verify final qualification #80; canary stays inactive: ${error.message}`
+              );
+              detail = 'qualification #80 could not be verified';
+            }
+
+            core.setOutput('active', active ? 'true' : 'false');
+            core.notice(
+              active
+                ? 'AA canary activated by completed final qualification #80.'
+                : `AA canary cleanly skipped: ${detail}.`
+            );
+            await core.summary
+              .addHeading('AA canary activation')
+              .addRaw(active ? 'ACTIVE' : 'NOT READY')
+              .addEOL()
+              .addRaw(detail)
+              .write();
+
+  canary:
+    needs: activation
+    if: needs.activation.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project and dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
+              bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Verify complete repository contract
+        shell: bash
+        run: bash scripts/verify.sh
+
+      - name: Smoke real local OpenCode server lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v opencode >/dev/null
+          python -m pytest -q \
+            tests/test_opencode_integration.py::test_spawned_server_shuts_down_gracefully \
+            tests/test_opencode_integration.py::test_attach_mode_never_kills_foreign_server
+
+      - name: Probe Telegram Bot API
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+            echo "::error::TELEGRAM_BOT_TOKEN is not configured."
+            exit 1
+          fi
+
+          response=""
+          for attempt in 1 2 3; do
+            if response="$(curl -fsS --max-time 15 --retry 2 --retry-delay 2 \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")"; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Telegram Bot API readiness probe failed."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+          TELEGRAM_PROBE="$response" python - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["TELEGRAM_PROBE"])
+          if payload.get("ok") is not True:
+              raise SystemExit("Telegram Bot API returned ok != true")
+          result = payload.get("result") or {}
+          if not result.get("id") or result.get("is_bot") is not True:
+              raise SystemExit("Telegram Bot API identity payload is invalid")
+          print("Telegram Bot API readiness: OK")
+          PY
+
+      - name: Record canary summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## AA canary"
+            echo
+            echo "- final activation gate: qualification #80 completed"
+            echo "- repository verification: executed"
+            echo "- real local OpenCode server lifecycle: executed"
+            echo "- Telegram Bot API getMe probe: executed"
+            echo "- product release: not performed"
+          } >> "$GITHUB_STEP_SUMMARY"
