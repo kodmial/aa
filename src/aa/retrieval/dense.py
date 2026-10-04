@@ -151,9 +151,8 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
     vectors: list[list[float]] = []
     with torch_mod.no_grad():
         for text in texts:
-            encoded = tokenizer(
-                "query: " + text, return_tensors="pt", truncation=True, max_length=512
-            )
+            prefixed = text if text.startswith(("query: ", "passage: ")) else "query: " + text
+            encoded = tokenizer(prefixed, return_tensors="pt", truncation=True, max_length=512)
             output = model(**encoded).last_hidden_state
             mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
             pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
