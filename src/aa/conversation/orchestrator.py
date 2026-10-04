@@ -103,11 +103,72 @@ MAX_EVIDENCE_CHUNKS = 8
 MAX_READ_PER_TURN = 6
 
 FAIL_CLOSED_REPLY = (
-    "Не могу дать обоснованный ответ по имеющимся отрывкам книги. "
-    "Попробуйте уточнить вопрос. / "
-    "I cannot give a grounded answer from the available book passages. "
-    "Please refine your question."
+    "Не могу дать обоснованный ответ по имеющимся отрывкам книги. Попробуйте уточнить вопрос."
 )
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+_EN_FALLBACK_PATTERNS = (
+    r"cannot\s+provide",
+    r"grounded\s+answer",
+    r"available\s+book",
+    r"book\s+passages",
+    r"refine\s+your\s+question",
+    r"please\s+refine",
+    r"please\s+try\s+again",
+    r"could\s+not\s+process",
+    r"bot\s+is\s+ready",
+    r"new\s+conversation",
+    r"send\s+a\s+message",
+    r"i\s+cannot\s+give",
+    r"ask\s+.*clarif",
+    r"insufficient\s+grounding",
+    r"fail[-\s]?closed",
+    r"opencode",
+    r"model\s+unavailable",
+    r"provider\s+error",
+    r"http\s*=",
+    r"transient",
+)
+
+_EN_FALLBACK_RES = tuple(re.compile(item, re.IGNORECASE) for item in _EN_FALLBACK_PATTERNS)
+
+
+def _strip_citations_for_language_check(text: str) -> str:
+    """Remove ``[source/section#chunk]`` pointers before language checks."""
+    return _CITATION_RE.sub(" ", text)
+
+
+def contains_english_fallback(text: str) -> bool:
+    """Return whether ``text`` leaks an English error/fallback fragment."""
+    cleaned = _strip_citations_for_language_check(text)
+    return any(item.search(cleaned) is not None for item in _EN_FALLBACK_RES)
+
+
+def meets_russian_only(text: str) -> bool:
+    """Return whether user-visible ``text`` obeys the RU-only contract.
+
+    Citations are pointers, not prose: they are stripped first. Valid
+    Russian text must contain Cyrillic and must not contain any Latin
+    (visible English) prose, English error/fallback fragment, or
+    internal provider token.
+    """
+    cleaned = _strip_citations_for_language_check(text)
+    if contains_english_fallback(text):
+        return False
+    if _CYRILLIC_RE.search(cleaned) is None:
+        return False
+    if _LATIN_RE.search(cleaned) is not None:
+        return False
+    return True
+
+
+def ensure_russian_only(text: str) -> None:
+    """Raise :class:`TurnFailed` when ``text`` violates the RU-only contract."""
+    if not meets_russian_only(text):
+        raise TurnFailed("language-violation", "synthesis violated the RU-only contract")
+
 
 _TRIVIAL_NORMALIZED = frozenset(
     {
@@ -255,6 +316,17 @@ _THEME_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("faith", ("высш", "сил", "вера", "молитв", "медитац", "агностик")),
     ("fellowship", ("содруж", "сообществ", "групп", "собран", "спонсор", "служени")),
 )
+
+# Coverage-oriented additive queries for broad/general turns (issue #98).
+# Same-language generic program vocabulary only: no factual strengthening,
+# no diagnosis, no loss-of-control/divorce/medical assumptions. Used to
+# sample distinct book regions when the user wording carries no specific
+# theme marker, so a broad query does not collapse to one top hit.
+_BROAD_COVERAGE_QUERIES: dict[str, tuple[str, ...]] = {
+    "general": (),
+    "program": ("программа трезвость шаги", "трезвость программа выздоровление"),
+    "support": ("сообщество поддержка помощь", "помощь сообщества трезвость"),
+}
 
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:#[A-Za-z0-9_:.\-]+)?)\]")
 # A period followed by a citation belongs to the preceding claim: the split
@@ -465,7 +537,10 @@ def build_local_plan_payload(text: str, *, utterance_id: str = "turn-1") -> dict
     tokens = ru_tokens(stripped)
     themes = _detect_themes(normalized)
     if not themes:
-        themes = ["general"]
+        # Broad/coverage-oriented turn: no specific theme marker. Plan
+        # multiple whole-book searches so retrieval samples distinct
+        # regions instead of collapsing to one top hit (issue #98).
+        themes = ["general", "program", "support"]
 
     ambiguity = "none"
     if any(token in ("сорвался", "сорвусь", "сорваться") for token in tokens):
@@ -488,12 +563,22 @@ def build_local_plan_payload(text: str, *, utterance_id: str = "turn-1") -> dict
             if len(lexical) >= 4:
                 break
             lexical.append(rewrite)
+        for extra in _BROAD_COVERAGE_QUERIES.get(theme, ()):
+            if len(lexical) >= 4:
+                break
+            if extra.casefold() not in {item.casefold() for item in lexical}:
+                lexical.append(extra)
         semantic: list[str] = [stripped]
         if normalized != stripped:
             semantic.append(normalized)
         stemmed = " ".join(ru_stem(token) for token in tokens if token)
         if stemmed and stemmed not in semantic and len(semantic) < 4:
             semantic.append(stemmed)
+        for extra in _BROAD_COVERAGE_QUERIES.get(theme, ()):
+            if len(semantic) >= 4:
+                break
+            if extra.casefold() not in {item.casefold() for item in semantic}:
+                semantic.append(extra)
         aspects.append(
             {
                 "aspect_id": theme if len(themes) > 1 else "main",
@@ -704,6 +789,12 @@ def check_coverage(plan: QueryPlan, merged: Sequence[RetrievalHit]) -> CoverageR
         gaps.append("no candidates retrieved")
     if plan.aspects and len(merged) < len(plan.aspects):
         gaps.append("fewer candidates than planned aspects")
+    aspect_ids = {aspect.aspect_id for aspect in plan.aspects}
+    broad_ids = {"general", "main", "program", "support"}
+    if merged and len(sections) < 2 and (aspect_ids & broad_ids):
+        gaps.append("broad turn needs evidence from at least two sections")
+    if merged and len(plan.aspects) > 1 and len(sections) < min(3, len(plan.aspects)):
+        gaps.append("coverage-oriented turn needs at least three distinct sections")
     payload: dict[str, Any] = {
         "schema_version": COVERAGE_SCHEMA_VERSION,
         "covered": not gaps,
@@ -924,11 +1015,16 @@ def build_synthesis_prompt(
     except ValueError:
         budget = resolve_generation_budget(0)
     lines: list[str] = [
-        "Ответь по-русски, используя ТОЛЬКО приведённые ниже точные отрывки.",
+        "Ответь ТОЛЬКО по-русски, используя ТОЛЬКО приведённые ниже точные отрывки.",
+        "Весь видимый ответ — на русском языке; английский текст запрещён.",
         "Каждое существенное утверждение снабди цитатой-ссылкой вида [source/section#chunk].",
         "Прямые цитаты — дословный русский текст отрывков без изменений.",
         "Если отрывки не подтверждают просьбу, так и скажи и предложи только близкий",
         "подтверждённый материал. Не выдумывай факты и цитаты.",
+        "Если обоснованный ответ невозможен, ответи строго: "
+        "Не могу дать обоснованный ответ по имеющимся отрывкам книги. "
+        "Попробуйте уточнить вопрос.",
+        "Никогда не отвечай по-английски и не сообщай технические детали.",
         "",
         "ФОРМАТ ОТВЕТА (обязательно): отвечай кратко, как в переписке, "
         "обычно 2-5 коротких предложений. Обычная цель: не более "
@@ -1058,6 +1154,18 @@ def judge_unit(
     # Citations are provenance pointers, not claim content: semantic support
     # is judged on the citation-stripped claim so locator tokens can never
     # dilute same-language overlap or smuggle cross-language support.
+    if kind is QuoteKind.TRANSLATION:
+        # Same-language Russian prose (own-words summary required by the
+        # anti-corpus-dump policy): grounded by stemmed entailment against
+        # the cited source text. No translation label is required here;
+        # cross-language translation policy stays in ``check_grounding``.
+        # Language purity is enforced separately by ``ensure_russian_only``.
+        support_text = " ".join(item.text for item in cited_units)
+        if not quoted.strip() or not support_text.strip():
+            return False, False, kind, tuple(validated)
+        judge = entails if entails is not None else default_entails
+        passed = bool(judge(quoted, support_text))
+        return passed, False, kind, tuple(validated)
     verdict = check_grounding(
         russian_claim=quoted,
         quoted_text=quoted,
@@ -1068,7 +1176,6 @@ def judge_unit(
         allow_translation_fallback=False,
         entails=entails if entails is not None else default_entails,
     )
-    _ = cited_units
     return verdict.passed, verdict.source_exact, kind, tuple(validated)
 
 
@@ -1443,12 +1550,27 @@ class TurnRunner:
         retrieval_rounds = 1
         if not coverage.covered and MAX_RETRIEVAL_ROUNDS > 1:
             # One bounded second round with broadened additive queries.
-            # The original wording stays; planner meanings only broaden
-            # vocabulary and never strengthen factual meaning.
+            # The original wording stays; only same-language additive
+            # vocabulary (stems, normalized form, broad program terms)
+            # is added and never strengthens factual meaning.
+            normalized_query = normalize_ru(plan.original_query)
+            stemmed_query = " ".join(
+                ru_stem(token) for token in ru_tokens(plan.original_query) if token
+            )
             second_hits: dict[str, list[RetrievalHit]] = {}
             for aspect in plan.aspects:
                 broadened = aspect_search_queries(aspect, original_query=plan.original_query)
-                broadened = [*broadened, f"{plan.original_query} {aspect.meaning}"]
+                seen_queries = {item.casefold() for item in broadened}
+                for extra in (
+                    normalized_query,
+                    stemmed_query,
+                    *_BROAD_COVERAGE_QUERIES.get(aspect.aspect_id, ()),
+                ):
+                    cleaned = extra.strip()
+                    if not cleaned or cleaned.casefold() in seen_queries:
+                        continue
+                    seen_queries.add(cleaned.casefold())
+                    broadened.append(cleaned)
                 try:
                     second_hits[aspect.aspect_id] = search_aspect(index, broadened)
                 except (ValueError, OSError, RuntimeError) as exc:
@@ -1461,11 +1583,12 @@ class TurnRunner:
             coverage = check_coverage(plan, merged)
             retrieval_rounds = 2
 
+        distinct_sections = {hit.section for hit in merged}
         pack, read_calls = load_exact_evidence(
             index,
             merged,
             ru_corpus_version=ru_version,
-            expand_multi_aspect=len(plan.aspects) > 1,
+            expand_multi_aspect=len(plan.aspects) > 1 or len(distinct_sections) < 2,
         )
         tool_calls += read_calls
         pack = fit_evidence_budget(pack, budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS)
@@ -1524,8 +1647,17 @@ class TurnRunner:
                 extra={"aspects": len(plan.aspects), "evidence": len(pack.units)},
             )
             raise
+        try:
+            ensure_russian_only(synthesis.text)
+            language_ok_first = True
+        except TurnFailed:
+            logger.warning(
+                "grounded turn synthesis violated RU-only contract",
+                extra={"aspects": len(plan.aspects), "evidence": len(pack.units)},
+            )
+            language_ok_first = False
         unsupported_first = [unit for unit in first.units if unit.grounding_passed is False]
-        if not unsupported_first:
+        if language_ok_first and not unsupported_first:
             logger.info(
                 "grounded turn completed",
                 extra={
@@ -1558,10 +1690,10 @@ class TurnRunner:
             extra={"unsupported": len(unsupported_first), "evidence": len(pack.units)},
         )
         repair_note = (
-            "Перепиши ответ, опираясь только на отрывки. "
+            "Перепиши ответ ТОЛЬКО по-русски, опираясь только на отрывки. "
             f"Неподтверждённых мест: {len(unsupported_first)}. "
             "Каждое существенное утверждение — с ссылкой; "
-            "прямые цитаты — дословно."
+            "прямые цитаты — дословно. Английский текст запрещён."
         )
         repair_prompt = build_synthesis_prompt(user_text=text, pack=pack, repair=repair_note)
         try:
@@ -1592,6 +1724,7 @@ class TurnRunner:
             error_category=repaired.error_category,
             retry_count=repaired.retry_count,
         )
+        ensure_russian_only(repaired.text)
         response = build_grounded_response(
             answer=repaired.text,
             pack=pack,
@@ -1604,6 +1737,7 @@ class TurnRunner:
                 "grounding-failed",
                 f"{len(unsupported)} answer unit(s) lack semantic support",
             )
+        ensure_russian_only(response.text)
         logger.info(
             "grounded turn completed after regeneration",
             extra={
@@ -1632,6 +1766,15 @@ class TurnRunner:
         return enveloped
 
 
+def build_trivial_prompt(*, user_text: str) -> str:
+    """Build the RU-only prompt for a non-substantive turn."""
+    return (
+        "Ответь ТОЛЬКО по-русски. Весь видимый ответ — на русском языке; "
+        "английский текст запрещён.\n"
+        f"{user_text}"
+    )
+
+
 async def run_trivial_turn(
     text: str,
     *,
@@ -1642,14 +1785,20 @@ async def run_trivial_turn(
     fallback_model: str,
     sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> SynthesisResult:
-    """Answer a non-substantive turn directly through the named agent."""
+    """Answer a non-substantive turn directly through the named agent.
+
+    The prompt demands a Russian-only reply. Any synthesis violating
+    the RU-only contract (missing Cyrillic, visible English/Latin, or
+    an English fallback/error/provider fragment) fails the turn closed
+    for a deterministic Russian fallback upstream.
+    """
     if not text.strip():
         raise TurnFailed("empty-turn", "refusing an empty turn")
     try:
         result = await send_with_fallback(
             send,
             session_id,
-            text,
+            build_trivial_prompt(user_text=text),
             agent=agent,
             primary_model=primary_model,
             fallback_model=fallback_model,
@@ -1657,8 +1806,12 @@ async def run_trivial_turn(
         )
     except OpenCodeSessionNotFoundError as exc:
         raise TurnFailed("session-not-found", "opencode session is gone") from exc
+    if not meets_russian_only(result.text):
+        raise TurnFailed("language-violation", "trivial synthesis violated RU-only contract")
     if not envelope_passes(result.text):
         compacted = compact_text_to_envelope(result.text)
+        if not meets_russian_only(compacted):
+            raise TurnFailed("language-violation", "trivial synthesis violated RU-only contract")
         logger.info(
             "trivial turn compacted to envelope",
             extra={
@@ -1699,14 +1852,18 @@ __all__ = [
     "build_grounded_response",
     "build_local_plan_payload",
     "build_synthesis_prompt",
+    "build_trivial_prompt",
     "check_coverage",
     "compact_grounded_response",
+    "contains_english_fallback",
     "deduplicate_cross_aspect",
     "enforce_grounded_envelope",
+    "ensure_russian_only",
     "fit_evidence_budget",
     "is_substantive",
     "judge_unit",
     "load_exact_evidence",
+    "meets_russian_only",
     "response_envelope_ok",
     "response_quote_chars",
     "run_planner",

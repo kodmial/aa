@@ -614,7 +614,8 @@ async def test_trivial_turn_uses_named_agent_with_fallback() -> None:
         session_id: str, prompt: str, *, agent: str = "", model: str = "", **_kw: Any
     ) -> str:
         seen.append((agent, model))
-        return "hello answer"
+        assert "по-русски" in prompt
+        return "Привет! Чем могу помочь?"
 
     result = await run_trivial_turn(
         "привет",
@@ -625,7 +626,7 @@ async def test_trivial_turn_uses_named_agent_with_fallback() -> None:
         fallback_model=FALLBACK,
         sleep=_noop_sleep,
     )
-    assert result.text == "hello answer"
+    assert result.text == "Привет! Чем могу помочь?"
     assert seen == [(AGENT_NAME, PRIMARY)]
 
 
@@ -727,10 +728,16 @@ def test_runtime_model_policy_has_no_third_fallback() -> None:
 
 
 def test_fail_closed_reply_carries_no_book_claims() -> None:
-    # Operational fail-closed message: states inability + asks to refine,
-    # carries no citations, no quotations and no factual book assertions.
+    # Operational fail-closed message: Russian-only, states inability +
+    # asks to refine, carries no citations, no quotations, no factual book
+    # assertions and no English fallback text (issue #98).
     assert "уточнить" in FAIL_CLOSED_REPLY
-    assert "refine" in FAIL_CLOSED_REPLY
     assert "[" not in FAIL_CLOSED_REPLY
     assert "«" not in FAIL_CLOSED_REPLY
+    for marker in ("refine", "cannot", "grounded", "please", "I cannot"):
+        assert marker not in FAIL_CLOSED_REPLY
+    from aa.conversation.orchestrator import contains_english_fallback, meets_russian_only
+
+    assert not contains_english_fallback(FAIL_CLOSED_REPLY)
+    assert meets_russian_only(FAIL_CLOSED_REPLY)
     assert RUNTIME_VERSION.startswith("aa-conversation-runtime/")

@@ -378,8 +378,8 @@ async def test_telegram_text_reaches_correct_session_and_chats_isolated() -> Non
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 2)
         by_chat = {payload["chat_id"]: payload["text"] for payload in api.sent_payloads}
-        assert by_chat[11] == "fake-reply-1"
-        assert by_chat[22] == "fake-reply-1"
+        assert by_chat[11] == "Фиктивный ответ 1"
+        assert by_chat[22] == "Фиктивный ответ 1"
         session_a = app.sessions.get_opencode_session_id(11)
         session_b = app.sessions.get_opencode_session_id(22)
         assert session_a is not None and session_b is not None
@@ -457,10 +457,10 @@ async def test_new_is_serialized_with_in_flight_turn_and_resets_only_one_chat() 
             by_chat.setdefault(payload["chat_id"], []).append(payload["text"])
         # Chat 301 keeps strict FIFO: slow turn, then /new, then next turn.
         assert len(by_chat[301]) == 3
-        assert by_chat[301][0] == "fake-reply-1"
-        assert "New conversation started" in by_chat[301][1]
-        assert by_chat[301][2] == "fake-reply-1"
-        assert by_chat[302] == ["fake-reply-1"]
+        assert by_chat[301][0] == "Фиктивный ответ 1"
+        assert "Новая беседа начата" in by_chat[301][1]
+        assert by_chat[301][2] == "Фиктивный ответ 1"
+        assert by_chat[302] == ["Фиктивный ответ 1"]
         # Only the requesting chat was rebound.
         assert app.sessions.get_opencode_session_id(301) != app.sessions.get_opencode_session_id(
             302
@@ -559,11 +559,16 @@ async def test_substantive_turn_requires_source_support_and_fails_closed() -> No
 
 
 async def test_user_language_is_preserved_for_fixed_replies() -> None:
-    assert "Бот готов" in _START_REPLY and "Bot is ready" in _START_REPLY
-    assert "Новая беседа" in _NEW_REPLY and "New conversation" in _NEW_REPLY
+    assert "Бот готов" in _START_REPLY
+    assert "Новая беседа" in _NEW_REPLY
+    assert "Bot is ready" not in _START_REPLY
+    assert "New conversation" not in _NEW_REPLY
+    assert "Could not process" not in _TEMPORARY_ERROR_REPLY
+    assert "The bot is busy" not in _BUSY_REPLY
     assert envelope_passes(_START_REPLY)
     assert envelope_passes(_NEW_REPLY)
     assert envelope_passes(_TEMPORARY_ERROR_REPLY)
+    assert envelope_passes(_BUSY_REPLY)
 
 
 def test_book_map_and_tools_available_in_every_session() -> None:

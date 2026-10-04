@@ -380,7 +380,7 @@ class FakeOpenCodeClient(OpenCodeClient):
         history = record["messages"]
         assert isinstance(history, list)
         history.append({"role": "user"})
-        reply = f"fake-reply-{len(history)}"
+        reply = f"Фиктивный ответ {len(history)}"
         history.append({"role": "assistant", "text": reply})
         return reply
 
