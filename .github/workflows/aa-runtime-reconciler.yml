@@ -1,0 +1,148 @@
+name: AA runtime reconciler
+
+on:
+  # Bounded test-campaign controller only: wake every 30 minutes (UTC cron;
+  # exact wake time is not guaranteed) to continue an explicitly activated
+  # manual-testing campaign. This is not an always-on hosting mechanism.
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+# Serialize overlapping cron/event wake-ups so duplicate ticks can never
+# dispatch two pollers; a queued duplicate re-reads state and no-ops.
+concurrency:
+  group: aa-runtime-control
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reconcile bounded campaign
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTROL_ISSUE: "31"
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // Issue #6 bounded reconciler: dispatch exactly one fixed 5h
+            // runtime only when a campaign is active, unexpired and
+            // starts_used < 4. Every other case is a success no-op, and an
+            // expired/completed/stopped campaign never auto-renews: later
+            // wake-ups stay permanent no-ops until a new owner `/run`.
+            // State is re-read immediately before dispatch (owner comments +
+            // authoritative run history), the committed dispatch itself is
+            // the durable start counter (failed/short runs still consume one
+            // start), and the runtime workflow rejects any queued duplicate
+            // behind its concurrency group, so duplicate cron/events cannot
+            // produce concurrent or queued duplicate pollers.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const controlIssue = Number(process.env.CONTROL_ISSUE);
+            const ACTIVE = ['queued', 'in_progress', 'waiting', 'requested', 'pending'];
+            const DAY_MS = 24 * 3600 * 1000;
+            const MAX_STARTS = 4;
+
+            const listAllComments = async () => {
+              const comments = [];
+              let page = 1;
+              for (;;) {
+                const { data } = await github.rest.issues.listComments({
+                  owner, repo, issue_number: controlIssue, per_page: 100, page,
+                });
+                comments.push(...data);
+                if (data.length < 100) break;
+                page += 1;
+              }
+              return comments;
+            };
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'aa-runtime.yml', per_page: 100,
+            });
+            const runs = data.workflow_runs;
+            const comments = await listAllComments();
+            const nowMs = Date.now();
+
+            const runTimes = comments
+              .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/run')
+              .map(c => Date.parse(c.created_at))
+              .filter(t => Number.isFinite(t))
+              .sort((a, b) => a - b);
+            const stopTimes = comments
+              .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/bot stop')
+              .map(c => Date.parse(c.created_at))
+              .filter(t => Number.isFinite(t));
+            const createdTimes = runs
+              .map(r => Date.parse(r.created_at))
+              .filter(t => Number.isFinite(t));
+
+            let accepted = null;
+            const sortedCreated = [...createdTimes].sort((a, b) => a - b);
+            for (let i = 0; i < runTimes.length; i++) {
+              const candidate = runTimes[i];
+              if (stopTimes.some(s => s > candidate)) continue;
+              if (nowMs - candidate >= DAY_MS) continue;
+              if (sortedCreated.filter(t => t > candidate).length >= MAX_STARTS) continue;
+              let exhaustedBefore = false;
+              for (let j = 0; j < i; j++) {
+                const prev = runTimes[j];
+                const prevRuns = sortedCreated.filter(t => t > prev);
+                if (prevRuns.length >= MAX_STARTS && candidate <= prevRuns[MAX_STARTS - 1]) {
+                  exhaustedBefore = true;
+                  break;
+                }
+              }
+              if (exhaustedBefore) continue;
+              accepted = candidate;
+              break;
+            }
+
+            if (accepted === null) {
+              core.info('Reconciler no-op: no active campaign (none, expired, completed or stopped). No renew.');
+              return;
+            }
+
+            const active = runs
+              .filter(r => r.conclusion === null && ACTIVE.includes(r.status))
+              .sort((a, b) => a.id - b.id);
+            if (active.length) {
+              core.info(`Reconciler no-op: runtime #${active[0].id} already ${active[0].status}; never queue a second poller.`);
+              return;
+            }
+
+            const startsUsed = createdTimes.filter(t => t > accepted).length;
+            if (startsUsed >= MAX_STARTS) {
+              core.info(`Reconciler no-op: campaign already used ${startsUsed}/${MAX_STARTS} starts.`);
+              return;
+            }
+
+            // Authoritative re-read passed: commit exactly one 5h dispatch.
+            // The new workflow run is the durable counter increment.
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration: '5h' },
+            });
+            core.info(`Reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h).`);
+            try {
+              await new Promise(resolve => setTimeout(resolve, 1500));
+              const latest = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 5,
+              });
+              const run = latest.data.workflow_runs[0];
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: controlIssue,
+                body: run
+                  ? `Scheduled reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h). Run #${run.id}: ${run.html_url}`
+                  : `Scheduled reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h).`,
+              });
+            } catch (error) {
+              core.warning('Reconciler dispatch committed; status comment no-op: ' + error.message);
+            }
