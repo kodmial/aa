@@ -1,4 +1,14 @@
-"""Async application lifecycle for the AA Telegram worker."""
+"""Async application lifecycle for the AA Telegram worker.
+
+Concurrency architecture (issue #5): one authoritative Telegram poller and
+one local ``opencode serve`` process exist per worker. Accepted updates are
+dispatched through a keyed per-chat dispatcher: turns for the same chat are
+strict FIFO with at most one active turn, turns for different chats may run
+concurrently under a global ``MAX_CONCURRENT_TURNS`` bound, and each
+per-chat pending queue is bounded. ``/new`` travels through the same per-chat
+queue as ordinary turns, so it is ordered relative to them and never resets
+a session while an older turn is still mutating it.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +37,7 @@ from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRu
 from aa.retrieval.index import HybridIndex, open_hybrid_index
 from aa.safety.router import SafetyDecision, SafetyRouter
 from aa.sessions.coordinator import SessionCoordinator
+from aa.telegram.dispatcher import ChatQueueFullError, ChatTurnDispatcher
 from aa.telegram.transport import (
     PollingTelegramTransport,
     StubTelegramTransport,
@@ -44,6 +55,10 @@ _NEW_REPLY = "Новая беседа начата. / New conversation started."
 _TEMPORARY_ERROR_REPLY = (
     "Не удалось обработать сообщение. Попробуйте ещё раз. / "
     "Could not process the message. Please try again."
+)
+_BUSY_REPLY = (
+    "Сейчас много сообщений. Попробуйте ещё раз через минуту. / "
+    "The bot is busy. Please try again in a minute."
 )
 
 
@@ -93,6 +108,14 @@ class Application:
         self._index: HybridIndex | None = None
         self._index_error: str | None = None
         self._running = False
+        # Transport/orchestration only: the dispatcher calls the production
+        # #9 turn orchestrator via ``respond`` and never creates another
+        # LLM/provider client or knowledge pipeline.
+        self.dispatcher = ChatTurnDispatcher(
+            self._process_dispatched_update,
+            max_concurrent_turns=settings.max_concurrent_turns,
+            per_chat_queue_size=settings.per_chat_queue_size,
+        )
         self._wire_transport_handlers()
 
     @property
@@ -118,12 +141,14 @@ class Application:
             await self.opencode_runtime.ensure_ready()
             await self.sessions.start()
             await self.safety.start()
+            await self.dispatcher.start()
             await self.transport.start()
             # Start the requested 15m/1h/2h/3h window only after the poller
             # is live and all dependencies have completed bootstrap.
             await self.controller.start()
         except Exception:
             await self.transport.stop()
+            await self.dispatcher.stop()
             await self.safety.stop()
             await self.sessions.stop()
             await self.opencode_runtime.stop()
@@ -138,6 +163,7 @@ class Application:
         if not self._running:
             # Still ensure subcomponents are stopped for partial startups.
             await self.transport.stop()
+            await self.dispatcher.stop()
             await self.safety.stop()
             await self.sessions.stop()
             await self.opencode_runtime.stop()
@@ -146,7 +172,13 @@ class Application:
             return
         logger.info("stopping worker")
         self._running = False
+        # Stop accepting new Telegram updates first, then drain dispatched
+        # turns (bounded) before releasing OpenCode/corpus resources. This
+        # keeps clean shutdown/handoff safe; the remaining crash window
+        # (accepted but unprocessed updates lost on crash) is documented in
+        # ``aa.telegram.dispatcher`` and ``docs/opencode-runtime.md``.
         await self.transport.stop()
+        await self.dispatcher.stop()
         await self.safety.stop()
         await self.sessions.stop()
         await self.opencode_runtime.stop()
@@ -164,12 +196,63 @@ class Application:
             await self.stop()
 
     def _wire_transport_handlers(self) -> None:
-        """Connect the concrete polling transport to application behavior."""
+        """Connect the concrete polling transport to application behavior.
+
+        Every accepted update (ordinary text, ``/start`` and ``/new``) is
+        enqueued into the same per-chat dispatcher queue. The poller callback
+        stays fast and never awaits a full OpenCode turn, so one slow chat
+        cannot head-of-line block unrelated chats. ``/new`` is ordered
+        relative to ordinary turns for that chat because it shares the same
+        FIFO queue and serialized worker.
+        """
         if not isinstance(self.transport, PollingTelegramTransport):
             return
-        self.transport.on_update(self._handle_telegram_update)
-        self.transport.on_command("start", self._handle_start_command)
-        self.transport.on_command("new", self._handle_new_command)
+        self.transport.on_update(self._enqueue_telegram_update)
+        self.transport.on_command("start", self._enqueue_telegram_update)
+        self.transport.on_command("new", self._enqueue_telegram_update)
+
+    async def _enqueue_telegram_update(self, incoming: TelegramIncoming) -> None:
+        """Accept one update into the per-chat dispatcher (poller-fast).
+
+        Transport acknowledgement happens after this returns, so this must
+        never await a full OpenCode turn. Overflow backpressures with a
+        single bounded reply instead of unbounded queue growth.
+        """
+        if not self.dispatcher.running:
+            await self._process_dispatched_update(incoming)
+            return
+        try:
+            await self.dispatcher.submit(incoming)
+        except ChatQueueFullError:
+            logger.warning(
+                "chat queue full; backpressure reply",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+            )
+            try:
+                await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_BUSY_REPLY))
+            except (TelegramApiError, TelegramEnvelopeError):
+                logger.warning(
+                    "backpressure reply delivery failed",
+                    extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+                )
+
+    async def _process_dispatched_update(self, incoming: TelegramIncoming) -> None:
+        """Run one dispatched turn inside that chat's serialized worker.
+
+        Safety routing precedes normal AA handling; substantive turns call
+        the production #9 orchestrator via :meth:`respond` as the single
+        substantive-turn API. Session create/reset happens here, inside the
+        per-chat serialization, so concurrent first messages cannot create
+        competing sessions and ``/new`` cannot interleave with an older
+        turn for the same chat.
+        """
+        if incoming.command == "start":
+            await self._handle_start_command(incoming)
+            return
+        if incoming.command == "new":
+            await self._handle_new_command(incoming)
+            return
+        await self._handle_telegram_update(incoming)
 
     async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_START_REPLY))
@@ -191,7 +274,9 @@ class Application:
         Exactly one Telegram message is delivered per update: overflow is
         never split into multiple messages. When the final transport guard
         blocks an escaped overlong payload, a single bounded fallback is
-        delivered instead.
+        delivered instead. Substantive work goes through :meth:`respond`,
+        the single production #9 orchestrator entry point; this transport
+        layer never sends a substantive user message to OpenCode directly.
         """
         self.sessions.record_message(incoming.chat_id)
         try:
@@ -224,26 +309,6 @@ class Application:
             logger.warning(
                 "telegram outbound send failed",
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
-            )
-
-    async def _send_grounded_message(self, session_id: str, text: str) -> str:
-        """Send through the named AA agent with a technical model fallback only."""
-        try:
-            return await self.opencode_runtime.client.send_message(
-                session_id,
-                text,
-                agent=self.settings.opencode_agent,
-                model=self.settings.opencode_model,
-            )
-        except OpenCodeError as exc:
-            if not exc.transient:
-                raise
-            logger.warning("primary AA model unavailable; trying fallback")
-            return await self.opencode_runtime.client.send_message(
-                session_id,
-                text,
-                agent=self.settings.opencode_agent,
-                model=self.settings.opencode_fallback_model,
             )
 
     def _turn_index(self) -> HybridIndex:
