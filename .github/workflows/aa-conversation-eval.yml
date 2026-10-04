@@ -83,22 +83,79 @@ jobs:
               core.setOutput('shard_matrix', JSON.stringify(Array.from({ length: n }, (_, i) => i)));
             }
             const eventName = context.eventName;
-            // Manual dispatch always revalidates before running; the gate
-            // below still enforces exact-main/current-#40-pass validation.
+            // Manual dispatch satisfies the same exact-main/current-PASS
+            // contract as automatic runs: fetch the current trusted #40 PASS
+            // SHA, require the requested SHA (or default) to equal it, and
+            // resolve the frozen corpus checksum. Arbitrary SHAs never proceed.
             if (eventName === 'workflow_dispatch') {
               const n = resolveShardCount();
               if (!n) {
                 core.setOutput('proceed', 'false');
-                core.setOutput('exact_sha', (context.payload.inputs && context.payload.inputs.exact_sha) || '');
+                core.setOutput('exact_sha', '');
                 core.setOutput('corpus_sha', '');
                 core.setOutput('reason', 'no-op: invalid shard_count (must be 1-8)');
                 setShardOutputs(4);
                 return;
               }
+              const requested = ((context.payload.inputs && context.payload.inputs.exact_sha) || '').trim();
+              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+              let passShaDispatch = '';
+              for await (const { data: comments } of github.paginate.iterator(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+              )) {
+                for (const c of comments) {
+                  const m = (c.body || '').match(markerReDispatch);
+                  if (m) {
+                    if (m[2] === 'pass') passShaDispatch = m[1];
+                    else passShaDispatch = '';
+                  }
+                }
+              }
+              if (!passShaDispatch) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
+                core.notice('aa-conversation-eval no-op: no #40 PASS SHA for manual dispatch.');
+                setShardOutputs(n);
+                return;
+              }
+              const exactShaDispatch = requested || passShaDispatch;
+              if (exactShaDispatch !== passShaDispatch) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: manual exact_sha is not the current trusted #40 PASS SHA');
+                core.notice('aa-conversation-eval no-op: manual SHA is not current #40 PASS.');
+                setShardOutputs(n);
+                return;
+              }
+              let corpusShaDispatch = '';
+              try {
+                const { data: content } = await github.rest.repos.getContent({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: 'qualification/ru_realworld_alcohol_help.v1_1.input.jsonl',
+                  ref: passShaDispatch,
+                });
+                const raw = Buffer.from(content.content, 'base64');
+                corpusShaDispatch = require('crypto').createHash('sha256').update(raw).digest('hex');
+              } catch (error) {
+                core.warning(`could not hash frozen corpus at ${passShaDispatch}: ${error.message}`);
+              }
+              if (!/^[0-9a-f]{64}$/.test(corpusShaDispatch)) {
+                core.setOutput('proceed', 'false');
+                core.setOutput('exact_sha', '');
+                core.setOutput('corpus_sha', '');
+                core.setOutput('reason', 'no-op: frozen corpus checksum unavailable at PASS SHA');
+                core.notice('aa-conversation-eval no-op: corpus checksum missing.');
+                setShardOutputs(n);
+                return;
+              }
               core.setOutput('proceed', 'true');
-              core.setOutput('exact_sha', (context.payload.inputs && context.payload.inputs.exact_sha) || '');
-              core.setOutput('corpus_sha', '');
-              core.setOutput('reason', 'manual workflow_dispatch; exact SHA revalidated downstream');
+              core.setOutput('exact_sha', passShaDispatch);
+              core.setOutput('corpus_sha', corpusShaDispatch);
+              core.setOutput('reason', `ready: manual dispatch validated against current #40 PASS sha=${passShaDispatch}`);
               setShardOutputs(n);
               return;
             }
@@ -222,6 +279,18 @@ jobs:
               setShardOutputs(shardCount);
               return;
             }
+            // Fail closed: without the frozen corpus checksum no COMPLETE
+            // result may be published (preserves exactly-once idempotency and
+            // the required corpus identity in the #62 marker).
+            if (!/^[0-9a-f]{64}$/.test(corpusSha)) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', 'no-op: frozen corpus checksum unavailable at PASS SHA');
+              core.notice('aa-conversation-eval no-op: corpus checksum missing.');
+              setShardOutputs(shardCount);
+              return;
+            }
             core.setOutput('proceed', 'true');
             core.setOutput('exact_sha', passSha);
             core.setOutput('corpus_sha', corpusSha);
@@ -238,6 +307,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      issues: read
     steps:
       - name: Check out and verify exact main SHA
         uses: actions/checkout@v4
@@ -251,6 +321,44 @@ jobs:
           test -n "${{ needs.readiness.outputs.exact_sha }}"
           test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
           echo "exact-main checkout verified: $(git rev-parse HEAD)"
+      - name: Verify exact SHA is current trusted #40 PASS SHA with corpus checksum
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const exactSha = '${{ needs.readiness.outputs.exact_sha }}';
+            const corpusSha = '${{ needs.readiness.outputs.corpus_sha }}';
+            if (!/^[0-9a-f]{40}$/.test(exactSha)) {
+              core.setFailed(`exact SHA is not a valid 40-hex SHA: ${exactSha}`);
+              return;
+            }
+            if (!/^[0-9a-f]{64}$/.test(corpusSha)) {
+              core.setFailed('corpus_sha is not a valid 64-hex frozen corpus checksum; refusing unqualified run');
+              return;
+            }
+            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            let passSha = '';
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const m = (c.body || '').match(trustedRe);
+                if (m) {
+                  if (m[2] === 'pass') passSha = m[1];
+                  else passSha = '';
+                }
+              }
+            }
+            if (!passSha) {
+              core.setFailed('no current trusted #40 PASS SHA; refusing run');
+              return;
+            }
+            if (exactSha !== passSha) {
+              core.setFailed(`exact SHA ${exactSha} is not the current trusted #40 PASS SHA ${passSha}`);
+              return;
+            }
+            core.notice(`exact SHA verified as current trusted #40 PASS with corpus ${corpusSha.slice(0, 16)}…`);
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -543,12 +651,18 @@ jobs:
             const mergeResult = '${{ steps.merge.outputs.result }}' || 'complete';
             let result = mergeResult;
             if (currentMain !== testedSha) result = 'stale';
+            // Fail closed on corpus identity: without a 64-hex frozen corpus
+            // checksum no COMPLETE result may be published, preserving
+            // exactly-once detection on the SHA+corpus tuple.
+            const rawCorpus = '${{ needs.readiness.outputs.corpus_sha }}';
+            const corpusOk = /^[0-9a-f]{64}$/.test(rawCorpus);
+            if (!corpusOk && result === 'complete') result = 'incomplete';
+            const corpus = corpusOk ? rawCorpus : '0'.repeat(64);
             // Compact non-sensitive manifest/summary persisted outside
             // production main (dedicated qualification-results branch), keyed
             // by exact main SHA + corpus checksum + run ID. Benchmark outputs
             // never mutate production main.
             core.notice(`publication decision: result=${result} tested=${testedSha} main=${currentMain}`);
-            const corpus = '${{ needs.readiness.outputs.corpus_sha }}' || 'pending-corpus-checksum';
             const runId = `${context.runId}`;
             const marker = `<!-- aa-conversation-eval-result issue=62 sha=${testedSha} corpus=${corpus} result=${result} run=${runId} -->`;
             const body = result === 'complete'

@@ -86,6 +86,7 @@ async def _execute_shard(
     sender: TurnSender,
     recipient: str,
     out_dir: Path,
+    dry_run: bool = False,
 ) -> ShardManifest:
     plans = plan_shards(
         [s.case_id for s in singles],
@@ -102,6 +103,9 @@ async def _execute_shard(
     single_chat_ids = allocate_chat_ids(list(wanted_singles), base=980000 + shard_index * 10000)
     captures: list[TurnCapture] = []
     policy = RetryPolicy()
+    # Production execution must use real exponential backoff; no-sleep is
+    # only for dry-run/offline tests to avoid delaying unit tests.
+    sleep_fn = _no_sleep if dry_run else asyncio.sleep
     for case_id in sorted(wanted_singles):
         view = wanted_singles[case_id]
         payload = view.to_generator_payload()
@@ -116,7 +120,7 @@ async def _execute_shard(
             primary_model=identity.primary_model,
             fallback_model=identity.fallback_model,
             policy=policy,
-            sleep=_no_sleep,
+            sleep=sleep_fn,
         )
         captures.append(
             TurnCapture(
@@ -163,7 +167,7 @@ async def _execute_shard(
                 primary_model=identity.primary_model,
                 fallback_model=identity.fallback_model,
                 policy=policy,
-                sleep=_no_sleep,
+                sleep=sleep_fn,
             )
             captures.append(
                 TurnCapture(
@@ -274,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             sender=sender,
             recipient=recipient,
             out_dir=out_dir,
+            dry_run=args.dry_run,
         )
     )
     digest = hashlib.sha256(json.dumps(manifest.to_dict(), sort_keys=True).encode()).hexdigest()
