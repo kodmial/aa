@@ -46,8 +46,15 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
 
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
-    assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
-    assert "\"${{ inputs.pause_on_failure || 'false' }}\"" in body
+    # Bare-passthrough contract synced with Continuum main: every knob is
+    # forwarded as `"${{ inputs.<knob> }}"` with no `|| '<literal>'` default.
+    # An empty passthrough lets the engine fall back to vars.AUTOMATION_*;
+    # pinning a literal here would override that repository variable.
+    # (`conflict_strategy` keeps its `|| 'merge'` because the callee input
+    # is a choice that must receive a listed value on non-dispatch events.)
+    for knob in ("max_dispatch_attempts", "pause_on_failure"):
+        assert f'"${{{{ inputs.{knob} }}}}"' in body
+        assert f"inputs.{knob} ||" not in body
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
