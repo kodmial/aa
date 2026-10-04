@@ -1,0 +1,504 @@
+{
+  "alignment_policy": "Section/chapter alignment is mandatory and one-to-one across RU/EN. Paragraph/chunk alignment is never forced: translations split/merge differently, so paragraphs and chunks are per-language physical units under explicit section-only alignment. Retrieval uses RU chunks as primary evidence units for Russian users; EN chunks are reference/control.",
+  "book": "aa-big-book",
+  "builder_version": 1,
+  "chunking": {
+    "max_chunk_chars": 1500,
+    "note": "Chunks group whole sentences within one paragraph only; sentences are never split. Paragraph/chunk instances with exact text live in corpus/generated/ and never in this file.",
+    "paragraph_rule": "blank-line-separated blocks; exact section offsets",
+    "sentence_rule": "sentence-rule/1"
+  },
+  "en": {
+    "artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
+    "edition": "Alcoholics Anonymous, First Edition (1939)",
+    "manifest_format": "aa-canonical-manifest/1"
+  },
+  "format": "aa-aligned-structure/1",
+  "max_chunk_chars": 1500,
+  "ru": {
+    "artifact_sha256": "0a0cf5feee03792d314936b27e4366c41002eadecfc2e9e60fbdf398cdb92967",
+    "edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+    "manifest_format": "aa-canonical-manifest-ru/1"
+  },
+  "sections": [
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "language": "en",
+        "source_id": "doctors-opinion",
+        "text_sha256": "434a829d6142de2882924965a6ee0048244d5e7f40ade2eb2b8ceb670379b54f",
+        "title": "The Doctor's Opinion"
+      },
+      "id": "doctors-opinion",
+      "next": "chapter-1",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": null,
+      "ru": {
+        "chars": 13724,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "a33faec79892b839eb14d28fd5f6eb36297c755aed5e73bf08419f17fafc6558",
+        "title": "Мнение доктора"
+      },
+      "titles": {
+        "en": "The Doctor's Opinion",
+        "ru": "Мнение доктора"
+      },
+      "topic_en": "Medical view: craving and obsession as illness"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 25876,
+        "byte_start": 332,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "c6d87cfa1bc910e4a943790959cb284ce9290476b737c4b66f14342944deb4a9",
+        "title": "BILL'S STORY"
+      },
+      "id": "chapter-1",
+      "next": "chapter-2",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "doctors-opinion",
+      "ru": {
+        "chars": 26542,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "b0f3c8848eceb0cd216f699164118b75c84363e2396b2ab695c49b9f7a993829",
+        "title": "Глава 1. Рассказ Билла"
+      },
+      "titles": {
+        "en": "BILL'S STORY",
+        "ru": "Глава 1. Рассказ Билла"
+      },
+      "topic_en": "Bill's story: descent and turning point"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 46560,
+        "byte_start": 25876,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "b0e5ae9a6b9a9c38f521b888aa4eb08e6d11422f361c1c5caac03fc9eb10cf94",
+        "title": "THERE IS A SOLUTION"
+      },
+      "id": "chapter-2",
+      "next": "chapter-3",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-1",
+      "ru": {
+        "chars": 22408,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "a44a3a60932bf6a65171c5dd3ccd595d93894f06b5d3e87b2c4e53be1b7ddfa6",
+        "title": "Глава 2. Выход есть"
+      },
+      "titles": {
+        "en": "THERE IS A SOLUTION",
+        "ru": "Глава 2. Выход есть"
+      },
+      "topic_en": "There is a solution: hope and fellowship"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 69462,
+        "byte_start": 46560,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "369467756afc3ecc332b044ab50350934ea1b5ac696b1472288a7d3a409f6703",
+        "title": "MORE ABOUT ALCOHOLISM"
+      },
+      "id": "chapter-3",
+      "next": "chapter-4",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-2",
+      "ru": {
+        "chars": 24194,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "9e3b2bbbea7bca9f7aa98edfe374278af0ccfa05bcd2d8aed6da4b278d88276a",
+        "title": "Глава 3. Еще об алкоголизме"
+      },
+      "titles": {
+        "en": "MORE ABOUT ALCOHOLISM",
+        "ru": "Глава 3. Еще об алкоголизме"
+      },
+      "topic_en": "More about alcoholism: craving, allergy, obsession"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 91489,
+        "byte_start": 69462,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "bc92f9cae50b98677cc2162f6f8accd5e4af952a9b1993c4de7a3e84cabd0691",
+        "title": "WE AGNOSTICS"
+      },
+      "id": "chapter-4",
+      "next": "chapter-5",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-3",
+      "ru": {
+        "chars": 22958,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "4b6c5c509ab6e3888e9a66f8d3539daf85ed0d2e083322db7b7202c45630f9a0",
+        "title": "Глава 4. А как быть агностикам?"
+      },
+      "titles": {
+        "en": "WE AGNOSTICS",
+        "ru": "Глава 4. А как быть агностикам?"
+      },
+      "topic_en": "We agnostics: willingness toward spiritual help"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 112627,
+        "byte_start": 91489,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "936b2326b9b4ec792ec52b906ea6bc362d506c237dfca952a6cbaa35c98f88b6",
+        "title": "HOW IT WORKS"
+      },
+      "id": "chapter-5",
+      "next": "chapter-6",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-4",
+      "ru": {
+        "chars": 23143,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "e47abf9dc375a864c4627ed2d36c2ade280c1757cf67487c6e46b2a7f370dc4c",
+        "title": "Глава 5. Программа в действии"
+      },
+      "titles": {
+        "en": "HOW IT WORKS",
+        "ru": "Глава 5. Программа в действии"
+      },
+      "topic_en": "How it works: honesty and action program"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 139807,
+        "byte_start": 112627,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "8693706f7739851c1d9f6670120715943e349b9aaf0fa7147535b6671affade3",
+        "title": "INTO ACTION"
+      },
+      "id": "chapter-6",
+      "next": "chapter-7",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-5",
+      "ru": {
+        "chars": 28725,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "82b1f0596edbe2219a9de6716a817b8b3d0439a796ca2d2dc40c99aaa9d13599",
+        "title": "Глава 6. За работу!"
+      },
+      "titles": {
+        "en": "INTO ACTION",
+        "ru": "Глава 6. За работу!"
+      },
+      "topic_en": "Into action: inventory, amends, daily practice"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 164068,
+        "byte_start": 139807,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "9992636788dae8ba30df118eabc4e2ec56ecb3f0aa6168a49185d40b58b6b924",
+        "title": "WORKING WITH OTHERS"
+      },
+      "id": "chapter-7",
+      "next": "chapter-8",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-6",
+      "ru": {
+        "chars": 26464,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "1ad8428400bae6720ed7ce95bf78b13173cb9a66869ff2446b7b674bbc01ab0c",
+        "title": "Глава 7. Работая с другими"
+      },
+      "titles": {
+        "en": "WORKING WITH OTHERS",
+        "ru": "Глава 7. Работая с другими"
+      },
+      "topic_en": "Working with others: carrying the message"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 192427,
+        "byte_start": 164068,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "c0c7b99b73462a8e6d038c7d570aff79af4b0121b6938523317c35dde5c31e07",
+        "title": "TO WIVES"
+      },
+      "id": "chapter-8",
+      "next": "chapter-9",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-7",
+      "ru": {
+        "chars": 30687,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "8e28618a0ab56cf2355c0e6f1231ef382c5b3a6ae5f259b9afb89ddfcc694d21",
+        "title": "Глава 8. Обращение к женам"
+      },
+      "titles": {
+        "en": "TO WIVES",
+        "ru": "Глава 8. Обращение к женам"
+      },
+      "topic_en": "To wives: family perspective and support"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 215264,
+        "byte_start": 192427,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "183f0dc16bbbb766bc3312255c10e96cc2910618504a6207c416ddb17fd4a12a",
+        "title": "THE FAMILY AFTERWARD"
+      },
+      "id": "chapter-9",
+      "next": "chapter-10",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-8",
+      "ru": {
+        "chars": 24270,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "05eccf2e2f1a2cea3352b1bdc69601329797fb1fa0d0d4d53a635dcd6edbc88e",
+        "title": "Глава 9. Новые отношения в семье"
+      },
+      "titles": {
+        "en": "THE FAMILY AFTERWARD",
+        "ru": "Глава 9. Новые отношения в семье"
+      },
+      "topic_en": "Family afterward: rebuilding trust at home"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 238386,
+        "byte_start": 215264,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "042c318d1ea57062bfec734efebd11da287dd08bf0bd9309acfdbd9b1c2fc725",
+        "title": "TO EMPLOYERS"
+      },
+      "id": "chapter-10",
+      "next": "chapter-11",
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-9",
+      "ru": {
+        "chars": 25408,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "51a2e18300e2c02a3935ce8e589107cc62cf63382d0c4cadfc59a72bc5f66632",
+        "title": "Глава 10. Обращение к работодателям"
+      },
+      "titles": {
+        "en": "TO EMPLOYERS",
+        "ru": "Глава 10. Обращение к работодателям"
+      },
+      "topic_en": "To employers: workplace perspective and help"
+    },
+    {
+      "alignment": {
+        "confidence": 1.0,
+        "status": "aligned"
+      },
+      "book": "aa-big-book",
+      "chunk_roles": {
+        "en": "reference-control",
+        "ru": "primary-retrieval"
+      },
+      "en": {
+        "byte_end": 260330,
+        "byte_start": 238386,
+        "language": "en",
+        "source_id": "core-pages-1-164",
+        "text_sha256": "a3ce0778038ae1aef767f1aafe71e502c8b3a3b28d5ae92d32c0fb44a499799e",
+        "title": "A VISION FOR YOU"
+      },
+      "id": "chapter-11",
+      "next": null,
+      "paragraph_alignment": {
+        "confidence": 1.0,
+        "note": "Paragraph/chunk alignment is explicitly not forced across RU/EN; see alignment_policy.",
+        "status": "section-aligned-only"
+      },
+      "parent": "aa-big-book",
+      "prev": "chapter-10",
+      "ru": {
+        "chars": 24084,
+        "language": "ru",
+        "source_id": "ru-fourth-edition-txt",
+        "text_sha256": "4f230e3245036f5ba1899ac0549f23e5578b7202f111400ad0ead61dd03613db",
+        "title": "Глава 11. Заглянем в ваше будущее"
+      },
+      "titles": {
+        "en": "A VISION FOR YOU",
+        "ru": "Глава 11. Заглянем в ваше будущее"
+      },
+      "topic_en": "Vision for you: fellowship growth and invitation"
+    }
+  ],
+  "sentence_rule": "sentence-rule/1"
+}
