@@ -96,7 +96,9 @@ async def _execute_shard(
     plan = plans[shard_index]
     wanted_singles = {s.case_id: s for s in singles if s.case_id in set(plan.single_ids)}
     wanted_journeys = {j.journey_id: j for j in journeys if j.journey_id in set(plan.journey_ids)}
-    chat_ids = allocate_chat_ids(list(wanted_journeys))
+    all_journey_ids = [j.journey_id for j in journeys]
+    global_chat_ids = allocate_chat_ids(all_journey_ids)
+    chat_ids = {jid: global_chat_ids[jid] for jid in wanted_journeys}
     # Fresh-session semantics: every single-turn case gets its own synthetic
     # chat, disjoint from the journey block, so independent singles never
     # share session state within a shard.

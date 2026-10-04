@@ -301,24 +301,14 @@ jobs:
               return;
             }
             // Idempotency: if the same exact SHA + corpus checksum already
-            // has a verified COMPLETE result on #62, no-op.
+            // has a verified COMPLETE result on #62, no-op (any matching
+            // tuple, not just the latest marker, so an earlier COMPLETE for
+            // the current tuple is never missed when a newer tuple exists).
             const evalRe = /aa-conversation-eval-result\s+issue=62\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+result=(complete|incomplete|stale)\s+run=(\S+)/;
-            let latestComplete = null;
-            for await (const { data: comments } of github.paginate.iterator(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, per_page: 100 },
-            )) {
-              for (const c of comments) {
-                const assoc62 = c.author_association || '';
-                const isTrusted62 = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc62);
-                if (!isTrusted62) continue;
-                const m = (c.body || '').match(evalRe);
-                if (m && m[3] === 'complete') latestComplete = { sha: m[1], corpus: m[2] };
-              }
-            }
-            // Resolve the current frozen corpus checksum at the PASS SHA so
-            // idempotency compares the current tuple (not a stale marker
-            // corpus) and the published marker carries the frozen checksum.
+            // Resolve the current frozen corpus checksum at the PASS SHA
+            // first so idempotency compares the current tuple (not a stale
+            // marker corpus) and the published marker carries the frozen
+            // checksum.
             const shardCount = resolveShardCount();
             if (!shardCount) {
               core.setOutput('proceed', 'false');
@@ -340,16 +330,6 @@ jobs:
             } catch (error) {
               core.warning(`could not hash frozen corpus at ${passSha}: ${error.message}`);
             }
-            if (latestComplete && latestComplete.sha === passSha && corpusSha
-                && latestComplete.corpus === corpusSha) {
-              core.setOutput('proceed', 'false');
-              core.setOutput('exact_sha', '');
-              core.setOutput('corpus_sha', '');
-              core.setOutput('reason', `no-op: exact SHA+corpus tuple already verified COMPLETE on #62 (sha=${passSha})`);
-              core.notice('aa-conversation-eval no-op: tuple already verified COMPLETE.');
-              setShardOutputs(shardCount);
-              return;
-            }
             // Fail closed: without the frozen corpus checksum no COMPLETE
             // result may be published (preserves exactly-once idempotency and
             // the required corpus identity in the #62 marker).
@@ -359,6 +339,29 @@ jobs:
               core.setOutput('corpus_sha', '');
               core.setOutput('reason', 'no-op: frozen corpus checksum unavailable at PASS SHA');
               core.notice('aa-conversation-eval no-op: corpus checksum missing.');
+              setShardOutputs(shardCount);
+              return;
+            }
+            let alreadyComplete = false;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc62 = c.author_association || '';
+                const isTrusted62 = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc62);
+                if (!isTrusted62) continue;
+                const m = (c.body || '').match(evalRe);
+                if (m && m[3] === 'complete' && m[1] === passSha && m[2] === corpusSha) { alreadyComplete = true; break; }
+              }
+              if (alreadyComplete) break;
+            }
+            if (alreadyComplete) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('exact_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('reason', `no-op: exact SHA+corpus tuple already verified COMPLETE on #62 (sha=${passSha})`);
+              core.notice('aa-conversation-eval no-op: tuple already verified COMPLETE.');
               setShardOutputs(shardCount);
               return;
             }
@@ -732,9 +735,24 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
             });
             const currentMain = mainRef.object.sha;
-            const mergeResult = '${{ steps.merge.outputs.result }}' || 'complete';
+            const mergeResult = '${{ steps.merge.outputs.result }}' || 'incomplete';
             let result = mergeResult;
             if (currentMain !== testedSha) result = 'stale';
+            // Revalidate the current trusted #40 PASS marker at publication
+            // time: a FAIL superseding the PASS after shards start must not
+            // still publish COMPLETE.
+            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            let passShaPublish = '';
+            for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 })) {
+              for (const c of comments) {
+                const assocP = c.author_association || '';
+                const isTrustedP = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assocP);
+                if (!isTrustedP) continue;
+                const m = (c.body || '').match(trustedRePublish);
+                if (m) { if (m[2] === 'pass') passShaPublish = m[1]; else passShaPublish = ''; }
+              }
+            }
+            if (passShaPublish !== testedSha && result === 'complete') result = 'stale';
             // Fail closed on corpus identity: without a 64-hex frozen corpus
             // checksum no COMPLETE result may be published, preserving
             // exactly-once detection on the SHA+corpus tuple.

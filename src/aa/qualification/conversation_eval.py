@@ -233,11 +233,13 @@ def load_generator_views(
                 entries.append(
                     JourneyTurnView(turn=number, kind="control", control=SESSION_RESET_CONTROL)
                 )
-            else:
+            elif kind == "user":
                 utterance = str(entry["utterance"])
                 if utterance.strip() == "/new":
                     raise ConversationEvalError(f"{journey_id}: /new must be a control event")
                 entries.append(JourneyTurnView(turn=number, kind="user", utterance=utterance))
+            else:
+                raise ConversationEvalError(f"{journey_id}: unknown journey kind {kind!r}")
         journey_views.append(JourneyView(journey_id=journey_id, slug=slug, turns=tuple(entries)))
     return single_views, journey_views
 
@@ -709,11 +711,47 @@ def merge_manifests(
     """Merge shard manifests, rejecting missing/duplicate case ids.
 
     Raises :class:`ConversationEvalError` when any expected case is missing,
-    any case appears twice, or any unexpected case appears.
+    any case appears twice, or any unexpected case appears. Also fails
+    closed on heterogeneous shards: every manifest must carry the same
+    ``shard_count`` (equal to ``len(manifests)``) with a unique
+    ``shard_index`` covering ``0..shard_count-1``, an identical
+    ``eval_identity`` tuple, and a distinct non-empty ``bundle_sha256``.
     """
+    if not manifests:
+        raise ConversationEvalError("merge requires at least one shard manifest")
     expected = sorted(expected_case_ids)
     if len(set(expected)) != len(expected):
         raise ConversationEvalError("expected case ids contain duplicates")
+    shard_count = len(manifests)
+    seen_indices: set[int] = set()
+    for manifest in manifests:
+        if manifest.shard_count != shard_count:
+            raise ConversationEvalError(
+                f"shard {manifest.shard_index}: shard_count {manifest.shard_count} "
+                f"does not match manifest count {shard_count}"
+            )
+        if manifest.shard_index in seen_indices:
+            raise ConversationEvalError(f"duplicate shard_index {manifest.shard_index}")
+        if not 0 <= manifest.shard_index < shard_count:
+            raise ConversationEvalError(f"shard_index {manifest.shard_index} out of range")
+        seen_indices.add(manifest.shard_index)
+    if seen_indices != set(range(shard_count)):
+        raise ConversationEvalError(f"incomplete shard coverage: {sorted(seen_indices)}")
+    base_identity = manifests[0].eval_identity
+    seen_bundles: set[str] = set()
+    for manifest in manifests:
+        if dict(manifest.eval_identity) != dict(base_identity):
+            raise ConversationEvalError(
+                f"shard {manifest.shard_index}: eval_identity drift across shards"
+            )
+        bundle = str(manifest.bundle_sha256 or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", bundle):
+            raise ConversationEvalError(
+                f"shard {manifest.shard_index}: bundle_sha256 must be a 64-hex SHA"
+            )
+        if bundle in seen_bundles:
+            raise ConversationEvalError("duplicate bundle_sha256 across shards")
+        seen_bundles.add(bundle)
     seen: dict[str, int] = {}
     for manifest in manifests:
         for case_id in manifest.case_ids:
@@ -993,12 +1031,23 @@ def build_compact_manifest(
     """Build the compact privacy-safe manifest persisted outside main.
 
     Keyed by exact main SHA + corpus checksum + run id; holds IDs, metrics
-    and checksums only, never large source dumps or answer text.
+    and checksums only, never large source dumps or answer text. Fails
+    closed when any shard manifest carries an eval_identity tuple different
+    from ``eval_identity`` so mixed model/config tuples can never persist
+    under a single caller-supplied identity.
     """
     if result not in ("complete", "incomplete", "stale"):
         raise ConversationEvalError("manifest result must be complete|incomplete|stale")
     if not run_id.strip():
         raise ConversationEvalError("run id must not be empty")
+    if not shard_manifests:
+        raise ConversationEvalError("compact manifest requires at least one shard")
+    expected_identity = eval_identity.to_dict()
+    for manifest in shard_manifests:
+        if dict(manifest.eval_identity) != dict(expected_identity):
+            raise ConversationEvalError(
+                f"shard {manifest.shard_index}: eval_identity does not match compact identity"
+            )
     rows: list[dict[str, Any]] = []
     for manifest in shard_manifests:
         rows.extend(manifest.turn_rows)
