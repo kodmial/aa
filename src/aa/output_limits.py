@@ -168,7 +168,7 @@ _BULK_EXPORT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"покажи\b.{0,80}?\b(вс[юе]|целиком|полностью)\b", re.IGNORECASE | re.DOTALL),
     re.compile(r"пришли\b.{0,80}?\b(глав\w*|текст\w*|книг\w*)", re.IGNORECASE | re.DOTALL),
     re.compile(r"продолж\w*.{0,40}?(глав\w*|печата\w*|выводи\w*)", re.IGNORECASE | re.DOTALL),
-    re.compile(r"давай\s+дальше\b.{0,40}?(глав\w*)?", re.IGNORECASE | re.DOTALL),
+    re.compile(r"давай\s+дальше\b.{0,40}?глав\w*", re.IGNORECASE | re.DOTALL),
     re.compile(r"следующ\w*\s+(часть|кусок|продолжение)\b", re.IGNORECASE),
     re.compile(r"сними\b.{0,40}?огранич", re.IGNORECASE | re.DOTALL),
     re.compile(r"игнорируй\b.{0,40}?огранич", re.IGNORECASE | re.DOTALL),
