@@ -1,0 +1,754 @@
+name: AA answer quality eval
+
+# Reusable answer-quality evaluator for the frozen Russian rubric (#73).
+# Evaluation infrastructure only: this workflow grades the trusted #62
+# COMPLETE benchmark artifact with the frozen #61-grounded rubric. It never
+# changes product behavior and never presents same-model self-grading as
+# independent clinical validation.
+# Canonical #63 marker carries result=pass|fail plus currency=current|stale.
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark_run_id:
+        description: "Benchmark workflow run id holding the #62 COMPLETE artifact"
+        required: true
+        type: string
+      benchmark_sha:
+        description: "Exact main SHA graded (defaults to the trusted #62 COMPLETE SHA)"
+        required: false
+        type: string
+      evaluator_model:
+        description: "Independent evaluator model id (empty keeps provisional heuristic)"
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["AA conversation eval"]
+    types: [completed]
+  issues:
+    types: [closed]
+  push:
+    paths:
+      - .github/workflows/aa-answer-quality-eval.yml
+      - qualification/ru_answer_quality_rubric.v1.json
+      - qualification/ru_answer_quality_rubric.v1.sha256
+      - qualification/ru_answer_quality_calibration.v1.json
+      - src/aa/qualification/answer_quality.py
+      - scripts/run_answer_quality_eval.py
+      - tests/test_answer_quality.py
+      - tests/test_answer_quality_workflow.py
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: aa-answer-quality-eval
+  cancel-in-progress: false
+
+jobs:
+  # Lightweight readiness gate (read-only). Every automatic wake-up refetches
+  # #62/#63/#73, binds the frozen rubric by checksum, and no-ops unless a new
+  # verified #62 COMPLETE tuple (SHA + corpus) still lacks a #63 result for
+  # the current rubric. Closing #73 still triggers grading of a trusted #62
+  # artifact that predates this evaluator workflow (catch-up path together
+  # with the push trigger above).
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      tested_sha: ${{ steps.gate.outputs.tested_sha }}
+      corpus_sha: ${{ steps.gate.outputs.corpus_sha }}
+      benchmark_run_id: ${{ steps.gate.outputs.benchmark_run_id }}
+      rubric_sha: ${{ steps.gate.outputs.rubric_sha }}
+      evaluator_model: ${{ steps.gate.outputs.evaluator_model }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Revalidate evaluator state and decide
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const EVAL_RE = /aa-conversation-eval-result\s+issue=62\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+result=(complete|incomplete|stale)\s+run=(\S+)/;
+            const QUALITY_RE = /aa-answer-quality-result\s+issue=63\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+artifact=([0-9a-f]{64})\s+rubric=([0-9a-f]{64})\s+result=(pass|fail)\s+run=(\S+?)\s+currency=(current|stale)\s*-->/;
+            function noop(reason) {
+              core.setOutput('proceed', 'false');
+              core.setOutput('tested_sha', '');
+              core.setOutput('corpus_sha', '');
+              core.setOutput('benchmark_run_id', '');
+              core.setOutput('rubric_sha', '');
+              core.setOutput('evaluator_model', '');
+              core.setOutput('reason', reason);
+              core.notice(`aa-answer-quality-eval no-op: ${reason}`);
+            }
+            async function getIssue(num) {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: num,
+              });
+              return data;
+            }
+            async function trustedComments(num, markerRe) {
+              const out = [];
+              for await (const { data: comments } of github.paginate.iterator(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: num, per_page: 100 },
+              )) {
+                for (const c of comments) {
+                  const assoc = c.author_association || '';
+                  const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+                  if (!isTrusted) continue;
+                  const m = (c.body || '').match(markerRe);
+                  if (m) out.push(m);
+                }
+              }
+              return out;
+            }
+            // Bind the frozen rubric by checksum before any grading decision:
+            // the file bytes at main must equal the committed sidecar, so
+            // scoring anchors cannot be tuned silently after #62 outputs.
+            async function boundRubricSha() {
+              const { data: rubricContent } = await github.rest.repos.getContent({
+                owner: context.repo.owner, repo: context.repo.repo,
+                path: 'qualification/ru_answer_quality_rubric.v1.json', ref: 'main',
+              });
+              const raw = Buffer.from(rubricContent.content, 'base64');
+              const actual = require('crypto').createHash('sha256').update(raw).digest('hex');
+              const { data: sidecar } = await github.rest.repos.getContent({
+                owner: context.repo.owner, repo: context.repo.repo,
+                path: 'qualification/ru_answer_quality_rubric.v1.sha256', ref: 'main',
+              });
+              const expected = Buffer.from(sidecar.content, 'base64').toString('utf8').trim().split(/\s+/)[0];
+              if (actual !== expected) {
+                throw new Error(`frozen rubric checksum mismatch at main (${actual.slice(0, 16)}… != sidecar)`);
+              }
+              return actual;
+            }
+            // Latest trusted #62 COMPLETE tuple (any matching tuple, newest last).
+            async function latestCompleteTuple() {
+              const markers = await trustedComments(62, EVAL_RE);
+              let tuple = null;
+              for (const m of markers) {
+                if (m[3] === 'complete') tuple = { sha: m[1], corpus: m[2], run: m[4] };
+              }
+              return tuple;
+            }
+            // Whether an identical SHA+corpus tuple already has a #63 result
+            // under the current rubric: grade exactly once, stale duplicate
+            // workflow events no-op.
+            async function alreadyGraded(sha, corpus, rubricSha) {
+              const markers = await trustedComments(63, QUALITY_RE);
+              return markers.some((m) => m[1] === sha && m[2] === corpus && m[4] === rubricSha);
+            }
+            const eventName = context.eventName;
+            const dispatchModel = ((context.payload.inputs && context.payload.inputs.evaluator_model) || '').trim();
+            if (eventName === 'workflow_dispatch') {
+              const runId = ((context.payload.inputs && context.payload.inputs.benchmark_run_id) || '').trim();
+              const requestedSha = ((context.payload.inputs && context.payload.inputs.benchmark_sha) || '').trim();
+              if (!runId) { noop('manual dispatch without benchmark_run_id'); return; }
+              let rubricSha;
+              try { rubricSha = await boundRubricSha(); }
+              catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
+              const tuple = await latestCompleteTuple();
+              if (!tuple) { noop('no trusted #62 COMPLETE tuple to grade'); return; }
+              const testedSha = requestedSha || tuple.sha;
+              if (requestedSha && requestedSha !== tuple.sha) {
+                noop('manual benchmark_sha is not the trusted #62 COMPLETE SHA');
+                return;
+              }
+              if (await alreadyGraded(testedSha, tuple.corpus, rubricSha)) {
+                noop(`identical tuple already has a #63 result (sha=${testedSha})`);
+                return;
+              }
+              core.setOutput('proceed', 'true');
+              core.setOutput('tested_sha', testedSha);
+              core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('benchmark_run_id', runId);
+              core.setOutput('rubric_sha', rubricSha);
+              core.setOutput('evaluator_model', dispatchModel);
+              core.setOutput('reason', `ready: manual dispatch for #62 COMPLETE sha=${testedSha}`);
+              core.notice(`aa-answer-quality-eval ready at ${testedSha}.`);
+              return;
+            }
+            if (eventName === 'workflow_run') {
+              const run = context.payload.workflow_run;
+              if (!run || run.name !== 'AA conversation eval' || run.conclusion !== 'success') {
+                noop('benchmark workflow run did not succeed');
+                return;
+              }
+              let rubricSha;
+              try { rubricSha = await boundRubricSha(); }
+              catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
+              const tuple = await latestCompleteTuple();
+              if (!tuple) { noop('no trusted #62 COMPLETE tuple after benchmark run'); return; }
+              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+                noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
+                return;
+              }
+              core.setOutput('proceed', 'true');
+              core.setOutput('tested_sha', tuple.sha);
+              core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('benchmark_run_id', `${run.id}`);
+              core.setOutput('rubric_sha', rubricSha);
+              core.setOutput('evaluator_model', '');
+              core.setOutput('reason', `ready: benchmark run ${run.id} completed for sha=${tuple.sha}`);
+              core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
+              return;
+            }
+            if (eventName === 'issues') {
+              // Lightweight wake-up for #62/#73 closures with full state
+              // revalidation below; any other issue no-ops. If #62 completed
+              // before #73 merged, closing #73 still triggers grading of the
+              // current trusted #62 artifact via this path.
+              const issueNumber = context.payload.issue ? context.payload.issue.number : 0;
+              if (![62, 73].includes(issueNumber)) {
+                noop(`wake-up is not a #62/#73 closure (issue ${issueNumber})`);
+                return;
+              }
+              const i73 = await getIssue(73);
+              if (i73.state !== 'closed') {
+                noop('#73 rubric is not merged/closed');
+                return;
+              }
+              let rubricSha;
+              try { rubricSha = await boundRubricSha(); }
+              catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
+              const tuple = await latestCompleteTuple();
+              if (!tuple) { noop('no trusted #62 COMPLETE tuple to grade'); return; }
+              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+                noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
+                return;
+              }
+              core.setOutput('proceed', 'true');
+              core.setOutput('tested_sha', tuple.sha);
+              core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('benchmark_run_id', tuple.run);
+              core.setOutput('rubric_sha', rubricSha);
+              core.setOutput('evaluator_model', '');
+              core.setOutput('reason', `ready: #${issueNumber} closure grades trusted #62 COMPLETE sha=${tuple.sha}`);
+              core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
+              return;
+            }
+            if (eventName === 'push') {
+              // Catch-up path for the evaluator workflow/rubric files
+              // themselves: merging #73 discovers and grades a #62 COMPLETE
+              // artifact that predates this workflow. Full revalidation
+              // applies; #73 closure is not required here because this push
+              // may be the merge that closes it.
+              let rubricSha;
+              try { rubricSha = await boundRubricSha(); }
+              catch (error) { noop(`frozen rubric is not bound: ${error.message}`); return; }
+              const tuple = await latestCompleteTuple();
+              if (!tuple) { noop('no trusted #62 COMPLETE tuple to grade'); return; }
+              if (await alreadyGraded(tuple.sha, tuple.corpus, rubricSha)) {
+                noop(`identical tuple already has a #63 result (sha=${tuple.sha})`);
+                return;
+              }
+              core.setOutput('proceed', 'true');
+              core.setOutput('tested_sha', tuple.sha);
+              core.setOutput('corpus_sha', tuple.corpus);
+              core.setOutput('benchmark_run_id', tuple.run);
+              core.setOutput('rubric_sha', rubricSha);
+              core.setOutput('evaluator_model', '');
+              core.setOutput('reason', `ready: evaluator push catch-up grades trusted #62 COMPLETE sha=${tuple.sha}`);
+              core.notice(`aa-answer-quality-eval ready at ${tuple.sha}.`);
+              return;
+            }
+            noop(`unsupported event ${eventName}`);
+
+  # Grade the trusted artifact: download the encrypted #62 result from the
+  # benchmark run, decrypt only here with AA_BOOK_AGE_IDENTITY (never logged),
+  # verify SHA/corpus/checksum/completeness, and publish the #63 marker.
+  grade:
+    needs: readiness
+    if: needs.readiness.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    outputs:
+      result: ${{ steps.publish.outputs.result }}
+      currency: ${{ steps.publish.outputs.currency }}
+      artifact_sha: ${{ steps.evaluate.outputs.artifact_sha }}
+      clusters: ${{ steps.evaluate.outputs.clusters }}
+    steps:
+      - name: Check out evaluator code at main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e "."
+      - name: Verify frozen rubric binding and calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/run_answer_quality_eval.py --calibration
+      - name: Download trusted benchmark artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-conversation-eval-full-encrypted
+          run-id: ${{ needs.readiness.outputs.benchmark_run_id }}
+          github-token: ${{ github.token }}
+          path: eval-in
+      - name: Grade the verified COMPLETE tuple
+        id: evaluate
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          TESTED_SHA: ${{ needs.readiness.outputs.tested_sha }}
+          EXPECTED_CORPUS: ${{ needs.readiness.outputs.corpus_sha }}
+          EXPECTED_RUBRIC: ${{ needs.readiness.outputs.rubric_sha }}
+          EVALUATOR_MODEL: ${{ needs.readiness.outputs.evaluator_model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The age identity is used only inside Python below and is never
+          # echoed or logged; unrelated steps must not reference it.
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from aa.qualification.answer_quality import (
+              AnswerQualityError,
+              BenchmarkTuple,
+              HardCheckContext,
+              collect_graded_keys,
+              grade_batch,
+              grade_turn,
+              load_calibration,
+              load_rubric,
+              tuple_key,
+              verify_benchmark_artifact,
+              verify_rubric_bound,
+          )
+          from aa.qualification.conversation_eval import (
+              collect_eval_identity,
+              decrypt_and_decompress,
+              expected_case_ids,
+              load_generator_views,
+          )
+          from aa.qualification.ru_realworld import find_repo_root, sha256_file
+
+          tested_sha = os.environ["TESTED_SHA"]
+          expected_corpus = os.environ["EXPECTED_CORPUS"]
+          expected_rubric = os.environ["EXPECTED_RUBRIC"]
+          evaluator_model = os.environ.get("EVALUATOR_MODEL", "").strip()
+          identity = os.environ.get("AA_BOOK_AGE_IDENTITY", "")
+          if not identity.strip():
+              raise AnswerQualityError("trusted evaluator identity is not configured")
+
+          # The frozen rubric must still be bound at grading time: anchors
+          # cannot be tuned after #62 outputs without a version bump.
+          rubric_sha = verify_rubric_bound()
+          if rubric_sha != expected_rubric:
+              raise AnswerQualityError("rubric rotated between readiness and grading")
+          rubric = load_rubric()
+          root = find_repo_root()
+
+          encrypted = Path("eval-in/aa-conversation-eval-full.tar.zst.age").read_bytes()
+          artifact_sha = hashlib.sha256(encrypted).hexdigest()
+          recorded = Path("eval-in/aa-conversation-eval-full.tar.zst.age.sha256").read_text(
+              encoding="utf-8"
+          ).strip().split()[0]
+          if artifact_sha != recorded:
+              raise AnswerQualityError("benchmark artifact checksum mismatch on download")
+
+          raw = decrypt_and_decompress(encrypted, identity=identity)
+          full = json.loads(raw.decode("utf-8"))
+          compact = json.loads(
+              Path("eval-in/aa-conversation-eval-compact.json").read_text(encoding="utf-8")
+          )
+          manifest_corpus = str(compact.get("corpus_input_sha256", ""))
+          if manifest_corpus != expected_corpus:
+              raise AnswerQualityError("benchmark corpus checksum does not match #62 tuple")
+
+          # Completeness manifest: every frozen case id must have a clean
+          # primary-model turn row; provider/infrastructure fallout makes the
+          # artifact ungradable (rejected, never silently partial).
+          singles, journeys = load_generator_views()
+          wanted = set(expected_case_ids(singles, journeys))
+          rows = compact.get("turn_rows", [])
+          seen = {str(r.get("case_id")) for r in rows if isinstance(r, dict)}
+          # Compact rows are per-turn while completeness is per case: journey
+          # turns share the journey case id prefix before '#'.
+          covered = {item.split("#")[0] for item in seen}
+          missing = sorted(wanted - covered)
+          unclean = [
+              r for r in rows
+              if not isinstance(r, dict)
+              or str(r.get("error_category", "ok")) != "ok"
+              or bool(r.get("fallback_used", False))
+          ]
+          completeness_ok = not missing and not unclean
+          completeness_reason = ""
+          if missing:
+              completeness_reason = f"missing {len(missing)} case(s): {missing[:5]}"
+          elif unclean:
+              completeness_reason = f"{len(unclean)} unclean turn(s)"
+
+          # Current main still matches the tested SHA for an authoritative
+          # PASS; a moved main keeps grading diagnostically only.
+          import subprocess
+
+          current_main = subprocess.run(
+              ["git", "rev-parse", "refs/remotes/origin/main"],
+              capture_output=True, text=True, check=False,
+          ).stdout.strip() or subprocess.run(
+              ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+          ).stdout.strip()
+          verdict = verify_benchmark_artifact(
+              tested_sha=tested_sha,
+              current_main_sha=current_main,
+              trusted_pass_sha=tested_sha,
+              corpus_sha=manifest_corpus,
+              expected_corpus_sha=expected_corpus,
+              artifact_sha=artifact_sha,
+              expected_artifact_sha=recorded,
+              completeness_ok=completeness_ok,
+              completeness_reason=completeness_reason,
+          )
+          if verdict.verdict == "rejected":
+              raise AnswerQualityError(f"artifact rejected: {'; '.join(verdict.reasons)}")
+          currency = "current" if verdict.verdict == "current" else "stale"
+
+          # Frozen oracle at the tested SHA (never current-main labels): the
+          # oracle under test, not whatever main holds now.
+          import subprocess as _sp
+
+          oracle_raw = _sp.run(
+              ["git", "show", f"{tested_sha}:qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          oracle_by_case: dict[str, dict] = {}
+          for line in oracle_raw.splitlines():
+              record = json.loads(line)
+              rtype = record.get("type")
+              if rtype == "single_turn":
+                  oracle_by_case[str(record["id"])] = record
+              elif rtype == "multi_turn_journey":
+                  for turn in record.get("turns", []):
+                      oracle_by_case[f"{record['id']}#{turn['turn']}"] = {
+                          **{k: v for k, v in record.items() if k != "turns"},
+                          **turn,
+                      }
+
+          # Qualified RU source index for exact-quote verification, restored
+          # from the version-pinned canonical artifact when available. Without
+          # it, quote-claiming turns fail closed (retrieval root cause) rather
+          # than passing unverified.
+          source_texts: dict[str, str] = {}
+          try:
+              from aa.corpus.canonical import load_canonical_ru
+
+              corpus = load_canonical_ru()
+              for section in corpus.sections:
+                  source_texts[section.source_id or section.id] = section.text
+          except Exception as exc:  # noqa: BLE001 -- degraded source index
+              print(f"qualified RU source unavailable: {type(exc).__name__}")
+
+          turns = full.get("turns", [])
+          if not isinstance(turns, list) or not turns:
+              raise AnswerQualityError("trusted artifact holds no turns")
+          grades = []
+          for entry in turns:
+              oracle = oracle_by_case.get(str(entry.get("case_id", "")), {})
+              if not oracle:
+                  raise AnswerQualityError(
+                      f"no frozen oracle entry for {entry.get('case_id')}"
+                  )
+              ctx = HardCheckContext(
+                  synthetic_input=str(entry.get("synthetic_input", "")),
+                  history=(),
+                  generated_answer=str(entry.get("generated_answer", "")),
+                  captured_safety_decision=str(entry.get("safety_decision", "allow")),
+                  claimed_quotes=(),
+                  evidence_locators=tuple(entry.get("evidence_locators", [])),
+                  evidence_book_claim=bool(oracle.get("book_relevance") == "required")
+                  and ("«" in str(entry.get("generated_answer", ""))),
+                  forbidden_spans=(),
+                  source_texts=dict(source_texts),
+                  valid_locators=frozenset(entry.get("evidence_locators", []))
+                  if source_texts else frozenset(),
+                  oracle=dict(oracle),
+              )
+              grades.append(
+                  grade_turn(
+                      ctx,
+                      rubric,
+                      case_id=str(entry.get("case_id", "?")),
+                      generator_model=str(entry.get("primary_model", "unknown")),
+                      evaluator_id=evaluator_model or "provisional-heuristic/1",
+                      is_multi_turn=bool(entry.get("journey_id", "")),
+                  )
+              )
+          generator_models = {str(e.get("primary_model", "")) for e in turns}
+          batch = grade_batch(
+              grades,
+              generator_model=sorted(generator_models)[0] if generator_models else "unknown",
+              evaluator_id=evaluator_model or "provisional-heuristic/1",
+          )
+          out = Path("eval-quality-out")
+          out.mkdir(parents=True, exist_ok=True)
+          result = {
+              "schema": "ru-answer-quality-result/1",
+              "rubric_sha256": rubric_sha,
+              "tuple_key": tuple_key(BenchmarkTuple(
+                  main_sha=tested_sha, corpus_sha=manifest_corpus,
+                  artifact_sha=artifact_sha, rubric_sha=rubric_sha,
+              )),
+              "batch_result": batch.result,
+              "currency": currency,
+              "graded_turns": batch.graded_turns,
+              "failed_turns": batch.failed_turns,
+              "hard_fail_turns": batch.hard_fail_turns,
+              "batch_soft_mean": batch.batch_soft_mean,
+              "provisional": batch.provisional,
+              "limitation": batch.limitation,
+              "clusters": [c.to_dict() for c in batch.clusters],
+              "turns": [
+                  {
+                      "case_id": g.case_id,
+                      "turn_pass": g.turn_pass,
+                      "failed_checks": [r.check_id for r in g.hard_results if not r.passed],
+                      "soft_mean": g.soft_mean,
+                  }
+                  for g in grades
+              ],
+          }
+          (out / "quality-result.json").write_text(
+              json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"result={batch.result}\n")
+              handle.write(f"currency={currency}\n")
+              handle.write(f"artifact_sha={artifact_sha}\n")
+              handle.write(
+                  f"clusters={json.dumps([c.to_dict() for c in batch.clusters])}\n"
+              )
+          print(
+              f"graded {batch.graded_turns} turns: {batch.result} "
+              f"currency={currency} failed={batch.failed_turns}"
+          )
+          PY
+      - name: Publish canonical #63 marker (idempotent)
+        id: publish
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const testedSha = '${{ needs.readiness.outputs.tested_sha }}';
+            const corpus = '${{ needs.readiness.outputs.corpus_sha }}';
+            const artifact = '${{ steps.evaluate.outputs.artifact_sha }}';
+            const rubric = '${{ needs.readiness.outputs.rubric_sha }}';
+            const result = '${{ steps.evaluate.outputs.result }}' || 'fail';
+            const currency = '${{ steps.evaluate.outputs.currency }}' || 'stale';
+            const runId = `${context.runId}`;
+            // Exactly-once: recheck #63 markers with the full tuple (now
+            // including the artifact checksum) before posting. A stale
+            // duplicate workflow event no-ops here even if readiness passed.
+            const qualityRe = /aa-answer-quality-result\s+issue=63\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+artifact=([0-9a-f]{64})\s+rubric=([0-9a-f]{64})\s+result=(pass|fail)\s+run=(\S+?)\s+currency=(current|stale)\s*-->/;
+            let duplicate = false;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 63, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc = c.author_association || '';
+                const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+                if (!isTrusted) continue;
+                const m = (c.body || '').match(qualityRe);
+                if (m && m[1] === testedSha && m[2] === corpus && m[3] === artifact && m[4] === rubric) {
+                  duplicate = true;
+                  break;
+                }
+              }
+              if (duplicate) break;
+            }
+            let quality = null;
+            try {
+              quality = JSON.parse(fs.readFileSync('eval-quality-out/quality-result.json', 'utf8'));
+            } catch (error) {
+              core.warning(`quality result file unreadable: ${error.message}`);
+            }
+            const provisional = quality && quality.provisional
+              ? ' Soft scores are provisional (same-model limitation stated in the artifact); hard checks ran deterministically.'
+              : '';
+            const marker = `<!-- aa-answer-quality-result issue=63 sha=${testedSha} corpus=${corpus} artifact=${artifact} rubric=${rubric} result=${result} run=${runId} currency=${currency} -->`;
+            if (!duplicate) {
+              const body = result === 'pass' && currency === 'current'
+                ? `${marker}\n\nAuthoritative answer-quality grade is PASS at the exact tested SHA (current production). Rubric \`${rubric.slice(0, 16)}…\` bound by checksum.${provisional}`
+                : result === 'pass'
+                  ? `${marker}\n\nAnswer-quality grade is PASS but main advanced past the tested SHA: retained diagnostically only, not a current production PASS.${provisional}`
+                  : `${marker}\n\nAuthoritative answer-quality grade is FAIL (${quality ? quality.failed_turns : '?'} failed turn(s), ${quality ? quality.hard_fail_turns : '?'} hard). Remediation clusters are grouped by root cause in the quality-result artifact; one remediation issue per root cause, never one per prompt.${provisional}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 63, body,
+              });
+              if (result === 'fail') {
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: 63, state: 'open',
+                });
+              } else if (currency === 'current') {
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: 63,
+                  state: 'closed', state_reason: 'completed',
+                });
+              }
+            } else {
+              core.notice('identical quality tuple already graded; no duplicate marker posted.');
+            }
+            core.setOutput('result', result);
+            core.setOutput('currency', currency);
+      - name: Upload quality result (privacy-safe, no answer bodies)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-answer-quality-result
+          path: eval-quality-out/quality-result.json
+          retention-days: 90
+          if-no-files-found: error
+
+  # Remediate FAIL batches: one issue per root cause (idempotent via stable
+  # fingerprint + tuple), reopen capability #9, machine-block it, then wake
+  # the local scheduler exactly once via workflow_dispatch.
+  remediate:
+    needs: [readiness, grade]
+    if: always() && needs.readiness.outputs.proceed == 'true' && needs.grade.outputs.result == 'fail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    steps:
+      - name: Download quality result
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-answer-quality-result
+          path: eval-quality-in
+      - name: Create or reuse remediation issues and reconnect #9
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const quality = JSON.parse(fs.readFileSync('eval-quality-in/quality-result.json', 'utf8'));
+            const testedSha = '${{ needs.readiness.outputs.tested_sha }}';
+            const corpus = '${{ needs.readiness.outputs.corpus_sha }}';
+            const rubric = '${{ needs.readiness.outputs.rubric_sha }}';
+            const runId = `${context.runId}`;
+            const currency = quality.currency || 'current';
+            const clusters = quality.clusters || [];
+            if (!clusters.length) {
+              core.notice('FAIL batch without clusters; nothing to remediate.');
+              return;
+            }
+            const remediationRe = /<!--\s*aa-quality-remediation\s+fingerprint=([0-9a-f]+)\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+rubric=([0-9a-f]{64})\s+category=(\S+?)\s*-->/;
+            // Idempotency: reuse the open remediation issue carrying the same
+            // stable fingerprint + tuple instead of duplicating it.
+            async function findOpenRemediation(fingerprint) {
+              for await (const { data: issues } of github.paginate.iterator(
+                github.rest.issues.listForRepo,
+                { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 },
+              )) {
+                for (const issue of issues) {
+                  if (issue.pull_request) continue;
+                  for await (const { data: comments } of github.paginate.iterator(
+                    github.rest.issues.listComments,
+                    { owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, per_page: 100 },
+                  )) {
+                    for (const c of comments) {
+                      const m = (c.body || '').match(remediationRe);
+                      if (m && m[1] === fingerprint && m[2] === testedSha && m[3] === corpus && m[4] === rubric) {
+                        return issue.number;
+                      }
+                    }
+                  }
+                  const mSelf = (issue.body || '').match(remediationRe);
+                  if (mSelf && mSelf[1] === fingerprint && mSelf[2] === testedSha && mSelf[3] === corpus && mSelf[4] === rubric) {
+                    return issue.number;
+                  }
+                }
+              }
+              return null;
+            }
+            const blockerNumbers = [];
+            for (const cluster of clusters) {
+              const existing = await findOpenRemediation(cluster.fingerprint);
+              if (existing) {
+                core.notice(`reusing open remediation #${existing} for ${cluster.category}.`);
+                blockerNumbers.push(existing);
+                continue;
+              }
+              const marker = `<!-- aa-quality-remediation fingerprint=${cluster.fingerprint} sha=${testedSha} corpus=${corpus} rubric=${rubric} category=${cluster.category} -->`;
+              const body = `${marker}\n\nAnswer-quality remediation for root cause \`${cluster.category}\` at tested SHA \`${testedSha}\` (quality run \`${runId}\`, currency ${currency}).\n\nFailed checks: ${(cluster.check_ids || []).join(', ')}.\nFailed cases: ${(cluster.case_ids || []).slice(0, 20).join(', ')}${(cluster.case_ids || []).length > 20 ? ` (+${cluster.case_ids.length - 20} more)` : ''}.\n\nScope: fix the underlying cause, never one prompt at a time.`;
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `[quality-remediation] ${cluster.category} @ ${testedSha.slice(0, 12)}`,
+                body,
+                labels: ['quality-remediation'],
+              });
+              core.notice(`created remediation #${created.data.number} for ${cluster.category}.`);
+              blockerNumbers.push(created.data.number);
+            }
+            // Reopen capability #9 when closed so #40 must requalify repaired main.
+            const cap = await github.rest.issues.get({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 9,
+            });
+            if (cap.data.state === 'closed') {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 9, state: 'open',
+              });
+              core.notice('reopened capability #9 for quality remediation.');
+            }
+            // Update #9's existing machine automation-blocked-by list, keeping
+            // closed historical references as evidence (dedupe, never prune).
+            const blockedRe = /<!--\s*automation-blocked-by:(.*?)-->/s;
+            const existing = new Set();
+            const blockedMatch = (cap.data.body || '').match(blockedRe);
+            if (blockedMatch) {
+              for (const token of blockedMatch[1].split(/[,\\s]+/)) {
+                const cleaned = token.replace(/^#/, '');
+                if (/^\\d+$/.test(cleaned)) existing.add(Number(cleaned));
+              }
+            }
+            for (const n of blockerNumbers) existing.add(n);
+            const merged = [...existing].sort((a, b) => a - b);
+            const marker = `<!-- automation-blocked-by: ${merged.map((n) => `#${n}`).join(', ')} -->`;
+            let newBody = cap.data.body || '';
+            if (blockedRe.test(newBody)) newBody = newBody.replace(blockedRe, marker);
+            else newBody = `${newBody}\n\n${marker}\n`;
+            await github.rest.issues.update({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 9, body: newBody,
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 9,
+              body: `<!-- quality-remediation sha=${testedSha} result=fail currency=${currency} run=${runId} -->\n\nAnswer-quality FAIL at tested #63 SHA \`${testedSha}\` (run \`${runId}\`, currency ${currency}). Capability #9 is machine-blocked on remediation issue(s) ${blockerNumbers.map((n) => `#${n}`).join(', ')} so #40 requalifies the repaired main.`,
+            });
+            // Wake the local scheduler once via workflow_dispatch (the
+            // supported recursion-safe wake-up). Never use TAP_PAT merely to
+            // manufacture event fan-out; GITHUB_TOKEN issue events are not a
+            // reliable trigger.
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+            });
+            core.notice('dispatched continuum-issue-scheduler.yml once for the remediation batch.');
