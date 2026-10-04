@@ -221,7 +221,8 @@ def _extract_blocks(
         text = html_to_text(fragment)
         if text:
             texts.append(text)
-    if not texts or heading not in "\n".join(texts[:3]):
+    first_lines = [line.strip() for text in texts[:3] for line in text.split("\n") if line.strip()]
+    if not texts or heading not in first_lines:
         raise ValueError(f"required heading {heading!r} is missing in {section!r}")
     dropped: list[str] = []
     if section == "n147":
