@@ -8,6 +8,17 @@
 /corpus/source/raw/
 /corpus/source/fetch-state.json
 /corpus/generated/
+# Issue #24: never commit private age identities, plaintext snapshots, or
+# plaintext retrieval indexes. Only the encrypted snapshot
+# (corpus/source/encrypted/*.age), recipient.txt, and metadata.json are public.
+*.age-key
+*AGE-SECRET-KEY*
+/corpus/source/encrypted/*.key
+/corpus/source/encrypted/*.identity
+/corpus/source/encrypted/*.tar.zst
+/corpus/source/encrypted/plaintext/
+*.tar.zst
+!/corpus/source/encrypted/.gitkeep
 
 # Python build/cache artifacts
 __pycache__/
