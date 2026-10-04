@@ -35,7 +35,7 @@
       "category": "slang-drinking",
       "utterance": "тяпнул вчера лишнего после работы",
       "context": "",
-      "plan_queries_ru": ["тяпнул вчера лишнего", "выпил немного лишнего", "первый глоток алкоголя"],
+      "plan_queries_ru": ["тяпнул вчера лишнего", "выпил немного лишнего", "выпил лишнего после работы"],
       "en_gloss_queries": ["a sip too many", "drinking after work"],
       "relevant_sections": ["chapter-1"],
       "allowed_interpretations": ["small drink that became too much", "after-work drinking without quantity claim"],
