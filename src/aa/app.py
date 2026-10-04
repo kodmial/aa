@@ -254,6 +254,31 @@ class Application:
         )
         return self._turn_runner
 
+    async def _run_trivial_turn(self, session_id: str, text: str) -> str:
+        """Execute the direct bounded agent path for one non-substantive turn."""
+        client = self.opencode_runtime.client
+
+        async def _trivial_send(
+            sid: str,
+            prompt: str,
+            *,
+            agent: str = "",
+            model: str = "",
+            timeout: float | None = None,
+        ) -> str:
+            _ = timeout
+            return await client.send_message(sid, prompt, agent=agent, model=model)
+
+        synthesis = await run_trivial_turn(
+            text,
+            session_id=session_id,
+            send=_trivial_send,
+            agent=self.settings.opencode_agent,
+            primary_model=self.settings.opencode_model,
+            fallback_model=self.settings.opencode_fallback_model,
+        )
+        return synthesis.text
+
     async def _run_grounded_turn(self, session_id: str, text: str) -> str:
         """Execute the production grounded pipeline for one substantive turn."""
         runner = self._get_turn_runner()
@@ -310,45 +335,18 @@ class Application:
         )
         try:
             if not is_substantive(text):
-                client = self.opencode_runtime.client
-
-                async def _trivial_send(
-                    sid: str,
-                    prompt: str,
-                    *,
-                    agent: str = "",
-                    model: str = "",
-                    timeout: float | None = None,
-                ) -> str:
-                    _ = timeout
-                    return await client.send_message(sid, prompt, agent=agent, model=model)
-
                 try:
-                    synthesis = await run_trivial_turn(
-                        text,
-                        session_id=session_id,
-                        send=_trivial_send,
-                        agent=self.settings.opencode_agent,
-                        primary_model=self.settings.opencode_model,
-                        fallback_model=self.settings.opencode_fallback_model,
-                    )
+                    trivial_reply = await self._run_trivial_turn(session_id, text)
                 except TurnFailed as exc:
                     if exc.category == "session-not-found":
                         session_id = await self.sessions.reset_opencode_session(
                             chat_id, self.opencode_runtime.client, delete_remote=False
                         )
-                        synthesis = await run_trivial_turn(
-                            text,
-                            session_id=session_id,
-                            send=_trivial_send,
-                            agent=self.settings.opencode_agent,
-                            primary_model=self.settings.opencode_model,
-                            fallback_model=self.settings.opencode_fallback_model,
-                        )
+                        trivial_reply = await self._run_trivial_turn(session_id, text)
                     else:
                         raise
                 logger.info("trivial response served", extra={"chat_id": chat_id})
-                return synthesis.text
+                return trivial_reply
             try:
                 reply = await self._run_grounded_turn(session_id, text)
             except TurnFailed as exc:
@@ -367,10 +365,23 @@ class Application:
             return FAIL_CLOSED_REPLY
         except OpenCodeSessionNotFoundError:
             # A local chat mapping can outlive an OpenCode session after a
-            # runtime restart. Rebind once and retry against a fresh session.
+            # runtime restart. Rebind once and retry against a fresh session,
+            # preserving the original routing: non-substantive greetings retry
+            # through the direct trivial path (never the RU grounded pipeline).
             session_id = await self.sessions.reset_opencode_session(
                 chat_id, self.opencode_runtime.client, delete_remote=False
             )
+            if not is_substantive(text):
+                try:
+                    trivial_retry = await self._run_trivial_turn(session_id, text)
+                except TurnFailed as exc:
+                    logger.warning(
+                        "trivial turn failed closed after rebind",
+                        extra={"chat_id": chat_id, "category": exc.category},
+                    )
+                    return FAIL_CLOSED_REPLY
+                logger.info("trivial response served", extra={"chat_id": chat_id})
+                return trivial_retry
             try:
                 reply = await self._run_grounded_turn(session_id, text)
             except TurnFailed as exc:
