@@ -71,6 +71,36 @@ uses the anonymous/keyless OpenCode free tier and must not require an OpenCode
 or Zen account, API key, provider credential, or authentication secret. The
 worker forwards at most the opaque `OPENCODE_MODEL` `provider/model` pointer.
 
+## Concurrency and restart state (issue #5)
+
+The runtime uses one authoritative Telegram poller and one local
+``opencode serve`` process per AA worker, not one OpenCode process per
+Telegram user. Each private ``chat_id`` maps to exactly one opaque OpenCode
+session identity; different chats never share a session, history, pending
+turn, reset generation, or mutable orchestration state.
+
+- Turns for the same chat are strict FIFO with at most one active
+  substantive turn; session create/rebind/reset and ``/new`` run inside the
+  same per-chat serialization, so concurrent first messages cannot create
+  competing sessions and ``/new`` replaces only the requesting chat.
+- Turns for different chats may execute concurrently under a configurable
+  global ``MAX_CONCURRENT_TURNS`` bound (default 4, conservative for the
+  pinned OpenCode/provider/runtime) plus a bounded per-chat pending queue
+  (``PER_CHAT_QUEUE_SIZE``, default 8) with safe backpressure.
+- One slow chat never head-of-line blocks unrelated chats: the poller only
+  enqueues and returns, while per-chat workers proceed independently.
+
+Conversation continuity is guaranteed only for the lifetime of the current
+worker/runtime; a new runtime starts a fresh OpenCode conversation per chat
+and no external database is added for history.
+
+Crash window (explicit): the transport commits an update offset once the
+update is accepted into the per-chat queue. Clean shutdown stops the poller
+first and then drains queued/in-flight turns (bounded). If the worker
+crashes after acceptance but before the reply is sent, that in-flight turn
+is lost and will not be redelivered. No exactly-once reply across crashes is
+claimed without durable transactional state.
+
 ## Generation budget (issue #83)
 
 Pinned-runtime finding (OpenCode 1.18.34, verified against `GET /doc`):

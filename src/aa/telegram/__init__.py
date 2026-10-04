@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from aa.telegram.dispatcher import ChatQueueFullError, ChatTurnDispatcher
 from aa.telegram.transport import (
     SUPPORTED_COMMANDS,
     PollingTelegramTransport,
@@ -18,6 +19,8 @@ from aa.telegram.transport import (
 )
 
 __all__ = [
+    "ChatQueueFullError",
+    "ChatTurnDispatcher",
     "SUPPORTED_COMMANDS",
     "PollingTelegramTransport",
     "StubTelegramTransport",
