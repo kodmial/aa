@@ -152,9 +152,13 @@ def main(argv: list[str] | None = None) -> int:
     archive_path = args.encrypted_dir / ARCHIVE_NAME
     tmp_path = archive_path.with_name(archive_path.name + ".tmp")
     tmp_path.write_bytes(encrypted)
-    os.replace(tmp_path, archive_path)
-    if archive_path.read_bytes() != encrypted:
+    if tmp_path.read_bytes() != encrypted:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
         return _fail("written archive differs from the encrypted payload")
+    os.replace(tmp_path, archive_path)
 
     encrypted_sha = hashlib.sha256(encrypted).hexdigest()
     metadata = build_metadata(

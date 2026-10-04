@@ -91,7 +91,15 @@ def _write_verified(path: Path, payload: bytes, *, expected_sha: str) -> bool:
     if sha256_bytes(payload) != expected_sha:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_bytes(payload)
+    if tmp_path.read_bytes() != payload:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return False
+    os.replace(tmp_path, path)
     try:
         load_canonical(path, expected_sha256=expected_sha)
     except CanonicalCorpusError:
@@ -123,7 +131,10 @@ def _network_allowed(*, flag: bool) -> bool:
 
 
 def _run_network_fallback(*, output: Path, manifest: Path) -> int:
-    if output != DEFAULT_OUTPUT or manifest != DEFAULT_MANIFEST:
+    if (
+        Path(output).resolve() != DEFAULT_OUTPUT.resolve()
+        or Path(manifest).resolve() != DEFAULT_MANIFEST.resolve()
+    ):
         print(
             "canonical restore failed: network fallback supports only "
             f"default --output/--manifest (got {output} / {manifest})",
