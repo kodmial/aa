@@ -177,13 +177,22 @@ def describe_case(
     payload: str,
     costs: list[int],
     baseline_median: float,
+    baseline_chars: int,
 ) -> CaseResult:
-    """Build a :class:`CaseResult` from collected costs and a baseline."""
+    """Build a :class:`CaseResult` from collected costs and a baseline.
+
+    ``chars_per_token`` uses net payload chars (``len(payload)`` minus
+    ``baseline_chars``) divided by the token delta, so the constant
+    ``MEASURE_INSTRUCTION`` wrapper cancels out and re-running the
+    harness reproduces the documented calibration. ``chars`` keeps the
+    gross payload length for reporting.
+    """
     stats = summarize_runs(costs)
     delta = stats.median - baseline_median
+    net_chars = len(payload) - baseline_chars
     per_token: float | None = None
-    if delta > 0:
-        per_token = len(payload) / delta
+    if delta > 0 and net_chars > 0:
+        per_token = net_chars / delta
     return CaseResult(
         name=name,
         language=language,

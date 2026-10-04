@@ -170,6 +170,7 @@ def run_suite(
     *,
     repeats: int,
     baseline_median: float | None = None,
+    baseline_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """Measure every case; return (results, baseline median)."""
     if baseline_median is None:
@@ -184,6 +185,7 @@ def run_suite(
             payload=payload,
             costs=costs,
             baseline_median=0.0,
+            baseline_chars=len(payload),
         )
         results = [
             {
@@ -200,10 +202,12 @@ def run_suite(
             }
         ]
         baseline_median = baseline.stats.median
+        baseline_chars = baseline.chars
         rest = cases[1:]
     else:
         results = []
         rest = cases
+        assert baseline_chars is not None
     for name, language, payload in rest:
         costs = collect_case(
             lambda text, case=name: measurer.send_once(text, case=case),
@@ -216,6 +220,7 @@ def run_suite(
             payload=payload,
             costs=costs,
             baseline_median=baseline_median,
+            baseline_chars=baseline_chars,
         )
         results.append(
             {

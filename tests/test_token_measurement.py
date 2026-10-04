@@ -123,10 +123,12 @@ def test_describe_case_delta_and_chars_per_token() -> None:
         payload="x" * 512,
         costs=[100, 100, 100],
         baseline_median=40.0,
+        baseline_chars=84,
     )
     assert isinstance(result, CaseResult)
     assert result.delta_tokens == 60.0
-    assert result.chars_per_token == pytest.approx(512 / 60.0)
+    assert result.chars == 512
+    assert result.chars_per_token == pytest.approx((512 - 84) / 60.0)
     assert result.stats.median == 100.0
 
 
@@ -137,8 +139,22 @@ def test_describe_case_no_per_token_when_no_positive_delta() -> None:
         payload="abc",
         costs=[40, 40],
         baseline_median=40.0,
+        baseline_chars=3,
     )
     assert result.delta_tokens == 0.0
+    assert result.chars_per_token is None
+
+
+def test_describe_case_no_per_token_when_net_not_positive() -> None:
+    result = describe_case(
+        name="baseline",
+        language="mixed",
+        payload="abc",
+        costs=[100, 100],
+        baseline_median=40.0,
+        baseline_chars=3,
+    )
+    assert result.delta_tokens == 60.0
     assert result.chars_per_token is None
 
 
