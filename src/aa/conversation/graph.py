@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.runnables import Runnable
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -35,8 +35,11 @@ from aa.conversation.graph_state import (
 )
 from aa.conversation.memory import (
     MemoryConfig,
+    build_summarization_node,
     default_memory_config,
-    maybe_compact_state,
+    ensure_message_ids,
+    running_summary_from_state,
+    summary_text_from_running,
 )
 from aa.conversation.planner_node import planner_node
 from aa.conversation.planner_schema import QueryPlanValidationError
@@ -87,31 +90,43 @@ def make_memory_node(
     summary_model: Runnable[list[BaseMessage], BaseMessage],
     memory_config: MemoryConfig,
 ) -> Any:
-    """Build the managed-memory node (token compaction via framework)."""
+    """Build the managed-memory node (LangMem graph-native compaction).
+
+    The LangMem ``SummarizationNode`` is an actual node delegate on the
+    execution path before the planner. Budgets come from ``memory_config``;
+    no project-owned split/running-summary logic exists here.
+    """
+    summarizer = build_summarization_node(summary_model, config=memory_config)
 
     async def ensure_memory(state: TurnState) -> dict[str, Any]:
         messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
+        ensure_message_ids(messages)
         previous = str(state.get("conversation_summary", ""))
-        merged, retained = await maybe_compact_state(
-            messages=messages,
-            previous_summary=previous,
-            model=summary_model,
-            config=memory_config,
-        )
+        context = dict(state.get("context", {}) or {})
+        running = running_summary_from_state(summary_text=previous, context=context)
+        node_input: dict[str, Any] = {"messages": messages}
+        if running is not None:
+            node_input["context"] = {"running_summary": running}
+        else:
+            node_input["context"] = {}
+        result = await summarizer.ainvoke(node_input)
+        new_context = dict(result.get("context", {}) or {})
+        new_running = new_context.get("running_summary")
         update: dict[str, Any] = {}
-        if merged != previous:
-            update["conversation_summary"] = merged
-        retained_ids = {id(item) for item in retained}
-        dropped = [item for item in messages if id(item) not in retained_ids]
-        removals: list[RemoveMessage] = []
-        for item in dropped:
-            if item.id:
-                removals.append(RemoveMessage(id=str(item.id)))
-        if removals:
-            update["messages"] = removals
+        if new_running is not None:
+            new_summary = summary_text_from_running(new_running)
+            if new_summary and new_summary != previous:
+                update["conversation_summary"] = new_summary
+            if new_context != context:
+                update["context"] = new_context
+            new_messages = result.get("messages", messages)
+            # LangMem overwrite mode returns RemoveMessage + compacted view;
+            # propagate it so history stays bounded by the framework.
+            if new_messages is not messages:
+                update["messages"] = new_messages
         logger.info(
             "v2 memory ensured",
-            extra={"dropped_messages": len(removals), "compacted": merged != previous},
+            extra={"compacted": bool(update)},
         )
         return update
 

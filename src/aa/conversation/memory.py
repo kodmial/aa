@@ -5,10 +5,10 @@ Framework-managed state, not a custom memory database:
 - a LangGraph checkpointer owns durable thread/session state; one Telegram
   private chat maps deterministically to one graph thread identity via a
   one-way digest (the raw chat identifier is never logged or stored);
-- token-based compaction uses the LangChain summarization middleware's
-  trigger/keep facilities with the #112 baselines (compact near ~60% of
-  the ~200k reference, retain ~20% verbatim); decisions are token-driven,
-  never fixed-turn-count driven;
+- token-based compaction uses the LangMem graph-native ``SummarizationNode``
+  / ``RunningSummary`` mechanism with the #112 baselines (compact near ~60%
+  of the ~200k reference, retain ~20% verbatim model-input view, 4k summary
+  ceiling); decisions are token-driven, never fixed-turn-count driven;
 - the checkpointer backend sits behind a replaceable factory so
   production storage can change later without changing graph semantics.
 
@@ -29,14 +29,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from langchain.agents.middleware.summarization import SummarizationMiddleware
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import count_tokens_approximately
-from langchain_core.runnables import Runnable
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langmem.short_term import RunningSummary, SummarizationNode  # type: ignore[import-untyped]
 
 from aa.conversation.v2_prompts import load_summarizer_system_v2
 
@@ -45,6 +44,7 @@ logger = logging.getLogger("aa.conversation.memory")
 CONTEXT_REFERENCE_TOKENS = 200_000
 COMPACTION_TRIGGER_TOKENS = 120_000
 RECENT_KEEP_TOKENS = 40_000
+MAX_SUMMARY_TOKENS = 4_096
 
 CHECKPOINT_ENV_VAR = "AA_V2_CHECKPOINT_DIR"
 CHECKPOINT_FILENAME = "aa-v2-checkpoints.sqlite3"
@@ -76,6 +76,7 @@ class MemoryConfig:
     context_reference_tokens: int = CONTEXT_REFERENCE_TOKENS
     trigger_tokens: int = COMPACTION_TRIGGER_TOKENS
     keep_tokens: int = RECENT_KEEP_TOKENS
+    max_summary_tokens: int = MAX_SUMMARY_TOKENS
     checkpoint_filename: str = CHECKPOINT_FILENAME
 
 
@@ -123,24 +124,55 @@ class SqliteCheckpointerFactory:
         logger.info("v2 checkpoint storage cleaned")
 
 
-def build_summarization_middleware(
-    model: BaseChatModel | str,
+def _summarizer_prompts() -> tuple[ChatPromptTemplate, ChatPromptTemplate]:
+    """Build LangMem prompts around the versioned English #112 artifact."""
+    system_text = load_summarizer_system_v2()
+    initial = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_text),
+            MessagesPlaceholder("messages"),
+            ("human", "Create a compact continuity summary of the conversation above."),
+        ]
+    )
+    existing = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_text),
+            MessagesPlaceholder("messages"),
+            (
+                "human",
+                "This is the running summary so far: {existing_summary}\n"
+                "Extend it with the new messages above, preserving continuity "
+                "without adding AA doctrine or advice.",
+            ),
+        ]
+    )
+    return initial, existing
+
+
+def build_summarization_node(
+    model: Any,
     *,
     config: MemoryConfig | None = None,
-) -> SummarizationMiddleware:
-    """Configure the framework middleware with the #112 AA memory contract.
+) -> SummarizationNode:
+    """Configure the LangMem graph-native summarization node.
 
-    Token-driven trigger/keep come from the framework's own facilities;
-    the summarization prompt is the versioned English #112 artifact so
+    Token budgets come from the #112 AA memory contract: trigger near ~60%
+    of the reference, recent/raw + summary envelope ~20%, summary ceiling
+    4k. The summarization prompt is the versioned English #112 artifact so
     compacted memory preserves continuity without becoming AA doctrine.
     """
     resolved = config or default_memory_config()
-    return SummarizationMiddleware(
+    initial, existing = _summarizer_prompts()
+    return SummarizationNode(
         model=model,
-        trigger=("tokens", resolved.trigger_tokens),
-        keep=("tokens", resolved.keep_tokens),
+        max_tokens=resolved.keep_tokens,
+        max_tokens_before_summary=resolved.trigger_tokens,
+        max_summary_tokens=resolved.max_summary_tokens,
         token_counter=count_tokens_approximately,
-        summary_prompt=load_summarizer_system_v2(),
+        initial_summary_prompt=initial,
+        existing_summary_prompt=existing,
+        input_messages_key="messages",
+        output_messages_key="messages",
     )
 
 
@@ -149,103 +181,49 @@ def count_message_tokens(messages: list[BaseMessage]) -> int:
     return int(count_tokens_approximately(messages))
 
 
+def ensure_message_ids(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Ensure every message carries an id (required by LangMem)."""
+    import uuid
+
+    for message in messages:
+        if not getattr(message, "id", None):
+            try:
+                message.id = f"msg-{uuid.uuid4().hex[:12]}"
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return messages
+
+
 def needs_compaction(messages: list[BaseMessage], *, trigger_tokens: int) -> bool:
     """Token-driven compaction decision; never fixed-turn-count driven."""
     return count_message_tokens(messages) >= trigger_tokens
 
 
-def split_keep_window(messages: list[BaseMessage], *, keep_tokens: int) -> int:
-    """Return the split index keeping roughly the newest ``keep_tokens``.
+def running_summary_from_state(
+    *, summary_text: str, context: dict[str, Any] | None
+) -> RunningSummary | None:
+    """Recover the persisted LangMem running summary without overwriting it.
 
-    The cut never orphans related structured messages: when the oldest
-    retained message answers a tool call, the calling assistant message is
-    retained with it.
+    A caller default of ``""`` never clears persisted state: when the stored
+    context already holds a running summary it is preserved verbatim.
     """
-    if not messages:
-        return 0
-    total = 0
-    start = len(messages)
-    for index in range(len(messages) - 1, -1, -1):
-        total += count_message_tokens([messages[index]])
-        if total > keep_tokens and index > 0:
-            start = index
-            break
-        start = index
-    else:
-        return 0
-    while start > 0:
-        oldest = messages[start]
-        previous = messages[start - 1]
-        if oldest.type == "tool" and isinstance(previous, AIMessage) and previous.tool_calls:
-            start -= 1
-            continue
-        break
-    return start
-
-
-def render_messages_for_summary(messages: list[BaseMessage]) -> str:
-    """Render a window of real dialogue for the summarizer model call."""
-    lines: list[str] = []
-    for message in messages:
-        role = "user" if message.type == "human" else "assistant"
-        content = message.content
-        text = content if isinstance(content, str) else str(content)
-        lines.append(f"{role}: {text}")
-    return "\n".join(lines)
-
-
-async def summarize_window(
-    messages: list[BaseMessage],
-    *,
-    model: Runnable[list[BaseMessage], BaseMessage],
-    summary_prompt: str | None = None,
-) -> str:
-    """Summarize one dialogue window for continuity (hidden model call)."""
-    prompt = summary_prompt or load_summarizer_system_v2()
-    rendered = render_messages_for_summary(messages)
-    if not rendered.strip():
-        return ""
-    reply = await model.ainvoke([SystemMessage(content=prompt), HumanMessage(content=rendered)])
-    content = reply.content if isinstance(reply, BaseMessage) else getattr(reply, "content", "")
-    return content.strip() if isinstance(content, str) else str(content).strip()
-
-
-async def maybe_compact_state(
-    *,
-    messages: list[BaseMessage],
-    previous_summary: str,
-    model: Runnable[list[BaseMessage], BaseMessage],
-    config: MemoryConfig,
-) -> tuple[str, list[BaseMessage]]:
-    """Compact older dialogue when the token trigger is reached.
-
-    Returns ``(summary, retained_messages)``. Below the trigger the inputs
-    pass through unchanged. The summary preserves conversational
-    referents/continuity; it must never be treated as AA evidence (the
-    prompt contract and the answer node enforce that downstream).
-    """
-    if not needs_compaction(messages, trigger_tokens=config.trigger_tokens):
-        return previous_summary, messages
-    split = split_keep_window(messages, keep_tokens=config.keep_tokens)
-    older = messages[:split] if split > 0 else messages[:-1] if len(messages) > 1 else messages
-    retained = messages[split:] if split > 0 else messages[-1:]
-    window_summary = await summarize_window(older, model=model)
-    if not window_summary:
-        logger.info("v2 compaction skipped", extra={"reason": "empty-summary"})
-        return previous_summary, retained
-    if previous_summary.strip():
-        merged = f"{previous_summary.strip()}\n{window_summary}"
-    else:
-        merged = window_summary
-    logger.info(
-        "v2 conversation compacted",
-        extra={
-            "older_messages": len(older),
-            "retained_messages": len(retained),
-            "summary_tokens": count_message_tokens([HumanMessage(content=merged)]),
-        },
+    context = context or {}
+    stored = context.get("running_summary")
+    if isinstance(stored, RunningSummary):
+        return stored
+    text = summary_text.strip()
+    if not text:
+        return None
+    return RunningSummary(
+        summary=text, summarized_message_ids=set(), last_summarized_message_id=None
     )
-    return merged, retained
+
+
+def summary_text_from_running(running: RunningSummary | None) -> str:
+    """Extract the continuity text from a LangMem running summary."""
+    if running is None:
+        return ""
+    return str(running.summary)
 
 
 __all__ = [
@@ -253,18 +231,18 @@ __all__ = [
     "CHECKPOINT_FILENAME",
     "COMPACTION_TRIGGER_TOKENS",
     "CONTEXT_REFERENCE_TOKENS",
+    "MAX_SUMMARY_TOKENS",
     "RECENT_KEEP_TOKENS",
     "CheckpointerFactory",
     "MemoryConfig",
     "SqliteCheckpointerFactory",
-    "build_summarization_middleware",
+    "build_summarization_node",
     "count_message_tokens",
     "default_checkpoint_dir",
     "default_memory_config",
-    "maybe_compact_state",
+    "ensure_message_ids",
     "needs_compaction",
-    "render_messages_for_summary",
-    "split_keep_window",
-    "summarize_window",
+    "running_summary_from_state",
+    "summary_text_from_running",
     "thread_id_for_chat",
 ]

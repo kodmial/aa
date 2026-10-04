@@ -20,6 +20,8 @@ later generation task owns the answer node itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from xml.sax.saxutils import escape as _xml_escape
+from xml.sax.saxutils import quoteattr as _xml_quoteattr
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
@@ -36,6 +38,11 @@ class EvidencePassage:
     text: str
 
 
+def _escape_text(value: str) -> str:
+    """Escape dynamic text so XML block boundaries stay literal data."""
+    return _xml_escape(value, {"'": "&apos;", '"': "&quot;"})
+
+
 def render_turn_context(
     *,
     summary: str,
@@ -48,21 +55,23 @@ def render_turn_context(
     structurally unambiguous.
     """
     lines: list[str] = ["<conversation_memory>"]
-    lines.append(summary.strip() if summary.strip() else "(no prior conversation)")
+    stripped = summary.strip()
+    lines.append(_escape_text(stripped) if stripped else "(no prior conversation)")
     lines.append("</conversation_memory>")
     lines.append("<book_evidence>")
     if passages:
         for passage in passages:
             lines.append(
-                f'<passage id="{passage.passage_id}" '
-                f'source="{passage.source}" section="{passage.section}">'
-                f"{passage.text}</passage>"
+                f"<passage id={_xml_quoteattr(passage.passage_id)} "
+                f"source={_xml_quoteattr(passage.source)} "
+                f"section={_xml_quoteattr(passage.section)}>"
+                f"{_escape_text(passage.text)}</passage>"
             )
     else:
         lines.append("(no book evidence supplied for this turn)")
     lines.append("</book_evidence>")
     lines.append("<user_message>")
-    lines.append(user_message)
+    lines.append(_escape_text(user_message))
     lines.append("</user_message>")
     return "\n".join(lines)
 

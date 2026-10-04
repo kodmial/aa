@@ -20,6 +20,7 @@ class TurnState(TypedDict, total=False):
 
     messages: Annotated[list[BaseMessage], add_messages]
     conversation_summary: str
+    context: dict[str, Any]
     current_user_message: str
     search_queries: list[str]
     retrieval_hits: list[dict[str, Any]]
