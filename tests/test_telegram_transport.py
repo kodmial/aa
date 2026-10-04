@@ -441,12 +441,17 @@ async def test_application_new_command_resets_only_that_chat() -> None:
     await app.start()
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 4)
-        replies = [payload["text"] for payload in api.sent_payloads]
-        assert replies[0] == "Фиктивный ответ 1"
-        assert replies[1] == "Фиктивный ответ 1"
-        assert "Новая беседа начата" in replies[2]
+        # Cross-chat completion order is intentionally concurrent (issue #5);
+        # assert per-chat FIFO and isolation instead of a global order.
+        by_chat: dict[int, list[str]] = {}
+        for payload in api.sent_payloads:
+            by_chat.setdefault(payload["chat_id"], []).append(payload["text"])
+        assert by_chat[8] == ["Фиктивный ответ 1"]
+        assert len(by_chat[7]) == 3
+        assert by_chat[7][0] == "Фиктивный ответ 1"
+        assert "Новая беседа начата" in by_chat[7][1]
         # Chat 7 gets a fresh OpenCode session after /new.
-        assert replies[3] == "Фиктивный ответ 1"
+        assert by_chat[7][2] == "Фиктивный ответ 1"
         assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)
     finally:
         await app.stop()

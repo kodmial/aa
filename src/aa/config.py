@@ -16,6 +16,13 @@ DEFAULT_AA_AGENT = "aa"
 DEFAULT_PRIMARY_MODEL = "opencode/muse-spark-1.3-contributor-free"
 DEFAULT_FALLBACK_MODEL = "opencode/space-bunny-free"
 
+# Conservative concurrency defaults for the single local ``opencode serve``
+# process per worker (issue #5). Qualification determines the safe value
+# against the pinned OpenCode/provider/runtime; these defaults stay small
+# so the worker cannot overload OpenCode/provider/runtime resources.
+DEFAULT_MAX_CONCURRENT_TURNS = 4
+DEFAULT_PER_CHAT_QUEUE_SIZE = 8
+
 
 def _get_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
@@ -78,6 +85,15 @@ class Settings:
     opencode_context_limit_tokens: int = 0
     opencode_max_output_tokens: int = 0
 
+    # Concurrency architecture (issue #5): one authoritative Telegram poller
+    # and one local ``opencode serve`` process per worker. Different chats
+    # may execute concurrently up to ``max_concurrent_turns``; turns for the
+    # same chat stay strict FIFO with at most one active turn. Each per-chat
+    # pending queue is bounded by ``per_chat_queue_size`` so the worker
+    # backpressures safely instead of growing memory without bound.
+    max_concurrent_turns: int = DEFAULT_MAX_CONCURRENT_TURNS
+    per_chat_queue_size: int = DEFAULT_PER_CHAT_QUEUE_SIZE
+
     # Logging.
     log_level: str = "INFO"
 
@@ -97,6 +113,8 @@ class Settings:
             "OPENCODE_FALLBACK_MODEL",
             "OPENCODE_CONTEXT_LIMIT_TOKENS",
             "OPENCODE_MAX_OUTPUT_TOKENS",
+            "MAX_CONCURRENT_TURNS",
+            "PER_CHAT_QUEUE_SIZE",
             "LOG_LEVEL",
         ),
         compare=False,
@@ -123,6 +141,12 @@ class Settings:
                     source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0
                 ),
                 opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
+                max_concurrent_turns=int(
+                    source.get("MAX_CONCURRENT_TURNS", "") or DEFAULT_MAX_CONCURRENT_TURNS
+                ),
+                per_chat_queue_size=int(
+                    source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
+                ),
                 log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             )
         return cls(
@@ -140,6 +164,12 @@ class Settings:
             opencode_fallback_model=source.get("OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL),
             opencode_context_limit_tokens=int(source.get("OPENCODE_CONTEXT_LIMIT_TOKENS", "") or 0),
             opencode_max_output_tokens=int(source.get("OPENCODE_MAX_OUTPUT_TOKENS", "") or 0),
+            max_concurrent_turns=int(
+                source.get("MAX_CONCURRENT_TURNS", "") or DEFAULT_MAX_CONCURRENT_TURNS
+            ),
+            per_chat_queue_size=int(
+                source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
+            ),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -162,6 +192,10 @@ class Settings:
             raise ValueError("OPENCODE_CONTEXT_LIMIT_TOKENS must be >= 0")
         if self.opencode_max_output_tokens < 0:
             raise ValueError("OPENCODE_MAX_OUTPUT_TOKENS must be >= 0")
+        if self.max_concurrent_turns <= 0:
+            raise ValueError("MAX_CONCURRENT_TURNS must be > 0")
+        if self.per_chat_queue_size <= 0:
+            raise ValueError("PER_CHAT_QUEUE_SIZE must be > 0")
         if require_bot_token and not self.has_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required but missing or empty")
 
@@ -182,5 +216,7 @@ class Settings:
             "opencode_fallback_model": self.opencode_fallback_model,
             "opencode_context_limit_tokens": self.opencode_context_limit_tokens,
             "opencode_max_output_tokens": self.opencode_max_output_tokens,
+            "max_concurrent_turns": self.max_concurrent_turns,
+            "per_chat_queue_size": self.per_chat_queue_size,
             "log_level": self.log_level,
         }

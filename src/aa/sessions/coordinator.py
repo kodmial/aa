@@ -14,6 +14,7 @@ still succeeds.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -36,10 +37,19 @@ class ChatSession:
 
 
 class SessionCoordinator:
-    """Owns the mapping from chat id to :class:`ChatSession`."""
+    """Owns the mapping from chat id to :class:`ChatSession`.
+
+    Concurrency (issue #5): session create/rebind/reset for the same chat
+    are serialized through a per-chat asyncio lock, so two simultaneous
+    first messages for one chat cannot create competing OpenCode sessions.
+    Different chats use different locks and never block each other here.
+    The lock body contains no ``await`` between the map lookup and the lock
+    creation, so lock creation itself is atomic on the single event loop.
+    """
 
     def __init__(self) -> None:
         self._sessions: dict[int, ChatSession] = {}
+        self._locks: dict[int, asyncio.Lock] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -62,6 +72,15 @@ class SessionCoordinator:
             session = ChatSession(chat_id=chat_id)
             self._sessions[chat_id] = session
         return session
+
+    def _lock_for(self, chat_id: int) -> asyncio.Lock:
+        """Return the serialization lock for ``chat_id`` (creating it)."""
+        existing = self._locks.get(chat_id)
+        if existing is not None:
+            return existing
+        created = asyncio.Lock()
+        self._locks[chat_id] = created
+        return created
 
     def record_message(self, chat_id: int) -> ChatSession:
         """Record one inbound message for ``chat_id``."""
@@ -108,9 +127,18 @@ class SessionCoordinator:
         Reuses the bound session when present (continuation); otherwise
         creates a new remote session and binds it. Distinct chats always
         receive distinct OpenCode sessions because each binding is stored
-        under its own chat id.
+        under its own chat id. The whole check-and-create is serialized per
+        chat so concurrent first messages cannot create competing sessions.
         """
-        existing = self.get_opencode_session_id(chat_id)
+        async with self._lock_for(chat_id):
+            return await self._ensure_unlocked(chat_id, client, title)
+
+    def _ensure_unlocked_sync(self, chat_id: int) -> str | None:
+        session = self._sessions.get(chat_id)
+        return session.opencode_session_id if session is not None else None
+
+    async def _ensure_unlocked(self, chat_id: int, client: OpenCodeClient, title: str = "") -> str:
+        existing = self._ensure_unlocked_sync(chat_id)
         if existing is not None:
             return existing
         info = await client.create_session(title or f"chat-{chat_id}")
@@ -124,13 +152,18 @@ class SessionCoordinator:
 
         The previous remote session is deleted best-effort (a missing
         session is not an error); the mapping is then cleared and a fresh
-        session is created and bound.
+        session is created and bound. Serialized per chat so a reset can
+        never interleave with a concurrent create/rebind for the same chat;
+        callers must additionally order resets against in-flight turns via
+        the per-chat dispatcher (issue #5) so a reset never retires a
+        session while an older turn is still mutating it.
         """
-        previous = self.get_opencode_session_id(chat_id)
-        if previous is not None and delete_remote:
-            try:
-                await client.delete_session(previous)
-            except OpenCodeSessionNotFoundError:
-                pass
-        self.reset(chat_id)
-        return await self.ensure_opencode_session(chat_id, client)
+        async with self._lock_for(chat_id):
+            previous = self._ensure_unlocked_sync(chat_id)
+            if previous is not None and delete_remote:
+                try:
+                    await client.delete_session(previous)
+                except OpenCodeSessionNotFoundError:
+                    pass
+            self.reset(chat_id)
+            return await self._ensure_unlocked(chat_id, client)
