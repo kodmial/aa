@@ -163,20 +163,18 @@ def build_metadata(
 ) -> dict[str, Any]:
     """Build the committed non-secret ``metadata.json`` payload.
 
-    English (``canonical_name == CANONICAL_NAME`` with the default EN
-    ``encrypted_file``) keeps the exact version-1 shape. Russian uses
-    version 2 with ``canonical_member`` plus an explicit ``encrypted_file``.
+    English (``canonical_name == CANONICAL_NAME``) keeps the exact version-1
+    shape. Russian uses version 2 with ``canonical_member`` plus an explicit
+    ``encrypted_file``.
     """
     default_en_file = f"corpus/source/encrypted/{ARCHIVE_NAME}"
-    is_english = canonical_name == CANONICAL_NAME and (
-        encrypted_file is None or encrypted_file == default_en_file
-    )
+    is_english = canonical_name == CANONICAL_NAME
     if is_english:
         return {
             "metadata_version": METADATA_VERSION,
             "canonical_sha256": canonical_sha256,
             "encrypted_sha256": encrypted_sha256,
-            "encrypted_file": default_en_file,
+            "encrypted_file": encrypted_file or default_en_file,
             "manifest_format": manifest.get("format"),
             "manifest_builder_version": manifest.get("builder_version"),
             "manifest_artifact_sha256": manifest.get("artifact_sha256"),
