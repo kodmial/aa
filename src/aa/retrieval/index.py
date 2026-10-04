@@ -248,6 +248,8 @@ def extract_ru_chunks(
                 "text",
                 "text_sha256",
                 "corpus_version",
+                "char_start",
+                "char_end",
             ):
                 if node.get(key) is None:
                     raise HybridIndexError(f"RU chunk is missing {key}")
