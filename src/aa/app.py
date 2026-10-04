@@ -49,6 +49,14 @@ from aa.telegram.transport import (
     TelegramReply,
     TelegramTransport,
 )
+from aa.telegram.voice import (
+    FfmpegDecoder,
+    GigaAMRecognizer,
+    VoiceError,
+    VoicePipeline,
+    build_pipeline,
+    voice_error_reply,
+)
 
 logger = logging.getLogger("aa.app")
 
@@ -72,6 +80,7 @@ class Application:
         safety: SafetyRouter | None = None,
         controller: RuntimeController | None = None,
         grounding: GroundingGate | None = None,
+        voice_pipeline: VoicePipeline | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
@@ -103,6 +112,10 @@ class Application:
         self._turn_runner: TurnRunner | None = None
         self._index: HybridIndex | None = None
         self._index_error: str | None = None
+        # Local voice recognition (issue #76): loaded once per worker and
+        # reused for all turns. ``None`` means the voice capability is
+        # unavailable; the text poller is unaffected.
+        self._voice_pipeline: VoicePipeline | None = voice_pipeline
         self._running = False
         # Transport/orchestration only: the dispatcher calls the production
         # #9 turn orchestrator via ``respond`` and never creates another
@@ -118,6 +131,50 @@ class Application:
     def running(self) -> bool:
         """Whether the application is running."""
         return self._running
+
+    @property
+    def voice_available(self) -> bool:
+        """Whether local voice recognition is ready for turns."""
+        pipeline = self._voice_pipeline
+        if pipeline is None or pipeline.recognizer is None:
+            return False
+        return pipeline.recognizer.available
+
+    async def _init_voice_capability(self) -> None:
+        """Load the pinned GigaAM recognizer once; fail voice-only on error."""
+        if self._voice_pipeline is not None:
+            logger.info(
+                "voice capability ready",
+                extra={"injected": True},
+            )
+            return
+        if not isinstance(self.transport, PollingTelegramTransport):
+            logger.info("voice capability disabled without polling transport")
+            return
+        if not self.settings.telegram_bot_token:
+            logger.info("voice capability disabled without bot token")
+            return
+        try:
+            recognizer = GigaAMRecognizer(Path(self.settings.aa_voice_model_dir))
+            await asyncio.to_thread(recognizer.ensure_loaded)
+        except VoiceError as exc:
+            logger.warning("voice capability disabled", extra={"category": exc.category})
+            return
+        except Exception:
+            logger.warning("voice capability disabled", extra={"category": "asr-unavailable"})
+            return
+        transport = self.transport
+
+        class _TransportFetcher:
+            async def fetch(self, file_id: str) -> bytes:
+                return await transport.fetch_voice_bytes(file_id)
+
+        self._voice_pipeline = build_pipeline(
+            fetcher=_TransportFetcher(),
+            decoder=FfmpegDecoder(),
+            recognizer=recognizer,
+        )
+        logger.info("voice capability ready", extra={"injected": False})
 
     async def start(self) -> None:
         """Start all components in dependency order.
@@ -138,6 +195,9 @@ class Application:
             await self.sessions.start()
             await self.safety.start()
             await self.dispatcher.start()
+            # Voice capability loads once here and is reused for all turns.
+            # Initialization failure disables voice only, never the poller.
+            await self._init_voice_capability()
             await self.transport.start()
             # Start the requested 15m/1h/2h/3h window only after the poller
             # is live and all dependencies have completed bootstrap.
@@ -248,6 +308,9 @@ class Application:
         if incoming.command == "new":
             await self._handle_new_command(incoming)
             return
+        if incoming.voice is not None:
+            await self._handle_voice_update(incoming)
+            return
         await self._handle_telegram_update(incoming)
 
     async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
@@ -274,9 +337,70 @@ class Application:
         the single production #9 orchestrator entry point; this transport
         layer never sends a substantive user message to OpenCode directly.
         """
+        await self._respond_and_deliver(incoming, text=incoming.text, voice_input=False)
+
+    async def _handle_voice_update(self, incoming: TelegramIncoming) -> None:
+        """Process one Telegram voice note through ASR into the text boundary.
+
+        The transcript enters the exact same production AA turn boundary
+        used by text messages, marked ``voice_input=True``. Any
+        download/decode/ASR failure sends one short Russian text error to
+        that user and leaves the poller alive. Temporary audio files are
+        removed by the pipeline in ``finally``.
+        """
+        attachment = incoming.voice
+        if attachment is None:
+            return
+        pipeline = self._voice_pipeline
+        if pipeline is None or not self.voice_available:
+            logger.warning(
+                "voice turn without recognizer",
+                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+            )
+            await self._send_text_reply(incoming, voice_error_reply("voice-disabled"))
+            return
+        try:
+            transcript = await pipeline.transcribe_voice(
+                file_id=attachment.file_id,
+                file_size_bytes=attachment.file_size_bytes,
+                duration_seconds=attachment.duration_seconds,
+            )
+        except VoiceError as exc:
+            logger.warning(
+                "voice turn failed",
+                extra={
+                    "chat_id": incoming.chat_id,
+                    "update_id": incoming.update_id,
+                    "category": exc.category,
+                },
+            )
+            await self._send_text_reply(incoming, voice_error_reply(exc.category))
+            return
+        except Exception:
+            logger.warning(
+                "voice turn failed",
+                extra={
+                    "chat_id": incoming.chat_id,
+                    "update_id": incoming.update_id,
+                    "category": "voice-failed",
+                },
+            )
+            await self._send_text_reply(incoming, voice_error_reply("voice-failed"))
+            return
+        await self._respond_and_deliver(incoming, text=transcript, voice_input=True)
+
+    async def _respond_and_deliver(
+        self, incoming: TelegramIncoming, *, text: str, voice_input: bool
+    ) -> None:
+        """Run :meth:`respond` for one turn and deliver exactly one reply."""
         self.sessions.record_message(incoming.chat_id)
         try:
-            reply = await self.respond(incoming.chat_id, incoming.text)
+            if voice_input:
+                reply = await self.respond(incoming.chat_id, text, voice_input=True)
+            else:
+                # Text path keeps the exact historical call shape so the
+                # production boundary is unchanged for ordinary messages.
+                reply = await self.respond(incoming.chat_id, text)
             if not reply.strip():
                 raise OpenCodeError("opencode returned an empty response")
             if not meets_russian_only(reply):
@@ -291,6 +415,10 @@ class Application:
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
             reply = _TEMPORARY_ERROR_REPLY
+        await self._send_text_reply(incoming, reply)
+
+    async def _send_text_reply(self, incoming: TelegramIncoming, reply: str) -> None:
+        """Deliver one bounded text reply with envelope fallback handling."""
         try:
             await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
         except TelegramEnvelopeError:
@@ -409,8 +537,12 @@ class Application:
             raise
         return response.text
 
-    async def respond(self, chat_id: int, text: str) -> str:
+    async def respond(self, chat_id: int, text: str, *, voice_input: bool = False) -> str:
         """Answer one inbound message with emergency precedence.
+
+        ``voice_input`` marks turns transcribed from Telegram voice notes
+        for downstream voice-reply handling; the production turn boundary
+        is otherwise identical to text messages.
 
         The deterministic safety layer runs first: when it takes the
         emergency route, the bounded safe reply is returned immediately
@@ -421,8 +553,8 @@ class Application:
         failures fail closed with a fixed message instead of an invented
         answer.
 
-        Only message lengths and routing decisions are logged, never the
-        message body.
+        Only message lengths, routing decisions and the voice flag are
+        logged, never the message body.
 
         Every returned reply is deterministically confined to the #83
         hard Telegram envelope (``<= 900`` graphemes / ``<= 130`` words,
@@ -432,6 +564,10 @@ class Application:
         and fail-closed paths all satisfy the same cap. Replies are
         returned as a single message; overflow is never split.
         """
+        logger.info(
+            "turn started",
+            extra={"chat_id": chat_id, "voice_input": voice_input, "text_len": len(text)},
+        )
         result, _emergency_reply = self.safety.route(text)
         if result.decision is SafetyDecision.EMERGENCY and result.classification is not None:
             # Production Telegram runtime is RU-only: the emergency reply

@@ -10,6 +10,7 @@ keywords = ["telegram", "asyncio", "worker"]
 dependencies = [
   "cryptography>=41",
   "zstandard>=0.22",
+  "sherpa-onnx==1.13.8",
 ]
 
 [project.optional-dependencies]

@@ -643,7 +643,8 @@ async def test_app_update_delivers_single_bounded_message() -> None:
     try:
         overlong = "Предложение номер один. " * 200
 
-        async def _fake_respond(chat_id: int, text: str) -> str:
+        async def _fake_respond(chat_id: int, text: str, *, voice_input: bool = False) -> str:
+            _ = voice_input
             return overlong
 
         app.respond = _fake_respond  # type: ignore[method-assign]

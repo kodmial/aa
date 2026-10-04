@@ -6,7 +6,7 @@ library only (no third-party Telegram/HTTP clients):
 - startup bootstrap: ``getMe`` (fail closed) -> ``deleteWebhook`` ->
   ``setMyCommands`` -> description/short-description (best effort) ->
   ``getUpdates`` long polling;
-- private text messages only;
+- private text and voice messages only;
 - ``/start`` and ``/new`` command recognition with a routing hook;
 - ``getUpdates`` offset handling and duplicate/idempotency handling;
 - ``sendMessage`` delivery with bounded retry/backoff;
@@ -106,14 +106,28 @@ class TelegramReply:
 
 
 @dataclass(frozen=True)
+class VoiceAttachment:
+    """A Telegram voice note reference (audio fetched separately)."""
+
+    file_id: str
+    duration_seconds: int
+    file_size_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class TelegramIncoming:
-    """Parsed private text message with command routing info."""
+    """Parsed private message with command routing info.
+
+    Text messages carry ``text``; voice notes carry ``voice`` with an
+    empty ``text``. Text parsing is unchanged by voice support.
+    """
 
     update_id: int
     chat_id: int
     message_id: int
     text: str
     command: str | None = None
+    voice: VoiceAttachment | None = None
 
 
 UpdateHandler = Callable[[TelegramIncoming], Awaitable[None]]
@@ -135,7 +149,7 @@ def parse_command(text: str) -> str | None:
 
 
 def parse_update(raw: Any) -> TelegramIncoming | None:
-    """Parse one raw ``getUpdates`` entry into private text, else ``None``."""
+    """Parse one raw ``getUpdates`` entry into private text/voice, else ``None``."""
     if not isinstance(raw, dict):
         return None
     update_id = raw.get("update_id")
@@ -152,16 +166,33 @@ def parse_update(raw: Any) -> TelegramIncoming | None:
     text = message.get("text")
     if not isinstance(chat_id, int) or not isinstance(message_id, int):
         return None
-    if not isinstance(text, str) or not text:
-        return None
-    command = parse_command(text)
-    return TelegramIncoming(
-        update_id=update_id,
-        chat_id=chat_id,
-        message_id=message_id,
-        text=text,
-        command=command,
-    )
+    if isinstance(text, str) and text:
+        command = parse_command(text)
+        return TelegramIncoming(
+            update_id=update_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            command=command,
+        )
+    voice_raw = message.get("voice")
+    if isinstance(voice_raw, dict):
+        file_id = voice_raw.get("file_id")
+        duration = voice_raw.get("duration")
+        file_size = voice_raw.get("file_size")
+        return TelegramIncoming(
+            update_id=update_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="",
+            command=None,
+            voice=VoiceAttachment(
+                file_id=file_id if isinstance(file_id, str) else "",
+                duration_seconds=duration if isinstance(duration, int) else 0,
+                file_size_bytes=file_size if isinstance(file_size, int) else None,
+            ),
+        )
+    return None
 
 
 class TelegramTransport(ABC):
@@ -219,6 +250,10 @@ class TelegramApi(ABC):
         """Call a Bot API method and return the ``result`` payload."""
         raise NotImplementedError
 
+    async def download_file(self, file_path: str) -> bytes:
+        """Download file content for a ``getFile`` path (voice notes)."""
+        raise NotImplementedError
+
 
 class UrllibTelegramApi(TelegramApi):
     """Stdlib ``urllib``-backed Bot API client (outbound HTTPS only)."""
@@ -259,6 +294,23 @@ class UrllibTelegramApi(TelegramApi):
         except json.JSONDecodeError as exc:
             raise TelegramApiError(f"telegram {method} bad response") from exc
         return _translate_envelope(method, envelope)
+
+    async def download_file(self, file_path: str) -> bytes:
+        """Download ``file_path`` content over file HTTPS (voice notes)."""
+        if not file_path or file_path.startswith("/") or ".." in file_path:
+            raise TelegramApiError("telegram file path is unsafe")
+        return await asyncio.to_thread(self._download_file_sync, file_path)
+
+    def _download_file_sync(self, file_path: str) -> bytes:
+        url = f"{self._base_url}/file/bot{self._token}/{file_path}"
+        try:
+            with urllib.request.urlopen(url, timeout=self._timeout_seconds) as resp:
+                payload = resp.read()
+                return bytes(payload)
+        except urllib.error.HTTPError as exc:
+            raise _translate_http_error(exc) from exc
+        except OSError as exc:
+            raise TelegramApiError("telegram file download network error") from exc
 
 
 def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
@@ -449,6 +501,26 @@ class PollingTelegramTransport(TelegramTransport):
             "telegram message sent",
             extra={"chat_id": reply.chat_id, "text_len": len(reply.text)},
         )
+
+    async def fetch_voice_bytes(self, file_id: str) -> bytes:
+        """Download one voice file through the existing transport.
+
+        Resolves ``file_id`` via ``getFile`` then fetches the file
+        content. Only sizes are logged, never file identifiers or paths.
+        """
+        if not file_id:
+            raise TelegramApiError("telegram voice file id is missing")
+        result = await self._call_with_retry(
+            "getFile", {"file_id": file_id}, max_retries=self._max_send_retries
+        )
+        if not isinstance(result, dict):
+            raise TelegramApiError("telegram getFile returned an unexpected result")
+        file_path = result.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            raise TelegramApiError("telegram getFile returned no file path")
+        data = await self._api.download_file(file_path)
+        logger.info("telegram voice file fetched", extra={"byte_len": len(data)})
+        return data
 
     async def _bootstrap(self) -> None:
         me = await self._call_with_retry("getMe", {}, max_retries=self._max_bootstrap_retries)
