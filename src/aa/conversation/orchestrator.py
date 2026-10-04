@@ -781,6 +781,10 @@ def load_exact_evidence(
                 chunk_id = str(item.get("logical_chunk_id", ""))
                 if not chunk_id or chunk_id in seen:
                     continue
+                expected_digest = str(locator.get("text_sha256", ""))
+                actual_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if not expected_digest or actual_digest != expected_digest:
+                    raise TurnFailed("evidence-checksum", "RU expanded chunk checksum mismatch")
                 provenance = Provenance(
                     corpus_version=ru_corpus_version,
                     source_id=str(locator.get("source_id", center.source_id)),
