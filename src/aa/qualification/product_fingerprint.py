@@ -67,10 +67,32 @@ UNRELATED_PREFIXES: tuple[str, ...] = (
 
 FINGERPRINT_VERSION = "product-fingerprint/1"
 
+# Generated/cache artifacts that never affect qualified product behavior.
+# A local test run or install materializing ``__pycache__``/``*.pyc``
+# must not rotate the product fingerprint and spuriously invalidate PASS.
+_GENERATED_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".pyd")
+_GENERATED_DIRS: frozenset[str] = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+)
+
+
+def _is_generated_artifact(relpath: str) -> bool:
+    """Return whether ``relpath`` is a generated/cache artifact."""
+    normalized = relpath.replace("\\", "/").lstrip("./")
+    parts = normalized.split("/")
+    if any(part in _GENERATED_DIRS for part in parts):
+        return True
+    basename = parts[-1] if parts else ""
+    if basename == ".DS_Store":
+        return True
+    return basename.endswith(_GENERATED_SUFFIXES)
+
 
 def is_product_path(relpath: str) -> bool:
     """Return whether a repo-relative path belongs to the product input set."""
     normalized = relpath.replace("\\", "/").lstrip("./")
+    if _is_generated_artifact(normalized):
+        return False
     for prefix in PRODUCT_INPUT_PREFIXES:
         if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
             return True
@@ -113,6 +135,8 @@ def collect_product_files(repo_root: Path) -> dict[str, bytes]:
             try:
                 rel = path.relative_to(repo_root).as_posix()
             except ValueError:
+                continue
+            if _is_generated_artifact(rel) or not is_product_path(rel):
                 continue
             try:
                 collected[rel] = path.read_bytes()

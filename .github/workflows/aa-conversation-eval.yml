@@ -43,9 +43,17 @@ on:
       - "src/aa/qualification/**"
       - "src/aa/app.py"
       - "src/aa/config.py"
+      - "src/aa/__main__.py"
       - "prompts/aa-agent-system.md"
       - "opencode.json"
+      - "corpus/**"
+      - "qualification/**"
       - "qualification/production_boundary.v1.json"
+      - "scripts/verify_runtime_qualification.py"
+      - ".opencode/tools/book_search.ts"
+      - ".opencode/tools/book_read.ts"
+      - ".opencode/tools/book_expand.ts"
+      - ".opencode/tools/book_section.ts"
 
 permissions:
   contents: read

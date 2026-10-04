@@ -153,13 +153,69 @@ def load_fixture(path: Path | None = None) -> list[BoundaryCase]:
     return cases
 
 
+def _lacks_domain_signals(utterance: str) -> bool:
+    """Return whether ``utterance`` carries no AA book/recovery signal.
+
+    Token/stem equality against the implementation's own substantive and
+    theme markers (not raw substring) so ``выпить таблетки`` does not
+    inherit the standalone ``пить`` recovery signal, while a regression
+    that starts grounding an out-of-corpus query is observed as grounded
+    instead of canned fail-closed.
+    """
+    from aa.conversation.orchestrator import _SUBSTANTIVE_KEYWORDS, _THEME_MARKERS
+    from aa.retrieval.normalize import normalize_ru, ru_stem, ru_tokens
+
+    tokens = ru_tokens(utterance)
+    if not tokens:
+        return True
+    token_set = set(tokens)
+    stem_set = {ru_stem(token) for token in tokens}
+    candidates: set[str] = set()
+    for keyword in _SUBSTANTIVE_KEYWORDS:
+        norm = normalize_ru(keyword)
+        if norm:
+            candidates.add(norm)
+    for _, markers in _THEME_MARKERS:
+        for marker in markers:
+            norm = normalize_ru(marker)
+            if norm:
+                candidates.add(norm)
+    for candidate in candidates:
+        if candidate in token_set:
+            return False
+        if ru_stem(candidate) in stem_set:
+            return False
+    return True
+
+
+def _sessions_isolate() -> bool:
+    """Probe the session layer: two chats must bind distinct sessions."""
+    try:
+        from aa.sessions.coordinator import SessionCoordinator
+
+        coordinator = SessionCoordinator()
+        first = coordinator.get_or_create(9001)
+        second = coordinator.get_or_create(9002)
+        if first is second:
+            return False
+        coordinator.set_opencode_session_id(9001, "sess-9001")
+        coordinator.set_opencode_session_id(9002, "sess-9002")
+        return coordinator.get_opencode_session_id(9001) != coordinator.get_opencode_session_id(
+            9002
+        )
+    except Exception:
+        return False
+
+
 def observe_path(case: BoundaryCase, *, router: SafetyRouter | None = None) -> str:
     """Return the observed production path for one fixture case."""
     active = router or SafetyRouter()
-    if case.utterance.strip() == "/new" or case.routing_class == "session-reset":
+    stripped = case.utterance.strip()
+    # Control events are utterance behavior, never a class label: only
+    # ``/new`` takes the reset path so a mislabeled reset still routes by
+    # what the implementation would actually do.
+    if stripped == "/new":
         return "session-reset"
-    if case.routing_class == "session-isolation":
-        return "isolated-sessions"
     decision = active.check(case.utterance).decision
     if decision is SafetyDecision.EMERGENCY:
         return "emergency"
@@ -168,7 +224,20 @@ def observe_path(case: BoundaryCase, *, router: SafetyRouter | None = None) -> s
     if is_meta_capability_request(case.utterance):
         return "conversational"
     if case.routing_class == "unsupported":
-        return "fail-closed-unsupported"
+        # Probe the utterance: only a standalone substantive turn with no
+        # AA domain signal stays fail-closed. A regression that grounds it
+        # falls through to behavior routing and is observed as grounded.
+        if (
+            not case.requires_context
+            and is_substantive(case.utterance)
+            and _lacks_domain_signals(case.utterance)
+        ):
+            return "fail-closed-unsupported"
+    elif case.routing_class == "session-isolation":
+        # Probe session behavior instead of returning a canned label: a
+        # broken coordinator falls through to utterance routing and FAILs.
+        if stripped and _sessions_isolate():
+            return "isolated-sessions"
     if is_substantive(case.utterance):
         return "grounded"
     return "conversational"
