@@ -39,6 +39,7 @@ from aa.corpus.age_v1 import (  # noqa: E402
     decrypt_bytes,
     encrypt_bytes,
     parse_recipient,
+    recipient_from_identity,
 )
 from aa.corpus.encrypted_snapshot import (  # noqa: E402
     ARCHIVE_NAME,
@@ -217,6 +218,20 @@ def main(argv: list[str] | None = None) -> int:
                 "decrypt verification requires an identity "
                 "(AA_BOOK_AGE_IDENTITY or --identity-file); refusing to write "
                 "an unverified snapshot (use --skip-decrypt-verify to override)"
+            )
+        # Production activation (#28): the configured identity must match the
+        # committed public recipient. Same existing keypair protects EN + RU;
+        # never generate, rotate, or persist another private key here. Only
+        # digests and the public recipient are logged, never the identity.
+        try:
+            derived_recipient = recipient_from_identity(identity)
+        except AgeError as exc:
+            return _fail(f"configured identity is invalid: {exc}")
+        if derived_recipient.strip() != recipient.strip():
+            return _fail(
+                "configured identity does not match the committed public recipient; "
+                "refusing to publish a snapshot under a different keypair "
+                f"(recipient_hint={recipient[-16:]})"
             )
         try:
             recovered_zst = decrypt_bytes(encrypted, [identity])

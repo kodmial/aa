@@ -1,0 +1,17 @@
+{
+  "archive_format": "canonical-tar-zst/1",
+  "canonical_member": "canonical.ru.json",
+  "canonical_sha256": "310367aa06976b66b484ac11f4a4d05131605be29a917e059eb62f8e2b72509b",
+  "creation_update": "Regenerate via the manually dispatched .github/workflows/encrypted-corpus-refresh.yml workflow, or locally: python3 scripts/fetch_aa_source.py && python3 scripts/build_canonical.py && python3 scripts/refresh_encrypted_snapshot.py --recipient-file corpus/source/encrypted/recipient.txt (decrypt verification needs AA_BOOK_AGE_IDENTITY). Production activation (key/secret/snapshot) is tracked in #28.",
+  "encrypted_file": "corpus/source/encrypted/canonical.ru.tar.zst.age",
+  "encrypted_sha256": "8fcae0b86d0faad09f2e535245289daac23e138112b0f516d24f2166c025e795",
+  "encryption_format": "age-encryption.org/v1/X25519",
+  "encryption_impl": "aa-age-v1-py/1",
+  "manifest_artifact_sha256": "310367aa06976b66b484ac11f4a4d05131605be29a917e059eb62f8e2b72509b",
+  "manifest_builder_version": 1,
+  "manifest_format": "aa-canonical-manifest-ru/1",
+  "metadata_version": 2,
+  "recipient_hint": "3p22ycm3zsvg8ns8",
+  "source_lock_edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
+  "source_lock_version": 1
+}

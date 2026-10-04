@@ -1,0 +1,16 @@
+{
+  "archive_format": "canonical-tar-zst/1",
+  "canonical_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
+  "creation_update": "Regenerate via the manually dispatched .github/workflows/encrypted-corpus-refresh.yml workflow, or locally: python3 scripts/fetch_aa_source.py && python3 scripts/build_canonical.py && python3 scripts/refresh_encrypted_snapshot.py --recipient-file corpus/source/encrypted/recipient.txt (decrypt verification needs AA_BOOK_AGE_IDENTITY). Production activation (key/secret/snapshot) is tracked in #28.",
+  "encrypted_file": "corpus/source/encrypted/canonical.tar.zst.age",
+  "encrypted_sha256": "3a1c98c0ee6b163a5d8b137fc62b7d5b62395712621d186b3ca7749551706e5e",
+  "encryption_format": "age-encryption.org/v1/X25519",
+  "encryption_impl": "aa-age-v1-py/1",
+  "manifest_artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
+  "manifest_builder_version": 1,
+  "manifest_format": "aa-canonical-manifest/1",
+  "metadata_version": 1,
+  "recipient_hint": "3p22ycm3zsvg8ns8",
+  "source_lock_edition": "Alcoholics Anonymous, First Edition (1939)",
+  "source_lock_version": 2
+}

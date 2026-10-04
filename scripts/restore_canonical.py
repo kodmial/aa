@@ -41,7 +41,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from aa.corpus.age_v1 import AgeError, decrypt_bytes  # noqa: E402
+from aa.corpus.age_v1 import AgeError, decrypt_bytes, recipient_from_identity  # noqa: E402
 from aa.corpus.canonical import (  # noqa: E402
     CanonicalCorpusError,
     load_canonical,
@@ -302,11 +302,33 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc))
     snapshot_error: str | None = None
     if archive.exists() and identity:
+        # Production activation (#28): when the committed public recipient is
+        # present, the configured identity must match it. Same existing
+        # keypair protects EN + RU; a mismatched identity fails closed here
+        # before decryption is attempted. Never log the identity itself.
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            metadata = None  # type: ignore[assignment]
-            snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
+            recipient_path = args.encrypted_dir / "recipient.txt"
+            if recipient_path.is_file():
+                committed = recipient_path.read_text(encoding="utf-8").strip()
+                if committed:
+                    try:
+                        derived = recipient_from_identity(identity)
+                    except AgeError as exc:
+                        snapshot_error = f"configured identity is invalid: {exc}"
+                        derived = ""
+                    if snapshot_error is None and derived.strip() != committed:
+                        snapshot_error = (
+                            "configured identity does not match the committed "
+                            "public recipient; refusing decrypt with a different keypair"
+                        )
+        except (OSError, UnicodeDecodeError) as exc:
+            snapshot_error = f"committed recipient is unreadable: {exc}"
+        if snapshot_error is None:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                metadata = None  # type: ignore[assignment]
+                snapshot_error = f"snapshot metadata is missing or invalid: {exc}"
         if snapshot_error is None:
             if not isinstance(metadata, dict):
                 snapshot_error = "snapshot metadata is malformed"
