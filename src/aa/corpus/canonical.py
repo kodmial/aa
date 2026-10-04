@@ -142,6 +142,9 @@ def load_canonical(
             if not isinstance(entry.get(key), str) or not entry.get(key):
                 raise CanonicalCorpusError(f"canonical section is missing {key}")
         source_url = entry.get("source_url")
+        if expected_format == ARTIFACT_FORMAT:
+            if not isinstance(source_url, str) or not source_url:
+                raise CanonicalCorpusError("canonical section is missing source_url")
         sections.append(
             CanonicalSection(
                 id=str(entry["id"]),
