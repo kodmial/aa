@@ -185,7 +185,21 @@ def evaluate_case(case: BoundaryCase, *, router: SafetyRouter | None = None) -> 
             return CaseVerdict(case.id, False, "session-reset", "reset case must use /new")
         return CaseVerdict(case.id, True, "session-reset", "reset control event")
     if case.routing_class == "session-isolation":
-        return CaseVerdict(case.id, True, "isolated-sessions", "isolation proven at session layer")
+        if not case.utterance.strip() or case.utterance.strip() == "/new":
+            return CaseVerdict(
+                case.id, False, "isolated-sessions", "isolation needs non-control utterance"
+            )
+        if observed_safety != case.expected_safety:
+            return CaseVerdict(
+                case.id,
+                False,
+                observed_safety,
+                f"safety {observed_safety} != {case.expected_safety}",
+            )
+        observed = observe_path(case, router=active)
+        if observed != case.expected_path:
+            return CaseVerdict(case.id, False, observed, f"path {observed} != {case.expected_path}")
+        return CaseVerdict(case.id, True, observed, "isolation proven at session layer")
     if observed_safety != case.expected_safety:
         return CaseVerdict(
             case.id, False, observed_safety, f"safety {observed_safety} != {case.expected_safety}"

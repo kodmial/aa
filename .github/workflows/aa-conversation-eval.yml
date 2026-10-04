@@ -155,7 +155,7 @@ jobs:
               }
               // #40 is reusable and stays open: readiness uses the trusted
               // PASS tuple below, never the tracker closed state.
-              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
               let passShaDispatch = '';
               for await (const { data: comments } of github.paginate.iterator(
                 github.rest.issues.listComments,
@@ -292,7 +292,7 @@ jobs:
             // A later FAIL supersedes any earlier PASS, so a FAIL clears the
             // recorded passSha instead of leaving a stale PASS current.
             // #40 stays open/reusable: only this tuple gates execution.
-            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
@@ -428,7 +428,7 @@ jobs:
               core.setFailed('corpus_sha is not a valid 64-hex frozen corpus checksum; refusing unqualified run');
               return;
             }
-            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
@@ -759,7 +759,7 @@ jobs:
             // Revalidate the current trusted #40 PASS marker at publication
             // time: a FAIL superseding the PASS after shards start must not
             // still publish COMPLETE.
-            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})\s+result=(pass|fail)/;
+            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passShaPublish = '';
             for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 })) {
               for (const c of comments) {

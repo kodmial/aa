@@ -212,11 +212,13 @@ def parse_eval_markers(bodies: list[str]) -> list[EvalTuple]:
 
 
 def latest_complete_tuple(markers: list[EvalTuple]) -> EvalTuple | None:
-    """Return the newest COMPLETE tuple, if any."""
+    """Return the latest COMPLETE tuple, where later INCOMPLETE/STALE clears it."""
     current: EvalTuple | None = None
     for marker in markers:
         if marker.result == "complete":
             current = marker
+        else:
+            current = None
     return current
 
 
