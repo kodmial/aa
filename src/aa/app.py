@@ -266,8 +266,7 @@ class Application:
             model: str = "",
             timeout: float | None = None,
         ) -> str:
-            _ = timeout
-            return await client.send_message(sid, prompt, agent=agent, model=model)
+            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
 
         synthesis = await run_trivial_turn(
             text,
@@ -294,8 +293,7 @@ class Application:
             model: str = "",
             timeout: float | None = None,
         ) -> str:
-            _ = timeout
-            return await client.send_message(sid, prompt, agent=agent, model=model)
+            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
 
         try:
             response = await runner.run_grounded_turn(text, session_id=session_id, send=_send)
