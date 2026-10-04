@@ -105,6 +105,14 @@ class CorpusStructure:
             if isinstance(index, bool) or not isinstance(index, int):
                 raise CorpusStructureError(f"node {node.id!r} lacks index_in_section")
         chunks.sort(key=lambda node: int(node.raw["index_in_section"]))
+        indices = [int(node.raw["index_in_section"]) for node in chunks]
+        if indices != list(range(1, len(chunks) + 1)):
+            raise CorpusStructureError(f"section {section_id!r} has non-contiguous chunk indices")
+        for first, second in zip(chunks, chunks[1:], strict=False):
+            if first.next_id != second.id or second.prev_id != first.id:
+                raise CorpusStructureError(
+                    f"section {section_id!r} chunk chain mismatches index order"
+                )
         return tuple(chunks)
 
     def chunk_text(self, chunk_id: str, corpus: CanonicalCorpus) -> str:
@@ -362,4 +370,18 @@ def check_book_map(
         if found < 0:
             raise CorpusStructureError(f"book map has no entry for {section_id!r}")
         position = found + len(marker)
+    guide_pos = text.find("## Section guide", position)
+    if guide_pos < 0:
+        raise CorpusStructureError("book map has no section guide")
+    position = guide_pos
+    for order, section_id in enumerate(structure.section_ids):
+        heading_marker = f"### {order}. "
+        heading = text.find(heading_marker, position)
+        if heading < 0:
+            raise CorpusStructureError(f"book map guide missing heading for {section_id!r}")
+        entry = text.find(f"(`{section_id}`)", heading)
+        next_heading = text.find("### ", heading + 1)
+        if entry < 0 or (next_heading >= 0 and entry > next_heading):
+            raise CorpusStructureError(f"book map guide out of order at {section_id!r}")
+        position = entry + len(section_id)
     return tokens

@@ -404,6 +404,9 @@ def build_structure(
     manifest_sections = manifest.get("sections")
     if not isinstance(manifest_sections, list):
         raise ValueError("manifest has no sections list")
+    manifest_ids = [str(s.get("id")) for s in manifest_sections if isinstance(s, dict)]
+    if manifest_ids != list(EXPECTED_SECTION_IDS):
+        raise ValueError("manifest section order is not the expected scope")
 
     artifact_entries = manifest.get("artifact_sha256")
     if not isinstance(artifact_entries, str) or not re.fullmatch(r"[0-9a-f]{64}", artifact_entries):
