@@ -381,6 +381,12 @@ class Application:
                         extra={"chat_id": chat_id, "category": exc.category},
                     )
                     return FAIL_CLOSED_REPLY
+                except OpenCodeSessionNotFoundError:
+                    logger.warning(
+                        "trivial turn failed closed after rebind",
+                        extra={"chat_id": chat_id, "category": "session-not-found"},
+                    )
+                    return FAIL_CLOSED_REPLY
                 logger.info("trivial response served", extra={"chat_id": chat_id})
                 return trivial_retry
             try:
@@ -389,6 +395,12 @@ class Application:
                 logger.warning(
                     "grounded turn failed closed after rebind",
                     extra={"chat_id": chat_id, "category": exc.category},
+                )
+                return FAIL_CLOSED_REPLY
+            except OpenCodeSessionNotFoundError:
+                logger.warning(
+                    "grounded turn failed closed after rebind",
+                    extra={"chat_id": chat_id, "category": "session-not-found"},
                 )
                 return FAIL_CLOSED_REPLY
         logger.info("normal response served", extra={"chat_id": chat_id})
