@@ -1,0 +1,53 @@
+{
+  "corpus_version": "ru_realworld_alcohol_help.v1_1",
+  "schema_version": "ru-realworld-alcohol-help-v1_1",
+  "input_schema_version": "ru-realworld-input-v1_1",
+  "oracle_schema_version": "ru-realworld-oracle-v1_1",
+  "provenance_schema_version": "ru-realworld-provenance-v1",
+  "files": {
+    "corpus": "qualification/ru_realworld_alcohol_help.v1.jsonl",
+    "input": "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl",
+    "oracle": "qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl",
+    "sources": "qualification/ru_realworld_alcohol_help.v1.sources.json",
+    "version": "qualification/ru_realworld_alcohol_help.v1_1.version.json"
+  },
+  "sha256": {
+    "corpus": "f54a503f05b8035e91090153fe4f9cf1f0b06073e515a3ad06fd0af79c6cc240",
+    "input": "57f1dd575875a80e93283b5c985fdc8a599274c6bd200fb4c20cc789fe69341d",
+    "oracle": "f5c1a82eb655b3d6788c986863b3b42183360e33854e823f517a47a9a8d4734e",
+    "sources": "54d1d305454b0ba0b21a74725e1c4eeb8de9c14bd22c89eaf0c375004cd6947e"
+  },
+  "counts": {
+    "single_turn": 200,
+    "multi_turn_journeys": 30,
+    "multi_turn_substantive_turns": 149,
+    "control_events": 1,
+    "total_substantive_utterances": 349
+  },
+  "provenance_sources": 15,
+  "safety_contract": {
+    "decisions": [
+      "allow",
+      "emergency",
+      "block"
+    ],
+    "response_modes": [
+      "ordinary_support",
+      "ambiguity_clarification",
+      "medical_boundary_clarification",
+      "medical_refusal_boundary",
+      "emergency_bounded_response",
+      "book_grounded_response"
+    ],
+    "clarify_is_router_state": false
+  },
+  "seed_commits": {
+    "corpus": "3070a929865f8374601625734b08e2447f7f4ed3",
+    "provenance": "0fd52e2711ff7184eb7c90e30d5f5dddfecb97d6"
+  },
+  "review": {
+    "emergency_classifier_false_positives": 0,
+    "fixture_corrections": 0,
+    "note": "v1_1 successor: allow/emergency/block oracle; clarification is a response mode; /new is a session-reset control event; input/oracle split keeps generator-visible utterances label-free."
+  }
+}

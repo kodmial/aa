@@ -1,0 +1,30 @@
+{
+  "corpus_version": "ru_realworld_alcohol_help.v1",
+  "schema_version": "ru-realworld-alcohol-help-v1",
+  "provenance_schema_version": "ru-realworld-provenance-v1",
+  "files": {
+    "corpus": "qualification/ru_realworld_alcohol_help.v1.jsonl",
+    "sources": "qualification/ru_realworld_alcohol_help.v1.sources.json",
+    "version": "qualification/ru_realworld_alcohol_help.v1.version.json"
+  },
+  "sha256": {
+    "corpus": "f54a503f05b8035e91090153fe4f9cf1f0b06073e515a3ad06fd0af79c6cc240",
+    "sources": "54d1d305454b0ba0b21a74725e1c4eeb8de9c14bd22c89eaf0c375004cd6947e"
+  },
+  "counts": {
+    "single_turn": 200,
+    "multi_turn_journeys": 30,
+    "multi_turn_user_turns": 150,
+    "total_user_utterances": 350
+  },
+  "provenance_sources": 15,
+  "seed_commits": {
+    "corpus": "3070a929865f8374601625734b08e2447f7f4ed3",
+    "provenance": "0fd52e2711ff7184eb7c90e30d5f5dddfecb97d6"
+  },
+  "review": {
+    "emergency_classifier_false_positives": 0,
+    "fixture_corrections": 0,
+    "note": "Emergency/clarify labels reviewed against #21; slang and ambiguity fixtures reviewed against #46. No fixture rewrite was required: emergency labels stay on reviewed withdrawal/self-harm escalations and ordinary/clarify inputs stay off the deterministic emergency path."
+  }
+}
