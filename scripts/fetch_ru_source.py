@@ -329,8 +329,14 @@ def _bootstrap() -> int:
         return _fail(f"lock file is missing: {LOCK}")
     except json.JSONDecodeError as exc:
         return _fail(f"lock file is not valid JSON: {exc}")
-    provider = config.get("provider", {}) if isinstance(config, dict) else {}
-    root = str(provider.get("edition_root", "https://aarus.fi/read/bigbook/"))
+    if not isinstance(config, dict):
+        return _fail("lock file is malformed")
+    provider = config.get("provider")
+    if not isinstance(provider, dict):
+        return _fail("lock file has no provider")
+    root = provider.get("edition_root")
+    if not isinstance(root, str) or not root.strip():
+        return _fail("lock file has no edition_root; refusing stale hardcoded provenance")
     if not root.endswith("/"):
         root += "/"
     try:
