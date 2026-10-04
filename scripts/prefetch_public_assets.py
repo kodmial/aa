@@ -138,7 +138,21 @@ def _prefetch(*, lock_path: Path, hf_cache: Path | None) -> int:
                 "revision": str(lock.get("revision")),
             }
         )
-    if verify_cached_model(model_root, lock):
+    snapshot = snapshot_dir(model_root, str(lock.get("revision")))
+    required = lock.get("required_files")
+    files_ok = isinstance(required, list) and bool(required)
+    if files_ok:
+        for name in required:
+            assert isinstance(name, str)
+            candidate = snapshot / name
+            try:
+                if not candidate.is_file() or candidate.stat().st_size == 0:
+                    files_ok = False
+                    break
+            except OSError:
+                files_ok = False
+                break
+    if files_ok:
         write_marker(model_root, lock)
         return _status(
             {
