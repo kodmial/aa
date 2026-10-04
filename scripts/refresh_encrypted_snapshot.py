@@ -8,10 +8,11 @@ recipient, and writes only the encrypted archive plus non-secret
 ``metadata.json`` into ``corpus/source/encrypted/``.
 
 When ``AA_BOOK_AGE_IDENTITY`` (or ``--identity-file``) is available, the
-script additionally decrypts the freshly written archive and verifies that it
-reproduces the expected canonical SHA-256. Without an identity the script
-still produces the snapshot but reports that decrypt-verification was
-skipped; the refresh workflow always provides the secret for verification.
+script decrypts the freshly produced archive in memory and verifies that it
+reproduces the expected canonical SHA-256 before anything is written.
+Without an identity the script fails closed and writes nothing, unless
+``--skip-decrypt-verify`` is explicitly passed for local development; the
+refresh workflow always provides the secret for verification.
 
 Logs contain only paths, sizes, and SHA-256 digests — never the plaintext
 corpus, the recipient secret, or the private identity.
@@ -70,7 +71,7 @@ def _read_identity(*, identity_file: Path | None) -> str | None:
     if identity_file is not None:
         try:
             return identity_file.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
+        except (OSError, UnicodeDecodeError):
             return None
     raw = os.environ.get("AA_BOOK_AGE_IDENTITY", "").strip()
     return raw or None
@@ -125,6 +126,28 @@ def main(argv: list[str] | None = None) -> int:
     except AgeError as exc:
         return _fail(f"encryption failed: {exc}")
 
+    skip_verify = bool(args.skip_decrypt_verify)
+    if not skip_verify:
+        try:
+            identity = _read_identity(identity_file=args.identity_file)
+        except OSError as exc:
+            return _fail(f"cannot read identity file: {exc}")
+        if not identity:
+            if args.identity_file is not None:
+                return _fail(f"identity file is missing or empty: {args.identity_file}")
+            return _fail(
+                "decrypt verification requires an identity "
+                "(AA_BOOK_AGE_IDENTITY or --identity-file); refusing to write "
+                "an unverified snapshot (use --skip-decrypt-verify to override)"
+            )
+        try:
+            recovered_zst = decrypt_bytes(encrypted, [identity])
+            recovered_canonical, _ = extract_tar_zst(recovered_zst)
+        except (AgeError, ValueError) as exc:
+            return _fail(f"decrypt verification failed: {exc}")
+        if sha256_bytes(recovered_canonical) != actual_sha:
+            return _fail("decrypt verification failed: canonical SHA mismatch after round-trip")
+
     args.encrypted_dir.mkdir(parents=True, exist_ok=True)
     archive_path = args.encrypted_dir / ARCHIVE_NAME
     tmp_path = archive_path.with_name(archive_path.name + ".tmp")
@@ -142,10 +165,12 @@ def main(argv: list[str] | None = None) -> int:
         recipient=recipient,
     )
     metadata_path = args.encrypted_dir / METADATA_NAME
-    metadata_path.write_text(
+    tmp_metadata = metadata_path.with_name(metadata_path.name + ".tmp")
+    tmp_metadata.write_text(
         json.dumps(metadata, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    os.replace(tmp_metadata, metadata_path)
 
     print(
         json.dumps(
@@ -158,26 +183,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    if args.skip_decrypt_verify:
-        print("decrypt verification skipped (no identity provided)")
+    if skip_verify:
+        print("decrypt verification skipped (--skip-decrypt-verify)")
         return 0
-
-    try:
-        identity = _read_identity(identity_file=args.identity_file)
-    except OSError as exc:
-        return _fail(f"cannot read identity file: {exc}")
-    if not identity:
-        if args.identity_file is not None:
-            return _fail(f"identity file is missing or empty: {args.identity_file}")
-        print("decrypt verification skipped (AA_BOOK_AGE_IDENTITY is not set)")
-        return 0
-    try:
-        recovered_zst = decrypt_bytes(encrypted, [identity])
-        recovered_canonical, _ = extract_tar_zst(recovered_zst)
-    except (AgeError, ValueError) as exc:
-        return _fail(f"decrypt verification failed: {exc}")
-    if sha256_bytes(recovered_canonical) != actual_sha:
-        return _fail("decrypt verification failed: canonical SHA mismatch after round-trip")
     print("decrypt verification ok")
     return 0
 
