@@ -390,15 +390,51 @@ async def run_with_retry(
 ) -> TurnObservation:
     """Execute one turn with bounded retry and a configured technical fallback.
 
+    The production safety gate runs first, exactly as in the Telegram
+    path: ``block``/``emergency`` turns never reach the model and are
+    captured with their real safety decision and categories instead of a
+    fabricated ``"allow"``. Only ``allow`` turns call the sender.
+
     Retries transient/provider failures only, up to ``policy.max_attempts``.
     Deterministic failures fail immediately. When the primary model is
     transiently unavailable, one bounded fallback attempt is made and
     segmented via ``fallback_used=True`` so fallback output never silently
     counts as a primary-model qualification result. Runner/IP rotation for
     quota evasion is never performed here.
+
+    Planner/retrieval/evidence/grounding capture fields stay empty when the
+    narrow :class:`TurnSender` boundary returns answer text only; they must
+    be populated by the production capture stage when available and never
+    fabricated here.
     """
     active = policy or RetryPolicy()
     sleeper = sleep or asyncio.sleep
+    from aa.safety.router import SafetyDecision, SafetyRouter
+
+    safety_result, emergency_reply = SafetyRouter().route(utterance)
+    safety_categories = tuple(category.value for category in safety_result.categories)
+    if safety_result.decision is SafetyDecision.BLOCK:
+        return TurnObservation(
+            answer="",
+            safety_decision="block",
+            safety_categories=safety_categories,
+            primary_model=primary_model,
+            actual_model=primary_model,
+            fallback_used=False,
+            latency_s=0.0,
+            retry_count=0,
+        )
+    if safety_result.decision is SafetyDecision.EMERGENCY:
+        return TurnObservation(
+            answer=emergency_reply or "",
+            safety_decision="emergency",
+            safety_categories=safety_categories,
+            primary_model=primary_model,
+            actual_model=primary_model,
+            fallback_used=False,
+            latency_s=0.0,
+            retry_count=0,
+        )
     session_id = await sender.ensure_session(chat_id)
     last_error: BaseException | None = None
     for attempt in range(1, active.max_attempts + 1):
@@ -408,6 +444,7 @@ async def run_with_retry(
             return TurnObservation(
                 answer=answer,
                 safety_decision="allow",
+                safety_categories=safety_categories,
                 primary_model=primary_model,
                 actual_model=primary_model,
                 fallback_used=False,
@@ -439,6 +476,7 @@ async def run_with_retry(
             return TurnObservation(
                 answer=answer,
                 safety_decision="allow",
+                safety_categories=safety_categories,
                 primary_model=primary_model,
                 actual_model=fallback_model,
                 fallback_used=True,
@@ -716,7 +754,9 @@ def is_resumable(prior_identity: dict[str, str], current_identity: dict[str, str
         "fallback_model",
     )
     for key in required:
-        if prior_identity.get(key) != current_identity.get(key):
+        if key not in prior_identity or key not in current_identity:
+            return False
+        if prior_identity[key] != current_identity[key]:
             return False
     return True
 
@@ -1060,10 +1100,25 @@ def expected_case_ids(
 
 def validate_files_do_not_mutate_main(paths: list[str]) -> None:
     """Guard that benchmark outputs never land on production main paths."""
-    protected = ("corpus/", "prompts/", "src/aa/", "scripts/verify.sh", "pyproject.toml")
+    protected_dirs = (
+        "corpus",
+        "prompts",
+        "src",
+        "tests",
+        "scripts",
+        "qualification",
+        ".github",
+    )
+    protected_files = ("pyproject.toml", "main")
     for path in paths:
-        normalized = path.strip().lstrip("./")
-        if normalized.startswith(protected) or normalized == "main":
+        normalized = path.strip()
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
+        for directory in protected_dirs:
+            if normalized == directory or normalized.startswith(directory + "/"):
+                raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
+        if normalized in protected_files:
             raise ConversationEvalError(f"benchmark output must not mutate main path {path!r}")
 
 

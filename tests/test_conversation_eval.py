@@ -12,7 +12,8 @@ import json
 import pytest
 
 from aa.corpus.age_v1 import generate_identity
-from aa.opencode.errors import OpenCodeTransientError
+from aa.opencode.client import FakeOpenCodeClient
+from aa.opencode.errors import OpenCodeSessionNotFoundError, OpenCodeTransientError
 from aa.qualification.conversation_eval import (
     ConversationEvalError,
     EvalIdentity,
@@ -168,24 +169,40 @@ async def test_control_event_calls_real_reset_boundary() -> None:
     sender = _ScriptSender()
     sessions = SessionCoordinator()
     await sessions.start()
-    singles, journeys = load_generator_views()
-    target = next(j for j in journeys if j.journey_id == CONTROL_JOURNEY_ID)
-    chat_id = allocate_chat_ids([target.journey_id])[target.journey_id]
-    prior: list[str] = []
-    for entry in target.turns:
-        if entry.is_control():
-            assert isinstance(entry, JourneyTurnView)
-            await sender.reset(chat_id)
-            prior = []
-        else:
-            sid = await sender.ensure_session(chat_id)
-            await sender.send(sid, entry.utterance, model="m")
-            prior.append(entry.utterance)
-    assert sender.resets == [chat_id]
-    # After reset, pre-reset state is unavailable: only post-reset turns ran
-    # after the single reset call.
-    assert len(prior) == 2
-    await sessions.stop()
+    client = FakeOpenCodeClient()
+    try:
+        singles, journeys = load_generator_views()
+        target = next(j for j in journeys if j.journey_id == CONTROL_JOURNEY_ID)
+        chat_id = allocate_chat_ids([target.journey_id])[target.journey_id]
+        pre_reset_sid = await sessions.ensure_opencode_session(chat_id, client)
+        prior: list[str] = []
+        rebound: list[str] = []
+        for entry in target.turns:
+            if entry.is_control():
+                assert isinstance(entry, JourneyTurnView)
+                await sender.reset(chat_id)
+                # The control event must go through the real production
+                # reset boundary, not only the stub sender.
+                rebound.append(await sessions.reset_opencode_session(chat_id, client))
+                prior = []
+            else:
+                sid = await sender.ensure_session(chat_id)
+                await sender.send(sid, entry.utterance, model="m")
+                prior.append(entry.utterance)
+        assert sender.resets == [chat_id]
+        assert len(rebound) == 1
+        assert rebound[0] != pre_reset_sid
+        assert sessions.get_opencode_session_id(chat_id) == rebound[0]
+        assert sessions.get_or_create(chat_id).generation == 1
+        # After reset, the pre-reset production session is unavailable:
+        # the remote session was deleted and the mapping rebound.
+        with pytest.raises(OpenCodeSessionNotFoundError):
+            await client.get_session(pre_reset_sid)
+        # After reset, pre-reset state is unavailable: only post-reset turns ran
+        # after the single reset call.
+        assert len(prior) == 2
+    finally:
+        await sessions.stop()
 
 
 async def test_production_safety_boundary_stays_authoritative() -> None:
@@ -269,6 +286,11 @@ def test_resumable_only_on_exact_match() -> None:
     altered2 = dict(current)
     altered2["main_sha"] = SHA_B
     assert is_resumable(altered2, current) is False
+    # Two empty/malformed identities must not compare resumable: missing keys
+    # fail closed instead of comparing None == None.
+    assert is_resumable({}, {}) is False
+    assert is_resumable({}, current) is False
+    assert is_resumable(current, {}) is False
 
 
 def test_bounded_parallelism_defaults_conservative() -> None:
@@ -379,6 +401,38 @@ async def test_fallback_is_segmented_not_silent_primary() -> None:
     assert obs.error_category == "fallback-used"
 
 
+async def test_safety_gate_captured_before_model_send() -> None:
+    sender = _ScriptSender()
+
+    async def _noop(_delay: float) -> None:
+        return None
+
+    blocked = await run_with_retry(
+        sender,
+        chat_id=1,
+        utterance="   ",
+        primary_model="p",
+        fallback_model="f",
+        policy=RetryPolicy(max_attempts=1),
+        sleep=_noop,
+    )
+    assert blocked.safety_decision == "block"
+    emergency = await run_with_retry(
+        sender,
+        chat_id=2,
+        utterance="I want to kill myself tonight",
+        primary_model="p",
+        fallback_model="f",
+        policy=RetryPolicy(max_attempts=1),
+        sleep=_noop,
+    )
+    assert emergency.safety_decision == "emergency"
+    assert emergency.safety_categories != ()
+    assert emergency.answer != ""
+    # Blocked/emergency turns never reach the model: no fabricated "allow".
+    assert sender.sent == []
+
+
 # -- Capture schema ------------------------------------------------------------
 
 
@@ -486,6 +540,18 @@ def test_results_never_mutate_main() -> None:
         validate_files_do_not_mutate_main(["src/aa/app.py"])
     with pytest.raises(ConversationEvalError):
         validate_files_do_not_mutate_main(["corpus/structure.json"])
+    # Bare directory prefixes and nested production paths must also fail.
+    for blocked in (
+        "src/aa",
+        "corpus",
+        "prompts/aa-agent-system.md",
+        "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl",
+        ".github/workflows/aa-conversation-eval.yml",
+        "tests/test_conversation_eval.py",
+        "scripts/run_conversation_eval.py",
+    ):
+        with pytest.raises(ConversationEvalError):
+            validate_files_do_not_mutate_main([blocked])
 
 
 # -- Encryption + privacy -------------------------------------------------------

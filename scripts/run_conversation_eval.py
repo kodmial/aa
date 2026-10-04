@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aa.qualification.conversation_eval import (  # noqa: E402
+    ConversationEvalError,
     EvalIdentity,
     JourneyView,
     RetryPolicy,
@@ -95,6 +96,10 @@ async def _execute_shard(
     wanted_singles = {s.case_id: s for s in singles if s.case_id in set(plan.single_ids)}
     wanted_journeys = {j.journey_id: j for j in journeys if j.journey_id in set(plan.journey_ids)}
     chat_ids = allocate_chat_ids(list(wanted_journeys))
+    # Fresh-session semantics: every single-turn case gets its own synthetic
+    # chat, disjoint from the journey block, so independent singles never
+    # share session state within a shard.
+    single_chat_ids = allocate_chat_ids(list(wanted_singles), base=980000 + shard_index * 10000)
     captures: list[TurnCapture] = []
     policy = RetryPolicy()
     for case_id in sorted(wanted_singles):
@@ -106,7 +111,7 @@ async def _execute_shard(
 
         obs = await run_with_retry(
             sender,
-            chat_id=990000 + shard_index,
+            chat_id=single_chat_ids[case_id],
             utterance=payload["utterance"],
             primary_model=identity.primary_model,
             fallback_model=identity.fallback_model,
@@ -120,7 +125,14 @@ async def _execute_shard(
                 turn=1,
                 synthetic_input=payload["utterance"],
                 generated_answer=obs.answer,
-                safety_decision="allow",
+                safety_decision=obs.safety_decision,
+                safety_categories=obs.safety_categories,
+                planner_diagnostics=dict(obs.planner_diagnostics),
+                retrieval_source_ids=obs.retrieval_source_ids,
+                evidence_locators=obs.evidence_locators,
+                evidence_checksums=obs.evidence_checksums,
+                grounding_passed=obs.grounding_passed,
+                regeneration_count=obs.regeneration_count,
                 primary_model=identity.primary_model,
                 actual_model=obs.actual_model or identity.primary_model,
                 fallback_used=obs.fallback_used,
@@ -160,7 +172,14 @@ async def _execute_shard(
                     turn=entry.turn,
                     synthetic_input=entry.utterance,
                     generated_answer=obs.answer,
-                    safety_decision="allow",
+                    safety_decision=obs.safety_decision,
+                    safety_categories=obs.safety_categories,
+                    planner_diagnostics=dict(obs.planner_diagnostics),
+                    retrieval_source_ids=obs.retrieval_source_ids,
+                    evidence_locators=obs.evidence_locators,
+                    evidence_checksums=obs.evidence_checksums,
+                    grounding_passed=obs.grounding_passed,
+                    regeneration_count=obs.regeneration_count,
                     primary_model=identity.primary_model,
                     actual_model=obs.actual_model or identity.primary_model,
                     fallback_used=obs.fallback_used,
@@ -238,7 +257,13 @@ def main(argv: list[str] | None = None) -> int:
         fallback_model=args.fallback_model,
     )
     out_dir = Path(args.out_dir)
-    sender = DryRunSender(primary_model=args.primary_model)
+    if args.dry_run:
+        sender: TurnSender = DryRunSender(primary_model=args.primary_model)
+    else:
+        raise ConversationEvalError(
+            "production TurnSender must be injected for non-dry-run execution; "
+            "refusing to publish dry-run output as authoritative"
+        )
     manifest = asyncio.run(
         _execute_shard(
             shard_index=args.shard_index,
@@ -253,7 +278,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     digest = hashlib.sha256(json.dumps(manifest.to_dict(), sort_keys=True).encode()).hexdigest()
     print(f"manifest digest {digest[:16]}")
-    _ = args.dry_run
     return 0
 
 
