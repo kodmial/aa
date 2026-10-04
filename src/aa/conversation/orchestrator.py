@@ -1011,7 +1011,7 @@ def build_grounded_response(
 
 def _classify_send_error(exc: BaseException) -> str:
     text = str(exc).casefold()
-    if "http=429" in text or "429" in text or "too many requests" in text:
+    if re.search(r"(?<!\d)429(?!\d)", text) is not None or "too many requests" in text:
         return "provider-429"
     if isinstance(exc, (OpenCodeTransientError, OpenCodeTimeoutError)):
         return "provider-transient"
