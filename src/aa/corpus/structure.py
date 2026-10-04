@@ -116,6 +116,11 @@ class CorpusStructure:
             raise CorpusStructureError(f"chunk resolves to truncated text: {chunk_id!r}")
         if not text.strip():
             raise CorpusStructureError(f"chunk resolves to blank text: {chunk_id!r}")
+        expected = node.raw.get("text_sha256")
+        if not isinstance(expected, str):
+            raise CorpusStructureError(f"chunk {chunk_id!r} lacks a text checksum")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected:
+            raise CorpusStructureError(f"chunk {chunk_id!r} checksum mismatch")
         return text
 
 

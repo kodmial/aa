@@ -1105,10 +1105,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # All validation passed: write every output (no partial writes before this).
     args.structure.parent.mkdir(parents=True, exist_ok=True)
+    args.book_map.parent.mkdir(parents=True, exist_ok=True)
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.chunks_out.parent.mkdir(parents=True, exist_ok=True)
     args.structure.write_bytes(structure_bytes)
     args.book_map.write_text(book_map_text, encoding="utf-8")
     args.report.write_bytes(report_bytes)
-    args.chunks_out.parent.mkdir(parents=True, exist_ok=True)
     args.chunks_out.write_bytes(chunks_bytes)
 
     print(

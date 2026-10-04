@@ -77,7 +77,8 @@ Public, versioned in Git (navigation metadata only, no literary text):
   sentence -> chunk` hierarchy with IDs, exact canonical offsets,
   parent/previous/next links, and provenance checksums;
 - `corpus/book-map.md` — compact always-loaded section/topic map with
-  stable IDs and chunk ranges (~2405 of 6000 budgeted tokens);
+  stable IDs and chunk ranges (must fit the budgeted tokens; see
+  `corpus/structure-report.json` for the current size/token report);
 - `corpus/structure-report.json` — deterministic size/token report.
 
 Private runtime workspace, ignored by Git (may contain substantial text):
