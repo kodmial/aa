@@ -107,11 +107,11 @@ def _read_identity(*, identity_file: Path | None) -> str | None:
     if identity_file is not None:
         try:
             text = identity_file.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return None
-        except (OSError, UnicodeDecodeError):
-            return None
-        return text or None
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"cannot read identity file {identity_file}: {exc}") from exc
+        if not text:
+            raise ValueError(f"identity file is empty: {identity_file}")
+        return text
     raw = os.environ.get(IDENTITY_ENV, "").strip()
     return raw or None
 
@@ -198,7 +198,11 @@ def main(argv: list[str] | None = None) -> int:
     # 2. Decrypt the committed encrypted snapshot when possible.
     archive = args.encrypted_dir / ARCHIVE_NAME
     metadata_path = args.encrypted_dir / METADATA_NAME
-    identity = _read_identity(identity_file=args.identity_file)
+    identity: str | None
+    try:
+        identity = _read_identity(identity_file=args.identity_file)
+    except ValueError as exc:
+        return _fail(str(exc))
     snapshot_error: str | None = None
     if archive.exists() and identity:
         try:

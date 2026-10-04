@@ -132,6 +132,8 @@ def extract_tar_zst(data: bytes) -> tuple[bytes, dict[str, Any]]:
         raise ValueError(f"snapshot archive is malformed: {exc}") from exc
     if not isinstance(provenance, dict):
         raise ValueError("snapshot provenance is malformed")
+    if provenance.get("canonical_sha256") != sha256_bytes(canonical_bytes):
+        raise ValueError("snapshot provenance canonical SHA does not match payload")
     return canonical_bytes, provenance
 
 
