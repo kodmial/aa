@@ -233,7 +233,7 @@ class Application:
                 lock_path=corpus_root / "embedding.lock.json",
             )
             return self._index
-        except ValueError as exc:
+        except (ValueError, OSError, RuntimeError) as exc:
             self._index_error = str(exc)
             raise TurnFailed("corpus-unavailable", self._index_error) from exc
 

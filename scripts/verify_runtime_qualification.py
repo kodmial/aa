@@ -235,8 +235,10 @@ def main() -> int:
     except Exception as exc:
         return _fail(f"conversation runtime is not importable: {exc}")
     bindings = aa_payload.get("bindings", {})
-    if not isinstance(bindings, dict) or not bindings.get("ru_artifact_sha256"):
-        return _fail("#19 artifact carries no RU bindings")
+    if not isinstance(bindings, dict) or bindings.get("ru_artifact_sha256") != ru_full:
+        return _fail("#19 RU bindings do not match the live RU manifest")
+    if "en_artifact_sha256" in bindings and bindings.get("en_artifact_sha256") != en_full:
+        return _fail("#19 EN bindings do not match the live EN manifest")
 
     retrieval = aa_payload.get("retrieval", {})
     print(
