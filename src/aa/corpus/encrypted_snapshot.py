@@ -39,9 +39,10 @@ RECIPIENT_NAME = "recipient.txt"
 RU_ARCHIVE_NAME = "canonical.ru.tar.zst.age"
 RU_CANONICAL_NAME = "canonical.ru.json"
 RU_METADATA_NAME = "metadata.ru.json"
-# Version 1: additive ``canonical_member``/``encrypted_file`` fields are
-# ignored by older readers; no EN migration is required.
-METADATA_VERSION = 1
+# Version 2 (issue #50): ``build_metadata`` always emits ``canonical_member``
+# and ``encrypted_file``. Version 1 readers must ignore additive fields;
+# strict EN consumers compare against the versioned shape.
+METADATA_VERSION = 2
 MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 
 
