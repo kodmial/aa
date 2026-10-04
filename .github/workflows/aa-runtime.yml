@@ -18,6 +18,10 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: aa-runtime
+  cancel-in-progress: false
+
 jobs:
   runtime:
     runs-on: ubuntu-latest

@@ -3,11 +3,35 @@
 Owns the requested bot session duration and computes shutdown deadlines so
 the asyncio worker can run in the same GitHub Actions job as OpenCode with
 a bounded lifetime.
+
+The operator surface (issue #31) only permits ``15m | 1h | 2h | 3h``. Every
+live run is bounded and the maximum duration is 3 hours (10800 seconds).
 """
 
 from __future__ import annotations
 
 import time
+
+MAX_SESSION_DURATION_SECONDS = 10800.0
+
+ALLOWED_DURATIONS: dict[str, float] = {
+    "15m": 900.0,
+    "1h": 3600.0,
+    "2h": 7200.0,
+    "3h": 10800.0,
+}
+
+
+def parse_duration_label(label: str) -> float:
+    """Parse an operator duration label into seconds.
+
+    Only ``15m | 1h | 2h | 3h`` are valid; anything else raises ``ValueError``.
+    """
+    key = label.strip()
+    try:
+        return ALLOWED_DURATIONS[key]
+    except KeyError as exc:
+        raise ValueError(f"unsupported bot duration: {label!r}") from exc
 
 
 class RuntimeController:
@@ -16,6 +40,8 @@ class RuntimeController:
     def __init__(self, session_duration_seconds: float = 0.0) -> None:
         if session_duration_seconds < 0:
             raise ValueError("session_duration_seconds must be >= 0")
+        if session_duration_seconds > MAX_SESSION_DURATION_SECONDS:
+            raise ValueError("session_duration_seconds must be <= 10800 (max 3h)")
         self.session_duration_seconds = session_duration_seconds
         self._deadline: float | None = None
         self._stop_requested = False

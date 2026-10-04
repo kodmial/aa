@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from aa.control.runtime_control import MAX_SESSION_DURATION_SECONDS
+
 DEFAULT_AA_AGENT = "aa"
 DEFAULT_PRIMARY_MODEL = "opencode/muse-spark-1.3-contributor-free"
 DEFAULT_FALLBACK_MODEL = "opencode/space-bunny-free"
@@ -148,6 +150,10 @@ class Settings:
         """Validate settings, raising ``ValueError`` on misuse."""
         if self.bot_session_duration_seconds < 0:
             raise ValueError("BOT_SESSION_DURATION_SECONDS must be >= 0")
+        if self.bot_session_duration_seconds > MAX_SESSION_DURATION_SECONDS:
+            raise ValueError("BOT_SESSION_DURATION_SECONDS must be <= 10800 (max 3h)")
+        if require_bot_token and self.bot_session_duration_seconds <= 0:
+            raise ValueError("BOT_SESSION_DURATION_SECONDS must be > 0 for live runs")
         if not self.opencode_agent.strip():
             raise ValueError("OPENCODE_AGENT must not be empty")
         if not self.opencode_model.strip():

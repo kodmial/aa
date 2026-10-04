@@ -10,6 +10,7 @@ import sys
 from aa import __version__
 from aa.app import create_application
 from aa.config import Settings
+from aa.control.runtime_control import MAX_SESSION_DURATION_SECONDS
 from aa.logging import configure_logging
 
 
@@ -75,6 +76,13 @@ def main(argv: list[str] | None = None) -> int:
     if not settings.has_bot_token:
         print(
             "TELEGRAM_BOT_TOKEN is not set; refusing to run the worker.",
+            file=sys.stderr,
+        )
+        return 2
+    if not 0 < settings.bot_session_duration_seconds <= MAX_SESSION_DURATION_SECONDS:
+        print(
+            "BOT_SESSION_DURATION_SECONDS must be a bounded live window "
+            "(900/3600/7200/10800); refusing unbounded or over-long runs.",
             file=sys.stderr,
         )
         return 2
