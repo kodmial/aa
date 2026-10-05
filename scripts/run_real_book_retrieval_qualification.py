@@ -173,7 +173,6 @@ def _load_checkpoint(
     return processed, diagnostics, infra_failures
 
 
-
 def _fail_incomplete(out_dir: Path, *, reason: str, main_sha: str) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"result": "INCOMPLETE", "reason": reason, "main_sha": main_sha}
