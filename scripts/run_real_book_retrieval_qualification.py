@@ -35,6 +35,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,97 @@ SUMMARY_FILENAME = "real-book-retrieval-summary.json"
 PROTECTED_FILENAME = "real-book-retrieval-protected.tar.zst.age"
 PROTECTED_SHA_FILENAME = "real-book-retrieval-protected.tar.zst.age.sha256"
 EXIT_RUNNER_RESTART_REQUIRED = 75
+CHECKPOINT_FILENAME = "checkpoint.json"
+CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_TUPLE_FIELDS = (
+    "planner_queries",
+    "bm25_top",
+    "e5_top",
+    "rrf_survivors",
+    "dedup_survivors",
+    "diversity_survivors",
+    "evidence_ids",
+)
+
+
+def _write_checkpoint(
+    out_dir: Path,
+    *,
+    main_sha: str,
+    corpus_sha: str,
+    benchmark_sha: str,
+    retrieval_sha: str,
+    processed_case_ids: list[str],
+    diagnostics: list[TurnDiagnostics],
+    infra_failures: int,
+) -> None:
+    """Persist restart-safe benchmark progress without source/book text."""
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "main_sha": main_sha,
+        "corpus_sha256": corpus_sha,
+        "benchmark_sha256": benchmark_sha,
+        "retrieval_config_sha256": retrieval_sha,
+        "processed_case_ids": processed_case_ids,
+        "infra_failures": infra_failures,
+        "diagnostics": [asdict(item) for item in diagnostics],
+    }
+    (out_dir / CHECKPOINT_FILENAME).write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _load_checkpoint(
+    out_dir: Path,
+    *,
+    main_sha: str,
+    corpus_sha: str,
+    benchmark_sha: str,
+    retrieval_sha: str,
+) -> tuple[list[str], list[TurnDiagnostics], int]:
+    """Load a checkpoint only when every immutable qualification binding matches."""
+    path = out_dir / CHECKPOINT_FILENAME
+    if not path.is_file():
+        return [], [], 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [], [], 0
+    expected = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "main_sha": main_sha,
+        "corpus_sha256": corpus_sha,
+        "benchmark_sha256": benchmark_sha,
+        "retrieval_config_sha256": retrieval_sha,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        print("resume checkpoint ignored: immutable qualification binding changed", flush=True)
+        return [], [], 0
+    processed_raw = payload.get("processed_case_ids", [])
+    diagnostics_raw = payload.get("diagnostics", [])
+    infra_raw = payload.get("infra_failures", 0)
+    if not isinstance(processed_raw, list) or not isinstance(diagnostics_raw, list):
+        return [], [], 0
+    processed = [str(item) for item in processed_raw]
+    diagnostics: list[TurnDiagnostics] = []
+    try:
+        for item in diagnostics_raw:
+            if not isinstance(item, dict):
+                raise ValueError("invalid diagnostic checkpoint entry")
+            restored = dict(item)
+            for field in _CHECKPOINT_TUPLE_FIELDS:
+                restored[field] = tuple(restored.get(field, ()))
+            diagnostics.append(TurnDiagnostics(**restored))
+        infra_failures = int(infra_raw)
+    except (TypeError, ValueError, KeyError):
+        return [], [], 0
+    print(
+        f"resume checkpoint accepted: processed={len(processed)} diagnostics={len(diagnostics)}",
+        flush=True,
+    )
+    return processed, diagnostics, infra_failures
+
 
 
 def _fail_incomplete(out_dir: Path, *, reason: str, main_sha: str) -> int:
@@ -475,12 +567,32 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     config = RetrievalConfig()
-    diagnostics: list[TurnDiagnostics] = []
-    infra_failures = 0
+    processed_case_ids, diagnostics, infra_failures = _load_checkpoint(
+        out_dir,
+        main_sha=expected_sha,
+        corpus_sha=corpus_sha,
+        benchmark_sha=benchmark_sha,
+        retrieval_sha=retrieval_sha,
+    )
+    processed = set(processed_case_ids)
     try:
         for case_id, utterance, recent_user_turns in turns:
+            if case_id in processed:
+                continue
             if not utterance.strip():
                 infra_failures += 1
+                processed.add(case_id)
+                processed_case_ids.append(case_id)
+                _write_checkpoint(
+                    out_dir,
+                    main_sha=expected_sha,
+                    corpus_sha=corpus_sha,
+                    benchmark_sha=benchmark_sha,
+                    retrieval_sha=retrieval_sha,
+                    processed_case_ids=processed_case_ids,
+                    diagnostics=diagnostics,
+                    infra_failures=infra_failures,
+                )
                 continue
             try:
                 queries = asyncio.run(
@@ -492,10 +604,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             except OpenCodeRateLimitError as exc:
+                _write_checkpoint(
+                    out_dir,
+                    main_sha=expected_sha,
+                    corpus_sha=corpus_sha,
+                    benchmark_sha=benchmark_sha,
+                    retrieval_sha=retrieval_sha,
+                    processed_case_ids=processed_case_ids,
+                    diagnostics=diagnostics,
+                    infra_failures=infra_failures,
+                )
                 payload = {
                     "result": "INCOMPLETE",
                     "reason": "OpenCode 429 requires fresh runner recovery",
                     "reason_code": "OPENCODE_429_RESTART_REQUIRED",
+                    "resume_after_case_count": len(processed_case_ids),
                     "main_sha": expected_sha,
                 }
                 (out_dir / STATUS_FILENAME).write_text(
@@ -527,9 +650,33 @@ def main(argv: list[str] | None = None) -> int:
                     error_payload["planner_error_detail"] = str(exc)
                 print(json.dumps(error_payload))
                 infra_failures += 1
+                processed.add(case_id)
+                processed_case_ids.append(case_id)
+                _write_checkpoint(
+                    out_dir,
+                    main_sha=expected_sha,
+                    corpus_sha=corpus_sha,
+                    benchmark_sha=benchmark_sha,
+                    retrieval_sha=retrieval_sha,
+                    processed_case_ids=processed_case_ids,
+                    diagnostics=diagnostics,
+                    infra_failures=infra_failures,
+                )
                 continue
             if not queries:
                 infra_failures += 1
+                processed.add(case_id)
+                processed_case_ids.append(case_id)
+                _write_checkpoint(
+                    out_dir,
+                    main_sha=expected_sha,
+                    corpus_sha=corpus_sha,
+                    benchmark_sha=benchmark_sha,
+                    retrieval_sha=retrieval_sha,
+                    processed_case_ids=processed_case_ids,
+                    diagnostics=diagnostics,
+                    infra_failures=infra_failures,
+                )
                 continue
             assert_no_oracle_leak({"queries": queries}, case_id)
             try:
@@ -554,7 +701,31 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 infra_failures += 1
+                processed.add(case_id)
+                processed_case_ids.append(case_id)
+                _write_checkpoint(
+                    out_dir,
+                    main_sha=expected_sha,
+                    corpus_sha=corpus_sha,
+                    benchmark_sha=benchmark_sha,
+                    retrieval_sha=retrieval_sha,
+                    processed_case_ids=processed_case_ids,
+                    diagnostics=diagnostics,
+                    infra_failures=infra_failures,
+                )
                 continue
+            processed.add(case_id)
+            processed_case_ids.append(case_id)
+            _write_checkpoint(
+                out_dir,
+                main_sha=expected_sha,
+                corpus_sha=corpus_sha,
+                benchmark_sha=benchmark_sha,
+                retrieval_sha=retrieval_sha,
+                processed_case_ids=processed_case_ids,
+                diagnostics=diagnostics,
+                infra_failures=infra_failures,
+            )
             print(
                 json.dumps(
                     {
