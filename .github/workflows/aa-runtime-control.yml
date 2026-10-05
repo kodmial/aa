@@ -356,12 +356,31 @@ jobs:
             }
 
             // Failure-after-commit path: the dispatch above was accepted, so
-            // start 1/4 is consumed even if the runtime later fails. Post the
-            // durable marker exactly once; never dispatch a second runtime to
-            // repair an uncertain listing below.
-            const marker = formatMarker(generation, 1, currentCommentId);
+            // start 1/4 is consumed even if the runtime later fails. Commit
+            // the durable marker immediately with retries before any
+            // best-effort listing, so a lost marker with lagging run listing
+            // can never read as 0 runs + 0 markers and dispatch a second
+            // poller. Never dispatch a second runtime to repair an uncertain
+            // listing below.
+            let marker = formatMarker(generation, 1, currentCommentId);
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: controlIssue,
+                  body: `Start 1/${MAX_STARTS} committed for generation ${generation}.\n` + marker,
+                });
+                break;
+              } catch (error) {
+                if (attempt === 2) {
+                  core.setFailed('Dispatch committed but marker not persisted: ' + ((error && error.message) || error));
+                  return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+              }
+            }
             // Give GitHub a short moment to create the run so the operator
-            // gets an authoritative run id in the control issue.
+            // gets an authoritative run id in the control issue. Best-effort
+            // only; the marker above is already the durable counter.
             await new Promise(resolve => setTimeout(resolve, 1500));
             let run = null;
             try {
@@ -376,6 +395,5 @@ jobs:
               (run
                 ? `AA campaign run requested (**${duration}**, fixed 5h window after readiness). Run #${run.id}: ${run.html_url}\n`
                 : `AA campaign run requested (**${duration}**, fixed 5h window after readiness).\n`) +
-              `Bounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal. Start 1/${MAX_STARTS} committed for generation ${generation}.\n` +
-              marker
+              `Bounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal. Start 1/${MAX_STARTS} committed for generation ${generation}.`
             );
