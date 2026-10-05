@@ -31,6 +31,11 @@ on:
         description: "Exact main SHA to qualify (defaults to current main HEAD)"
         required: false
         type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/aa-real-book-retrieval-qualification.yml"
 
 permissions:
   contents: read
