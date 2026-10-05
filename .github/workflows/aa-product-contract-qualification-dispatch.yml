@@ -105,6 +105,18 @@ jobs:
         run: |
           echo "Product Contract #7 is not activated: #118 production cutover is not yet present on exact main." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Reopen qualification tracker for the active exact-main run
+        if: steps.readiness.outputs.status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(gh issue view 7 --json state --jq .state)"
+          if [[ "$state" == "CLOSED" ]]; then
+            gh issue reopen 7
+          fi
+
       - name: Dispatch authoritative exact-main qualification #7
         if: steps.readiness.outputs.status == 'ready'
         env:
