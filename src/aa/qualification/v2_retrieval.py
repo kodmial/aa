@@ -330,6 +330,10 @@ def run_v2_case(
     config: RetrievalConfig | None = None,
 ) -> V2CaseResult:
     """Run baseline (RRF-only) vs target (RRF + rerank + expansion) for one case."""
+    # Frozen validation pins the full-quality 64-candidate pool explicitly:
+    # ordinary turns default to the optimized interactive pool via
+    # retrieve_evidence, but this benchmark must keep measuring the
+    # committed ~21-22s configuration so the latency gate stays comparable.
     active = config if config is not None else RetrievalConfig()
     queries = planner_proxy_queries(case)
     diversity = query_diversity(queries)

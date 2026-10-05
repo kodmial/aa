@@ -661,8 +661,17 @@ def retrieve_evidence(
     count must be 10..16 and ``queries[0]`` is the canonical reranker
     query. The answering model receives only the returned exact
     passages; ``retrieval_metadata`` stays internal.
+
+    When ``config`` is omitted, ordinary turns use the optimized
+    interactive pool (``interactive_retrieval_config``, 16 BGE
+    candidates) instead of the frozen full-quality 64-candidate default:
+    CPU BGE cost scales linearly, so the default hot path issues ~4x
+    fewer forwards than the ~21-22s warm p50/p95 validation recorded
+    against the 5s budget. The frozen BGE validation must pass an
+    explicit full-quality ``RetrievalConfig()`` so its numbers stay
+    comparable.
     """
-    active = config if config is not None else RetrievalConfig()
+    active = config if config is not None else interactive_retrieval_config()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
         raise EvidenceError("branch_top_k and rrf_k must be > 0")
     if active.reranker_pool_cap <= 0 or active.post_rerank_child_cap <= 0:
