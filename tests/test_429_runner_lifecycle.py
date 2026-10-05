@@ -90,9 +90,9 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
 
 
 def test_global_429_recovery_watches_runtime_and_qualification() -> None:
-    workflow = (
-        ROOT / ".github" / "workflows" / "aa-real-book-429-recovery.yml"
-    ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "aa-real-book-429-recovery.yml").read_text(
+        encoding="utf-8"
+    )
     assert '"AA real-book retrieval qualification"' in workflow
     assert '"AA bot runtime"' in workflow
     assert "aa-runtime-429-recovery" in workflow
