@@ -343,37 +343,104 @@ def dedup_and_diversify(
     pool_cap: int = POOL_CAP,
     max_per_section: int = MAX_PER_SECTION,
 ) -> list[FusedCandidate]:
-    """Collapse overlapping child spans and apply bounded section diversity."""
+    """Collapse overlaps while preserving bounded cross-section recall.
+
+    The normal RRF pool remains the primary candidate set. In addition,
+    the best RRF-scored candidate from every section seen anywhere in
+    the branch union receives a section ticket before the bounded global
+    fill. This prevents repeated hits from popular sections from erasing
+    a lower-frequency but still retrieved section before Evidence Pack
+    construction.
+    """
     if pool_cap <= 0 or max_per_section <= 0:
         raise EvidenceError("pool_cap and max_per_section must be > 0")
-    candidates = [fused[chunk_id] for chunk_id in pool_ids if chunk_id in fused]
+
+    sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
+    by_id = {chunk_id: fused[chunk_id] for chunk_id in pool_ids if chunk_id in fused}
+
+    best_by_section: dict[str, FusedCandidate] = {}
+    for candidate in fused.values():
+        section = sections.get(candidate.chunk_id)
+        if section is None:
+            continue
+        current = best_by_section.get(section)
+        if current is None or candidate.fused_score > current.fused_score:
+            best_by_section[section] = candidate
+    for candidate in best_by_section.values():
+        by_id.setdefault(candidate.chunk_id, candidate)
+
     spans = {
         chunk_id: (record.section, record.char_start, record.char_end)
         for chunk_id, record in index.chunks.items()
     }
-    deduped = deduplicate_overlaps(candidates, spans=spans)
-    sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
-    return enforce_diversity(
-        deduped, sections=sections, max_n=pool_cap, max_per_section=max_per_section
-    )
+    deduped = deduplicate_overlaps(list(by_id.values()), spans=spans)
+    ordered = sorted(deduped, key=lambda item: item.fused_score, reverse=True)
+
+    picked: list[FusedCandidate] = []
+    picked_ids: set[str] = set()
+    seen_sections: set[str] = set()
+    counts: dict[str, int] = {}
+
+    for candidate in ordered:
+        section = sections.get(candidate.chunk_id, "?")
+        if section in seen_sections:
+            continue
+        picked.append(candidate)
+        picked_ids.add(candidate.chunk_id)
+        seen_sections.add(section)
+        counts[section] = 1
+        if len(picked) >= pool_cap:
+            return picked
+
+    for candidate in ordered:
+        if candidate.chunk_id in picked_ids:
+            continue
+        section = sections.get(candidate.chunk_id, "?")
+        if counts.get(section, 0) >= max_per_section:
+            continue
+        picked.append(candidate)
+        picked_ids.add(candidate.chunk_id)
+        counts[section] = counts.get(section, 0) + 1
+        if len(picked) >= pool_cap:
+            break
+    return picked
 
 
 def select_top_candidates(
     candidates: list[FusedCandidate],
     *,
     top_cap: int = TOP_CHILD_CAP,
+    sections: dict[str, str] | None = None,
 ) -> list[FusedCandidate]:
-    """Select the top RRF-ordered candidates (no second-stage reranker).
-
-    Ordering is pure fused-score order; canonical text and provenance
-    are never rewritten.
-    """
+    """Select bounded RRF winners with an optional section-coverage floor."""
     if top_cap <= 0:
         raise EvidenceError("top_cap must be > 0")
     if not candidates:
         return []
     ranked = sorted(candidates, key=lambda item: item.fused_score, reverse=True)
-    return ranked[:top_cap]
+    if sections is None:
+        return ranked[:top_cap]
+
+    picked: list[FusedCandidate] = []
+    picked_ids: set[str] = set()
+    seen_sections: set[str] = set()
+    for candidate in ranked:
+        section = sections.get(candidate.chunk_id, "?")
+        if section in seen_sections:
+            continue
+        picked.append(candidate)
+        picked_ids.add(candidate.chunk_id)
+        seen_sections.add(section)
+        if len(picked) >= top_cap:
+            return picked
+
+    for candidate in ranked:
+        if candidate.chunk_id in picked_ids:
+            continue
+        picked.append(candidate)
+        if len(picked) >= top_cap:
+            break
+    return picked
 
 
 def _ordered_section_chunks(index: HybridIndex, section_id: str) -> list[str]:
@@ -618,28 +685,53 @@ def select_passages_under_budget(
 
     if priority_child_ids:
         priority = {cid: rank for rank, cid in enumerate(priority_child_ids)}
+        atoms = {cid: _atom(cid) for cid in priority_child_ids}
+        atom_costs = {
+            cid: estimate_text_tokens(atom.exact_text)
+            for cid, atom in atoms.items()
+            if atom is not None
+        }
+        remaining_priority = {cid for cid in priority_child_ids if cid in atom_costs}
+        remaining_reserve = sum(atom_costs[cid] for cid in remaining_priority)
+        reserve_all = remaining_reserve <= budget_tokens
+
         for passage in passages:
+            passage_priority = sorted(
+                (cid for cid in passage.child_chunk_ids if cid in remaining_priority),
+                key=priority.__getitem__,
+            )
+            covered_by_passage = set(passage_priority)
+            reserve_after = remaining_reserve - sum(
+                atom_costs[cid] for cid in covered_by_passage
+            )
             need = estimate_text_tokens(passage.exact_text)
-            if total + need <= budget_tokens:
+
+            if total + need <= budget_tokens and (
+                not reserve_all or total + need + reserve_after <= budget_tokens
+            ):
                 selected.append(passage)
                 covered.update(passage.child_chunk_ids)
+                for cid in covered_by_passage:
+                    remaining_priority.discard(cid)
+                remaining_reserve = reserve_after
                 total += need
                 continue
 
-            direct_winners = sorted(
-                (cid for cid in passage.child_chunk_ids if cid in priority and cid not in covered),
-                key=priority.__getitem__,
-            )
-            for cid in direct_winners:
-                atom = _atom(cid)
+            for cid in passage_priority:
+                atom = atoms.get(cid)
                 if atom is None:
                     continue
-                atom_need = estimate_text_tokens(atom.exact_text)
+                atom_need = atom_costs[cid]
                 if atom_need <= 0 or total + atom_need > budget_tokens:
                     continue
                 selected.append(atom)
                 covered.add(cid)
+                remaining_priority.discard(cid)
+                remaining_reserve -= atom_need
                 total += atom_need
+
+        if reserve_all and remaining_priority:
+            raise EvidenceError("priority winner reservation was not materialized")
         return selected, total
 
     for passage in passages:
@@ -732,7 +824,12 @@ def retrieve_evidence(
         pool_cap=active.pool_cap,
         max_per_section=active.max_per_section,
     )
-    winners = select_top_candidates(diverse, top_cap=active.top_child_cap)
+    sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
+    winners = select_top_candidates(
+        diverse,
+        top_cap=active.top_child_cap,
+        sections=sections,
+    )
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
     selected, total = select_passages_under_budget(
         expanded,
