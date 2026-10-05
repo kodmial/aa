@@ -45,11 +45,7 @@ on:
 permissions:
   contents: read
   issues: read
-  actions: read
-
-concurrency:
-  group: aa-real-book-retrieval-qualification-v2
-  cancel-in-progress: true
+  actions: write
 
 env:
   PYTHON_VERSION: "3.12"
@@ -60,9 +56,41 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: write
     outputs:
       exact_sha: ${{ steps.resolve.outputs.exact_sha }}
     steps:
+      - name: Cancel superseded qualification runs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const current = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            const workflowId = current.data.workflow_id;
+            const currentNumber = Number(current.data.run_number);
+            const activeStates = new Set(['queued', 'in_progress', 'pending', 'requested', 'waiting']);
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowId,
+              per_page: 100,
+            });
+            for (const run of data.workflow_runs) {
+              if (run.id === context.runId) continue;
+              if (Number(run.run_number) >= currentNumber) continue;
+              if (!activeStates.has(run.status)) continue;
+              await github.rest.actions.cancelWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              core.notice(`cancelled superseded qualification run ${run.id} (#${run.run_number})`);
+            }
+
       - name: Resolve exact main SHA
         id: resolve
         uses: actions/github-script@v7
