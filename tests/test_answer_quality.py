@@ -92,6 +92,13 @@ EXPECTED_HARD_CHECKS = [
     "tool_leakage",
     "diagnosis_inference",
     "grounding_evidence",
+    "book_substantive_support",
+    "product_meta_exempt",
+    "glue_exempt",
+    "mechanics_concealment",
+    "generic_knowledge_boundary",
+    "memory_fidelity",
+    "citation_optionality",
 ]
 
 
@@ -165,7 +172,9 @@ def test_rubric_covers_all_required_hard_checks_and_dimensions() -> None:
 
 def test_calibration_targets_frozen_rubric() -> None:
     calibration = load_calibration()
-    assert calibration["rubric_version"] == RUBRIC_VERSION
+    # Historical v1 calibration remains valid for v2 (v2 preserves every v1
+    # dimension/check as a prefix and only appends Product Contract checks).
+    assert calibration["rubric_version"] in (RUBRIC_VERSION, "ru-answer-quality-rubric-v1")
     assert len(calibration["fixtures"]) == 12
 
 

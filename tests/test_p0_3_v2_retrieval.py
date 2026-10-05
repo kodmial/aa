@@ -761,6 +761,7 @@ def test_budget_fallback_reserves_priority_before_later_passages(
     finally:
         close_hybrid_index(index)
 
+
 # ---------------------------------------------------------------------------
 # Evidence Pack contract: exact text plus minimal provenance only.
 # ---------------------------------------------------------------------------
