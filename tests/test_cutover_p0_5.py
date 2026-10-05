@@ -23,11 +23,7 @@ from aa.conversation.output_limits import (
     aggregate_quote_chars,
     envelope_passes,
 )
-from aa.conversation.turn_pipeline import (
-    NATURAL_CLARIFICATION_REPLY,
-    contains_cyrillic,
-    leaks_internal_terms,
-)
+from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
 from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
 from aa.telegram.transport import (
     StubTelegramTransport,
@@ -80,14 +76,12 @@ async def _delegate(thread: str, text: str, *, runtime: GraphTurnRuntime) -> str
 
 
 def _runtime() -> GraphTurnRuntime:
-    runtime = GraphTurnRuntime()
     holder: dict[str, GraphTurnRuntime] = {}
 
     async def _run(thread: str, text: str) -> str:
-        assert holder["rt"] is runtime
-        return await _delegate(thread, text, runtime=runtime)
+        return await _delegate(thread, text, runtime=holder["rt"])
 
-    runtime._delegate = _run  # type: ignore[attr-defined]
+    runtime = GraphTurnRuntime(delegate=_run)
     holder["rt"] = runtime
     return runtime
 
@@ -304,9 +298,7 @@ async def test_new_command_clears_only_requesting_chat() -> None:
             TelegramIncoming(update_id=2, chat_id=602, message_id=1, text="про сон")
         )
         await app._process_dispatched_update(
-            TelegramIncoming(
-                update_id=3, chat_id=601, message_id=2, text="/new", command="new"
-            )
+            TelegramIncoming(update_id=3, chat_id=601, message_id=2, text="/new", command="new")
         )
         assert transport.sent[-1].text == "Новая беседа начата."
         assert runtime.history_for_thread(thread_id_for_chat(601)) == []
@@ -358,9 +350,7 @@ async def test_provider_failure_never_leaks_terms() -> None:
 
 
 async def test_graph_runtime_error_never_leaks_terms() -> None:
-    runtime = GraphTurnRuntime(
-        delegate=_failing_delegate,  # type: ignore[arg-type]
-    )
+    runtime = GraphTurnRuntime(delegate=_failing_delegate)
     await runtime.start()
     app = _app(runtime)
     await app.start()
@@ -618,13 +608,13 @@ async def test_real_graph_thread_persists_and_new_clears(tmp_path: pathlib.Path)
         graph = build_turn_graph(planner_model=RunnableLambda(_plan), checkpointer=saver)
         thread = thread_id_for_chat(4242)
         config = {"configurable": {"thread_id": thread}}
-        first = await graph.ainvoke(turn_input("первое сообщение"), config=config)
+        first = await graph.ainvoke(turn_input("первое сообщение"), config=config)  # type: ignore[call-overload]
         assert first["planner_invoked"] is True
-        second = await graph.ainvoke(turn_input("почему?"), config=config)
+        second = await graph.ainvoke(turn_input("почему?"), config=config)  # type: ignore[call-overload]
         humans = [str(item.content) for item in second["messages"] if item.type == "human"]
         assert "первое сообщение" in humans
         assert "почему?" in humans
         await saver.adelete_thread(thread)
-        third = await graph.ainvoke(turn_input("почему?"), config=config)
+        third = await graph.ainvoke(turn_input("почему?"), config=config)  # type: ignore[call-overload]
         cleared = [str(item.content) for item in third["messages"] if item.type == "human"]
         assert "первое сообщение" not in cleared

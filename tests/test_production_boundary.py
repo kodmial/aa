@@ -6,7 +6,6 @@ from aa.app import Application
 from aa.config import Settings
 from aa.conversation.meta import META_CAPABILITY_REPLY, is_meta_capability_request
 from aa.conversation.orchestrator import (
-    FAIL_CLOSED_REPLY,
     contains_english_fallback,
     is_substantive,
     meets_russian_only,

@@ -383,11 +383,11 @@ def test_format_russian_quotation_marks_kind_unambiguously() -> None:
 
 
 def test_application_wires_fail_closed_grounding_gate() -> None:
+    # Cutover #118: the LangGraph verifier owns grounding; the retired
+    # orchestrator gate handle stays None for constructor compatibility.
     settings = Settings.from_env({})
     app = Application(settings)
-    assert app.grounding.corpus_version == settings.aa_corpus_version
-    assert app.grounding.ru_corpus_available is False
-    assert app.grounding.allow_translation_fallback is False
+    assert app.grounding is None
 
 
 def _prompt_text() -> str:
