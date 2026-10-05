@@ -446,16 +446,29 @@ def main(argv: list[str] | None = None) -> int:
                 infra_failures += 1
                 continue
             assert_no_oracle_leak({"queries": queries}, case_id)
-            diagnostics.append(
-                _run_turn(
-                    index=index,
-                    case_id=case_id,
-                    utterance=utterance,
-                    planner_queries=queries,
-                    oracle_sections=oracle_regions.get(case_id, set()),
-                    config=config,
+            try:
+                diagnostics.append(
+                    _run_turn(
+                        index=index,
+                        case_id=case_id,
+                        utterance=utterance,
+                        planner_queries=queries,
+                        oracle_sections=oracle_regions.get(case_id, set()),
+                        config=config,
+                    )
                 )
-            )
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "case_id": case_id,
+                            "retrieval_error": type(exc).__name__,
+                            "utterance_chars": len(utterance),
+                        }
+                    )
+                )
+                infra_failures += 1
+                continue
             print(
                 json.dumps(
                     {

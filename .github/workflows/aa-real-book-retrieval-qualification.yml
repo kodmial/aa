@@ -353,7 +353,7 @@ jobs:
             test -f eval-real-book-out/real-book-retrieval-summary.json
           fi
           # Plaintext corpus/index must never be staged for upload.
-          if ls eval-real-book-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null | grep -v -e summary -e result; then
+          if ls eval-real-book-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null; then
             echo "protected exact text outside the encrypted bundle" >&2
             exit 1
           fi
