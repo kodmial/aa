@@ -54,6 +54,7 @@ from aa.retrieval.evidence import (
     INTERACTIVE_RERANKER_POOL_CAP,
     EvidencePack,
     RetrievalConfig,
+    is_interactive_config,
     retrieve_evidence,
 )
 from aa.retrieval.index import HybridIndex
@@ -602,7 +603,7 @@ def require_v2_cutover_acceptance(
     """
     if not performance_accepted:
         raise ValueError(V2_CUTOVER_BLOCKED_REASON)
-    if config is not None and config.reranker_pool_cap > INTERACTIVE_RERANKER_POOL_CAP:
+    if config is not None and not is_interactive_config(config):
         raise ValueError(
             "v2 retrieval cutover requires the optimized interactive pool "
             f"(reranker_pool_cap<={INTERACTIVE_RERANKER_POOL_CAP}, "

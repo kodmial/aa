@@ -44,6 +44,7 @@ from aa.retrieval.evidence import (
     EvidencePack,
     RetrievalConfig,
     interactive_retrieval_config,
+    is_interactive_config,
     retrieve_evidence,
 )
 from aa.retrieval.index import HybridIndex, logical_chunk_id
@@ -161,6 +162,20 @@ async def retrieval_node(
             "retrieval_over_budget": False,
         }
     active_config = _resolve_retrieval_config(config)
+    if not is_interactive_config(active_config):
+        # The frozen 64-candidate validation exceeds the 5s interactive
+        # budget (~20-22s warm p50/p95 of CPU BGE forwards); running it on
+        # the turn hot path requires explicit performance acceptance at
+        # binding time, so surface it here as well instead of silently
+        # serving the slow full-quality path as if it were interactive.
+        logger.warning(
+            "v2 retrieval running non-interactive BGE pool",
+            extra={
+                "reranker_pool_cap": active_config.reranker_pool_cap,
+                "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
+                "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+            },
+        )
     started = time.perf_counter()
     pack = await asyncio.to_thread(
         retrieve_evidence, index, queries, config=active_config, reranker=reranker
