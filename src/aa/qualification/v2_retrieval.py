@@ -370,9 +370,22 @@ def run_v2_case(
     # branches, RRF pool truncation, and final pack recall. The pool is
     # recomputed deterministically from the same branch outputs (no
     # rerank involved), so union -> pool -> pack losses are attributable.
+    # The union is derived from the same branch outputs used for fusion
+    # (no separate re-embedding/re-search per query), avoiding doubled
+    # hot-path cost and union-vs-pool divergence.
+    from aa.retrieval import evidence as _evidence
+
+    _ranked, _per_query = _evidence.run_branch_searches(
+        index, queries, branch_top_k=active.branch_top_k
+    )
     union_sections: set[str] = set()
-    for query in queries:
-        for chunk_id, _ in _branch_union(index, query, top_k=active.branch_top_k):
+    for ranked in _ranked:
+        for chunk_id, _ in ranked:
+            record = index.chunks.get(chunk_id)
+            if record is not None:
+                union_sections.add(record.section)
+    for contributed in _per_query:
+        for chunk_id in contributed:
             record = index.chunks.get(chunk_id)
             if record is not None:
                 union_sections.add(record.section)
@@ -380,11 +393,6 @@ def run_v2_case(
         any(section in case.relevant_sections for section in union_sections)
         if not case.is_unsupported
         else False
-    )
-    from aa.retrieval import evidence as _evidence
-
-    _ranked, _per_query = _evidence.run_branch_searches(
-        index, queries, branch_top_k=active.branch_top_k
     )
     _fused, _pool_ids = _evidence.fuse_query_pool(
         _ranked, _per_query, rrf_k=active.rrf_k, pool_cap=active.reranker_pool_cap

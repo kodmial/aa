@@ -46,6 +46,12 @@ _DENSE_SEARCH_LOCK = threading.Lock()
 # the built index and these cached weights; nothing is reloaded per turn.
 _E5_LOADED: dict[str, tuple[Any, Any]] = {}
 
+# Serializes shared e5 batched inference when retrieval runs in worker
+# threads via ``asyncio.to_thread``. Torch/transformers forward has no
+# cross-thread guarantee (unlike the FAISS search lock above), so
+# concurrent turns must not share one tokenizer/model call.
+_E5_INFER_LOCK = threading.Lock()
+
 
 class DenseError(ValueError):
     """Raised when dense embeddings or search cannot be served locally."""
@@ -171,15 +177,16 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
     # One batched forward for the whole turn (single tokenizer + model
     # call with padding) instead of one forward per query: identical
     # mean-pooled scores with ~N fewer HF overheads on the hot path.
-    with torch_mod.no_grad():
-        encoded = tokenizer(
-            prefixed, return_tensors="pt", padding=True, truncation=True, max_length=512
-        )
-        output = model(**encoded).last_hidden_state
-        mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
-        pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        normalized = torch_mod.nn.functional.normalize(pooled, p=2, dim=1)
-        vectors = [[float(value) for value in row.tolist()] for row in normalized]
+    with _E5_INFER_LOCK:
+        with torch_mod.no_grad():
+            encoded = tokenizer(
+                prefixed, return_tensors="pt", padding=True, truncation=True, max_length=512
+            )
+            output = model(**encoded).last_hidden_state
+            mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
+            pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            normalized = torch_mod.nn.functional.normalize(pooled, p=2, dim=1)
+            vectors = [[float(value) for value in row.tolist()] for row in normalized]
     return vectors
 
 

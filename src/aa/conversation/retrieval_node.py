@@ -140,19 +140,21 @@ async def retrieval_node(
     one long-lived ``reranker`` across ``asyncio.to_thread`` workers.
     Shared access is internally serialized where the underlying
     libraries offer no cross-thread guarantee: lexical FTS via its
-    connection lock, dense FAISS search via the dense search lock, and
+    connection lock, dense FAISS search via the dense search lock,
+    shared e5 batched inference via the e5 infer lock, and
     FlagReranker scoring via the reranker score lock. No caller-side
     locking is required.
 
     The per-turn wall-clock latency against
-    ``INTERACTIVE_LATENCY_BUDGET_MS`` is propagated in state
+    ``INTERACTIVE_LATENCY_BUDGET_MS`` is enforced with a timeout (fails
+    closed on expiry) and propagated in state
     (``retrieval_latency_ms``/``retrieval_over_budget``) so an over-budget
     BGE turn (~20-22s warm p50/p95 for the frozen 64-candidate validation
-    vs the 5s budget) can never be mistaken for interactive serving
-    downstream; only counts and latencies are logged, never prompts or
-    user text. When ``config`` is omitted the optimized interactive pool
-    (``reranker_pool_cap`` 16) is used instead of the slow full-quality
-    default.
+    vs the 5s budget) can never block an interactive turn or be mistaken
+    for interactive serving downstream; only counts and latencies are
+    logged, never prompts or user text. When ``config`` is omitted the
+    optimized interactive pool (``reranker_pool_cap`` 16) is used instead
+    of the slow full-quality default.
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -191,9 +193,18 @@ async def retrieval_node(
             "and the optimized interactive config"
         )
     started = time.perf_counter()
-    pack = await asyncio.to_thread(
-        retrieve_evidence, index, queries, config=active_config, reranker=reranker
-    )
+    try:
+        pack = await asyncio.wait_for(
+            asyncio.to_thread(
+                retrieve_evidence, index, queries, config=active_config, reranker=reranker
+            ),
+            timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
+        )
+    except TimeoutError as exc:
+        raise ValueError(
+            "v2 retrieval exceeded interactive budget; explicit performance "
+            "acceptance or optimization is required"
+        ) from exc
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     hits, pack_dicts = pack_to_state(pack)
