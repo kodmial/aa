@@ -420,6 +420,7 @@ jobs:
           key: ${{ steps.derived-cache-key.outputs.derived-key }}
 
       - name: Run bounded Telegram poller and OpenCode
+        id: runtime
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_SESSION_DURATION_SECONDS: ${{ steps.duration.outputs.seconds }}
@@ -427,13 +428,36 @@ jobs:
           OPENCODE_COMMAND: opencode
           OPENCODE_WORKDIR: .
           OPENCODE_AGENT: aa
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_MODEL: opencode/space-bunny-free
+          OPENCODE_FALLBACK_MODEL: opencode/muse-spark-1.3-contributor-free
           OPENCODE_CONTEXT_LIMIT_TOKENS: "200000"
           GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           LOG_LEVEL: INFO
-        run: python -m aa
+        shell: bash
+        run: |
+          set +e
+          python -m aa
+          status=$?
+          set -e
+          if [ "$status" -eq 75 ]; then
+            mkdir -p runtime-recovery
+            printf '%s\n' '{"reason_code":"OPENCODE_429_RESTART_REQUIRED"}' > runtime-recovery/result.json
+            echo "restart_required=true" >> "$GITHUB_OUTPUT"
+            echo "::error::OpenCode 429: retire this runner and start a fresh runtime VM."
+            exit 75
+          fi
+          echo "restart_required=false" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Upload 429 runner-restart marker
+        if: always() && steps.runtime.outputs.restart_required == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-runtime-429-recovery
+          path: runtime-recovery/result.json
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Record bounded completion
         if: success()
