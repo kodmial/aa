@@ -82,12 +82,16 @@ jobs:
               return { generation: m[1], seq: Number(m[2]), sourceComment: m[3] || null };
             };
             const markersForGeneration = (comments, generation) => {
-              const seqs = [];
+              // Deduplicated by seq: a retried marker post after an
+              // ambiguous success may persist the same seq twice, and
+              // counting both would wedge the reconciler in pending
+              // (markers greater than runs forever).
+              const seqs = new Set();
               for (const c of comments) {
                 const parsed = parseMarker(c.body || '');
-                if (parsed && parsed.generation === generation) seqs.push(parsed.seq);
+                if (parsed && parsed.generation === generation) seqs.add(parsed.seq);
               }
-              return seqs.sort((a, b) => a - b);
+              return [...seqs].sort((a, b) => a - b);
             };
             const generationForComment = commentId => `c${commentId}`;
 

@@ -380,14 +380,19 @@ def parse_dispatch_marker(body: str) -> dict[str, object] | None:
 
 
 def markers_for_generation(bodies: list[str], generation_id: str) -> list[int]:
-    """Return committed seq numbers for ``generation_id`` (durable markers)."""
-    seqs: list[int] = []
+    """Return committed seq numbers for ``generation_id`` (durable markers).
+
+    Deduplicated by seq: a retried marker post after an ambiguous success
+    may persist the same seq twice, and counting both would wedge the
+    reconciler in ``noop_pending`` (markers greater than runs forever).
+    """
+    seqs: set[int] = set()
     for body in bodies:
         parsed = parse_dispatch_marker(body)
         if parsed is not None and parsed.get("generation") == generation_id:
             value = parsed.get("seq")
             if isinstance(value, int):
-                seqs.append(value)
+                seqs.add(value)
     return sorted(seqs)
 
 

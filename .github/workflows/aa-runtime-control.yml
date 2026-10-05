@@ -168,12 +168,16 @@ jobs:
               return { generation: m[1], seq: Number(m[2]), sourceComment: m[3] || null };
             };
             const markersForGeneration = (comments, generation) => {
-              const seqs = [];
+              // Deduplicated by seq: a retried marker post after an
+              // ambiguous success may persist the same seq twice, and
+              // counting both would wedge the reconciler in pending
+              // (markers greater than runs forever).
+              const seqs = new Set();
               for (const c of comments) {
                 const parsed = parseMarker(c.body || '');
-                if (parsed && parsed.generation === generation) seqs.push(parsed.seq);
+                if (parsed && parsed.generation === generation) seqs.add(parsed.seq);
               }
-              return seqs.sort((a, b) => a - b);
+              return [...seqs].sort((a, b) => a - b);
             };
             const hasMarkerForSource = (comments, sourceId) => {
               if (sourceId === null || sourceId === undefined) return false;
@@ -363,20 +367,69 @@ jobs:
             // poller. Never dispatch a second runtime to repair an uncertain
             // listing below.
             let marker = formatMarker(generation, 1, currentCommentId);
-            for (let attempt = 0; attempt < 3; attempt++) {
+            const markerBody = `Start 1/${MAX_STARTS} committed for generation ${generation}.\n` + marker;
+            let markerCommitted = false;
+            for (let attempt = 0; attempt < 3 && !markerCommitted; attempt++) {
               try {
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: controlIssue,
-                  body: `Start 1/${MAX_STARTS} committed for generation ${generation}.\n` + marker,
+                  body: markerBody,
                 });
-                break;
+                markerCommitted = true;
               } catch (error) {
-                if (attempt === 2) {
-                  core.setFailed('Dispatch committed but marker not persisted: ' + ((error && error.message) || error));
-                  return;
+                // A failed post may still have persisted server-side
+                // (ambiguous success), so re-read before retrying: any
+                // duplicate seq post is deduplicated by
+                // markersForGeneration and never double counts a start.
+                try {
+                  const reread = await listAllComments();
+                  if (markersForGeneration(reread, generation).includes(1)) {
+                    markerCommitted = true;
+                    break;
+                  }
+                } catch (_) {
+                  // Re-read is best-effort; fall through to the retry below.
                 }
-                await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                if (attempt < 2) {
+                  await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                }
               }
+            }
+            if (!markerCommitted) {
+              // Failure-after-commit with no durable marker yet: the dispatch
+              // above was accepted, so start 1/4 is consumed. Returning now
+              // would leave 0 markers + 0 runs (not pending), letting a later
+              // tick dispatch a second runtime for the same generation.
+              // Poll briefly so a transient comment-API blip can still
+              // converge on the durable marker before this execution
+              // releases the aa-runtime-control lock.
+              for (let wait = 0; wait < 4 && !markerCommitted; wait++) {
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: controlIssue,
+                    body: markerBody,
+                  });
+                  markerCommitted = true;
+                } catch (_) {
+                  try {
+                    const reread = await listAllComments();
+                    if (markersForGeneration(reread, generation).includes(1)) {
+                      markerCommitted = true;
+                    }
+                  } catch (_) {
+                    // Best-effort; keep waiting for the API to recover.
+                  }
+                }
+              }
+            }
+            if (!markerCommitted) {
+              core.setFailed(
+                'Dispatch committed but marker not persisted for generation ' + generation +
+                ': start 1/' + MAX_STARTS + ' is consumed and a runtime may appear shortly. ' +
+                'Verify runs before re-posting `/run`; never dispatch a second poller to repair this tick.'
+              );
+              return;
             }
             // Give GitHub a short moment to create the run so the operator
             // gets an authoritative run id in the control issue. Best-effort
