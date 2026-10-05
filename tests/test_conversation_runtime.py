@@ -41,6 +41,7 @@ from aa.conversation.orchestrator import (
 from aa.corpus.structure import SECTION_IDS, build_full_structure
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
+    OpenCodeRateLimitError,
     OpenCodeTransientError,
 )
 from aa.retrieval.index import HybridIndex, build_hybrid_index
@@ -534,7 +535,7 @@ def _diag() -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def test_transient_429_retries_then_succeeds_on_primary() -> None:
+async def test_transient_503_retries_then_succeeds_on_primary() -> None:
     attempts = 0
 
     async def _send(
@@ -543,7 +544,7 @@ async def test_transient_429_retries_then_succeeds_on_primary() -> None:
         nonlocal attempts
         attempts += 1
         if attempts <= 2:
-            raise OpenCodeTransientError("opencode request failed transiently: http=429")
+            raise OpenCodeTransientError("opencode request failed transiently: http=503")
         return "steady answer"
 
     result = await send_with_fallback(
@@ -562,7 +563,7 @@ async def test_transient_429_retries_then_succeeds_on_primary() -> None:
     assert attempts == 3
 
 
-async def test_persistent_429_uses_bounded_technical_fallback_once() -> None:
+async def test_persistent_503_uses_bounded_technical_fallback_once() -> None:
     seen: list[str] = []
 
     async def _send(
@@ -570,7 +571,7 @@ async def test_persistent_429_uses_bounded_technical_fallback_once() -> None:
     ) -> str:
         seen.append(model)
         if model == PRIMARY:
-            raise OpenCodeTransientError("opencode request failed transiently: http=429")
+            raise OpenCodeTransientError("opencode request failed transiently: http=503")
         return "fallback answer"
 
     result = await send_with_fallback(
@@ -586,6 +587,28 @@ async def test_persistent_429_uses_bounded_technical_fallback_once() -> None:
     assert result.served_model == FALLBACK
     assert result.error_category == "fallback-used"
     assert seen.count(FALLBACK) == 1
+
+
+async def test_real_429_always_escapes_synthesis_for_runner_recovery() -> None:
+    seen: list[str] = []
+
+    async def _send(
+        session_id: str, prompt: str, *, agent: str = "", model: str = "", **_kw: Any
+    ) -> str:
+        seen.append(model)
+        raise OpenCodeRateLimitError("opencode provider rate-limited: http=429")
+
+    with pytest.raises(OpenCodeRateLimitError):
+        await send_with_fallback(
+            _send,
+            "ses_1",
+            "prompt",
+            agent=AGENT_NAME,
+            primary_model=PRIMARY,
+            fallback_model=FALLBACK,
+            sleep=_noop_sleep,
+        )
+    assert seen == [PRIMARY]
 
 
 async def test_deterministic_provider_error_never_falls_back() -> None:
