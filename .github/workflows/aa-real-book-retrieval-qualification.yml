@@ -409,8 +409,10 @@ jobs:
           path: |
             eval-real-book-out/real-book-retrieval-summary.json
             eval-real-book-out/result.json
+            eval-real-book-out/checkpoint.json
           retention-days: 90
           if-no-files-found: warn
+          overwrite: true
 
       - name: Publish idempotent #130 result marker (SHA + corpus + benchmark + retrieval)
         if: always()
