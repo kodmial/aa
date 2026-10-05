@@ -355,7 +355,9 @@ def test_section_ticket_survives_global_pool_pressure(tmp_path: pathlib.Path) ->
             pool_cap=4,
             max_per_section=4,
         )
-        section_map = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
+        section_map = {
+            chunk_id: record.section for chunk_id, record in index.chunks.items()
+        }
         winners = select_top_candidates(diverse, top_cap=4, sections=section_map)
         winner_sections = {section_map[item.chunk_id] for item in winners}
         assert dominant in winner_sections
@@ -760,7 +762,6 @@ def test_budget_fallback_reserves_priority_before_later_passages(
         assert selected[0].exact_text == first.text
     finally:
         close_hybrid_index(index)
-
 
 # ---------------------------------------------------------------------------
 # Evidence Pack contract: exact text plus minimal provenance only.
