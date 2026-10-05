@@ -196,6 +196,13 @@ def make_retrieval_node(
     from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
 
     require_v2_cutover_acceptance(performance_accepted=performance_accepted)
+    logger.warning(
+        "v2 retrieval wired with explicit performance acceptance",
+        extra={
+            "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+            "expected_warm_p95_ms": 22472,
+        },
+    )
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
         return await retrieval_node(state, index=index, reranker=reranker, config=config)

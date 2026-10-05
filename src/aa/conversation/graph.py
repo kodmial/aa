@@ -223,8 +223,16 @@ def build_turn_graph(
     else:
         from aa.conversation.retrieval_node import make_retrieval_node
         from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
+        from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS
 
         require_v2_cutover_acceptance(performance_accepted=performance_accepted)
+        logger.warning(
+            "v2 retrieval graph wired with explicit performance acceptance",
+            extra={
+                "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+                "expected_warm_p95_ms": 22472,
+            },
+        )
         builder.add_node(
             "retrieval",
             make_retrieval_node(
@@ -253,6 +261,8 @@ def turn_input(user_message: str, *, summary: str | None = None) -> TurnState:
         search_queries=[],
         retrieval_hits=[],
         evidence_pack=[],
+        retrieval_latency_ms=0.0,
+        retrieval_over_budget=False,
         draft_response="",
         grounding_result={},
         retry_state={},
