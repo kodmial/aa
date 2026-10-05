@@ -37,6 +37,10 @@ on:
       - main
     paths:
       - ".github/workflows/aa-real-book-retrieval-qualification.yml"
+      - "opencode.json"
+      - "scripts/run_real_book_retrieval_qualification.py"
+      - "src/aa/conversation/model_adapter.py"
+      - "src/aa/conversation/planner_node.py"
 
 permissions:
   contents: read
