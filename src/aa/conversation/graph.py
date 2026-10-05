@@ -154,9 +154,13 @@ async def retrieval_stub_node(state: TurnState) -> dict[str, Any]:
     """Interface placeholder for the #116 retrieval pipeline (no-op).
 
     Keeps graph semantics stable when no RAM-resident index is bound.
-    Pass ``retrieval_index`` to :func:`build_turn_graph` to run the real
-    target pipeline (multi-query hybrid plus BGE rerank plus Evidence
-    Pack selection). Emits counts only.
+    Pass ``retrieval_index`` plus explicit ``performance_accepted=True``
+    to :func:`build_turn_graph` to run the real target pipeline
+    (multi-query hybrid plus BGE rerank plus Evidence Pack selection).
+    The explicit flag records performance acceptance for the ~20-22s
+    warm p50/p95 BGE path against the 5s interactive budget; without it
+    cutover stays blocked and binding the index fails closed. Emits
+    counts only.
     """
     _ = state
     logger.info("v2 retrieval interface reached")
@@ -173,6 +177,7 @@ def build_turn_graph(
     retrieval_index: Any = None,
     reranker: Any = None,
     retrieval_config: Any = None,
+    performance_accepted: bool = False,
 ) -> CompiledStateGraph[TurnState, None, TurnState, TurnState]:
     """Compile the v2 turn graph with managed checkpointing.
 
@@ -189,7 +194,10 @@ def build_turn_graph(
     production path stays untouched until the later cutover task:
     the v2 BGE path exceeds the 5s interactive budget (~20-22s warm
     p50/p95) so production cutover stays blocked pending explicit
-    performance acceptance or optimization.
+    performance acceptance or optimization. Binding ``retrieval_index``
+    therefore requires ``performance_accepted=True`` and fails closed
+    otherwise via
+    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -209,10 +217,17 @@ def build_turn_graph(
         retrieval_node_name = "retrieval_stub"
     else:
         from aa.conversation.retrieval_node import make_retrieval_node
+        from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
 
+        require_v2_cutover_acceptance(performance_accepted=performance_accepted)
         builder.add_node(
             "retrieval",
-            make_retrieval_node(index=retrieval_index, reranker=reranker, config=retrieval_config),
+            make_retrieval_node(
+                index=retrieval_index,
+                reranker=reranker,
+                config=retrieval_config,
+                performance_accepted=performance_accepted,
+            ),
         )
         retrieval_node_name = "retrieval"
     builder.add_edge(START, "gate")

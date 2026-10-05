@@ -23,6 +23,10 @@ turn (per-turn RRF plus 64-candidate CPU rerank) against the 5s
 interactive budget, so production cutover stays blocked until explicit
 performance acceptance or optimization (see
 ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``).
+Binding the node via :func:`make_retrieval_node` therefore requires
+``performance_accepted=True`` and fails closed otherwise, so a slow
+turn can never be wired into production without a recorded
+acceptance.
 """
 
 from __future__ import annotations
@@ -162,8 +166,19 @@ def make_retrieval_node(
     index: HybridIndex,
     reranker: CrossEncoderReranker | None = None,
     config: RetrievalConfig | None = None,
+    performance_accepted: bool = False,
 ) -> Any:
-    """Build the evidence retrieval node bound to one RAM-resident index."""
+    """Build the evidence retrieval node bound to one RAM-resident index.
+
+    ``performance_accepted=True`` records explicit acceptance of the
+    ~20-22s warm BGE latency against the 5s interactive budget; the
+    default (``False``) fails closed via
+    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``
+    instead of wiring the slow path into production.
+    """
+    from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
+
+    require_v2_cutover_acceptance(performance_accepted=performance_accepted)
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
         return await retrieval_node(state, index=index, reranker=reranker, config=config)

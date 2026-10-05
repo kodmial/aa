@@ -937,6 +937,10 @@ async def test_graph_retrieval_node_wires_evidence_pack(tmp_path: pathlib.Path) 
             planner_model=RunnableLambda(_plan),
             retrieval_index=index,
             reranker=offline,
+            # Hermetic offline test acceptance only: the frozen BGE
+            # validation still exceeds the 5s interactive budget, so
+            # production cutover stays blocked without real acceptance.
+            performance_accepted=True,
         )
         from aa.conversation.graph import turn_input
 
@@ -966,3 +970,60 @@ async def test_graph_without_index_keeps_stub(tmp_path: pathlib.Path) -> None:
     result = await graph.ainvoke(turn_input("привет"))
     assert result["evidence_pack"] == []
     assert result["retrieval_hits"] == []
+
+
+def test_v2_retrieval_binding_requires_performance_acceptance(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Binding the slow BGE path fails closed without explicit acceptance."""
+    from langchain_core.runnables import RunnableLambda
+
+    from aa.conversation.graph import build_turn_graph
+
+    index = _build_index(tmp_path)
+    try:
+
+        async def _plan(_messages: Any) -> Any:
+            return {"queries": []}
+
+        offline = _offline_reranker()
+        with pytest.raises(ValueError, match="cutover is blocked"):
+            build_turn_graph(
+                planner_model=RunnableLambda(_plan),
+                retrieval_index=index,
+                reranker=offline,
+            )
+        with pytest.raises(ValueError, match="cutover is blocked"):
+            build_turn_graph(
+                planner_model=RunnableLambda(_plan),
+                retrieval_index=index,
+                reranker=offline,
+                performance_accepted=False,
+            )
+        # Explicit acceptance wires the node (hermetic offline backend).
+        graph = build_turn_graph(
+            planner_model=RunnableLambda(_plan),
+            retrieval_index=index,
+            reranker=offline,
+            performance_accepted=True,
+        )
+        assert graph is not None
+    finally:
+        close_hybrid_index(index)
+
+
+def test_make_retrieval_node_requires_performance_acceptance(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Direct node construction fails closed without explicit acceptance."""
+    from aa.conversation.retrieval_node import make_retrieval_node
+
+    index = _build_index(tmp_path)
+    try:
+        offline = _offline_reranker()
+        with pytest.raises(ValueError, match="cutover is blocked"):
+            make_retrieval_node(index=index, reranker=offline)
+        node = make_retrieval_node(index=index, reranker=offline, performance_accepted=True)
+        assert callable(node)
+    finally:
+        close_hybrid_index(index)
