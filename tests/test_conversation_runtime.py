@@ -711,7 +711,7 @@ async def test_synthesis_prompt_never_carries_planner_metadata(
 
 
 # ---------------------------------------------------------------------------
-# Qualification gate + #40 dispatch wiring
+# Qualification gates + Product Contract #7 dispatch wiring
 # ---------------------------------------------------------------------------
 
 
@@ -728,16 +728,23 @@ def test_runtime_qualification_gate_passes_on_qualified_repo() -> None:
     assert '"status": "qualified"' in completed.stdout
 
 
-def test_issue40_dispatch_workflow_is_automatic() -> None:
+def test_product_contract_dispatch_targets_exact_main_issue7() -> None:
     root = pathlib.Path(__file__).resolve().parents[1]
-    workflow = (root / ".github" / "workflows" / "aa-issue9-qualification-dispatch.yml").read_text(
-        encoding="utf-8"
+    workflow_path = (
+        root / ".github" / "workflows" / "aa-product-contract-qualification-dispatch.yml"
     )
+    workflow = workflow_path.read_text(encoding="utf-8")
     assert "branches" in workflow and "main" in workflow
-    assert "capability_number=9" in workflow
-    assert "qualification_number=40" in workflow
+    assert "Verify exact current main identity" in workflow
+    assert "refs/remotes/origin/main" in workflow
+    assert "capability_number=6" in workflow
+    assert "qualification_number=7" in workflow
     assert "required_sha" in workflow
-    assert "verify_runtime_qualification.py" in workflow
+    assert "verify_product_contract_qualification.py" in workflow
+    assert "not-activated" in workflow
+    assert "capability_number=9" not in workflow
+    assert "qualification_number=40" not in workflow
+    assert not (root / ".github" / "workflows" / "aa-issue9-qualification-dispatch.yml").exists()
 
 
 def test_runtime_model_policy_has_no_third_fallback() -> None:
