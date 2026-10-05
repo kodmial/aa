@@ -39,28 +39,74 @@ jobs:
         with:
           github-token: ${{ github.token }}
           script: |
-            // Issue #6 campaign control: one owner `/run` on control issue #31
-            // starts a bounded manual-testing campaign (max 4 x 5h runtimes,
-            // 20h aggregate requested, unconditional 24h wall-clock expiry, no
-            // renewal or rollover). A repeated `/run` while a campaign is
-            // active is an idempotent no-op; a completed/expired/stopped
-            // campaign restarts only via a new owner `/run`. `/bot status`
-            // reports the authoritative run; `/bot stop` cancels it early and
-            // terminates the campaign. Comments carry ids/counters/durations
-            // only, never message text, prompts, corpus dumps or credentials.
+            // Issue #6 campaign control with issue #119 idempotent dispatch:
+            // one owner `/run` on control issue #31 starts a bounded
+            // manual-testing campaign (max 4 x 5h runtimes, 20h aggregate
+            // requested, unconditional 24h wall-clock expiry, no renewal or
+            // rollover). A repeated `/run` while a campaign is active is an
+            // idempotent no-op; a completed/expired/stopped campaign restarts
+            // only via a new owner `/run`. `/bot status` reports the
+            // authoritative run; `/bot stop` cancels it early and terminates
+            // the campaign. Comments carry ids/counters/durations only, never
+            // message text, prompts, corpus dumps or credentials.
+            //
+            // Shared state-transition implementation (mirrors
+            // src/aa/control/campaign.py for issue #119; the reconciler
+            // workflow uses the same functions verbatim):
+            // - the command is parsed from the immutable event payload;
+            // - pre-existing campaign resolution excludes the current event
+            //   comment id, so the initiating `/run` never self-matches as
+            //   "already active" (the 0/4 self-match defect);
+            // - re-delivery of the same event is idempotent via a durable
+            //   dispatch marker keyed by source comment id;
+            // - a marker is posted only after the dispatch API accepts the
+            //   run (failure-before-commit consumes no start); once committed
+            //   the start is consumed even if the runtime later fails;
+            // - effective starts = max(committed runs, committed markers),
+            //   so status while the initial dispatch is pending reports
+            //   start 1/4 (pending), never 0/4 active from self-match;
+            // - exactly one dispatch attempt per serialized execution; an
+            //   uncertain dispatch is never repaired with a second poller:
+            //   never queue a second poller and allow no overlapping pollers.
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const controlIssue = Number(process.env.CONTROL_ISSUE);
+            // Immutable event payload: the command text, comment id and
+            // comment timestamp come from the delivery payload, never from a
+            // re-read that could observe a later edit.
+            const payloadComment = context.payload.comment || null;
+            const currentCommentId = payloadComment && payloadComment.id
+              ? Number(payloadComment.id)
+              : null;
+            const payloadCreatedAt = payloadComment && payloadComment.created_at
+              ? Date.parse(payloadComment.created_at)
+              : NaN;
             const rawCommand = (
               context.eventName === 'workflow_dispatch'
                 ? process.env.DISPATCH_COMMAND
-                : context.payload.comment?.body
+                : payloadComment?.body
             || '').trim();
 
             const isRun = rawCommand === '/run';
             const isStop = rawCommand === '/bot stop';
             const isStatus = rawCommand === '/bot status';
             const looksLikeCommand = rawCommand.startsWith('/run') || rawCommand.startsWith('/bot');
+
+            // Defensive authentication: the job `if:` already requires the
+            // owner and exact control issue, but fail closed here as well.
+            if (context.eventName === 'issue_comment') {
+              const actor = context.actor || '';
+              const issueNumber = context.payload.issue?.number;
+              if (actor !== owner || issueNumber !== controlIssue) {
+                core.info('Not an authenticated owner command on the control issue; ignoring.');
+                return;
+              }
+              const commentAuthor = payloadComment?.user?.login || '';
+              if (commentAuthor && commentAuthor !== owner) {
+                core.info('Ignoring non-owner comment.');
+                return;
+              }
+            }
 
             const comment = async body => {
               if (context.eventName !== 'issue_comment') return;
@@ -90,6 +136,7 @@ jobs:
             const ACTIVE = ['queued', 'in_progress', 'waiting', 'requested', 'pending'];
             const DAY_MS = 24 * 3600 * 1000;
             const MAX_STARTS = 4;
+            const MARKER_KIND = 'aa-campaign-dispatch';
 
             const listAllComments = async () => {
               const comments = [];
@@ -112,16 +159,44 @@ jobs:
               return data.workflow_runs;
             };
 
-            // Re-read authoritative state immediately before deciding: owner
-            // /run epochs, owner /bot stop epochs, and committed runtime
-            // dispatches. A committed dispatch consumes one campaign start
-            // even when the run later fails or ends early.
-            const resolveCampaign = (comments, runs, nowMs) => {
-              const runTimes = comments
+            const formatMarker = (generation, seq, sourceCommentId) =>
+              `<!-- ${MARKER_KIND} generation=${generation} seq=${seq}` +
+              (sourceCommentId ? ` source-comment=${sourceCommentId}` : '') + ' -->';
+            const parseMarker = body => {
+              const m = /<!--\s*aa-campaign-dispatch\s+generation=(\S+)\s+seq=(\d+)(?:\s+source-comment=(\S+))?\s*-->/.exec(body || '');
+              if (!m) return null;
+              return { generation: m[1], seq: Number(m[2]), sourceComment: m[3] || null };
+            };
+            const markersForGeneration = (comments, generation) => {
+              const seqs = [];
+              for (const c of comments) {
+                const parsed = parseMarker(c.body || '');
+                if (parsed && parsed.generation === generation) seqs.push(parsed.seq);
+              }
+              return seqs.sort((a, b) => a - b);
+            };
+            const hasMarkerForSource = (comments, sourceId) => {
+              if (sourceId === null || sourceId === undefined) return false;
+              const wanted = String(sourceId);
+              return comments.some(c => {
+                const parsed = parseMarker(c.body || '');
+                return parsed !== null && parsed.sourceComment === wanted;
+              });
+            };
+            const generationForComment = commentId => `c${commentId}`;
+
+            // Shared resolver: re-read authoritative state immediately before
+            // deciding. Owner `/run` epochs exclude the current event comment
+            // id; owner `/bot stop` epochs, committed runs and committed
+            // markers form the durable counter. A committed dispatch consumes
+            // one start even when the run later fails or ends early.
+            const resolveCampaign = (comments, runs, nowMs, excludeId) => {
+              const runEntries = comments
                 .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/run')
-                .map(c => Date.parse(c.created_at))
-                .filter(t => Number.isFinite(t))
-                .sort((a, b) => a - b);
+                .filter(c => excludeId === null || excludeId === undefined || Number(c.id) !== Number(excludeId))
+                .map(c => ({ t: Date.parse(c.created_at), id: Number(c.id) }))
+                .filter(e => Number.isFinite(e.t))
+                .sort((a, b) => a.t - b.t);
               const stopTimes = comments
                 .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/bot stop')
                 .map(c => Date.parse(c.created_at))
@@ -130,14 +205,14 @@ jobs:
                 .map(r => Date.parse(r.created_at))
                 .filter(t => Number.isFinite(t));
               const sortedCreated = [...createdTimes].sort((a, b) => a - b);
-              for (let i = 0; i < runTimes.length; i++) {
-                const candidate = runTimes[i];
+              for (let i = 0; i < runEntries.length; i++) {
+                const candidate = runEntries[i].t;
                 if (stopTimes.some(s => s > candidate)) continue;
                 if (nowMs - candidate >= DAY_MS) continue;
                 if (sortedCreated.filter(t => t > candidate).length >= MAX_STARTS) continue;
                 let exhaustedBefore = false;
                 for (let j = 0; j < i; j++) {
-                  const prev = runTimes[j];
+                  const prev = runEntries[j].t;
                   const prevRuns = sortedCreated.filter(t => t > prev);
                   if (prevRuns.length >= MAX_STARTS && candidate <= prevRuns[MAX_STARTS - 1]) {
                     exhaustedBefore = true;
@@ -145,7 +220,7 @@ jobs:
                   }
                 }
                 if (exhaustedBefore) continue;
-                return candidate;
+                return { accepted: candidate, sourceCommentId: runEntries[i].id };
               }
               return null;
             };
@@ -155,15 +230,27 @@ jobs:
                 .filter(r => r.conclusion === null && ACTIVE.includes(r.status))
                 .sort((a, b) => a.id - b.id);
 
-            const describeCampaign = (accepted, runs, active, nowMs) => {
-              const startsUsed = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+            const effectiveStarts = (accepted, runs, comments, generation) => {
+              const runsAfter = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+              const markers = generation ? markersForGeneration(comments, generation).length : 0;
+              return Math.max(runsAfter, markers);
+            };
+
+            const describeCampaign = (accepted, generation, runs, active, comments, nowMs) => {
+              const startsUsed = effectiveStarts(accepted, runs, comments, generation);
+              const runsAfter = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+              const markers = generation ? markersForGeneration(comments, generation).length : 0;
+              const pending = markers > runsAfter;
               const expiresInH = Math.max(0, (accepted + DAY_MS - nowMs) / 3600000).toFixed(1);
               const runLines = active.length
                 ? active.map(r => `- #${r.id}: **${r.status}** — ${r.html_url}`).join('\n')
                 : '- none';
+              const pendingLine = pending
+                ? `\nDispatch pending: start ${startsUsed}/${MAX_STARTS} committed, runtime appearing.`
+                : '';
               return [
                 `Active campaign: started ${new Date(accepted).toISOString()}, expires in ~${expiresInH}h.`,
-                `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).`,
+                `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).${pendingLine}`,
                 `Active runtime:\n${runLines}`,
               ].join('\n');
             };
@@ -171,15 +258,16 @@ jobs:
             if (isStatus) {
               const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
               const active = activeRunsOf(runs);
-              const accepted = resolveCampaign(comments, runs, Date.now());
-              if (accepted === null) {
+              const resolved = resolveCampaign(comments, runs, Date.now(), null);
+              if (resolved === null) {
                 await comment(
                   'No active campaign. Post `/run` (owner only) to start one bounded 5h run ' +
                   '(max 4 starts / 20h requested / 24h wall clock).'
                 );
                 return;
               }
-              await comment(['AA campaign status (authoritative):', describeCampaign(accepted, runs, active, Date.now())].join('\n'));
+              const generation = generationForComment(resolved.sourceCommentId);
+              await comment(['AA campaign status (authoritative):', describeCampaign(resolved.accepted, generation, runs, active, comments, Date.now())].join('\n'));
               return;
             }
 
@@ -204,11 +292,27 @@ jobs:
             }
 
             // isRun: start one bounded campaign run (idempotent no-op when active).
+            // Re-read authoritative state immediately before deciding, exclude
+            // the current event comment id, and honor the durable marker so a
+            // re-delivered event never consumes another start.
             const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
             const active = activeRunsOf(runs);
-            const accepted = resolveCampaign(comments, runs, Date.now());
+            const nowMs = Date.now();
+            if (currentCommentId !== null && hasMarkerForSource(comments, currentCommentId)) {
+              const resolved = resolveCampaign(comments, runs, nowMs, currentCommentId);
+              const gen = resolved ? generationForComment(resolved.sourceCommentId) : null;
+              const startsUsed = resolved ? effectiveStarts(resolved.accepted, runs, comments, gen) : 0;
+              await comment(
+                `No-op: duplicate delivery of \`/run\` comment #${currentCommentId} is idempotent` +
+                (resolved ? ` (already active campaign, starts used ${startsUsed}/${MAX_STARTS}). ` : '. ') +
+                'Re-delivery never consumes another start; use `/bot status` or `/bot stop`.'
+              );
+              return;
+            }
+            const accepted = resolveCampaign(comments, runs, nowMs, currentCommentId);
             if (accepted !== null) {
-              const startsUsed = runs.filter(r => Date.parse(r.created_at) > accepted).length;
+              const generation = generationForComment(accepted.sourceCommentId);
+              const startsUsed = effectiveStarts(accepted.accepted, runs, comments, generation);
               await comment(
                 `No-op: a campaign is already active (starts used ${startsUsed}/${MAX_STARTS}). ` +
                 'Repeated `/run` never starts a second poller; use `/bot status` or `/bot stop`.'
@@ -224,20 +328,54 @@ jobs:
               return;
             }
 
+            // Fresh campaign: the new generation is anchored at the immutable
+            // event comment (id + payload timestamp), committed atomically
+            // with the single dispatch below. First accepted dispatch is
+            // start 1/4.
+            const generation = currentCommentId !== null
+              ? generationForComment(currentCommentId)
+              : `manual-${nowMs}`;
             const duration = '5h';
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration },
-            });
+            let dispatchAccepted = false;
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration },
+              });
+              dispatchAccepted = true;
+            } catch (error) {
+              // Failure-before-commit: no marker, no consumed start, no
+              // second poller to "repair" it. The reconciler may retry on a
+              // later tick after re-reading authoritative state.
+              await comment(
+                'Start failed: runtime dispatch was not accepted/committed, so no start was consumed ' +
+                `(generation ${generation}). Error: ${(error && error.message) || error}. ` +
+                'Post `/run` again or wait for the scheduled reconciler; duplicate dispatches are never queued.'
+              );
+              core.setFailed(`AA runtime dispatch not committed: ${(error && error.message) || error}`);
+              return;
+            }
 
+            // Failure-after-commit path: the dispatch above was accepted, so
+            // start 1/4 is consumed even if the runtime later fails. Post the
+            // durable marker exactly once; never dispatch a second runtime to
+            // repair an uncertain listing below.
+            const marker = formatMarker(generation, 1, currentCommentId);
             // Give GitHub a short moment to create the run so the operator
             // gets an authoritative run id in the control issue.
             await new Promise(resolve => setTimeout(resolve, 1500));
-            const latest = await github.rest.actions.listWorkflowRuns({
-              owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 10,
-            });
-            const run = latest.data.workflow_runs[0];
+            let run = null;
+            try {
+              const latest = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 10,
+              });
+              run = latest.data.workflow_runs[0] || null;
+            } catch (error) {
+              core.warning('Dispatch committed; run listing best-effort: ' + (error && error.message ? error.message : error));
+            }
             await comment(
-              run
-                ? `AA campaign run requested (**${duration}**, fixed 5h window after readiness). Run #${run.id}: ${run.html_url}\nBounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal.`
-                : `AA campaign run requested (**${duration}**, fixed 5h window after readiness).\nBounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal.`
+              (run
+                ? `AA campaign run requested (**${duration}**, fixed 5h window after readiness). Run #${run.id}: ${run.html_url}\n`
+                : `AA campaign run requested (**${duration}**, fixed 5h window after readiness).\n`) +
+              `Bounds: max 4 starts / 20h requested / 24h wall clock, no auto-renewal. Start 1/${MAX_STARTS} committed for generation ${generation}.\n` +
+              marker
             );
