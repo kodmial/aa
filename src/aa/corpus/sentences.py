@@ -56,6 +56,10 @@ def split_sentences_razdel(paragraph_text: str, base_offset: int) -> list[Senten
     if not raw:
         raise SentenceSegmentationError("sentence split produced no sentences")
     # Validate exact round-trip and whitespace-only gaps.
+    if paragraph_text[: raw[0][0]].strip():
+        raise SentenceSegmentationError("sentence split lost paragraph content")
+    if paragraph_text[raw[-1][1] :].strip():
+        raise SentenceSegmentationError("sentence split lost paragraph content")
     previous_stop: int | None = None
     for start, stop in raw:
         if start < 0 or stop <= start or stop > len(paragraph_text):
@@ -63,11 +67,11 @@ def split_sentences_razdel(paragraph_text: str, base_offset: int) -> list[Senten
         if paragraph_text[start:stop] == "":
             raise SentenceSegmentationError("razdel returned an empty span")
         if previous_stop is not None:
+            if start < previous_stop:
+                raise SentenceSegmentationError("sentence spans overlap")
             gap = paragraph_text[previous_stop:start]
             if gap.strip():
                 raise SentenceSegmentationError("sentence split lost paragraph content")
-            if start < previous_stop:
-                raise SentenceSegmentationError("sentence spans overlap")
         previous_stop = stop
     spans: list[SentenceSpan] = []
     for number, (start, stop) in enumerate(raw, start=1):

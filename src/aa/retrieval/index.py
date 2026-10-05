@@ -387,38 +387,10 @@ def _chunking_proof_from_structure(full_structure: dict[str, Any]) -> dict[str, 
         "chunk_max_tokens": full_structure.get("chunk_max_tokens"),
         "e5_hard_input_tokens": full_structure.get("e5_hard_input_tokens"),
     }
-    # Static pinned expectations for the #115 substrate (fail closed on drift).
-    try:
-        from aa.corpus.e5_tokens import (
-            CHILD_MAX_TOKENS as _default_max,
-        )
-        from aa.corpus.e5_tokens import (
-            CHUNKER_ID as _chunker,
-        )
-        from aa.corpus.e5_tokens import (
-            CHUNKER_VERSION as _chunker_version,
-        )
-        from aa.corpus.e5_tokens import (
-            E5_HARD_INPUT_TOKENS as _hard,
-        )
-        from aa.corpus.e5_tokens import (
-            TOKENIZER_ID as _tokenizer,
-        )
-        from aa.corpus.sentences import SEGMENTER_ID as _segmenter
-    except Exception:
-        return proof
-    if not proof.get("sentence_segmenter"):
-        proof["sentence_segmenter"] = _segmenter
-    if not proof.get("chunker"):
-        proof["chunker"] = _chunker
-    if proof.get("chunker_version") is None:
-        proof["chunker_version"] = _chunker_version
-    if not proof.get("tokenizer"):
-        proof["tokenizer"] = _tokenizer
-    if proof.get("chunk_max_tokens") is None:
-        proof["chunk_max_tokens"] = _default_max
-    if proof.get("e5_hard_input_tokens") is None:
-        proof["e5_hard_input_tokens"] = _hard
+    # Fail closed on missing proof: no pinned-default backfill here, so a
+    # structure without segmenter/chunker/tokenizer/chunk-limit provenance
+    # reaches the build_hybrid_index checks below and raises instead of
+    # building with claimed provenance.
     return proof
 
 
@@ -447,6 +419,14 @@ def build_hybrid_index(
         raise HybridIndexError("full structure must carry chunker/segmenter proof")
     if not proof.get("tokenizer"):
         raise HybridIndexError("full structure must carry tokenizer identity")
+    if (
+        proof.get("chunker_version") is None
+        or proof.get("chunk_max_tokens") is None
+        or proof.get("e5_hard_input_tokens") is None
+    ):
+        raise HybridIndexError("full structure must carry chunk-limit proof")
+    if not proof.get("chunk_policy"):
+        raise HybridIndexError("full structure must carry chunk-policy proof")
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
 

@@ -117,6 +117,8 @@ def load_fixture(path: str | Path) -> dict[str, Any]:
 def _spans_round_trip(paragraph: str, spans: list[tuple[int, int]]) -> bool:
     if not spans:
         return False
+    if paragraph[0 : spans[0][0]].strip():
+        return False
     previous_end: int | None = None
     for start, stop in spans:
         if start < 0 or stop <= start or stop > len(paragraph):
@@ -129,6 +131,8 @@ def _spans_round_trip(paragraph: str, spans: list[tuple[int, int]]) -> bool:
             if paragraph[previous_end:start].strip():
                 return False
         previous_end = stop
+    if previous_end is not None and paragraph[previous_end:].strip():
+        return False
     return True
 
 

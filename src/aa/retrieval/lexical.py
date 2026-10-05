@@ -100,7 +100,7 @@ def load_lexical_into_memory(db_path: str | Path) -> sqlite3.Connection:
         except sqlite3.Error as exc:
             target.close()
             raise LexicalError(f"lexical memory index is unreadable: {exc}") from exc
-        if count is None:
+        if count is None or int(count[0]) == 0:
             target.close()
             raise LexicalError("lexical memory index is empty")
         return target
