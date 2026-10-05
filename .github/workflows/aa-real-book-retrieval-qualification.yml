@@ -286,6 +286,29 @@ jobs:
               close_hybrid_index(index)
           PY
 
+      - name: Restore checkpoint from previous runner attempt
+        if: ${{ github.run_attempt > 1 }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-real-book-retrieval-summary
+          path: resume-input
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage resume checkpoint
+        if: ${{ github.run_attempt > 1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p eval-real-book-out
+          if [ -f resume-input/checkpoint.json ]; then
+            cp resume-input/checkpoint.json eval-real-book-out/checkpoint.json
+            echo "previous checkpoint staged"
+          else
+            echo "no previous checkpoint found"
+          fi
+
       - name: Execute frozen benchmark via real planner + production retrieval
         id: execute
         if: always()
