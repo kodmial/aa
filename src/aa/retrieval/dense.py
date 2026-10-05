@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,13 @@ DENSE_TOP_K = 40
 HASHING_DIM = 256
 HASHING_BACKEND_NAME = "hashing-char-token/1"
 E5_BACKEND_NAME = "intfloat-multilingual-e5-base/1"
+
+# Serializes shared dense-index search when retrieval runs in worker
+# threads via ``asyncio.to_thread``. The pure-Python scan is read-only,
+# but ``faiss.IndexFlatIP.search`` on the shared long-lived index has no
+# documented cross-thread guarantee, so concurrent turns take this lock
+# (mirroring the lexical FTS lock).
+_DENSE_SEARCH_LOCK = threading.Lock()
 
 # Per-snapshot loaded e5 (tokenizer, model) pairs. Ordinary turns reuse
 # the built index and these cached weights; nothing is reloaded per turn.
@@ -238,7 +246,10 @@ class ExactIPIndex:
         )
 
     def search(self, query: list[float], *, top_k: int) -> list[tuple[str, float]]:
-        """Return ``[(chunk_id, ip_score)]`` best-first (exact search)."""
+        """Return ``[(chunk_id, ip_score)]`` best-first (exact search).
+
+        Thread-safe for concurrent turns sharing one long-lived index.
+        """
         if top_k <= 0:
             raise DenseError("top_k must be > 0")
         if len(query) != self.dim:
@@ -250,15 +261,18 @@ class ExactIPIndex:
                 np_mod = importlib.import_module("numpy")
 
                 matrix = np_mod.array([query], dtype=np_mod.float32)
-                scores, indices = self._faiss_index.search(  # type: ignore[attr-defined]
-                    matrix, min(top_k, len(self.ids))
-                )
+                with _DENSE_SEARCH_LOCK:
+                    scores, indices = self._faiss_index.search(  # type: ignore[attr-defined]
+                        matrix, min(top_k, len(self.ids))
+                    )
                 out: list[tuple[str, float]] = []
                 for position, score in zip(indices[0].tolist(), scores[0].tolist(), strict=True):
                     if position < 0:
                         continue
                     out.append((self.ids[position], float(score)))
                 return out
+            except DenseError:
+                raise
             except Exception:
                 pass
         scored = [

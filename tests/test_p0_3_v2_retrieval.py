@@ -725,8 +725,16 @@ def test_reranker_cache_validated_and_reused(
     assert resolve_reranker_root(tmp_path / "hfcache").name.startswith("models--BAAI--")
     reset_reranker_cache()
     try:
-        first = get_reranker()
-        second = get_reranker()
+        import pytest as _pytest
+
+        from aa.retrieval.reranker import RerankerError
+
+        # Production is BGE-only: missing snapshot fails closed.
+        with _pytest.raises(RerankerError):
+            get_reranker()
+        # Explicit hermetic injection only: offline backend on demand.
+        first = get_reranker(allow_offline=True)
+        second = get_reranker(allow_offline=True)
         assert first is second
         assert first.model_id == RERANKER_MODEL_ID
         assert first.backend == OFFLINE_BACKEND_NAME

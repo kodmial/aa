@@ -101,7 +101,16 @@ async def retrieval_node(
     reranker: CrossEncoderReranker | None = None,
     config: RetrievalConfig | None = None,
 ) -> dict[str, Any]:
-    """LangGraph retrieval node: queries to hits plus Evidence Pack."""
+    """LangGraph retrieval node: queries to hits plus Evidence Pack.
+
+    Thread safety: concurrent turns share one long-lived ``index`` and
+    one long-lived ``reranker`` across ``asyncio.to_thread`` workers.
+    Shared access is internally serialized where the underlying
+    libraries offer no cross-thread guarantee: lexical FTS via its
+    connection lock, dense FAISS search via the dense search lock, and
+    FlagReranker scoring via the reranker score lock. No caller-side
+    locking is required.
+    """
     raw_queries = state.get("search_queries", [])
     queries = list(raw_queries) if isinstance(raw_queries, list) else []
     pack = await asyncio.to_thread(

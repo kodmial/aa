@@ -56,6 +56,14 @@ from aa.retrieval.reranker import CrossEncoderReranker
 V2_BENCHMARK_VERSION = "aa-v2-retrieval-benchmark/1"
 V2_EVAL_SET_VERSION = "aa-v2-conversational-eval/1"
 
+# Interactive Telegram budget for one warm retrieval turn (RRF plus
+# 64-candidate CPU BGE reranking). The frozen BGE validation records
+# ~20-22s p50/p95 per case, far above interactive expectations: cutover
+# requires explicit performance acceptance or optimization (smaller
+# reranker pool, quantized/GPU serving, or a documented higher budget)
+# before this gate can pass.
+V2_TARGET_P95_LATENCY_BUDGET_MS = 5000.0
+
 PROXY_QUERY_COUNT = 12
 BROAD_CATEGORIES = (
     "slang-drinking",
@@ -479,7 +487,8 @@ def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
 
     The gate mirrors the issue: no regression in the qualified recall
     gate, measurable reranker benefit over RRF-only, non-regressive
-    broad/colloquial/multi-turn cases, and zero hot-path disk reads
+    broad/colloquial/multi-turn cases, warm p95 latency within the
+    interactive Telegram budget, and zero hot-path disk reads
     (verified separately by the harness blocking filesystem access).
     Unsupported-case passage rates are measured and reported but carry
     no abstention gate: #116 defines no grounding abstention mechanism.
@@ -510,6 +519,14 @@ def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
         failures.append("broad/colloquial/multi-turn cases regressed vs baseline")
     if summary.duplicate_rate > 0.05:
         failures.append(f"duplicate rate {summary.duplicate_rate:.3f} exceeds 0.05")
+    if summary.p95_target_latency_ms > V2_TARGET_P95_LATENCY_BUDGET_MS:
+        failures.append(
+            f"warm p95 latency {summary.p95_target_latency_ms:.0f}ms exceeds "
+            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms "
+            "(per-turn RRF plus 64-candidate CPU BGE rerank); "
+            "explicit performance acceptance or optimization is required "
+            "before cutover"
+        )
     return (not failures, failures)
 
 
@@ -527,6 +544,7 @@ __all__ = [
     "PROXY_QUERY_COUNT",
     "V2_BENCHMARK_VERSION",
     "V2_EVAL_SET_VERSION",
+    "V2_TARGET_P95_LATENCY_BUDGET_MS",
     "V2CaseResult",
     "V2Summary",
     "duplicate_query_rate",

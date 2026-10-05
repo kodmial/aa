@@ -500,16 +500,19 @@ def select_passages_under_budget(
     passages: list[EvidencePassageData],
     *,
     budget_tokens: int = RETRIEVED_PASSAGES_BUDGET_TOKENS,
+    index: HybridIndex | None = None,
 ) -> tuple[list[EvidencePassageData], int]:
     """Select coherent passages atomically under the source-token budget.
 
     No passage is silently character-truncated: a passage either fits in
-    full or is skipped. Atomic fallback would require an index lookup to
-    map fallback text to the exact child id and char span; without it,
-    emitting a longest-line fragment with mismatched provenance would
-    corrupt the exact-text plus provenance contract. Callers that need
-    fewer passages must re-rank explicitly; this function never truncates
-    text.
+    full or is skipped in the first pass. When ``index`` is provided and
+    the first pass leaves no passage selected, or drops the top-ranked
+    passage while one of its constituent child chunks would fit, an
+    atomic single-child fallback is emitted: the highest-priority
+    fitting child chunks become one-child passages with exact text and
+    provenance taken from ``index``. Without ``index`` no fallback text
+    can be mapped to an exact child id and char span, so oversized
+    passages are skipped atomically instead of truncating.
     """
     if budget_tokens <= 0:
         raise EvidenceError("budget_tokens must be > 0")
@@ -521,10 +524,55 @@ def select_passages_under_budget(
             selected.append(passage)
             total += need
             continue
-        # Atomic fallback requires index lookup to map text to child id and
-        # char span; without it we must not emit mismatched provenance.
-        # Skip oversized passages atomically instead of truncating.
+        # Atomic: skip oversized passages instead of truncating.
         continue
+    if index is not None and passages:
+        covered = {cid for item in selected for cid in item.child_chunk_ids}
+        top = passages[0]
+        top_covered = any(cid in covered for cid in top.child_chunk_ids)
+        if not selected or not top_covered:
+            remaining = budget_tokens - total
+            seen: set[str] = set(covered)
+            fallbacks: list[EvidencePassageData] = []
+            for passage in passages:
+                for cid in passage.child_chunk_ids:
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    record = index.chunks.get(cid)
+                    if record is None:
+                        continue
+                    need = estimate_text_tokens(record.text)
+                    if need <= 0 or need > remaining:
+                        continue
+                    fallbacks.append(
+                        EvidencePassageData(
+                            passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
+                            exact_text=record.text,
+                            source_id=record.source_id,
+                            section_id=record.section,
+                            child_chunk_ids=(cid,),
+                            char_start=record.char_start,
+                            char_end=record.char_end,
+                            text_sha256=record.text_sha256,
+                            source_sha256=record.source_sha256,
+                        )
+                    )
+                    remaining -= need
+                    total += need
+                    if remaining <= 0:
+                        break
+                if remaining <= 0:
+                    break
+            if fallbacks:
+                if not selected:
+                    selected = fallbacks
+                elif not top_covered:
+                    # Keep rerank priority: top-winner atoms come first.
+                    top_ids = set(top.child_chunk_ids)
+                    head = [item for item in fallbacks if item.child_chunk_ids[0] in top_ids]
+                    tail = [item for item in fallbacks if item.child_chunk_ids[0] not in top_ids]
+                    selected = [*head, *selected, *tail]
     return selected, total
 
 
@@ -557,6 +605,10 @@ def retrieve_evidence(
     if not cleaned:
         return empty_evidence_pack(corpus_version=corpus_version)
     started = time.perf_counter()
+    # Resolve the long-lived reranker once per turn and reuse the same
+    # instance for scoring and metadata: a second get_reranker() call
+    # would repeat validation work on the hot path.
+    active_reranker = reranker if reranker is not None else get_reranker()
     ranked_lists, per_query_ids = run_branch_searches(
         index, cleaned, branch_top_k=active.branch_top_k
     )
@@ -577,13 +629,14 @@ def retrieve_evidence(
         index,
         diverse,
         reranker_query=cleaned[0],
-        reranker=reranker,
+        reranker=active_reranker,
         post_rerank_cap=active.post_rerank_child_cap,
     )
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
-    selected, total = select_passages_under_budget(expanded, budget_tokens=active.budget_tokens)
+    selected, total = select_passages_under_budget(
+        expanded, budget_tokens=active.budget_tokens, index=index
+    )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    active_reranker = reranker if reranker is not None else get_reranker()
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
         "reranker_query_digest": _short_digest(cleaned[0]),

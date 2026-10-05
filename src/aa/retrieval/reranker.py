@@ -18,12 +18,13 @@ library version. Every cache hit is validated before use; corrupt or
 stale cache is discarded and rebuilt. One long-lived reranker instance
 per worker scores candidates in batches.
 
-Offline/test backend: when the pinned snapshot or the ``FlagEmbedding``
-stack is unavailable (hermetic CI without weights), scoring falls back
-to a deterministic local relevance scorer over the same
-``(canonical_query, exact_child_text)`` pairs. The fallback is clearly
-labeled, performs no network access, never rewrites canonical text, and
-only changes ordering/selection, exactly like the production reranker.
+Offline/test backend: explicit test injection only. Construct
+``CrossEncoderReranker(lock, backend=OFFLINE_BACKEND_NAME)`` directly in
+tests or pass ``allow_offline=True`` to :func:`get_reranker` for hermetic
+CI without weights. Production (``allow_offline=False``) fails closed
+with :class:`RerankerError` when the pinned snapshot or the
+``FlagEmbedding`` stack is unavailable instead of silently serving
+heuristic ordering.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import logging
 import os
 import platform
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -505,7 +507,8 @@ class CrossEncoderReranker:
     def _score_flag(self, query: str, texts: list[str]) -> list[float]:
         pairs = [[query, text] for text in texts]
         try:
-            raw = self._flag_reranker.compute_score(pairs, normalize=True)
+            with _RERANKER_SCORE_LOCK:
+                raw = self._flag_reranker.compute_score(pairs, normalize=True)
         except Exception as exc:
             raise RerankerError(f"FlagEmbedding reranker scoring failed: {exc}") from exc
         if isinstance(raw, float):
@@ -518,39 +521,55 @@ class CrossEncoderReranker:
 
 _RERANKER_SINGLETONS: dict[str, CrossEncoderReranker] = {}
 
+# Zero hot-path disk-read contract: the validated lock is parsed once and
+# cached in process memory; warm turns reuse the singleton without
+# touching the filesystem.
+_RERANKER_LOCK_CACHE: dict[str, dict[str, Any]] = {}
+_RERANKER_INIT_LOCK = threading.Lock()
+_RERANKER_SCORE_LOCK = threading.Lock()
 
-def _try_load_flag_reranker(lock: dict[str, Any]) -> Any | None:
+
+def _load_cached_lock(resolved: Path) -> dict[str, Any]:
+    """Return the validated lock, reading disk only on the first miss."""
+    key = str(resolved)
+    cached = _RERANKER_LOCK_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    lock = load_reranker_lock(resolved)
+    _RERANKER_LOCK_CACHE[key] = dict(lock)
+    return dict(lock)
+
+
+def _load_flag_reranker(lock: dict[str, Any]) -> Any:
     """Load the FlagEmbedding reranker from the validated local cache.
 
-    Returns None when the stack or the pinned snapshot is unavailable;
-    the caller keeps the deterministic offline backend instead of
-    touching the network. Never downloads on the hot path.
+    Fails closed with :class:`RerankerError` when the stack or the pinned
+    snapshot is unavailable; the caller must not silently serve heuristic
+    ordering in production. Never downloads on the hot path.
     """
     try:
         import importlib
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RerankerError(f"FlagEmbedding stack is unavailable: {exc}") from exc
     try:
         flag_module = importlib.import_module("FlagEmbedding")
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RerankerError(f"FlagEmbedding stack is unavailable: {exc}") from exc
     flag_cls = getattr(flag_module, "FlagReranker", None)
     if flag_cls is None:
-        return None
+        raise RerankerError("FlagEmbedding.FlagReranker interface is unavailable")
     previous = os.environ.get("HF_HUB_OFFLINE")
     os.environ["HF_HUB_OFFLINE"] = "1"
     try:
         model_root = resolve_reranker_root(resolve_hf_cache_dir())
         if not verify_cached_reranker(model_root, lock):
-            return None
+            raise RerankerError("pinned BGE snapshot is not cached locally; refusing network fetch")
         snapshot = snapshot_dir(model_root, str(lock.get("revision")))
         try:
             # Maintained FlagEmbedding reranker interface, CPU, local only.
             return flag_cls(str(snapshot), use_fp16=False, device="cpu")
         except Exception as exc:
-            logger.warning("flag reranker load failed, keeping offline backend")
-            _ = exc
-            return None
+            raise RerankerError(f"FlagEmbedding reranker load failed: {exc}") from exc
     finally:
         if previous is None:
             os.environ.pop("HF_HUB_OFFLINE", None)
@@ -558,33 +577,68 @@ def _try_load_flag_reranker(lock: dict[str, Any]) -> Any | None:
             os.environ["HF_HUB_OFFLINE"] = previous
 
 
-def get_reranker(lock_path: str | Path | None = None) -> CrossEncoderReranker:
+def _try_load_flag_reranker(lock: dict[str, Any]) -> Any | None:
+    """Best-effort flag load returning None (explicit offline paths only)."""
+    try:
+        return _load_flag_reranker(lock)
+    except RerankerError:
+        return None
+
+
+def get_reranker(
+    lock_path: str | Path | None = None, *, allow_offline: bool = False
+) -> CrossEncoderReranker:
     """Return the long-lived worker reranker for the pinned lock.
 
     Loads once per lock revision; every later turn reuses the instance
-    and performs zero model downloads and zero network access.
+    and performs zero model downloads, zero network access and zero
+    lock-file disk reads on the warm path (the validated lock is cached
+    in process memory and the singleton is checked under a lock).
+
+    Production (``allow_offline=False``) is BGE-only and fails closed
+    with :class:`RerankerError` when the pinned snapshot or the
+    ``FlagEmbedding`` stack is unavailable. Pass
+    ``allow_offline=True`` only for explicit hermetic test injection
+    where the deterministic stem-overlap backend is wanted.
     """
     resolved = Path(lock_path) if lock_path is not None else default_reranker_lock_path()
-    lock = load_reranker_lock(resolved)
-    key = f"{lock.get('model_id')}@{lock.get('revision')}"
-    cached = _RERANKER_SINGLETONS.get(key)
-    if cached is not None:
-        return cached
-    flag_reranker = _try_load_flag_reranker(lock)
-    if flag_reranker is not None:
-        instance = CrossEncoderReranker(
-            lock=lock, backend=FLAG_BACKEND_NAME, _flag_reranker=flag_reranker
-        )
-    else:
-        instance = CrossEncoderReranker(lock=lock, backend=OFFLINE_BACKEND_NAME)
-    _RERANKER_SINGLETONS[key] = instance
+    cache_key = str(resolved)
+    with _RERANKER_INIT_LOCK:
+        cached_lock = _RERANKER_LOCK_CACHE.get(cache_key)
+        if cached_lock is not None:
+            key = f"{cached_lock.get('model_id')}@{cached_lock.get('revision')}"
+            cached = _RERANKER_SINGLETONS.get(key)
+            if cached is not None:
+                return cached
+            lock = dict(cached_lock)
+        else:
+            lock = load_reranker_lock(resolved)
+            _RERANKER_LOCK_CACHE[cache_key] = dict(lock)
+            key = f"{lock.get('model_id')}@{lock.get('revision')}"
+            cached = _RERANKER_SINGLETONS.get(key)
+            if cached is not None:
+                return cached
+        try:
+            flag_reranker = _load_flag_reranker(lock)
+        except RerankerError:
+            if not allow_offline:
+                raise
+            flag_reranker = None
+        if flag_reranker is not None:
+            instance = CrossEncoderReranker(
+                lock=lock, backend=FLAG_BACKEND_NAME, _flag_reranker=flag_reranker
+            )
+        else:
+            instance = CrossEncoderReranker(lock=lock, backend=OFFLINE_BACKEND_NAME)
+        _RERANKER_SINGLETONS[key] = instance
     logger.info("reranker ready backend=%s model=%s", instance.backend, key)
     return instance
 
 
 def reset_reranker_cache() -> None:
-    """Drop cached reranker singletons (tests only)."""
+    """Drop cached reranker singletons and the cached lock (tests only)."""
     _RERANKER_SINGLETONS.clear()
+    _RERANKER_LOCK_CACHE.clear()
 
 
 __all__ = [
