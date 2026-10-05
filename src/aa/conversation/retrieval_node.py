@@ -156,7 +156,18 @@ async def retrieval_node(
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
-        queries = [q.strip() for q in raw_queries if isinstance(q, str) and q.strip()]
+        queries: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_queries:
+            if not isinstance(raw, str):
+                continue
+            cleaned = " ".join(raw.split())
+            if not cleaned or cleaned.casefold() in seen:
+                continue
+            seen.add(cleaned.casefold())
+            queries.append(cleaned)
+            if len(queries) >= 16:
+                break
     else:
         queries = []
     if not queries:
@@ -241,7 +252,7 @@ def make_retrieval_node(
         "v2 retrieval wired with explicit performance acceptance",
         extra={
             "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
-            "expected_warm_p95_ms": 22472,
+            "frozen_full_quality_warm_p95_ms": 22472,
             "reranker_pool_cap": active_config.reranker_pool_cap,
             "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
         },

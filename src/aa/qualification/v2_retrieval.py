@@ -403,7 +403,7 @@ def run_v2_case(
             if (record := index.chunks.get(chunk.chunk_id)) is not None
         )
     )
-    pool_hit = _recall_at(pool_sections, case, len(pool_sections))
+    pool_hit = _recall_at(pool_sections, case, 10)
     pack_hit = target_r10
     unsupported_clean = (not target_pack.passages) if case.is_unsupported else True
     return V2CaseResult(
