@@ -18,10 +18,12 @@ search previews) stays in internal retrieval metadata and never enters
 the user-facing prompt. Logs carry only routes, counts and token
 lengths, never prompts or user text.
 
-Performance note: the pinned BGE path records ~20-22s warm latency per
-turn (per-turn RRF plus 64-candidate CPU rerank) against the 5s
-interactive budget, so production cutover stays blocked until explicit
-performance acceptance or optimization (see
+Performance note: the frozen full-quality BGE validation records
+~20-22s warm latency (per-turn RRF plus 64-candidate CPU rerank) against
+the 5s interactive budget. Ordinary turns therefore default to the
+optimized interactive pool (16 candidates, ~4x fewer CPU BGE forwards)
+and reject the 64-candidate path without explicit performance
+acceptance, so a warm turn never silently pays the frozen cost (see
 ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``).
 Binding the node via :func:`make_retrieval_node` therefore requires
 ``performance_accepted=True`` and fails closed otherwise, so a slow

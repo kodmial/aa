@@ -384,7 +384,7 @@ def test_small_pool_preserves_global_rrf_depth() -> None:
     assert len(pool_ids) == 4
     assert "g1" in pool_ids
     assert "g2" in pool_ids
-    _, full_pool_ids = fuse_query_pool(ranked_lists, per_query_ids)
+    _, full_pool_ids = fuse_query_pool(ranked_lists, per_query_ids, pool_cap=RERANKER_POOL_CAP)
     for chunk_id in ("u0", "u1", "u2", "u3", "g1", "g2", "g3", "g4"):
         assert chunk_id in full_pool_ids
 
@@ -406,8 +406,8 @@ def test_reranker_ordering_is_honored(tmp_path: pathlib.Path) -> None:
     try:
         queries = _twelve_queries("молитва утром")
         ranked, per_query = run_branch_searches(index, queries)
-        fused, pool_ids = fuse_query_pool(ranked, per_query)
-        diverse = dedup_and_diversify(index, pool_ids, fused)
+        fused, pool_ids = fuse_query_pool(ranked, per_query, pool_cap=RERANKER_POOL_CAP)
+        diverse = dedup_and_diversify(index, pool_ids, fused, pool_cap=RERANKER_POOL_CAP)
         assert len(diverse) >= 2
         # Reverse the fused order deterministically through stub scores.
         scored = sorted(diverse, key=lambda item: item.fused_score, reverse=True)
@@ -417,13 +417,18 @@ def test_reranker_ordering_is_honored(tmp_path: pathlib.Path) -> None:
         expected = list(reversed(scored))[:POST_RERANK_CHILD_CAP]
         assert [item.chunk_id for item in winners] == [item.chunk_id for item in expected]
         # End to end: the top-scored chunk lands in the first passage.
+        # Pin the frozen full-quality pool so the full-depth ordering check
+        # is unaffected by the interactive 16-cap library default.
         favor_last = _RecordingReranker(
             _reranker_lock(), scores=[float(pos) for pos in range(len(scored))]
         )
         pack = retrieve_evidence(
             index,
             queries,
-            config=RetrievalConfig(post_rerank_child_cap=len(scored)),
+            config=RetrievalConfig(
+                reranker_pool_cap=RERANKER_POOL_CAP,
+                post_rerank_child_cap=len(scored),
+            ),
             reranker=favor_last,
         )
         first = pack.passages[0]
