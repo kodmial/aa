@@ -50,6 +50,7 @@ from aa.corpus.public_cache import (  # noqa: E402
     resolve_model_root,
     verify_cached_model,
 )
+from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
 from aa.qualification.real_book_retrieval import (  # noqa: E402
     BENCHMARK_INPUT_REL,
     BENCHMARK_ORACLE_REL,
@@ -71,7 +72,6 @@ from aa.qualification.real_book_retrieval import (  # noqa: E402
     summarize_public,
     validate_exact_sha,
 )
-from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
 from aa.retrieval.evidence import RetrievalConfig  # noqa: E402
 from aa.retrieval.index import open_hybrid_index  # noqa: E402
 
