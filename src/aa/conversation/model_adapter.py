@@ -43,6 +43,7 @@ VERIFIER_AGENT_V2 = "aa-verifier-v2"
 RUNTIME_AGENT_V2 = "aa-runtime-v2"
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
+MODEL_ACCESS_RETRY_DELAYS = (5.0, 10.0, 20.0)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -223,18 +224,27 @@ class OpenCodeChatModel(BaseChatModel):
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
         last_transient: BaseException | None = None
-        for attempt in range(len(MODEL_TRANSIENT_RETRY_DELAYS) + 1):
+        access_attempt = 0
+        transient_attempt = 0
+        while True:
             try:
                 return await self._invoke_ephemeral(
                     prompt, model=self.primary_model, agent=self.agent, system=system
                 )
-            except OpenCodeProviderAccessError:
-                # 403/access rejection is not retried on the same model.
+            except OpenCodeProviderAccessError as exc:
+                last_transient = exc
+                if access_attempt < len(MODEL_ACCESS_RETRY_DELAYS):
+                    delay = MODEL_ACCESS_RETRY_DELAYS[access_attempt]
+                    access_attempt += 1
+                    logger.info("opencode primary 403 retry scheduled")
+                    await asyncio.sleep(delay)
+                    continue
                 break
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
-                if attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
-                    delay = MODEL_TRANSIENT_RETRY_DELAYS[attempt]
+                if transient_attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
+                    delay = MODEL_TRANSIENT_RETRY_DELAYS[transient_attempt]
+                    transient_attempt += 1
                     logger.info("opencode primary transient retry scheduled")
                     await asyncio.sleep(delay)
                     continue
@@ -265,7 +275,9 @@ class OpenCodeChatModel(BaseChatModel):
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
         last_transient: BaseException | None = None
-        for attempt in range(len(MODEL_TRANSIENT_RETRY_DELAYS) + 1):
+        access_attempt = 0
+        transient_attempt = 0
+        while True:
             try:
                 return await self._invoke_ephemeral_structured(
                     prompt,
@@ -275,13 +287,20 @@ class OpenCodeChatModel(BaseChatModel):
                     agent=self.agent,
                     retry_count=retry_count,
                 )
-            except OpenCodeProviderAccessError:
-                # 403/access rejection is not retried on the same model.
+            except OpenCodeProviderAccessError as exc:
+                last_transient = exc
+                if access_attempt < len(MODEL_ACCESS_RETRY_DELAYS):
+                    delay = MODEL_ACCESS_RETRY_DELAYS[access_attempt]
+                    access_attempt += 1
+                    logger.info("opencode primary 403 retry scheduled")
+                    await asyncio.sleep(delay)
+                    continue
                 break
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
-                if attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
-                    delay = MODEL_TRANSIENT_RETRY_DELAYS[attempt]
+                if transient_attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
+                    delay = MODEL_TRANSIENT_RETRY_DELAYS[transient_attempt]
+                    transient_attempt += 1
                     logger.info("opencode primary transient retry scheduled")
                     await asyncio.sleep(delay)
                     continue
