@@ -386,7 +386,10 @@ def verify_rubric_bound(repo_root: Path | None = None) -> str:
     sha_path = root / RUBRIC_SHA_REL
     if not sha_path.exists():
         raise ProductContractVNextError("rubric checksum sidecar is missing; refusing to proceed")
-    expected = sha_path.read_text(encoding="utf-8").strip().split()[0]
+    parts = sha_path.read_text(encoding="utf-8").strip().split()
+    if not parts:
+        raise ProductContractVNextError("rubric checksum sidecar is missing content")
+    expected = parts[0]
     if not _HEX64_RE.fullmatch(expected):
         raise ProductContractVNextError("rubric checksum sidecar is malformed")
     actual = sha256_file(root / RUBRIC_REL)
@@ -506,7 +509,7 @@ def _check_oracle_semantics(record: dict[str, Any], owner: str) -> None:
                 f"{owner}: provenance must be a proper subset, never a verbatim region copy"
             )
     else:
-        if prov and set(prov) - set(regions) and regions:
+        if set(prov) - set(regions):
             raise ProductContractVNextError(f"{owner}: provenance must subset canonical regions")
     if content == "product_meta":
         if book != "forbidden":

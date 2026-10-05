@@ -16,9 +16,9 @@
   },
   "sha256": {
     "input": "30b2b0f222ca31b9c33a93f14e618bbee6eced7345cb128c94e9bc6559171649",
-    "oracle": "8279fbd70b23e629e64f80a1b975fbbcee2bf54c638a88dae62abf9f0bd6e243",
+    "oracle": "a010aaa7134cd451029dd65c12abc2e74ea52f6c2322e763946450953cf5be8b",
     "sources": "d594ac158817ceb45138984191a18718d67f90b677f8741ae4001eacdaa0e575",
-    "rubric": "8427507d20d76f52eba538c916dfbc15a657b4cd1b0169decab86033848e516b"
+    "rubric": "01fd156de6ed331de2114901150176f64c0ada0915538e82a2c42c174aa9fbd5"
   },
   "counts": {
     "single_turn": 40,
@@ -76,10 +76,10 @@
   "benchmark_tuple": {
     "benchmark_version": "ru_product_contract.v1_2",
     "input_sha256": "30b2b0f222ca31b9c33a93f14e618bbee6eced7345cb128c94e9bc6559171649",
-    "oracle_sha256": "8279fbd70b23e629e64f80a1b975fbbcee2bf54c638a88dae62abf9f0bd6e243",
+    "oracle_sha256": "a010aaa7134cd451029dd65c12abc2e74ea52f6c2322e763946450953cf5be8b",
     "sources_sha256": "d594ac158817ceb45138984191a18718d67f90b677f8741ae4001eacdaa0e575",
     "rubric_version": "ru-answer-quality-rubric-v2",
-    "rubric_sha256": "8427507d20d76f52eba538c916dfbc15a657b4cd1b0169decab86033848e516b"
+    "rubric_sha256": "01fd156de6ed331de2114901150176f64c0ada0915538e82a2c42c174aa9fbd5"
   },
   "history": {
     "preserved": [
