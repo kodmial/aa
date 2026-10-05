@@ -39,6 +39,7 @@ logger = logging.getLogger("aa.conversation.model_adapter")
 PLANNER_AGENT_V2 = "aa-planner-v2"
 SUMMARIZER_AGENT_V2 = "aa-summarizer-v2"
 ANSWER_AGENT_V2 = "aa-v2"
+VERIFIER_AGENT_V2 = "aa-verifier-v2"
 RUNTIME_AGENT_V2 = "aa-runtime-v2"
 STRUCTURED_RETRY_COUNT = 2
 
@@ -305,6 +306,7 @@ __all__ = [
     "RUNTIME_AGENT_V2",
     "STRUCTURED_RETRY_COUNT",
     "SUMMARIZER_AGENT_V2",
+    "VERIFIER_AGENT_V2",
     "OpenCodeChatModel",
     "render_messages_text",
     "split_system_and_user",
