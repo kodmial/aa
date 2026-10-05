@@ -11,6 +11,7 @@ from aa import __version__
 from aa.app import create_application
 from aa.config import Settings
 from aa.logging import configure_logging
+from aa.opencode.errors import OpenCodeRateLimitError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,7 +79,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    return asyncio.run(_run_worker(settings))
+    try:
+        return asyncio.run(_run_worker(settings))
+    except OpenCodeRateLimitError:
+        print("OpenCode 429: runner restart required", file=sys.stderr)
+        return 75
 
 
 if __name__ == "__main__":
