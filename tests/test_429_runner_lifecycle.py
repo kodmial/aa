@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import aa.__main__ as main_mod
+from aa.config import Settings
 from aa.conversation.orchestrator import send_with_fallback
 from aa.opencode.errors import (
     OpenCodeRateLimitError,
@@ -74,7 +75,7 @@ def test_cli_maps_rate_limit_to_runner_restart_exit_code(
     async def _boom(_settings: object) -> int:
         raise OpenCodeRateLimitError("http=429")
 
-    monkeypatch.setattr(main_mod.Settings, "from_env", lambda: _Settings())
+    monkeypatch.setattr(Settings, "from_env", lambda: _Settings())
     monkeypatch.setattr(main_mod, "configure_logging", lambda _level: None)
     monkeypatch.setattr(main_mod, "_run_worker", _boom)
 
