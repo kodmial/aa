@@ -1,0 +1,132 @@
+name: AA Product Contract qualification dispatch
+
+# Validation-only exact-main gate for Product Contract #110 / Product
+# Implementation #112. #121 may merge before the Telegram cutover #118;
+# until the production boundary is actually cut over this workflow succeeds
+# as "not activated" and never dispatches authoritative qualification #7.
+#
+# Once #118 is on main, any product-affecting push reruns this gate against
+# the exact current main SHA and dispatches #7 only when the v2 production
+# fingerprint is ready.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/aa/conversation/**"
+      - "src/aa/retrieval/**"
+      - "src/aa/grounding/**"
+      - "src/aa/corpus/**"
+      - "src/aa/safety/**"
+      - "src/aa/sessions/**"
+      - "src/aa/telegram/**"
+      - "src/aa/qualification/**"
+      - "src/aa/control/**"
+      - "src/aa/app.py"
+      - "src/aa/config.py"
+      - "prompts/aa-*-v2.md"
+      - "opencode.json"
+      - "qualification/ru_product_contract.v1_2.*"
+      - "scripts/verify_product_contract_qualification.py"
+      - ".github/workflows/aa-product-contract-qualification-dispatch.yml"
+  workflow_dispatch:
+    inputs:
+      required_sha:
+        description: "Exact current main SHA to qualify (defaults to current main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: aa-product-contract-qualification-dispatch
+  cancel-in-progress: true
+
+jobs:
+  qualify-current-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout requested SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.required_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact current main identity
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          checked_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main --depth=1
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$checked_sha" != "$current_main" ]]; then
+            echo "::error::Refusing stale qualification: checked=$checked_sha current-main=$current_main"
+            exit 1
+          fi
+          echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
+          echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Evaluate Product Contract qualification readiness
+        id: readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$(python scripts/verify_product_contract_qualification.py)"
+          status="$(python -c 'import json,sys; print(json.loads(sys.argv[1])["status"])' "$payload")"
+          if [[ "$status" != "ready" && "$status" != "not-activated" ]]; then
+            echo "::error::Unexpected readiness status: $status"
+            exit 1
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "$payload" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep authoritative qualification dormant before cutover
+        if: steps.readiness.outputs.status == 'not-activated'
+        shell: bash
+        run: |
+          echo "Product Contract #7 is not activated: #118 production cutover is not yet present on exact main." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dispatch authoritative exact-main qualification #7
+        if: steps.readiness.outputs.status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_SHA: ${{ steps.sha.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run continuum-opencode.yml \
+            --ref main \
+            -f mode=qualification \
+            -f capability_number=6 \
+            -f qualification_number=7 \
+            -f required_sha="$REQUIRED_SHA"
+          echo "dispatched Product Contract qualification #7 at $REQUIRED_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record dispatch on qualification tracker
+        if: steps.readiness.outputs.status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_SHA: ${{ steps.sha.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh issue comment 7 --body "Product Contract qualification dispatched automatically for exact current main \`$REQUIRED_SHA\` (capability #6, qualification #7). The qualification tracker remains validation-only; PASS is valid only for this exact SHA."
