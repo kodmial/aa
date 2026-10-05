@@ -226,6 +226,15 @@ class TelegramTransport(ABC):
         """Deliver one OGG/Opus voice reply via ``sendVoice``."""
         raise NotImplementedError
 
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Send one ``sendChatAction`` event (typing heartbeat).
+
+        The base implementation is a no-op so offline/test transports stay
+        usable; the polling transport overrides it with a real Bot API call.
+        Only counts are logged, never message bodies.
+        """
+        _ = (chat_id, action)
+
     @property
     @abstractmethod
     def running(self) -> bool:
@@ -240,6 +249,7 @@ class StubTelegramTransport(TelegramTransport):
         self._running = False
         self.sent: list[TelegramReply] = []
         self.sent_voices: list[TelegramVoiceReply] = []
+        self.chat_actions: list[tuple[int, str]] = []
 
     async def start(self) -> None:
         self._running = True
@@ -250,6 +260,10 @@ class StubTelegramTransport(TelegramTransport):
     async def send(self, reply: TelegramReply) -> None:
         _check_outbound_envelope(reply.text)
         self.sent.append(reply)
+
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Record one typing heartbeat event (no network I/O)."""
+        self.chat_actions.append((chat_id, action))
 
     async def send_voice(self, reply: TelegramVoiceReply) -> None:
         if not reply.voice_bytes:
@@ -619,6 +633,22 @@ class PollingTelegramTransport(TelegramTransport):
             "telegram voice message sent",
             extra={"chat_id": reply.chat_id, "byte_len": len(payload_bytes)},
         )
+
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Send one ``sendChatAction`` typing event (heartbeat, no retry).
+
+        Heartbeat delivery is best-effort: a transient failure is logged
+        by category only and never fails the turn. Only counts are
+        logged, never message bodies.
+        """
+        payload: dict[str, Any] = {"chat_id": chat_id, "action": action}
+        try:
+            await self._api.call("sendChatAction", payload)
+        except TelegramAuthError:
+            raise
+        except (TelegramApiError, TimeoutError, OSError):
+            logger.info("telegram chat action failed")
+        self._chat_action_count = getattr(self, "_chat_action_count", 0) + 1
 
     async def fetch_voice_bytes(self, file_id: str) -> bytes:
         """Download one voice file through the existing transport.
