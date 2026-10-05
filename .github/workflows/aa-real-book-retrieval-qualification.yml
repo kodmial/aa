@@ -272,14 +272,10 @@ jobs:
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_EVAL_RECIPIENT: "age1cps60qh3crgt75lcul4ky2pn4nlqfle6m4mudfngwr3p22ycm3zsvg8ns8"
           OPENCODE_BASE_URL: "http://127.0.0.1:4096"
         run: |
           set -euo pipefail
-          # The age recipient is public configuration and is already committed
-          # for the canonical encrypted snapshot. Reuse it here so this trusted
-          # qualification has no second secret/configuration dependency.
-          AA_EVAL_RECIPIENT="$(tr -d '\r\n' < corpus/source/encrypted/recipient.txt)"
-          export AA_EVAL_RECIPIENT
           # The real mandatory planner runs through the same OpenCode
           # structured-output adapter/profile used by production
           # (aa-planner-v2 + json_schema). Missing E5/planner/provider
@@ -294,181 +290,14 @@ jobs:
           # emits result.json (INCOMPLETE when prerequisites are missing) so
           # the #130 marker below is always published.
           mkdir -p eval-real-book-out
-          case "$AA_EVAL_RECIPIENT" in
-            age1*) ;;
-            *)
-              python3 - <<'PY'
-          import json
-          import os
-          out = "eval-real-book-out/result.json"
-          payload = {"result": "INCOMPLETE", "reason": "committed age recipient is missing or invalid", "main_sha": os.environ.get("EXACT_SHA", "")}
-          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
-          print("committed age recipient invalid; qualification yields INCOMPLETE, never PASS", flush=True)
-          PY
-              echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"
-              cat eval-real-book-out/result.json
-              exit 0
-              ;;
-          esac
-          set +e
-          python3 scripts/run_real_book_retrieval_qualification.py \
-            --main-sha "$EXACT_SHA" \
-            --out-dir eval-real-book-out \
-            --recipient "$AA_EVAL_RECIPIENT"
-          status=$?
-          set -e
-          echo "qualification exit status: $status"
-          if [ ! -f eval-real-book-out/result.json ]; then
+          if [ -z "${AA_EVAL_RECIPIENT:-}" ]; then
             python3 - <<'PY'
           import json
           import os
           out = "eval-real-book-out/result.json"
-          payload = {"result": "INCOMPLETE", "reason": "runner produced no result.json", "main_sha": os.environ.get("EXACT_SHA", "")}
+          payload = {"result": "INCOMPLETE", "reason": "AA_EVAL_AGE_RECIPIENT is not configured", "main_sha": os.environ.get("EXACT_SHA", "")}
           open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
-          print("runner produced no result.json; synthesized deterministic INCOMPLETE", flush=True)
-          PY
-            status=2
-          fi
-          cat eval-real-book-out/result.json
-          if [ "$status" -eq 0 ]; then echo "result=PASS" >> "$GITHUB_OUTPUT"; fi
-          if [ "$status" -eq 1 ]; then echo "result=FAIL" >> "$GITHUB_OUTPUT"; fi
-          if [ "$status" -eq 2 ]; then echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"; fi
-          if [ "$status" -eq 3 ]; then echo "result=STALE" >> "$GITHUB_OUTPUT"; fi
-          if [ -z "${{ steps.execute.outputs.result }}" ]; then :; fi
-          # Never fail the job itself on FAIL/INCOMPLETE/STALE: the result is
-          # published deterministically as the marker below.
-          exit 0
-
-      - name: Revalidate exact SHA after run
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXACT_SHA"
-          echo "exact SHA still pinned after run: $(git rev-parse HEAD)"
-
-      - name: Guard encrypted-only upload (never plaintext book text)
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          # On deterministic INCOMPLETE the protected bundle/summary may be
-          # absent; only result.json is mandatory for the #130 marker.
-          test -f eval-real-book-out/result.json
-          if python3 -c "import json; assert json.load(open('eval-real-book-out/result.json'))['result'] == 'INCOMPLETE'"; then
-            echo "INCOMPLETE run: protected bundle/summary may be absent; marker still published"
-          else
-            test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age
-            test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
-            test -f eval-real-book-out/real-book-retrieval-summary.json
-          fi
-          # Plaintext corpus/index must never be staged for upload.
-          if ls eval-real-book-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null; then
-            echo "protected exact text outside the encrypted bundle" >&2
-            exit 1
-          fi
-          if grep -R "AA_BOOK_AGE_IDENTITY" eval-real-book-out/ 2>/dev/null; then
-            echo "secret material in outputs" >&2
-            exit 1
-          fi
-          echo "encrypted-only upload guard passed"
-
-      - name: Upload encrypted protected artifact (source text stays encrypted)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: aa-real-book-retrieval-protected-encrypted
-          path: |
-            eval-real-book-out/real-book-retrieval-protected.tar.zst.age
-            eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload compact public summary (metrics only, no book text)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: aa-real-book-retrieval-summary
-          path: |
-            eval-real-book-out/real-book-retrieval-summary.json
-            eval-real-book-out/result.json
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Publish idempotent #130 result marker (SHA + corpus + benchmark + retrieval)
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const fs = require('fs');
-            const testedSha = '${{ needs.resolve.outputs.exact_sha }}';
-            const runId = `${context.runId}`;
-            let status = {};
-            try {
-              status = JSON.parse(fs.readFileSync('eval-real-book-out/result.json', 'utf8'));
-            } catch (error) {
-              core.setFailed(`result file unreadable: ${error.message}`);
-              return;
-            }
-            const result = status.result || 'INCOMPLETE';
-            if (!['PASS', 'FAIL', 'INCOMPLETE', 'STALE'].includes(result)) {
-              core.setFailed(`invalid deterministic result: ${result}`);
-              return;
-            }
-            // Revalidate main at publication: a moved main yields STALE.
-            const { data: mainRef } = await github.rest.git.getRef({
-              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
-            });
-            const currentMain = (mainRef.object.sha || '').trim();
-            let finalResult = result;
-            if (currentMain !== testedSha) finalResult = 'STALE';
-            const corpus = status.corpus_sha256 || '0'.repeat(64);
-            const benchmark = status.benchmark_sha256 || '0'.repeat(64);
-            const retrieval = status.retrieval_config_sha256 || '0'.repeat(64);
-            const markerRe = /aa-real-book-retrieval-result\s+issue=130\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+benchmark=([0-9a-f]{64})\s+retrieval=([0-9a-f]{64})\s+result=(PASS|FAIL|INCOMPLETE|STALE)\s+run=(\S+?)\s*-->/;
-            let duplicate = false;
-            for await (const { data: comments } of github.paginate.iterator(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 130, per_page: 100 },
-            )) {
-              for (const c of comments) {
-                const assoc = c.author_association || '';
-                const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
-                if (!isTrusted) continue;
-                const m = (c.body || '').match(markerRe);
-                if (m && m[1] === testedSha && m[2] === corpus && m[3] === benchmark && m[4] === retrieval) {
-                  duplicate = true;
-                  break;
-                }
-              }
-              if (duplicate) break;
-            }
-            const marker = `<!-- aa-real-book-retrieval-result issue=130 sha=${testedSha} corpus=${corpus} benchmark=${benchmark} retrieval=${retrieval} result=${finalResult} run=${runId} -->`;
-            if (!duplicate) {
-              const body = finalResult === 'PASS'
-                ? `${marker}\n\nTrusted real-book retrieval qualification is PASS at the exact tested SHA (production planner + real RU corpus + BM25/E5 path). Protected per-case details are in the encrypted artifact; the public summary carries metrics only.`
-                : finalResult === 'FAIL'
-                  ? `${marker}\n\nTrusted real-book retrieval qualification is FAIL at the exact tested SHA (see the compact summary for branch-union/RRF/dedup/budget diagnostics). #130 stays open.`
-                  : finalResult === 'STALE'
-                    ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #130 stays open for the fresh exact SHA.`
-                    : `${marker}\n\nTrusted real-book retrieval qualification is INCOMPLETE (missing E5/planner/provider prerequisites or infrastructure fallout, never a fake PASS). #130 stays open.`;
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: 130, body,
-              });
-            } else {
-              core.notice('identical SHA+corpus+benchmark+retrieval tuple already marked on #130; no duplicate posted.');
-            }
-; then
-            python3 - <<'PY'
-          import json
-          import os
-          out = "eval-real-book-out/result.json"
-          payload = {"result": "INCOMPLETE", "reason": "committed age recipient is missing or invalid", "main_sha": os.environ.get("EXACT_SHA", "")}
-          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
-          print("committed age recipient invalid; qualification yields INCOMPLETE, never PASS", flush=True)
+          print("recipient missing; qualification yields INCOMPLETE, never PASS", flush=True)
           PY
             echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"
             cat eval-real-book-out/result.json
