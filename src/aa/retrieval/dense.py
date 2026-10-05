@@ -1,10 +1,12 @@
-"""Local dense retrieval over RU canonical chunks (issue #17).
+"""Local dense retrieval over RU canonical chunks (issue #115).
 
 Production backend: pinned local ``intfloat/multilingual-e5-base``
 (``corpus/embedding.lock.json``) with L2-normalized embeddings and exact
 ``faiss.IndexFlatIP`` search. Local/keyless only: the model is loaded
 exclusively from the local Hugging Face hub cache with networking
-disabled; no remote embedding service is ever contacted.
+disabled; no remote embedding service is ever contacted. The tokenizer
+and model stay loaded and reusable; dense vectors live in one long-lived
+in-memory ``IndexFlatIP`` (no HNSW/ANN, no per-turn re-embedding).
 
 Offline/test backend: deterministic hashing embeddings (also normalized,
 also exact inner-product search). The hashing backend keeps unit tests
@@ -13,7 +15,9 @@ selected automatically whenever the pinned model plus ``transformers``
 and ``torch`` are locally available.
 
 The exact-IP index uses ``faiss.IndexFlatIP`` when the ``faiss`` package
-is importable and a bit-exact pure-Python equivalent otherwise.
+is importable and a bit-exact pure-Python equivalent otherwise. The
+in-memory FAISS index is the hot-path dense substrate; disk
+(``dense.json``) is startup/persistence storage only.
 """
 
 from __future__ import annotations

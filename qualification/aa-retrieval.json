@@ -16,28 +16,28 @@
     "probes": [
       {
         "en_chunks": 24,
-        "max_chars": 1000,
+        "max_tokens": 128,
         "mean_source_tokens": 222.97826086956522,
         "recall_at_5": 1.0,
         "ru_chunks": 24
       },
       {
         "en_chunks": 24,
-        "max_chars": 1500,
+        "max_tokens": 256,
         "mean_source_tokens": 222.97826086956522,
         "recall_at_5": 1.0,
         "ru_chunks": 24
       },
       {
         "en_chunks": 24,
-        "max_chars": 2400,
+        "max_tokens": 512,
         "mean_source_tokens": 222.97826086956522,
         "recall_at_5": 1.0,
         "ru_chunks": 24
       }
     ],
-    "rationale": "At fixture scale every probe width collapses to identical whole-paragraph chunking with equal recall and source tokens; 1500 is retained as the middle ground grouping whole sentences within one paragraph.",
-    "selected_max_chars": 1500
+    "rationale": "At fixture scale every probe width collapses to identical whole-paragraph chunking with equal recall and source tokens; 256 E5 tokens is retained as the initial baseline grouping whole adjacent sentences within one paragraph.",
+    "selected_max_tokens": 256
   },
   "en_control": {
     "fixtures": 6,
@@ -64,17 +64,20 @@
   "gold_sha256": "5a5c00bb6ab54d6d2f863542e43a6773a9f90adb28209cffbea97a74905e9d1f",
   "gold_version": "aa-retrieval-gold-v1",
   "index_config": {
-    "chunk_max_chars": 1500,
+    "chunk_max_tokens": 256,
+    "chunk_policy": "adjacent-sentences-within-paragraph",
     "dense_top_k": 40,
     "embedding_backend": "hashing-char-token/1",
     "hermetic_only": true,
     "lexical_top_k": 40,
     "max_per_aspect": 12,
     "max_per_section": 4,
-    "note": "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; production e5 uses the pinned lock. Chunking groups whole sentences within one paragraph up to 1500 chars. Hermetic-only: recall/latency are not production validation for intfloat/multilingual-e5-base.",
+    "note": "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; production e5 uses the pinned lock. Chunking groups whole adjacent sentences within one paragraph up to 256 E5 tokens (razdel segmentation). Hermetic-only: recall/latency are not production validation for intfloat/multilingual-e5-base.",
     "production_promotion_blocked": true,
     "production_validated": false,
-    "rrf_k": 60
+    "rrf_k": 60,
+    "sentence_segmenter": "razdel-0.5.0",
+    "tokenizer": "intfloat/multilingual-e5-base@d1287505"
   },
   "notes": "RU-first is fixed and not up for reversal. Legacy RU-to-EN-only cannot become production. EN control is navigation integrity only; final evidence is always exact RU text.",
   "per_case": [
@@ -89,7 +92,7 @@
         "doctors-opinion",
         "chapter-4"
       ],
-      "latency_ms": 3.5035450000009405,
+      "latency_ms": 1.2015770000743942,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -109,7 +112,7 @@
         "chapter-6",
         "chapter-5"
       ],
-      "latency_ms": 2.5910710000118797,
+      "latency_ms": 0.9442179999723521,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -129,7 +132,7 @@
         "chapter-7",
         "chapter-5"
       ],
-      "latency_ms": 2.6126409999847056,
+      "latency_ms": 0.9286989999282014,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -149,7 +152,7 @@
         "chapter-5",
         "chapter-1"
       ],
-      "latency_ms": 2.5773549999996703,
+      "latency_ms": 0.938277000045673,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -169,7 +172,7 @@
         "chapter-3",
         "doctors-opinion"
       ],
-      "latency_ms": 2.5051309999923888,
+      "latency_ms": 0.8963889999904495,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -189,7 +192,7 @@
         "chapter-3",
         "chapter-10"
       ],
-      "latency_ms": 2.5376910000147745,
+      "latency_ms": 0.8627969999679408,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": false,
       "recall_at_5": true,
@@ -209,7 +212,7 @@
         "chapter-3",
         "chapter-4"
       ],
-      "latency_ms": 2.4936899999943307,
+      "latency_ms": 0.8217300000978867,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -229,7 +232,7 @@
         "chapter-3",
         "chapter-9"
       ],
-      "latency_ms": 2.581962999983034,
+      "latency_ms": 0.9019789999911154,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -249,7 +252,7 @@
         "chapter-7",
         "chapter-4"
       ],
-      "latency_ms": 2.5462669999853915,
+      "latency_ms": 0.8719029999610939,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -269,7 +272,7 @@
         "chapter-1",
         "chapter-3"
       ],
-      "latency_ms": 2.5522789999854467,
+      "latency_ms": 0.8597810000310346,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -289,7 +292,7 @@
         "chapter-1",
         "chapter-5"
       ],
-      "latency_ms": 2.5533300000120107,
+      "latency_ms": 0.8550119999881645,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -309,7 +312,7 @@
         "chapter-6",
         "chapter-1"
       ],
-      "latency_ms": 2.6710100000002512,
+      "latency_ms": 0.9566009999844027,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -329,7 +332,7 @@
         "chapter-8",
         "chapter-6"
       ],
-      "latency_ms": 2.564341999999442,
+      "latency_ms": 0.8849380000128804,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -349,7 +352,7 @@
         "chapter-9",
         "chapter-9"
       ],
-      "latency_ms": 2.526180999979033,
+      "latency_ms": 0.8649809999496938,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -369,7 +372,7 @@
         "chapter-1",
         "chapter-9"
       ],
-      "latency_ms": 2.659117000007427,
+      "latency_ms": 1.0228840000081618,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -389,7 +392,7 @@
         "chapter-7",
         "chapter-9"
       ],
-      "latency_ms": 2.675676999984944,
+      "latency_ms": 0.9690340000361175,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -409,7 +412,7 @@
         "chapter-5",
         "chapter-8"
       ],
-      "latency_ms": 2.6056380000056834,
+      "latency_ms": 0.9074890000420055,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -429,7 +432,7 @@
         "chapter-5",
         "chapter-9"
       ],
-      "latency_ms": 2.963030999978855,
+      "latency_ms": 0.9139609999238019,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -449,7 +452,7 @@
         "chapter-3",
         "chapter-6"
       ],
-      "latency_ms": 2.7196000000060394,
+      "latency_ms": 0.8526169999640842,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -469,7 +472,7 @@
         "chapter-7",
         "chapter-3"
       ],
-      "latency_ms": 3.439536000001908,
+      "latency_ms": 0.9049550000099771,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -489,7 +492,7 @@
         "chapter-3",
         "chapter-1"
       ],
-      "latency_ms": 2.6454820000196833,
+      "latency_ms": 0.9327870000106486,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -509,7 +512,7 @@
         "chapter-9",
         "chapter-1"
       ],
-      "latency_ms": 2.60611899997798,
+      "latency_ms": 0.9598770000138757,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -529,7 +532,7 @@
         "chapter-5",
         "doctors-opinion"
       ],
-      "latency_ms": 2.563831000003347,
+      "latency_ms": 0.8738969999058099,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -549,7 +552,7 @@
         "chapter-5",
         "chapter-11"
       ],
-      "latency_ms": 2.584950000027675,
+      "latency_ms": 0.8753700000170284,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -569,7 +572,7 @@
         "chapter-4",
         "chapter-3"
       ],
-      "latency_ms": 2.571294000006219,
+      "latency_ms": 0.8457249999764826,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -589,7 +592,7 @@
         "chapter-6",
         "chapter-10"
       ],
-      "latency_ms": 2.5565969999945537,
+      "latency_ms": 0.8441810000476835,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -609,7 +612,7 @@
         "chapter-1",
         "doctors-opinion"
       ],
-      "latency_ms": 2.5220520000175384,
+      "latency_ms": 0.8398229999784235,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -629,7 +632,7 @@
         "chapter-8",
         "chapter-11"
       ],
-      "latency_ms": 2.5648620000140454,
+      "latency_ms": 0.8481190000111383,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -649,7 +652,7 @@
         "doctors-opinion",
         "chapter-1"
       ],
-      "latency_ms": 2.572756000006393,
+      "latency_ms": 0.8309370000461058,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -669,7 +672,7 @@
         "chapter-8",
         "doctors-opinion"
       ],
-      "latency_ms": 2.5223629999970854,
+      "latency_ms": 0.8173219999889625,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -689,7 +692,7 @@
         "chapter-5",
         "chapter-11"
       ],
-      "latency_ms": 2.4992609999969773,
+      "latency_ms": 0.7953110000471497,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -709,7 +712,7 @@
         "chapter-8",
         "chapter-9"
       ],
-      "latency_ms": 2.6155660000029,
+      "latency_ms": 0.8008710000240171,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -729,7 +732,7 @@
         "chapter-5",
         "chapter-6"
       ],
-      "latency_ms": 2.621427000008225,
+      "latency_ms": 0.9429460000092149,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -749,7 +752,7 @@
         "chapter-3",
         "chapter-5"
       ],
-      "latency_ms": 2.6122299999826737,
+      "latency_ms": 0.9232090000068638,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -769,7 +772,7 @@
         "chapter-1",
         "chapter-3"
       ],
-      "latency_ms": 2.474976000002016,
+      "latency_ms": 0.7927860000336295,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -789,7 +792,7 @@
         "chapter-8",
         "chapter-11"
       ],
-      "latency_ms": 2.6233410000031654,
+      "latency_ms": 0.9237799999937124,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -809,7 +812,7 @@
         "chapter-10",
         "chapter-7"
       ],
-      "latency_ms": 2.7187179999828004,
+      "latency_ms": 1.0283249999929467,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -829,7 +832,7 @@
         "chapter-8",
         "chapter-7"
       ],
-      "latency_ms": 2.5927640000134033,
+      "latency_ms": 0.9337679999816828,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -849,7 +852,7 @@
         "chapter-1",
         "chapter-9"
       ],
-      "latency_ms": 2.710030999992341,
+      "latency_ms": 1.0168840000233104,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -869,7 +872,7 @@
         "chapter-1",
         "chapter-11"
       ],
-      "latency_ms": 2.5480909999942014,
+      "latency_ms": 0.8545409999669573,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -889,7 +892,7 @@
         "chapter-7",
         "chapter-4"
       ],
-      "latency_ms": 2.454045999996879,
+      "latency_ms": 0.8463359999950626,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -909,7 +912,7 @@
         "chapter-6",
         "chapter-8"
       ],
-      "latency_ms": 2.615294999998241,
+      "latency_ms": 0.9286890000339554,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -929,7 +932,7 @@
         "chapter-5",
         "chapter-10"
       ],
-      "latency_ms": 2.6358539999762343,
+      "latency_ms": 0.9542770000052769,
       "lexical_recall_at_5": true,
       "raw_utterance_recall_at_5": true,
       "recall_at_5": true,
@@ -949,7 +952,7 @@
         "chapter-1",
         "chapter-1"
       ],
-      "latency_ms": 1.7591360000039913,
+      "latency_ms": 0.645341999984339,
       "lexical_recall_at_5": false,
       "raw_utterance_recall_at_5": false,
       "recall_at_5": false,
@@ -969,7 +972,7 @@
         "chapter-9",
         "doctors-opinion"
       ],
-      "latency_ms": 1.7062480000049618,
+      "latency_ms": 0.6003180000107022,
       "lexical_recall_at_5": false,
       "raw_utterance_recall_at_5": false,
       "recall_at_5": false,
@@ -989,7 +992,7 @@
         "chapter-3",
         "chapter-1"
       ],
-      "latency_ms": 1.627312000010761,
+      "latency_ms": 0.5727260000867318,
       "lexical_recall_at_5": false,
       "raw_utterance_recall_at_5": false,
       "recall_at_5": false,
@@ -1119,7 +1122,7 @@
     "config_version": "aa-retrieval-production-v1",
     "evidence_language": "ru",
     "evidence_rule": "All final Russian answer evidence resolves to exact RU canonical text.",
-    "rationale": "Baseline RU-first hybrid (40/40/RRF60/max12/diversity4, chunk 1500, expand 1+1) is the simplest configuration clearing recall>=0.95 with 100% slang, fidelity and stale gates; wider candidates and larger expansion add cost without material yield.",
+    "rationale": "Baseline RU-first hybrid (40/40/RRF60/max12/diversity4, chunk 256 E5 tokens, expand 1+1) is the simplest configuration clearing recall>=0.95 with 100% slang, fidelity and stale gates; wider candidates and larger expansion add cost without material yield.",
     "ru_only": true
   },
   "quality_gate": {
@@ -1148,15 +1151,15 @@
     "false_strengthening_count": 0,
     "fixtures": 46,
     "lexical_recall_at_5": 1.0,
-    "mean_cold_latency_ms": 3.5035450000009405,
+    "mean_cold_latency_ms": 1.2015770000743942,
     "mean_diversity": 0.753623188405797,
     "mean_evidence_tokens": 190.67391304347825,
-    "mean_latency_ms": 2.573993413042662,
+    "mean_latency_ms": 0.8823471521776335,
     "mean_planner_cost_tokens": 145.6304347826087,
     "mean_source_tokens": 222.97826086956522,
     "mean_tool_calls": 3.0652173913043477,
     "missed_relevant_region_rate": 0.0,
-    "p95_latency_ms": 2.963030999978855,
+    "p95_latency_ms": 1.0228840000081618,
     "p95_source_tokens": 452.0,
     "p95_tool_calls": 4.0,
     "raw_utterance_recall_at_5": 0.9767441860465116,
@@ -1193,7 +1196,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.573993413042662,
+      "mean_latency_ms": 0.8823471521776335,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1206,7 +1209,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 60,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5239825869567025,
+      "mean_latency_ms": 0.8670604347868072,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1219,7 +1222,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.524863108698251,
+      "mean_latency_ms": 0.8698059130477739,
       "mean_source_tokens": 221.6086956521739,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1232,7 +1235,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 4,
-      "mean_latency_ms": 2.5280943695650113,
+      "mean_latency_ms": 0.8652466086884844,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1245,7 +1248,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 2,
-      "mean_latency_ms": 2.5276188695648254,
+      "mean_latency_ms": 0.8719536086924444,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,
@@ -1258,7 +1261,7 @@
       "duplicate_rate": 0.0,
       "lexical_top_k": 40,
       "max_per_section": 6,
-      "mean_latency_ms": 2.528116586956146,
+      "mean_latency_ms": 0.868791500006014,
       "mean_source_tokens": 222.97826086956522,
       "passed": true,
       "recall_at_5": 1.0,

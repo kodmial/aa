@@ -260,6 +260,8 @@ def test_every_chunk_round_trips_to_exact_source_text() -> None:
 
 def test_chunks_use_natural_boundaries_only() -> None:
     text = "First sentence here. Second sentence follows.\n\nNext paragraph alone."
+    # Word-count counter forces a split inside the first paragraph without
+    # depending on E5 tokenizer weights; production uses E5 tokens.
     units = build_section_units(
         section_id="chapter-5",
         lang="en",
@@ -269,7 +271,8 @@ def test_chunks_use_natural_boundaries_only() -> None:
         source_sha256="0" * 64,
         edition="en-edition",
         corpus_version="en-v1",
-        max_chars=40,
+        max_tokens=5,
+        token_counter=lambda value: len(value.split()),
     )
     chunks_raw = units["chunks"]
     assert isinstance(chunks_raw, list) and len(chunks_raw) >= 2
@@ -445,13 +448,17 @@ def test_sentence_splitting_handles_russian_punctuation() -> None:
     paragraph = "Первое предложение здесь. Второе — там! А третье… Четвертое?"
     sentences = split_sentences(paragraph, 10)
     assert len(sentences) == 4
-    assert "".join(item.text for item in sentences) == paragraph
-    assert [item.char_start for item in sentences] == [
-        10,
-        10 + len(sentences[0].text),
-        10 + len(sentences[0].text + sentences[1].text),
-        10 + len(sentences[0].text + sentences[1].text + sentences[2].text),
-    ]
+    # Qualified razdel segmentation: every span round-trips exactly and
+    # inter-sentence gaps are whitespace-only (no content loss).
+    for sentence in sentences:
+        assert paragraph[sentence.char_start - 10 : sentence.char_end - 10] == sentence.text
+    assert sentences[0].char_start == 10
+    for previous, current in zip(sentences, sentences[1:], strict=False):
+        assert current.char_start >= previous.char_end
+        assert paragraph[previous.char_end - 10 : current.char_start - 10].strip() == ""
+    covered = "".join(paragraph[sent.char_start - 10 : sent.char_end - 10] for sent in sentences)
+    # Gaps are single spaces; removing them reconstructs the joined sentences.
+    assert covered.replace(" ", "") == paragraph.replace(" ", "")
 
 
 def test_paragraph_split_preserves_exact_offsets() -> None:

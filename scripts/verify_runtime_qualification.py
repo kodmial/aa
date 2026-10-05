@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 EXPECTED_STRUCTURE_FORMAT = "aa-aligned-structure/1"
-EXPECTED_STRUCTURE_BUILDER = 1
+EXPECTED_STRUCTURE_BUILDER = 2
 EXPECTED_RU_MANIFEST_FORMAT = "aa-canonical-manifest-ru/1"
 EXPECTED_RU_METADATA_VERSION = 2
 EXPECTED_ARCHIVE_FORMAT = "canonical-tar-zst/1"

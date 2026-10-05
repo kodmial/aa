@@ -93,20 +93,31 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc))
 
     digest = hashlib.sha256((args.out_dir / "index.json").read_bytes()).hexdigest()
-    print(
-        json.dumps(
-            {
-                "chunks": index.chunk_count,
-                "backend": index.metadata.get("embedding_backend"),
-                "ru_artifact_sha256": index.metadata.get("ru_artifact_sha256"),
-                "en_artifact_sha256": index.metadata.get("en_artifact_sha256"),
-                "embedding_revision": index.metadata.get("embedding_revision"),
-                "index_sha256": digest,
-                "out_dir": str(args.out_dir),
-            },
-            sort_keys=True,
+    try:
+        print(
+            json.dumps(
+                {
+                    "chunks": index.chunk_count,
+                    "backend": index.metadata.get("embedding_backend"),
+                    "ru_artifact_sha256": index.metadata.get("ru_artifact_sha256"),
+                    "en_artifact_sha256": index.metadata.get("en_artifact_sha256"),
+                    "embedding_revision": index.metadata.get("embedding_revision"),
+                    "sentence_segmenter": index.metadata.get("sentence_segmenter"),
+                    "chunker": index.metadata.get("chunker"),
+                    "chunk_max_tokens": index.metadata.get("chunk_max_tokens"),
+                    "index_sha256": digest,
+                    "out_dir": str(args.out_dir),
+                },
+                sort_keys=True,
+            )
         )
-    )
+    finally:
+        try:
+            from aa.retrieval.index import close_hybrid_index
+
+            close_hybrid_index(index)
+        except Exception:
+            pass
     return 0
 
 

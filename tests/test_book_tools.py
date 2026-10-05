@@ -84,7 +84,8 @@ def _fixture_full() -> dict[str, Any]:
         ru_edition="ru-edition",
         en_corpus_version="en-v1",
         ru_corpus_version="ru-v1",
-        max_chars=120,
+        max_tokens=10,
+        token_counter=lambda value: len(value.split()),
     )
     return full
 
@@ -124,6 +125,8 @@ def _search_payload(
 
 
 def test_search_returns_compact_navigation_candidates(tmp_path: pathlib.Path) -> None:
+    import hashlib as _hashlib
+
     index = _build_index(tmp_path)
     result = book_search(index, _search_payload())
     assert result["tool"] == "book_search"
@@ -134,7 +137,13 @@ def test_search_returns_compact_navigation_candidates(tmp_path: pathlib.Path) ->
         assert ":ru:" not in candidate["logical_chunk_id"]
         assert "ru_locator" in candidate and "preview" in candidate
         assert "never evidence" in candidate["preview"]
-        assert "text" not in candidate
+        # Issue #115: search candidates carry exact canonical text as the
+        # evidence substrate (preview stays navigation-only).
+        assert candidate["text"]
+        assert (
+            _hashlib.sha256(candidate["text"].encode("utf-8")).hexdigest()
+            == candidate["ru_locator"]["text_sha256"]
+        )
         locator = candidate["ru_locator"]
         for key in ("source_id", "source_file", "char_start", "char_end", "text_sha256"):
             assert key in locator

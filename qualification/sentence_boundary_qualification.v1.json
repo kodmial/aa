@@ -1,0 +1,394 @@
+{
+  "candidates": {
+    "razdel": {
+      "api": "razdel.sentenize",
+      "offsets": "exact start/stop",
+      "package": "razdel==0.5.0"
+    },
+    "spacy": {
+      "model": "ru_core_news_sm==3.8.0",
+      "package": "spacy==3.8.7",
+      "pipeline": "statistical parser (no Sentencizer)"
+    }
+  },
+  "fixture_version": "aa-sentence-boundary-fixture/1",
+  "per_case": [
+    {
+      "case_id": "abbr-g-n-td",
+      "category": "abbreviation",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          33
+        ],
+        [
+          34,
+          52
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          33
+        ],
+        [
+          34,
+          52
+        ]
+      ]
+    },
+    {
+      "case_id": "abbr-year-str",
+      "category": "abbreviation",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          28
+        ],
+        [
+          29,
+          41
+        ],
+        [
+          42,
+          54
+        ]
+      ],
+      "spacy_errors": 2,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          28
+        ],
+        [
+          29,
+          32
+        ],
+        [
+          33,
+          41
+        ],
+        [
+          42,
+          54
+        ]
+      ]
+    },
+    {
+      "case_id": "initials-pushkin",
+      "category": "initials",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          25
+        ],
+        [
+          26,
+          54
+        ]
+      ],
+      "spacy_errors": 1,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          25
+        ],
+        [
+          26,
+          31
+        ],
+        [
+          32,
+          54
+        ]
+      ]
+    },
+    {
+      "case_id": "dialogue-dash",
+      "category": "dialogue",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          20
+        ],
+        [
+          21,
+          48
+        ],
+        [
+          49,
+          70
+        ]
+      ],
+      "spacy_errors": 2,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          48
+        ],
+        [
+          49,
+          70
+        ]
+      ]
+    },
+    {
+      "case_id": "dialogue-direct",
+      "category": "dialogue",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          27
+        ],
+        [
+          28,
+          54
+        ],
+        [
+          55,
+          72
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          27
+        ],
+        [
+          28,
+          54
+        ],
+        [
+          55,
+          72
+        ]
+      ]
+    },
+    {
+      "case_id": "quotes-book",
+      "category": "quotes",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          36
+        ],
+        [
+          37,
+          60
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          36
+        ],
+        [
+          37,
+          60
+        ]
+      ]
+    },
+    {
+      "case_id": "ellipsis-pause",
+      "category": "ellipsis",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          25
+        ],
+        [
+          26,
+          38
+        ],
+        [
+          39,
+          60
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          25
+        ],
+        [
+          26,
+          38
+        ],
+        [
+          39,
+          60
+        ]
+      ]
+    },
+    {
+      "case_id": "list-steps",
+      "category": "list",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          11
+        ],
+        [
+          12,
+          38
+        ],
+        [
+          39,
+          65
+        ],
+        [
+          66,
+          90
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          11
+        ],
+        [
+          12,
+          38
+        ],
+        [
+          39,
+          65
+        ],
+        [
+          66,
+          90
+        ]
+      ]
+    },
+    {
+      "case_id": "decimal-temp",
+      "category": "decimal",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          30
+        ],
+        [
+          31,
+          53
+        ],
+        [
+          54,
+          66
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          30
+        ],
+        [
+          31,
+          53
+        ],
+        [
+          54,
+          66
+        ]
+      ]
+    },
+    {
+      "case_id": "chapter-head",
+      "category": "chapter-typography",
+      "razdel_errors": 0,
+      "razdel_round_trip": true,
+      "razdel_spans": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          26
+        ],
+        [
+          27,
+          50
+        ],
+        [
+          51,
+          72
+        ]
+      ],
+      "spacy_errors": 0,
+      "spacy_round_trip": true,
+      "spacy_spans": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          26
+        ],
+        [
+          27,
+          50
+        ],
+        [
+          51,
+          72
+        ]
+      ]
+    }
+  ],
+  "production_segmenter": "razdel-0.5.0",
+  "razdel": {
+    "round_trip_ok": true,
+    "total_errors": 0,
+    "version": "0.5.0"
+  },
+  "reason": "lowest boundary error wins (razdel 0 < spacy 5)",
+  "selection_rule": [
+    "exact source-offset round trip is mandatory",
+    "lowest boundary error on the frozen fixture wins",
+    "if tied, prefer lower startup/RAM/dependency footprint",
+    "record winner in index manifest"
+  ],
+  "spacy": {
+    "model": "ru_core_news_sm==3.8.0",
+    "round_trip_ok": true,
+    "spacy_version": "3.8.7",
+    "statistical_pipeline": "parser (no sentencizer)",
+    "total_errors": 5
+  },
+  "winner": "razdel"
+}

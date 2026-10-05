@@ -4,7 +4,7 @@ Use language-neutral section ids to route retrieval. Read exact
 source passages with the book tools before making AA claims.
 RU chunks are primary evidence for Russian users; EN is reference.
 
-versions: en=7bd1b398090e ru=0a0cf5feee03
+versions: en=7bd1b398090e ru=310367aa0697
 
 | section | EN title | topic |
 |---|---|---|
