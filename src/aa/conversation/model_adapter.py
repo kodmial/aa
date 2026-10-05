@@ -32,7 +32,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict, PrivateAttr
 
 from aa.opencode.client import OpenCodeClient
-from aa.opencode.errors import OpenCodeError, OpenCodeTimeoutError, OpenCodeTransientError
+from aa.opencode.errors import (OpenCodeError, OpenCodeProviderAccessError, OpenCodeTimeoutError, OpenCodeTransientError)
 
 logger = logging.getLogger("aa.conversation.model_adapter")
 
@@ -225,7 +225,7 @@ class OpenCodeChatModel(BaseChatModel):
             return await self._invoke_ephemeral(
                 prompt, model=self.primary_model, agent=self.agent, system=system
             )
-        except (OpenCodeTransientError, OpenCodeTimeoutError):
+        except (OpenCodeTransientError, OpenCodeTimeoutError, OpenCodeProviderAccessError):
             if self.fallback_model.strip() and self.fallback_model != self.primary_model:
                 logger.info("opencode model fallback used")
                 return await self._invoke_ephemeral(
@@ -258,7 +258,7 @@ class OpenCodeChatModel(BaseChatModel):
                 agent=self.agent,
                 retry_count=retry_count,
             )
-        except (OpenCodeTransientError, OpenCodeTimeoutError):
+        except (OpenCodeTransientError, OpenCodeTimeoutError, OpenCodeProviderAccessError):
             if self.fallback_model.strip() and self.fallback_model != self.primary_model:
                 logger.info("opencode model fallback used")
                 return await self._invoke_ephemeral_structured(
