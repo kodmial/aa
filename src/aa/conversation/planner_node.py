@@ -24,6 +24,8 @@ from pydantic import ValidationError
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.planner_schema import (
+    MAX_QUERIES,
+    MIN_NONEMPTY_QUERIES,
     PLANNER_MAX_ATTEMPTS,
     QueryPlan,
     QueryPlanValidationError,
@@ -35,8 +37,27 @@ logger = logging.getLogger("aa.conversation.planner_node")
 
 
 def query_plan_json_schema() -> dict[str, Any]:
-    """Derive the native OpenCode JSON Schema from the Pydantic model."""
-    return dict(QueryPlan.model_json_schema())
+    """Build the native schema, including the structural planner contract.
+
+    OpenCode owns bounded structured-output retries, so constraints that can
+    be expressed in JSON Schema must live here rather than only in the
+    post-response Pydantic validator. This makes 1..9/17+ query plans, exact
+    duplicate strings, and blank items retryable inside the same planner call.
+    """
+    schema = dict(QueryPlan.model_json_schema())
+    properties = dict(schema["properties"])
+    queries = dict(properties["queries"])
+    items = dict(queries.get("items", {}))
+    items["pattern"] = r"\S"
+    queries["items"] = items
+    queries["uniqueItems"] = True
+    queries["anyOf"] = [
+        {"maxItems": 0},
+        {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
+    ]
+    properties["queries"] = queries
+    schema["properties"] = properties
+    return schema
 
 
 def _render_context_value(value: object) -> str:

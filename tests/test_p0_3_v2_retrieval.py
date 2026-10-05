@@ -315,6 +315,57 @@ def test_duplicate_and_overlapping_children_collapse(tmp_path: pathlib.Path) -> 
         close_hybrid_index(index)
 
 
+def test_section_ticket_survives_global_pool_pressure(tmp_path: pathlib.Path) -> None:
+    from aa.retrieval.evidence import dedup_and_diversify, select_top_candidates
+    from aa.retrieval.fusion import FusedCandidate
+
+    index = _build_index(tmp_path)
+    try:
+        by_section: dict[str, list[str]] = {}
+        for chunk_id, record in index.chunks.items():
+            by_section.setdefault(record.section, []).append(chunk_id)
+        sections_with_hits = [section for section, ids in by_section.items() if ids]
+        assert len(sections_with_hits) >= 2
+        dominant, rare = sections_with_hits[:2]
+        dominant_ids = by_section[dominant][:4]
+        rare_id = by_section[rare][0]
+        fused: dict[str, FusedCandidate] = {}
+        for pos, chunk_id in enumerate(dominant_ids):
+            fused[chunk_id] = FusedCandidate(
+                chunk_id=chunk_id,
+                fused_score=10.0 - pos,
+                lexical_rank=pos + 1,
+                dense_rank=pos + 1,
+                lexical_score=0.0,
+                dense_score=0.0,
+            )
+        fused[rare_id] = FusedCandidate(
+            chunk_id=rare_id,
+            fused_score=0.01,
+            lexical_rank=40,
+            dense_rank=None,
+            lexical_score=0.0,
+            dense_score=None,
+        )
+
+        diverse = dedup_and_diversify(
+            index,
+            dominant_ids,
+            fused,
+            pool_cap=4,
+            max_per_section=4,
+        )
+        section_map = {
+            chunk_id: record.section for chunk_id, record in index.chunks.items()
+        }
+        winners = select_top_candidates(diverse, top_cap=4, sections=section_map)
+        winner_sections = {section_map[item.chunk_id] for item in winners}
+        assert dominant in winner_sections
+        assert rare in winner_sections
+    finally:
+        close_hybrid_index(index)
+
+
 def test_per_query_best_candidate_retained(tmp_path: pathlib.Path) -> None:
     index = _build_index(tmp_path)
     try:
@@ -609,6 +660,59 @@ def test_budget_fallback_preserves_skipped_rrf_winner(
         assert second.chunk_id in by_child
         assert by_child[second.chunk_id].exact_text == second.text
         assert by_child[second.chunk_id].text_sha256 == second.text_sha256
+    finally:
+        close_hybrid_index(index)
+
+
+def test_budget_reserves_late_priority_before_early_expansion(
+    tmp_path: pathlib.Path,
+) -> None:
+    index = _build_index(tmp_path)
+    try:
+        first, second = list(index.chunks.values())[:2]
+        first_need = estimate_text_tokens(first.text)
+        second_need = estimate_text_tokens(second.text)
+        budget = first_need + second_need
+
+        expanded_text = first.text
+        while estimate_text_tokens(expanded_text) <= first_need:
+            expanded_text += "xxx"
+        expanded_need = estimate_text_tokens(expanded_text)
+        assert expanded_need <= budget
+        assert expanded_need + second_need > budget
+
+        early_expanded = EvidencePassageData(
+            passage_id="early-expanded",
+            exact_text=expanded_text,
+            source_id=first.source_id,
+            section_id=first.section,
+            child_chunk_ids=(first.chunk_id,),
+            char_start=first.char_start,
+            char_end=first.char_end,
+            text_sha256=hashlib.sha256(expanded_text.encode("utf-8")).hexdigest(),
+            source_sha256=first.source_sha256,
+        )
+        late = EvidencePassageData(
+            passage_id="late",
+            exact_text=second.text,
+            source_id=second.source_id,
+            section_id=second.section,
+            child_chunk_ids=(second.chunk_id,),
+            char_start=second.char_start,
+            char_end=second.char_end,
+            text_sha256=second.text_sha256,
+            source_sha256=second.source_sha256,
+        )
+        selected, total = select_passages_under_budget(
+            [early_expanded, late],
+            budget_tokens=budget,
+            index=index,
+            priority_child_ids=(first.chunk_id, second.chunk_id),
+        )
+        selected_ids = {cid for passage in selected for cid in passage.child_chunk_ids}
+        assert total <= budget
+        assert first.chunk_id in selected_ids
+        assert second.chunk_id in selected_ids
     finally:
         close_hybrid_index(index)
 

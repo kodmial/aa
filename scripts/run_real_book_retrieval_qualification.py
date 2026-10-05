@@ -348,13 +348,21 @@ def _run_turn(
         max_per_section=config.max_per_section,
     )
     dedup_ids = [item.chunk_id for item in diverse]
-    winners = evidence_mod.select_top_candidates(diverse, top_cap=config.top_child_cap)
+    sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
+    winners = evidence_mod.select_top_candidates(
+        diverse,
+        top_cap=config.top_child_cap,
+        sections=sections,
+    )
     diversity_ids = [item.chunk_id for item in winners]
     expanded = evidence_mod.expand_small_to_big(
         index, winners, neighbor_window=config.neighbor_window
     )
     selected, _ = evidence_mod.select_passages_under_budget(
-        expanded, budget_tokens=config.budget_tokens, index=index
+        expanded,
+        budget_tokens=config.budget_tokens,
+        index=index,
+        priority_child_ids=tuple(candidate.chunk_id for candidate in winners),
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -394,7 +402,8 @@ def _run_turn(
         branch_sections = _sections([cid for contributed in per_query_ids for cid in contributed])
         branch_hit = bool(branch_sections & oracle_sections)
         rrf_hit = bool(_sections(rrf_ids) & oracle_sections)
-        dedup_hit = bool(_sections(dedup_ids) & oracle_sections)
+        # The dedup/diversity stage ends at bounded winner selection.
+        dedup_hit = bool(_sections(diversity_ids) & oracle_sections)
         budget_hit = bool(pack_sections & oracle_sections)
         oracle_hit = budget_hit
     budget_loss = bool(dedup_hit and not budget_hit)
