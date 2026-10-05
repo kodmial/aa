@@ -13,8 +13,8 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_AA_AGENT = "aa"
-DEFAULT_PRIMARY_MODEL = "opencode/muse-spark-1.3-contributor-free"
-DEFAULT_FALLBACK_MODEL = "opencode/space-bunny-free"
+DEFAULT_PRIMARY_MODEL = "opencode/space-bunny-free"
+DEFAULT_FALLBACK_MODEL = "opencode/muse-spark-1.3-contributor-free"
 
 # Conservative concurrency defaults for the single local ``opencode serve``
 # process per worker (issue #5). Qualification determines the safe value
