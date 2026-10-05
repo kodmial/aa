@@ -52,6 +52,14 @@ from aa.retrieval.reranker import CrossEncoderReranker
 
 logger = logging.getLogger("aa.conversation.retrieval_node")
 
+# Single-flight guard for the turn hot path: ``asyncio.wait_for`` cancels
+# the awaitable but cannot abort the ``asyncio.to_thread`` worker, so a
+# timed-out ~20s CPU BGE ``retrieve_evidence`` keeps running while holding
+# the lexical/dense/infer/score locks. Serializing turns at the asyncio
+# level bounds that pileup so one expired turn cannot head-of-line block
+# later interactive turns with an unbounded queue of orphaned workers.
+_RETRIEVAL_SEMAPHORE = asyncio.Semaphore(1)
+
 
 def _resolve_retrieval_config(config: RetrievalConfig | None) -> RetrievalConfig:
     """Return the active retrieval config (interactive 16-cap by default).
@@ -142,8 +150,11 @@ async def retrieval_node(
     libraries offer no cross-thread guarantee: lexical FTS via its
     connection lock, dense FAISS search via the dense search lock,
     shared e5 batched inference via the e5 infer lock, and
-    FlagReranker scoring via the reranker score lock. No caller-side
-    locking is required.
+    FlagReranker scoring via the reranker score lock. Turns are
+    additionally single-flighted via ``_RETRIEVAL_SEMAPHORE`` because
+    ``asyncio.wait_for`` cannot abort an expired ``to_thread`` worker:
+    without it, timed-out BGE turns would pile up orphaned workers
+    holding those locks and head-of-line block later turns.
 
     The per-turn wall-clock latency against
     ``INTERACTIVE_LATENCY_BUDGET_MS`` is enforced with a timeout (fails
@@ -194,12 +205,13 @@ async def retrieval_node(
         )
     started = time.perf_counter()
     try:
-        pack = await asyncio.wait_for(
-            asyncio.to_thread(
-                retrieve_evidence, index, queries, config=active_config, reranker=reranker
-            ),
-            timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
-        )
+        async with _RETRIEVAL_SEMAPHORE:
+            pack = await asyncio.wait_for(
+                asyncio.to_thread(
+                    retrieve_evidence, index, queries, config=active_config, reranker=reranker
+                ),
+                timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
+            )
     except TimeoutError as exc:
         raise ValueError(
             "v2 retrieval exceeded interactive budget; explicit performance "
