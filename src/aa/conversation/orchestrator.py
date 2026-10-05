@@ -61,6 +61,7 @@ from aa.grounding.quotes import (
 )
 from aa.opencode.errors import (
     OpenCodeError,
+    OpenCodeRateLimitError,
     OpenCodeSessionNotFoundError,
     OpenCodeTimeoutError,
     OpenCodeTransientError,
@@ -1587,8 +1588,9 @@ async def send_with_fallback(
 ) -> SynthesisResult:
     """Send one synthesis prompt with bounded retry and technical fallback.
 
-    Provider 429/availability failures use bounded retry/backoff and the
-    configured technical fallback model. Retrieval/grounding failures never
+    Provider 429 is a runner-lifecycle signal and is never retried inside
+    the process. Other transient availability failures use bounded retry/backoff
+    and the configured technical fallback model. Retrieval/grounding failures never
     reach this path; corpus/index state is never touched here, so a cache
     hit/miss or a 429 can never trigger corpus/index invalidation.
     Only the failure category and served model are recorded.
@@ -1613,6 +1615,8 @@ async def send_with_fallback(
                 retry_count=attempt - 1,
             )
         except TurnFailed:
+            raise
+        except OpenCodeRateLimitError:
             raise
         except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
             last_error = exc
@@ -1647,6 +1651,8 @@ async def send_with_fallback(
         except TurnFailed:
             raise
         except OpenCodeSessionNotFoundError:
+            raise
+        except OpenCodeRateLimitError:
             raise
         except OpenCodeError as exc:
             raise TurnFailed("synthesis-failed", _classify_send_error(exc)) from exc
