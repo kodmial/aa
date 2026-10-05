@@ -441,17 +441,17 @@ def _branch_union(index: HybridIndex, query: str, *, top_k: int) -> list[tuple[s
     """Return the lexical + dense branch union for one query (diagnostics)."""
     from aa.retrieval.lexical import lexical_search_conn as _lex_conn
 
-    if index.lexical_conn is None:
-        return []
     seen: dict[str, float] = {}
-    for chunk_id, score in _lex_conn(index.lexical_conn, query, top_k=top_k):
-        seen.setdefault(chunk_id, score)
+    if index.lexical_conn is not None:
+        for chunk_id, score in _lex_conn(index.lexical_conn, query, top_k=top_k):
+            seen.setdefault(chunk_id, score)
     from aa.retrieval.evidence import _embed_query_vector as _embed
 
-    for chunk_id, score in index.dense.search(
-        _embed(index, query), top_k=min(top_k, len(index.chunks))
-    ):
-        seen.setdefault(chunk_id, score)
+    if index.chunks and top_k > 0:
+        for chunk_id, score in index.dense.search(
+            _embed(index, query), top_k=min(top_k, len(index.chunks))
+        ):
+            seen.setdefault(chunk_id, score)
     return list(seen.items())
 
 

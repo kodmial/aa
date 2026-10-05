@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import sys
@@ -511,12 +512,34 @@ class CrossEncoderReranker:
                 raw = self._flag_reranker.compute_score(pairs, normalize=True)
         except Exception as exc:
             raise RerankerError(f"FlagEmbedding reranker scoring failed: {exc}") from exc
-        if isinstance(raw, float):
-            return [float(raw)]
         try:
-            return [float(value) for value in list(raw)]
-        except TypeError as exc:
+            if isinstance(raw, (float, int)) and not isinstance(raw, bool):
+                scores = [float(raw)]
+            else:
+                items = list(raw)
+                for value in items:
+                    if isinstance(value, bool) or isinstance(value, (str, bytes, bytearray)):
+                        raise RerankerError("FlagEmbedding reranker returned non-numeric scores")
+                    if not isinstance(value, (float, int)):
+                        try:
+                            float(value)
+                        except (TypeError, ValueError, ArithmeticError) as exc:
+                            raise RerankerError(
+                                f"FlagEmbedding reranker returned no scores: {exc}"
+                            ) from exc
+                scores = [float(value) for value in items]
+        except RerankerError:
+            raise
+        except (TypeError, ValueError, ArithmeticError) as exc:
             raise RerankerError(f"FlagEmbedding reranker returned no scores: {exc}") from exc
+        if len(scores) != len(texts):
+            raise RerankerError(
+                f"FlagEmbedding reranker returned {len(scores)} scores for {len(texts)} candidates"
+            )
+        for score in scores:
+            if not math.isfinite(score):
+                raise RerankerError("FlagEmbedding reranker returned non-finite scores")
+        return scores
 
 
 _RERANKER_SINGLETONS: dict[str, CrossEncoderReranker] = {}
