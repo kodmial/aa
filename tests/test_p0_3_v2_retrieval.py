@@ -366,26 +366,36 @@ def test_per_query_best_candidate_retained(tmp_path: pathlib.Path) -> None:
 
 
 def test_small_pool_preserves_global_rrf_depth() -> None:
-    """A small interactive pool keeps global RRF depth, not just per-query bests.
+    """Per-query bests are retained first; the remainder fills by global RRF.
 
-    With 4 queries and a 4-cap pool, uncapped per-query retention would fill
-    the pool with per-query uniques and drop the globally top-ranked
-    candidates. Retention is capped at half the pool so the interactive
-    16-cap prefix keeps RRF-ranked depth; the frozen 64-cap pool still
-    retains every per-query best.
+    With 2 queries and a 4-cap pool both uniques are retained plus the
+    globally top-ranked candidates. With 12 queries and the interactive
+    16-cap pool every distinct per-query best fits and must be retained;
+    the frozen 64-cap pool still retains every per-query best.
     """
     from aa.retrieval.evidence import fuse_query_pool
 
     ranked_lists = [
-        [("g1", 9.0), ("g2", 8.0), ("g3", 7.0), ("g4", 6.0), (f"u{pos}", 1.0)] for pos in range(4)
+        [("g1", 9.0), ("g2", 8.0), ("g3", 7.0), ("g4", 6.0), (f"u{pos}", 1.0)] for pos in range(2)
     ]
-    per_query_ids = [[f"u{pos}"] for pos in range(4)]
+    per_query_ids = [[f"u{pos}"] for pos in range(2)]
     fused, pool_ids = fuse_query_pool(ranked_lists, per_query_ids, pool_cap=4)
     assert len(pool_ids) == 4
+    assert "u0" in pool_ids
+    assert "u1" in pool_ids
     assert "g1" in pool_ids
     assert "g2" in pool_ids
+    # Review trigger: 12 queries, 16-cap pool, >8 distinct uniques.
+    trigger_ranked = [[("g1", 9.0), ("g2", 8.0), (f"u{pos}", 1.0)] for pos in range(12)]
+    trigger_per_query = [[f"u{pos}"] for pos in range(12)]
+    _, trigger_pool = fuse_query_pool(trigger_ranked, trigger_per_query, pool_cap=16)
+    assert len(trigger_pool) == 14
+    for pos in range(12):
+        assert f"u{pos}" in trigger_pool
+    assert "g1" in trigger_pool
+    assert "g2" in trigger_pool
     _, full_pool_ids = fuse_query_pool(ranked_lists, per_query_ids, pool_cap=RERANKER_POOL_CAP)
-    for chunk_id in ("u0", "u1", "u2", "u3", "g1", "g2", "g3", "g4"):
+    for chunk_id in ("u0", "u1", "g1", "g2", "g3", "g4"):
         assert chunk_id in full_pool_ids
 
 

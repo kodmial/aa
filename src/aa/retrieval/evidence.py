@@ -296,13 +296,14 @@ def fuse_query_pool(
 ) -> tuple[dict[str, FusedCandidate], list[str]]:
     """Fuse branch rankings with RRF, retaining each query's best candidate.
 
-    Per-query retention keeps multi-query recall, but it is capped at half
-    the pool so a small interactive pool (16 candidates over 10..16 planner
-    queries) keeps global RRF depth: the top retained per-query bests by
-    fused score are kept, then the rest of the pool fills by global RRF
-    rank. The frozen full-quality pool (64 candidates, passed explicitly
-    by the benchmark) retains every per-query best exactly as before, so
-    committed validation numbers are unaffected.
+    Per-query retention keeps multi-query recall: every query's best
+    unique candidate is retained first (sorted by fused score and
+    truncated only when distinct bests exceed ``pool_cap``), then the
+    rest of the pool fills by global RRF rank. With 10..16 planner
+    queries and the interactive 16-cap pool this guarantees the ticket
+    rule (at least the best unique candidate per query) whenever the
+    distinct bests fit in the pool; the frozen full-quality pool (64
+    candidates, passed explicitly by the benchmark) behaves identically.
     """
     if rrf_k <= 0:
         raise EvidenceError("rrf_k must be > 0")
@@ -312,12 +313,10 @@ def fuse_query_pool(
     ordered = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
     pool: list[FusedCandidate] = []
     seen: set[str] = set()
-    # Preserve multi-query recall: keep each query's best unique candidate,
-    # capped so at least half the pool fills by global RRF rank. With
-    # 10..16 planner queries a 16-cap pool would otherwise hold only
-    # per-query bests and lose RRF-ranked depth versus the validated
-    # full-quality configuration.
-    retention_cap = max(1, pool_cap // 2)
+    # Preserve multi-query recall: keep each query's best unique candidate.
+    # Every distinct per-query best is retained first (up to pool_cap), so
+    # no required best is discarded before the global RRF fill; only when
+    # distinct bests exceed the pool is the tail truncated by fused score.
     retained: list[FusedCandidate] = []
     for contributed in per_query_ids:
         best: FusedCandidate | None = None
@@ -331,7 +330,7 @@ def fuse_query_pool(
             retained.append(best)
             seen.add(best.chunk_id)
     retained.sort(key=lambda item: item.fused_score, reverse=True)
-    pool.extend(retained[:retention_cap])
+    pool.extend(retained[:pool_cap])
     for candidate in ordered:
         if len(pool) >= pool_cap:
             break
@@ -707,12 +706,12 @@ def retrieve_evidence(
     When ``config`` is omitted, the optimized interactive default
     (``RetrievalConfig()``, 16 BGE candidates) is used so an ordinary warm
     turn never silently pays the frozen ~21-22s full-quality cost against
-    the 5s budget: per-query retention is capped at half the pool so the
-    interactive pool keeps global RRF depth. The frozen full-quality pool
-    (64 candidates, ``RERANKER_POOL_CAP``) must be passed explicitly by
-    the benchmark so its numbers stay comparable and the latency gate
-    stays failed/blocked until re-validation plus explicit performance
-    acceptance via
+    the 5s budget: per-query retention keeps each query's best unique
+    candidate first, then fills the remainder by global RRF rank. The
+    frozen full-quality pool (64 candidates, ``RERANKER_POOL_CAP``) must
+    be passed explicitly by the benchmark so its numbers stay comparable
+    and the latency gate stays failed/blocked until re-validation plus
+    explicit performance acceptance via
     ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
     Production wiring additionally requires that acceptance before
     cutover; CPU BGE cost scales linearly (~4x fewer forwards than the

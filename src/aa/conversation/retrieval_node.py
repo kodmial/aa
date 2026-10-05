@@ -208,18 +208,37 @@ async def retrieval_node(
             "and the optimized interactive config"
         )
     started = time.perf_counter()
-    try:
-        await _RETRIEVAL_SEMAPHORE.acquire()
-        loop = asyncio.get_running_loop()
+    await _RETRIEVAL_SEMAPHORE.acquire()
+    loop = asyncio.get_running_loop()
 
-        def _run_with_release() -> EvidencePack:
+    def _do_release() -> None:
+        try:
+            loop.call_soon_threadsafe(_RETRIEVAL_SEMAPHORE.release)
+        except RuntimeError:
+            # Loop is closed/shutting down: fall back to a direct release
+            # so a finished worker never leaks the single-flight permit.
             try:
-                return retrieve_evidence(index, queries, config=active_config, reranker=reranker)
-            finally:
-                loop.call_soon_threadsafe(_RETRIEVAL_SEMAPHORE.release)
+                _RETRIEVAL_SEMAPHORE.release()
+            except ValueError:
+                pass
 
+    def _run_with_release() -> EvidencePack:
+        try:
+            return retrieve_evidence(index, queries, config=active_config, reranker=reranker)
+        finally:
+            _do_release()
+
+    try:
+        try:
+            future = loop.run_in_executor(None, _run_with_release)
+        except Exception:
+            # Submission failed before the worker started: it will never
+            # run the release path, so release inline to avoid holding the
+            # global permit forever and deadlocking all later turns.
+            _RETRIEVAL_SEMAPHORE.release()
+            raise
         pack = await asyncio.wait_for(
-            loop.run_in_executor(None, _run_with_release),
+            future,
             timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
         )
     except TimeoutError as exc:
