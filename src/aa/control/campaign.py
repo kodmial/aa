@@ -28,6 +28,10 @@ prompts, corpus text or credentials.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from typing import Literal
+
 CONTROL_ISSUE_NUMBER = 31
 
 RUN_COMMAND = "/run"
@@ -234,4 +238,407 @@ def campaign_summary(
         "active": campaign_is_active(
             now, accepted_at, starts_used, stopped=stopped, runtime_active=runtime_active
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Authoritative idempotent dispatch (issue #119).
+#
+# Single shared state-transition implementation for the owner `/run`
+# command handler and the scheduled reconciler. Both callers must use
+# these helpers (or mirror them exactly in workflow JS) instead of
+# maintaining divergent campaign semantics.
+#
+# Durable state model (existing representation only):
+# - owner `/run` / `/bot stop` comments on the control issue, plus
+# - committed `aa-runtime.yml` workflow runs, plus
+# - machine-readable dispatch markers posted as control-issue comments
+#   after a dispatch is accepted/committed.
+#
+# Rules:
+# - the command is parsed from the immutable event payload, never from a
+#   re-read/edited comment body;
+# - pre-existing campaign resolution excludes the current event comment ID,
+#   so the initiating comment can never self-match as "already active";
+# - re-delivery of the same event (same comment ID) is idempotent via the
+#   dispatch marker for that source comment ID;
+# - a marker is posted only after the dispatch API accepts the run
+#   (failure-before-commit consumes no start);
+# - once committed, the start is consumed even if the runtime later fails
+#   (failed runs still count via the run history);
+# - effective starts = max(committed runs after accepted_at,
+#   committed markers for the generation), which bridges the
+#   eventually-consistent run listing without ever double-dispatching to
+#   "repair" an uncertain dispatch (exactly one dispatch attempt per
+#   serialized handler execution);
+# - control and reconciler handlers serialize on one concurrency group and
+#   always re-read authoritative state immediately before deciding, so the
+#   second contender sees the first contender's marker/run and no-ops.
+# ---------------------------------------------------------------------------
+
+DISPATCH_MARKER_KIND = "aa-campaign-dispatch"
+
+_MARKER_RE = re.compile(
+    r"<!--\s*aa-campaign-dispatch\s+"
+    r"generation=(?P<generation>\S+)\s+"
+    r"seq=(?P<seq>\d+)"
+    r"(?:\s+source-comment=(?P<source>\S+))?"
+    r"\s*-->",
+)
+
+InitialDispatchAction = Literal[
+    "dispatch_new", "noop_duplicate", "noop_active", "noop_runtime_active", "noop_invalid"
+]
+
+ReconcileAction = Literal[
+    "dispatch",
+    "noop_no_campaign",
+    "noop_runtime_active",
+    "noop_pending",
+    "noop_exhausted",
+    "noop_inactive",
+]
+
+
+@dataclass(frozen=True)
+class ControlComment:
+    """Durable control-issue comment (ids/counters only, never message text)."""
+
+    comment_id: int
+    body: str
+    created_at: float
+    is_owner: bool
+
+
+@dataclass(frozen=True)
+class RuntimeRun:
+    """Authoritative runtime run reference (ids/counters only)."""
+
+    run_id: int
+    created_at: float
+    status: str
+    conclusion: str | None
+
+
+@dataclass(frozen=True)
+class CampaignGeneration:
+    """Explicit durable campaign identity for one accepted `/run`."""
+
+    accepted_at: float
+    source_comment_id: int
+    generation_id: str
+
+
+@dataclass(frozen=True)
+class InitialDispatchDecision:
+    """Shared outcome for the owner `/run` event handler."""
+
+    action: InitialDispatchAction
+    generation: CampaignGeneration | None
+    starts_used: int
+    next_seq: int
+
+
+@dataclass(frozen=True)
+class ReconcileDecision:
+    """Shared outcome for the scheduled reconciler."""
+
+    action: ReconcileAction
+    generation: CampaignGeneration | None
+    starts_used: int
+    next_seq: int
+
+
+def is_authorized_control_event(actor: str, owner: str, issue_number: int) -> bool:
+    """Whether an event is an authenticated owner command on the control issue."""
+    return bool(actor) and actor == owner and issue_number == CONTROL_ISSUE_NUMBER
+
+
+def generation_id_for_comment(comment_id: int) -> str:
+    """Return the explicit durable generation id for a `/run` comment id."""
+    return f"c{int(comment_id)}"
+
+
+def format_dispatch_marker(
+    generation_id: str, seq: int, source_comment_id: int | None = None
+) -> str:
+    """Return the machine-readable commit marker for a successful dispatch."""
+    suffix = f" source-comment={int(source_comment_id)}" if source_comment_id is not None else ""
+    return f"<!-- {DISPATCH_MARKER_KIND} generation={generation_id} seq={int(seq)}{suffix} -->"
+
+
+def parse_dispatch_marker(body: str) -> dict[str, object] | None:
+    """Parse one dispatch marker from a comment body, if present."""
+    match = _MARKER_RE.search(body)
+    if match is None:
+        return None
+    return {
+        "generation": match.group("generation"),
+        "seq": int(match.group("seq")),
+        "source_comment": match.group("source"),
+    }
+
+
+def markers_for_generation(bodies: list[str], generation_id: str) -> list[int]:
+    """Return committed seq numbers for ``generation_id`` (durable markers).
+
+    Deduplicated by seq: a retried marker post after an ambiguous success
+    may persist the same seq twice, and counting both would wedge the
+    reconciler in ``noop_pending`` (markers greater than runs forever).
+    """
+    seqs: set[int] = set()
+    for body in bodies:
+        parsed = parse_dispatch_marker(body)
+        if parsed is not None and parsed.get("generation") == generation_id:
+            value = parsed.get("seq")
+            if isinstance(value, int):
+                seqs.add(value)
+    return sorted(seqs)
+
+
+def has_marker_for_source(bodies: list[str], source_comment_id: int) -> bool:
+    """Whether a committed dispatch marker already exists for a source comment."""
+    wanted = str(int(source_comment_id))
+    for body in bodies:
+        parsed = parse_dispatch_marker(body)
+        if parsed is not None and parsed.get("source_comment") == wanted:
+            return True
+    return False
+
+
+def effective_starts_used(runs_after_accepted: int, marker_count: int) -> int:
+    """Return the authoritative start counter bridging eventual consistency."""
+    return max(int(runs_after_accepted), int(marker_count))
+
+
+def resolve_active_generation(
+    comments: list[ControlComment],
+    run_created_at: list[float],
+    now: float,
+    *,
+    exclude_comment_id: int | None = None,
+) -> CampaignGeneration | None:
+    """Resolve the pre-existing active campaign generation, if any.
+
+    ``exclude_comment_id`` is the current event comment id and is always
+    excluded, so the initiating `/run` can never self-match as already
+    active. All other semantics match :func:`resolve_active_start`.
+    """
+    candidates: list[tuple[float, int]] = sorted(
+        (c.created_at, c.comment_id)
+        for c in comments
+        if c.is_owner
+        and (exclude_comment_id is None or c.comment_id != exclude_comment_id)
+        and parse_control_command(c.body) == "run"
+    )
+    stop_times = [
+        c.created_at for c in comments if c.is_owner and parse_control_command(c.body) == "stop"
+    ]
+    ordered = sorted(run_created_at)
+    ordered_pairs = sorted(candidates)
+    for index, (candidate, source_id) in enumerate(ordered_pairs):
+        if any(stop > candidate for stop in stop_times):
+            continue
+        if campaign_is_expired(now, candidate):
+            continue
+        if count_starts_after(ordered, candidate) >= MAX_STARTS:
+            continue
+        exhausted_before = False
+        for prev, _prev_id in ordered_pairs[:index]:
+            prev_runs = sorted(t for t in ordered if t > prev)
+            if len(prev_runs) >= MAX_STARTS and candidate <= prev_runs[MAX_STARTS - 1]:
+                exhausted_before = True
+                break
+        if exhausted_before:
+            continue
+        return CampaignGeneration(
+            accepted_at=candidate,
+            source_comment_id=source_id,
+            generation_id=generation_id_for_comment(source_id),
+        )
+    return None
+
+
+def effective_starts_for_generation(
+    generation: CampaignGeneration,
+    comment_bodies: list[str],
+    run_created_at: list[float],
+) -> int:
+    """Return the authoritative starts-used counter for a generation."""
+    runs_after = count_starts_after(sorted(run_created_at), generation.accepted_at)
+    markers = len(markers_for_generation(comment_bodies, generation.generation_id))
+    return effective_starts_used(runs_after, markers)
+
+
+def decide_initial_dispatch(
+    *,
+    event_body: str,
+    event_comment_id: int,
+    event_created_at: float,
+    comments: list[ControlComment],
+    comment_bodies: list[str],
+    run_created_at: list[float],
+    runtime_active: bool,
+    now: float,
+) -> InitialDispatchDecision:
+    """Decide one owner `/run` event using the shared transition.
+
+    ``event_body`` is the immutable payload body (never a re-read body).
+    ``comments`` is the re-read history including all markers. Exactly one
+    dispatch attempt follows only from ``dispatch_new``; every ``noop_*``
+    must not dispatch.
+    """
+    if parse_control_command(event_body) != "run":
+        return InitialDispatchDecision(
+            action="noop_invalid", generation=None, starts_used=0, next_seq=0
+        )
+    if has_marker_for_source(comment_bodies, event_comment_id):
+        preexisting = resolve_active_generation(
+            comments, run_created_at, now, exclude_comment_id=event_comment_id
+        )
+        if preexisting is not None:
+            starts = effective_starts_for_generation(preexisting, comment_bodies, run_created_at)
+            return InitialDispatchDecision(
+                action="noop_duplicate",
+                generation=preexisting,
+                starts_used=starts,
+                next_seq=starts + 1,
+            )
+        # Marker exists but the generation itself expired/stopped: the event
+        # was already committed and must never consume another start.
+        return InitialDispatchDecision(
+            action="noop_duplicate", generation=None, starts_used=0, next_seq=0
+        )
+    preexisting = resolve_active_generation(
+        comments, run_created_at, now, exclude_comment_id=event_comment_id
+    )
+    if preexisting is not None:
+        starts = effective_starts_for_generation(preexisting, comment_bodies, run_created_at)
+        return InitialDispatchDecision(
+            action="noop_active",
+            generation=preexisting,
+            starts_used=starts,
+            next_seq=starts + 1,
+        )
+    if runtime_active:
+        return InitialDispatchDecision(
+            action="noop_runtime_active", generation=None, starts_used=0, next_seq=0
+        )
+    new_generation = CampaignGeneration(
+        accepted_at=float(event_created_at),
+        source_comment_id=int(event_comment_id),
+        generation_id=generation_id_for_comment(event_comment_id),
+    )
+    return InitialDispatchDecision(
+        action="dispatch_new", generation=new_generation, starts_used=0, next_seq=1
+    )
+
+
+def decide_reconcile(
+    *,
+    comments: list[ControlComment],
+    comment_bodies: list[str],
+    run_created_at: list[float],
+    runtime_active: bool,
+    now: float,
+) -> ReconcileDecision:
+    """Decide one scheduled reconciler tick using the shared transition."""
+    generation = resolve_active_generation(comments, run_created_at, now)
+    if generation is None:
+        return ReconcileDecision(
+            action="noop_no_campaign", generation=None, starts_used=0, next_seq=0
+        )
+    if runtime_active:
+        starts = effective_starts_for_generation(generation, comment_bodies, run_created_at)
+        return ReconcileDecision(
+            action="noop_runtime_active",
+            generation=generation,
+            starts_used=starts,
+            next_seq=starts + 1,
+        )
+    runs_after = count_starts_after(sorted(run_created_at), generation.accepted_at)
+    markers = len(markers_for_generation(comment_bodies, generation.generation_id))
+    starts = effective_starts_used(runs_after, markers)
+    if starts >= MAX_STARTS:
+        return ReconcileDecision(
+            action="noop_exhausted",
+            generation=generation,
+            starts_used=starts,
+            next_seq=starts + 1,
+        )
+    if markers > runs_after:
+        # A dispatch was committed but its run is not yet listed (eventual
+        # consistency). Wait for the runtime to appear; never dispatch a
+        # second poller to "repair" the uncertain window.
+        return ReconcileDecision(
+            action="noop_pending",
+            generation=generation,
+            starts_used=starts,
+            next_seq=starts + 1,
+        )
+    stopped = any(
+        c.is_owner
+        and parse_control_command(c.body) == "stop"
+        and c.created_at > generation.accepted_at
+        for c in comments
+    )
+    if not campaign_is_active(
+        now, generation.accepted_at, starts, stopped=stopped, runtime_active=False
+    ):
+        if starts >= MAX_STARTS:
+            return ReconcileDecision(
+                action="noop_exhausted",
+                generation=generation,
+                starts_used=starts,
+                next_seq=starts + 1,
+            )
+        return ReconcileDecision(
+            action="noop_inactive",
+            generation=generation,
+            starts_used=starts,
+            next_seq=starts + 1,
+        )
+    return ReconcileDecision(
+        action="dispatch", generation=generation, starts_used=starts, next_seq=starts + 1
+    )
+
+
+def status_snapshot(
+    *,
+    comments: list[ControlComment],
+    comment_bodies: list[str],
+    run_created_at: list[float],
+    runtime_active: bool,
+    now: float,
+) -> dict[str, object]:
+    """Return a privacy-safe status snapshot with pending-dispatch awareness."""
+    generation = resolve_active_generation(comments, run_created_at, now)
+    if generation is None:
+        return {"active": False, "generation": None, "starts_used": 0}
+    starts = effective_starts_for_generation(generation, comment_bodies, run_created_at)
+    runs_after = count_starts_after(sorted(run_created_at), generation.accepted_at)
+    markers = len(markers_for_generation(comment_bodies, generation.generation_id))
+    stopped = any(
+        c.is_owner
+        and parse_control_command(c.body) == "stop"
+        and c.created_at > generation.accepted_at
+        for c in comments
+    )
+    return {
+        "active": campaign_is_active(
+            now,
+            generation.accepted_at,
+            starts,
+            stopped=stopped,
+            runtime_active=runtime_active,
+        ),
+        "generation": generation.generation_id,
+        "source_comment": generation.source_comment_id,
+        "accepted_at": generation.accepted_at,
+        "starts_used": starts,
+        "starts_max": MAX_STARTS,
+        "pending_dispatch": markers > runs_after,
+        "stopped": stopped,
+        "expired": campaign_is_expired(now, generation.accepted_at),
+        "runtime_active": runtime_active,
     }

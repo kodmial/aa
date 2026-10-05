@@ -31,23 +31,33 @@ jobs:
         with:
           github-token: ${{ github.token }}
           script: |
-            // Issue #6 bounded reconciler: dispatch exactly one fixed 5h
-            // runtime only when a campaign is active, unexpired and
-            // starts_used < 4. Every other case is a success no-op, and an
-            // expired/completed/stopped campaign never auto-renews: later
-            // wake-ups stay permanent no-ops until a new owner `/run`.
+            // Issue #6 bounded reconciler with issue #119 shared semantics:
+            // dispatch exactly one fixed 5h runtime only when a campaign is
+            // active, unexpired and starts_used < 4. Every other case is a
+            // success no-op, and an expired/completed/stopped campaign never
+            // auto-renews: later wake-ups stay permanent no-ops until a new
+            // owner `/run`. This block shares one state-transition
+            // implementation with aa-runtime-control.yml (mirrors
+            // src/aa/control/campaign.py): the same resolver, the same
+            // durable dispatch markers, and the same effective
+            // starts_used = max(committed runs, committed markers).
             // State is re-read immediately before dispatch (owner comments +
             // authoritative run history), the committed dispatch itself is
             // the durable start counter (failed/short runs still consume one
             // start), and the runtime workflow rejects any queued duplicate
             // behind its concurrency group, so duplicate cron/events cannot
-            // produce concurrent or queued duplicate pollers.
+            // produce concurrent or queued duplicate pollers. The reconciler
+            // never races the initial dispatch: both serialize on
+            // aa-runtime-control, the initial dispatch commits a start 1/4
+            // marker before the reconciler re-reads, and an uncertain
+            // dispatch is never repaired with a second poller.
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const controlIssue = Number(process.env.CONTROL_ISSUE);
             const ACTIVE = ['queued', 'in_progress', 'waiting', 'requested', 'pending'];
             const DAY_MS = 24 * 3600 * 1000;
             const MAX_STARTS = 4;
+            const MARKER_KIND = 'aa-campaign-dispatch';
 
             const listAllComments = async () => {
               const comments = [];
@@ -63,6 +73,66 @@ jobs:
               return comments;
             };
 
+            const formatMarker = (generation, seq, sourceCommentId) =>
+              `<!-- ${MARKER_KIND} generation=${generation} seq=${seq}` +
+              (sourceCommentId ? ` source-comment=${sourceCommentId}` : '') + ' -->';
+            const parseMarker = body => {
+              const m = /<!--\s*aa-campaign-dispatch\s+generation=(\S+)\s+seq=(\d+)(?:\s+source-comment=(\S+))?\s*-->/.exec(body || '');
+              if (!m) return null;
+              return { generation: m[1], seq: Number(m[2]), sourceComment: m[3] || null };
+            };
+            const markersForGeneration = (comments, generation) => {
+              // Deduplicated by seq: a retried marker post after an
+              // ambiguous success may persist the same seq twice, and
+              // counting both would wedge the reconciler in pending
+              // (markers greater than runs forever).
+              const seqs = new Set();
+              for (const c of comments) {
+                const parsed = parseMarker(c.body || '');
+                if (parsed && parsed.generation === generation) seqs.add(parsed.seq);
+              }
+              return [...seqs].sort((a, b) => a - b);
+            };
+            const generationForComment = commentId => `c${commentId}`;
+
+            // Shared resolver (verbatim with the control workflow): owner
+            // `/run` epochs with no exclusion here, owner `/bot stop`
+            // epochs, committed runs. Markers bridge the pending window.
+            const resolveCampaign = (comments, runs, nowMs) => {
+              const runEntries = comments
+                .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/run')
+                .map(c => ({ t: Date.parse(c.created_at), id: Number(c.id) }))
+                .filter(e => Number.isFinite(e.t))
+                .sort((a, b) => a.t - b.t);
+              const stopTimes = comments
+                .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/bot stop')
+                .map(c => Date.parse(c.created_at))
+                .filter(t => Number.isFinite(t));
+              const createdTimes = runs
+                .map(r => Date.parse(r.created_at))
+                .filter(t => Number.isFinite(t));
+              const sortedCreated = [...createdTimes].sort((a, b) => a - b);
+              for (let i = 0; i < runEntries.length; i++) {
+                const candidate = runEntries[i].t;
+                if (stopTimes.some(s => s > candidate)) continue;
+                if (nowMs - candidate >= DAY_MS) continue;
+                if (sortedCreated.filter(t => t > candidate).length >= MAX_STARTS) continue;
+                let exhaustedBefore = false;
+                for (let j = 0; j < i; j++) {
+                  const prev = runEntries[j].t;
+                  const prevRuns = sortedCreated.filter(t => t > prev);
+                  if (prevRuns.length >= MAX_STARTS && candidate <= prevRuns[MAX_STARTS - 1]) {
+                    exhaustedBefore = true;
+                    break;
+                  }
+                }
+                if (exhaustedBefore) continue;
+                return { accepted: candidate, sourceCommentId: runEntries[i].id };
+              }
+              return null;
+            };
+
+            // Authoritative re-read immediately before deciding.
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner, repo, workflow_id: 'aa-runtime.yml', per_page: 100,
             });
@@ -70,44 +140,12 @@ jobs:
             const comments = await listAllComments();
             const nowMs = Date.now();
 
-            const runTimes = comments
-              .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/run')
-              .map(c => Date.parse(c.created_at))
-              .filter(t => Number.isFinite(t))
-              .sort((a, b) => a - b);
-            const stopTimes = comments
-              .filter(c => c.user && c.user.login === owner && (c.body || '').trim() === '/bot stop')
-              .map(c => Date.parse(c.created_at))
-              .filter(t => Number.isFinite(t));
-            const createdTimes = runs
-              .map(r => Date.parse(r.created_at))
-              .filter(t => Number.isFinite(t));
-
-            let accepted = null;
-            const sortedCreated = [...createdTimes].sort((a, b) => a - b);
-            for (let i = 0; i < runTimes.length; i++) {
-              const candidate = runTimes[i];
-              if (stopTimes.some(s => s > candidate)) continue;
-              if (nowMs - candidate >= DAY_MS) continue;
-              if (sortedCreated.filter(t => t > candidate).length >= MAX_STARTS) continue;
-              let exhaustedBefore = false;
-              for (let j = 0; j < i; j++) {
-                const prev = runTimes[j];
-                const prevRuns = sortedCreated.filter(t => t > prev);
-                if (prevRuns.length >= MAX_STARTS && candidate <= prevRuns[MAX_STARTS - 1]) {
-                  exhaustedBefore = true;
-                  break;
-                }
-              }
-              if (exhaustedBefore) continue;
-              accepted = candidate;
-              break;
-            }
-
-            if (accepted === null) {
+            const resolved = resolveCampaign(comments, runs, nowMs);
+            if (resolved === null) {
               core.info('Reconciler no-op: no active campaign (none, expired, completed or stopped). No renew.');
               return;
             }
+            const generation = generationForComment(resolved.sourceCommentId);
 
             const active = runs
               .filter(r => r.conclusion === null && ACTIVE.includes(r.status))
@@ -117,32 +155,58 @@ jobs:
               return;
             }
 
-            const startsUsed = createdTimes.filter(t => t > accepted).length;
+            const runsAfter = runs.filter(r => Date.parse(r.created_at) > resolved.accepted).length;
+            const markers = markersForGeneration(comments, generation).length;
+            const startsUsed = Math.max(runsAfter, markers);
             if (startsUsed >= MAX_STARTS) {
               core.info(`Reconciler no-op: campaign already used ${startsUsed}/${MAX_STARTS} starts.`);
               return;
             }
+            if (markers > runsAfter) {
+              core.info(`Reconciler no-op: dispatch ${startsUsed}/${MAX_STARTS} pending for generation ${generation}; waiting for the runtime to appear, never queue a second poller.`);
+              return;
+            }
 
             // Authoritative re-read passed: commit exactly one 5h dispatch.
-            // The new workflow run is the durable counter increment.
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration: '5h' },
-            });
-            core.info(`Reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h).`);
+            // The new workflow run plus the durable marker below form the
+            // counter increment; on failure-before-commit no marker is
+            // posted and no start is consumed; an uncertain success is never
+            // repaired with a second dispatch in this tick.
+            const nextSeq = startsUsed + 1;
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration: '5h' },
+              });
+            } catch (error) {
+              core.warning('Reconciler dispatch not committed; no start consumed: ' + (error && error.message ? error.message : error));
+              return;
+            }
+            core.info(`Reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h).`);
+            const marker = formatMarker(generation, nextSeq, null);
+            try {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: controlIssue,
+                body: `Scheduled reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h).\nGeneration ${generation}, starts_used ${nextSeq}/${MAX_STARTS}.\n` + marker,
+              });
+            } catch (error) {
+              core.warning('Reconciler dispatch committed; marker comment failed: ' + (error && error.message ? error.message : error));
+            }
             try {
               await new Promise(resolve => setTimeout(resolve, 1500));
               const latest = await github.rest.actions.listWorkflowRuns({
                 owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 5,
               });
               const run = latest.data.workflow_runs[0];
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: controlIssue,
-                body: run
-                  ? `Scheduled reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h). Run #${run.id}: ${run.html_url}`
-                  : `Scheduled reconciler dispatched campaign runtime ${startsUsed + 1}/${MAX_STARTS} (fixed 5h).`,
-              });
+              if (run) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: controlIssue,
+                  body: `Scheduled reconciler runtime link for generation ${generation}: Run #${run.id}: ${run.html_url}`,
+                });
+              }
             } catch (error) {
-              core.warning('Reconciler dispatch committed; status comment no-op: ' + error.message);
+              core.warning('Reconciler dispatch committed; run link no-op: ' + error.message);
             }
