@@ -178,22 +178,31 @@ jobs:
               return;
             }
             core.info(`Reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h).`);
+            const marker = formatMarker(generation, nextSeq, null);
+            try {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: controlIssue,
+                body: `Scheduled reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h).\nGeneration ${generation}, starts_used ${nextSeq}/${MAX_STARTS}.\n` + marker,
+              });
+            } catch (error) {
+              core.warning('Reconciler dispatch committed; marker comment failed: ' + (error && error.message ? error.message : error));
+            }
             try {
               await new Promise(resolve => setTimeout(resolve, 1500));
               const latest = await github.rest.actions.listWorkflowRuns({
                 owner, repo, workflow_id: 'aa-runtime.yml', event: 'workflow_dispatch', per_page: 5,
               });
               const run = latest.data.workflow_runs[0];
-              const marker = formatMarker(generation, nextSeq, null);
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: controlIssue,
-                body: (run
-                  ? `Scheduled reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h). Run #${run.id}: ${run.html_url}`
-                  : `Scheduled reconciler dispatched campaign runtime ${nextSeq}/${MAX_STARTS} (fixed 5h).`) +
-                  `\nGeneration ${generation}, starts_used ${nextSeq}/${MAX_STARTS}.\n` + marker,
-              });
+              if (run) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: controlIssue,
+                  body: `Scheduled reconciler runtime link for generation ${generation}: Run #${run.id}: ${run.html_url}`,
+                });
+              }
             } catch (error) {
-              core.warning('Reconciler dispatch committed; status comment no-op: ' + error.message);
+              core.warning('Reconciler dispatch committed; run link no-op: ' + error.message);
             }
