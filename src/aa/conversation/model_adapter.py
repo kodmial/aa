@@ -32,7 +32,13 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict, PrivateAttr
 
 from aa.opencode.client import OpenCodeClient
-from aa.opencode.errors import (OpenCodeError, OpenCodeProviderAccessError, OpenCodeRateLimitError, OpenCodeTimeoutError, OpenCodeTransientError)
+from aa.opencode.errors import (
+    OpenCodeError,
+    OpenCodeProviderAccessError,
+    OpenCodeRateLimitError,
+    OpenCodeTimeoutError,
+    OpenCodeTransientError,
+)
 
 logger = logging.getLogger("aa.conversation.model_adapter")
 
