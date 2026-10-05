@@ -49,7 +49,7 @@ permissions:
 
 concurrency:
   group: aa-real-book-retrieval-qualification
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   PYTHON_VERSION: "3.12"
