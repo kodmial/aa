@@ -567,7 +567,9 @@ def test_evidence_budget_is_atomic(tmp_path: pathlib.Path) -> None:
         close_hybrid_index(index)
 
 
-def test_budget_fallback_preserves_skipped_rrf_winner(tmp_path: pathlib.Path) -> None:
+def test_budget_fallback_preserves_skipped_rrf_winner(
+    tmp_path: pathlib.Path,
+) -> None:
     index = _build_index(tmp_path)
     try:
         first, second = list(index.chunks.values())[:2]
@@ -611,7 +613,9 @@ def test_budget_fallback_preserves_skipped_rrf_winner(tmp_path: pathlib.Path) ->
         close_hybrid_index(index)
 
 
-def test_budget_fallback_reserves_priority_before_later_passages(tmp_path: pathlib.Path) -> None:
+def test_budget_fallback_reserves_priority_before_later_passages(
+    tmp_path: pathlib.Path,
+) -> None:
     index = _build_index(tmp_path)
     try:
         first, second = list(index.chunks.values())[:2]
