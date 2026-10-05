@@ -120,7 +120,13 @@ async def retrieval_node(
     locking is required.
     """
     raw_queries = state.get("search_queries", [])
-    queries = list(raw_queries) if isinstance(raw_queries, list) else []
+    if isinstance(raw_queries, (list, tuple)):
+        queries = [q.strip() for q in raw_queries if isinstance(q, str) and q.strip()]
+    else:
+        queries = []
+    if not queries:
+        logger.info("v2 retrieval skipped", extra={"queries": 0})
+        return {"retrieval_hits": [], "evidence_pack": []}
     started = time.perf_counter()
     pack = await asyncio.to_thread(
         retrieve_evidence, index, queries, config=config, reranker=reranker
