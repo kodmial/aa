@@ -122,6 +122,13 @@ async def retrieval_node(
     connection lock, dense FAISS search via the dense search lock, and
     FlagReranker scoring via the reranker score lock. No caller-side
     locking is required.
+
+    The per-turn wall-clock latency against
+    ``INTERACTIVE_LATENCY_BUDGET_MS`` is propagated in state
+    (``retrieval_latency_ms``/``retrieval_over_budget``) so an over-budget
+    BGE turn (~20-22s warm p50/p95 vs the 5s budget) can never be mistaken
+    for interactive serving downstream; only counts and latencies are
+    logged, never prompts or user text.
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -130,7 +137,12 @@ async def retrieval_node(
         queries = []
     if not queries:
         logger.info("v2 retrieval skipped", extra={"queries": 0})
-        return {"retrieval_hits": [], "evidence_pack": []}
+        return {
+            "retrieval_hits": [],
+            "evidence_pack": [],
+            "retrieval_latency_ms": 0.0,
+            "retrieval_over_budget": False,
+        }
     started = time.perf_counter()
     pack = await asyncio.to_thread(
         retrieve_evidence, index, queries, config=config, reranker=reranker
@@ -158,7 +170,12 @@ async def retrieval_node(
             "over_budget": over_budget,
         },
     )
-    return {"retrieval_hits": hits, "evidence_pack": pack_dicts}
+    return {
+        "retrieval_hits": hits,
+        "evidence_pack": pack_dicts,
+        "retrieval_latency_ms": elapsed_ms,
+        "retrieval_over_budget": over_budget,
+    }
 
 
 def make_retrieval_node(

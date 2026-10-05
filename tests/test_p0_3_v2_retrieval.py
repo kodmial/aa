@@ -1027,3 +1027,87 @@ def test_make_retrieval_node_requires_performance_acceptance(
         assert callable(node)
     finally:
         close_hybrid_index(index)
+
+
+async def test_retrieval_node_propagates_latency_budget_signal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Over-budget BGE turns stay visible in state instead of looking interactive."""
+    from aa.conversation.graph import turn_input
+    from aa.conversation.retrieval_node import retrieval_node
+    from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS
+
+    index = _build_index(tmp_path)
+    try:
+        state = turn_input("тяга вечером")
+        state["search_queries"] = _twelve_queries("тяга поддержка")
+        result = await retrieval_node(state, index=index, reranker=_offline_reranker())
+        assert result["evidence_pack"]
+        latency_ms = result["retrieval_latency_ms"]
+        over_budget = result["retrieval_over_budget"]
+        assert isinstance(latency_ms, float) and latency_ms >= 0.0
+        assert over_budget == (latency_ms > INTERACTIVE_LATENCY_BUDGET_MS)
+        # Hermetic offline rerank is fast: it must not read as over budget.
+        assert over_budget is False
+        skipped = turn_input("привет")
+        skipped_result = await retrieval_node(skipped, index=index, reranker=_offline_reranker())
+        assert skipped_result["retrieval_latency_ms"] == 0.0
+        assert skipped_result["retrieval_over_budget"] is False
+    finally:
+        close_hybrid_index(index)
+
+
+def test_frozen_bge_validation_latency_gate_stays_blocked() -> None:
+    """The committed 52-case BGE validation fails the 5s gate: cutover stays blocked."""
+    from aa.qualification.v2_retrieval import (
+        V2Summary,
+        require_v2_cutover_acceptance,
+        v2_production_status,
+        v2_quality_gate,
+    )
+    from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS
+
+    payload = json.loads(
+        (ROOT / "qualification" / "v2-retrieval.bge-validation.v1.json").read_text(encoding="utf-8")
+    )
+    assert payload["quality_gate"]["passed"] is False
+    assert payload["summary"]["cases"] == 52
+    assert payload["summary"]["p95_target_latency_ms"] > INTERACTIVE_LATENCY_BUDGET_MS
+    assert payload["summary"]["p50_target_latency_ms"] > INTERACTIVE_LATENCY_BUDGET_MS
+    assert INTERACTIVE_LATENCY_BUDGET_MS == 5000.0
+    summary = V2Summary(
+        benchmark_version=str(payload["benchmark_version"]),
+        eval_set_version=str(payload["eval_set_version"]),
+        cases=int(payload["summary"]["cases"]),
+        baseline_recall_at_5=float(payload["summary"]["baseline_recall_at_5"]),
+        target_recall_at_5=float(payload["summary"]["target_recall_at_5"]),
+        baseline_recall_at_10=float(payload["summary"]["baseline_recall_at_10"]),
+        target_recall_at_10=float(payload["summary"]["target_recall_at_10"]),
+        baseline_mrr=float(payload["summary"]["baseline_mrr"]),
+        target_mrr=float(payload["summary"]["target_mrr"]),
+        baseline_ndcg_10=float(payload["summary"]["baseline_ndcg_10"]),
+        target_ndcg_10=float(payload["summary"]["target_ndcg_10"]),
+        target_coverage=float(payload["summary"]["target_coverage"]),
+        duplicate_rate=float(payload["summary"]["duplicate_rate"]),
+        mean_reranker_lift_recall=float(payload["summary"]["mean_reranker_lift_recall"]),
+        mean_reranker_lift_mrr=float(payload["summary"]["mean_reranker_lift_mrr"]),
+        mean_reranker_lift_ndcg=float(payload["summary"]["mean_reranker_lift_ndcg"]),
+        mean_query_diversity=float(payload["summary"]["mean_query_diversity"]),
+        mean_duplicate_query_rate=float(payload["summary"]["mean_duplicate_query_rate"]),
+        mean_target_tokens=float(payload["summary"]["mean_target_tokens"]),
+        p50_target_latency_ms=float(payload["summary"]["p50_target_latency_ms"]),
+        p95_target_latency_ms=float(payload["summary"]["p95_target_latency_ms"]),
+        unsupported_clean_rate=float(payload["summary"]["unsupported_clean_rate"]),
+        broad_non_regressive=bool(payload["summary"]["broad_non_regressive"]),
+        pool_to_pack_loss_rate=float(payload["summary"]["pool_to_pack_loss_rate"]),
+        peak_rss_mb=0.0,
+    )
+    passed, failures = v2_quality_gate(summary)
+    assert passed is False
+    assert any("p95 latency" in failure for failure in failures)
+    status = v2_production_status(summary)
+    assert status["quality_gate_passed"] is False
+    assert status["cutover_allowed"] is False
+    assert status["production_promotion_blocked"] is True
+    with pytest.raises(ValueError, match="cutover is blocked"):
+        require_v2_cutover_acceptance(performance_accepted=False)

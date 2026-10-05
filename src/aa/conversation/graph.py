@@ -164,7 +164,12 @@ async def retrieval_stub_node(state: TurnState) -> dict[str, Any]:
     """
     _ = state
     logger.info("v2 retrieval interface reached")
-    return {"retrieval_hits": [], "evidence_pack": []}
+    return {
+        "retrieval_hits": [],
+        "evidence_pack": [],
+        "retrieval_latency_ms": 0.0,
+        "retrieval_over_budget": False,
+    }
 
 
 def build_turn_graph(

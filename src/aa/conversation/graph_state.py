@@ -25,6 +25,8 @@ class TurnState(TypedDict, total=False):
     search_queries: list[str]
     retrieval_hits: list[dict[str, Any]]
     evidence_pack: list[dict[str, Any]]
+    retrieval_latency_ms: float
+    retrieval_over_budget: bool
     draft_response: str
     grounding_result: dict[str, Any]
     retry_state: dict[str, Any]
