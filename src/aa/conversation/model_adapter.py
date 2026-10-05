@@ -42,6 +42,7 @@ ANSWER_AGENT_V2 = "aa-v2"
 VERIFIER_AGENT_V2 = "aa-verifier-v2"
 RUNTIME_AGENT_V2 = "aa-runtime-v2"
 STRUCTURED_RETRY_COUNT = 2
+MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -221,17 +222,31 @@ class OpenCodeChatModel(BaseChatModel):
     async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
-        try:
-            return await self._invoke_ephemeral(
-                prompt, model=self.primary_model, agent=self.agent, system=system
-            )
-        except (OpenCodeTransientError, OpenCodeTimeoutError, OpenCodeProviderAccessError):
-            if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-                logger.info("opencode model fallback used")
+        last_transient: BaseException | None = None
+        for attempt in range(len(MODEL_TRANSIENT_RETRY_DELAYS) + 1):
+            try:
                 return await self._invoke_ephemeral(
-                    prompt, model=self.fallback_model, agent=self.agent, system=system
+                    prompt, model=self.primary_model, agent=self.agent, system=system
                 )
-            raise
+            except OpenCodeProviderAccessError:
+                # 403/access rejection is not retried on the same model.
+                break
+            except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
+                last_transient = exc
+                if attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
+                    delay = MODEL_TRANSIENT_RETRY_DELAYS[attempt]
+                    logger.info("opencode primary transient retry scheduled")
+                    await asyncio.sleep(delay)
+                    continue
+                break
+        if self.fallback_model.strip() and self.fallback_model != self.primary_model:
+            logger.info("opencode model fallback used")
+            return await self._invoke_ephemeral(
+                prompt, model=self.fallback_model, agent=self.agent, system=system
+            )
+        if last_transient is not None:
+            raise last_transient
+        raise OpenCodeProviderAccessError("opencode primary model access rejected")
 
     async def ainvoke_structured(
         self,
@@ -249,27 +264,41 @@ class OpenCodeChatModel(BaseChatModel):
         """
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
-        try:
-            return await self._invoke_ephemeral_structured(
-                prompt,
-                system=system,
-                schema=schema,
-                model=self.primary_model,
-                agent=self.agent,
-                retry_count=retry_count,
-            )
-        except (OpenCodeTransientError, OpenCodeTimeoutError, OpenCodeProviderAccessError):
-            if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-                logger.info("opencode model fallback used")
+        last_transient: BaseException | None = None
+        for attempt in range(len(MODEL_TRANSIENT_RETRY_DELAYS) + 1):
+            try:
                 return await self._invoke_ephemeral_structured(
                     prompt,
                     system=system,
                     schema=schema,
-                    model=self.fallback_model,
+                    model=self.primary_model,
                     agent=self.agent,
                     retry_count=retry_count,
                 )
-            raise
+            except OpenCodeProviderAccessError:
+                # 403/access rejection is not retried on the same model.
+                break
+            except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
+                last_transient = exc
+                if attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
+                    delay = MODEL_TRANSIENT_RETRY_DELAYS[attempt]
+                    logger.info("opencode primary transient retry scheduled")
+                    await asyncio.sleep(delay)
+                    continue
+                break
+        if self.fallback_model.strip() and self.fallback_model != self.primary_model:
+            logger.info("opencode model fallback used")
+            return await self._invoke_ephemeral_structured(
+                prompt,
+                system=system,
+                schema=schema,
+                model=self.fallback_model,
+                agent=self.agent,
+                retry_count=retry_count,
+            )
+        if last_transient is not None:
+            raise last_transient
+        raise OpenCodeProviderAccessError("opencode primary model access rejected")
 
     def _generate(
         self,
