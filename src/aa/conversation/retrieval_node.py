@@ -53,11 +53,12 @@ from aa.retrieval.reranker import CrossEncoderReranker
 logger = logging.getLogger("aa.conversation.retrieval_node")
 
 # Single-flight guard for the turn hot path: ``asyncio.wait_for`` cancels
-# the awaitable but cannot abort the ``asyncio.to_thread`` worker, so a
-# timed-out ~20s CPU BGE ``retrieve_evidence`` keeps running while holding
-# the lexical/dense/infer/score locks. Serializing turns at the asyncio
-# level bounds that pileup so one expired turn cannot head-of-line block
-# later interactive turns with an unbounded queue of orphaned workers.
+# the awaitable but cannot abort the executor worker, so a timed-out ~20s
+# CPU BGE ``retrieve_evidence`` keeps running while holding the
+# lexical/dense/infer/score locks. The permit is therefore held until the
+# worker thread itself finishes (released via ``call_soon_threadsafe``),
+# so one expired turn cannot release early and let later turns pile up an
+# unbounded queue of orphaned workers.
 _RETRIEVAL_SEMAPHORE = asyncio.Semaphore(1)
 
 
@@ -145,24 +146,25 @@ async def retrieval_node(
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
     Thread safety: concurrent turns share one long-lived ``index`` and
-    one long-lived ``reranker`` across ``asyncio.to_thread`` workers.
-    Shared access is internally serialized where the underlying
-    libraries offer no cross-thread guarantee: lexical FTS via its
-    connection lock, dense FAISS search via the dense search lock,
-    shared e5 batched inference via the e5 infer lock, and
-    FlagReranker scoring via the reranker score lock. Turns are
-    additionally single-flighted via ``_RETRIEVAL_SEMAPHORE`` because
-    ``asyncio.wait_for`` cannot abort an expired ``to_thread`` worker:
-    without it, timed-out BGE turns would pile up orphaned workers
-    holding those locks and head-of-line block later turns.
+    one long-lived ``reranker`` across executor workers. Shared access
+    is internally serialized where the underlying libraries offer no
+    cross-thread guarantee: lexical FTS via its connection lock, dense
+    FAISS search via the dense search lock, shared e5 batched inference
+    via the e5 infer lock, and FlagReranker scoring via the reranker
+    score lock. Turns are additionally single-flighted via
+    ``_RETRIEVAL_SEMAPHORE`` because ``asyncio.wait_for`` cannot abort
+    an expired worker: the permit is held until the worker thread itself
+    finishes, so timed-out BGE turns cannot release early and pile up
+    orphaned workers holding those locks.
 
     The per-turn wall-clock latency against
     ``INTERACTIVE_LATENCY_BUDGET_MS`` is enforced with a timeout (fails
     closed on expiry) and propagated in state
     (``retrieval_latency_ms``/``retrieval_over_budget``) so an over-budget
     BGE turn (~20-22s warm p50/p95 for the frozen 64-candidate validation
-    vs the 5s budget) can never block an interactive turn or be mistaken
-    for interactive serving downstream; only counts and latencies are
+    vs the 5s budget) fails closed instead of being mistaken for
+    interactive serving downstream; later turns wait on the single-flight
+    guard instead of piling up orphan workers. Only counts and latencies are
     logged, never prompts or user text. When ``config`` is omitted the
     optimized interactive pool (``reranker_pool_cap`` 16) is used instead
     of the slow full-quality default.
@@ -205,13 +207,19 @@ async def retrieval_node(
         )
     started = time.perf_counter()
     try:
-        async with _RETRIEVAL_SEMAPHORE:
-            pack = await asyncio.wait_for(
-                asyncio.to_thread(
-                    retrieve_evidence, index, queries, config=active_config, reranker=reranker
-                ),
-                timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
-            )
+        await _RETRIEVAL_SEMAPHORE.acquire()
+        loop = asyncio.get_running_loop()
+
+        def _run_with_release() -> EvidencePack:
+            try:
+                return retrieve_evidence(index, queries, config=active_config, reranker=reranker)
+            finally:
+                loop.call_soon_threadsafe(_RETRIEVAL_SEMAPHORE.release)
+
+        pack = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_with_release),
+            timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
+        )
     except TimeoutError as exc:
         raise ValueError(
             "v2 retrieval exceeded interactive budget; explicit performance "
