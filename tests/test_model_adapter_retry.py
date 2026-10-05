@@ -9,7 +9,7 @@ import pytest
 import aa.conversation.model_adapter as adapter_mod
 from aa.conversation.model_adapter import OpenCodeChatModel
 from aa.opencode.client import SessionInfo
-from aa.opencode.errors import OpenCodeProviderAccessError, OpenCodeTransientError
+from aa.opencode.errors import OpenCodeProviderAccessError, OpenCodeRateLimitError, OpenCodeTransientError
 
 PRIMARY = "opencode/space-bunny-free"
 FALLBACK = "opencode/muse-spark-1.3-contributor-free"
@@ -64,16 +64,10 @@ class _ScriptedClient:
         return outcome
 
 
-async def test_text_429_retries_primary_with_exponential_backoff(
+async def test_text_429_escalates_immediately_for_fresh_runner_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _ScriptedClient(
-        text_outcomes=[
-            OpenCodeTransientError("http=429"),
-            OpenCodeTransientError("http=429"),
-            "ok",
-        ]
-    )
+    client = _ScriptedClient(text_outcomes=[OpenCodeRateLimitError("http=429")])
     sleeps: list[float] = []
 
     async def _sleep(delay: float) -> None:
@@ -87,9 +81,10 @@ async def test_text_429_retries_primary_with_exponential_backoff(
         fallback_model=FALLBACK,
     )
 
-    assert await model._ainvoke_text("hello") == "ok"
-    assert client.models == [PRIMARY, PRIMARY, PRIMARY]
-    assert sleeps == [1.0, 4.0]
+    with pytest.raises(OpenCodeRateLimitError):
+        await model._ainvoke_text("hello")
+    assert client.models == [PRIMARY]
+    assert sleeps == []
 
 
 async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
@@ -122,17 +117,10 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     assert sleeps == [5.0, 10.0, 20.0]
 
 
-async def test_structured_persistent_429_uses_fallback_after_three_primary_attempts(
+async def test_structured_429_escalates_immediately_for_fresh_runner_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _ScriptedClient(
-        structured_outcomes=[
-            OpenCodeTransientError("http=429"),
-            OpenCodeTransientError("http=429"),
-            OpenCodeTransientError("http=429"),
-            {"queries": ["fallback"]},
-        ]
-    )
+    client = _ScriptedClient(structured_outcomes=[OpenCodeRateLimitError("http=429")])
     sleeps: list[float] = []
 
     async def _sleep(delay: float) -> None:
@@ -146,11 +134,11 @@ async def test_structured_persistent_429_uses_fallback_after_three_primary_attem
         fallback_model=FALLBACK,
     )
 
-    result = await model.ainvoke_structured(
-        "hello",
-        system="planner",
-        schema={"type": "object"},
-    )
-    assert result == {"queries": ["fallback"]}
-    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
-    assert sleeps == [1.0, 4.0]
+    with pytest.raises(OpenCodeRateLimitError):
+        await model.ainvoke_structured(
+            "hello",
+            system="planner",
+            schema={"type": "object"},
+        )
+    assert client.models == [PRIMARY]
+    assert sleeps == []
