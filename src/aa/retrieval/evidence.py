@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import numbers
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -301,11 +303,25 @@ def rerank_candidates(
         raise EvidenceError(str(exc)) from exc
     if len(scores) != len(candidates):
         raise EvidenceError("reranker must return one score per candidate")
+    clean_scores: list[float] = []
     for score in scores:
-        if not isinstance(score, float):
+        if isinstance(score, bool) or isinstance(score, (str, bytes, bytearray)):
             raise EvidenceError("reranker scores must be floats")
+        if not isinstance(score, numbers.Real):
+            try:
+                value = float(score)  # numpy scalars without Real registration
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise EvidenceError("reranker scores must be floats") from exc
+            if not math.isfinite(value):
+                raise EvidenceError("reranker scores must be finite floats")
+            clean_scores.append(value)
+            continue
+        value = float(score)
+        if not math.isfinite(value):
+            raise EvidenceError("reranker scores must be finite floats")
+        clean_scores.append(value)
     ranked = sorted(
-        zip(candidates, scores, strict=True),
+        zip(candidates, clean_scores, strict=True),
         key=lambda pair: (pair[1], pair[0].fused_score),
         reverse=True,
     )
@@ -389,12 +405,37 @@ def expand_small_to_big(
             ):
                 window.add(link)
         raw_windows.append((record.section, window))
+
     # Merge overlapping/adjacent windows within each section.
+    def _windows_touch(section_id: str, first: set[str], second: set[str]) -> bool:
+        if first & second:
+            return True
+        positions = section_position.get(section_id)
+        if not positions:
+            return False
+        try:
+            first_pos = sorted(positions[cid] for cid in first)
+            second_pos = sorted(positions[cid] for cid in second)
+        except KeyError:
+            return False
+        if not first_pos or not second_pos:
+            return False
+        # Contiguous but disjoint windows coalesce: any positions adjacent
+        # or intervals touching/overlapping in section order.
+        if first_pos[-1] + 1 >= second_pos[0] and second_pos[-1] + 1 >= first_pos[0]:
+            # Guard the gap case (e.g. {0,5} vs {2,3} overlap the span but
+            # share no adjacency): require overlap or a +/-1 edge.
+            pos_set = set(second_pos)
+            return any(
+                pos in pos_set or (pos + 1) in pos_set or (pos - 1) in pos_set for pos in first_pos
+            )
+        return False
+
     merged: list[tuple[str, set[str]]] = []
     for section_id, window in raw_windows:
         placed = False
         for pos, (kept_section, kept) in enumerate(merged):
-            if kept_section != section_id or not (kept & window):
+            if kept_section != section_id or not _windows_touch(section_id, kept, window):
                 continue
             merged[pos] = (kept_section, kept | window)
             placed = True
@@ -408,7 +449,7 @@ def expand_small_to_big(
         for section_id, window in merged:
             absorbed = False
             for pos, (kept_section, kept) in enumerate(collapsed):
-                if kept_section == section_id and (kept & window):
+                if kept_section == section_id and _windows_touch(section_id, kept, window):
                     collapsed[pos] = (kept_section, kept | window)
                     absorbed = True
                     changed = True
@@ -463,9 +504,12 @@ def select_passages_under_budget(
     """Select coherent passages atomically under the source-token budget.
 
     No passage is silently character-truncated: a passage either fits in
-    full, falls back to a smaller coherent atomic window (its single
-    best child chunk), or is skipped. Callers that need fewer passages
-    must re-rank explicitly; this function never truncates text.
+    full or is skipped. Atomic fallback would require an index lookup to
+    map fallback text to the exact child id and char span; without it,
+    emitting a longest-line fragment with mismatched provenance would
+    corrupt the exact-text plus provenance contract. Callers that need
+    fewer passages must re-rank explicitly; this function never truncates
+    text.
     """
     if budget_tokens <= 0:
         raise EvidenceError("budget_tokens must be > 0")
@@ -477,25 +521,10 @@ def select_passages_under_budget(
             selected.append(passage)
             total += need
             continue
-        # Atomic fallback: the single best child chunk of this window.
-        child_texts = passage.exact_text.split("\n")
-        fallback_text = max(child_texts, key=len) if child_texts else ""
-        fallback_need = estimate_text_tokens(fallback_text) if fallback_text else 0
-        if fallback_text and total + fallback_need <= budget_tokens:
-            selected.append(
-                EvidencePassageData(
-                    passage_id=passage.passage_id + ":atomic",
-                    exact_text=fallback_text,
-                    source_id=passage.source_id,
-                    section_id=passage.section_id,
-                    child_chunk_ids=passage.child_chunk_ids[:1],
-                    char_start=passage.char_start,
-                    char_end=passage.char_start + len(fallback_text),
-                    text_sha256=_sha256_text(fallback_text),
-                    source_sha256=passage.source_sha256,
-                )
-            )
-            total += fallback_need
+        # Atomic fallback requires index lookup to map text to child id and
+        # char span; without it we must not emit mismatched provenance.
+        # Skip oversized passages atomically instead of truncating.
+        continue
     return selected, total
 
 

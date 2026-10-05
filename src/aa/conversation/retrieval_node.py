@@ -21,6 +21,7 @@ lengths, never prompts or user text.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -103,7 +104,9 @@ async def retrieval_node(
     """LangGraph retrieval node: queries to hits plus Evidence Pack."""
     raw_queries = state.get("search_queries", [])
     queries = list(raw_queries) if isinstance(raw_queries, list) else []
-    pack = retrieve_evidence(index, queries, config=config, reranker=reranker)
+    pack = await asyncio.to_thread(
+        retrieve_evidence, index, queries, config=config, reranker=reranker
+    )
     hits, pack_dicts = pack_to_state(pack)
     logger.info(
         "v2 retrieval done",

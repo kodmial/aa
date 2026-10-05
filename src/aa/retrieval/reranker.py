@@ -61,6 +61,44 @@ def _is_hex_revision(value: object) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(char in _HEX40_RE for char in value)
 
 
+def _is_hex_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in _HEX40_RE for char in value.casefold())
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _lock_file_hashes(lock: dict[str, Any]) -> dict[str, str] | None:
+    """Return optional pinned per-file SHA-256 digests from the lock."""
+    raw = lock.get("files")
+    if raw is None:
+        raw = lock.get("file_hashes")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        raise RerankerError("reranker lock file hashes must be a non-empty object")
+    cleaned: dict[str, str] = {}
+    for name, digest in raw.items():
+        if not isinstance(name, str) or not name or ".." in name or name.startswith("/"):
+            raise RerankerError(f"reranker lock file hash has bad name: {name!r}")
+        if isinstance(digest, dict):
+            digest = digest.get("sha256")
+        if not _is_hex_sha256(digest):
+            raise RerankerError(f"reranker lock file hash must be sha256 hex: {name!r}")
+        assert isinstance(digest, str)
+        cleaned[name] = digest.casefold()
+    return cleaned
+
+
 def repo_root() -> Path:
     """Return the repository root holding ``corpus/reranker.lock.json``."""
     return Path(__file__).resolve().parents[3]
@@ -103,6 +141,12 @@ def load_reranker_lock(path: str | Path) -> dict[str, Any]:
         )
     ):
         raise RerankerError("reranker lock required_files must be a non-empty path list")
+    if lock.get("files") is not None or lock.get("file_hashes") is not None:
+        pinned = _lock_file_hashes(lock)
+        assert pinned is not None
+        missing = [name for name in required if name not in pinned]
+        if missing:
+            raise RerankerError(f"reranker lock file hashes miss required files: {missing!r}")
     runtime = lock.get("runtime")
     if not isinstance(runtime, dict):
         raise RerankerError("reranker lock must carry a runtime section")
@@ -244,12 +288,20 @@ def verify_cached_reranker(model_root: str | Path, lock: dict[str, Any]) -> bool
     """Return True only when the cached reranker matches the pinned lock.
 
     Every cache hit is validated: the marker revision must equal the
-    pinned revision and every ``required_files`` entry must exist as a
-    non-empty file under ``snapshots/<revision>/``.
+    pinned revision, the marker must bind the exact lock digest, and
+    every ``required_files`` entry must exist under
+    ``snapshots/<revision>/`` with matching size and SHA-256 digest
+    recorded in the marker (plus the lock-pinned digest when the lock
+    carries per-file hashes). Truncated or bit-corrupted files with
+    size > 0 fail closed instead of loading silently.
     """
     revision = str(lock.get("revision"))
     required = lock.get("required_files")
     if not _is_hex_revision(revision) or not isinstance(required, list):
+        return False
+    try:
+        pinned = _lock_file_hashes(lock)
+    except RerankerError:
         return False
     marker_path = Path(model_root) / RERANKER_MARKER_NAME
     try:
@@ -262,13 +314,42 @@ def verify_cached_reranker(model_root: str | Path, lock: dict[str, Any]) -> bool
         return False
     if marker.get("revision") != revision:
         return False
+    if marker.get("lock_sha256") != lock_digest(lock):
+        return False
+    recorded = marker.get("files")
+    if not isinstance(recorded, dict):
+        return False
     snapshot = snapshot_dir(model_root, revision)
     for name in required:
         if not isinstance(name, str) or not name:
             return False
         try:
             candidate = snapshot / name
-            if not candidate.is_file() or candidate.stat().st_size == 0:
+            if not candidate.is_file():
+                return False
+            size = candidate.stat().st_size
+            if size == 0:
+                return False
+            entry = recorded.get(name)
+            if not isinstance(entry, dict):
+                return False
+            expected_sha = entry.get("sha256")
+            expected_size = entry.get("size")
+            if not _is_hex_sha256(expected_sha):
+                return False
+            if not isinstance(expected_size, int) or expected_size <= 0:
+                return False
+            if size != expected_size:
+                return False
+            if pinned is not None:
+                want = pinned.get(name)
+                if want is None or str(expected_sha).casefold() != want:
+                    return False
+            try:
+                actual_sha = _sha256_file(candidate)
+            except OSError:
+                return False
+            if actual_sha.casefold() != str(expected_sha).casefold():
                 return False
         except OSError:
             return False
@@ -279,12 +360,31 @@ def write_reranker_marker(model_root: str | Path, lock: dict[str, Any]) -> Path:
     """Record the verified pinned reranker revision next to the cache."""
     root = Path(model_root)
     root.mkdir(parents=True, exist_ok=True)
+    revision = str(lock.get("revision"))
+    required = lock.get("required_files")
+    files: dict[str, dict[str, Any]] = {}
+    if isinstance(required, list):
+        snapshot = snapshot_dir(root, revision)
+        for name in required:
+            if not isinstance(name, str) or not name:
+                continue
+            candidate = snapshot / name
+            try:
+                if not candidate.is_file():
+                    continue
+                size = candidate.stat().st_size
+                if size <= 0:
+                    continue
+                files[name] = {"sha256": _sha256_file(candidate), "size": size}
+            except OSError:
+                continue
     marker = root / RERANKER_MARKER_NAME
     payload = {
         "format": "aa-reranker-model-marker/1",
         "model_id": str(lock.get("model_id")),
-        "revision": str(lock.get("revision")),
+        "revision": revision,
         "lock_sha256": lock_digest(lock),
+        "files": files,
     }
     marker.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return marker

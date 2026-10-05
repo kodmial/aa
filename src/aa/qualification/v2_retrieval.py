@@ -195,7 +195,21 @@ def planner_proxy_queries(case: GoldCase, *, count: int = PROXY_QUERY_COUNT) -> 
         cleaned.append(collapsed)
         if len(cleaned) >= count:
             break
-    return cleaned
+    if len(cleaned) < count:
+        base = cleaned[0] if cleaned else (resolved if resolved.strip() else "вопрос")
+        base = " ".join(str(base).split()) or "вопрос"
+        suffix = 1
+        guard = 0
+        while len(cleaned) < count and guard < 10 * count + 50:
+            guard += 1
+            candidate = f"{base} уточнение {suffix}"
+            suffix += 1
+            collapsed = " ".join(candidate.split())
+            if not collapsed or collapsed.casefold() in seen:
+                continue
+            seen.add(collapsed.casefold())
+            cleaned.append(collapsed)
+    return cleaned[:count]
 
 
 def query_diversity(queries: list[str]) -> float:
