@@ -35,6 +35,7 @@ from aa.opencode.client import (
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
     OpenCodeProviderAccessError,
+    OpenCodeRateLimitError,
     OpenCodeSessionNotFoundError,
     OpenCodeStartupError,
     OpenCodeTimeoutError,
@@ -166,7 +167,7 @@ def test_classify_http_status() -> None:
     assert isinstance(classify_http_status(400), OpenCodeDeterministicError)
     assert isinstance(classify_http_status(404), OpenCodeSessionNotFoundError)
     assert isinstance(classify_http_status(403), OpenCodeProviderAccessError)
-    assert isinstance(classify_http_status(429), OpenCodeTransientError)
+    assert isinstance(classify_http_status(429), OpenCodeRateLimitError)
     assert isinstance(classify_http_status(500), OpenCodeTransientError)
     assert isinstance(classify_http_status(503), OpenCodeTransientError)
     assert classify_http_status(500).transient
