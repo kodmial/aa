@@ -125,17 +125,17 @@ class EvidenceError(ValueError):
 class RetrievalConfig:
     """Tunable retrieval/evidence parameters (recorded in metadata/evals).
 
-    The default is the optimized interactive pool (``reranker_pool_cap``
-    16, ~4x fewer CPU BGE forwards than the frozen 64-candidate
-    validation) so an ordinary warm turn never silently pays the ~21-22s
-    full-quality cost against the 5s budget. The frozen benchmark pins
-    ``RERANKER_POOL_CAP`` (64) explicitly and is unaffected by this
-    default.
+    The default is the frozen full-quality pool (``reranker_pool_cap``
+    64, matching ``RERANKER_POOL_CAP`` and the validated BGE setting)
+    so an ordinary turn scores the full 64-candidate pool. The
+    optimized interactive pool (16 candidates, ~4x fewer CPU BGE
+    forwards) must be requested explicitly via
+    ``interactive_retrieval_config()`` and re-validated before cutover.
     """
 
     branch_top_k: int = BRANCH_TOP_K
     rrf_k: int = RRF_K
-    reranker_pool_cap: int = INTERACTIVE_RERANKER_POOL_CAP
+    reranker_pool_cap: int = RERANKER_POOL_CAP
     post_rerank_child_cap: int = POST_RERANK_CHILD_CAP
     max_per_section: int = MAX_PER_SECTION
     neighbor_window: int = NEIGHBOR_WINDOW
@@ -344,7 +344,7 @@ def fuse_query_pool(
     per_query_ids: list[list[str]],
     *,
     rrf_k: int = RRF_K,
-    pool_cap: int = INTERACTIVE_RERANKER_POOL_CAP,
+    pool_cap: int = RERANKER_POOL_CAP,
 ) -> tuple[dict[str, FusedCandidate], list[str]]:
     """Fuse branch rankings with RRF, retaining each query's best candidate.
 
@@ -352,10 +352,11 @@ def fuse_query_pool(
     unique candidate is retained first (sorted by fused score and
     truncated only when distinct bests exceed ``pool_cap``), then the
     rest of the pool fills by global RRF rank. With 10..16 planner
-    queries and the interactive 16-cap pool this guarantees the ticket
-    rule (at least the best unique candidate per query) whenever the
-    distinct bests fit in the pool; the frozen full-quality pool (64
-    candidates, passed explicitly by the benchmark) behaves identically.
+    queries and the frozen 64-cap pool this guarantees the ticket
+    rule (at least the best unique candidate per query) while leaving
+    ample slots for global RRF depth; a smaller interactive pool (16
+    candidates, passed explicitly) behaves identically apart from the
+    reduced depth.
     """
     if rrf_k <= 0:
         raise EvidenceError("rrf_k must be > 0")
@@ -397,7 +398,7 @@ def dedup_and_diversify(
     pool_ids: list[str],
     fused: dict[str, FusedCandidate],
     *,
-    pool_cap: int = INTERACTIVE_RERANKER_POOL_CAP,
+    pool_cap: int = RERANKER_POOL_CAP,
     max_per_section: int = MAX_PER_SECTION,
 ) -> list[FusedCandidate]:
     """Collapse overlapping child spans and apply bounded section diversity."""
@@ -755,19 +756,20 @@ def retrieve_evidence(
     query. The answering model receives only the returned exact
     passages; ``retrieval_metadata`` stays internal.
 
-    When ``config`` is omitted, the optimized interactive default
-    (``RetrievalConfig()``, 16 BGE candidates) is used so an ordinary warm
-    turn never silently pays the frozen ~21-22s full-quality cost against
-    the 5s budget: per-query retention keeps each query's best unique
+    When ``config`` is omitted, the frozen full-quality default
+    (``RetrievalConfig()``, 64 BGE candidates) is used so an ordinary
+    turn scores the initial 64-cap pool validated by the frozen
+    benchmark: per-query retention keeps each query's best unique
     candidate first, then fills the remainder by global RRF rank. The
-    frozen full-quality pool (64 candidates, ``RERANKER_POOL_CAP``) must
-    be passed explicitly by the benchmark so its numbers stay comparable
+    optimized interactive pool (16 candidates,
+    ``INTERACTIVE_RERANKER_POOL_CAP``) must be passed explicitly via
+    ``interactive_retrieval_config()`` so its numbers stay comparable
     and the latency gate stays failed/blocked until re-validation plus
     explicit performance acceptance via
     ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
     Production wiring additionally requires that acceptance before
-    cutover; CPU BGE cost scales linearly (~4x fewer forwards than the
-    frozen validation).
+    cutover; CPU BGE cost scales linearly (~4x fewer forwards for the
+    interactive prefix than the frozen validation).
     """
     active = config if config is not None else RetrievalConfig()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
