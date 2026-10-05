@@ -18,23 +18,12 @@ from pathlib import Path
 
 from aa.config import Settings
 from aa.control.runtime_control import RuntimeController
-from aa.conversation.meta import META_CAPABILITY_REPLY, is_meta_capability_request
-from aa.conversation.orchestrator import (
-    FAIL_CLOSED_REPLY,
-    TurnFailed,
-    TurnRunner,
-    is_substantive,
-    meets_russian_only,
-    run_trivial_turn,
-)
-from aa.conversation.output_limits import (
-    compact_text_to_envelope,
-    envelope_passes,
-    resolve_generation_budget,
-)
+from aa.conversation.memory import thread_id_for_chat
+from aa.conversation.output_limits import compact_text_to_envelope, envelope_passes
+from aa.conversation.runtime import ProductConversationRuntime
+from aa.conversation.turn_pipeline import contains_cyrillic
 from aa.corpus.context import CorpusContext
-from aa.grounding import GroundingGate
-from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError, OpenCodeSessionNotFoundError
+from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.retrieval.index import HybridIndex, open_hybrid_index
 from aa.safety.response import build_emergency_response
@@ -95,7 +84,8 @@ class Application:
         sessions: SessionCoordinator | None = None,
         safety: SafetyRouter | None = None,
         controller: RuntimeController | None = None,
-        grounding: GroundingGate | None = None,
+        grounding: object | None = None,
+        conversation_runtime: ProductConversationRuntime | None = None,
         voice_pipeline: VoicePipeline | None = None,
         tts_pipeline: TtsPipeline | None = None,
         presentation_classifier: VoicePresentationClassifier | None = None,
@@ -120,16 +110,19 @@ class Application:
         self.controller = controller or RuntimeController(
             session_duration_seconds=settings.bot_session_duration_seconds
         )
-        # Deterministic Russian quotation/grounding policy owned by the
-        # Python orchestrator (aa.grounding). Production fails closed:
-        # exact Russian quotations require the version-pinned Russian
-        # corpus (issue #50); translation fallback stays disabled unless
-        # a caller explicitly allows it. The agent prompt states the
-        # user-facing duties and defers enforcement to this gate.
-        self.grounding = grounding or GroundingGate(corpus_version=settings.aa_corpus_version)
-        self._turn_runner: TurnRunner | None = None
+        # Kept only as an inert compatibility attribute for old tests/callers;
+        # production conversation semantics no longer invoke the old grounding
+        # object or any legacy orchestrator.
+        self.grounding = grounding
         self._index: HybridIndex | None = None
         self._index_error: str | None = None
+        self._conversation_runtime = conversation_runtime or ProductConversationRuntime(
+            client=self.opencode_runtime.client,
+            primary_model=settings.opencode_model,
+            fallback_model=settings.opencode_fallback_model,
+            index_loader=self._load_v2_index,
+            safety_check=self.safety.check,
+        )
         # Local voice recognition (issue #76): loaded once per worker and
         # reused for all turns. ``None`` means the voice capability is
         # unavailable; the text poller is unaffected.
@@ -154,9 +147,9 @@ class Application:
                 pass
         self._running = False
         self._fatal_error: BaseException | None = None
-        # Transport/orchestration only: the dispatcher calls the production
-        # #9 turn orchestrator via ``respond`` and never creates another
-        # LLM/provider client or knowledge pipeline.
+        # Transport only: every ordinary turn reaches the single production
+        # LangGraph boundary through ``respond``; hidden model calls reuse the
+        # one local OpenCode runtime via the thin v2 adapter.
         self.dispatcher = ChatTurnDispatcher(
             self._process_dispatched_update,
             max_concurrent_turns=settings.max_concurrent_turns,
@@ -306,6 +299,7 @@ class Application:
             await self.opencode_runtime.ensure_ready()
             await self.sessions.start()
             await self.safety.start()
+            await self._conversation_runtime.start()
             await self.dispatcher.start()
             # Voice capability loads once here and is reused for all turns.
             # Initialization failure disables voice only, never the poller.
@@ -322,6 +316,7 @@ class Application:
         except Exception:
             await self.transport.stop()
             await self.dispatcher.stop()
+            await self._conversation_runtime.stop()
             await self.safety.stop()
             await self.sessions.stop()
             await self.opencode_runtime.stop()
@@ -337,6 +332,7 @@ class Application:
             # Still ensure subcomponents are stopped for partial startups.
             await self.transport.stop()
             await self.dispatcher.stop()
+            await self._conversation_runtime.stop()
             await self.safety.stop()
             await self.sessions.stop()
             await self.opencode_runtime.stop()
@@ -352,6 +348,7 @@ class Application:
         # ``aa.telegram.dispatcher`` and ``docs/opencode-runtime.md``.
         await self.transport.stop()
         await self.dispatcher.stop()
+        await self._conversation_runtime.stop()
         await self.safety.stop()
         await self.sessions.stop()
         await self.opencode_runtime.stop()
@@ -415,7 +412,7 @@ class Application:
         """Run one dispatched turn inside that chat's serialized worker.
 
         Safety routing precedes normal AA handling; substantive turns call
-        the production #9 orchestrator via :meth:`respond` as the single
+        the production LangGraph runtime via :meth:`respond` as the single
         substantive-turn API. Session create/reset happens here, inside the
         per-chat serialization, so concurrent first messages cannot create
         competing sessions and ``/new`` cannot interleave with an older
@@ -446,12 +443,14 @@ class Application:
 
     async def _handle_new_command(self, incoming: TelegramIncoming) -> None:
         try:
-            await self.sessions.reset_opencode_session(
-                incoming.chat_id, self.opencode_runtime.client
-            )
+            await self._conversation_runtime.reset(incoming.chat_id)
+            self.sessions.reset(incoming.chat_id)
             reply = _NEW_REPLY
-        except OpenCodeError:
-            logger.warning("telegram new-session reset failed", extra={"chat_id": incoming.chat_id})
+        except (RuntimeError, OpenCodeError):
+            logger.warning(
+                "telegram new-session reset failed",
+                extra=self._thread_extra(incoming.chat_id),
+            )
             reply = _TEMPORARY_ERROR_REPLY
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
 
@@ -462,7 +461,7 @@ class Application:
         never split into multiple messages. When the final transport guard
         blocks an escaped overlong payload, a single bounded fallback is
         delivered instead. Substantive work goes through :meth:`respond`,
-        the single production #9 orchestrator entry point; this transport
+        the single production LangGraph runtime entry point; this transport
         layer never sends a substantive user message to OpenCode directly.
         """
         await self._respond_and_deliver(incoming, text=incoming.text, voice_input=False)
@@ -534,6 +533,34 @@ class Application:
             incoming, text=transcript, voice_input=True, voice_presentation=presentation
         )
 
+    async def _typing_heartbeat(self, chat_id: int) -> None:
+        """Refresh Telegram typing until the owning turn finishes delivery."""
+        interval = self.settings.telegram_typing_interval_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.transport.send_chat_action(chat_id, "typing")
+            except asyncio.CancelledError:
+                raise
+            except NotImplementedError:
+                return
+            except (TelegramApiError, TimeoutError, OSError):
+                logger.warning("telegram typing refresh failed", extra=self._thread_extra(chat_id))
+
+    async def _begin_typing(self, chat_id: int) -> asyncio.Task[None]:
+        """Send typing immediately, then start the independent refresh loop."""
+        try:
+            await self.transport.send_chat_action(chat_id, "typing")
+        except NotImplementedError:
+            pass
+        except (TelegramApiError, TimeoutError, OSError):
+            logger.warning("telegram typing start failed", extra=self._thread_extra(chat_id))
+        return asyncio.create_task(self._typing_heartbeat(chat_id))
+
+    @staticmethod
+    def _thread_extra(chat_id: int) -> dict[str, str]:
+        return {"v2_thread": thread_id_for_chat(chat_id)[:12]}
+
     async def _respond_and_deliver(
         self,
         incoming: TelegramIncoming,
@@ -542,47 +569,36 @@ class Application:
         voice_input: bool,
         voice_presentation: str | None = None,
     ) -> None:
-        """Run :meth:`respond` for one turn and deliver exactly one reply.
-
-        Voice turns (``voice_input=True``) request voice output: the
-        already-generated answer is synthesized locally and delivered via
-        ``sendVoice``. Any TTS/encoding/delivery failure deterministically
-        falls back to the same answer as text; the response is never
-        dropped. Text turns always receive text output. ``voice_presentation``
-        is an ephemeral acoustic routing signal for the current turn only
-        (never persisted); ``None``/``unknown``/error defaults to ``xenia``.
-        """
+        """Run one v2 turn and keep typing alive through confirmed delivery."""
         self.sessions.record_message(incoming.chat_id)
+        heartbeat = await self._begin_typing(incoming.chat_id)
         try:
-            if voice_input:
-                reply = await self.respond(incoming.chat_id, text, voice_input=True)
-            else:
-                # Text path keeps the exact historical call shape so the
-                # production boundary is unchanged for ordinary messages.
-                reply = await self.respond(incoming.chat_id, text)
-            if not reply.strip():
-                raise OpenCodeError("opencode returned an empty response")
-            if not meets_russian_only(reply):
+            try:
+                reply = await self.respond(incoming.chat_id, text, voice_input=voice_input)
+                if not reply.strip() or not contains_cyrillic(reply):
+                    raise ValueError("v2 reply violates Russian output boundary")
+            except OpenCodeRateLimitError:
+                raise
+            except (OpenCodeError, RuntimeError, ValueError):
                 logger.warning(
-                    "telegram reply failed closed on RU-only contract",
-                    extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
+                    "telegram message processing failed",
+                    extra=self._thread_extra(incoming.chat_id),
                 )
-                reply = FAIL_CLOSED_REPLY
-        except OpenCodeRateLimitError:
-            raise
-        except (OpenCodeError, ValueError):
-            logger.warning(
-                "telegram message processing failed",
-                extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
-            )
-            reply = _TEMPORARY_ERROR_REPLY
-        if voice_input:
-            delivered = await self._send_voice_reply(
-                incoming, reply, voice_presentation=voice_presentation
-            )
-            if delivered:
-                return
-        await self._send_text_reply(incoming, reply)
+                reply = _TEMPORARY_ERROR_REPLY
+
+            if voice_input:
+                delivered = await self._send_voice_reply(
+                    incoming, reply, voice_presentation=voice_presentation
+                )
+                if delivered:
+                    return
+            await self._send_text_reply(incoming, reply)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
 
     def _resolve_voice_for_turn(self, presentation: str | None = None) -> str:
         """Resolve the TTS voice for one turn (issue #78 opposite-voice rule).
@@ -674,21 +690,16 @@ class Application:
                 extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
             )
 
-    def _turn_index(self) -> HybridIndex:
-        """Open (once) the RU-first hybrid index or fail closed.
-
-        The opened index is reused across ordinary turns; provider
-        failures never invalidate or rebuild it here.
-        """
+    def _load_v2_index(self) -> HybridIndex:
+        """Open and cache the canonical RU-first retrieval index for LangGraph."""
         if self._index is not None:
             return self._index
         if self._index_error is not None:
-            raise TurnFailed("corpus-unavailable", self._index_error)
+            raise RuntimeError(self._index_error)
         try:
             corpus_root = Path(self.settings.aa_corpus_path)
-            index_dir = corpus_root / "generated" / "retrieval"
             self._index = open_hybrid_index(
-                index_dir,
+                corpus_root / "generated" / "retrieval",
                 ru_manifest_path=corpus_root / "canonical.ru.manifest.json",
                 en_manifest_path=corpus_root / "canonical.manifest.json",
                 lock_path=corpus_root / "embedding.lock.json",
@@ -696,259 +707,30 @@ class Application:
             return self._index
         except (ValueError, OSError, RuntimeError) as exc:
             self._index_error = str(exc)
-            raise TurnFailed("corpus-unavailable", self._index_error) from exc
-
-    def _get_turn_runner(self) -> TurnRunner:
-        """Build the deterministic turn runner for the pinned runtime."""
-        if self._turn_runner is not None and self._turn_runner.index is not None:
-            return self._turn_runner
-        self._index_error = None
-        try:
-            index: HybridIndex | None = self._turn_index()
-        except TurnFailed:
-            index = None
-        runner = TurnRunner(
-            index=index,
-            ru_corpus_version=self.settings.aa_corpus_version,
-            agent=self.settings.opencode_agent,
-            primary_model=self.settings.opencode_model,
-            fallback_model=self.settings.opencode_fallback_model,
-            generation_budget_tokens=resolve_generation_budget(
-                self.settings.opencode_max_output_tokens
-            ),
-        )
-        if runner.index is not None:
-            self._turn_runner = runner
-        return runner
-
-    async def _run_trivial_turn(
-        self, session_id: str, text: str, *, voice_mode: bool = False
-    ) -> str:
-        """Execute the direct bounded agent path for one non-substantive turn."""
-        client = self.opencode_runtime.client
-
-        async def _trivial_send(
-            sid: str,
-            prompt: str,
-            *,
-            agent: str = "",
-            model: str = "",
-            timeout: float | None = None,
-        ) -> str:
-            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
-
-        synthesis = await run_trivial_turn(
-            text,
-            session_id=session_id,
-            send=_trivial_send,
-            agent=self.settings.opencode_agent,
-            primary_model=self.settings.opencode_model,
-            fallback_model=self.settings.opencode_fallback_model,
-            voice_mode=voice_mode,
-        )
-        return synthesis.text
-
-    async def _run_grounded_turn(
-        self, session_id: str, text: str, *, voice_mode: bool = False
-    ) -> str:
-        """Execute the production grounded pipeline for one substantive turn."""
-        runner = self._get_turn_runner()
-        if runner.index is None:
-            raise TurnFailed("corpus-unavailable", "RU corpus/index is unavailable")
-        client = self.opencode_runtime.client
-
-        async def _send(
-            sid: str,
-            prompt: str,
-            *,
-            agent: str = "",
-            model: str = "",
-            timeout: float | None = None,
-        ) -> str:
-            return await client.send_message(sid, prompt, timeout=timeout, agent=agent, model=model)
-
-        try:
-            response = await runner.run_grounded_turn(
-                text, session_id=session_id, send=_send, voice_mode=voice_mode
-            )
-        except TurnFailed as exc:
-            if exc.category == "session-not-found":
-                raise
-            raise
-        return response.text
+            raise RuntimeError(self._index_error) from exc
 
     async def respond(self, chat_id: int, text: str, *, voice_input: bool = False) -> str:
-        """Answer one inbound message with emergency precedence.
-
-        ``voice_input`` marks turns transcribed from Telegram voice notes
-        and requests voice output. Ordinary non-emergency voice turns use
-        the #77 concise voice mode (2-4 short sentences, at most 4
-        sentences / 80 words, enforced in generation with one compact
-        regeneration); emergency replies may exceed that bound. Text
-        turns always receive text output with the unchanged boundary.
-
-        The deterministic safety layer runs first: when it takes the
-        emergency route, the bounded safe reply is returned immediately
-        and no OpenCode work is scheduled (the LLM never decides whether
-        the emergency route is taken). Substantive turns run the full
-        Russian-first grounded pipeline (issue #9); non-substantive
-        greetings take a direct bounded agent path. Retrieval/grounding
-        failures fail closed with a fixed message instead of an invented
-        answer.
-
-        Only message lengths, routing decisions and the voice flag are
-        logged, never the message body.
-
-        Every returned reply is deterministically confined to the #83
-        hard Telegram envelope (``<= 900`` graphemes / ``<= 130`` words,
-        verbatim quote aggregate ``<= 300`` chars). The orchestrator owns
-        compact regeneration for grounded turns; this boundary applies a
-        final complete-unit compaction so emergency, trivial, grounded,
-        and fail-closed paths all satisfy the same cap. Replies are
-        returned as a single message; overflow is never split.
-        """
+        """Answer one turn through deterministic safety then the v2 LangGraph."""
         logger.info(
-            "turn started",
-            extra={"chat_id": chat_id, "voice_input": voice_input, "text_len": len(text)},
+            "v2 turn started",
+            extra={**self._thread_extra(chat_id), "voice_input": voice_input, "text_len": len(text)},
         )
-        result, _emergency_reply = self.safety.route(text)
+        result = self.safety.check(text)
         if result.decision is SafetyDecision.EMERGENCY and result.classification is not None:
-            # Production Telegram runtime is RU-only: the emergency reply
-            # is always the deterministic Russian template, regardless of
-            # the detected input language. No English fallback may leak.
             logger.info(
                 "emergency response served",
-                extra={"chat_id": chat_id, "reason": result.reason},
+                extra={**self._thread_extra(chat_id), "reason": result.reason},
             )
             return self._fit_envelope(
                 build_emergency_response(result.classification, language="ru")
             )
         if result.decision is SafetyDecision.BLOCK:
-            logger.info("blocked message refused", extra={"chat_id": chat_id})
             raise ValueError("refusing to answer an empty message")
-        # Meta/capability/identity turns are conversational, never
-        # book-grounded: serve the bounded deterministic capability reply
-        # without retrieval, grounding, or model dependence so they cannot
-        # fail closed as unsupported book answers (issues #105/#106).
-        if is_meta_capability_request(text):
-            await self.sessions.ensure_opencode_session(chat_id, self.opencode_runtime.client)
-            logger.info("meta capability response served", extra={"chat_id": chat_id})
-            return self._fit_envelope(META_CAPABILITY_REPLY)
-        session_id = await self.sessions.ensure_opencode_session(
-            chat_id, self.opencode_runtime.client
-        )
-        voice_mode = bool(voice_input)
-        try:
-            if not is_substantive(text):
-                try:
-                    trivial_reply = await self._run_trivial_turn(
-                        session_id, text, voice_mode=voice_mode
-                    )
-                except TurnFailed as exc:
-                    if exc.category == "session-not-found":
-                        try:
-                            session_id = await self.sessions.reset_opencode_session(
-                                chat_id, self.opencode_runtime.client, delete_remote=False
-                            )
-                            trivial_reply = await self._run_trivial_turn(
-                                session_id, text, voice_mode=voice_mode
-                            )
-                        except OpenCodeSessionNotFoundError as exc2:
-                            raise TurnFailed(
-                                "session-not-found", "opencode session is gone"
-                            ) from exc2
-                    else:
-                        raise
-                if not meets_russian_only(trivial_reply):
-                    logger.warning(
-                        "trivial turn failed closed on RU-only contract",
-                        extra={"chat_id": chat_id},
-                    )
-                    return FAIL_CLOSED_REPLY
-                logger.info("trivial response served", extra={"chat_id": chat_id})
-                return self._fit_envelope(trivial_reply)
-            try:
-                reply = await self._run_grounded_turn(session_id, text, voice_mode=voice_mode)
-            except TurnFailed as exc:
-                if exc.category == "session-not-found":
-                    try:
-                        session_id = await self.sessions.reset_opencode_session(
-                            chat_id, self.opencode_runtime.client, delete_remote=False
-                        )
-                        reply = await self._run_grounded_turn(
-                            session_id, text, voice_mode=voice_mode
-                        )
-                    except OpenCodeSessionNotFoundError as exc2:
-                        raise TurnFailed("session-not-found", "opencode session is gone") from exc2
-                else:
-                    raise
-        except TurnFailed as exc:
-            logger.warning(
-                "grounded turn failed closed",
-                extra={"chat_id": chat_id, "category": exc.category},
-            )
-            return FAIL_CLOSED_REPLY
-        except OpenCodeSessionNotFoundError:
-            # A local chat mapping can outlive an OpenCode session after a
-            # runtime restart. Rebind once and retry against a fresh session,
-            # preserving the original routing: non-substantive greetings retry
-            # through the direct trivial path (never the RU grounded pipeline).
-            try:
-                session_id = await self.sessions.reset_opencode_session(
-                    chat_id, self.opencode_runtime.client, delete_remote=False
-                )
-            except OpenCodeSessionNotFoundError:
-                logger.warning(
-                    "grounded turn failed closed after rebind",
-                    extra={"chat_id": chat_id, "category": "session-not-found"},
-                )
-                return FAIL_CLOSED_REPLY
-            if not is_substantive(text):
-                try:
-                    trivial_retry = await self._run_trivial_turn(
-                        session_id, text, voice_mode=voice_mode
-                    )
-                except TurnFailed as exc:
-                    logger.warning(
-                        "trivial turn failed closed after rebind",
-                        extra={"chat_id": chat_id, "category": exc.category},
-                    )
-                    return FAIL_CLOSED_REPLY
-                except OpenCodeSessionNotFoundError:
-                    logger.warning(
-                        "trivial turn failed closed after rebind",
-                        extra={"chat_id": chat_id, "category": "session-not-found"},
-                    )
-                    return FAIL_CLOSED_REPLY
-                if not meets_russian_only(trivial_retry):
-                    logger.warning(
-                        "trivial turn failed closed on RU-only contract after rebind",
-                        extra={"chat_id": chat_id},
-                    )
-                    return FAIL_CLOSED_REPLY
-                logger.info("trivial response served", extra={"chat_id": chat_id})
-                return self._fit_envelope(trivial_retry)
-            try:
-                reply = await self._run_grounded_turn(session_id, text, voice_mode=voice_mode)
-            except TurnFailed as exc:
-                logger.warning(
-                    "grounded turn failed closed after rebind",
-                    extra={"chat_id": chat_id, "category": exc.category},
-                )
-                return FAIL_CLOSED_REPLY
-            except OpenCodeSessionNotFoundError:
-                logger.warning(
-                    "grounded turn failed closed after rebind",
-                    extra={"chat_id": chat_id, "category": "session-not-found"},
-                )
-                return FAIL_CLOSED_REPLY
-        if not meets_russian_only(reply):
-            logger.warning(
-                "grounded turn failed closed on RU-only contract",
-                extra={"chat_id": chat_id},
-            )
-            return FAIL_CLOSED_REPLY
-        logger.info("normal response served", extra={"chat_id": chat_id})
+
+        reply = await self._conversation_runtime.respond(chat_id, text)
+        if not contains_cyrillic(reply):
+            raise ValueError("v2 graph returned a non-Russian reply")
+        logger.info("v2 response served", extra=self._thread_extra(chat_id))
         return self._fit_envelope(reply)
 
     @staticmethod
