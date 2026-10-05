@@ -9,7 +9,10 @@ import pytest
 import aa.conversation.model_adapter as adapter_mod
 from aa.conversation.model_adapter import OpenCodeChatModel
 from aa.opencode.client import SessionInfo
-from aa.opencode.errors import OpenCodeProviderAccessError, OpenCodeRateLimitError, OpenCodeTransientError
+from aa.opencode.errors import (
+    OpenCodeProviderAccessError,
+    OpenCodeRateLimitError,
+)
 
 PRIMARY = "opencode/space-bunny-free"
 FALLBACK = "opencode/muse-spark-1.3-contributor-free"
