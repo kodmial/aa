@@ -294,7 +294,23 @@ jobs:
           # emits result.json (INCOMPLETE when prerequisites are missing) so
           # the #130 marker below is always published.
           mkdir -p eval-real-book-out
-          if ! printf '%s' "$AA_EVAL_RECIPIENT" | grep -Eq '^age1[0-9a-z]+          set +e
+          case "$AA_EVAL_RECIPIENT" in
+            age1*) ;;
+            *)
+              python3 - <<'PY'
+          import json
+          import os
+          out = "eval-real-book-out/result.json"
+          payload = {"result": "INCOMPLETE", "reason": "committed age recipient is missing or invalid", "main_sha": os.environ.get("EXACT_SHA", "")}
+          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print("committed age recipient invalid; qualification yields INCOMPLETE, never PASS", flush=True)
+          PY
+              echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"
+              cat eval-real-book-out/result.json
+              exit 0
+              ;;
+          esac
+          set +e
           python3 scripts/run_real_book_retrieval_qualification.py \
             --main-sha "$EXACT_SHA" \
             --out-dir eval-real-book-out \
