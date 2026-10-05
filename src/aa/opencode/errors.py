@@ -69,6 +69,13 @@ class OpenCodeDeterministicError(OpenCodeError):
     transient = False
 
 
+class OpenCodeProviderAccessError(OpenCodeDeterministicError):
+    """Provider/model access rejection where trying a configured fallback is valid."""
+
+    kind = "provider-access"
+    transient = False
+
+
 class OpenCodeSessionNotFoundError(OpenCodeDeterministicError):
     """The referenced OpenCode session id does not exist."""
 
@@ -129,6 +136,12 @@ def classify_provider_error(error: Mapping[str, Any] | None) -> OpenCodeError:
         return OpenCodeTransientError(
             f"opencode provider error is retryable: http={status_code or 'unknown'}"
         )
+    if status_code == 403:
+        # A model/provider access rejection can be SKU-specific (for example
+        # an unavailable/free-tier route) while a separately configured
+        # fallback model remains usable. The request shape itself is valid,
+        # so let the model adapter try that fallback exactly once.
+        return OpenCodeProviderAccessError("opencode provider access rejected: http=403")
     return OpenCodeDeterministicError(
         f"opencode provider error is deterministic: http={status_code or 'unknown'}"
     )
