@@ -32,7 +32,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict, PrivateAttr
 
 from aa.opencode.client import OpenCodeClient
-from aa.opencode.errors import (OpenCodeError, OpenCodeProviderAccessError, OpenCodeTimeoutError, OpenCodeTransientError)
+from aa.opencode.errors import (OpenCodeError, OpenCodeProviderAccessError, OpenCodeRateLimitError, OpenCodeTimeoutError, OpenCodeTransientError)
 
 logger = logging.getLogger("aa.conversation.model_adapter")
 
@@ -240,6 +240,8 @@ class OpenCodeChatModel(BaseChatModel):
                     await asyncio.sleep(delay)
                     continue
                 break
+            except OpenCodeRateLimitError:
+                raise
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
                 if transient_attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
@@ -296,6 +298,8 @@ class OpenCodeChatModel(BaseChatModel):
                     await asyncio.sleep(delay)
                     continue
                 break
+            except OpenCodeRateLimitError:
+                raise
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
                 if transient_attempt < len(MODEL_TRANSIENT_RETRY_DELAYS):
