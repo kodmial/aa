@@ -662,16 +662,21 @@ def retrieve_evidence(
     query. The answering model receives only the returned exact
     passages; ``retrieval_metadata`` stays internal.
 
-    When ``config`` is omitted, ordinary turns use the optimized
-    interactive pool (``interactive_retrieval_config``, 16 BGE
-    candidates) instead of the frozen full-quality 64-candidate default:
-    CPU BGE cost scales linearly, so the default hot path issues ~4x
-    fewer forwards than the ~21-22s warm p50/p95 validation recorded
-    against the 5s budget. The frozen BGE validation must pass an
-    explicit full-quality ``RetrievalConfig()`` so its numbers stay
-    comparable.
+    When ``config`` is omitted, the frozen full-quality default
+    (``RetrievalConfig()``, 64 BGE candidates) is used: with 10..16
+    planner queries, per-query retention alone can fill a 16-cap pool
+    before global RRF fill runs, leaving only per-query bests and
+    losing RRF-ranked depth versus the validated configuration. The
+    optimized interactive pool (``interactive_retrieval_config``, 16
+    candidates) must be passed explicitly for the turn hot path, where
+    CPU BGE cost scales linearly (~4x fewer forwards than the ~21-22s
+    warm p50/p95 validation recorded against the 5s budget).
+    Production wiring additionally requires explicit performance
+    acceptance or optimization before cutover; the frozen BGE
+    validation stays on the full-quality config so its numbers stay
+    comparable and the latency gate stays failed/blocked.
     """
-    active = config if config is not None else interactive_retrieval_config()
+    active = config if config is not None else RetrievalConfig()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
         raise EvidenceError("branch_top_k and rrf_k must be > 0")
     if active.reranker_pool_cap <= 0 or active.post_rerank_child_cap <= 0:
