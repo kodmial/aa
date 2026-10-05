@@ -67,8 +67,10 @@ V2_EVAL_SET_VERSION = "aa-v2-conversational-eval/1"
 # evidence pipeline so the gate and per-turn metadata share one value.
 # The frozen BGE validation records ~20-22s p50/p95 per case, far above
 # interactive expectations: cutover requires explicit performance
-# acceptance or optimization (smaller reranker pool, quantized/GPU
-# serving, or a documented higher budget) before this gate can pass.
+# acceptance or optimization (aa.retrieval.evidence
+# .interactive_retrieval_config with a 16-candidate BGE pool, exact
+# text-dedup in BGE scoring, quantized/GPU serving, or a documented
+# higher budget) before this gate can pass.
 V2_TARGET_P95_LATENCY_BUDGET_MS = INTERACTIVE_LATENCY_BUDGET_MS
 
 # Production cutover is explicitly out of scope for #116. The committed

@@ -512,7 +512,13 @@ class CrossEncoderReranker:
         return _offline_scores(query, texts)
 
     def _score_flag(self, query: str, texts: list[str]) -> list[float]:
-        pairs = [[query, text] for text in texts]
+        # Exact-score dedup: identical child texts share one BGE forward
+        # (eval-mode inference is deterministic for identical pairs), so
+        # repeated spans cost one scoring instead of N. Order preserved.
+        unique_texts: list[str] = list(dict.fromkeys(texts))
+        index_of: dict[str, int] = {text: pos for pos, text in enumerate(unique_texts)}
+        positions = [index_of[text] for text in texts]
+        pairs = [[query, text] for text in unique_texts]
         raw_scores: list[float] = []
         try:
             with _RERANKER_SCORE_LOCK:
@@ -548,17 +554,18 @@ class CrossEncoderReranker:
         except Exception as exc:
             raise RerankerError(f"FlagEmbedding reranker scoring failed: {exc}") from exc
         try:
-            scores = [float(value) for value in raw_scores]
+            unique_scores = [float(value) for value in raw_scores]
         except (TypeError, ValueError, ArithmeticError) as exc:
             raise RerankerError(f"FlagEmbedding reranker returned no scores: {exc}") from exc
-        if len(scores) != len(texts):
+        if len(unique_scores) != len(unique_texts):
             raise RerankerError(
-                f"FlagEmbedding reranker returned {len(scores)} scores for {len(texts)} candidates"
+                f"FlagEmbedding reranker returned {len(unique_scores)} scores "
+                f"for {len(unique_texts)} unique candidates"
             )
-        for score in scores:
+        for score in unique_scores:
             if not math.isfinite(score):
                 raise RerankerError("FlagEmbedding reranker returned non-finite scores")
-        return scores
+        return [unique_scores[pos] for pos in positions]
 
 
 _RERANKER_SINGLETONS: dict[str, CrossEncoderReranker] = {}

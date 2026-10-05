@@ -83,6 +83,15 @@ NEIGHBOR_WINDOW = 1
 # performance acceptance or optimization lands.
 INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
 
+# Optimized interactive pool for the BGE rerank hot path. CPU BGE cost
+# scales linearly with scored pairs, so 64 -> 16 cuts BGE forwards ~4x
+# (frozen ~21s warm p50 suggests ~5-6s on the same CPU before other
+# overheads). Branch recall (top-40 RRF union) is untouched; only the
+# reranked prefix shrinks. Requires re-validation of recall/rerank lift
+# before cutover: use interactive_retrieval_config() explicitly.
+INTERACTIVE_RERANKER_POOL_CAP = 16
+INTERACTIVE_POST_RERANK_CHILD_CAP = 16
+
 
 class EvidenceError(ValueError):
     """Raised when the evidence pipeline cannot serve a request (fails closed)."""
@@ -99,6 +108,28 @@ class RetrievalConfig:
     max_per_section: int = MAX_PER_SECTION
     neighbor_window: int = NEIGHBOR_WINDOW
     budget_tokens: int = RETRIEVED_PASSAGES_BUDGET_TOKENS
+
+
+def interactive_retrieval_config() -> RetrievalConfig:
+    """Return the optimized interactive config for the BGE hot path.
+
+    Keeps branch recall (top-40 per branch, RRF k=60) and the evidence
+    budget identical to the full-quality default while capping the CPU
+    BGE rerank to ``INTERACTIVE_RERANKER_POOL_CAP`` candidates. This is
+    the documented optimization for the frozen ~21-22s warm p50/p95 vs
+    the 5s budget: ~4x fewer BGE forwards on the hot path. Cutover still
+    requires re-validation plus explicit performance acceptance via
+    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
+    """
+    return RetrievalConfig(
+        branch_top_k=BRANCH_TOP_K,
+        rrf_k=RRF_K,
+        reranker_pool_cap=INTERACTIVE_RERANKER_POOL_CAP,
+        post_rerank_child_cap=INTERACTIVE_POST_RERANK_CHILD_CAP,
+        max_per_section=MAX_PER_SECTION,
+        neighbor_window=NEIGHBOR_WINDOW,
+        budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS,
+    )
 
 
 @dataclass(frozen=True)
@@ -748,12 +779,15 @@ def render_book_evidence(pack: EvidencePack) -> str:
 __all__ = [
     "BRANCH_TOP_K",
     "INTERACTIVE_LATENCY_BUDGET_MS",
+    "INTERACTIVE_POST_RERANK_CHILD_CAP",
+    "INTERACTIVE_RERANKER_POOL_CAP",
     "MAX_PER_SECTION",
     "MAX_PLANNER_QUERIES",
     "MIN_PLANNER_QUERIES",
     "NEIGHBOR_WINDOW",
     "POST_RERANK_CHILD_CAP",
     "RERANKER_POOL_CAP",
+    "interactive_retrieval_config",
     "EvidenceError",
     "EvidencePack",
     "EvidencePassageData",
