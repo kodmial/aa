@@ -59,7 +59,7 @@ from aa.qualification.real_book_retrieval import (  # noqa: E402
     assert_no_oracle_leak,
     assert_no_reranker,
     assert_source_exact,
-    benchmark_checksums,
+    benchmark_binding_checksum,
     build_protected_payload,
     build_result_marker,
     corpus_checksum,
@@ -120,49 +120,85 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _input_turns(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    turns: list[tuple[str, str]] = []
+def _oracle_by_case(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index evaluation-only oracle records by case id.
+
+    Oracle data is used only to select book-required retrieval cases and to
+    score canonical regions. It is never included in planner/model inputs.
+    """
+    indexed: dict[str, dict[str, Any]] = {}
     for record in records[1:]:
         rtype = record.get("type")
         if rtype == "single_turn":
-            assert_no_oracle_leak(record, str(record.get("id", "single")))
-            turns.append((str(record["id"]), str(record["utterance"])))
-        elif rtype == "multi_turn_journey":
-            assert_no_oracle_leak(record, str(record.get("id", "journey")))
-            for entry in record.get("turns", []):
-                if not isinstance(entry, dict):
-                    raise RealBookRetrievalError("journey entry must be an object")
-                assert_no_oracle_leak(entry, str(record.get("id", "journey")))
-                if entry.get("kind") != "user":
-                    continue
-                case_id = f"{record['id']}#{entry['turn']}"
-                turns.append((case_id, str(entry["utterance"])))
-    return turns
-
-
-def _oracle_regions(records: list[dict[str, Any]]) -> dict[str, set[str]]:
-    regions: dict[str, set[str]] = {}
-    for record in records[1:]:
-        rtype = record.get("type")
-        if rtype == "single_turn":
-            case_id = str(record["id"])
-            provenances = record.get("provenance_ids", [])
-            regions[case_id] = {str(item) for item in provenances if str(item)}
+            indexed[str(record["id"])] = dict(record)
         elif rtype == "multi_turn_journey":
             journey = str(record["id"])
             for entry in record.get("turns", []):
                 if not isinstance(entry, dict):
                     continue
-                case_id = f"{journey}#{entry['turn']}"
-                provenances = entry.get("provenance_ids", [])
-                regions[case_id] = {str(item) for item in provenances if str(item)}
+                indexed[f"{journey}#{entry['turn']}"] = dict(entry)
+    return indexed
+
+
+def _input_turns(
+    records: list[dict[str, Any]],
+    oracle_by_case: dict[str, dict[str, Any]],
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Project Product Contract v1.2 to book-required retrieval turns.
+
+    Journey context contains only prior generator-visible user utterances.
+    A session_reset control clears that context. No oracle fields are copied
+    into planner inputs.
+    """
+    turns: list[tuple[str, str, tuple[str, ...]]] = []
+    for record in records[1:]:
+        rtype = record.get("type")
+        if rtype == "single_turn":
+            assert_no_oracle_leak(record, str(record.get("id", "single")))
+            case_id = str(record["id"])
+            oracle = oracle_by_case.get(case_id, {})
+            if oracle.get("book_content") == "required":
+                turns.append((case_id, str(record["utterance"]), ()))
+        elif rtype == "multi_turn_journey":
+            assert_no_oracle_leak(record, str(record.get("id", "journey")))
+            history: list[str] = []
+            for entry in record.get("turns", []):
+                if not isinstance(entry, dict):
+                    raise RealBookRetrievalError("journey entry must be an object")
+                assert_no_oracle_leak(entry, str(record.get("id", "journey")))
+                if entry.get("kind") == "control":
+                    if entry.get("control") == "session_reset":
+                        history.clear()
+                    continue
+                if entry.get("kind") != "user":
+                    continue
+                case_id = f"{record['id']}#{entry['turn']}"
+                utterance = str(entry["utterance"])
+                oracle = oracle_by_case.get(case_id, {})
+                if oracle.get("book_content") == "required":
+                    turns.append((case_id, utterance, tuple(history)))
+                history.append(utterance)
+    return turns
+
+
+def _oracle_regions(oracle_by_case: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    regions: dict[str, set[str]] = {}
+    for case_id, record in oracle_by_case.items():
+        provenances = record.get("provenance_ids", [])
+        regions[case_id] = {str(item) for item in provenances if str(item)}
     return regions
 
 
 async def _plan_with_production_adapter(
-    utterance: str, *, primary_model: str, fallback_model: str
+    utterance: str,
+    *,
+    primary_model: str,
+    fallback_model: str,
+    recent_user_turns: tuple[str, ...] = (),
 ) -> list[str]:
     """Invoke the real mandatory planner via the production adapter/profile."""
+    from langchain_core.messages import HumanMessage
+
     from aa.conversation.model_adapter import PLANNER_AGENT_V2, OpenCodeChatModel
     from aa.conversation.planner_node import query_plan_json_schema, run_planner
     from aa.opencode.client import HttpOpenCodeClient
@@ -178,7 +214,8 @@ async def _plan_with_production_adapter(
         primary_model=primary_model,
         fallback_model=fallback_model,
     )
-    plan = await run_planner(utterance, model=model)
+    recent = [HumanMessage(content=item) for item in recent_user_turns]
+    plan = await run_planner(utterance, model=model, recent=recent)
     _ = query_plan_json_schema()
     return list(plan.queries)
 
@@ -336,8 +373,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         corpus_sha = corpus_checksum(ROOT)
-        checksums = benchmark_checksums(ROOT)
-        benchmark_sha = checksums["input"]
+        benchmark_sha = benchmark_binding_checksum(ROOT)
         retrieval_sha = production_retrieval_checksum(ROOT)
     except RealBookRetrievalError as exc:
         return _fail_incomplete(out_dir, reason=str(exc), main_sha=expected_sha)
@@ -358,10 +394,10 @@ def main(argv: list[str] | None = None) -> int:
             main_sha=expected_sha,
         )
 
-    primary_model = os.environ.get(
-        "OPENCODE_MODEL", "opencode/muse-spark-1.3-contributor-free"
-    ).strip()
-    fallback_model = os.environ.get("OPENCODE_FALLBACK_MODEL", "").strip()
+    from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+
+    primary_model = (os.environ.get("OPENCODE_MODEL") or DEFAULT_PRIMARY_MODEL).strip()
+    fallback_model = (os.environ.get("OPENCODE_FALLBACK_MODEL") or DEFAULT_FALLBACK_MODEL).strip()
     if not primary_model:
         return _fail_incomplete(
             out_dir, reason="OPENCODE_MODEL is not configured", main_sha=expected_sha
@@ -407,18 +443,40 @@ def main(argv: list[str] | None = None) -> int:
     except RealBookRetrievalError as exc:
         return _fail_incomplete(out_dir, reason=str(exc), main_sha=expected_sha)
 
-    turns = _input_turns(input_records)
+    oracle_by_case = _oracle_by_case(oracle_records)
+    turns = _input_turns(input_records, oracle_by_case)
     if args.limit and args.limit > 0:
         turns = turns[: args.limit]
     if not turns:
-        return _fail_incomplete(out_dir, reason="benchmark has no turns", main_sha=expected_sha)
-    oracle_regions = _oracle_regions(oracle_records)
+        return _fail_incomplete(
+            out_dir, reason="benchmark has no book-required retrieval turns", main_sha=expected_sha
+        )
+    oracle_regions = _oracle_regions(oracle_by_case)
+
+    from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig
+
+    runtime = LocalOpenCodeRuntime(
+        OpenCodeConfig(
+            base_url=os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096"),
+            command=os.environ.get("OPENCODE_COMMAND", "opencode"),
+            workdir=os.environ.get("OPENCODE_WORKDIR", str(ROOT)),
+            model=primary_model,
+        )
+    )
+    try:
+        asyncio.run(runtime.start())
+    except Exception as exc:
+        return _fail_incomplete(
+            out_dir,
+            reason=f"opencode runtime startup failed: {type(exc).__name__}",
+            main_sha=expected_sha,
+        )
 
     config = RetrievalConfig()
     diagnostics: list[TurnDiagnostics] = []
     infra_failures = 0
     try:
-        for case_id, utterance in turns:
+        for case_id, utterance, recent_user_turns in turns:
             if not utterance.strip():
                 infra_failures += 1
                 continue
@@ -428,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
                         utterance,
                         primary_model=primary_model,
                         fallback_model=fallback_model,
+                        recent_user_turns=recent_user_turns,
                     )
                 )
             except Exception as exc:
@@ -487,6 +546,10 @@ def main(argv: list[str] | None = None) -> int:
             from aa.retrieval.index import close_hybrid_index
 
             close_hybrid_index(index)
+        except Exception:
+            pass
+        try:
+            asyncio.run(runtime.stop())
         except Exception:
             pass
 
