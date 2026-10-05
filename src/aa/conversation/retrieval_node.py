@@ -40,14 +40,28 @@ from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
 from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
+    INTERACTIVE_RERANKER_POOL_CAP,
     EvidencePack,
     RetrievalConfig,
+    interactive_retrieval_config,
     retrieve_evidence,
 )
 from aa.retrieval.index import HybridIndex, logical_chunk_id
 from aa.retrieval.reranker import CrossEncoderReranker
 
 logger = logging.getLogger("aa.conversation.retrieval_node")
+
+
+def _resolve_retrieval_config(config: RetrievalConfig | None) -> RetrievalConfig:
+    """Return the active retrieval config (interactive 16-cap by default).
+
+    Production turns default to the optimized interactive pool (~4x fewer
+    CPU BGE forwards than the frozen 64-candidate validation) instead of
+    silently inheriting the slow full-quality default. Explicit configs
+    are honored unchanged so the frozen benchmark can keep validating
+    the full-quality path.
+    """
+    return config if config is not None else interactive_retrieval_config()
 
 
 def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -126,9 +140,12 @@ async def retrieval_node(
     The per-turn wall-clock latency against
     ``INTERACTIVE_LATENCY_BUDGET_MS`` is propagated in state
     (``retrieval_latency_ms``/``retrieval_over_budget``) so an over-budget
-    BGE turn (~20-22s warm p50/p95 vs the 5s budget) can never be mistaken
-    for interactive serving downstream; only counts and latencies are
-    logged, never prompts or user text.
+    BGE turn (~20-22s warm p50/p95 for the frozen 64-candidate validation
+    vs the 5s budget) can never be mistaken for interactive serving
+    downstream; only counts and latencies are logged, never prompts or
+    user text. When ``config`` is omitted the optimized interactive pool
+    (``reranker_pool_cap`` 16) is used instead of the slow full-quality
+    default.
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -143,9 +160,10 @@ async def retrieval_node(
             "retrieval_latency_ms": 0.0,
             "retrieval_over_budget": False,
         }
+    active_config = _resolve_retrieval_config(config)
     started = time.perf_counter()
     pack = await asyncio.to_thread(
-        retrieve_evidence, index, queries, config=config, reranker=reranker
+        retrieve_evidence, index, queries, config=active_config, reranker=reranker
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
@@ -188,24 +206,31 @@ def make_retrieval_node(
     """Build the evidence retrieval node bound to one RAM-resident index.
 
     ``performance_accepted=True`` records explicit acceptance of the
-    ~20-22s warm BGE latency against the 5s interactive budget; the
-    default (``False``) fails closed via
+    frozen ~20-22s warm BGE latency (64-candidate validation) against the
+    5s interactive budget; the default (``False``) fails closed via
     ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``
-    instead of wiring the slow path into production.
+    instead of wiring the slow path into production. The bound config
+    defaults to the optimized interactive pool (16 candidates, ~4x fewer
+    CPU BGE forwards); an explicit full-quality 64-candidate config is
+    rejected even with acceptance until the reduced prefix is
+    re-validated.
     """
     from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
 
-    require_v2_cutover_acceptance(performance_accepted=performance_accepted)
+    active_config = _resolve_retrieval_config(config)
+    require_v2_cutover_acceptance(performance_accepted=performance_accepted, config=active_config)
     logger.warning(
         "v2 retrieval wired with explicit performance acceptance",
         extra={
             "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
             "expected_warm_p95_ms": 22472,
+            "reranker_pool_cap": active_config.reranker_pool_cap,
+            "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
         },
     )
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
-        return await retrieval_node(state, index=index, reranker=reranker, config=config)
+        return await retrieval_node(state, index=index, reranker=reranker, config=active_config)
 
     return run_evidence_retrieval
 

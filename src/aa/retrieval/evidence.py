@@ -132,6 +132,18 @@ def interactive_retrieval_config() -> RetrievalConfig:
     )
 
 
+def is_interactive_config(config: RetrievalConfig) -> bool:
+    """Return True when ``config`` respects the interactive BGE pool cap.
+
+    The frozen 64-candidate validation exceeds the 5s budget, so only
+    configs at or below ``INTERACTIVE_RERANKER_POOL_CAP`` qualify as the
+    optimized production path. Branch recall parameters are intentionally
+    not constrained here: the interactive optimization only shrinks the
+    reranked prefix.
+    """
+    return config.reranker_pool_cap <= INTERACTIVE_RERANKER_POOL_CAP
+
+
 @dataclass(frozen=True)
 class EvidencePassageData:
     """One coherent expanded passage of exact canonical Russian text."""
@@ -788,6 +800,7 @@ __all__ = [
     "POST_RERANK_CHILD_CAP",
     "RERANKER_POOL_CAP",
     "interactive_retrieval_config",
+    "is_interactive_config",
     "EvidenceError",
     "EvidencePack",
     "EvidencePassageData",

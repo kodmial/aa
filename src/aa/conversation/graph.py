@@ -195,14 +195,18 @@ def build_turn_graph(
     (multi-query hybrid plus pinned local BGE rerank plus small-to-big
     Evidence Pack selection) instead of the ``retrieval_stub`` no-op.
     ``reranker`` (one long-lived worker instance) and
-    ``retrieval_config`` are forwarded when provided. The legacy
+    ``retrieval_config`` are forwarded when provided, defaulting to the
+    optimized interactive pool (16 BGE candidates, ~4x fewer CPU forwards
+    than the frozen 64-candidate validation). The legacy
     production path stays untouched until the later cutover task:
-    the v2 BGE path exceeds the 5s interactive budget (~20-22s warm
-    p50/p95) so production cutover stays blocked pending explicit
-    performance acceptance or optimization. Binding ``retrieval_index``
-    therefore requires ``performance_accepted=True`` and fails closed
-    otherwise via
-    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
+    the frozen v2 BGE validation exceeds the 5s interactive budget
+    (~20-22s warm p50/p95) so production cutover stays blocked pending
+    explicit performance acceptance or optimization. Binding
+    ``retrieval_index`` therefore requires ``performance_accepted=True``
+    and fails closed otherwise via
+    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``;
+    an explicit 64-candidate config is additionally rejected until the
+    reduced prefix is re-validated.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -223,14 +227,26 @@ def build_turn_graph(
     else:
         from aa.conversation.retrieval_node import make_retrieval_node
         from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
-        from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS
+        from aa.retrieval.evidence import (
+            INTERACTIVE_LATENCY_BUDGET_MS,
+            INTERACTIVE_RERANKER_POOL_CAP,
+            interactive_retrieval_config,
+        )
 
-        require_v2_cutover_acceptance(performance_accepted=performance_accepted)
+        resolved_retrieval_config = (
+            retrieval_config if retrieval_config is not None else interactive_retrieval_config()
+        )
+        require_v2_cutover_acceptance(
+            performance_accepted=performance_accepted,
+            config=resolved_retrieval_config,
+        )
         logger.warning(
             "v2 retrieval graph wired with explicit performance acceptance",
             extra={
                 "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
                 "expected_warm_p95_ms": 22472,
+                "reranker_pool_cap": resolved_retrieval_config.reranker_pool_cap,
+                "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
             },
         )
         builder.add_node(
@@ -238,7 +254,7 @@ def build_turn_graph(
             make_retrieval_node(
                 index=retrieval_index,
                 reranker=reranker,
-                config=retrieval_config,
+                config=resolved_retrieval_config,
                 performance_accepted=performance_accepted,
             ),
         )

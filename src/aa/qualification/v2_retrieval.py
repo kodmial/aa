@@ -51,6 +51,7 @@ from typing import Any
 from aa.qualification.aa_retrieval import GoldCase
 from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
+    INTERACTIVE_RERANKER_POOL_CAP,
     EvidencePack,
     RetrievalConfig,
     retrieve_evidence,
@@ -584,16 +585,30 @@ def v2_production_status(summary: V2Summary) -> dict[str, Any]:
     }
 
 
-def require_v2_cutover_acceptance(*, performance_accepted: bool) -> None:
+def require_v2_cutover_acceptance(
+    *, performance_accepted: bool, config: RetrievalConfig | None = None
+) -> None:
     """Fail closed unless explicit v2 performance acceptance is recorded.
 
     The frozen BGE validation exceeds the interactive budget by ~4x, so
     any production-cutover caller must pass ``performance_accepted=True``
     after documenting acceptance or landing an optimization. The default
     (``False``) raises instead of silently promoting the slow path.
+
+    When ``config`` is given, the full-quality 64-candidate pool is also
+    rejected: production wiring must use the optimized interactive pool
+    (``aa.retrieval.evidence.interactive_retrieval_config``) with
+    re-validation, not merely accept the slow path.
     """
     if not performance_accepted:
         raise ValueError(V2_CUTOVER_BLOCKED_REASON)
+    if config is not None and config.reranker_pool_cap > INTERACTIVE_RERANKER_POOL_CAP:
+        raise ValueError(
+            "v2 retrieval cutover requires the optimized interactive pool "
+            f"(reranker_pool_cap<={INTERACTIVE_RERANKER_POOL_CAP}, "
+            f"got {config.reranker_pool_cap}); "
+            "re-validate the reduced BGE prefix before production wiring"
+        )
 
 
 def find_repo_root() -> Path:
