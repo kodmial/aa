@@ -48,15 +48,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aa.corpus.budget import RETRIEVED_PASSAGES_BUDGET_TOKENS
 from aa.qualification.aa_retrieval import GoldCase
 from aa.retrieval.evidence import (
+    BRANCH_TOP_K,
     INTERACTIVE_LATENCY_BUDGET_MS,
     INTERACTIVE_RERANKER_POOL_CAP,
+    MAX_PER_SECTION,
+    NEIGHBOR_WINDOW,
+    POST_RERANK_CHILD_CAP,
+    RERANKER_POOL_CAP,
     EvidencePack,
     RetrievalConfig,
     is_interactive_config,
     retrieve_evidence,
 )
+from aa.retrieval.fusion import RRF_K
 from aa.retrieval.index import HybridIndex
 from aa.retrieval.normalize import ru_tokens
 from aa.retrieval.reranker import CrossEncoderReranker
@@ -334,7 +341,24 @@ def run_v2_case(
     # ordinary turns default to the optimized interactive pool via
     # retrieve_evidence, but this benchmark must keep measuring the
     # committed ~21-22s configuration so the latency gate stays comparable.
-    active = config if config is not None else RetrievalConfig()
+    # Construct the frozen config from named constants instead of bare
+    # RetrievalConfig() defaults so a future default change (for example
+    # switching defaults to the interactive 16-cap pool) cannot silently
+    # re-measure the validation at a smaller pool and invalidate the
+    # p95-vs-5s comparison in the committed BGE artifact.
+    active = (
+        config
+        if config is not None
+        else RetrievalConfig(
+            branch_top_k=BRANCH_TOP_K,
+            rrf_k=RRF_K,
+            reranker_pool_cap=RERANKER_POOL_CAP,
+            post_rerank_child_cap=POST_RERANK_CHILD_CAP,
+            max_per_section=MAX_PER_SECTION,
+            neighbor_window=NEIGHBOR_WINDOW,
+            budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS,
+        )
+    )
     queries = planner_proxy_queries(case)
     diversity = query_diversity(queries)
     dup_rate = duplicate_query_rate(queries)
