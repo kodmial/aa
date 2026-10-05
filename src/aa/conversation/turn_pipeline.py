@@ -163,13 +163,13 @@ def merge_pack_dicts(
     merged: list[dict[str, Any]] = [dict(item) for item in current]
     seen = {str(item.get("passage_id", "")) for item in merged}
     for item in incoming:
+        if len(merged) >= MAX_PACK_PASSAGES:
+            break
         key = str(item.get("passage_id", ""))
         if not key or key in seen:
             continue
         seen.add(key)
         merged.append(dict(item))
-        if len(merged) >= MAX_PACK_PASSAGES:
-            break
     return merged
 
 
