@@ -517,6 +517,10 @@ class CrossEncoderReranker:
         ``query`` must be the context-resolved canonical query
         (``queries[0]``); every ``text`` must be exact Russian child
         chunk text. Returns one float per text, best-first independent.
+
+        Cross-turn exact-score cache: identical ``(query, text)`` pairs
+        scored before (same pinned model/revision/backend) reuse the
+        cached finite score instead of paying another CPU BGE forward.
         """
         if not isinstance(query, str) or not query.strip():
             raise RerankerError("reranker query must be a non-empty string")
@@ -525,9 +529,45 @@ class CrossEncoderReranker:
         for text in texts:
             if not isinstance(text, str) or not text:
                 raise RerankerError("reranker candidates must be non-empty strings")
+        keys = [_rerank_cache_key(self.lock, self.backend, query, text) for text in texts]
+        with _RERANK_SCORE_CACHE_LOCK:
+            cached = [_RERANK_SCORE_CACHE.get(key) for key in keys]
+        if all(value is not None for value in cached):
+            return [float(value) for value in cached if value is not None]
+        # Score only cache misses (deduped), then fill the bounded cache.
+        miss_index: dict[str, int] = {}
+        miss_texts: list[str] = []
+        miss_positions: list[int] = []
+        for pos, (text, value) in enumerate(zip(texts, cached, strict=True)):
+            if value is not None:
+                continue
+            if text not in miss_index:
+                miss_index[text] = len(miss_texts)
+                miss_texts.append(text)
+            miss_positions.append(pos)
         if self._flag_reranker is not None:
-            return self._score_flag(query, texts)
-        return _offline_scores(query, texts)
+            miss_scores = self._score_flag(query, miss_texts)
+        else:
+            miss_scores = _offline_scores(query, miss_texts)
+        miss_by_text = {text: score for text, score in zip(miss_texts, miss_scores, strict=True)}
+        fresh = [miss_by_text[texts[pos]] for pos in miss_positions]
+        # Populate the cross-turn cache (finite scores only, FIFO eviction).
+        with _RERANK_SCORE_CACHE_LOCK:
+            for key, value in zip([keys[pos] for pos in miss_positions], fresh, strict=True):
+                if not math.isfinite(float(value)):
+                    continue
+                if key not in _RERANK_SCORE_CACHE:
+                    while len(_RERANK_SCORE_CACHE) >= _RERANK_SCORE_CACHE_MAX:
+                        _RERANK_SCORE_CACHE.pop(next(iter(_RERANK_SCORE_CACHE)))
+                    _RERANK_SCORE_CACHE[key] = float(value)
+        out: list[float] = []
+        miss_iter = iter(fresh)
+        for value in cached:
+            if value is not None:
+                out.append(float(value))
+            else:
+                out.append(float(next(miss_iter)))
+        return out
 
     def _score_flag(self, query: str, texts: list[str]) -> list[float]:
         # Exact-score dedup: identical child texts share one BGE forward
@@ -594,6 +634,46 @@ _RERANKER_SINGLETONS: dict[str, CrossEncoderReranker] = {}
 _RERANKER_LOCK_CACHE: dict[str, dict[str, Any]] = {}
 _RERANKER_INIT_LOCK = threading.Lock()
 _RERANKER_SCORE_LOCK = threading.Lock()
+
+# Cross-turn exact-score cache for (query, text) pairs (latency
+# optimization for the 5s interactive budget). CPU BGE cost scales
+# linearly with scored pairs, so repeated spans across turns (terse
+# follow-ups, overlapping planner queries, duplicated child text) reuse
+# the exact cached score instead of paying another forward. Scores are
+# deterministic for a pinned (model, revision, backend) triple, so the
+# key binds all three plus SHA-256 digests of the exact strings; only
+# finite scores are cached. Bounded FIFO (2048 entries) with its own
+# lock so cache checks never block model scoring.
+_RERANK_SCORE_CACHE_MAX = 2048
+_RERANK_SCORE_CACHE: dict[tuple[str, str, str, str, str], float] = {}
+_RERANK_SCORE_CACHE_LOCK = threading.Lock()
+
+
+def _rerank_cache_key(
+    lock: dict[str, Any], backend: str, query: str, text: str
+) -> tuple[str, str, str, str, str]:
+    """Build the cross-turn cache key for one exact ``(query, text)`` pair."""
+    query_digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (
+        str(lock.get("model_id")),
+        str(lock.get("revision")),
+        str(backend),
+        query_digest,
+        text_digest,
+    )
+
+
+def reranker_score_cache_info() -> dict[str, int]:
+    """Return the current cross-turn rerank score cache size (observability)."""
+    with _RERANK_SCORE_CACHE_LOCK:
+        return {"size": len(_RERANK_SCORE_CACHE), "max": _RERANK_SCORE_CACHE_MAX}
+
+
+def clear_reranker_score_cache() -> None:
+    """Drop cached cross-turn rerank scores (tests/tooling only)."""
+    with _RERANK_SCORE_CACHE_LOCK:
+        _RERANK_SCORE_CACHE.clear()
 
 
 def _load_cached_lock(resolved: Path) -> dict[str, Any]:
@@ -721,6 +801,8 @@ def reset_reranker_cache() -> None:
     """Drop cached reranker singletons and the cached lock (tests only)."""
     _RERANKER_SINGLETONS.clear()
     _RERANKER_LOCK_CACHE.clear()
+    with _RERANK_SCORE_CACHE_LOCK:
+        _RERANK_SCORE_CACHE.clear()
 
 
 __all__ = [
@@ -732,12 +814,14 @@ __all__ = [
     "RERANK_SCORE_BATCH_SIZE",
     "CrossEncoderReranker",
     "RerankerError",
+    "clear_reranker_score_cache",
     "default_reranker_lock_path",
     "flag_embedding_version",
     "get_reranker",
     "load_reranker_lock",
     "lock_digest",
     "reranker_cache_key",
+    "reranker_score_cache_info",
     "reset_reranker_cache",
     "resolve_hf_cache_dir",
     "resolve_reranker_root",

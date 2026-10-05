@@ -40,6 +40,7 @@ import hashlib
 import logging
 import math
 import numbers
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -91,6 +92,29 @@ INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
 # before cutover: use interactive_retrieval_config() explicitly.
 INTERACTIVE_RERANKER_POOL_CAP = 16
 INTERACTIVE_POST_RERANK_CHILD_CAP = 16
+
+# Cross-turn E5 query-vector cache (latency optimization for the 5s
+# interactive budget). Planner queries repeat across turns (terse
+# follow-ups, overlapping paraphrases); reusing the exact L2-normalized
+# vector skips a padded transformer forward per repeated query. Keys bind
+# the index backend plus dimension plus the exact query string. Bounded
+# FIFO (1024 entries) with its own lock; vectors are copied on store and
+# on return so callers cannot mutate cached state.
+_QUERY_VECTOR_CACHE_MAX = 1024
+_QUERY_VECTOR_CACHE: dict[tuple[str, int, str], list[float]] = {}
+_QUERY_VECTOR_CACHE_LOCK = threading.Lock()
+
+
+def clear_query_vector_cache() -> None:
+    """Drop cached cross-turn query vectors (tests/tooling only)."""
+    with _QUERY_VECTOR_CACHE_LOCK:
+        _QUERY_VECTOR_CACHE.clear()
+
+
+def query_vector_cache_info() -> dict[str, int]:
+    """Return the current query-vector cache size (observability)."""
+    with _QUERY_VECTOR_CACHE_LOCK:
+        return {"size": len(_QUERY_VECTOR_CACHE), "max": _QUERY_VECTOR_CACHE_MAX}
 
 
 class EvidenceError(ValueError):
@@ -239,19 +263,47 @@ def _embed_query_vectors(index: HybridIndex, queries: list[str]) -> list[list[fl
 
     The hashing backend is cheap and stays per-query; the E5 backend goes
     through a single :func:`e5_embed` forward with padded batching instead
-    of one lock/model call per query. Returned vectors are L2-normalized
-    and order-preserving; ranking is unchanged.
+    of one lock/model call per query. Repeated E5 queries reuse the exact
+    cached L2-normalized vector across turns (bounded FIFO) so a repeated
+    follow-up skips its transformer forward. Returned vectors are
+    L2-normalized and order-preserving; ranking is unchanged.
     """
     backend = str(index.metadata.get("embedding_backend", HASHING_BACKEND_NAME))
     dim = int(index.metadata.get("embedding_dim", HASHING_DIM))
     if backend == HASHING_BACKEND_NAME:
         return [hashing_embed(query, dim=dim) for query in queries]
     if backend == E5_BACKEND_NAME:
+        keys = [(backend, dim, query) for query in queries]
+        with _QUERY_VECTOR_CACHE_LOCK:
+            cached = [_QUERY_VECTOR_CACHE.get(key) for key in keys]
+        if all(vector is not None for vector in cached):
+            return [list(vector) for vector in cached if vector is not None]
+        miss_queries: list[str] = []
+        miss_keys: list[tuple[str, int, str]] = []
+        seen_miss: set[tuple[str, int, str]] = set()
+        for key, query, vector in zip(keys, queries, cached, strict=True):
+            if vector is None and key not in seen_miss:
+                seen_miss.add(key)
+                miss_keys.append(key)
+                miss_queries.append("query: " + query)
         try:
-            vectors = e5_embed(["query: " + query for query in queries])
+            vectors = e5_embed(miss_queries)
         except DenseError as exc:
             raise EvidenceError(str(exc)) from exc
-        return [l2_normalize(vector) for vector in vectors]
+        normalized = [l2_normalize(vector) for vector in vectors]
+        with _QUERY_VECTOR_CACHE_LOCK:
+            for key, vector in zip(miss_keys, normalized, strict=True):
+                if key not in _QUERY_VECTOR_CACHE:
+                    while len(_QUERY_VECTOR_CACHE) >= _QUERY_VECTOR_CACHE_MAX:
+                        _QUERY_VECTOR_CACHE.pop(next(iter(_QUERY_VECTOR_CACHE)))
+                    _QUERY_VECTOR_CACHE[key] = list(vector)
+            out: list[list[float]] = []
+            for key in keys:
+                stored = _QUERY_VECTOR_CACHE.get(key)
+                if stored is None:
+                    raise EvidenceError("query vector cache missed after embed")
+                out.append(list(stored))
+            return out
     raise EvidenceError(f"unsupported index embedding backend: {backend!r}")
 
 
@@ -854,8 +906,10 @@ __all__ = [
     "NEIGHBOR_WINDOW",
     "POST_RERANK_CHILD_CAP",
     "RERANKER_POOL_CAP",
+    "clear_query_vector_cache",
     "interactive_retrieval_config",
     "is_interactive_config",
+    "query_vector_cache_info",
     "EvidenceError",
     "EvidencePack",
     "EvidencePassageData",
