@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,9 +35,22 @@ HASHING_DIM = 256
 HASHING_BACKEND_NAME = "hashing-char-token/1"
 E5_BACKEND_NAME = "intfloat-multilingual-e5-base/1"
 
+# Serializes shared dense-index search when retrieval runs in worker
+# threads via ``asyncio.to_thread``. The pure-Python scan is read-only,
+# but ``faiss.IndexFlatIP.search`` on the shared long-lived index has no
+# documented cross-thread guarantee, so concurrent turns take this lock
+# (mirroring the lexical FTS lock).
+_DENSE_SEARCH_LOCK = threading.Lock()
+
 # Per-snapshot loaded e5 (tokenizer, model) pairs. Ordinary turns reuse
 # the built index and these cached weights; nothing is reloaded per turn.
 _E5_LOADED: dict[str, tuple[Any, Any]] = {}
+
+# Serializes shared e5 batched inference when retrieval runs in worker
+# threads via ``asyncio.to_thread``. Torch/transformers forward has no
+# cross-thread guarantee (unlike the FAISS search lock above), so
+# concurrent turns must not share one tokenizer/model call.
+_E5_INFER_LOCK = threading.Lock()
 
 
 class DenseError(ValueError):
@@ -104,7 +118,10 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
     ``local_files_only=True``); raises :class:`DenseError` when the
     stack or the pinned snapshot is unavailable instead of touching
     the network. Loaded weights are cached per snapshot directory so
-    ordinary turns reuse them instead of reloading per query.
+    ordinary turns reuse them instead of reloading per query. All
+    ``texts`` are scored in one batched forward (padded tokenizer
+    batch + single model call with masked mean pooling), preserving
+    per-text scores while removing per-query HF overhead.
     """
     import importlib
     import os
@@ -152,16 +169,24 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
         _E5_LOADED[cache_key] = cached
     else:
         tokenizer, model = cached
-    vectors: list[list[float]] = []
-    with torch_mod.no_grad():
-        for text in texts:
-            prefixed = text if text.startswith(("query: ", "passage: ")) else "query: " + text
-            encoded = tokenizer(prefixed, return_tensors="pt", truncation=True, max_length=512)
+    if not texts:
+        return []
+    prefixed = [
+        text if text.startswith(("query: ", "passage: ")) else "query: " + text for text in texts
+    ]
+    # One batched forward for the whole turn (single tokenizer + model
+    # call with padding) instead of one forward per query: identical
+    # mean-pooled scores with ~N fewer HF overheads on the hot path.
+    with _E5_INFER_LOCK:
+        with torch_mod.no_grad():
+            encoded = tokenizer(
+                prefixed, return_tensors="pt", padding=True, truncation=True, max_length=512
+            )
             output = model(**encoded).last_hidden_state
             mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
             pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
             normalized = torch_mod.nn.functional.normalize(pooled, p=2, dim=1)
-            vectors.append([float(value) for value in normalized[0].tolist()])
+            vectors = [[float(value) for value in row.tolist()] for row in normalized]
     return vectors
 
 
@@ -238,7 +263,10 @@ class ExactIPIndex:
         )
 
     def search(self, query: list[float], *, top_k: int) -> list[tuple[str, float]]:
-        """Return ``[(chunk_id, ip_score)]`` best-first (exact search)."""
+        """Return ``[(chunk_id, ip_score)]`` best-first (exact search).
+
+        Thread-safe for concurrent turns sharing one long-lived index.
+        """
         if top_k <= 0:
             raise DenseError("top_k must be > 0")
         if len(query) != self.dim:
@@ -250,15 +278,18 @@ class ExactIPIndex:
                 np_mod = importlib.import_module("numpy")
 
                 matrix = np_mod.array([query], dtype=np_mod.float32)
-                scores, indices = self._faiss_index.search(  # type: ignore[attr-defined]
-                    matrix, min(top_k, len(self.ids))
-                )
+                with _DENSE_SEARCH_LOCK:
+                    scores, indices = self._faiss_index.search(  # type: ignore[attr-defined]
+                        matrix, min(top_k, len(self.ids))
+                    )
                 out: list[tuple[str, float]] = []
                 for position, score in zip(indices[0].tolist(), scores[0].tolist(), strict=True):
                     if position < 0:
                         continue
                     out.append((self.ids[position], float(score)))
                 return out
+            except DenseError:
+                raise
             except Exception:
                 pass
         scored = [

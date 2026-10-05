@@ -24,12 +24,19 @@ tokenizer path, so raw user text can never break the MATCH syntax.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 from aa.retrieval.normalize import stemmed_norm_text
 
 FTS_TABLE = "chunks_fts"
 LEXICAL_TOP_K = 40
+
+# Serializes shared in-memory FTS connections when retrieval runs in
+# worker threads via ``asyncio.to_thread`` (the connection is opened with
+# ``check_same_thread=False`` for cross-thread use; concurrent ``execute``
+# calls still need mutual exclusion).
+_LEXICAL_SEARCH_LOCK = threading.Lock()
 
 
 class LexicalError(ValueError):
@@ -89,7 +96,7 @@ def load_lexical_into_memory(db_path: str | Path) -> sqlite3.Connection:
     except sqlite3.Error as exc:
         raise LexicalError(f"lexical database is unreadable: {exc}") from exc
     try:
-        target = sqlite3.connect(":memory:")
+        target = sqlite3.connect(":memory:", check_same_thread=False)
         try:
             source.backup(target)
         except sqlite3.Error as exc:
@@ -118,12 +125,13 @@ def lexical_search_conn(
     if match is None:
         return []
     try:
-        rows = connection.execute(
-            f"SELECT chunk_id, bm25({FTS_TABLE}) AS rank "
-            f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (match, top_k),
-        ).fetchall()
+        with _LEXICAL_SEARCH_LOCK:
+            rows = connection.execute(
+                f"SELECT chunk_id, bm25({FTS_TABLE}) AS rank "
+                f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (match, top_k),
+            ).fetchall()
     except sqlite3.OperationalError as exc:
         raise LexicalError(f"lexical search failed: {exc}") from exc
     scored = [(str(chunk_id), -float(rank)) for chunk_id, rank in rows]

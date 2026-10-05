@@ -25,6 +25,8 @@ class TurnState(TypedDict, total=False):
     search_queries: list[str]
     retrieval_hits: list[dict[str, Any]]
     evidence_pack: list[dict[str, Any]]
+    retrieval_latency_ms: float
+    retrieval_over_budget: bool
     draft_response: str
     grounding_result: dict[str, Any]
     retry_state: dict[str, Any]
@@ -49,6 +51,8 @@ def initial_state(user_message: str, *, summary: str = "") -> TurnState:
         search_queries=[],
         retrieval_hits=[],
         evidence_pack=[],
+        retrieval_latency_ms=0.0,
+        retrieval_over_budget=False,
         draft_response="",
         grounding_result={},
         retry_state={},
