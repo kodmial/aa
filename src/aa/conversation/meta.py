@@ -1,12 +1,10 @@
-"""Conversational meta/capability turn boundary (issues #105/#106).
+"""Retired conversational meta/capability turn boundary (issues #105/#106).
 
-Meta/capability/identity questions (``А что ты можешь?``,
-``Тогда зачем ты?``) are conversational turns, not corpus-grounded AA
-turns. Routing them through the book-grounded pipeline fails closed with
-the generic unsupported-answer message and breaks the user-facing
-contract. This module detects them deterministically so the application
-serves a bounded Russian capability reply without retrieval, grounding,
-or model dependence.
+Retired by the issue #118 production cutover: ordinary turns no longer
+route through ``is_substantive``/meta/punctuation heuristics in
+production. The LangGraph planner owns conversational continuity and
+meta questions are answered as natural turns. This module remains for
+offline qualification history only; production code must not import it.
 """
 
 from __future__ import annotations

@@ -6,8 +6,8 @@ stable (prompt-cache friendly) and evaluable. This module loads them from
 disk; the loaders never log prompt or user content.
 
 The v2 prompts are English only and describe product behavior, never
-FAISS/SQLite/RRF/planner mechanics. They are not activated in the legacy
-orchestrator; the later cutover task wires them into production.
+FAISS/SQLite/RRF/planner mechanics. They are the production prompts used
+by the LangGraph runtime after the #118 cutover.
 """
 
 from __future__ import annotations

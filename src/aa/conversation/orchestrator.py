@@ -1,4 +1,11 @@
-"""Production Russian-first grounded conversational turn orchestrator (issue #9).
+"""Retired Russian-first grounded conversational turn orchestrator (issue #9).
+
+Retired by the issue #118 production cutover: the LangGraph runtime in
+:mod:`aa.conversation.graph` is the only ordinary conversational path in
+production, and ``aa.app`` never imports this module. This file remains
+for offline qualification history only (existing regression suites import
+it directly). Do not import it from production code; rollback is by Git
+revision, not by a runtime flag selecting this path.
 
 Deterministic state machine for every non-trivial substantive user turn:
 
