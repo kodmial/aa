@@ -449,6 +449,7 @@ async def run_v2_answer_turn(
             envelope_passes(compacted)
             and contains_cyrillic(compacted)
             and not leaks_internal_terms(compacted)
+            and aggregate_quote_chars(compacted) <= QUOTE_BUDGET_CHARS
         ):
             return {
                 "text": compacted,
