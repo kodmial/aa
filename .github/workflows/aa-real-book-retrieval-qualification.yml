@@ -23,6 +23,7 @@ name: AA real-book retrieval qualification
 # never uploaded or logged, decrypted corpus/index artifacts never enter
 # the Actions cache, and logs carry IDs/checksums/counts/latencies only.
 # Deterministic exit status: PASS / FAIL / INCOMPLETE / STALE.
+# Planner transport failures surface sanitized OpenCode status detail in the run log.
 
 on:
   workflow_dispatch:
