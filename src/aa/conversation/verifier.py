@@ -176,7 +176,7 @@ def coerce_grounding_result(
         result = validate_grounding_result(parsed, expected_unit_ids=expected)
     else:
         raise VerifierValidationError("verifier output is not a structured object")
-    pack_ids = {str(item.get("passage_id", "")) for item in passages if item.get("passage_id")}
+    pack_ids = set(_pack_index(passages).keys())
     check_passage_checksums(passages)
     check_cited_passage_ids(result, pack_ids=pack_ids)
     check_exact_quotes(units=units, result=result, passages=passages)
