@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
-import aa.conversation.model_adapter as adapter_mod
 from aa.conversation.model_adapter import OpenCodeChatModel
 from aa.opencode.client import SessionInfo
 from aa.opencode.errors import (
@@ -76,7 +76,7 @@ async def test_text_429_escalates_immediately_for_fresh_runner_recovery(
     async def _sleep(delay: float) -> None:
         sleeps.append(delay)
 
-    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
         agent="aa-planner-v2",
@@ -107,7 +107,7 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     async def _sleep(delay: float) -> None:
         sleeps.append(delay)
 
-    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
         agent="aa-planner-v2",
@@ -129,7 +129,7 @@ async def test_structured_429_escalates_immediately_for_fresh_runner_recovery(
     async def _sleep(delay: float) -> None:
         sleeps.append(delay)
 
-    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
         agent="aa-planner-v2",
