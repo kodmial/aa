@@ -1,0 +1,95 @@
+{
+  "corpus_version": "ru_product_contract.v1_2",
+  "schema_version": "ru-product-contract-v1_2",
+  "input_schema_version": "ru-product-contract-input-v1_2",
+  "oracle_schema_version": "ru-product-contract-oracle-v1_2",
+  "provenance_schema_version": "ru-product-contract-sources/1",
+  "rubric_version": "ru-answer-quality-rubric-v2",
+  "rubric_schema_version": "ru-answer-quality-rubric/2",
+  "files": {
+    "input": "qualification/ru_product_contract.v1_2.input.jsonl",
+    "oracle": "qualification/ru_product_contract.v1_2.oracle.jsonl",
+    "sources": "qualification/ru_product_contract.v1_2.sources.json",
+    "rubric": "qualification/ru_answer_quality_rubric.v2.json",
+    "rubric_sha": "qualification/ru_answer_quality_rubric.v2.sha256",
+    "version": "qualification/ru_product_contract.v1_2.version.json"
+  },
+  "sha256": {
+    "input": "30b2b0f222ca31b9c33a93f14e618bbee6eced7345cb128c94e9bc6559171649",
+    "oracle": "8279fbd70b23e629e64f80a1b975fbbcee2bf54c638a88dae62abf9f0bd6e243",
+    "sources": "d594ac158817ceb45138984191a18718d67f90b677f8741ae4001eacdaa0e575",
+    "rubric": "8427507d20d76f52eba538c916dfbc15a657b4cd1b0169decab86033848e516b"
+  },
+  "counts": {
+    "single_turn": 40,
+    "multi_turn_journeys": 8,
+    "multi_turn_substantive_turns": 42,
+    "control_events": 1,
+    "total_substantive_utterances": 82
+  },
+  "coverage": [
+    "greeting",
+    "product_meta",
+    "short_followup",
+    "pronoun_ellipsis",
+    "topic_shift",
+    "ambiguity",
+    "delimiter_injection",
+    "compaction",
+    "book_substantive",
+    "quote_request",
+    "out_of_book",
+    "emergency_medical"
+  ],
+  "provenance_regions": [
+    "chapter-1",
+    "chapter-10",
+    "chapter-11",
+    "chapter-2",
+    "chapter-3",
+    "chapter-4",
+    "chapter-5",
+    "chapter-6",
+    "chapter-7",
+    "chapter-8",
+    "chapter-9",
+    "doctors-opinion"
+  ],
+  "safety_contract": {
+    "decisions": [
+      "allow",
+      "emergency",
+      "block"
+    ],
+    "response_modes": [
+      "ordinary_support",
+      "conversational_glue",
+      "product_meta",
+      "ambiguity_clarification",
+      "medical_boundary_clarification",
+      "medical_refusal_boundary",
+      "emergency_bounded_response",
+      "book_grounded_response"
+    ],
+    "clarify_is_router_state": false
+  },
+  "benchmark_tuple": {
+    "benchmark_version": "ru_product_contract.v1_2",
+    "input_sha256": "30b2b0f222ca31b9c33a93f14e618bbee6eced7345cb128c94e9bc6559171649",
+    "oracle_sha256": "8279fbd70b23e629e64f80a1b975fbbcee2bf54c638a88dae62abf9f0bd6e243",
+    "sources_sha256": "d594ac158817ceb45138984191a18718d67f90b677f8741ae4001eacdaa0e575",
+    "rubric_version": "ru-answer-quality-rubric-v2",
+    "rubric_sha256": "8427507d20d76f52eba538c916dfbc15a657b4cd1b0169decab86033848e516b"
+  },
+  "history": {
+    "preserved": [
+      "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl",
+      "qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl",
+      "qualification/ru_realworld_alcohol_help.v1_1.version.json"
+    ],
+    "note": "v1.1 artifacts are preserved byte-stable as historical evidence and are never rewritten by this freeze."
+  },
+  "review": {
+    "note": "v1.2 Product Contract freeze: static evaluation assets only; no production runtime output was used or needed; oracle prescribes no literal prose; /new-equivalent session_reset stays a control event; product-meta is an oracle/rubric semantic, never a lexical production router."
+  }
+}

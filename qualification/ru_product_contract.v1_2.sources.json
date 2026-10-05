@@ -1,0 +1,68 @@
+{
+  "schema_version": "ru-product-contract-sources/1",
+  "note": "Authoritative canonical regions for the Product Contract vNext benchmark. Substantive oracle provenance_ids resolve to canonical RU book sections; product-meta, glue, clarification and safety-boundary cases validly carry empty provenance with zero book queries.",
+  "canonical_manifest": "corpus/canonical.ru.manifest.json",
+  "canonical_artifact_sha256": "310367aa06976b66b484ac11f4a4d05131605be29a917e059eb62f8e2b72509b",
+  "regions": [
+    {
+      "id": "doctors-opinion",
+      "title": "Мнение доктора",
+      "text_sha256": "a33faec79892b839eb14d28fd5f6eb36297c755aed5e73bf08419f17fafc6558"
+    },
+    {
+      "id": "chapter-1",
+      "title": "Глава 1. Рассказ Билла",
+      "text_sha256": "b0f3c8848eceb0cd216f699164118b75c84363e2396b2ab695c49b9f7a993829"
+    },
+    {
+      "id": "chapter-2",
+      "title": "Глава 2. Выход есть",
+      "text_sha256": "a44a3a60932bf6a65171c5dd3ccd595d93894f06b5d3e87b2c4e53be1b7ddfa6"
+    },
+    {
+      "id": "chapter-3",
+      "title": "Глава 3. Еще об алкоголизме",
+      "text_sha256": "9e3b2bbbea7bca9f7aa98edfe374278af0ccfa05bcd2d8aed6da4b278d88276a"
+    },
+    {
+      "id": "chapter-4",
+      "title": "Глава 4. А как быть агностикам?",
+      "text_sha256": "4b6c5c509ab6e3888e9a66f8d3539daf85ed0d2e083322db7b7202c45630f9a0"
+    },
+    {
+      "id": "chapter-5",
+      "title": "Глава 5. Программа в действии",
+      "text_sha256": "e47abf9dc375a864c4627ed2d36c2ade280c1757cf67487c6e46b2a7f370dc4c"
+    },
+    {
+      "id": "chapter-6",
+      "title": "Глава 6. За работу!",
+      "text_sha256": "82b1f0596edbe2219a9de6716a817b8b3d0439a796ca2d2dc40c99aaa9d13599"
+    },
+    {
+      "id": "chapter-7",
+      "title": "Глава 7. Работая с другими",
+      "text_sha256": "1ad8428400bae6720ed7ce95bf78b13173cb9a66869ff2446b7b674bbc01ab0c"
+    },
+    {
+      "id": "chapter-8",
+      "title": "Глава 8. Обращение к женам",
+      "text_sha256": "8e28618a0ab56cf2355c0e6f1231ef382c5b3a6ae5f259b9afb89ddfcc694d21"
+    },
+    {
+      "id": "chapter-9",
+      "title": "Глава 9. Новые отношения в семье",
+      "text_sha256": "05eccf2e2f1a2cea3352b1bdc69601329797fb1fa0d0d4d53a635dcd6edbc88e"
+    },
+    {
+      "id": "chapter-10",
+      "title": "Глава 10. Обращение к работодателям",
+      "text_sha256": "51a2e18300e2c02a3935ce8e589107cc62cf63382d0c4cadfc59a72bc5f66632"
+    },
+    {
+      "id": "chapter-11",
+      "title": "Глава 11. Заглянем в ваше будущее",
+      "text_sha256": "4f230e3245036f5ba1899ac0549f23e5578b7202f111400ad0ead61dd03613db"
+    }
+  ]
+}
