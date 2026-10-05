@@ -79,6 +79,13 @@ jobs:
               core.notice(`real-book qualification pinned to dispatch SHA ${requested}.`);
               return;
             }
+            const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT || '1');
+            const triggerSha = (context.sha || '').trim();
+            if (runAttempt > 1 && /^[0-9a-f]{40}$/.test(triggerSha)) {
+              core.setOutput('exact_sha', triggerSha);
+              core.notice(`real-book rerun pinned to original trigger SHA ${triggerSha}.`);
+              return;
+            }
             const { data: mainRef } = await github.rest.git.getRef({
               owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
             });
