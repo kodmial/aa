@@ -34,9 +34,11 @@ from aa.retrieval.evidence import (
     POOL_CAP,
     TOP_CHILD_CAP,
     EvidenceError,
+    EvidencePassageData,
     RetrievalConfig,
     render_book_evidence,
     retrieve_evidence,
+    select_passages_under_budget,
     to_prompt_passages,
 )
 from aa.retrieval.fusion import RRF_K
@@ -561,6 +563,50 @@ def test_evidence_budget_is_atomic(tmp_path: pathlib.Path) -> None:
                 passage.text_sha256
                 == hashlib.sha256(passage.exact_text.encode("utf-8")).hexdigest()
             )
+    finally:
+        close_hybrid_index(index)
+
+
+def test_budget_fallback_preserves_skipped_rrf_winner(tmp_path: pathlib.Path) -> None:
+    index = _build_index(tmp_path)
+    try:
+        first, second = list(index.chunks.values())[:2]
+        first_passage = EvidencePassageData(
+            passage_id="first-expanded",
+            exact_text=first.text,
+            source_id=first.source_id,
+            section_id=first.section,
+            child_chunk_ids=(first.chunk_id,),
+            char_start=first.char_start,
+            char_end=first.char_end,
+            text_sha256=first.text_sha256,
+            source_sha256=first.source_sha256,
+        )
+        oversized_text = second.text * 20
+        oversized = EvidencePassageData(
+            passage_id="second-expanded",
+            exact_text=oversized_text,
+            source_id=second.source_id,
+            section_id=second.section,
+            child_chunk_ids=(second.chunk_id,),
+            char_start=second.char_start,
+            char_end=second.char_end,
+            text_sha256=hashlib.sha256(oversized_text.encode("utf-8")).hexdigest(),
+            source_sha256=second.source_sha256,
+        )
+        budget = estimate_text_tokens(first.text) + estimate_text_tokens(second.text)
+        selected, total = select_passages_under_budget(
+            [first_passage, oversized],
+            budget_tokens=budget,
+            index=index,
+            priority_child_ids=(first.chunk_id, second.chunk_id),
+        )
+        assert total <= budget
+        by_child = {passage.child_chunk_ids[0]: passage for passage in selected}
+        assert first.chunk_id in by_child
+        assert second.chunk_id in by_child
+        assert by_child[second.chunk_id].exact_text == second.text
+        assert by_child[second.chunk_id].text_sha256 == second.text_sha256
     finally:
         close_hybrid_index(index)
 
