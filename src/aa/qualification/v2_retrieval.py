@@ -365,6 +365,9 @@ def run_v2_case(
     dup_rate = duplicate_query_rate(queries)
     # Warm latency: measure the second (warm) execution per arm.
     retrieve_evidence(index, queries, config=active, reranker=reranker)
+    from aa.retrieval.reranker import clear_reranker_score_cache
+
+    clear_reranker_score_cache()
     started = time.perf_counter()
     target_pack = retrieve_evidence(index, queries, config=active, reranker=reranker)
     target_ms = (time.perf_counter() - started) * 1000.0
