@@ -156,16 +156,17 @@ def _prefetch(*, lock_path: Path, hf_cache: Path | None) -> int:
             except OSError:
                 files_ok = False
                 break
-    if files_ok and verify_cached_reranker(model_root, lock):
+    if files_ok:
         write_reranker_marker(model_root, lock)
-        return _status(
-            {
-                "status": "downloaded",
-                "model_id": str(lock.get("model_id")),
-                "revision": str(lock.get("revision")),
-                "model_root": str(model_root),
-            }
-        )
+        if verify_cached_reranker(model_root, lock):
+            return _status(
+                {
+                    "status": "downloaded",
+                    "model_id": str(lock.get("model_id")),
+                    "revision": str(lock.get("revision")),
+                    "model_root": str(model_root),
+                }
+            )
     invalidate_cached_reranker(model_root)
     print("downloaded reranker failed pinned verification; cache pruned", file=sys.stderr)
     return _status(

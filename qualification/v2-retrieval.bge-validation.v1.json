@@ -839,8 +839,10 @@
   "gold_sha256": "5a5c00bb6ab54d6d2f863542e43a6773a9f90adb28209cffbea97a74905e9d1f",
   "gold_version": "aa-retrieval-gold-v1",
   "quality_gate": {
-    "failures": [],
-    "passed": true
+    "failures": [
+      "warm p95 latency 22472ms exceeds the interactive budget 5000ms (per-turn RRF plus 64-candidate CPU BGE rerank); explicit performance acceptance or optimization is required before cutover"
+    ],
+    "passed": false
   },
   "reranker_backend": "bge-reranker-v2-m3-flag/1",
   "reranker_lock_sha256": "7e719e7779f082a42694f2c8c22a9d94cd321806058ebf68554dcbe2d894c759",
