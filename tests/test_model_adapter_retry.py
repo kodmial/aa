@@ -1,0 +1,153 @@
+"""Bounded OpenCode retry/fallback policy for the v2 model adapter."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+import aa.conversation.model_adapter as adapter_mod
+from aa.conversation.model_adapter import OpenCodeChatModel
+from aa.opencode.client import SessionInfo
+from aa.opencode.errors import OpenCodeProviderAccessError, OpenCodeTransientError
+
+PRIMARY = "opencode/space-bunny-free"
+FALLBACK = "opencode/muse-spark-1.3-contributor-free"
+
+
+class _ScriptedClient:
+    def __init__(
+        self,
+        *,
+        text_outcomes: list[object] | None = None,
+        structured_outcomes: list[object] | None = None,
+    ) -> None:
+        self.text_outcomes = list(text_outcomes or [])
+        self.structured_outcomes = list(structured_outcomes or [])
+        self.models: list[str] = []
+        self._sessions = 0
+
+    async def create_session(self, title: str = "") -> SessionInfo:
+        self._sessions += 1
+        return SessionInfo(id=f"ses_{self._sessions}", title=title)
+
+    async def delete_session(self, session_id: str) -> bool:
+        return True
+
+    async def send_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        model: str = "",
+        **_: Any,
+    ) -> str:
+        self.models.append(model)
+        outcome = self.text_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return str(outcome)
+
+    async def send_structured_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        model: str = "",
+        **_: Any,
+    ) -> dict[str, object]:
+        self.models.append(model)
+        outcome = self.structured_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, dict)
+        return outcome
+
+
+async def test_text_429_retries_primary_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeTransientError("http=429"),
+            OpenCodeTransientError("http=429"),
+            "ok",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await model._ainvoke_text("hello") == "ok"
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY]
+    assert sleeps == [1.0, 4.0]
+
+
+async def test_text_403_skips_same_model_retry_and_uses_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            "fallback-ok",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await model._ainvoke_text("hello") == "fallback-ok"
+    assert client.models == [PRIMARY, FALLBACK]
+    assert sleeps == []
+
+
+async def test_structured_persistent_429_uses_fallback_after_three_primary_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        structured_outcomes=[
+            OpenCodeTransientError("http=429"),
+            OpenCodeTransientError("http=429"),
+            OpenCodeTransientError("http=429"),
+            {"queries": ["fallback"]},
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    result = await model.ainvoke_structured(
+        "hello",
+        system="planner",
+        schema={"type": "object"},
+    )
+    assert result == {"queries": ["fallback"]}
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [1.0, 4.0]
