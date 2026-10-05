@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
 
 import aa.__main__ as main_mod
 from aa.conversation.orchestrator import send_with_fallback
-from aa.opencode.errors import OpenCodeRateLimitError, classify_http_status, classify_provider_error
+from aa.opencode.errors import (
+    OpenCodeRateLimitError,
+    classify_http_status,
+    classify_provider_error,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
