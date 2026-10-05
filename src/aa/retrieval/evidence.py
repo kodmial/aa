@@ -578,33 +578,74 @@ def select_passages_under_budget(
     *,
     budget_tokens: int = RETRIEVED_PASSAGES_BUDGET_TOKENS,
     index: HybridIndex | None = None,
+    priority_child_ids: tuple[str, ...] = (),
 ) -> tuple[list[EvidencePassageData], int]:
     """Select coherent passages atomically under the source-token budget.
 
-    No passage is silently character-truncated: a passage either fits in
-    full or is skipped in the first pass. When ``index`` is provided and
-    the first pass leaves no passage selected, or drops the top-ranked
-    passage while one of its constituent child chunks would fit, an
-    atomic single-child fallback is emitted: the highest-priority
-    fitting child chunks become one-child passages with exact text and
-    provenance taken from ``index``. Without ``index`` no fallback text
-    can be mapped to an exact child id and char span, so oversized
-    passages are skipped atomically instead of truncating.
+    Expanded passages are preferred whenever they fit. If an expanded
+    passage is too large, any directly selected RRF winner inside that
+    passage degrades to its exact child chunk, in fused-priority order,
+    as long as the child fits the remaining budget. This preserves
+    retrieval recall without truncating canonical text or admitting
+    arbitrary sibling/neighbor chunks merely because an expansion was
+    oversized.
+
+    The legacy top-passage fallback remains for direct callers that do
+    not provide priority_child_ids.
     """
     if budget_tokens <= 0:
         raise EvidenceError("budget_tokens must be > 0")
-    selected: list[EvidencePassageData] = []
+
+    chosen: list[tuple[int, int, EvidencePassageData]] = []
+    skipped: list[tuple[int, EvidencePassageData]] = []
+    covered: set[str] = set()
     total = 0
-    for passage in passages:
+
+    for position, passage in enumerate(passages):
         need = estimate_text_tokens(passage.exact_text)
         if total + need <= budget_tokens:
-            selected.append(passage)
+            chosen.append((position, 0, passage))
+            covered.update(passage.child_chunk_ids)
             total += need
             continue
-        # Atomic: skip oversized passages instead of truncating.
-        continue
-    if index is not None and passages:
-        covered = {cid for item in selected for cid in item.child_chunk_ids}
+        skipped.append((position, passage))
+
+    if index is not None and passages and priority_child_ids:
+        remaining = budget_tokens - total
+        skipped_position: dict[str, int] = {}
+        for position, passage in skipped:
+            for cid in passage.child_chunk_ids:
+                skipped_position.setdefault(cid, position)
+
+        for priority_rank, cid in enumerate(priority_child_ids):
+            if remaining <= 0:
+                break
+            if cid in covered or cid not in skipped_position:
+                continue
+            record = index.chunks.get(cid)
+            if record is None:
+                continue
+            need = estimate_text_tokens(record.text)
+            if need <= 0 or need > remaining:
+                continue
+            atom = EvidencePassageData(
+                passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
+                exact_text=record.text,
+                source_id=record.source_id,
+                section_id=record.section,
+                child_chunk_ids=(cid,),
+                char_start=record.char_start,
+                char_end=record.char_end,
+                text_sha256=record.text_sha256,
+                source_sha256=record.source_sha256,
+            )
+            chosen.append((skipped_position[cid], priority_rank + 1, atom))
+            covered.add(cid)
+            remaining -= need
+            total += need
+
+    elif index is not None and passages:
+        selected = [item for _, _, item in chosen]
         top = passages[0]
         top_covered = any(cid in covered for cid in top.child_chunk_ids)
         if not selected or not top_covered:
@@ -643,15 +684,12 @@ def select_passages_under_budget(
                     break
             if fallbacks:
                 if not selected:
-                    selected = fallbacks
+                    chosen = [(position, 1, item) for position, item in enumerate(fallbacks)]
                 elif not top_covered:
-                    # Keep fused priority: top-winner atoms come first.
-                    top_ids = set(top.child_chunk_ids)
-                    head = [item for item in fallbacks if item.child_chunk_ids[0] in top_ids]
-                    tail = [item for item in fallbacks if item.child_chunk_ids[0] not in top_ids]
-                    selected = [*head, *selected, *tail]
-    return selected, total
+                    chosen.extend((0, position + 1, item) for position, item in enumerate(fallbacks))
 
+    selected = [item for _, _, item in sorted(chosen, key=lambda entry: (entry[0], entry[1]))]
+    return selected, total
 
 def retrieve_evidence(
     index: HybridIndex,
@@ -705,7 +743,10 @@ def retrieve_evidence(
     winners = select_top_candidates(diverse, top_cap=active.top_child_cap)
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
     selected, total = select_passages_under_budget(
-        expanded, budget_tokens=active.budget_tokens, index=index
+        expanded,
+        budget_tokens=active.budget_tokens,
+        index=index,
+        priority_child_ids=tuple(candidate.chunk_id for candidate in winners),
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     metadata: dict[str, Any] = {
