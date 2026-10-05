@@ -22,7 +22,7 @@ retrieval substrate inside the dedicated trusted workflow:
 
 Logs carry IDs, checksums, counts and latencies only. The age identity
 is never printed and plaintext book text is never logged or uploaded.
-Exit codes: 0 PASS, 1 FAIL, 2 INCOMPLETE, 3 STALE.
+Exit codes: 0 PASS, 1 FAIL, 2 INCOMPLETE, 3 STALE, 75 RUNNER_RESTART_REQUIRED.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ from aa.qualification.real_book_retrieval import (  # noqa: E402
     summarize_public,
     validate_exact_sha,
 )
+from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
 from aa.retrieval.evidence import RetrievalConfig  # noqa: E402
 from aa.retrieval.index import open_hybrid_index  # noqa: E402
 
@@ -78,6 +79,7 @@ STATUS_FILENAME = "result.json"
 SUMMARY_FILENAME = "real-book-retrieval-summary.json"
 PROTECTED_FILENAME = "real-book-retrieval-protected.tar.zst.age"
 PROTECTED_SHA_FILENAME = "real-book-retrieval-protected.tar.zst.age.sha256"
+EXIT_RUNNER_RESTART_REQUIRED = 75
 
 
 def _fail_incomplete(out_dir: Path, *, reason: str, main_sha: str) -> int:
@@ -489,6 +491,27 @@ def main(argv: list[str] | None = None) -> int:
                         recent_user_turns=recent_user_turns,
                     )
                 )
+            except OpenCodeRateLimitError as exc:
+                payload = {
+                    "result": "INCOMPLETE",
+                    "reason": "OpenCode 429 requires fresh runner recovery",
+                    "reason_code": "OPENCODE_429_RESTART_REQUIRED",
+                    "main_sha": expected_sha,
+                }
+                (out_dir / STATUS_FILENAME).write_text(
+                    json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+                )
+                print(
+                    json.dumps(
+                        {
+                            "case_id": case_id,
+                            "planner_error": type(exc).__name__,
+                            "planner_error_detail": str(exc),
+                            "runner_restart_required": True,
+                        }
+                    )
+                )
+                return EXIT_RUNNER_RESTART_REQUIRED
             except Exception as exc:
                 error_payload = {
                     "case_id": case_id,
