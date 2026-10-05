@@ -53,8 +53,9 @@ SCHEMA_VERSION = "aa-real-book-retrieval-qualification/1"
 PUBLIC_SUMMARY_VERSION = "aa-real-book-retrieval-summary/1"
 PROTECTED_ARTIFACT_VERSION = "aa-real-book-retrieval-protected/1"
 
-BENCHMARK_INPUT_REL = "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl"
-BENCHMARK_ORACLE_REL = "qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl"
+BENCHMARK_INPUT_REL = "qualification/ru_product_contract.v1_2.input.jsonl"
+BENCHMARK_ORACLE_REL = "qualification/ru_product_contract.v1_2.oracle.jsonl"
+BENCHMARK_VERSION_REL = "qualification/ru_product_contract.v1_2.version.json"
 EMBEDDING_LOCK_REL = "corpus/embedding.lock.json"
 RU_MANIFEST_REL = "corpus/canonical.ru.manifest.json"
 
@@ -214,12 +215,20 @@ def production_retrieval_checksum(repo_root: Path | None = None) -> str:
 
 
 def benchmark_checksums(repo_root: Path | None = None) -> dict[str, str]:
-    """Return stable input/oracle checksums for the frozen benchmark."""
+    """Return stable input/oracle/version checksums for the frozen benchmark."""
     root = repo_root or find_repo_root()
     return {
         "input": sha256_file(root / BENCHMARK_INPUT_REL),
         "oracle": sha256_file(root / BENCHMARK_ORACLE_REL),
+        "version": sha256_file(root / BENCHMARK_VERSION_REL),
     }
+
+
+def benchmark_binding_checksum(repo_root: Path | None = None) -> str:
+    """Bind the exact Product Contract benchmark tuple used by qualification."""
+    checksums = benchmark_checksums(repo_root)
+    payload = json.dumps(checksums, sort_keys=True, separators=(",", ":")) + "\n"
+    return sha256_text(payload)
 
 
 def corpus_checksum(repo_root: Path | None = None) -> str:
@@ -579,6 +588,7 @@ def parse_result_marker(text: str) -> dict[str, str]:
 __all__ = [
     "BENCHMARK_INPUT_REL",
     "BENCHMARK_ORACLE_REL",
+    "BENCHMARK_VERSION_REL",
     "E5_BACKEND_NAME",
     "EMBEDDING_LOCK_REL",
     "EMBEDDING_MODEL_ID",
@@ -604,6 +614,7 @@ __all__ = [
     "assert_planner_input_isolated",
     "assert_public_summary_safe",
     "assert_source_exact",
+    "benchmark_binding_checksum",
     "benchmark_checksums",
     "build_protected_payload",
     "build_result_marker",
