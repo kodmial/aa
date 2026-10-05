@@ -60,7 +60,6 @@ from aa.retrieval.fusion import (
     RRF_K,
     FusedCandidate,
     deduplicate_overlaps,
-    enforce_diversity,
     rrf_fuse,
 )
 from aa.retrieval.index import HybridIndex
