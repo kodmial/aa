@@ -700,9 +700,7 @@ def select_passages_under_budget(
                 key=priority.__getitem__,
             )
             covered_by_passage = set(passage_priority)
-            reserve_after = remaining_reserve - sum(
-                atom_costs[cid] for cid in covered_by_passage
-            )
+            reserve_after = remaining_reserve - sum(atom_costs[cid] for cid in covered_by_passage)
             need = estimate_text_tokens(passage.exact_text)
 
             if total + need <= budget_tokens and (
