@@ -34,6 +34,7 @@ from aa.opencode.client import (
 )
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
+    OpenCodeProviderAccessError,
     OpenCodeSessionNotFoundError,
     OpenCodeStartupError,
     OpenCodeTimeoutError,
@@ -164,6 +165,7 @@ async def test_worker_restart_recovers_via_opencode_source_of_truth() -> None:
 def test_classify_http_status() -> None:
     assert isinstance(classify_http_status(400), OpenCodeDeterministicError)
     assert isinstance(classify_http_status(404), OpenCodeSessionNotFoundError)
+    assert isinstance(classify_http_status(403), OpenCodeProviderAccessError)
     assert isinstance(classify_http_status(429), OpenCodeTransientError)
     assert isinstance(classify_http_status(500), OpenCodeTransientError)
     assert isinstance(classify_http_status(503), OpenCodeTransientError)
