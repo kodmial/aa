@@ -70,7 +70,7 @@ from aa.qualification.real_book_retrieval import (  # noqa: E402
     summarize_public,
     validate_exact_sha,
 )
-from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence  # noqa: E402
+from aa.retrieval.evidence import RetrievalConfig  # noqa: E402
 from aa.retrieval.index import open_hybrid_index  # noqa: E402
 
 DEFAULT_OUT = ROOT / "eval-real-book-out"
@@ -226,7 +226,6 @@ def _run_turn(
     selected, _ = evidence_mod.select_passages_under_budget(
         expanded, budget_tokens=config.budget_tokens, index=index
     )
-    pack = retrieve_evidence(index, planner_queries, config=config)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     evidence_ids: list[str] = []
@@ -269,7 +268,6 @@ def _run_turn(
         budget_hit = bool(pack_sections & oracle_sections)
         oracle_hit = budget_hit
     budget_loss = bool(dedup_hit and not budget_hit)
-    _ = pack
     return TurnDiagnostics(
         case_id=case_id,
         planner_queries=tuple(planner_queries),

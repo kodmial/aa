@@ -265,11 +265,26 @@ def assert_no_oracle_leak(payload: Any, owner: str = "planner-input") -> None:
 def assert_planner_input_isolated(*, utterance: str, oracle_record: dict[str, Any]) -> None:
     """Fail closed when oracle text/labels leak into the planner utterance."""
     assert_no_oracle_leak({"utterance": utterance}, "planner-utterance")
-    oracle_labels = {
-        str(oracle_record.get("expected_safety_decision", "")),
-        str(oracle_record.get("expected_response_mode", "")),
-    } - {""}
-    _ = oracle_labels
+    lowered = utterance.lower()
+    candidates: set[str] = set()
+    for value in oracle_record.values():
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                candidates.add(cleaned)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    cleaned_item = item.strip()
+                    if cleaned_item:
+                        candidates.add(cleaned_item)
+    for label in candidates:
+        if len(label) < 4:
+            continue
+        if label.lower() in lowered:
+            raise RealBookRetrievalError(
+                f"planner-utterance: oracle leak: {label!r} must not reach planner/generator"
+            )
 
 
 def assert_no_reranker(modules: dict[str, Any] | None = None) -> None:

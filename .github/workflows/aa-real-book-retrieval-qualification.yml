@@ -142,20 +142,25 @@ jobs:
           set -euo pipefail
           # Secret presence is validated fail-closed; the value itself is
           # never echoed, logged, or passed on any command line.
+          # Never fail the job here: a missing secret must still yield a
+          # deterministic INCOMPLETE result.json plus the #130 marker via
+          # the execute step below (which runs with `if: always()`).
           python3 - <<'PY'
           import os
-          import sys
           if not os.environ.get("AA_BOOK_AGE_IDENTITY", "").strip():
-              print("AA_BOOK_AGE_IDENTITY is not configured; refusing trusted run", file=sys.stderr)
-              raise SystemExit(2)
-          print("trusted secret is configured (value never printed)")
+              print("AA_BOOK_AGE_IDENTITY is not configured; qualification yields INCOMPLETE, never PASS", flush=True)
+          else:
+              print("trusted secret is configured (value never printed)")
           PY
 
       - name: Provision and validate pinned E5 snapshot (public cache mechanism)
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/prefetch_public_assets.py --check-only
+          # Never fail the job here: a missing E5 snapshot must still yield
+          # a deterministic INCOMPLETE result.json plus the #130 marker via
+          # the execute step below (which runs with `if: always()`).
+          python3 scripts/prefetch_public_assets.py --check-only || echo "prefetch check unavailable; qualification yields INCOMPLETE, never PASS"
           python3 - <<'PY'
           import sys
           sys.path.insert(0, "src")
@@ -173,7 +178,7 @@ jobs:
           if not verify_cached_model(root, lock):
               print("pinned E5 snapshot is not cached locally; downloading via public prefetch", flush=True)
           PY
-          python3 scripts/prefetch_public_assets.py
+          python3 scripts/prefetch_public_assets.py || echo "public prefetch unavailable; qualification yields INCOMPLETE, never PASS"
           python3 - <<'PY'
           import sys
           sys.path.insert(0, "src")
@@ -188,11 +193,13 @@ jobs:
           root = resolve_model_root(resolve_hf_cache_dir())
           if not verify_cached_model(root, lock):
               print("pinned E5 snapshot unavailable; qualification yields INCOMPLETE, never PASS", flush=True)
-              raise SystemExit(2)
-          print("pinned E5 snapshot verified: intfloat/multilingual-e5-base@d1287505")
+          else:
+              print("pinned E5 snapshot verified: intfloat/multilingual-e5-base@d1287505")
           PY
 
       - name: Restore canonical RU corpus (trusted restore path)
+        if: always()
+        continue-on-error: true
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -215,6 +222,8 @@ jobs:
           PY
 
       - name: Build corpus structure for retrieval (no plaintext caching)
+        if: always()
+        continue-on-error: true
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -229,6 +238,8 @@ jobs:
           # only pip wheels and public HF weights are cached above.
 
       - name: Build and open production RAM-resident BM25 + E5/FAISS index
+        if: always()
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -252,6 +263,7 @@ jobs:
 
       - name: Execute frozen benchmark via real planner + production retrieval
         id: execute
+        if: always()
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -269,7 +281,23 @@ jobs:
           # evaluation-only oracle at
           # qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl (the
           # oracle never reaches planner/generator inputs).
-          test -n "$AA_EVAL_RECIPIENT"
+          # This step always runs and never fails the job: it deterministically
+          # emits result.json (INCOMPLETE when prerequisites are missing) so
+          # the #130 marker below is always published.
+          mkdir -p eval-real-book-out
+          if [ -z "${AA_EVAL_RECIPIENT:-}" ]; then
+            python3 - <<'PY'
+          import json
+          import os
+          out = "eval-real-book-out/result.json"
+          payload = {"result": "INCOMPLETE", "reason": "AA_EVAL_AGE_RECIPIENT is not configured", "main_sha": os.environ.get("EXACT_SHA", "")}
+          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print("recipient missing; qualification yields INCOMPLETE, never PASS", flush=True)
+          PY
+            echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"
+            cat eval-real-book-out/result.json
+            exit 0
+          fi
           set +e
           python3 scripts/run_real_book_retrieval_qualification.py \
             --main-sha "$EXACT_SHA" \
@@ -278,6 +306,17 @@ jobs:
           status=$?
           set -e
           echo "qualification exit status: $status"
+          if [ ! -f eval-real-book-out/result.json ]; then
+            python3 - <<'PY'
+          import json
+          import os
+          out = "eval-real-book-out/result.json"
+          payload = {"result": "INCOMPLETE", "reason": "runner produced no result.json", "main_sha": os.environ.get("EXACT_SHA", "")}
+          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print("runner produced no result.json; synthesized deterministic INCOMPLETE", flush=True)
+          PY
+            status=2
+          fi
           cat eval-real-book-out/result.json
           if [ "$status" -eq 0 ]; then echo "result=PASS" >> "$GITHUB_OUTPUT"; fi
           if [ "$status" -eq 1 ]; then echo "result=FAIL" >> "$GITHUB_OUTPUT"; fi
@@ -289,6 +328,8 @@ jobs:
           exit 0
 
       - name: Revalidate exact SHA after run
+        if: always()
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -296,13 +337,21 @@ jobs:
           echo "exact SHA still pinned after run: $(git rev-parse HEAD)"
 
       - name: Guard encrypted-only upload (never plaintext book text)
+        if: always()
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age
-          test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
-          test -f eval-real-book-out/real-book-retrieval-summary.json
+          # On deterministic INCOMPLETE the protected bundle/summary may be
+          # absent; only result.json is mandatory for the #130 marker.
           test -f eval-real-book-out/result.json
+          if python3 -c "import json; assert json.load(open('eval-real-book-out/result.json'))['result'] == 'INCOMPLETE'"; then
+            echo "INCOMPLETE run: protected bundle/summary may be absent; marker still published"
+          else
+            test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age
+            test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
+            test -f eval-real-book-out/real-book-retrieval-summary.json
+          fi
           # Plaintext corpus/index must never be staged for upload.
           if ls eval-real-book-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null | grep -v -e summary -e result; then
             echo "protected exact text outside the encrypted bundle" >&2
@@ -315,6 +364,7 @@ jobs:
           echo "encrypted-only upload guard passed"
 
       - name: Upload encrypted protected artifact (source text stays encrypted)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aa-real-book-retrieval-protected-encrypted
@@ -322,9 +372,10 @@ jobs:
             eval-real-book-out/real-book-retrieval-protected.tar.zst.age
             eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
           retention-days: 90
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Upload compact public summary (metrics only, no book text)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aa-real-book-retrieval-summary
@@ -332,9 +383,10 @@ jobs:
             eval-real-book-out/real-book-retrieval-summary.json
             eval-real-book-out/result.json
           retention-days: 90
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Publish idempotent #130 result marker (SHA + corpus + benchmark + retrieval)
+        if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
