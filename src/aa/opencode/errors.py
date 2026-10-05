@@ -9,7 +9,9 @@ Failures are classified so callers can react deterministically:
   readiness was verified. Deterministic caller bug.
 - :class:`OpenCodeTimeoutError`: a readiness probe or request exceeded its
   deadline. Treated as transient.
-- :class:`OpenCodeTransientError`: network errors, HTTP 408/425/429/5xx and
+- :class:`OpenCodeRateLimitError`: HTTP/provider 429. Escalates to hosted-runner
+  lifecycle recovery; it is never retried locally inside a worker process.
+- :class:`OpenCodeTransientError`: network errors, HTTP 408/425/5xx and
   provider errors flagged retryable by OpenCode. Safe to retry with backoff.
 - :class:`OpenCodeDeterministicError`: HTTP 4xx (other than 408/425/429),
   malformed requests and provider errors flagged non-retryable by OpenCode.
