@@ -106,6 +106,8 @@ def classify_http_status(status: int, *, session_id: str = "") -> OpenCodeError:
         return OpenCodeSessionNotFoundError(f"opencode session not found: {hint}")
     if status >= 500 or status in _RETRYABLE_HTTP_STATUSES:
         return OpenCodeTransientError(f"opencode request failed transiently: http={status}")
+    if status == 403:
+        return OpenCodeProviderAccessError("opencode provider access rejected: http=403")
     return OpenCodeDeterministicError(f"opencode request rejected: http={status}")
 
 
