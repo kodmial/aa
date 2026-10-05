@@ -153,8 +153,10 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
 async def retrieval_stub_node(state: TurnState) -> dict[str, Any]:
     """Interface placeholder for the #116 retrieval pipeline (no-op).
 
-    Keeps graph semantics stable while retrieval, reranking and Evidence
-    Pack selection land in the next task. Emits counts only.
+    Keeps graph semantics stable when no RAM-resident index is bound.
+    Pass ``retrieval_index`` to :func:`build_turn_graph` to run the real
+    target pipeline (multi-query hybrid plus BGE rerank plus Evidence
+    Pack selection). Emits counts only.
     """
     _ = state
     logger.info("v2 retrieval interface reached")
@@ -168,12 +170,23 @@ def build_turn_graph(
     memory_config: MemoryConfig | None = None,
     checkpointer: Any = None,
     safety_check: SafetyCheck | None = None,
+    retrieval_index: Any = None,
+    reranker: Any = None,
+    retrieval_config: Any = None,
 ) -> CompiledStateGraph[TurnState, None, TurnState, TurnState]:
     """Compile the v2 turn graph with managed checkpointing.
 
     ``checkpointer`` is the framework checkpointer (or ``None`` for
     stateless unit tests); production passes the factory-backed
     ``SqliteSaver`` so one Telegram chat maps to one persisted thread.
+
+    ``retrieval_index`` binds the #115 RAM-resident canonical index; when
+    given, the ``retrieval`` node runs the #116 target pipeline
+    (multi-query hybrid plus pinned local BGE rerank plus small-to-big
+    Evidence Pack selection) instead of the ``retrieval_stub`` no-op.
+    ``reranker`` (one long-lived worker instance) and
+    ``retrieval_config`` are forwarded when provided. The legacy
+    production path stays untouched until the later cutover task.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -188,14 +201,24 @@ def build_turn_graph(
         make_memory_node(summary_model=resolved_summary, memory_config=resolved_config),
     )
     builder.add_node("planner", make_planner_node(planner_model=planner_model))
-    builder.add_node("retrieval_stub", retrieval_stub_node)
+    if retrieval_index is None:
+        builder.add_node("retrieval_stub", retrieval_stub_node)
+        retrieval_node_name = "retrieval_stub"
+    else:
+        from aa.conversation.retrieval_node import make_retrieval_node
+
+        builder.add_node(
+            "retrieval",
+            make_retrieval_node(index=retrieval_index, reranker=reranker, config=retrieval_config),
+        )
+        retrieval_node_name = "retrieval"
     builder.add_edge(START, "gate")
     builder.add_conditional_edges(
         "gate", _route_after_gate, {NORMAL_ROUTE: "ensure_memory", END: END}
     )
     builder.add_edge("ensure_memory", "planner")
-    builder.add_edge("planner", "retrieval_stub")
-    builder.add_edge("retrieval_stub", END)
+    builder.add_edge("planner", retrieval_node_name)
+    builder.add_edge(retrieval_node_name, END)
     return builder.compile(checkpointer=checkpointer)
 
 

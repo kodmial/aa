@@ -1,0 +1,35 @@
+{
+  "format": "aa-reranker-lock/1",
+  "model_id": "BAAI/bge-reranker-v2-m3",
+  "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+  "sha": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+  "required_files": [
+    "config.json",
+    "model.safetensors",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json"
+  ],
+  "runtime": {
+    "interface": "FlagEmbedding.FlagReranker",
+    "flag_embedding": "1.4.2",
+    "python": "3.12",
+    "torch": "2.14.1",
+    "transformers": "4.57.3",
+    "device": "cpu",
+    "use_fp16": false
+  },
+  "policy": {
+    "public_only": true,
+    "local_only": true,
+    "no_network_on_hot_path": true,
+    "never_cache": [
+      "corpus text",
+      "retrieval indexes",
+      "secrets",
+      "Telegram/user state",
+      "decrypted artifacts"
+    ]
+  }
+}

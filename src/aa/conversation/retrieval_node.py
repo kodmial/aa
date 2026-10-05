@@ -1,0 +1,139 @@
+"""V2 retrieval node: planner queries to compact Evidence Pack (issue #116).
+
+The node consumes the minimal ``search_queries`` produced by the #113
+hidden planner (0 or 10..16 context-resolved Russian queries) and runs
+the complete target pipeline from :mod:`aa.retrieval.evidence` over the
+#115 RAM-resident canonical index:
+
+- ``search_queries == []`` performs no retrieval and yields an empty
+  pack for a purely conversational/glue turn;
+- otherwise every query runs BM25 + E5/FAISS branches, global RRF,
+  dedup/diversity, the pinned local BGE reranker, small-to-big
+  expansion and atomic budget selection.
+
+Only orchestration state is written; ``messages`` is left untouched.
+State carries exact passage text plus minimal provenance. Ranking
+metadata (RRF/BM25/dense/rerank scores, embeddings, planner reasoning,
+search previews) stays in internal retrieval metadata and never enters
+the user-facing prompt. Logs carry only routes, counts and token
+lengths, never prompts or user text.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from aa.conversation.graph_state import TurnState
+from aa.conversation.prompt_builder import EvidencePassage
+from aa.retrieval.evidence import (
+    EvidencePack,
+    RetrievalConfig,
+    retrieve_evidence,
+)
+from aa.retrieval.index import HybridIndex, logical_chunk_id
+from aa.retrieval.reranker import CrossEncoderReranker
+
+logger = logging.getLogger("aa.conversation.retrieval_node")
+
+
+def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Map an Evidence Pack to graph state payloads (exact text + provenance)."""
+    hits: list[dict[str, Any]] = []
+    pack_dicts: list[dict[str, Any]] = []
+    for passage in pack.passages:
+        pack_dicts.append(
+            {
+                "passage_id": passage.passage_id,
+                "text": passage.exact_text,
+                "source_id": passage.source_id,
+                "section_id": passage.section_id,
+                "child_chunk_ids": list(passage.child_chunk_ids),
+                "char_start": passage.char_start,
+                "char_end": passage.char_end,
+                "text_sha256": passage.text_sha256,
+            }
+        )
+        for chunk_id in passage.child_chunk_ids:
+            hits.append(
+                {
+                    "chunk_id": chunk_id,
+                    "logical_chunk_id": logical_chunk_id(chunk_id),
+                    "section_id": passage.section_id,
+                    "source_id": passage.source_id,
+                    "passage_id": passage.passage_id,
+                    "char_start": passage.char_start,
+                    "char_end": passage.char_end,
+                    "text_sha256": passage.text_sha256,
+                }
+            )
+    return hits, pack_dicts
+
+
+def state_passages_to_prompt(pack_dicts: list[dict[str, Any]]) -> list[EvidencePassage]:
+    """Map stored state passages back to prompt-builder passages."""
+    passages: list[EvidencePassage] = []
+    for item in pack_dicts:
+        text = item.get("text")
+        passage_id = item.get("passage_id")
+        source_id = item.get("source_id")
+        section_id = item.get("section_id")
+        if not isinstance(text, str) or not text:
+            continue
+        if not isinstance(passage_id, str) or not passage_id:
+            continue
+        passages.append(
+            EvidencePassage(
+                passage_id=passage_id,
+                source=str(source_id),
+                section=str(section_id),
+                text=text,
+            )
+        )
+    return passages
+
+
+async def retrieval_node(
+    state: TurnState,
+    *,
+    index: HybridIndex,
+    reranker: CrossEncoderReranker | None = None,
+    config: RetrievalConfig | None = None,
+) -> dict[str, Any]:
+    """LangGraph retrieval node: queries to hits plus Evidence Pack."""
+    raw_queries = state.get("search_queries", [])
+    queries = list(raw_queries) if isinstance(raw_queries, list) else []
+    pack = retrieve_evidence(index, queries, config=config, reranker=reranker)
+    hits, pack_dicts = pack_to_state(pack)
+    logger.info(
+        "v2 retrieval done",
+        extra={
+            "queries": len(queries),
+            "hits": len(hits),
+            "passages": len(pack_dicts),
+            "tokens": pack.total_tokens,
+        },
+    )
+    return {"retrieval_hits": hits, "evidence_pack": pack_dicts}
+
+
+def make_retrieval_node(
+    *,
+    index: HybridIndex,
+    reranker: CrossEncoderReranker | None = None,
+    config: RetrievalConfig | None = None,
+) -> Any:
+    """Build the evidence retrieval node bound to one RAM-resident index."""
+
+    async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
+        return await retrieval_node(state, index=index, reranker=reranker, config=config)
+
+    return run_evidence_retrieval
+
+
+__all__ = [
+    "make_retrieval_node",
+    "pack_to_state",
+    "retrieval_node",
+    "state_passages_to_prompt",
+]
