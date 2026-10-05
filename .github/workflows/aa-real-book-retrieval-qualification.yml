@@ -48,7 +48,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: aa-real-book-retrieval-qualification
+  group: aa-real-book-retrieval-qualification-v2
   cancel-in-progress: true
 
 env:
