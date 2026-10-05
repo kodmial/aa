@@ -46,8 +46,8 @@ from aa.opencode.errors import (
 from aa.retrieval.index import HybridIndex, build_hybrid_index
 from aa.retrieval.planner import aspect_search_queries, validate_plan
 
-PRIMARY = "opencode/muse-spark-1.3-contributor-free"
-FALLBACK = "opencode/space-bunny-free"
+PRIMARY = "opencode/space-bunny-free"
+FALLBACK = "opencode/muse-spark-1.3-contributor-free"
 
 RU_FIXTURES: dict[str, str] = {
     "doctors-opinion": (
