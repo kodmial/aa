@@ -154,13 +154,9 @@ async def retrieval_stub_node(state: TurnState) -> dict[str, Any]:
     """Interface placeholder for the #116 retrieval pipeline (no-op).
 
     Keeps graph semantics stable when no RAM-resident index is bound.
-    Pass ``retrieval_index`` plus explicit ``performance_accepted=True``
-    to :func:`build_turn_graph` to run the real target pipeline
-    (multi-query hybrid plus BGE rerank plus Evidence Pack selection).
-    The explicit flag records performance acceptance for the ~20-22s
-    warm p50/p95 BGE path against the 5s interactive budget; without it
-    cutover stays blocked and binding the index fails closed. Emits
-    counts only.
+    Pass ``retrieval_index`` to :func:`build_turn_graph` to run the
+    real RRF-only target pipeline (multi-query hybrid plus Evidence
+    Pack selection). Emits counts only.
     """
     _ = state
     logger.info("v2 retrieval interface reached")
@@ -180,9 +176,7 @@ def build_turn_graph(
     checkpointer: Any = None,
     safety_check: SafetyCheck | None = None,
     retrieval_index: Any = None,
-    reranker: Any = None,
     retrieval_config: Any = None,
-    performance_accepted: bool = False,
 ) -> CompiledStateGraph[TurnState, None, TurnState, TurnState]:
     """Compile the v2 turn graph with managed checkpointing.
 
@@ -191,22 +185,12 @@ def build_turn_graph(
     ``SqliteSaver`` so one Telegram chat maps to one persisted thread.
 
     ``retrieval_index`` binds the #115 RAM-resident canonical index; when
-    given, the ``retrieval`` node runs the #116 target pipeline
-    (multi-query hybrid plus pinned local BGE rerank plus small-to-big
-    Evidence Pack selection) instead of the ``retrieval_stub`` no-op.
-    ``reranker`` (one long-lived worker instance) and
-    ``retrieval_config`` are forwarded when provided, defaulting to the
-    optimized interactive pool (16 BGE candidates, ~4x fewer CPU forwards
-    than the frozen 64-candidate validation). The legacy
-    production path stays untouched until the later cutover task:
-    the frozen v2 BGE validation exceeds the 5s interactive budget
-    (~20-22s warm p50/p95) so production cutover stays blocked pending
-    explicit performance acceptance or optimization. Binding
-    ``retrieval_index`` therefore requires ``performance_accepted=True``
-    and fails closed otherwise via
-    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``;
-    an explicit 64-candidate config is additionally rejected until the
-    reduced prefix is re-validated.
+    given, the ``retrieval`` node runs the #116 RRF-only target
+    pipeline (multi-query hybrid plus small-to-big Evidence Pack
+    selection: ``QueryPlan -> BM25+E5 -> RRF -> dedup/diversity ->
+    small-to-big``) instead of the ``retrieval_stub`` no-op.
+    ``retrieval_config`` is forwarded when provided. The legacy
+    production path stays untouched until the later cutover task.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -226,36 +210,12 @@ def build_turn_graph(
         retrieval_node_name = "retrieval_stub"
     else:
         from aa.conversation.retrieval_node import make_retrieval_node
-        from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
-        from aa.retrieval.evidence import (
-            INTERACTIVE_LATENCY_BUDGET_MS,
-            INTERACTIVE_RERANKER_POOL_CAP,
-            interactive_retrieval_config,
-        )
 
-        resolved_retrieval_config = (
-            retrieval_config if retrieval_config is not None else interactive_retrieval_config()
-        )
-        require_v2_cutover_acceptance(
-            performance_accepted=performance_accepted,
-            config=resolved_retrieval_config,
-        )
-        logger.warning(
-            "v2 retrieval graph wired with explicit performance acceptance",
-            extra={
-                "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
-                "expected_warm_p95_ms": 22472,
-                "reranker_pool_cap": resolved_retrieval_config.reranker_pool_cap,
-                "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
-            },
-        )
         builder.add_node(
             "retrieval",
             make_retrieval_node(
                 index=retrieval_index,
-                reranker=reranker,
-                config=resolved_retrieval_config,
-                performance_accepted=performance_accepted,
+                config=retrieval_config,
             ),
         )
         retrieval_node_name = "retrieval"

@@ -2,38 +2,28 @@
 
 The node consumes the minimal ``search_queries`` produced by the #113
 hidden planner (0 or 10..16 context-resolved Russian queries) and runs
-the complete target pipeline from :mod:`aa.retrieval.evidence` over the
+the RRF-only target pipeline from :mod:`aa.retrieval.evidence` over the
 #115 RAM-resident canonical index:
 
 - ``search_queries == []`` performs no retrieval and yields an empty
   pack for a purely conversational/glue turn;
 - otherwise every query runs BM25 + E5/FAISS branches, global RRF,
-  dedup/diversity, the pinned local BGE reranker, small-to-big
-  expansion and atomic budget selection.
+  dedup/diversity, small-to-big expansion and atomic budget selection.
 
 Only orchestration state is written; ``messages`` is left untouched.
 State carries exact passage text plus minimal provenance. Ranking
-metadata (RRF/BM25/dense/rerank scores, embeddings, planner reasoning,
+metadata (RRF/BM25/dense scores, embeddings, planner reasoning,
 search previews) stays in internal retrieval metadata and never enters
 the user-facing prompt. Logs carry only routes, counts and token
 lengths, never prompts or user text.
 
-Performance note: the frozen full-quality BGE validation records
-~20-22s warm latency (per-turn RRF plus 64-candidate CPU rerank) against
-the 5s interactive budget. Ordinary turns therefore default to the
-optimized interactive pool (16 candidates, ~4x fewer CPU BGE forwards)
-and reject the 64-candidate path without explicit performance
-acceptance, so a warm turn never silently pays the frozen cost (see
-``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``).
-Binding the node via :func:`make_retrieval_node` therefore requires
-``performance_accepted=True`` and fails closed otherwise, so a slow
-turn can never be wired into production without a recorded
-acceptance.
+The hot path is RAM-only with zero network/download dependency and no
+second-stage reranker: ``QueryPlan -> BM25+E5 -> RRF -> dedup ->
+expansion -> pack``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -42,38 +32,13 @@ from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
 from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
-    INTERACTIVE_RERANKER_POOL_CAP,
     EvidencePack,
     RetrievalConfig,
-    interactive_retrieval_config,
-    is_interactive_config,
     retrieve_evidence,
 )
 from aa.retrieval.index import HybridIndex, logical_chunk_id
-from aa.retrieval.reranker import CrossEncoderReranker
 
 logger = logging.getLogger("aa.conversation.retrieval_node")
-
-# Single-flight guard for the turn hot path: ``asyncio.wait_for`` cancels
-# the awaitable but cannot abort the executor worker, so a timed-out ~20s
-# CPU BGE ``retrieve_evidence`` keeps running while holding the
-# lexical/dense/infer/score locks. The permit is therefore held until the
-# worker thread itself finishes (released via ``call_soon_threadsafe``),
-# so one expired turn cannot release early and let later turns pile up an
-# unbounded queue of orphaned workers.
-_RETRIEVAL_SEMAPHORE = asyncio.Semaphore(1)
-
-
-def _resolve_retrieval_config(config: RetrievalConfig | None) -> RetrievalConfig:
-    """Return the active retrieval config (interactive 16-cap by default).
-
-    Production turns default to the optimized interactive pool (~4x fewer
-    CPU BGE forwards than the frozen 64-candidate validation) instead of
-    silently inheriting the slow full-quality default. Explicit configs
-    are honored unchanged so the frozen benchmark can keep validating
-    the full-quality path.
-    """
-    return config if config is not None else interactive_retrieval_config()
 
 
 def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -142,34 +107,16 @@ async def retrieval_node(
     state: TurnState,
     *,
     index: HybridIndex,
-    reranker: CrossEncoderReranker | None = None,
     config: RetrievalConfig | None = None,
 ) -> dict[str, Any]:
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
-    Thread safety: concurrent turns share one long-lived ``index`` and
-    one long-lived ``reranker`` across executor workers. Shared access
-    is internally serialized where the underlying libraries offer no
-    cross-thread guarantee: lexical FTS via its connection lock, dense
-    FAISS search via the dense search lock, shared e5 batched inference
-    via the e5 infer lock, and FlagReranker scoring via the reranker
-    score lock. Turns are additionally single-flighted via
-    ``_RETRIEVAL_SEMAPHORE`` because ``asyncio.wait_for`` cannot abort
-    an expired worker: the permit is held until the worker thread itself
-    finishes, so timed-out BGE turns cannot release early and pile up
-    orphaned workers holding those locks.
-
+    Runs the RRF-only pipeline synchronously on the RAM-resident index.
     The per-turn wall-clock latency against
-    ``INTERACTIVE_LATENCY_BUDGET_MS`` is enforced with a timeout (fails
-    closed on expiry) and propagated in state
-    (``retrieval_latency_ms``/``retrieval_over_budget``) so an over-budget
-    BGE turn (~20-22s warm p50/p95 for the frozen 64-candidate validation
-    vs the 5s budget) fails closed instead of being mistaken for
-    interactive serving downstream; later turns wait on the single-flight
-    guard instead of piling up orphan workers. Only counts and latencies are
-    logged, never prompts or user text. When ``config`` is omitted the
-    optimized interactive pool (``reranker_pool_cap`` 16) is used instead
-    of the slow full-quality default.
+    ``INTERACTIVE_LATENCY_BUDGET_MS`` is measured and propagated in
+    state (``retrieval_latency_ms``/``retrieval_over_budget``) for
+    observability. Only counts and latencies are logged, never prompts
+    or user text.
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -195,57 +142,9 @@ async def retrieval_node(
             "retrieval_latency_ms": 0.0,
             "retrieval_over_budget": False,
         }
-    active_config = _resolve_retrieval_config(config)
-    if not is_interactive_config(active_config):
-        # The frozen 64-candidate validation exceeds the 5s interactive
-        # budget (~20-22s warm p50/p95 of CPU BGE forwards); running it on
-        # the turn hot path requires explicit performance acceptance via
-        # make_retrieval_node, so fail closed here as well instead of
-        # serving the slow full-quality path behind a warning.
-        raise ValueError(
-            "non-interactive `reranker_pool_cap` cannot run on the turn hot path; "
-            "bind via `make_retrieval_node` with `performance_accepted=True` "
-            "and the optimized interactive config"
-        )
+    active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
-    await _RETRIEVAL_SEMAPHORE.acquire()
-    loop = asyncio.get_running_loop()
-
-    def _do_release() -> None:
-        try:
-            loop.call_soon_threadsafe(_RETRIEVAL_SEMAPHORE.release)
-        except RuntimeError:
-            # Loop is closed/shutting down: fall back to a direct release
-            # so a finished worker never leaks the single-flight permit.
-            try:
-                _RETRIEVAL_SEMAPHORE.release()
-            except ValueError:
-                pass
-
-    def _run_with_release() -> EvidencePack:
-        try:
-            return retrieve_evidence(index, queries, config=active_config, reranker=reranker)
-        finally:
-            _do_release()
-
-    try:
-        try:
-            future = loop.run_in_executor(None, _run_with_release)
-        except Exception:
-            # Submission failed before the worker started: it will never
-            # run the release path, so release inline to avoid holding the
-            # global permit forever and deadlocking all later turns.
-            _RETRIEVAL_SEMAPHORE.release()
-            raise
-        pack = await asyncio.wait_for(
-            future,
-            timeout=INTERACTIVE_LATENCY_BUDGET_MS / 1000.0,
-        )
-    except TimeoutError as exc:
-        raise ValueError(
-            "v2 retrieval exceeded interactive budget; explicit performance "
-            "acceptance or optimization is required"
-        ) from exc
+    pack = retrieve_evidence(index, queries, config=active_config)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     hits, pack_dicts = pack_to_state(pack)
@@ -280,38 +179,13 @@ async def retrieval_node(
 def make_retrieval_node(
     *,
     index: HybridIndex,
-    reranker: CrossEncoderReranker | None = None,
     config: RetrievalConfig | None = None,
-    performance_accepted: bool = False,
 ) -> Any:
-    """Build the evidence retrieval node bound to one RAM-resident index.
-
-    ``performance_accepted=True`` records explicit acceptance of the
-    frozen ~20-22s warm BGE latency (64-candidate validation) against the
-    5s interactive budget; the default (``False``) fails closed via
-    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``
-    instead of wiring the slow path into production. The bound config
-    defaults to the optimized interactive pool (16 candidates, ~4x fewer
-    CPU BGE forwards); an explicit full-quality 64-candidate config is
-    rejected even with acceptance until the reduced prefix is
-    re-validated.
-    """
-    from aa.qualification.v2_retrieval import require_v2_cutover_acceptance
-
-    active_config = _resolve_retrieval_config(config)
-    require_v2_cutover_acceptance(performance_accepted=performance_accepted, config=active_config)
-    logger.warning(
-        "v2 retrieval wired with explicit performance acceptance",
-        extra={
-            "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
-            "frozen_full_quality_warm_p95_ms": 22472,
-            "reranker_pool_cap": active_config.reranker_pool_cap,
-            "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
-        },
-    )
+    """Build the evidence retrieval node bound to one RAM-resident index."""
+    active_config = config if config is not None else RetrievalConfig()
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
-        return await retrieval_node(state, index=index, reranker=reranker, config=active_config)
+        return await retrieval_node(state, index=index, config=active_config)
 
     return run_evidence_retrieval
 

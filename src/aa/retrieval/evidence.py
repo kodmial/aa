@@ -1,4 +1,4 @@
-"""Multi-query hybrid retrieval with BGE reranking and Evidence Packs (issue #116).
+"""Multi-query hybrid retrieval with Evidence Packs (issue #116).
 
 Target retrieval pipeline for the new conversation graph, built on the
 #113 planner state (``QueryPlan.queries``: 0 or 10..16 context-resolved
@@ -6,7 +6,7 @@ Russian queries) and the #115 RAM-resident canonical index:
 
 ```text
 QueryPlan(10-16) -> BM25 + E5/FAISS per query -> global RRF(k=60)
-  -> per-query retention -> overlap dedup/diversity -> BGE rerank
+  -> per-query retention -> overlap dedup/diversity
   -> small-to-big expansion -> compact Evidence Pack (16k token budget)
 ```
 
@@ -19,27 +19,26 @@ Contract notes:
   FAISS ``IndexFlatIP`` over the same canonical child chunks);
 - raw BM25 and dense scores are never compared directly; fusion uses
   only the standard RRF primitive;
-- ``queries[0]`` (the direct context-resolved formulation) is the only
-  reranker query, scored as ``queries[0] <-> exact Russian child text``;
-- the reranker only reorders/selects; canonical text and provenance are
-  never rewritten;
+- selection after fusion is RRF-only (fused-score order); canonical
+  text and provenance are never rewritten;
 - small-to-big expansion stays within one canonical source/section
   unless an explicit neighbor link crosses a valid boundary, merges
   overlapping/adjacent windows, and keeps exact text plus provenance;
 - the Evidence Pack carries only generation-relevant evidence; ranking
-  metadata (RRF/BM25/dense/rerank scores, embeddings, planner reasoning,
+  metadata (RRF/BM25/dense scores, embeddings, planner reasoning,
   search previews) is internal-only and never enters ``<book_evidence>``.
 
 This path has zero dependency on legacy semantic logic: no handwritten
-query-expansion dictionaries and no legacy planner structures.
+query-expansion dictionaries and no legacy planner structures. It is
+RAM-only (BM25 + E5/FAISS plus RRF) with zero network/download
+dependency on the hot path and no second-stage cross-encoder/BGE
+reranker.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import math
-import numbers
 import threading
 import time
 from dataclasses import dataclass, field
@@ -66,32 +65,19 @@ from aa.retrieval.fusion import (
 )
 from aa.retrieval.index import HybridIndex
 from aa.retrieval.lexical import lexical_search_conn
-from aa.retrieval.reranker import CrossEncoderReranker, RerankerError, get_reranker
 
 logger = logging.getLogger("aa.retrieval.evidence")
 
 MIN_PLANNER_QUERIES = 10
 MAX_PLANNER_QUERIES = 16
 BRANCH_TOP_K = 40
-RERANKER_POOL_CAP = 64
-POST_RERANK_CHILD_CAP = 16
+POOL_CAP = 64
+TOP_CHILD_CAP = 16
 MAX_PER_SECTION = 4
 NEIGHBOR_WINDOW = 1
-# Interactive Telegram budget for one warm retrieval turn (mirrors the
-# frozen v2 qualification gate). The qualified BGE validation records
-# ~20-22s p50/p95 with per-turn RRF plus 64-candidate CPU BGE rerank,
-# far above this budget: production cutover stays blocked until explicit
-# performance acceptance or optimization lands.
+# Interactive Telegram budget for one warm retrieval turn. The RRF-only
+# RAM path is expected to serve well within this budget.
 INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
-
-# Optimized interactive pool for the BGE rerank hot path. CPU BGE cost
-# scales linearly with scored pairs, so 64 -> 16 cuts BGE forwards ~4x
-# (frozen ~21s warm p50 suggests ~5-6s on the same CPU before other
-# overheads). Branch recall (top-40 RRF union) is untouched; only the
-# reranked prefix shrinks. Requires re-validation of recall/rerank lift
-# before cutover: use interactive_retrieval_config() explicitly.
-INTERACTIVE_RERANKER_POOL_CAP = 16
-INTERACTIVE_POST_RERANK_CHILD_CAP = 16
 
 # Cross-turn E5 query-vector cache (latency optimization for the 5s
 # interactive budget). Planner queries repeat across turns (terse
@@ -123,57 +109,15 @@ class EvidenceError(ValueError):
 
 @dataclass(frozen=True)
 class RetrievalConfig:
-    """Tunable retrieval/evidence parameters (recorded in metadata/evals).
-
-    The default is the frozen full-quality pool (``reranker_pool_cap``
-    64, matching ``RERANKER_POOL_CAP`` and the validated BGE setting)
-    so an ordinary turn scores the full 64-candidate pool. The
-    optimized interactive pool (16 candidates, ~4x fewer CPU BGE
-    forwards) must be requested explicitly via
-    ``interactive_retrieval_config()`` and re-validated before cutover.
-    """
+    """Tunable retrieval/evidence parameters (recorded in metadata/evals)."""
 
     branch_top_k: int = BRANCH_TOP_K
     rrf_k: int = RRF_K
-    reranker_pool_cap: int = RERANKER_POOL_CAP
-    post_rerank_child_cap: int = POST_RERANK_CHILD_CAP
+    pool_cap: int = POOL_CAP
+    top_child_cap: int = TOP_CHILD_CAP
     max_per_section: int = MAX_PER_SECTION
     neighbor_window: int = NEIGHBOR_WINDOW
     budget_tokens: int = RETRIEVED_PASSAGES_BUDGET_TOKENS
-
-
-def interactive_retrieval_config() -> RetrievalConfig:
-    """Return the optimized interactive config for the BGE hot path.
-
-    Keeps branch recall (top-40 per branch, RRF k=60) and the evidence
-    budget identical to the full-quality default while capping the CPU
-    BGE rerank to ``INTERACTIVE_RERANKER_POOL_CAP`` candidates. This is
-    the documented optimization for the frozen ~21-22s warm p50/p95 vs
-    the 5s budget: ~4x fewer BGE forwards on the hot path. Cutover still
-    requires re-validation plus explicit performance acceptance via
-    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
-    """
-    return RetrievalConfig(
-        branch_top_k=BRANCH_TOP_K,
-        rrf_k=RRF_K,
-        reranker_pool_cap=INTERACTIVE_RERANKER_POOL_CAP,
-        post_rerank_child_cap=INTERACTIVE_POST_RERANK_CHILD_CAP,
-        max_per_section=MAX_PER_SECTION,
-        neighbor_window=NEIGHBOR_WINDOW,
-        budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS,
-    )
-
-
-def is_interactive_config(config: RetrievalConfig) -> bool:
-    """Return True when ``config`` respects the interactive BGE pool cap.
-
-    The frozen 64-candidate validation exceeds the 5s budget, so only
-    configs at or below ``INTERACTIVE_RERANKER_POOL_CAP`` qualify as the
-    optimized production path. Branch recall parameters are intentionally
-    not constrained here: the interactive optimization only shrinks the
-    reranked prefix.
-    """
-    return config.reranker_pool_cap <= INTERACTIVE_RERANKER_POOL_CAP
 
 
 @dataclass(frozen=True)
@@ -344,7 +288,7 @@ def fuse_query_pool(
     per_query_ids: list[list[str]],
     *,
     rrf_k: int = RRF_K,
-    pool_cap: int = RERANKER_POOL_CAP,
+    pool_cap: int = POOL_CAP,
 ) -> tuple[dict[str, FusedCandidate], list[str]]:
     """Fuse branch rankings with RRF, retaining each query's best candidate.
 
@@ -352,11 +296,9 @@ def fuse_query_pool(
     unique candidate is retained first (sorted by fused score and
     truncated only when distinct bests exceed ``pool_cap``), then the
     rest of the pool fills by global RRF rank. With 10..16 planner
-    queries and the frozen 64-cap pool this guarantees the ticket
+    queries and the 64-cap pool this guarantees the ticket
     rule (at least the best unique candidate per query) while leaving
-    ample slots for global RRF depth; a smaller interactive pool (16
-    candidates, passed explicitly) behaves identically apart from the
-    reduced depth.
+    ample slots for global RRF depth.
     """
     if rrf_k <= 0:
         raise EvidenceError("rrf_k must be > 0")
@@ -398,7 +340,7 @@ def dedup_and_diversify(
     pool_ids: list[str],
     fused: dict[str, FusedCandidate],
     *,
-    pool_cap: int = RERANKER_POOL_CAP,
+    pool_cap: int = POOL_CAP,
     max_per_section: int = MAX_PER_SECTION,
 ) -> list[FusedCandidate]:
     """Collapse overlapping child spans and apply bounded section diversity."""
@@ -416,83 +358,22 @@ def dedup_and_diversify(
     )
 
 
-def rerank_candidates(
-    index: HybridIndex,
+def select_top_candidates(
     candidates: list[FusedCandidate],
     *,
-    reranker_query: str,
-    reranker: CrossEncoderReranker | None = None,
-    post_rerank_cap: int = POST_RERANK_CHILD_CAP,
-) -> tuple[list[FusedCandidate], list[float]]:
-    """Rerank fused candidates with ``queries[0] <-> exact child text``.
+    top_cap: int = TOP_CHILD_CAP,
+) -> list[FusedCandidate]:
+    """Select the top RRF-ordered candidates (no second-stage reranker).
 
-    Batched scoring through one long-lived reranker instance. Ordering
-    and selection may change; canonical text and provenance never do.
-    Exact duplicate texts are scored once and mapped back so the
-    64-candidate CPU BGE hot path never pays repeated forwards for
-    identical child text; ranking is unchanged (identical texts share
-    one score, ties still break by fused score).
+    Ordering is pure fused-score order; canonical text and provenance
+    are never rewritten.
     """
-    if post_rerank_cap <= 0:
-        raise EvidenceError("post_rerank_cap must be > 0")
+    if top_cap <= 0:
+        raise EvidenceError("top_cap must be > 0")
     if not candidates:
-        return [], []
-    if not reranker_query.strip():
-        raise EvidenceError("reranker query must be a non-empty string")
-    active = reranker if reranker is not None else get_reranker()
-    texts: list[str] = []
-    for candidate in candidates:
-        record = index.chunks.get(candidate.chunk_id)
-        if record is None:
-            raise EvidenceError(f"fused candidate is not indexed: {candidate.chunk_id!r}")
-        if _sha256_text(record.text) != record.text_sha256:
-            raise EvidenceError(f"RAM chunk checksum mismatch: {record.chunk_id!r}")
-        texts.append(record.text)
-    # Deduplicate exact texts before the CPU BGE forward: identical child
-    # text yields an identical cross-encoder score, so scoring uniques
-    # once preserves ranking while cutting forwards on duplicated spans.
-    unique_index: dict[str, int] = {}
-    unique_texts: list[str] = []
-    text_positions: list[int] = []
-    for text in texts:
-        pos = unique_index.get(text)
-        if pos is None:
-            pos = len(unique_texts)
-            unique_index[text] = pos
-            unique_texts.append(text)
-        text_positions.append(pos)
-    try:
-        unique_scores = active.score(reranker_query, unique_texts)
-    except RerankerError as exc:
-        raise EvidenceError(str(exc)) from exc
-    if len(unique_scores) != len(unique_texts):
-        raise EvidenceError("reranker must return one score per candidate")
-    scores = [unique_scores[pos] for pos in text_positions]
-    clean_scores: list[float] = []
-    for score in scores:
-        if isinstance(score, bool) or isinstance(score, (str, bytes, bytearray)):
-            raise EvidenceError("reranker scores must be floats")
-        if not isinstance(score, numbers.Real):
-            try:
-                value = float(score)  # numpy scalars without Real registration
-            except (TypeError, ValueError, ArithmeticError) as exc:
-                raise EvidenceError("reranker scores must be floats") from exc
-            if not math.isfinite(value):
-                raise EvidenceError("reranker scores must be finite floats")
-            clean_scores.append(value)
-            continue
-        value = float(score)
-        if not math.isfinite(value):
-            raise EvidenceError("reranker scores must be finite floats")
-        clean_scores.append(value)
-    ranked = sorted(
-        zip(candidates, clean_scores, strict=True),
-        key=lambda pair: (pair[1], pair[0].fused_score),
-        reverse=True,
-    )
-    winners = [candidate for candidate, _ in ranked[:post_rerank_cap]]
-    ordered_scores = [score for _, score in ranked[:post_rerank_cap]]
-    return winners, ordered_scores
+        return []
+    ranked = sorted(candidates, key=lambda item: item.fused_score, reverse=True)
+    return ranked[:top_cap]
 
 
 def _ordered_section_chunks(index: HybridIndex, section_id: str) -> list[str]:
@@ -509,7 +390,7 @@ def expand_small_to_big(
     *,
     neighbor_window: int = NEIGHBOR_WINDOW,
 ) -> list[EvidencePassageData]:
-    """Expand reranked child hits to coherent parent/neighbor passages.
+    """Expand RRF-selected child hits to coherent parent/neighbor passages.
 
     Each winning child expands to its full canonical parent paragraph
     (all sibling child chunks) plus a bounded adjacent-child window on
@@ -528,7 +409,7 @@ def expand_small_to_big(
     for chunk_id in rank_of:
         record = index.chunks.get(chunk_id)
         if record is None:
-            raise EvidenceError(f"reranked winner is not indexed: {chunk_id!r}")
+            raise EvidenceError(f"selected winner is not indexed: {chunk_id!r}")
         if record.section not in section_order:
             ordered_ids = _ordered_section_chunks(index, record.section)
             section_order[record.section] = ordered_ids
@@ -654,7 +535,7 @@ def expand_small_to_big(
                 source_sha256=first.source_sha256,
             )
         )
-    # Highest-value (best rerank order) passages first.
+    # Highest-value (best fused order) passages first.
     passages.sort(
         key=lambda item: min(rank_of[cid] for cid in item.child_chunk_ids if cid in rank_of)
     )
@@ -733,7 +614,7 @@ def select_passages_under_budget(
                 if not selected:
                     selected = fallbacks
                 elif not top_covered:
-                    # Keep rerank priority: top-winner atoms come first.
+                    # Keep fused priority: top-winner atoms come first.
                     top_ids = set(top.child_chunk_ids)
                     head = [item for item in fallbacks if item.child_chunk_ids[0] in top_ids]
                     tail = [item for item in fallbacks if item.child_chunk_ids[0] not in top_ids]
@@ -746,36 +627,25 @@ def retrieve_evidence(
     queries: object,
     *,
     config: RetrievalConfig | None = None,
-    reranker: CrossEncoderReranker | None = None,
 ) -> EvidencePack:
-    """Run the full target pipeline for one planner query list.
+    """Run the full RRF-only pipeline for one planner query list.
 
     ``queries`` is the minimal ``QueryPlan.queries`` from #113. An empty
     list performs no retrieval and returns an empty pack. Otherwise the
-    count must be 10..16 and ``queries[0]`` is the canonical reranker
-    query. The answering model receives only the returned exact
-    passages; ``retrieval_metadata`` stays internal.
+    count must be 10..16. The answering model receives only the
+    returned exact passages; ``retrieval_metadata`` stays internal.
 
-    When ``config`` is omitted, the frozen full-quality default
-    (``RetrievalConfig()``, 64 BGE candidates) is used so an ordinary
-    turn scores the initial 64-cap pool validated by the frozen
-    benchmark: per-query retention keeps each query's best unique
-    candidate first, then fills the remainder by global RRF rank. The
-    optimized interactive pool (16 candidates,
-    ``INTERACTIVE_RERANKER_POOL_CAP``) must be passed explicitly via
-    ``interactive_retrieval_config()`` so its numbers stay comparable
-    and the latency gate stays failed/blocked until re-validation plus
-    explicit performance acceptance via
-    ``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``.
-    Production wiring additionally requires that acceptance before
-    cutover; CPU BGE cost scales linearly (~4x fewer forwards for the
-    interactive prefix than the frozen validation).
+    Pipeline: ``QueryPlan -> BM25+E5 -> RRF -> dedup/diversity ->
+    small-to-big`` over the RAM-resident index with zero
+    network/download dependency and no second-stage reranker.
+    Per-query retention keeps each query's best unique candidate
+    first, then fills the remainder by global RRF rank.
     """
     active = config if config is not None else RetrievalConfig()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
         raise EvidenceError("branch_top_k and rrf_k must be > 0")
-    if active.reranker_pool_cap <= 0 or active.post_rerank_child_cap <= 0:
-        raise EvidenceError("reranker caps must be > 0")
+    if active.pool_cap <= 0 or active.top_child_cap <= 0:
+        raise EvidenceError("pool caps must be > 0")
     if active.max_per_section <= 0 or active.neighbor_window < 0:
         raise EvidenceError("diversity/neighbor parameters are invalid")
     if active.budget_tokens <= 0:
@@ -785,10 +655,6 @@ def retrieve_evidence(
     if not cleaned:
         return empty_evidence_pack(corpus_version=corpus_version)
     started = time.perf_counter()
-    # Resolve the long-lived reranker once per turn and reuse the same
-    # instance for scoring and metadata: a second get_reranker() call
-    # would repeat validation work on the hot path.
-    active_reranker = reranker if reranker is not None else get_reranker()
     ranked_lists, per_query_ids = run_branch_searches(
         index, cleaned, branch_top_k=active.branch_top_k
     )
@@ -796,22 +662,16 @@ def retrieve_evidence(
         ranked_lists,
         per_query_ids,
         rrf_k=active.rrf_k,
-        pool_cap=active.reranker_pool_cap,
+        pool_cap=active.pool_cap,
     )
     diverse = dedup_and_diversify(
         index,
         pool_ids,
         fused,
-        pool_cap=active.reranker_pool_cap,
+        pool_cap=active.pool_cap,
         max_per_section=active.max_per_section,
     )
-    winners, rerank_scores = rerank_candidates(
-        index,
-        diverse,
-        reranker_query=cleaned[0],
-        reranker=active_reranker,
-        post_rerank_cap=active.post_rerank_child_cap,
-    )
+    winners = select_top_candidates(diverse, top_cap=active.top_child_cap)
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
     selected, total = select_passages_under_budget(
         expanded, budget_tokens=active.budget_tokens, index=index
@@ -819,19 +679,17 @@ def retrieve_evidence(
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
-        "reranker_query_digest": _short_digest(cleaned[0]),
+        "primary_query_digest": _short_digest(cleaned[0]),
         "branch_lists": len(ranked_lists),
         "branch_top_k": active.branch_top_k,
         "rrf_k": active.rrf_k,
-        "reranker_pool_cap": active.reranker_pool_cap,
+        "pool_cap": active.pool_cap,
         "fused_unique": len(fused),
         "pool_unique": len(pool_ids),
         "diverse_unique": len(diverse),
-        "post_rerank_child_cap": active.post_rerank_child_cap,
-        "reranked_winners": len(winners),
-        "reranker_model": active_reranker.model_id,
-        "reranker_revision": active_reranker.revision,
-        "reranker_backend": active_reranker.backend,
+        "top_child_cap": active.top_child_cap,
+        "selected_winners": len(winners),
+        "retrieval_backend": "rrf-only/1",
         "neighbor_window": active.neighbor_window,
         "expanded_passages": len(expanded),
         "selected_passages": len(selected),
@@ -879,7 +737,7 @@ def _escape_text(value: str) -> str:
 def render_book_evidence(pack: EvidencePack) -> str:
     """Render ``<book_evidence>`` carrying only exact text + provenance.
 
-    Ranking metadata (RRF/BM25/dense/rerank scores, embeddings, planner
+    Ranking metadata (RRF/BM25/dense scores, embeddings, planner
     reasoning, search previews) can never enter this block.
     """
     lines: list[str] = ["<book_evidence>"]
@@ -900,17 +758,13 @@ def render_book_evidence(pack: EvidencePack) -> str:
 __all__ = [
     "BRANCH_TOP_K",
     "INTERACTIVE_LATENCY_BUDGET_MS",
-    "INTERACTIVE_POST_RERANK_CHILD_CAP",
-    "INTERACTIVE_RERANKER_POOL_CAP",
     "MAX_PER_SECTION",
     "MAX_PLANNER_QUERIES",
     "MIN_PLANNER_QUERIES",
     "NEIGHBOR_WINDOW",
-    "POST_RERANK_CHILD_CAP",
-    "RERANKER_POOL_CAP",
+    "POOL_CAP",
+    "TOP_CHILD_CAP",
     "clear_query_vector_cache",
-    "interactive_retrieval_config",
-    "is_interactive_config",
     "query_vector_cache_info",
     "EvidenceError",
     "EvidencePack",
@@ -921,10 +775,10 @@ __all__ = [
     "expand_small_to_big",
     "fuse_query_pool",
     "render_book_evidence",
-    "rerank_candidates",
     "retrieve_evidence",
     "run_branch_searches",
     "select_passages_under_budget",
+    "select_top_candidates",
     "to_prompt_passages",
     "validate_planner_queries",
 ]

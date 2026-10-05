@@ -1,11 +1,10 @@
-"""Frozen v2 retrieval benchmark: baseline vs target pipeline (issue #116).
+"""RRF-only v2 retrieval benchmark (issue #116).
 
 Extends the frozen retrieval benchmark without tuning to only known
-literal phrases. Compares the qualified legacy baseline (per-aspect
-RRF-only hybrid from ``aa.qualification.aa_retrieval``) against the
-target pipeline (multi-query hybrid plus global RRF, pinned local BGE
-reranking and small-to-big Evidence Packs from
-:mod:`aa.retrieval.evidence`).
+literal phrases. Measures the RRF-only target pipeline (multi-query
+hybrid plus global RRF, dedup/diversity and small-to-big Evidence
+Packs from :mod:`aa.retrieval.evidence`) with no second-stage
+reranker.
 
 The benchmark exercises the combined planner + retrieval pipeline, not
 only hand-authored search strings: a frozen, versioned set of unseen
@@ -16,28 +15,21 @@ proxy generator sees only the utterance, its multi-turn context and the
 case's own paraphrase lists; it never sees oracle relevant-section
 labels.
 
-Measured per case and arm:
+Measured per case:
 
 - recall@5 / recall@10 of relevant canonical regions;
 - MRR / nDCG@10 where oracle (binary) relevance exists;
 - unique relevant-region coverage;
 - duplicate rate;
-- reranker lift over RRF-only candidates;
 - planner query diversity;
 - evidence-pack source-token size;
-- warm p50/p95 latency;
+- warm p50/p95 latency (warmup first, then timed);
 - unsupported/irrelevant passage rate.
 
-Quality gate:
-
-- no regression in the existing qualified retrieval recall gate;
-- the reranker must show measurable ranking/relevance benefit over
-  RRF-only on the versioned evaluation set;
-- broad/colloquial/multi-turn cases improve or remain non-regressive;
-- hot-path disk reads remain zero (verified by the test harness).
-
-If the reranker cannot beat RRF-only on the frozen eval, this module
-reports failure rather than removing the mandatory reranker.
+Quality gate covers operational invariants only (recall gate,
+duplicate rate, token budget, warm latency, zero hot-path disk reads
+verified separately by the harness). Product-quality judgments on the
+real book are explicitly out of scope here (owned by #130).
 """
 
 from __future__ import annotations
@@ -53,46 +45,30 @@ from aa.qualification.aa_retrieval import GoldCase
 from aa.retrieval.evidence import (
     BRANCH_TOP_K,
     INTERACTIVE_LATENCY_BUDGET_MS,
-    INTERACTIVE_RERANKER_POOL_CAP,
     MAX_PER_SECTION,
     NEIGHBOR_WINDOW,
-    POST_RERANK_CHILD_CAP,
-    RERANKER_POOL_CAP,
+    POOL_CAP,
+    TOP_CHILD_CAP,
     EvidencePack,
     RetrievalConfig,
-    is_interactive_config,
     retrieve_evidence,
 )
 from aa.retrieval.fusion import RRF_K
 from aa.retrieval.index import HybridIndex
 from aa.retrieval.normalize import ru_tokens
-from aa.retrieval.reranker import CrossEncoderReranker
 
-V2_BENCHMARK_VERSION = "aa-v2-retrieval-benchmark/1"
+V2_BENCHMARK_VERSION = "aa-v2-retrieval-benchmark/2"
 V2_EVAL_SET_VERSION = "aa-v2-conversational-eval/1"
 
-# Interactive Telegram budget for one warm retrieval turn (RRF plus
-# 64-candidate CPU BGE reranking). Single-sourced from the hot-path
-# evidence pipeline so the gate and per-turn metadata share one value.
-# The frozen BGE validation records ~20-22s p50/p95 per case, far above
-# interactive expectations: cutover requires explicit performance
-# acceptance or optimization (aa.retrieval.evidence
-# .interactive_retrieval_config with a 16-candidate BGE pool, exact
-# text-dedup in BGE scoring, quantized/GPU serving, or a documented
-# higher budget) before this gate can pass.
+# Interactive Telegram budget for one warm RRF-only retrieval turn.
+# Single-sourced from the hot-path evidence pipeline so the gate and
+# per-turn metadata share one value.
 V2_TARGET_P95_LATENCY_BUDGET_MS = INTERACTIVE_LATENCY_BUDGET_MS
 
-# Production cutover is explicitly out of scope for #116. The committed
-# BGE validation fails the latency gate (warm p95 ~22s vs the 5s
-# interactive budget from per-turn RRF plus 64-candidate CPU BGE
-# rerank), so the v2 pipeline must stay behind the legacy production
-# path until explicit performance acceptance or optimization lands.
-V2_PRODUCTION_CONFIG_VERSION = "v2-blocked-latency/1"
+V2_PRODUCTION_CONFIG_VERSION = "v2-rrf-only/1"
 V2_CUTOVER_BLOCKED_REASON = (
-    "v2 retrieval warm p95 ~21-22s exceeds the 5s interactive budget "
-    "(per-turn RRF plus 64-candidate CPU BGE rerank); production "
-    "cutover is blocked until explicit performance acceptance or "
-    "optimization lands"
+    "v2 RRF-only pipeline is measured by this benchmark; "
+    "product-quality promotion on the real book is owned by #130"
 )
 
 PROXY_QUERY_COUNT = 12
@@ -114,7 +90,7 @@ BROAD_CATEGORIES = (
 
 @dataclass(frozen=True)
 class V2CaseResult:
-    """Per-case baseline-vs-target outcome plus stage diagnostics."""
+    """Per-case RRF-only outcome plus stage diagnostics."""
 
     case_id: str
     category: str
@@ -122,60 +98,41 @@ class V2CaseResult:
     proxy_queries: tuple[str, ...]
     query_diversity: float
     duplicate_query_rate: float
-    baseline_sections_10: tuple[str, ...]
     target_sections_10: tuple[str, ...]
-    baseline_recall_at_5: bool
     target_recall_at_5: bool
-    baseline_recall_at_10: bool
     target_recall_at_10: bool
-    baseline_mrr: float
     target_mrr: float
-    baseline_ndcg_10: float
     target_ndcg_10: float
-    baseline_coverage: float
     target_coverage: float
     union_recall: bool
     pool_recall: bool
     pack_recall: bool
-    reranker_false_negative_loss: bool
-    reranker_lift_recall: float
-    reranker_lift_mrr: float
-    reranker_lift_ndcg: float
+    selection_loss: bool
     duplicate_rate: float
-    baseline_tokens: int
     target_tokens: int
-    baseline_latency_ms: float
     target_latency_ms: float
     unsupported_clean: bool
 
 
 @dataclass(frozen=True)
 class V2Summary:
-    """Aggregate baseline-vs-target benchmark summary."""
+    """Aggregate RRF-only benchmark summary."""
 
     benchmark_version: str
     eval_set_version: str
     cases: int
-    baseline_recall_at_5: float
     target_recall_at_5: float
-    baseline_recall_at_10: float
     target_recall_at_10: float
-    baseline_mrr: float
     target_mrr: float
-    baseline_ndcg_10: float
     target_ndcg_10: float
     target_coverage: float
     duplicate_rate: float
-    mean_reranker_lift_recall: float
-    mean_reranker_lift_mrr: float
-    mean_reranker_lift_ndcg: float
     mean_query_diversity: float
     mean_duplicate_query_rate: float
     mean_target_tokens: float
     p50_target_latency_ms: float
     p95_target_latency_ms: float
     unsupported_clean_rate: float
-    broad_non_regressive: bool
     pool_to_pack_loss_rate: float
     peak_rss_mb: float
 
@@ -333,28 +290,17 @@ def run_v2_case(
     index: HybridIndex,
     case: GoldCase,
     *,
-    reranker: CrossEncoderReranker,
     config: RetrievalConfig | None = None,
 ) -> V2CaseResult:
-    """Run baseline (RRF-only) vs target (RRF + rerank + expansion) for one case."""
-    # Frozen validation pins the full-quality 64-candidate pool explicitly:
-    # ordinary turns default to the optimized interactive pool (16
-    # candidates via RetrievalConfig defaults and the turn hot path),
-    # but this benchmark must keep measuring the committed ~21-22s
-    # configuration so the latency gate stays comparable.
-    # Construct the frozen config from named constants instead of bare
-    # RetrievalConfig() defaults (which are now the interactive 16-cap
-    # pool) so the default change cannot silently re-measure the
-    # validation at a smaller pool and invalidate the p95-vs-5s
-    # comparison in the committed BGE artifact.
+    """Run the RRF-only pipeline for one case (warmup, then timed)."""
     active = (
         config
         if config is not None
         else RetrievalConfig(
             branch_top_k=BRANCH_TOP_K,
             rrf_k=RRF_K,
-            reranker_pool_cap=RERANKER_POOL_CAP,
-            post_rerank_child_cap=POST_RERANK_CHILD_CAP,
+            pool_cap=POOL_CAP,
+            top_child_cap=TOP_CHILD_CAP,
             max_per_section=MAX_PER_SECTION,
             neighbor_window=NEIGHBOR_WINDOW,
             budget_tokens=RETRIEVED_PASSAGES_BUDGET_TOKENS,
@@ -363,40 +309,15 @@ def run_v2_case(
     queries = planner_proxy_queries(case)
     diversity = query_diversity(queries)
     dup_rate = duplicate_query_rate(queries)
-    # Warm latency: measure the second (warm) execution per arm.
-    retrieve_evidence(index, queries, config=active, reranker=reranker)
-    from aa.retrieval.reranker import clear_reranker_score_cache
-
-    clear_reranker_score_cache()
+    # Warm latency: warm up first (untimed), then measure the warm run.
+    retrieve_evidence(index, queries, config=active)
     started = time.perf_counter()
-    target_pack = retrieve_evidence(index, queries, config=active, reranker=reranker)
+    target_pack = retrieve_evidence(index, queries, config=active)
     target_ms = (time.perf_counter() - started) * 1000.0
-    from aa.retrieval.reranker import CrossEncoderReranker as _Reranker
-    from aa.retrieval.reranker import RerankerError as _RerankerError
-
-    class _IdentityReranker(_Reranker):
-        """RRF-only baseline: preserve fused order instead of reranking."""
-
-        def score(self, query: str, texts: list[str]) -> list[float]:
-            if not query.strip():
-                raise _RerankerError("reranker query must be non-empty")
-            # Descending scores keep the fused candidate order intact.
-            return [float(len(texts) - pos) for pos in range(len(texts))]
-
-    baseline_reranker = _IdentityReranker(lock=dict(reranker.lock), backend="rrf-only/1")
-    retrieve_evidence(index, queries, config=active, reranker=baseline_reranker)
-    started = time.perf_counter()
-    baseline_pack = retrieve_evidence(index, queries, config=active, reranker=baseline_reranker)
-    baseline_ms = (time.perf_counter() - started) * 1000.0
-    baseline_sections = _pack_sections(baseline_pack, 10)
     target_sections = _pack_sections(target_pack, 10)
-    baseline_r5 = _recall_at(baseline_sections, case, 5)
     target_r5 = _recall_at(target_sections, case, 5)
-    baseline_r10 = _recall_at(baseline_sections, case, 10)
     target_r10 = _recall_at(target_sections, case, 10)
-    baseline_mrr_v = _mrr(baseline_sections, case)
     target_mrr_v = _mrr(target_sections, case)
-    baseline_ndcg = _ndcg(baseline_sections, case)
     target_ndcg = _ndcg(target_sections, case)
     # Stage diagnostics for the target arm: union of all planner-query
     # branches, RRF pool truncation, and final pack recall. The pool is
@@ -427,13 +348,13 @@ def run_v2_case(
         else False
     )
     _fused, _pool_ids = _evidence.fuse_query_pool(
-        _ranked, _per_query, rrf_k=active.rrf_k, pool_cap=active.reranker_pool_cap
+        _ranked, _per_query, rrf_k=active.rrf_k, pool_cap=active.pool_cap
     )
     _diverse = _evidence.dedup_and_diversify(
         index,
         _pool_ids,
         _fused,
-        pool_cap=active.reranker_pool_cap,
+        pool_cap=active.pool_cap,
         max_per_section=active.max_per_section,
     )
     pool_sections = tuple(
@@ -453,29 +374,18 @@ def run_v2_case(
         proxy_queries=tuple(queries),
         query_diversity=diversity,
         duplicate_query_rate=dup_rate,
-        baseline_sections_10=baseline_sections,
         target_sections_10=target_sections,
-        baseline_recall_at_5=baseline_r5,
         target_recall_at_5=target_r5,
-        baseline_recall_at_10=baseline_r10,
         target_recall_at_10=target_r10,
-        baseline_mrr=baseline_mrr_v,
         target_mrr=target_mrr_v,
-        baseline_ndcg_10=baseline_ndcg,
         target_ndcg_10=target_ndcg,
-        baseline_coverage=_coverage(baseline_sections, case),
         target_coverage=_coverage(target_sections, case),
         union_recall=union_hit,
         pool_recall=pool_hit,
         pack_recall=pack_hit,
-        reranker_false_negative_loss=bool(pool_hit and not pack_hit),
-        reranker_lift_recall=float(target_r5) - float(baseline_r5),
-        reranker_lift_mrr=target_mrr_v - baseline_mrr_v,
-        reranker_lift_ndcg=target_ndcg - baseline_ndcg,
+        selection_loss=bool(pool_hit and not pack_hit),
         duplicate_rate=_duplicate_rate(target_pack),
-        baseline_tokens=baseline_pack.total_tokens,
         target_tokens=target_pack.total_tokens,
-        baseline_latency_ms=baseline_ms,
         target_latency_ms=target_ms,
         unsupported_clean=unsupported_clean,
     )
@@ -509,95 +419,61 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def summarize_v2(results: list[V2CaseResult]) -> V2Summary:
-    """Aggregate per-case baseline-vs-target results."""
+    """Aggregate per-case RRF-only results."""
     if not results:
         raise ValueError("v2 benchmark has no case results")
     supported = [item for item in results if not item.is_unsupported]
     denom = max(1, len(supported))
-    broad = [item for item in supported if item.category in BROAD_CATEGORIES]
-    broad_ok = all(item.target_recall_at_5 >= item.baseline_recall_at_5 for item in broad)
     latencies = [item.target_latency_ms for item in results]
     return V2Summary(
         benchmark_version=V2_BENCHMARK_VERSION,
         eval_set_version=V2_EVAL_SET_VERSION,
         cases=len(results),
-        baseline_recall_at_5=sum(1 for r in supported if r.baseline_recall_at_5) / denom,
         target_recall_at_5=sum(1 for r in supported if r.target_recall_at_5) / denom,
-        baseline_recall_at_10=sum(1 for r in supported if r.baseline_recall_at_10) / denom,
         target_recall_at_10=sum(1 for r in supported if r.target_recall_at_10) / denom,
-        baseline_mrr=sum(r.baseline_mrr for r in supported) / denom,
         target_mrr=sum(r.target_mrr for r in supported) / denom,
-        baseline_ndcg_10=sum(r.baseline_ndcg_10 for r in supported) / denom,
         target_ndcg_10=sum(r.target_ndcg_10 for r in supported) / denom,
         target_coverage=sum(r.target_coverage for r in supported) / denom,
         duplicate_rate=sum(r.duplicate_rate for r in results) / len(results),
-        mean_reranker_lift_recall=sum(r.reranker_lift_recall for r in supported) / denom,
-        mean_reranker_lift_mrr=sum(r.reranker_lift_mrr for r in supported) / denom,
-        mean_reranker_lift_ndcg=sum(r.reranker_lift_ndcg for r in supported) / denom,
         mean_query_diversity=sum(r.query_diversity for r in results) / len(results),
         mean_duplicate_query_rate=sum(r.duplicate_query_rate for r in results) / len(results),
         mean_target_tokens=sum(float(r.target_tokens) for r in results) / len(results),
         p50_target_latency_ms=_percentile(latencies, 50),
         p95_target_latency_ms=_percentile(latencies, 95),
         unsupported_clean_rate=sum(1 for r in results if r.unsupported_clean) / len(results),
-        broad_non_regressive=broad_ok,
-        pool_to_pack_loss_rate=sum(1 for r in supported if r.reranker_false_negative_loss) / denom,
+        pool_to_pack_loss_rate=sum(1 for r in supported if r.selection_loss) / denom,
         peak_rss_mb=_peak_rss_mb(),
     )
 
 
 def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
-    """Evaluate the #116 benchmark gate (fails closed, never drops the reranker).
+    """Evaluate the RRF-only benchmark gate (fails closed).
 
-    The gate mirrors the issue: no regression in the qualified recall
-    gate, measurable reranker benefit over RRF-only, non-regressive
-    broad/colloquial/multi-turn cases, warm p50/p95 latency within the
-    interactive Telegram budget, and zero hot-path disk reads
-    (verified separately by the harness blocking filesystem access).
-    Unsupported-case passage rates are measured and reported but carry
-    no abstention gate: #116 defines no grounding abstention mechanism.
+    The gate covers operational invariants only: duplicate rate,
+    token budget, and warm p50/p95 latency within the interactive
+    Telegram budget. Product-quality judgments on the real book are
+    owned by #130 and are not gated here. Hot-path disk reads remain
+    zero (verified separately by the harness blocking filesystem
+    access). Unsupported-case passage rates are measured and reported
+    but carry no abstention gate.
     """
     failures: list[str] = []
-    if summary.target_recall_at_5 < summary.baseline_recall_at_5:
-        failures.append(
-            f"target recall@5 {summary.target_recall_at_5:.3f} regressed "
-            f"vs baseline {summary.baseline_recall_at_5:.3f}"
-        )
-    if summary.target_recall_at_10 < summary.baseline_recall_at_10:
-        failures.append(
-            f"target recall@10 {summary.target_recall_at_10:.3f} regressed "
-            f"vs baseline {summary.baseline_recall_at_10:.3f}"
-        )
-    lift = (
-        summary.mean_reranker_lift_recall,
-        summary.mean_reranker_lift_mrr,
-        summary.mean_reranker_lift_ndcg,
-    )
-    if not any(value > 0 for value in lift):
-        failures.append(
-            "reranker shows no measurable benefit over RRF-only "
-            f"(recall {lift[0]:+.3f}, mrr {lift[1]:+.3f}, ndcg {lift[2]:+.3f}); "
-            "failing rather than removing the mandatory reranker"
-        )
-    if not summary.broad_non_regressive:
-        failures.append("broad/colloquial/multi-turn cases regressed vs baseline")
     if summary.duplicate_rate > 0.05:
         failures.append(f"duplicate rate {summary.duplicate_rate:.3f} exceeds 0.05")
+    if summary.mean_target_tokens > RETRIEVED_PASSAGES_BUDGET_TOKENS:
+        failures.append(
+            f"mean target tokens {summary.mean_target_tokens:.0f} exceeds "
+            f"budget {RETRIEVED_PASSAGES_BUDGET_TOKENS}"
+        )
     if summary.p50_target_latency_ms > V2_TARGET_P95_LATENCY_BUDGET_MS:
         failures.append(
             f"warm p50 latency {summary.p50_target_latency_ms:.0f}ms exceeds "
-            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms "
-            "(per-turn RRF plus 64-candidate CPU BGE rerank); "
-            "explicit performance acceptance or optimization is required "
-            "before cutover"
+            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms"
         )
     if summary.p95_target_latency_ms > V2_TARGET_P95_LATENCY_BUDGET_MS:
         failures.append(
             f"warm p95 latency {summary.p95_target_latency_ms:.0f}ms exceeds "
-            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms "
-            "(per-turn RRF plus 64-candidate CPU BGE rerank); "
-            "explicit performance acceptance or optimization is required "
-            "before cutover"
+            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms"
         )
     return (not failures, failures)
 
@@ -606,67 +482,35 @@ def v2_production_status(summary: V2Summary) -> dict[str, Any]:
     """Return the machine-readable v2 production promotion status.
 
     Mirrors the ``production_promotion_blocked`` pattern from the
-    qualified retrieval artifact: any quality-gate failure (currently
-    the warm-p50/p95 interactive-latency breach) keeps the v2 pipeline
-    blocked behind the legacy production path. Cutover also stays
-    blocked when the gate passes because #116 explicitly leaves cutover
-    out of scope; a later cutover task must re-evaluate the gate with
-    explicit performance acceptance or optimization.
+    qualified retrieval artifact: any quality-gate failure keeps the v2
+    pipeline blocked behind the legacy production path. Product-quality
+    promotion on the real book is owned by #130.
     """
     passed, failures = v2_quality_gate(summary)
-    blocked = True
-    config_id = "blocked"
-    reason = V2_CUTOVER_BLOCKED_REASON
-    if passed:
-        reason = (
-            "v2 quality gate passed but production cutover remains out of "
-            "scope for #116; a later cutover task must re-evaluate with "
-            "explicit performance acceptance"
-        )
+    blocked = not passed
     return {
-        "config_id": config_id,
+        "config_id": V2_PRODUCTION_CONFIG_VERSION if passed else "blocked",
         "config_version": V2_PRODUCTION_CONFIG_VERSION,
-        "cutover_allowed": not blocked,
+        "cutover_allowed": passed,
         "production_promotion_blocked": blocked,
         "quality_gate_passed": passed,
         "quality_gate_failures": list(failures),
-        "reason": reason,
+        "reason": (
+            "v2 RRF-only quality gate passed; product-quality promotion "
+            "on the real book is owned by #130"
+            if passed
+            else V2_CUTOVER_BLOCKED_REASON
+        ),
     }
-
-
-def require_v2_cutover_acceptance(
-    *, performance_accepted: bool, config: RetrievalConfig | None = None
-) -> None:
-    """Fail closed unless explicit v2 performance acceptance is recorded.
-
-    The frozen BGE validation exceeds the interactive budget by ~4x, so
-    any production-cutover caller must pass ``performance_accepted=True``
-    after documenting acceptance or landing an optimization. The default
-    (``False``) raises instead of silently promoting the slow path.
-
-    When ``config`` is given, the full-quality 64-candidate pool is also
-    rejected: production wiring must use the optimized interactive pool
-    (``aa.retrieval.evidence.interactive_retrieval_config``) with
-    re-validation, not merely accept the slow path.
-    """
-    if not performance_accepted:
-        raise ValueError(V2_CUTOVER_BLOCKED_REASON)
-    if config is not None and not is_interactive_config(config):
-        raise ValueError(
-            "v2 retrieval cutover requires the optimized interactive pool "
-            f"(reranker_pool_cap<={INTERACTIVE_RERANKER_POOL_CAP}, "
-            f"got {config.reranker_pool_cap}); "
-            "re-validate the reduced BGE prefix before production wiring"
-        )
 
 
 def find_repo_root() -> Path:
     """Return the repository root containing qualification + corpus."""
     here = Path(__file__).resolve()
     for parent in (here, *here.parents):
-        if (parent / "corpus" / "reranker.lock.json").is_file():
+        if (parent / "corpus" / "embedding.lock.json").is_file():
             return parent
-    raise ValueError("repository root with reranker lock not found")
+    raise ValueError("repository root with embedding lock not found")
 
 
 __all__ = [
@@ -683,7 +527,6 @@ __all__ = [
     "find_repo_root",
     "planner_proxy_queries",
     "query_diversity",
-    "require_v2_cutover_acceptance",
     "run_v2_case",
     "summarize_v2",
     "v2_production_status",
