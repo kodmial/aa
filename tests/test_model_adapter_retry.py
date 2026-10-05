@@ -92,11 +92,14 @@ async def test_text_429_retries_primary_with_exponential_backoff(
     assert sleeps == [1.0, 4.0]
 
 
-async def test_text_403_skips_same_model_retry_and_uses_fallback(
+async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _ScriptedClient(
         text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             "fallback-ok",
         ]
@@ -115,8 +118,8 @@ async def test_text_403_skips_same_model_retry_and_uses_fallback(
     )
 
     assert await model._ainvoke_text("hello") == "fallback-ok"
-    assert client.models == [PRIMARY, FALLBACK]
-    assert sleeps == []
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [5.0, 10.0, 20.0]
 
 
 async def test_structured_persistent_429_uses_fallback_after_three_primary_attempts(
