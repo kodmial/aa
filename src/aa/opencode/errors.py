@@ -62,6 +62,13 @@ class OpenCodeTransientError(OpenCodeError):
     transient = True
 
 
+class OpenCodeRateLimitError(OpenCodeTransientError):
+    """HTTP/provider 429: retire the current runner and retry on a fresh one."""
+
+    kind = "rate-limit"
+    transient = True
+
+
 class OpenCodeDeterministicError(OpenCodeError):
     """A non-retryable failure (bad request, non-retryable provider error)."""
 
@@ -104,6 +111,8 @@ def classify_http_status(status: int, *, session_id: str = "") -> OpenCodeError:
     hint = _short_session_hint(session_id)
     if status == 404:
         return OpenCodeSessionNotFoundError(f"opencode session not found: {hint}")
+    if status == 429:
+        return OpenCodeRateLimitError("opencode request rate-limited: http=429")
     if status >= 500 or status in _RETRYABLE_HTTP_STATUSES:
         return OpenCodeTransientError(f"opencode request failed transiently: http={status}")
     if status == 403:
@@ -134,6 +143,8 @@ def classify_provider_error(error: Mapping[str, Any] | None) -> OpenCodeError:
             status_code = raw_status
         elif isinstance(raw_status, str) and raw_status.isdigit():
             status_code = int(raw_status)
+    if status_code == 429:
+        return OpenCodeRateLimitError("opencode provider rate-limited: http=429")
     if retryable or (status_code >= 500) or status_code in _RETRYABLE_HTTP_STATUSES:
         return OpenCodeTransientError(
             f"opencode provider error is retryable: http={status_code or 'unknown'}"
