@@ -490,15 +490,19 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             except Exception as exc:
-                print(
-                    json.dumps(
-                        {
-                            "case_id": case_id,
-                            "planner_error": type(exc).__name__,
-                            "utterance_chars": len(utterance),
-                        }
-                    )
-                )
+                error_payload = {
+                    "case_id": case_id,
+                    "planner_error": type(exc).__name__,
+                    "utterance_chars": len(utterance),
+                }
+                # aa.opencode.errors messages are deliberately sanitized and
+                # contain only status/retryability/session hints, never prompt
+                # text or provider response bodies. Surface that safe detail
+                # so trusted qualification can distinguish a bad request from
+                # a provider/model rejection instead of reporting only a type.
+                if exc.__class__.__module__ == "aa.opencode.errors":
+                    error_payload["planner_error_detail"] = str(exc)
+                print(json.dumps(error_payload))
                 infra_failures += 1
                 continue
             if not queries:
