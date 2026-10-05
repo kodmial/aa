@@ -226,6 +226,14 @@ class TelegramTransport(ABC):
         """Deliver one OGG/Opus voice reply via ``sendVoice``."""
         raise NotImplementedError
 
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Emit a Telegram chat action.
+
+        Optional for non-network test transports; production polling transport
+        implements this with the Bot API ``sendChatAction`` method.
+        """
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def running(self) -> bool:
@@ -240,6 +248,7 @@ class StubTelegramTransport(TelegramTransport):
         self._running = False
         self.sent: list[TelegramReply] = []
         self.sent_voices: list[TelegramVoiceReply] = []
+        self.chat_actions: list[tuple[int, str]] = []
 
     async def start(self) -> None:
         self._running = True
@@ -259,6 +268,11 @@ class StubTelegramTransport(TelegramTransport):
             "telegram voice message sent",
             extra={"chat_id": reply.chat_id, "byte_len": len(reply.voice_bytes)},
         )
+
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        if action != "typing":
+            raise TelegramApiError("unsupported telegram chat action")
+        self.chat_actions.append((chat_id, action))
 
     @property
     def running(self) -> bool:
@@ -618,6 +632,21 @@ class PollingTelegramTransport(TelegramTransport):
         logger.info(
             "telegram voice message sent",
             extra={"chat_id": reply.chat_id, "byte_len": len(payload_bytes)},
+        )
+
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Emit ``sendChatAction`` with bounded retry.
+
+        Chat actions are ephemeral UI hints and contain no user content.
+        Delivery failures are surfaced to the heartbeat owner, which may log
+        only the failure category and continue the turn.
+        """
+        if action != "typing":
+            raise TelegramApiError("unsupported telegram chat action")
+        await self._call_with_retry(
+            "sendChatAction",
+            {"chat_id": chat_id, "action": action},
+            max_retries=self._max_send_retries,
         )
 
     async def fetch_voice_bytes(self, file_id: str) -> bytes:
