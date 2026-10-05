@@ -62,7 +62,14 @@ class ProductConversationRuntime:
     async def start(self) -> None:
         if self._graph is not None:
             return
-        index = self._index_loader()
+        try:
+            index = self._index_loader()
+        except (OSError, RuntimeError, ValueError):
+            # Unit/dev environments may not have the production index
+            # provisioned. Stay on the v2 graph with an empty retrieval
+            # interface; never fall back to the legacy conversation path.
+            index = None
+            logger.warning("v2 retrieval index unavailable")
         planner = OpenCodeChatModel(
             self._client,
             agent=PLANNER_AGENT_V2,
