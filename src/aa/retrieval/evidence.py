@@ -582,74 +582,81 @@ def select_passages_under_budget(
 ) -> tuple[list[EvidencePassageData], int]:
     """Select coherent passages atomically under the source-token budget.
 
-    Expanded passages are preferred whenever they fit. If an expanded
-    passage is too large, any directly selected RRF winner inside that
-    passage degrades to its exact child chunk, in fused-priority order,
-    as long as the child fits the remaining budget. This preserves
-    retrieval recall without truncating canonical text or admitting
-    arbitrary sibling/neighbor chunks merely because an expansion was
-    oversized.
+    Expanded passages are preferred whenever they fit. If a passage
+    cannot fit, directly selected RRF winners inside that passage degrade
+    immediately to exact child chunks before any lower-priority passage
+    can consume the remaining budget. This preserves fused-rank priority
+    without truncating canonical text.
 
-    The legacy top-passage fallback remains for direct callers that do
-    not provide priority_child_ids.
+    Direct callers that do not provide ``priority_child_ids`` keep the
+    legacy fallback semantics.
     """
     if budget_tokens <= 0:
         raise EvidenceError("budget_tokens must be > 0")
 
-    chosen: list[tuple[int, int, EvidencePassageData]] = []
-    skipped: list[tuple[int, EvidencePassageData]] = []
+    def _atom(cid: str) -> EvidencePassageData | None:
+        if index is None:
+            return None
+        record = index.chunks.get(cid)
+        if record is None:
+            return None
+        return EvidencePassageData(
+            passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
+            exact_text=record.text,
+            source_id=record.source_id,
+            section_id=record.section,
+            child_chunk_ids=(cid,),
+            char_start=record.char_start,
+            char_end=record.char_end,
+            text_sha256=record.text_sha256,
+            source_sha256=record.source_sha256,
+        )
+
+    selected: list[EvidencePassageData] = []
     covered: set[str] = set()
     total = 0
 
-    for position, passage in enumerate(passages):
+    if priority_child_ids:
+        priority = {cid: rank for rank, cid in enumerate(priority_child_ids)}
+        for passage in passages:
+            need = estimate_text_tokens(passage.exact_text)
+            if total + need <= budget_tokens:
+                selected.append(passage)
+                covered.update(passage.child_chunk_ids)
+                total += need
+                continue
+
+            direct_winners = sorted(
+                (
+                    cid
+                    for cid in passage.child_chunk_ids
+                    if cid in priority and cid not in covered
+                ),
+                key=priority.__getitem__,
+            )
+            for cid in direct_winners:
+                atom = _atom(cid)
+                if atom is None:
+                    continue
+                atom_need = estimate_text_tokens(atom.exact_text)
+                if atom_need <= 0 or total + atom_need > budget_tokens:
+                    continue
+                selected.append(atom)
+                covered.add(cid)
+                total += atom_need
+        return selected, total
+
+    for passage in passages:
         need = estimate_text_tokens(passage.exact_text)
         if total + need <= budget_tokens:
-            chosen.append((position, 0, passage))
+            selected.append(passage)
             covered.update(passage.child_chunk_ids)
             total += need
-            continue
-        skipped.append((position, passage))
 
-    if index is not None and passages and priority_child_ids:
-        remaining = budget_tokens - total
-        skipped_position: dict[str, int] = {}
-        for position, passage in skipped:
-            for cid in passage.child_chunk_ids:
-                skipped_position.setdefault(cid, position)
-
-        for priority_rank, cid in enumerate(priority_child_ids):
-            if remaining <= 0:
-                break
-            if cid in covered or cid not in skipped_position:
-                continue
-            record = index.chunks.get(cid)
-            if record is None:
-                continue
-            need = estimate_text_tokens(record.text)
-            if need <= 0 or need > remaining:
-                continue
-            atom = EvidencePassageData(
-                passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
-                exact_text=record.text,
-                source_id=record.source_id,
-                section_id=record.section,
-                child_chunk_ids=(cid,),
-                char_start=record.char_start,
-                char_end=record.char_end,
-                text_sha256=record.text_sha256,
-                source_sha256=record.source_sha256,
-            )
-            chosen.append((skipped_position[cid], priority_rank + 1, atom))
-            covered.add(cid)
-            remaining -= need
-            total += need
-
-    elif index is not None and passages:
-        selected = [item for _, _, item in chosen]
+    if index is not None and passages:
         top = passages[0]
         top_covered = any(cid in covered for cid in top.child_chunk_ids)
         if not selected or not top_covered:
-            remaining = budget_tokens - total
             seen: set[str] = set(covered)
             fallbacks: list[EvidencePassageData] = []
             for passage in passages:
@@ -657,38 +664,26 @@ def select_passages_under_budget(
                     if cid in seen:
                         continue
                     seen.add(cid)
-                    record = index.chunks.get(cid)
-                    if record is None:
+                    atom = _atom(cid)
+                    if atom is None:
                         continue
-                    need = estimate_text_tokens(record.text)
-                    if need <= 0 or need > remaining:
+                    need = estimate_text_tokens(atom.exact_text)
+                    if need <= 0 or total + need > budget_tokens:
                         continue
-                    fallbacks.append(
-                        EvidencePassageData(
-                            passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
-                            exact_text=record.text,
-                            source_id=record.source_id,
-                            section_id=record.section,
-                            child_chunk_ids=(cid,),
-                            char_start=record.char_start,
-                            char_end=record.char_end,
-                            text_sha256=record.text_sha256,
-                            source_sha256=record.source_sha256,
-                        )
-                    )
-                    remaining -= need
+                    fallbacks.append(atom)
                     total += need
-                    if remaining <= 0:
+                    if total >= budget_tokens:
                         break
-                if remaining <= 0:
+                if total >= budget_tokens:
                     break
             if fallbacks:
                 if not selected:
-                    chosen = [(position, 1, item) for position, item in enumerate(fallbacks)]
+                    selected = fallbacks
                 elif not top_covered:
-                    chosen.extend((0, position + 1, item) for position, item in enumerate(fallbacks))
-
-    selected = [item for _, _, item in sorted(chosen, key=lambda entry: (entry[0], entry[1]))]
+                    top_ids = set(top.child_chunk_ids)
+                    head = [item for item in fallbacks if item.child_chunk_ids[0] in top_ids]
+                    tail = [item for item in fallbacks if item.child_chunk_ids[0] not in top_ids]
+                    selected = [*head, *selected, *tail]
     return selected, total
 
 def retrieve_evidence(
