@@ -53,6 +53,12 @@ RERANKER_MARKER_NAME = "aa-reranker-cache.json"
 OFFLINE_BACKEND_NAME = "offline-stem-overlap/1"
 FLAG_BACKEND_NAME = "bge-reranker-v2-m3-flag/1"
 
+# Explicit CPU batch size for the 64-candidate BGE rerank. Scoring stays
+# one logical batched call per turn (order preserved) but is issued in
+# bounded micro-batches so a warm turn holds one small activation block
+# instead of the full 64-pair tensor; scores are unchanged.
+RERANK_SCORE_BATCH_SIZE = 32
+
 _HEX40_RE = frozenset("0123456789abcdef")
 
 
@@ -507,29 +513,42 @@ class CrossEncoderReranker:
 
     def _score_flag(self, query: str, texts: list[str]) -> list[float]:
         pairs = [[query, text] for text in texts]
+        raw_scores: list[float] = []
         try:
             with _RERANKER_SCORE_LOCK:
-                raw = self._flag_reranker.compute_score(pairs, normalize=True)
+                for start in range(0, len(pairs), RERANK_SCORE_BATCH_SIZE):
+                    batch = pairs[start : start + RERANK_SCORE_BATCH_SIZE]
+                    try:
+                        raw = self._flag_reranker.compute_score(
+                            batch, normalize=True, batch_size=RERANK_SCORE_BATCH_SIZE
+                        )
+                    except TypeError:
+                        # Older FlagEmbedding builds without a batch_size kwarg.
+                        raw = self._flag_reranker.compute_score(batch, normalize=True)
+                    if isinstance(raw, (float, int)) and not isinstance(raw, bool):
+                        raw_scores.append(float(raw))
+                    else:
+                        for value in list(raw):
+                            if isinstance(value, bool) or isinstance(
+                                value, (str, bytes, bytearray)
+                            ):
+                                raise RerankerError(
+                                    "FlagEmbedding reranker returned non-numeric scores"
+                                )
+                            if not isinstance(value, (float, int)):
+                                try:
+                                    float(value)
+                                except (TypeError, ValueError, ArithmeticError) as exc:
+                                    raise RerankerError(
+                                        f"FlagEmbedding reranker returned no scores: {exc}"
+                                    ) from exc
+                            raw_scores.append(float(value))
+        except RerankerError:
+            raise
         except Exception as exc:
             raise RerankerError(f"FlagEmbedding reranker scoring failed: {exc}") from exc
         try:
-            if isinstance(raw, (float, int)) and not isinstance(raw, bool):
-                scores = [float(raw)]
-            else:
-                items = list(raw)
-                for value in items:
-                    if isinstance(value, bool) or isinstance(value, (str, bytes, bytearray)):
-                        raise RerankerError("FlagEmbedding reranker returned non-numeric scores")
-                    if not isinstance(value, (float, int)):
-                        try:
-                            float(value)
-                        except (TypeError, ValueError, ArithmeticError) as exc:
-                            raise RerankerError(
-                                f"FlagEmbedding reranker returned no scores: {exc}"
-                            ) from exc
-                scores = [float(value) for value in items]
-        except RerankerError:
-            raise
+            scores = [float(value) for value in raw_scores]
         except (TypeError, ValueError, ArithmeticError) as exc:
             raise RerankerError(f"FlagEmbedding reranker returned no scores: {exc}") from exc
         if len(scores) != len(texts):
@@ -685,6 +704,7 @@ __all__ = [
     "RERANKER_LOCK_FORMAT",
     "RERANKER_MODEL_DIR_NAME",
     "RERANKER_MODEL_ID",
+    "RERANK_SCORE_BATCH_SIZE",
     "CrossEncoderReranker",
     "RerankerError",
     "default_reranker_lock_path",

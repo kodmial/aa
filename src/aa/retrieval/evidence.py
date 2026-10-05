@@ -183,6 +183,27 @@ def _require_ram_index(index: HybridIndex) -> None:
         raise EvidenceError("index is not RAM-resident; open it via open_hybrid_index")
 
 
+def _embed_query_vectors(index: HybridIndex, queries: list[str]) -> list[list[float]]:
+    """Embed all planner queries in one batched call (hot-path optimization).
+
+    The hashing backend is cheap and stays per-query; the E5 backend goes
+    through a single :func:`e5_embed` forward with padded batching instead
+    of one lock/model call per query. Returned vectors are L2-normalized
+    and order-preserving; ranking is unchanged.
+    """
+    backend = str(index.metadata.get("embedding_backend", HASHING_BACKEND_NAME))
+    dim = int(index.metadata.get("embedding_dim", HASHING_DIM))
+    if backend == HASHING_BACKEND_NAME:
+        return [hashing_embed(query, dim=dim) for query in queries]
+    if backend == E5_BACKEND_NAME:
+        try:
+            vectors = e5_embed(["query: " + query for query in queries])
+        except DenseError as exc:
+            raise EvidenceError(str(exc)) from exc
+        return [l2_normalize(vector) for vector in vectors]
+    raise EvidenceError(f"unsupported index embedding backend: {backend!r}")
+
+
 def run_branch_searches(
     index: HybridIndex,
     queries: list[str],
@@ -194,12 +215,13 @@ def run_branch_searches(
     if branch_top_k <= 0:
         raise EvidenceError("branch_top_k must be > 0")
     assert index.lexical_conn is not None
+    query_vectors = _embed_query_vectors(index, queries)
     ranked_lists: list[list[tuple[str, float]]] = []
     per_query_ids: list[list[str]] = []
-    for query in queries:
+    for query, query_vector in zip(queries, query_vectors, strict=True):
         lexical_ranked = lexical_search_conn(index.lexical_conn, query, top_k=branch_top_k)
         dense_ranked = index.dense.search(
-            _embed_query_vector(index, query),
+            query_vector,
             top_k=min(branch_top_k, len(index.chunks)),
         )
         ranked_lists.append(lexical_ranked)

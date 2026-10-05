@@ -112,7 +112,10 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
     ``local_files_only=True``); raises :class:`DenseError` when the
     stack or the pinned snapshot is unavailable instead of touching
     the network. Loaded weights are cached per snapshot directory so
-    ordinary turns reuse them instead of reloading per query.
+    ordinary turns reuse them instead of reloading per query. All
+    ``texts`` are scored in one batched forward (padded tokenizer
+    batch + single model call with masked mean pooling), preserving
+    per-text scores while removing per-query HF overhead.
     """
     import importlib
     import os
@@ -160,16 +163,23 @@ def e5_embed(texts: list[str], *, model_dir: str | None = None) -> list[list[flo
         _E5_LOADED[cache_key] = cached
     else:
         tokenizer, model = cached
-    vectors: list[list[float]] = []
+    if not texts:
+        return []
+    prefixed = [
+        text if text.startswith(("query: ", "passage: ")) else "query: " + text for text in texts
+    ]
+    # One batched forward for the whole turn (single tokenizer + model
+    # call with padding) instead of one forward per query: identical
+    # mean-pooled scores with ~N fewer HF overheads on the hot path.
     with torch_mod.no_grad():
-        for text in texts:
-            prefixed = text if text.startswith(("query: ", "passage: ")) else "query: " + text
-            encoded = tokenizer(prefixed, return_tensors="pt", truncation=True, max_length=512)
-            output = model(**encoded).last_hidden_state
-            mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
-            pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-            normalized = torch_mod.nn.functional.normalize(pooled, p=2, dim=1)
-            vectors.append([float(value) for value in normalized[0].tolist()])
+        encoded = tokenizer(
+            prefixed, return_tensors="pt", padding=True, truncation=True, max_length=512
+        )
+        output = model(**encoded).last_hidden_state
+        mask = encoded["attention_mask"].unsqueeze(-1).expand(output.size()).float()
+        pooled = (output * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        normalized = torch_mod.nn.functional.normalize(pooled, p=2, dim=1)
+        vectors = [[float(value) for value in row.tolist()] for row in normalized]
     return vectors
 
 
