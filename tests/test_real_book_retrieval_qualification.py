@@ -350,7 +350,9 @@ def test_runner_uses_production_adapter_and_never_logs_text() -> None:
     assert "run_planner" in text
     assert "open_hybrid_index" in text
     assert "retrieve_evidence" in text or "run_branch_searches" in text
-    assert "priority_child_ids=tuple(candidate.chunk_id for candidate in winners)" in text
+    assert (
+        "priority_child_ids=tuple(candidate.chunk_id for candidate in winners)" in text
+    )
     assert "sections=sections" in text
     assert "AA_BOOK_AGE_IDENTITY" in text
     assert "never printed" in text.lower() or "never echoed" in text.lower()
