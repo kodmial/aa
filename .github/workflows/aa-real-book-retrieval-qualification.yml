@@ -41,6 +41,8 @@ on:
       - "scripts/run_real_book_retrieval_qualification.py"
       - "src/aa/conversation/model_adapter.py"
       - "src/aa/conversation/planner_node.py"
+      - "src/aa/retrieval/**"
+      - "src/aa/corpus/budget.py"
 
 permissions:
   contents: read
