@@ -338,9 +338,10 @@ def run_v2_case(
 ) -> V2CaseResult:
     """Run baseline (RRF-only) vs target (RRF + rerank + expansion) for one case."""
     # Frozen validation pins the full-quality 64-candidate pool explicitly:
-    # ordinary turns default to the optimized interactive pool via
-    # retrieve_evidence, but this benchmark must keep measuring the
-    # committed ~21-22s configuration so the latency gate stays comparable.
+    # ordinary turns default to the optimized interactive pool via the turn
+    # hot path (retrieval_node/graph with interactive_retrieval_config),
+    # but this benchmark must keep measuring the committed ~21-22s
+    # configuration so the latency gate stays comparable.
     # Construct the frozen config from named constants instead of bare
     # RetrievalConfig() defaults so a future default change (for example
     # switching defaults to the interactive 16-cap pool) cannot silently

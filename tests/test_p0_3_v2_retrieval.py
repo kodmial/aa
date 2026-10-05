@@ -365,6 +365,30 @@ def test_per_query_best_candidate_retained(tmp_path: pathlib.Path) -> None:
         close_hybrid_index(index)
 
 
+def test_small_pool_preserves_global_rrf_depth() -> None:
+    """A small interactive pool keeps global RRF depth, not just per-query bests.
+
+    With 4 queries and a 4-cap pool, uncapped per-query retention would fill
+    the pool with per-query uniques and drop the globally top-ranked
+    candidates. Retention is capped at half the pool so the interactive
+    16-cap prefix keeps RRF-ranked depth; the frozen 64-cap pool still
+    retains every per-query best.
+    """
+    from aa.retrieval.evidence import fuse_query_pool
+
+    ranked_lists = [
+        [("g1", 9.0), ("g2", 8.0), ("g3", 7.0), ("g4", 6.0), (f"u{pos}", 1.0)] for pos in range(4)
+    ]
+    per_query_ids = [[f"u{pos}"] for pos in range(4)]
+    fused, pool_ids = fuse_query_pool(ranked_lists, per_query_ids, pool_cap=4)
+    assert len(pool_ids) == 4
+    assert "g1" in pool_ids
+    assert "g2" in pool_ids
+    _, full_pool_ids = fuse_query_pool(ranked_lists, per_query_ids)
+    for chunk_id in ("u0", "u1", "u2", "u3", "g1", "g2", "g3", "g4"):
+        assert chunk_id in full_pool_ids
+
+
 # ---------------------------------------------------------------------------
 # Reranker: ordering honored, canonical query, batched long-lived reuse.
 # ---------------------------------------------------------------------------
