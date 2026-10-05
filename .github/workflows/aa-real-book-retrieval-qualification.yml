@@ -460,6 +460,10 @@ jobs:
               core.setFailed(`result file unreadable: ${error.message}`);
               return;
             }
+            if (status.reason_code === 'OPENCODE_429_RESTART_REQUIRED') {
+              core.notice('429 recovery checkpoint published; final #130 marker waits for the fresh-runner continuation.');
+              return;
+            }
             const result = status.result || 'INCOMPLETE';
             if (!['PASS', 'FAIL', 'INCOMPLETE', 'STALE'].includes(result)) {
               core.setFailed(`invalid deterministic result: ${result}`);
