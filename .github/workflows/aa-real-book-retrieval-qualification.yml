@@ -43,6 +43,9 @@ on:
       - "src/aa/conversation/planner_node.py"
       - "src/aa/retrieval/**"
       - "src/aa/corpus/budget.py"
+      - "src/aa/qualification/real_book_retrieval.py"
+      - "tests/test_p0_3_v2_retrieval.py"
+      - "tests/test_real_book_retrieval_qualification.py"
 
 permissions:
   contents: read
