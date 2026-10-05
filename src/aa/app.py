@@ -34,7 +34,7 @@ from aa.conversation.output_limits import (
 )
 from aa.corpus.context import CorpusContext
 from aa.grounding import GroundingGate
-from aa.opencode.errors import OpenCodeError, OpenCodeSessionNotFoundError
+from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError, OpenCodeSessionNotFoundError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.retrieval.index import HybridIndex, open_hybrid_index
 from aa.safety.response import build_emergency_response
@@ -153,6 +153,7 @@ class Application:
             except Exception:
                 pass
         self._running = False
+        self._fatal_error: BaseException | None = None
         # Transport/orchestration only: the dispatcher calls the production
         # #9 turn orchestrator via ``respond`` and never creates another
         # LLM/provider client or knowledge pipeline.
@@ -366,6 +367,8 @@ class Application:
                 await asyncio.sleep(0.05)
         finally:
             await self.stop()
+        if self._fatal_error is not None:
+            raise self._fatal_error
 
     def _wire_transport_handlers(self) -> None:
         """Connect the concrete polling transport to application behavior.
@@ -418,16 +421,25 @@ class Application:
         competing sessions and ``/new`` cannot interleave with an older
         turn for the same chat.
         """
-        if incoming.command == "start":
-            await self._handle_start_command(incoming)
-            return
-        if incoming.command == "new":
-            await self._handle_new_command(incoming)
-            return
-        if incoming.voice is not None:
-            await self._handle_voice_update(incoming)
-            return
-        await self._handle_telegram_update(incoming)
+        try:
+            if incoming.command == "start":
+                await self._handle_start_command(incoming)
+                return
+            if incoming.command == "new":
+                await self._handle_new_command(incoming)
+                return
+            if incoming.voice is not None:
+                await self._handle_voice_update(incoming)
+                return
+            await self._handle_telegram_update(incoming)
+        except OpenCodeRateLimitError as exc:
+            # Provider 429 is a worker lifecycle failure: stop accepting work,
+            # let the main run loop unwind, and surface the fatal exception so
+            # the hosted workflow can replace this runner.
+            if self._fatal_error is None:
+                self._fatal_error = exc
+            await self.controller.stop()
+            raise
 
     async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_START_REPLY))
@@ -556,6 +568,8 @@ class Application:
                     extra={"chat_id": incoming.chat_id, "update_id": incoming.update_id},
                 )
                 reply = FAIL_CLOSED_REPLY
+        except OpenCodeRateLimitError:
+            raise
         except (OpenCodeError, ValueError):
             logger.warning(
                 "telegram message processing failed",
