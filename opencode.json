@@ -4,7 +4,7 @@
     "aa": {
       "description": "Closed-book AA literature support assistant",
       "mode": "primary",
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/space-bunny-free",
       "prompt": "{file:./prompts/aa-agent-system.md}",
       "temperature": 0.2,
       "permission": {
@@ -17,7 +17,7 @@
     },
     "aa-planner-v2": {
       "description": "Hidden retrieval query planner for the v2 conversation graph",
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/space-bunny-free",
       "prompt": "{file:./prompts/aa-planner-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -27,7 +27,7 @@
     },
     "aa-summarizer-v2": {
       "description": "Hidden conversation continuity summarizer for the v2 graph",
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/space-bunny-free",
       "prompt": "{file:./prompts/aa-summarizer-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -36,7 +36,7 @@
     },
     "aa-v2": {
       "description": "Russian-language AA conversational assistant (v2 graph foundation)",
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/space-bunny-free",
       "prompt": "{file:./prompts/aa-agent-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -45,7 +45,7 @@
     },
     "aa-verifier-v2": {
       "description": "Hidden claim-level grounding verifier for the v2 conversation graph",
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/space-bunny-free",
       "prompt": "{file:./prompts/aa-verifier-system-v2.md}",
       "temperature": 0.0,
       "permission": {
