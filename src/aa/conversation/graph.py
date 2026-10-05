@@ -1,9 +1,9 @@
-"""LangGraph turn foundation for the v2 conversation architecture (issue #113).
+"""LangGraph turn foundation for the v2 conversation architecture.
 
 Turn boundary: Telegram turn -> typed state -> deterministic
 application-command/safety handling -> mandatory hidden planner -> managed
-conversation memory -> downstream retrieval/answer interfaces (stubs owned
-by later tasks #116/#117).
+conversation memory -> retrieval/Evidence Pack -> natural AA answer with
+claim-level verification and bounded repair.
 
 The legacy ``aa.conversation.orchestrator`` path is untouched and remains
 the production path until the later cutover task. No legacy lexical
@@ -177,6 +177,8 @@ def build_turn_graph(
     safety_check: SafetyCheck | None = None,
     retrieval_index: Any = None,
     retrieval_config: Any = None,
+    answer_model: Runnable[list[BaseMessage], BaseMessage] | Any | None = None,
+    verifier_model: Any | None = None,
 ) -> CompiledStateGraph[TurnState, None, TurnState, TurnState]:
     """Compile the v2 turn graph with managed checkpointing.
 
@@ -191,6 +193,12 @@ def build_turn_graph(
     small-to-big``) instead of the ``retrieval_stub`` no-op.
     ``retrieval_config`` is forwarded when provided. The legacy
     production path stays untouched until the later cutover task.
+
+    ``answer_model``/``verifier_model`` bind the natural answer pipeline:
+    when both are given, an ``answer`` node runs AA generation,
+    claim-level verification, bounded targeted repair, and the #83
+    envelope after retrieval. When omitted, the graph keeps its
+    planner-to-retrieval semantics for unit tests.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -225,7 +233,24 @@ def build_turn_graph(
     )
     builder.add_edge("ensure_memory", "planner")
     builder.add_edge("planner", retrieval_node_name)
-    builder.add_edge(retrieval_node_name, END)
+    if answer_model is not None and verifier_model is not None:
+        from aa.conversation.turn_pipeline import answer_pipeline_node
+
+        async def _answer(state: TurnState) -> dict[str, Any]:
+            return await answer_pipeline_node(
+                state,
+                answer_model=answer_model,
+                verifier_model=verifier_model,
+                planner_model=planner_model,
+                retrieval_index=retrieval_index,
+                retrieval_config=retrieval_config,
+            )
+
+        builder.add_node("answer", _answer)
+        builder.add_edge(retrieval_node_name, "answer")
+        builder.add_edge("answer", END)
+    else:
+        builder.add_edge(retrieval_node_name, END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -240,10 +265,12 @@ def turn_input(user_message: str, *, summary: str | None = None) -> TurnState:
         retrieval_latency_ms=0.0,
         retrieval_over_budget=False,
         draft_response="",
+        final_response="",
         grounding_result={},
         retry_state={},
         planner_invoked=False,
         route=NORMAL_ROUTE,
+        recent_quote_ranges=[],
     )
     if summary is not None:
         payload["conversation_summary"] = summary

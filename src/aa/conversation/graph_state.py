@@ -28,10 +28,12 @@ class TurnState(TypedDict, total=False):
     retrieval_latency_ms: float
     retrieval_over_budget: bool
     draft_response: str
+    final_response: str
     grounding_result: dict[str, Any]
     retry_state: dict[str, Any]
     planner_invoked: bool
     route: str
+    recent_quote_ranges: list[dict[str, Any]]
 
 
 NORMAL_ROUTE = "normal"
@@ -54,10 +56,12 @@ def initial_state(user_message: str, *, summary: str = "") -> TurnState:
         retrieval_latency_ms=0.0,
         retrieval_over_budget=False,
         draft_response="",
+        final_response="",
         grounding_result={},
         retry_state={},
         planner_invoked=False,
         route=NORMAL_ROUTE,
+        recent_quote_ranges=[],
     )
 
 

@@ -41,6 +41,15 @@
       "permission": {
         "*": "deny"
       }
+    },
+    "aa-verifier-v2": {
+      "description": "Hidden claim-level grounding verifier for the v2 conversation graph",
+      "model": "opencode/muse-spark-1.3-contributor-free",
+      "prompt": "{file:./prompts/aa-verifier-system-v2.md}",
+      "temperature": 0.0,
+      "permission": {
+        "*": "deny"
+      }
     }
   }
 }
