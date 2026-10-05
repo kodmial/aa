@@ -368,6 +368,10 @@ def rerank_candidates(
 
     Batched scoring through one long-lived reranker instance. Ordering
     and selection may change; canonical text and provenance never do.
+    Exact duplicate texts are scored once and mapped back so the
+    64-candidate CPU BGE hot path never pays repeated forwards for
+    identical child text; ranking is unchanged (identical texts share
+    one score, ties still break by fused score).
     """
     if post_rerank_cap <= 0:
         raise EvidenceError("post_rerank_cap must be > 0")
@@ -384,12 +388,26 @@ def rerank_candidates(
         if _sha256_text(record.text) != record.text_sha256:
             raise EvidenceError(f"RAM chunk checksum mismatch: {record.chunk_id!r}")
         texts.append(record.text)
+    # Deduplicate exact texts before the CPU BGE forward: identical child
+    # text yields an identical cross-encoder score, so scoring uniques
+    # once preserves ranking while cutting forwards on duplicated spans.
+    unique_index: dict[str, int] = {}
+    unique_texts: list[str] = []
+    text_positions: list[int] = []
+    for text in texts:
+        pos = unique_index.get(text)
+        if pos is None:
+            pos = len(unique_texts)
+            unique_index[text] = pos
+            unique_texts.append(text)
+        text_positions.append(pos)
     try:
-        scores = active.score(reranker_query, texts)
+        unique_scores = active.score(reranker_query, unique_texts)
     except RerankerError as exc:
         raise EvidenceError(str(exc)) from exc
-    if len(scores) != len(candidates):
+    if len(unique_scores) != len(unique_texts):
         raise EvidenceError("reranker must return one score per candidate")
+    scores = [unique_scores[pos] for pos in text_positions]
     clean_scores: list[float] = []
     for score in scores:
         if isinstance(score, bool) or isinstance(score, (str, bytes, bytearray)):
