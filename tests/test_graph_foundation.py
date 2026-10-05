@@ -153,6 +153,14 @@ def test_query_plan_json_schema_derives_from_pydantic() -> None:
     schema = query_plan_json_schema()
     assert schema["type"] == "object"
     assert "queries" in schema["properties"]
+    queries = schema["properties"]["queries"]
+    assert queries["items"]["type"] == "string"
+    assert queries["items"]["pattern"] == r"\S"
+    assert queries["uniqueItems"] is True
+    assert queries["anyOf"] == [
+        {"maxItems": 0},
+        {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
+    ]
 
 
 def test_planner_node_has_no_text_json_machinery() -> None:
