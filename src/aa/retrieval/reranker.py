@@ -623,22 +623,35 @@ def get_reranker(
     ``FlagEmbedding`` stack is unavailable. Pass
     ``allow_offline=True`` only for explicit hermetic test injection
     where the deterministic stem-overlap backend is wanted.
+
+    Singleton isolation: the FLAG backend is keyed by
+    ``model@revision`` while the offline stem-overlap backend is keyed
+    by ``model@revision|offline-stem-overlap/1``. A prior
+    ``allow_offline=True`` call never poisons a later production call:
+    production reuses only a cached FLAG instance and otherwise falls
+    through to :func:`_load_flag_reranker`, which fails closed.
     """
     resolved = Path(lock_path) if lock_path is not None else default_reranker_lock_path()
     cache_key = str(resolved)
     with _RERANKER_INIT_LOCK:
         cached_lock = _RERANKER_LOCK_CACHE.get(cache_key)
         if cached_lock is not None:
-            key = f"{cached_lock.get('model_id')}@{cached_lock.get('revision')}"
-            cached = _RERANKER_SINGLETONS.get(key)
-            if cached is not None:
-                return cached
             lock = dict(cached_lock)
         else:
             lock = load_reranker_lock(resolved)
             _RERANKER_LOCK_CACHE[cache_key] = dict(lock)
-            key = f"{lock.get('model_id')}@{lock.get('revision')}"
-            cached = _RERANKER_SINGLETONS.get(key)
+        base_key = f"{lock.get('model_id')}@{lock.get('revision')}"
+        flag_key = base_key
+        offline_key = f"{base_key}|{OFFLINE_BACKEND_NAME}"
+        if not allow_offline:
+            cached = _RERANKER_SINGLETONS.get(flag_key)
+            if cached is not None and cached.backend == FLAG_BACKEND_NAME:
+                return cached
+        else:
+            cached = _RERANKER_SINGLETONS.get(flag_key)
+            if cached is not None:
+                return cached
+            cached = _RERANKER_SINGLETONS.get(offline_key)
             if cached is not None:
                 return cached
         try:
@@ -651,8 +664,10 @@ def get_reranker(
             instance = CrossEncoderReranker(
                 lock=lock, backend=FLAG_BACKEND_NAME, _flag_reranker=flag_reranker
             )
+            key = flag_key
         else:
             instance = CrossEncoderReranker(lock=lock, backend=OFFLINE_BACKEND_NAME)
+            key = offline_key
         _RERANKER_SINGLETONS[key] = instance
     logger.info("reranker ready backend=%s model=%s", instance.backend, key)
     return instance
