@@ -245,7 +245,7 @@ async def test_planner_uses_native_structured_output() -> None:
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     plan = await run_planner("как справиться с тягой?", model=model)
@@ -319,7 +319,7 @@ def test_summarization_node_uses_langmem_budgets() -> None:
     adapter = OpenCodeChatModel(
         FakeOpenCodeClient(),
         agent=SUMMARIZER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     node = build_summarization_node(
@@ -572,7 +572,7 @@ async def test_adapter_uses_ephemeral_sessions() -> None:
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     reply = await model.ainvoke([HumanMessage(content="скрытый вызов")])
@@ -580,7 +580,7 @@ async def test_adapter_uses_ephemeral_sessions() -> None:
     assert client.created == 1
     assert client.deleted == 1
     assert client.agents == [PLANNER_AGENT_V2]
-    assert client.models == ["opencode/muse-spark-1.3-contributor-free"]
+    assert client.models == ["opencode/space-bunny-free"]
 
 
 async def test_adapter_sends_system_natively_not_in_text() -> None:
@@ -588,7 +588,7 @@ async def test_adapter_sends_system_natively_not_in_text() -> None:
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     await model.ainvoke(
@@ -614,7 +614,7 @@ async def test_adapter_structured_output_uses_json_schema() -> None:
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     result = await model.ainvoke_structured(
@@ -631,7 +631,7 @@ def test_sync_generate_runs_without_running_loop() -> None:
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="",
     )
     result = model.invoke([HumanMessage(content="синхронный вызов")])
@@ -666,7 +666,7 @@ async def test_adapter_falls_back_on_transient_error() -> None:
     model = OpenCodeChatModel(
         client,
         agent=SUMMARIZER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     reply = await model.ainvoke([HumanMessage(content="резюмируй")])
@@ -679,7 +679,7 @@ async def test_adapter_hidden_calls_do_not_accumulate_history() -> None:
     model = OpenCodeChatModel(
         client,
         agent=ANSWER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     await model.ainvoke([HumanMessage(content="первый")])
@@ -745,7 +745,7 @@ async def test_adapter_logs_nothing_with_content(caplog: pytest.LogCaptureFixtur
     model = OpenCodeChatModel(
         client,
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     with caplog.at_level(logging.INFO, logger="aa"):
@@ -825,10 +825,13 @@ def test_opencode_agents_keep_legacy_and_add_locked_down_v2() -> None:
         ("aa-summarizer-v2", "aa-summarizer-system-v2.md"),
     ):
         agent = agents[name]
-        assert agent["permission"] == {"*": "deny"}
+        expected_permission = {"*": "deny"}
+        if name == "aa-planner-v2":
+            expected_permission["StructuredOutput"] = "allow"
+        assert agent["permission"] == expected_permission
         assert agent["prompt"] == "{file:./prompts/" + prompt_file + "}"
         assert (root / "prompts" / prompt_file).exists()
-        assert agent["model"] == "opencode/muse-spark-1.3-contributor-free"
+        assert agent["model"] == "opencode/space-bunny-free"
 
 
 def test_typed_state_contract_fields() -> None:
@@ -869,14 +872,14 @@ async def test_timeouts_fall_back_without_user_content_leak() -> None:
             system: str = "",
             format: dict[str, object] | None = None,
         ) -> str:
-            if model == "opencode/muse-spark-1.3-contributor-free":
+            if model == "opencode/space-bunny-free":
                 raise OpenCodeTimeoutError("slow")
             return "ok"
 
     model = OpenCodeChatModel(
         _TimeoutClient(),
         agent=PLANNER_AGENT_V2,
-        primary_model="opencode/muse-spark-1.3-contributor-free",
+        primary_model="opencode/space-bunny-free",
         fallback_model="opencode/space-bunny-free",
     )
     reply = await model.ainvoke([HumanMessage(content="план")])
