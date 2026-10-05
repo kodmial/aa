@@ -174,14 +174,17 @@ class V2Summary:
 
 
 def planner_proxy_queries(case: GoldCase, *, count: int = PROXY_QUERY_COUNT) -> list[str]:
-    """Build 10..16 deterministic proxy planner queries for one gold case.
+    """Build up to 10..16 deterministic proxy planner queries for one gold case.
 
     ``queries[0]`` is the direct context-resolved formulation of the
     current turn (utterance plus multi-turn context when the case
     requires it). Remaining queries diversify wording using only the
     case's own utterance, context, paraphrase lists and allowed
     interpretations; oracle relevant-section labels are never consulted
-    and no hand-written expansion dictionary is used.
+    and no hand-written expansion dictionary is used. No synthetic
+    filler vocabulary is invented: when the case owns fewer distinct
+    phrasings, the honest deduped pool (possibly shorter than ``count``)
+    is returned.
     """
     if count < 10 or count > 16:
         raise ValueError("proxy query count must be 10..16")
@@ -228,19 +231,10 @@ def planner_proxy_queries(case: GoldCase, *, count: int = PROXY_QUERY_COUNT) -> 
         if len(cleaned) >= count:
             break
     if len(cleaned) < count:
-        base = cleaned[0] if cleaned else (resolved if resolved.strip() else "вопрос")
-        base = " ".join(str(base).split()) or "вопрос"
-        suffix = 1
-        guard = 0
-        while len(cleaned) < count and guard < 10 * count + 50:
-            guard += 1
-            candidate = f"{base} уточнение {suffix}"
-            suffix += 1
-            collapsed = " ".join(candidate.split())
-            if not collapsed or collapsed.casefold() in seen:
-                continue
-            seen.add(collapsed.casefold())
-            cleaned.append(collapsed)
+        # Do not invent vocabulary to hit `count`; the frozen eval must use
+        # only case-owned phrasing. Callers already handle variable lengths
+        # via `query_diversity` and `duplicate_query_rate`.
+        pass
     return cleaned[:count]
 
 
@@ -402,7 +396,13 @@ def run_v2_case(
         pool_cap=active.reranker_pool_cap,
         max_per_section=active.max_per_section,
     )
-    pool_sections = tuple(dict.fromkeys(index.chunks[c.chunk_id].section for c in _diverse))
+    pool_sections = tuple(
+        dict.fromkeys(
+            record.section
+            for chunk in _diverse
+            if (record := index.chunks.get(chunk.chunk_id)) is not None
+        )
+    )
     pool_hit = _recall_at(pool_sections, case, len(pool_sections))
     pack_hit = target_r10
     unsupported_clean = (not target_pack.passages) if case.is_unsupported else True

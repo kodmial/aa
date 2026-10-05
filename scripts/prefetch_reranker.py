@@ -2,15 +2,20 @@
 """Prefetch the pinned BGE reranker model (issue #116).
 
 Optional acceleration only, mirroring ``prefetch_public_assets.py``. The
-AA runtime works identically when this cache is missing or unavailable,
-falling back to the deterministic offline scoring backend:
+prefetch itself never fails the runtime: production
+``get_reranker(allow_offline=False)`` fails closed with
+``RerankerError`` when the pinned snapshot/stack is missing, so a
+skipped/missed prefetch leaves bootstrap to fail closed until the cache
+is populated. The deterministic offline scoring backend is explicit
+test injection only (``allow_offline=True``):
 
 - ``--check-only`` verifies the pinned identity and prunes corrupt or
   incompatible content, then exits 0 without downloading;
 - the default mode reuses a verified hit, otherwise downloads normally
   via ``huggingface_hub`` when available and revalidates before use;
-- any download/cache failure is non-fatal (exit 0 with a ``miss`` or
-  ``skipped`` status) so a valid runtime is never failed by the cache;
+- any download/cache failure is non-fatal for this script (exit 0 with
+  a ``miss`` or ``skipped`` status) but does not provision a valid
+  production runtime on its own;
 - only the pinned reranker id + revision from
   ``corpus/reranker.lock.json`` is handled. Corpus text, retrieval
   indexes, secrets, Telegram/user state, and decrypted artifacts are

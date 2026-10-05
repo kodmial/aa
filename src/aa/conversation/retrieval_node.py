@@ -110,11 +110,17 @@ def state_passages_to_prompt(pack_dicts: list[dict[str, Any]]) -> list[EvidenceP
             continue
         if not isinstance(passage_id, str) or not passage_id:
             continue
+        # Never coerce a missing id to the literal "None": skip passages
+        # without real grounding provenance instead of misattributing them.
+        if not isinstance(source_id, str) or not source_id:
+            continue
+        if not isinstance(section_id, str) or not section_id:
+            continue
         passages.append(
             EvidencePassage(
                 passage_id=passage_id,
-                source=str(source_id),
-                section=str(section_id),
+                source=source_id,
+                section=section_id,
                 text=text,
             )
         )
@@ -165,16 +171,13 @@ async def retrieval_node(
     if not is_interactive_config(active_config):
         # The frozen 64-candidate validation exceeds the 5s interactive
         # budget (~20-22s warm p50/p95 of CPU BGE forwards); running it on
-        # the turn hot path requires explicit performance acceptance at
-        # binding time, so surface it here as well instead of silently
-        # serving the slow full-quality path as if it were interactive.
-        logger.warning(
-            "v2 retrieval running non-interactive BGE pool",
-            extra={
-                "reranker_pool_cap": active_config.reranker_pool_cap,
-                "interactive_pool_cap": INTERACTIVE_RERANKER_POOL_CAP,
-                "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
-            },
+        # the turn hot path requires explicit performance acceptance via
+        # make_retrieval_node, so fail closed here as well instead of
+        # serving the slow full-quality path behind a warning.
+        raise ValueError(
+            "non-interactive `reranker_pool_cap` cannot run on the turn hot path; "
+            "bind via `make_retrieval_node` with `performance_accepted=True` "
+            "and the optimized interactive config"
         )
     started = time.perf_counter()
     pack = await asyncio.to_thread(

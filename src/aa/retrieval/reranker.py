@@ -406,8 +406,8 @@ def invalidate_cached_reranker(model_root: str | Path) -> None:
     try:
         if marker.is_file():
             marker.unlink()
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("reranker cache marker removal failed: %s", exc)
     snapshots = root / "snapshots"
     if snapshots.is_dir():
         for child in sorted(snapshots.iterdir()):
@@ -415,16 +415,34 @@ def invalidate_cached_reranker(model_root: str | Path) -> None:
                 if child.is_file() or child.is_symlink():
                     child.unlink()
                 elif child.is_dir():
-                    for sub in sorted(child.rglob("*"), reverse=True):
+                    # Depth-first (deepest first) so children are removed
+                    # before parents regardless of name ordering; files
+                    # first, then dirs deepest-first, so rmdir sees empty
+                    # dirs for a clean rebuild.
+                    try:
+                        entries = list(child.rglob("*"))
+                    except OSError as exc:
+                        logger.warning("reranker cache scan failed: %s", exc)
+                        continue
+                    entries.sort(key=lambda p: (len(p.parts), str(p)), reverse=True)
+                    for sub in entries:
                         try:
                             if sub.is_file() or sub.is_symlink():
                                 sub.unlink()
-                            elif sub.is_dir():
+                        except OSError as exc:
+                            logger.warning("reranker cache file removal failed: %s", exc)
+                    for sub in entries:
+                        try:
+                            if sub.is_dir() and not sub.is_symlink():
                                 sub.rmdir()
-                        except OSError:
-                            pass
-                    child.rmdir()
-            except OSError:
+                        except OSError as exc:
+                            logger.warning("reranker cache dir removal failed: %s", exc)
+                    try:
+                        child.rmdir()
+                    except OSError as exc:
+                        logger.warning("reranker cache snapshot removal failed: %s", exc)
+            except OSError as exc:
+                logger.warning("reranker cache invalidation failed: %s", exc)
                 continue
 
 
