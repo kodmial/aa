@@ -112,6 +112,20 @@ def test_workflow_has_bounded_timeout_and_deterministic_status() -> None:
         assert status in text
 
 
+def test_workflow_resumes_after_429_runner_restart() -> None:
+    text = _workflow_text()
+    runner = _runner_text()
+    assert "Restore checkpoint from previous runner attempt" in text
+    assert "github.run_attempt > 1" in text
+    assert "checkpoint.json" in text
+    assert "overwrite: true" in text
+    assert "original trigger SHA" in text
+    assert "OPENCODE_429_RESTART_REQUIRED" in runner
+    assert "_write_checkpoint" in runner
+    assert "_load_checkpoint" in runner
+    assert "processed_case_ids" in runner
+
+
 def test_workflow_posts_idempotent_marker_keyed_by_full_tuple() -> None:
     text = _workflow_text()
     assert "issue_number: 130" in text or "issue_number:130" in text or "130" in text
