@@ -1,17 +1,20 @@
-"""Executable autonomous validation DAG (issue #106).
+"""Executable autonomous validation DAG (issues #106, #123).
 
 Validation/result state is the source of truth, never issue open/closed
 state:
 
 - capability -> qualification is one-way metadata; a qualification tracker
   must not declare its capability as a normal blocker;
-- validation trackers (40/62/63/7) are never normal implementation work
-  and must not enter the generic coding queue;
+- validation trackers (7/62/63, plus historical 40) are never normal
+  implementation work and must not enter the generic coding queue;
 - a qualification tracker may stay open/reusable across many SHAs;
 - current validity is a trusted machine-readable result tuple:
   qualification id + exact product revision/fingerprint + pass/fail + run;
 - FAIL/INCOMPLETE creates or reuses one repair issue per root cause,
-  waits for its merge, invalidates stale evidence and reruns automatically.
+  waits for its merge, invalidates stale evidence and reruns automatically;
+- #62 requires the current trusted #7 PASS plus the frozen vNext benchmark
+  checksum plus the migrated harness version; #63 requires the trusted #62
+  COMPLETE tuple plus the rubric/evaluator vNext checksum.
 
 This module keeps the DAG decision logic pure (no network) so workflows
 and unit tests share one implementation.
@@ -23,14 +26,28 @@ import hashlib
 import re
 from dataclasses import dataclass
 
-VALIDATION_TRACKERS: frozenset[int] = frozenset({40, 62, 63, 7})
+# Active validation trackers plus the historical product qualification
+# tracker, which remains excluded from coding work as immutable evidence
+# but is never authoritative for new #62/#63 cycles.
+VALIDATION_TRACKERS: frozenset[int] = frozenset({7, 62, 63, 40})
+
+# Active qualification authority for new benchmark cycles.
+ACTIVE_VALIDATION_TRACKERS: frozenset[int] = frozenset({7, 62, 63})
+
+# Historical tracker kept out of the coding queue as evidence only.
+HISTORICAL_VALIDATION_TRACKERS: frozenset[int] = frozenset({40})
+
+BENCHMARK_VERSION = "ru_product_contract.v1_2"
+HARNESS_VERSION = "aa-conversation-eval-harness/2"
+RUBRIC_VERSION = "ru-answer-quality-rubric-v2"
+EVALUATOR_VERSION = "aa-answer-quality-evaluator/2"
 
 # Capability qualified by each validation tracker (None = derived stage).
 CAPABILITY_FOR_QUALIFICATION: dict[int, int | None] = {
-    40: 9,
+    7: 6,
     62: None,
     63: None,
-    7: 6,
+    40: 9,
 }
 
 PASS_MARKER = "continuum-qualification-result"
@@ -106,8 +123,8 @@ def qualification_must_not_block(issue_number: int) -> int | None:
     return CAPABILITY_FOR_QUALIFICATION.get(issue_number)
 
 
-def parse_pass_markers(bodies: list[str], *, issue: int = 40) -> list[QualificationTuple]:
-    """Parse trusted #40 PASS/FAIL markers from comment bodies in order."""
+def parse_pass_markers(bodies: list[str], *, issue: int = 7) -> list[QualificationTuple]:
+    """Parse trusted #7 PASS/FAIL markers from comment bodies in order."""
     pattern = re.compile(
         r"<!--\s*continuum-qualification-result\s+"
         r"issue=(?P<issue>\d+)\s+"
@@ -150,17 +167,26 @@ def is_pass_current(
     current_fingerprint: str,
     current_sha: str = "",
 ) -> bool:
-    """Return whether a #40 PASS tuple authorizes downstream work.
+    """Return whether a trusted #7 PASS tuple authorizes downstream work.
 
     A fingerprint-bound PASS stays current across unrelated repository
     commits (scheduler-only changes do not rotate the product inputs). A
     legacy marker without a fingerprint falls back to exact-SHA equality,
-    which callers must requalify on every new main SHA.
+    which callers must requalify on every new main SHA. Only issue #7
+    markers are authoritative; legacy trackers never authorize new cycles.
     """
     if pass_tuple is None or pass_tuple.result != "pass":
         return False
+    if pass_tuple.issue != 7:
+        return False
     if pass_tuple.product_fingerprint:
-        return pass_tuple.product_fingerprint == current_fingerprint
+        if pass_tuple.product_fingerprint != current_fingerprint:
+            return False
+        # Fingerprint equality alone is not enough: the PASS SHA must also
+        # be the exact current main SHA for an authoritative #62 run.
+        if current_sha and pass_tuple.sha != current_sha:
+            return False
+        return True
     if not current_sha:
         return False
     return pass_tuple.sha == current_sha
@@ -173,18 +199,35 @@ def readiness_62(
     corpus_ready: bool,
     harness_ready: bool,
     current_sha: str = "",
+    benchmark_version: str = BENCHMARK_VERSION,
+    benchmark_sha: str = "",
+    expected_benchmark_sha: str = "",
+    harness_version: str = HARNESS_VERSION,
+    expected_harness_version: str = HARNESS_VERSION,
 ) -> tuple[bool, str]:
-    """Decide #62 readiness from result state, never issue closed state."""
+    """Decide #62 readiness from trusted tuple/checksum state.
+
+    Requires the current trusted #7 PASS on the exact same current main
+    SHA plus the frozen benchmark vNext checksum plus the migrated harness
+    version. Readiness is trusted tuple/checksum state, never issue closure
+    alone.
+    """
     if not corpus_ready:
-        return False, "no-op: #61 corpus is not frozen/ready"
+        return False, "no-op: vNext benchmark is not frozen/ready"
     if not harness_ready:
-        return False, "no-op: #72 harness is not merged/ready"
+        return False, "no-op: migrated #72 harness is not ready"
+    if benchmark_version != BENCHMARK_VERSION:
+        return False, f"no-op: unexpected benchmark version {benchmark_version!r}"
+    if harness_version != expected_harness_version:
+        return False, "no-op: harness version mismatch"
+    if expected_benchmark_sha and benchmark_sha != expected_benchmark_sha:
+        return False, "no-op: benchmark vNext checksum mismatch"
     if not is_pass_current(
         pass_tuple, current_fingerprint=current_fingerprint, current_sha=current_sha
     ):
-        return False, "no-op: no current trusted #40 PASS tuple"
+        return False, "no-op: no current trusted #7 PASS tuple on the exact main SHA"
     assert pass_tuple is not None
-    return True, f"ready: trusted #40 PASS sha={pass_tuple.sha}"
+    return True, f"ready: trusted #7 PASS sha={pass_tuple.sha}"
 
 
 def parse_eval_markers(bodies: list[str]) -> list[EvalTuple]:
@@ -257,15 +300,43 @@ def readiness_63(
     *,
     rubric_ready: bool,
     already_graded: bool,
+    rubric_sha: str = "",
+    expected_rubric_sha: str = "",
+    evaluator_version: str = EVALUATOR_VERSION,
+    expected_evaluator_version: str = EVALUATOR_VERSION,
 ) -> tuple[bool, str]:
-    """Decide #63 readiness from the trusted #62 COMPLETE tuple + rubric."""
+    """Decide #63 readiness from the trusted #62 COMPLETE tuple + rubric.
+
+    Requires the trusted #62 COMPLETE tuple plus the rubric/evaluator vNext
+    checksum. Readiness is trusted tuple/checksum state, never issue closure
+    alone.
+    """
     if complete is None:
         return False, "no-op: no trusted #62 COMPLETE tuple to grade"
     if not rubric_ready:
-        return False, "no-op: frozen #73 rubric is not bound"
+        return False, "no-op: frozen rubric/evaluator vNext is not bound"
+    if evaluator_version != expected_evaluator_version:
+        return False, "no-op: evaluator version mismatch"
+    if expected_rubric_sha and rubric_sha != expected_rubric_sha:
+        return False, "no-op: rubric vNext checksum mismatch"
     if already_graded:
         return False, "no-op: identical tuple already has a #63 result"
     return True, f"ready: #62 COMPLETE sha={complete.sha}"
+
+
+def should_schedule_fresh_cycle(
+    *,
+    latest_pass_sha: str,
+    graded_sha: str,
+) -> bool:
+    """Whether a newer trusted #7 PASS invalidates stale authority.
+
+    The same exact SHA + fixture + rubric tuple is idempotent (no rerun),
+    while a newer #7 PASS schedules exactly one fresh evaluation cycle.
+    """
+    if not latest_pass_sha.strip() or not graded_sha.strip():
+        return True
+    return latest_pass_sha.strip() != graded_sha.strip()
 
 
 def should_requalify_product(last_pass_fingerprint: str, *, current_fingerprint: str) -> bool:
@@ -290,10 +361,16 @@ def find_reusable_repair(open_repairs: list[tuple[int, str]], *, fingerprint: st
 
 
 __all__ = [
+    "ACTIVE_VALIDATION_TRACKERS",
+    "BENCHMARK_VERSION",
     "CAPABILITY_FOR_QUALIFICATION",
     "EVAL_MARKER",
+    "EVALUATOR_VERSION",
+    "HARNESS_VERSION",
+    "HISTORICAL_VALIDATION_TRACKERS",
     "PASS_MARKER",
     "QUALITY_MARKER",
+    "RUBRIC_VERSION",
     "VALIDATION_TRACKERS",
     "EvalTuple",
     "QualificationTuple",
@@ -313,4 +390,5 @@ __all__ = [
     "readiness_63",
     "repair_fingerprint",
     "should_requalify_product",
+    "should_schedule_fresh_cycle",
 ]

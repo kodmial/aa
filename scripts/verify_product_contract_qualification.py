@@ -95,8 +95,7 @@ def _production_python_sources() -> list[Path]:
     return sorted(
         path
         for path in root.rglob("*.py")
-        if path.is_file()
-        and path.relative_to(ROOT).as_posix() != "src/aa/conversation/graph.py"
+        if path.is_file() and path.relative_to(ROOT).as_posix() != "src/aa/conversation/graph.py"
     )
 
 
@@ -114,8 +113,7 @@ def _has_typing_heartbeat_binding() -> bool:
         *(ROOT / "src" / "aa" / "telegram").glob("*.py"),
     ]
     return any(
-        path.is_file() and TYPING_MARKER in path.read_text(encoding="utf-8")
-        for path in candidates
+        path.is_file() and TYPING_MARKER in path.read_text(encoding="utf-8") for path in candidates
     )
 
 

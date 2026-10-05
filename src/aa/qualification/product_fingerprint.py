@@ -1,10 +1,10 @@
-"""Deterministic product-qualification input fingerprint (issue #106).
+"""Deterministic product-qualification input fingerprint (issues #106, #121).
 
-The product qualification (#40) measures the user-facing AA runtime, not
-repository plumbing. A change to the deterministic product input set
-invalidates the current product PASS and must rerun qualification;
-unrelated automation/docs changes must not stale it merely because the
-repository HEAD moved.
+The Product Contract qualification (#7 for capability #6) measures the
+user-facing AA runtime, not repository plumbing. A change to the
+deterministic product input set invalidates the current product PASS and
+must rerun qualification; unrelated automation/docs changes must not stale
+it merely because the repository HEAD moved.
 
 The product input set covers runtime code, prompt, retrieval/grounding,
 corpus/index bindings, the Telegram production adapter and relevant
@@ -35,7 +35,10 @@ PRODUCT_INPUT_FILES: tuple[str, ...] = (
     "src/aa/app.py",
     "src/aa/config.py",
     "src/aa/__main__.py",
-    "prompts/aa-agent-system.md",
+    "prompts/aa-agent-system-v2.md",
+    "prompts/aa-planner-system-v2.md",
+    "prompts/aa-summarizer-system-v2.md",
+    "prompts/aa-verifier-system-v2.md",
     "opencode.json",
     "corpus/canonical.ru.manifest.json",
     "corpus/canonical.manifest.json",
@@ -45,11 +48,12 @@ PRODUCT_INPUT_FILES: tuple[str, ...] = (
     "corpus/embedding.lock.json",
     "qualification/aa-retrieval.json",
     "qualification/ru_first_retrieval.v1.decision.json",
-    "qualification/ru_answer_quality_rubric.v1.json",
-    "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl",
-    "qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl",
+    "qualification/ru_answer_quality_rubric.v2.json",
+    "qualification/ru_product_contract.v1_2.input.jsonl",
+    "qualification/ru_product_contract.v1_2.oracle.jsonl",
+    "qualification/ru_product_contract.v1_2.sources.json",
     "qualification/production_boundary.v1.json",
-    "scripts/verify_runtime_qualification.py",
+    "scripts/verify_product_contract_qualification.py",
     ".opencode/tools/book_search.ts",
     ".opencode/tools/book_read.ts",
     ".opencode/tools/book_expand.ts",

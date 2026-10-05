@@ -3,13 +3,20 @@
 Evaluation infrastructure only. This module never performs the authoritative
 #62 benchmark run and never changes product behavior to make a benchmark pass.
 
-Execution boundary: bulk evaluation must call the same transport-independent
-production turn boundary used by Telegram -- deterministic safety gating
-(:class:`aa.safety.router.SafetyRouter`), session coordination
-(:class:`aa.sessions.coordinator.SessionCoordinator`) and the planner /
-retrieval / evidence / synthesis / grounding path behind the OpenCode runtime
-(:class:`aa.opencode.client.OpenCodeClient`). Telegram network transport
-itself is excluded: no hundreds of cases go through the public Bot API.
+Authoritative readiness uses the trusted Product Contract qualification #7
+PASS on the exact same current main SHA. The frozen Product Contract vNext
+benchmark/rubric tuple from #127 (``ru_product_contract.v1_2.*`` plus
+``ru-answer-quality-rubric-v2``) is the only corpus this harness executes.
+
+Execution boundary: bulk evaluation must call the exact new production turn
+boundary from #118 -- the v2 LangGraph turn graph
+(:func:`aa.conversation.graph.build_turn_graph`) with deterministic safety
+gating (:class:`aa.safety.router.SafetyRouter`), framework-managed memory
+compaction, the mandatory hidden planner, RRF-only retrieval plus Evidence
+Pack selection, and the natural answer pipeline with claim-level verification
+and bounded targeted repair (:func:`aa.conversation.turn_pipeline.run_v2_answer_turn`).
+Telegram network transport itself is excluded: no hundreds of cases go through
+the public Bot API.
 
 Generator input isolation: the runner exposes to the generator only the
 current synthetic utterance, bounded prior turns from the same synthetic
@@ -40,21 +47,29 @@ from aa.opencode.errors import (
     OpenCodeTimeoutError,
     OpenCodeTransientError,
 )
-from aa.qualification.ru_realworld import (
-    INPUT_FORBIDDEN_KEYS,
+from aa.qualification.product_contract_vnext import (
+    BENCHMARK_VERSION,
     INPUT_REL,
     ORACLE_REL,
     SESSION_RESET_CONTROL,
+    SOURCES_REL,
     VERSION_REL,
     find_repo_root,
     load_input,
     sha256_file,
     validate,
 )
+from aa.qualification.product_contract_vnext import (
+    INPUT_FORBIDDEN_KEYS as VNEXT_INPUT_FORBIDDEN_KEYS,
+)
 
-EVAL_SCHEMA_VERSION = "aa-conversation-eval/1"
+EVAL_SCHEMA_VERSION = "aa-conversation-eval/2"
+HARNESS_VERSION = "aa-conversation-eval-harness/2"
+PRODUCTION_BOUNDARY_VERSION = "aa-v2-turn-graph/118"
 RESULT_MARKER = "aa-conversation-eval-result"
 RESULT_ISSUE = 62
+QUALIFICATION_ISSUE = 7
+CAPABILITY_ISSUE = 6
 
 DEFAULT_SHARD_COUNT = 4
 MAX_SHARD_COUNT = 8
@@ -65,11 +80,11 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BASE_DELAY_S = 1.0
 DEFAULT_MAX_DELAY_S = 30.0
 
-# Generator must never see these evaluation-only keys. Anchored on the corpus
+# Generator must never see these evaluation-only keys. Anchored on the vNext
 # input-leak boundary plus evaluator/rubric/provenance aliases so a new label
 # fails closed instead of leaking silently.
 FORBIDDEN_GENERATOR_KEYS = frozenset(
-    set(INPUT_FORBIDDEN_KEYS)
+    set(VNEXT_INPUT_FORBIDDEN_KEYS)
     | {
         "provenance",
         "sources",
@@ -287,7 +302,13 @@ def fresh_chat_ids(journey_ids: list[str], *, base: int, repeat: int) -> dict[st
 
 
 class TurnSender(Protocol):
-    """Narrow OpenCode send boundary behind the production turn pipeline."""
+    """Narrow production turn boundary behind the v2 LangGraph pipeline.
+
+    Implementations must invoke the exact new production turn boundary from
+    #118 (:func:`aa.conversation.graph.build_turn_graph` with the
+    ``run_v2_answer_turn`` answer path), never the legacy orchestrator and
+    never the public Telegram Bot API transport.
+    """
 
     async def ensure_session(self, chat_id: int) -> str: ...
     async def send(self, session_id: str, text: str, *, model: str) -> str: ...
@@ -296,23 +317,42 @@ class TurnSender(Protocol):
 
 @dataclass
 class TurnObservation:
-    """Raw observation of one production turn (pre-capture)."""
+    """Raw observation of one production turn (pre-capture).
+
+    Capture records current #112 architecture diagnostics without exposing
+    hidden reasoning: planner query count/hash/statistics, retrieval and
+    evidence IDs/checksums, response-unit grounding verdict summary,
+    targeted repair count, memory-compaction event/version, actual runtime
+    model/provider, and latency/resource metadata. Old aspect/slang planner
+    fields are never required diagnostics.
+    """
 
     answer: str
     safety_decision: str
     safety_categories: tuple[str, ...] = ()
     planner_diagnostics: dict[str, Any] = field(default_factory=dict)
+    planner_query_count: int = 0
+    planner_queries_sha256: str = ""
+    planner_statistics: dict[str, Any] = field(default_factory=dict)
     retrieval_source_ids: tuple[str, ...] = ()
     evidence_locators: tuple[str, ...] = ()
     evidence_checksums: tuple[str, ...] = ()
     grounding_passed: bool | None = None
+    grounding_units_total: int = 0
+    grounding_units_supported: int = 0
+    grounding_verdict_summary: dict[str, Any] = field(default_factory=dict)
     regeneration_count: int = 0
+    targeted_repair_rounds: int = 0
+    memory_compaction_event: str = "none"
+    memory_version: str = ""
     primary_model: str = ""
     actual_model: str = ""
+    runtime_provider: str = ""
     fallback_used: bool = False
     latency_s: float = 0.0
     tool_call_count: int = 0
     evidence_token_count: int = 0
+    resource_metadata: dict[str, Any] = field(default_factory=dict)
     error_category: str = "ok"
     retry_count: int = 0
 
@@ -508,7 +548,14 @@ def sha256_text(text: str) -> str:
 
 @dataclass
 class TurnCapture:
-    """Per-substantive-turn capture (no hidden chain-of-thought)."""
+    """Per-substantive-turn capture (no hidden chain-of-thought).
+
+    Records current #112 architecture diagnostics without exposing hidden
+    reasoning: planner query count/hash/statistics, retrieval/evidence
+    IDs/checksums, response-unit grounding verdict summary, targeted repair
+    count, memory-compaction event/version, actual runtime model/provider,
+    and latency/resource metadata.
+    """
 
     case_id: str
     journey_id: str
@@ -518,18 +565,29 @@ class TurnCapture:
     safety_decision: str
     safety_categories: tuple[str, ...] = ()
     planner_diagnostics: dict[str, Any] = field(default_factory=dict)
+    planner_query_count: int = 0
+    planner_queries_sha256: str = ""
+    planner_statistics: dict[str, Any] = field(default_factory=dict)
     retrieval_source_ids: tuple[str, ...] = ()
     evidence_locators: tuple[str, ...] = ()
     evidence_checksums: tuple[str, ...] = ()
     grounding_passed: bool | None = None
+    grounding_units_total: int = 0
+    grounding_units_supported: int = 0
+    grounding_verdict_summary: dict[str, Any] = field(default_factory=dict)
     regeneration_count: int = 0
+    targeted_repair_rounds: int = 0
+    memory_compaction_event: str = "none"
+    memory_version: str = ""
     primary_model: str = ""
     actual_model: str = ""
+    runtime_provider: str = ""
     fallback_used: bool = False
     latency_s: float = 0.0
     tool_call_count: int = 0
     evidence_token_count: int = 0
     source_token_count: int = 0
+    resource_metadata: dict[str, Any] = field(default_factory=dict)
     retry_count: int = 0
     error_category: str = "ok"
     answer_sha256: str = ""
@@ -542,6 +600,14 @@ class TurnCapture:
             raise ConversationEvalError(f"invalid safety decision {self.safety_decision!r}")
         if self.regeneration_count < 0 or self.retry_count < 0:
             raise ConversationEvalError("regeneration/retry counts must be >= 0")
+        if self.planner_query_count < 0 or self.targeted_repair_rounds < 0:
+            raise ConversationEvalError("planner/repair counts must be >= 0")
+        if self.grounding_units_total < 0 or self.grounding_units_supported < 0:
+            raise ConversationEvalError("grounding unit counts must be >= 0")
+        if self.grounding_units_supported > self.grounding_units_total:
+            raise ConversationEvalError("supported grounding units exceed total")
+        if self.memory_compaction_event not in ("none", "compacted"):
+            raise ConversationEvalError("memory compaction event must be none|compacted")
 
     def with_hashes(self) -> TurnCapture:
         """Return a copy with answer/output hashes populated."""
@@ -561,19 +627,30 @@ class TurnCapture:
             "safety_decision": self.safety_decision,
             "safety_categories": list(self.safety_categories),
             "planner_diagnostics": dict(self.planner_diagnostics),
+            "planner_query_count": self.planner_query_count,
+            "planner_queries_sha256": self.planner_queries_sha256,
+            "planner_statistics": dict(self.planner_statistics),
             "retrieval_source_ids": list(self.retrieval_source_ids),
             "evidence_locators": list(self.evidence_locators),
             "evidence_checksums": list(self.evidence_checksums),
             "grounding_passed": self.grounding_passed,
+            "grounding_units_total": self.grounding_units_total,
+            "grounding_units_supported": self.grounding_units_supported,
+            "grounding_verdict_summary": dict(self.grounding_verdict_summary),
             "regeneration_count": self.regeneration_count,
+            "targeted_repair_rounds": self.targeted_repair_rounds,
+            "memory_compaction_event": self.memory_compaction_event,
+            "memory_version": self.memory_version,
             "primary_model": self.primary_model,
             "actual_model": self.actual_model,
+            "runtime_provider": self.runtime_provider,
             "fallback_used": self.fallback_used,
             "model_path": ("fallback" if self.fallback_used else "primary"),
             "latency_s": self.latency_s,
             "tool_call_count": self.tool_call_count,
             "evidence_token_count": self.evidence_token_count,
             "source_token_count": self.source_token_count,
+            "resource_metadata": dict(self.resource_metadata),
             "retry_count": self.retry_count,
             "error_category": self.error_category,
             "answer_sha256": self.answer_sha256 or sha256_text(self.generated_answer),
@@ -588,10 +665,18 @@ class TurnCapture:
             "turn": self.turn,
             "safety_decision": self.safety_decision,
             "safety_categories": list(self.safety_categories),
+            "planner_query_count": self.planner_query_count,
+            "planner_queries_sha256": self.planner_queries_sha256,
             "grounding_passed": self.grounding_passed,
+            "grounding_units_total": self.grounding_units_total,
+            "grounding_units_supported": self.grounding_units_supported,
             "regeneration_count": self.regeneration_count,
+            "targeted_repair_rounds": self.targeted_repair_rounds,
+            "memory_compaction_event": self.memory_compaction_event,
+            "memory_version": self.memory_version,
             "primary_model": self.primary_model,
             "actual_model": self.actual_model,
+            "runtime_provider": self.runtime_provider,
             "fallback_used": self.fallback_used,
             "model_path": ("fallback" if self.fallback_used else "primary"),
             "latency_s": self.latency_s,
@@ -604,6 +689,43 @@ class TurnCapture:
             "output_sha256": self.output_sha256 or sha256_text(self.generated_answer),
             "input_chars": len(self.synthetic_input),
         }
+
+
+def validate_capture_diagnostics(capture: TurnCapture) -> None:
+    """Validate the vNext capture diagnostics contract for one turn.
+
+    Requires the current #112 architecture diagnostics (planner count/hash,
+    grounding verdict summary, repair count, memory event/version, runtime
+    model/provider, latency/resource metadata). Old aspect/slang planner
+    fields are never required: a capture missing ``aspect``/``slang`` keys
+    still validates.
+    """
+    if capture.planner_query_count < 0:
+        raise ConversationEvalError("planner query count must be >= 0")
+    if capture.planner_queries_sha256 and not re.fullmatch(
+        r"[0-9a-f]{64}", capture.planner_queries_sha256
+    ):
+        raise ConversationEvalError("planner queries hash must be a 64-hex SHA")
+    if not isinstance(capture.planner_statistics, dict):
+        raise ConversationEvalError("planner statistics must be a mapping")
+    if not isinstance(capture.grounding_verdict_summary, dict):
+        raise ConversationEvalError("grounding verdict summary must be a mapping")
+    if not isinstance(capture.resource_metadata, dict):
+        raise ConversationEvalError("resource metadata must be a mapping")
+    # Old aspect/slang planner fields must never be required diagnostics.
+    assert_manifest_privacy_safe(capture.manifest_row())
+
+
+def summarize_planner_queries(queries: list[str]) -> tuple[int, str, dict[str, Any]]:
+    """Return ``(count, sha256, statistics)`` for planner queries (no text)."""
+    normalized = [" ".join(str(item).split()) for item in queries if str(item).strip()]
+    digest = sha256_text("\n".join(sorted(normalized))) if normalized else ""
+    statistics = {
+        "query_count": len(normalized),
+        "empty": not normalized,
+        "zero_queries_valid": not normalized,
+    }
+    return len(normalized), digest, statistics
 
 
 # ---------------------------------------------------------------------------
@@ -778,13 +900,19 @@ def merge_manifests(
 def is_resumable(prior_identity: dict[str, str], current_identity: dict[str, str]) -> bool:
     """Whether a successful shard may be resumed under the current config.
 
-    Resumable only when exact SHA + corpus checksums + runtime config + model
-    config all match; anything else forces a fresh shard execution.
+    Resumable only when exact SHA + vNext benchmark checksums + rubric +
+    harness version + runtime config + model config all match; anything else
+    forces a fresh shard execution.
     """
     required = (
         "main_sha",
-        "corpus_input_sha256",
-        "corpus_oracle_sha256",
+        "benchmark_version",
+        "benchmark_input_sha256",
+        "benchmark_oracle_sha256",
+        "benchmark_sources_sha256",
+        "rubric_sha256",
+        "harness_version",
+        "production_boundary_version",
         "runtime_version",
         "prompt_version",
         "retrieval_version",
@@ -797,11 +925,29 @@ def is_resumable(prior_identity: dict[str, str], current_identity: dict[str, str
             return False
         if prior_identity[key] != current_identity[key]:
             return False
+    # Legacy v1 tuples without the vNext keys never resume under the
+    # migrated harness: the missing keys above already return False.
     return True
 
 
+def benchmark_tuple_checksums(repo_root: Path | None = None) -> dict[str, str]:
+    """Return the frozen vNext benchmark/rubric checksums for readiness."""
+    from aa.qualification.product_contract_vnext import verify_rubric_bound
+
+    root = repo_root or find_repo_root()
+    summary = validate(root)
+    return {
+        "benchmark_version": BENCHMARK_VERSION,
+        "input": summary.input_sha256,
+        "oracle": summary.oracle_sha256,
+        "sources": summary.sources_sha256,
+        "rubric": verify_rubric_bound(root),
+        "harness": HARNESS_VERSION,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Exact-main contract
+# Exact-main contract (trusted #7 PASS on the exact same current main SHA)
 # ---------------------------------------------------------------------------
 
 
@@ -810,8 +956,13 @@ class EvalIdentity:
     """Exact configuration identifying one authoritative benchmark tuple."""
 
     main_sha: str
-    corpus_input_sha256: str
-    corpus_oracle_sha256: str
+    benchmark_version: str
+    benchmark_input_sha256: str
+    benchmark_oracle_sha256: str
+    benchmark_sources_sha256: str
+    rubric_sha256: str
+    harness_version: str
+    production_boundary_version: str
     runtime_version: str
     prompt_version: str
     retrieval_version: str
@@ -823,8 +974,13 @@ class EvalIdentity:
         """Serialize the identity."""
         return {
             "main_sha": self.main_sha,
-            "corpus_input_sha256": self.corpus_input_sha256,
-            "corpus_oracle_sha256": self.corpus_oracle_sha256,
+            "benchmark_version": self.benchmark_version,
+            "benchmark_input_sha256": self.benchmark_input_sha256,
+            "benchmark_oracle_sha256": self.benchmark_oracle_sha256,
+            "benchmark_sources_sha256": self.benchmark_sources_sha256,
+            "rubric_sha256": self.rubric_sha256,
+            "harness_version": self.harness_version,
+            "production_boundary_version": self.production_boundary_version,
             "runtime_version": self.runtime_version,
             "prompt_version": self.prompt_version,
             "retrieval_version": self.retrieval_version,
@@ -841,15 +997,22 @@ def collect_eval_identity(
     primary_model: str,
     fallback_model: str,
 ) -> EvalIdentity:
-    """Collect the exact benchmark identity from the frozen corpus + runtime."""
+    """Collect the exact vNext benchmark identity from frozen assets + runtime."""
+    from aa.qualification.product_contract_vnext import verify_rubric_bound
+
     root = repo_root or find_repo_root()
     summary = validate(root)
-    prompt_path = root / "prompts" / "aa-agent-system.md"
+    prompt_path = root / "prompts" / "aa-agent-system-v2.md"
     prompt_sha = sha256_file(prompt_path) if prompt_path.exists() else "missing-prompt"
     return EvalIdentity(
         main_sha=main_sha,
-        corpus_input_sha256=summary.input_sha256,
-        corpus_oracle_sha256=summary.oracle_sha256,
+        benchmark_version=BENCHMARK_VERSION,
+        benchmark_input_sha256=summary.input_sha256,
+        benchmark_oracle_sha256=summary.oracle_sha256,
+        benchmark_sources_sha256=summary.sources_sha256,
+        rubric_sha256=verify_rubric_bound(root),
+        harness_version=HARNESS_VERSION,
+        production_boundary_version=PRODUCTION_BOUNDARY_VERSION,
         runtime_version=runtime_version(),
         prompt_version=prompt_sha,
         retrieval_version=retrieval_version(),
@@ -886,11 +1049,13 @@ def validate_exact_main(
     current_main_sha: str,
     trusted_pass_sha: str,
 ) -> None:
-    """Refuse to run/publish unless the exact #40 PASS SHA is still current.
+    """Refuse to run/publish unless the exact trusted #7 PASS SHA is current.
 
     All three SHAs must be identical: the SHA under test, the SHA main
-    currently points at, and the latest trusted #40 PASS marker. A moved main
-    or stale qualification evidence fails closed.
+    currently points at, and the latest trusted #7 PASS marker for
+    capability #6. A moved main or stale qualification evidence fails
+    closed. The migrated harness never accepts a legacy qualification
+    tracker as authority.
     """
     for name, value in (
         ("tested_sha", tested_sha),
@@ -900,10 +1065,10 @@ def validate_exact_main(
         if not re.fullmatch(r"[0-9a-f]{40}", value or ""):
             raise ConversationEvalError(f"{name} must be a 40-hex SHA")
     if tested_sha != trusted_pass_sha:
-        raise ConversationEvalError("tested SHA is not the current #40 PASS SHA")
+        raise ConversationEvalError("tested SHA is not the current trusted #7 PASS SHA")
     if current_main_sha != trusted_pass_sha:
         raise ConversationEvalError(
-            "main advanced past the trusted #40 PASS SHA; refusing stale run"
+            "main advanced past the trusted #7 PASS SHA; refusing stale run"
         )
 
 
@@ -954,10 +1119,12 @@ def should_rerun(
     candidate_sha: str,
     candidate_corpus: str,
 ) -> bool:
-    """Decide whether a newer #40 PASS tuple needs a fresh #62 run.
+    """Decide whether a newer trusted #7 PASS tuple needs a fresh #62 run.
 
-    Idempotent: the same exact SHA + corpus tuple never reruns. A
-    newer/different tuple reruns exactly once per SHA+corpus pair.
+    Idempotent: the same exact SHA + fixture + rubric tuple never reruns. A
+    newer/different tuple reruns exactly once per SHA+corpus pair. A newer
+    #7 PASS invalidates stale #62 authority: any SHA drift forces one fresh
+    evaluation cycle for the new trusted tuple.
     """
     if latest_complete is None:
         return True
@@ -1056,8 +1223,15 @@ def build_compact_manifest(
         "run_id": run_id,
         "result": result,
         "main_sha": eval_identity.main_sha,
-        "corpus_input_sha256": eval_identity.corpus_input_sha256,
-        "corpus_oracle_sha256": eval_identity.corpus_oracle_sha256,
+        "benchmark_version": eval_identity.benchmark_version,
+        "benchmark_input_sha256": eval_identity.benchmark_input_sha256,
+        "benchmark_oracle_sha256": eval_identity.benchmark_oracle_sha256,
+        "benchmark_sources_sha256": eval_identity.benchmark_sources_sha256,
+        "rubric_sha256": eval_identity.rubric_sha256,
+        "harness_version": eval_identity.harness_version,
+        "production_boundary_version": eval_identity.production_boundary_version,
+        "corpus_input_sha256": eval_identity.benchmark_input_sha256,
+        "corpus_oracle_sha256": eval_identity.benchmark_oracle_sha256,
         "runtime_version": eval_identity.runtime_version,
         "prompt_version": eval_identity.prompt_version,
         "retrieval_version": eval_identity.retrieval_version,
@@ -1198,16 +1372,58 @@ def validate_files_do_not_mutate_main(paths: list[str]) -> None:
 
 
 def corpus_checksums(repo_root: Path | None = None) -> dict[str, str]:
-    """Return stable input/oracle checksums for the frozen corpus."""
+    """Return stable vNext benchmark checksums for the frozen corpus."""
+    from aa.qualification.product_contract_vnext import verify_rubric_bound
+
     root = repo_root or find_repo_root()
     return {
         "input": sha256_file(root / INPUT_REL),
         "oracle": sha256_file(root / ORACLE_REL),
+        "sources": sha256_file(root / SOURCES_REL),
+        "rubric": verify_rubric_bound(root),
         "version": sha256_file(root / VERSION_REL),
+        "benchmark_version": BENCHMARK_VERSION,
+        "harness_version": HARNESS_VERSION,
     }
 
 
+def verify_vnext_tuple_unchanged(repo_root: Path | None = None) -> dict[str, str]:
+    """Verify the exact #127 vNext version/checksum tuple unchanged.
+
+    Consumes the frozen benchmark/rubric vNext without redefining,
+    regenerating, or tuning it: input/oracle/sources/rubric bytes must match
+    the version record, and the rubric sidecar must still bind.
+    """
+    import json as _json
+
+    root = repo_root or find_repo_root()
+    summary = validate(root)
+    recorded = _json.loads((root / VERSION_REL).read_text(encoding="utf-8"))
+    expected = {
+        "input": summary.input_sha256,
+        "oracle": summary.oracle_sha256,
+        "sources": summary.sources_sha256,
+        "rubric": summary.rubric_sha256,
+    }
+    recorded_sha = recorded.get("sha256", {})
+    for key, value in expected.items():
+        if recorded_sha.get(key) != value:
+            raise ConversationEvalError(f"vNext {key} checksum drifted from version record")
+    benchmark_tuple = recorded.get("benchmark_tuple", {})
+    for key, value in expected.items():
+        tuple_key = {"input": "input_sha256", "oracle": "oracle_sha256"}.get(key, f"{key}_sha256")
+        if key == "rubric":
+            tuple_key = "rubric_sha256"
+        if benchmark_tuple.get(tuple_key) != value:
+            raise ConversationEvalError(f"vNext benchmark_tuple {tuple_key} mismatch")
+    if recorded.get("corpus_version") != BENCHMARK_VERSION:
+        raise ConversationEvalError("vNext corpus_version mismatch")
+    return expected
+
+
 __all__ = [
+    "BENCHMARK_VERSION",
+    "CAPABILITY_ISSUE",
     "DEFAULT_BASE_DELAY_S",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_DELAY_S",
@@ -1215,8 +1431,11 @@ __all__ = [
     "DEFAULT_SHARD_COUNT",
     "EVAL_SCHEMA_VERSION",
     "FORBIDDEN_GENERATOR_KEYS",
+    "HARNESS_VERSION",
     "MAX_PARALLEL_SHARDS",
     "MAX_SHARD_COUNT",
+    "PRODUCTION_BOUNDARY_VERSION",
+    "QUALIFICATION_ISSUE",
     "RESULT_ISSUE",
     "RESULT_MARKER",
     "ConversationEvalError",
@@ -1256,10 +1475,14 @@ __all__ = [
     "revalidate_at_publication",
     "run_with_retry",
     "runtime_version",
+    "benchmark_tuple_checksums",
     "sha256_text",
     "should_rerun",
     "stable_shard",
+    "summarize_planner_queries",
     "summarize_run",
+    "validate_capture_diagnostics",
     "validate_exact_main",
     "validate_files_do_not_mutate_main",
+    "verify_vnext_tuple_unchanged",
 ]
