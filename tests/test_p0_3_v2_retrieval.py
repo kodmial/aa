@@ -611,6 +611,50 @@ def test_budget_fallback_preserves_skipped_rrf_winner(tmp_path: pathlib.Path) ->
         close_hybrid_index(index)
 
 
+def test_budget_fallback_reserves_priority_before_later_passages(tmp_path: pathlib.Path) -> None:
+    index = _build_index(tmp_path)
+    try:
+        first, second = list(index.chunks.values())[:2]
+        oversized_text = first.text * 20
+        oversized_first = EvidencePassageData(
+            passage_id="first-expanded",
+            exact_text=oversized_text,
+            source_id=first.source_id,
+            section_id=first.section,
+            child_chunk_ids=(first.chunk_id,),
+            char_start=first.char_start,
+            char_end=first.char_end,
+            text_sha256=hashlib.sha256(oversized_text.encode("utf-8")).hexdigest(),
+            source_sha256=first.source_sha256,
+        )
+        later = EvidencePassageData(
+            passage_id="later-full",
+            exact_text=second.text,
+            source_id=second.source_id,
+            section_id=second.section,
+            child_chunk_ids=(second.chunk_id,),
+            char_start=second.char_start,
+            char_end=second.char_end,
+            text_sha256=second.text_sha256,
+            source_sha256=second.source_sha256,
+        )
+        first_need = estimate_text_tokens(first.text)
+        second_need = estimate_text_tokens(second.text)
+        budget = max(first_need, second_need)
+        selected, total = select_passages_under_budget(
+            [oversized_first, later],
+            budget_tokens=budget,
+            index=index,
+            priority_child_ids=(first.chunk_id, second.chunk_id),
+        )
+        assert total <= budget
+        child_ids = [passage.child_chunk_ids[0] for passage in selected]
+        assert first.chunk_id in child_ids
+        assert child_ids[0] == first.chunk_id
+        assert selected[0].exact_text == first.text
+    finally:
+        close_hybrid_index(index)
+
 # ---------------------------------------------------------------------------
 # Evidence Pack contract: exact text plus minimal provenance only.
 # ---------------------------------------------------------------------------
