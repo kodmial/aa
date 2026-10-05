@@ -548,7 +548,7 @@ def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
 
     The gate mirrors the issue: no regression in the qualified recall
     gate, measurable reranker benefit over RRF-only, non-regressive
-    broad/colloquial/multi-turn cases, warm p95 latency within the
+    broad/colloquial/multi-turn cases, warm p50/p95 latency within the
     interactive Telegram budget, and zero hot-path disk reads
     (verified separately by the harness blocking filesystem access).
     Unsupported-case passage rates are measured and reported but carry
@@ -580,6 +580,14 @@ def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
         failures.append("broad/colloquial/multi-turn cases regressed vs baseline")
     if summary.duplicate_rate > 0.05:
         failures.append(f"duplicate rate {summary.duplicate_rate:.3f} exceeds 0.05")
+    if summary.p50_target_latency_ms > V2_TARGET_P95_LATENCY_BUDGET_MS:
+        failures.append(
+            f"warm p50 latency {summary.p50_target_latency_ms:.0f}ms exceeds "
+            f"the interactive budget {V2_TARGET_P95_LATENCY_BUDGET_MS:.0f}ms "
+            "(per-turn RRF plus 64-candidate CPU BGE rerank); "
+            "explicit performance acceptance or optimization is required "
+            "before cutover"
+        )
     if summary.p95_target_latency_ms > V2_TARGET_P95_LATENCY_BUDGET_MS:
         failures.append(
             f"warm p95 latency {summary.p95_target_latency_ms:.0f}ms exceeds "
@@ -596,7 +604,7 @@ def v2_production_status(summary: V2Summary) -> dict[str, Any]:
 
     Mirrors the ``production_promotion_blocked`` pattern from the
     qualified retrieval artifact: any quality-gate failure (currently
-    the warm-p95 interactive-latency breach) keeps the v2 pipeline
+    the warm-p50/p95 interactive-latency breach) keeps the v2 pipeline
     blocked behind the legacy production path. Cutover also stays
     blocked when the gate passes because #116 explicitly leaves cutover
     out of scope; a later cutover task must re-evaluate the gate with
