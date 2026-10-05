@@ -627,11 +627,7 @@ def select_passages_under_budget(
                 continue
 
             direct_winners = sorted(
-                (
-                    cid
-                    for cid in passage.child_chunk_ids
-                    if cid in priority and cid not in covered
-                ),
+                (cid for cid in passage.child_chunk_ids if cid in priority and cid not in covered),
                 key=priority.__getitem__,
             )
             for cid in direct_winners:
@@ -681,12 +677,8 @@ def select_passages_under_budget(
                     selected = fallbacks
                 elif not top_covered:
                     top_ids = set(top.child_chunk_ids)
-                    head = [
-                        item for item in fallbacks if item.child_chunk_ids[0] in top_ids
-                    ]
-                    tail = [
-                        item for item in fallbacks if item.child_chunk_ids[0] not in top_ids
-                    ]
+                    head = [item for item in fallbacks if item.child_chunk_ids[0] in top_ids]
+                    tail = [item for item in fallbacks if item.child_chunk_ids[0] not in top_ids]
                     selected = [*head, *selected, *tail]
     return selected, total
 
