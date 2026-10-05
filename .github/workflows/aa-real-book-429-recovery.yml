@@ -1,9 +1,10 @@
-name: AA real-book 429 runner recovery
+name: AA OpenCode 429 runner recovery
 
 on:
   workflow_run:
     workflows:
       - "AA real-book retrieval qualification"
+      - "AA bot runtime"
     types:
       - completed
 
@@ -17,11 +18,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download qualification result
+      - name: Download qualification 429 marker
+        if: ${{ github.event.workflow_run.name == 'AA real-book retrieval qualification' }}
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: aa-real-book-retrieval-summary
-          path: recovery-input
+          path: recovery-input/qualification
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Download runtime 429 marker
+        if: ${{ github.event.workflow_run.name == 'AA bot runtime' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-runtime-429-recovery
+          path: recovery-input/runtime
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
@@ -33,16 +46,25 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           from pathlib import Path
-          path = Path("recovery-input/result.json")
-          if not path.is_file():
-              print("restart=false")
-              raise SystemExit(0)
-          payload = json.loads(path.read_text(encoding="utf-8"))
-          requested = payload.get("reason_code") == "OPENCODE_429_RESTART_REQUIRED"
+
+          requested = False
+          for path in (
+              Path("recovery-input/qualification/result.json"),
+              Path("recovery-input/runtime/result.json"),
+          ):
+              if not path.is_file():
+                  continue
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  continue
+              if payload.get("reason_code") == "OPENCODE_429_RESTART_REQUIRED":
+                  requested = True
+                  break
           print(f"restart={'true' if requested else 'false'}")
           PY
 
-      - name: Re-run qualification on a fresh runner
+      - name: Re-run workflow on a fresh runner
         if: ${{ steps.detect.outputs.restart == 'true' }}
         uses: actions/github-script@v7
         with:
