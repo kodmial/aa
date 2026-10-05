@@ -26,14 +26,15 @@ def test_workflow_supports_dispatch_and_readiness_event() -> None:
     assert "workflow_dispatch:" in text
     assert "issues:" in text
     assert "closed" in text
-    for tracker in ("40", "61", "72"):
+    for tracker in ("7", "72", "127"):
         assert tracker in text
 
 
 def test_workflow_revalidates_trackers_and_noops() -> None:
     text = _read()
     assert "no-op" in text
-    assert "#40" in text and "#61" in text and "#72" in text
+    assert "#7" in text and "#72" in text
+    assert "vNext" in text or "#127" in text
     assert "closing #72" in text
 
 
@@ -41,8 +42,9 @@ def test_workflow_enforces_exact_main_and_frozen_corpus() -> None:
     text = _read()
     assert "exact" in text.lower()
     assert "PASS" in text
-    assert "test_ru_realworld_corpus" in text or "#61" in text
+    assert "test_product_contract_vnext" in text or "#127" in text
     assert "git rev-parse HEAD" in text
+    assert "ru_product_contract.v1_2.input.jsonl" in text
 
 
 def test_workflow_runs_deterministic_shards_with_bounded_parallelism() -> None:

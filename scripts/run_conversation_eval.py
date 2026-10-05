@@ -1,7 +1,9 @@
 """Deterministic shard runner for the Russian conversation benchmark (#72).
 
-Reads only the frozen input projection, executes the shard's cases against
-an injected production turn boundary, and writes exactly two files:
+Reads only the frozen vNext input projection (#127), executes the shard's
+cases against the exact new production turn boundary from #118 (the v2
+LangGraph turn graph, never the legacy orchestrator and never the public
+Telegram Bot API), and writes exactly two files:
 
 - ``<out-dir>/shard-<i>-manifest.json`` (privacy-safe, plaintext allowed);
 - ``<out-dir>/shard-<i>.tar.zst.age`` (already compressed + age-encrypted).
@@ -42,7 +44,7 @@ from aa.qualification.conversation_eval import (  # noqa: E402
     plan_shards,
     validate_files_do_not_mutate_main,
 )
-from aa.qualification.ru_realworld import SESSION_RESET_CONTROL  # noqa: E402
+from aa.qualification.product_contract_vnext import SESSION_RESET_CONTROL  # noqa: E402
 
 
 @dataclass
@@ -134,15 +136,26 @@ async def _execute_shard(
                 safety_decision=obs.safety_decision,
                 safety_categories=obs.safety_categories,
                 planner_diagnostics=dict(obs.planner_diagnostics),
+                planner_query_count=obs.planner_query_count,
+                planner_queries_sha256=obs.planner_queries_sha256,
+                planner_statistics=dict(obs.planner_statistics),
                 retrieval_source_ids=obs.retrieval_source_ids,
                 evidence_locators=obs.evidence_locators,
                 evidence_checksums=obs.evidence_checksums,
                 grounding_passed=obs.grounding_passed,
+                grounding_units_total=obs.grounding_units_total,
+                grounding_units_supported=obs.grounding_units_supported,
+                grounding_verdict_summary=dict(obs.grounding_verdict_summary),
                 regeneration_count=obs.regeneration_count,
+                targeted_repair_rounds=obs.targeted_repair_rounds,
+                memory_compaction_event=obs.memory_compaction_event,
+                memory_version=obs.memory_version,
                 primary_model=identity.primary_model,
                 actual_model=obs.actual_model or identity.primary_model,
+                runtime_provider=obs.runtime_provider,
                 fallback_used=obs.fallback_used,
                 latency_s=obs.latency_s,
+                resource_metadata=dict(obs.resource_metadata),
                 error_category=obs.error_category,
                 retry_count=obs.retry_count,
             ).with_hashes()
@@ -181,15 +194,26 @@ async def _execute_shard(
                     safety_decision=obs.safety_decision,
                     safety_categories=obs.safety_categories,
                     planner_diagnostics=dict(obs.planner_diagnostics),
+                    planner_query_count=obs.planner_query_count,
+                    planner_queries_sha256=obs.planner_queries_sha256,
+                    planner_statistics=dict(obs.planner_statistics),
                     retrieval_source_ids=obs.retrieval_source_ids,
                     evidence_locators=obs.evidence_locators,
                     evidence_checksums=obs.evidence_checksums,
                     grounding_passed=obs.grounding_passed,
+                    grounding_units_total=obs.grounding_units_total,
+                    grounding_units_supported=obs.grounding_units_supported,
+                    grounding_verdict_summary=dict(obs.grounding_verdict_summary),
                     regeneration_count=obs.regeneration_count,
+                    targeted_repair_rounds=obs.targeted_repair_rounds,
+                    memory_compaction_event=obs.memory_compaction_event,
+                    memory_version=obs.memory_version,
                     primary_model=identity.primary_model,
                     actual_model=obs.actual_model or identity.primary_model,
+                    runtime_provider=obs.runtime_provider,
                     fallback_used=obs.fallback_used,
                     latency_s=obs.latency_s,
+                    resource_metadata=dict(obs.resource_metadata),
                     error_category=obs.error_category,
                     retry_count=obs.retry_count,
                 ).with_hashes()

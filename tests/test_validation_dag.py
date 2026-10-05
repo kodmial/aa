@@ -1,9 +1,10 @@
-"""Executable validation DAG tests (issue #106)."""
+"""Executable validation DAG tests (issues #106, #123)."""
 
 from __future__ import annotations
 
 from aa.qualification.product_fingerprint import fingerprint_of_files, is_product_path
 from aa.qualification.validation_dag import (
+    ACTIVE_VALIDATION_TRACKERS,
     admit_to_coding_queue,
     find_reusable_repair,
     has_qualification_blocker_cycle,
@@ -18,6 +19,7 @@ from aa.qualification.validation_dag import (
     readiness_63,
     repair_fingerprint,
     should_requalify_product,
+    should_schedule_fresh_cycle,
 )
 
 
@@ -33,10 +35,12 @@ def _product_files(extra: dict[str, bytes] | None = None) -> dict[str, bytes]:
 
 
 def test_validation_trackers_never_enter_coding_queue() -> None:
-    for tracker in (40, 62, 63, 7):
+    for tracker in (7, 62, 63, 40):
         assert is_validation_tracker(tracker) is True
         assert admit_to_coding_queue(tracker) is False
-    assert admit_to_coding_queue(9) is True
+    # Active authority is #7/#62/#63; historical #40 stays excluded as evidence.
+    assert ACTIVE_VALIDATION_TRACKERS == frozenset({7, 62, 63})
+    assert admit_to_coding_queue(6) is True
     assert admit_to_coding_queue(106) is True
 
 
@@ -48,13 +52,20 @@ def test_qualification_must_not_machine_block_capability() -> None:
 
 
 def test_reusable_tracker_uses_pass_tuple_not_closed_state() -> None:
-    bodies = ["<!-- continuum-qualification-result issue=40 sha=" + "a" * 40 + " result=pass -->"]
+    bodies = ["<!-- continuum-qualification-result issue=7 sha=" + "a" * 40 + " result=pass -->"]
     markers = parse_pass_markers(bodies)
     current = latest_pass_tuple(markers)
     assert current is not None
-    # Legacy exact-SHA marker stays current only at the same SHA.
+    # Exact-SHA marker stays current only at the same SHA.
     assert is_pass_current(current, current_fingerprint="x" * 64, current_sha="a" * 40) is True
     assert is_pass_current(current, current_fingerprint="x" * 64, current_sha="b" * 40) is False
+    # Legacy trackers never authorize new cycles.
+    legacy_bodies = [
+        "<!-- continuum-qualification-result issue=40 sha=" + "a" * 40 + " result=pass -->"
+    ]
+    legacy = latest_pass_tuple(parse_pass_markers(legacy_bodies, issue=40))
+    assert legacy is not None
+    assert is_pass_current(legacy, current_fingerprint="x" * 64, current_sha="a" * 40) is False
 
 
 def test_fingerprint_bound_pass_survives_scheduler_only_change() -> None:
@@ -66,7 +77,7 @@ def test_fingerprint_bound_pass_survives_scheduler_only_change() -> None:
     assert is_product_path(".github/workflows/continuum-issue-scheduler.yml") is False
     assert is_product_path("docs/plan.md") is False
     bodies = [
-        "<!-- continuum-qualification-result issue=40 sha="
+        "<!-- continuum-qualification-result issue=7 sha="
         + "a" * 40
         + " product="
         + before
@@ -74,7 +85,7 @@ def test_fingerprint_bound_pass_survives_scheduler_only_change() -> None:
     ]
     current = latest_pass_tuple(parse_pass_markers(bodies))
     assert current is not None
-    assert is_pass_current(current, current_fingerprint=after) is True
+    assert is_pass_current(current, current_fingerprint=after, current_sha="a" * 40) is True
 
 
 def test_product_change_invalidates_and_reruns() -> None:
@@ -86,7 +97,7 @@ def test_product_change_invalidates_and_reruns() -> None:
     assert should_requalify_product(before, current_fingerprint=after) is True
     assert should_requalify_product(after, current_fingerprint=after) is False
     bodies = [
-        "<!-- continuum-qualification-result issue=40 sha="
+        "<!-- continuum-qualification-result issue=7 sha="
         + "a" * 40
         + " product="
         + before
@@ -100,7 +111,7 @@ def test_product_change_invalidates_and_reruns() -> None:
 def test_62_readiness_uses_pass_tuple_and_harness_readiness() -> None:
     fingerprint = "f" * 64
     bodies = [
-        "<!-- continuum-qualification-result issue=40 sha="
+        "<!-- continuum-qualification-result issue=7 sha="
         + "a" * 40
         + " product="
         + fingerprint
@@ -108,17 +119,55 @@ def test_62_readiness_uses_pass_tuple_and_harness_readiness() -> None:
     ]
     current = latest_pass_tuple(parse_pass_markers(bodies))
     ready, _ = readiness_62(
-        current, current_fingerprint=fingerprint, corpus_ready=True, harness_ready=True
+        current,
+        current_fingerprint=fingerprint,
+        corpus_ready=True,
+        harness_ready=True,
+        current_sha="a" * 40,
     )
     assert ready is True
     not_ready, _ = readiness_62(
-        current, current_fingerprint=fingerprint, corpus_ready=True, harness_ready=False
+        current,
+        current_fingerprint=fingerprint,
+        corpus_ready=True,
+        harness_ready=False,
+        current_sha="a" * 40,
     )
     assert not_ready is False
     stale, _ = readiness_62(
-        current, current_fingerprint="0" * 64, corpus_ready=True, harness_ready=True
+        current,
+        current_fingerprint="0" * 64,
+        corpus_ready=True,
+        harness_ready=True,
+        current_sha="a" * 40,
     )
     assert stale is False
+    # Exact-main drift invalidates stale authority even with a matching fingerprint.
+    moved, _ = readiness_62(
+        current,
+        current_fingerprint=fingerprint,
+        corpus_ready=True,
+        harness_ready=True,
+        current_sha="b" * 40,
+    )
+    assert moved is False
+    # Benchmark/harness version mismatch blocks readiness.
+    assert (
+        readiness_62(
+            current,
+            current_fingerprint=fingerprint,
+            corpus_ready=True,
+            harness_ready=True,
+            current_sha="a" * 40,
+            harness_version="wrong",
+        )[0]
+        is False
+    )
+
+
+def test_newer_pass_schedules_exactly_one_fresh_cycle() -> None:
+    assert should_schedule_fresh_cycle(latest_pass_sha="a" * 40, graded_sha="a" * 40) is False
+    assert should_schedule_fresh_cycle(latest_pass_sha="b" * 40, graded_sha="a" * 40) is True
 
 
 def test_63_readiness_uses_complete_tuple_and_rubric() -> None:

@@ -50,7 +50,7 @@ from aa.qualification.conversation_eval import (
     validate_exact_main,
     validate_files_do_not_mutate_main,
 )
-from aa.qualification.ru_realworld import (
+from aa.qualification.product_contract_vnext import (
     CONTROL_JOURNEY_ID,
     INPUT_FORBIDDEN_KEYS,
     SESSION_RESET_CONTROL,
@@ -67,8 +67,13 @@ CORPUS_HEX = "c" * 64
 def _identity(sha: str = SHA_A) -> EvalIdentity:
     return EvalIdentity(
         main_sha=sha,
-        corpus_input_sha256="i" * 64,
-        corpus_oracle_sha256="o" * 64,
+        benchmark_version="ru_product_contract.v1_2",
+        benchmark_input_sha256="i" * 64,
+        benchmark_oracle_sha256="o" * 64,
+        benchmark_sources_sha256="s" * 64,
+        rubric_sha256="r" * 64,
+        harness_version="aa-conversation-eval-harness/2",
+        production_boundary_version="aa-v2-turn-graph/118",
         runtime_version="aa-worker/0.1.0",
         prompt_version="p" * 64,
         retrieval_version="r/1",
@@ -112,8 +117,8 @@ class _ScriptSender(TurnSender):
 
 def test_generator_view_never_carries_oracle_labels() -> None:
     singles, journeys = load_generator_views()
-    assert len(singles) == 200
-    assert len(journeys) == 30
+    assert len(singles) == 40
+    assert len(journeys) == 8
     for single in singles:
         payload = {"id": single.case_id, "utterance": single.utterance}
         assert_no_oracle_leak(payload, single.case_id)
@@ -228,8 +233,8 @@ async def test_single_turn_cases_use_isolated_sessions() -> None:
 
 
 def test_shards_keep_journeys_atomic_and_cover_all_cases() -> None:
-    singles = [f"RU-S-{n:03d}" for n in range(1, 201)]
-    journeys = [f"RU-J-{n:03d}" for n in range(1, 31)]
+    singles = [f"PC-S-{n:03d}" for n in range(1, 41)]
+    journeys = [f"PC-J-{n:02d}" for n in range(1, 9)]
     plans = plan_shards(singles, journeys, shard_count=4)
     assert len(plans) == 4
     # Journeys atomic: each journey appears in exactly one shard.
@@ -238,7 +243,7 @@ def test_shards_keep_journeys_atomic_and_cover_all_cases() -> None:
         for jid in plan.journey_ids:
             assert jid not in seen
             seen[jid] = plan.shard_index
-    assert len(seen) == 30
+    assert len(seen) == 8
     covered = sorted([c for p in plans for c in p.case_ids()])
     assert covered == sorted(singles + journeys)
     # Deterministic across calls.
@@ -249,7 +254,7 @@ def test_shards_keep_journeys_atomic_and_cover_all_cases() -> None:
 
 
 def test_stable_shard_is_deterministic() -> None:
-    assert stable_shard("RU-S-001", 4) == stable_shard("RU-S-001", 4)
+    assert stable_shard("PC-S-001", 4) == stable_shard("PC-S-001", 4)
     with pytest.raises(ConversationEvalError):
         stable_shard("", 4)
     with pytest.raises(ConversationEvalError):
@@ -438,7 +443,7 @@ async def test_safety_gate_captured_before_model_send() -> None:
 
 def test_capture_schema_has_required_fields() -> None:
     cap = TurnCapture(
-        case_id="RU-S-001",
+        case_id="PC-S-001",
         journey_id="",
         turn=1,
         synthetic_input="привет",
@@ -456,15 +461,26 @@ def test_capture_schema_has_required_fields() -> None:
         "generated_answer",
         "safety_decision",
         "planner_diagnostics",
+        "planner_query_count",
+        "planner_queries_sha256",
+        "planner_statistics",
         "retrieval_source_ids",
         "evidence_locators",
         "evidence_checksums",
         "grounding_passed",
+        "grounding_units_total",
+        "grounding_units_supported",
+        "grounding_verdict_summary",
         "regeneration_count",
+        "targeted_repair_rounds",
+        "memory_compaction_event",
+        "memory_version",
         "actual_model",
+        "runtime_provider",
         "latency_s",
         "tool_call_count",
         "evidence_token_count",
+        "resource_metadata",
         "retry_count",
         "error_category",
         "answer_sha256",
@@ -500,8 +516,13 @@ def test_collect_identity_records_versions_and_models() -> None:
         fallback_model="opencode/space-bunny-free",
     )
     assert identity.main_sha == SHA_A
-    assert len(identity.corpus_input_sha256) == 64
-    assert len(identity.corpus_oracle_sha256) == 64
+    assert len(identity.benchmark_input_sha256) == 64
+    assert len(identity.benchmark_oracle_sha256) == 64
+    assert len(identity.benchmark_sources_sha256) == 64
+    assert len(identity.rubric_sha256) == 64
+    assert identity.benchmark_version == "ru_product_contract.v1_2"
+    assert identity.harness_version == "aa-conversation-eval-harness/2"
+    assert identity.production_boundary_version == "aa-v2-turn-graph/118"
     assert identity.primary_model != identity.fallback_model
 
 
@@ -544,8 +565,8 @@ def test_results_never_mutate_main() -> None:
     for blocked in (
         "src/aa",
         "corpus",
-        "prompts/aa-agent-system.md",
-        "qualification/ru_realworld_alcohol_help.v1_1.input.jsonl",
+        "prompts/aa-agent-system-v2.md",
+        "qualification/ru_product_contract.v1_2.input.jsonl",
         ".github/workflows/aa-conversation-eval.yml",
         "tests/test_conversation_eval.py",
         "scripts/run_conversation_eval.py",
@@ -561,7 +582,7 @@ def test_every_shard_encrypts_before_upload() -> None:
     identity, recipient = generate_identity()
     captures = [
         TurnCapture(
-            case_id="RU-S-001",
+            case_id="PC-S-001",
             journey_id="",
             turn=1,
             synthetic_input="привет",
@@ -588,7 +609,7 @@ def test_compress_encrypt_round_trip() -> None:
 def test_compact_manifest_is_privacy_safe() -> None:
     identity = _identity()
     cap = TurnCapture(
-        case_id="RU-S-001",
+        case_id="PC-S-001",
         journey_id="",
         turn=1,
         synthetic_input="привет",
@@ -600,7 +621,7 @@ def test_compact_manifest_is_privacy_safe() -> None:
     manifest = ShardManifest(
         shard_index=0,
         shard_count=1,
-        case_ids=("RU-S-001",),
+        case_ids=("PC-S-001",),
         turn_rows=(cap.manifest_row(),),
         bundle_sha256="b" * 64,
         eval_identity=identity.to_dict(),
@@ -644,7 +665,7 @@ def test_summarize_segments_provider_failures() -> None:
 def test_expected_case_ids_cover_full_corpus() -> None:
     singles, journeys = load_generator_views()
     ids = expected_case_ids(singles, journeys)
-    assert len(ids) == 230
-    assert "RU-J-027" in ids
+    assert len(ids) == 48
+    assert "PC-J-06" in ids
     root = find_repo_root()
-    assert (root / "qualification" / "ru_realworld_alcohol_help.v1_1.input.jsonl").exists()
+    assert (root / "qualification" / "ru_product_contract.v1_2.input.jsonl").exists()
