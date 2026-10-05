@@ -1,9 +1,16 @@
-"""SQLite FTS5/BM25 lexical retrieval over RU canonical chunks (issue #17).
+"""SQLite FTS5/BM25 lexical retrieval over RU canonical chunks (issue #115).
 
 Local/keyless only: the standard-library ``sqlite3`` module with the
 ``FTS5`` extension and its ``bm25()`` ranker. No remote search service.
 
-Index layout (generated artifact, never committed):
+Persistence layout (generated artifact, never committed):
+
+- ``lexical.db`` — persisted FTS5 table (startup/persistence only);
+- hot-path search runs against an SQLite ``:memory:`` copy loaded at
+  startup via the supported backup mechanism. Ordinary turns never
+  open/read ``lexical.db`` from disk.
+
+Index layout:
 
 - ``chunks_fts`` virtual table: ``chunk_id`` (unindexed), ``section``
   (unindexed), ``norm`` (stemmed Russian token text).
@@ -68,14 +75,69 @@ def _match_query(query: str) -> str | None:
     return " OR ".join(terms)
 
 
+def load_lexical_into_memory(db_path: str | Path) -> sqlite3.Connection:
+    """Load the persisted FTS5 database into a ``:memory:`` connection.
+
+    Uses SQLite's supported backup mechanism. The returned connection is
+    long-lived process memory; callers must not reopen the file per turn.
+    """
+    source_path = Path(db_path)
+    if not source_path.is_file():
+        raise LexicalError(f"lexical database is missing: {source_path}")
+    try:
+        source = sqlite3.connect(str(source_path))
+    except sqlite3.Error as exc:
+        raise LexicalError(f"lexical database is unreadable: {exc}") from exc
+    try:
+        target = sqlite3.connect(":memory:")
+        try:
+            source.backup(target)
+        except sqlite3.Error as exc:
+            target.close()
+            raise LexicalError(f"lexical memory load failed: {exc}") from exc
+        try:
+            count = target.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()
+        except sqlite3.Error as exc:
+            target.close()
+            raise LexicalError(f"lexical memory index is unreadable: {exc}") from exc
+        if count is None or int(count[0]) == 0:
+            target.close()
+            raise LexicalError("lexical memory index is empty")
+        return target
+    finally:
+        source.close()
+
+
+def lexical_search_conn(
+    connection: sqlite3.Connection, query: str, *, top_k: int = LEXICAL_TOP_K
+) -> list[tuple[str, float]]:
+    """Search an open (in-memory) FTS5 connection (hot path, no disk I/O)."""
+    if top_k <= 0:
+        raise LexicalError("top_k must be > 0")
+    match = _match_query(query)
+    if match is None:
+        return []
+    try:
+        rows = connection.execute(
+            f"SELECT chunk_id, bm25({FTS_TABLE}) AS rank "
+            f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (match, top_k),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise LexicalError(f"lexical search failed: {exc}") from exc
+    scored = [(str(chunk_id), -float(rank)) for chunk_id, rank in rows]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
 def lexical_search(
     db_path: str | Path, query: str, *, top_k: int = LEXICAL_TOP_K
 ) -> list[tuple[str, float]]:
-    """Search the FTS5 index; return ``[(chunk_id, bm25_score)]`` (best first).
+    """Search the persisted FTS5 index file (startup/tooling only).
 
-    ``bm25()`` returns negative values where more negative is better; this
-    function converts to a positive relevance (``-bm25``) so higher is
-    better and ranks best-first. Empty/stopword-only queries return [].
+    Ordinary turns must use :func:`lexical_search_conn` against the
+    RAM-resident connection instead of reopening the file per query.
     """
     if top_k <= 0:
         raise LexicalError("top_k must be > 0")

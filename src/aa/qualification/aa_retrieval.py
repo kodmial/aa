@@ -542,8 +542,10 @@ def fixture_section_texts() -> tuple[dict[str, str], dict[str, str]]:
     return ru, en
 
 
-def build_fixture_full(*, max_chars: int = 1500) -> dict[str, Any]:
+def build_fixture_full(*, max_tokens: int = 256, max_chars: int | None = None) -> dict[str, Any]:
     """Build the invented full hierarchy used by the hermetic benchmark."""
+    if max_chars is not None:
+        raise ValueError("max_chars was replaced by E5-token max_tokens (issue #115)")
     ru_texts, en_texts = fixture_section_texts()
     en_sections: list[dict[str, object]] = []
     ru_sections: list[dict[str, object]] = []
@@ -575,7 +577,7 @@ def build_fixture_full(*, max_chars: int = 1500) -> dict[str, Any]:
         ru_edition="ru-edition",
         en_corpus_version="en-v1",
         ru_corpus_version="ru-v1",
-        max_chars=max_chars,
+        max_tokens=max_tokens,
     )
     return dict(full)
 
@@ -631,10 +633,13 @@ def _lexical_sections(
 ) -> tuple[str, ...]:
     from collections import Counter
 
+    from aa.retrieval.lexical import lexical_search_conn
+
     counter: Counter[str] = Counter()
-    lexical_path = index.directory / "lexical.db"
+    if index.lexical_conn is None:
+        raise ValueError("index is not RAM-resident")
     for query in queries:
-        for chunk_id, _ in lexical_search(lexical_path, query, top_k=search_top_k):
+        for chunk_id, _ in lexical_search_conn(index.lexical_conn, query, top_k=search_top_k):
             record = index.chunks.get(chunk_id)
             if record is not None:
                 counter[record.section] += 1
@@ -1172,15 +1177,19 @@ def build_artifact_payload(
             "rrf_k": RRF_K,
             "max_per_aspect": MAX_CANDIDATES_PER_ASPECT,
             "max_per_section": MAX_PER_SECTION,
-            "chunk_max_chars": 1500,
+            "chunk_max_tokens": 256,
+            "chunk_policy": "adjacent-sentences-within-paragraph",
+            "sentence_segmenter": "razdel-0.5.0",
+            "tokenizer": "intfloat/multilingual-e5-base@d1287505",
             "embedding_backend": "hashing-char-token/1",
             "production_validated": False,
             "hermetic_only": True,
             "production_promotion_blocked": True,
             "note": (
                 "Hermetic hashing backend mirrors the exact-IP IndexFlatIP contract; "
-                "production e5 uses the pinned lock. Chunking groups whole sentences "
-                "within one paragraph up to 1500 chars. Hermetic-only: recall/latency "
+                "production e5 uses the pinned lock. Chunking groups whole adjacent "
+                "sentences within one paragraph up to 256 E5 tokens (razdel "
+                "segmentation). Hermetic-only: recall/latency "
                 "are not production validation for intfloat/multilingual-e5-base."
             ),
         },
@@ -1232,10 +1241,10 @@ def build_artifact_payload(
                 "All final Russian answer evidence resolves to exact RU canonical text."
             ),
             "rationale": (
-                "Baseline RU-first hybrid (40/40/RRF60/max12/diversity4, chunk 1500, "
-                "expand 1+1) is the simplest configuration clearing recall>=0.95 with "
-                "100% slang, fidelity and stale gates; wider candidates and larger "
-                "expansion add cost without material yield."
+                "Baseline RU-first hybrid (40/40/RRF60/max12/diversity4, chunk 256 "
+                "E5 tokens, expand 1+1) is the simplest configuration clearing "
+                "recall>=0.95 with 100% slang, fidelity and stale gates; wider "
+                "candidates and larger expansion add cost without material yield."
             ),
         },
         "retrieval": _summary_to_dict(summary),
@@ -1352,7 +1361,7 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
     lock = json.loads((repo_root / "corpus" / "embedding.lock.json").read_text(encoding="utf-8"))
     with tempfile.TemporaryDirectory(prefix="aa-retrieval-") as tmp:
         tmp_path = Path(tmp)
-        full = build_fixture_full(max_chars=1500)
+        full = build_fixture_full(max_tokens=256)
         ru_manifest = {
             "format": "aa-canonical-manifest-ru/1",
             "artifact_sha256": "r" * 64,
@@ -1417,10 +1426,10 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
                 baseline_results = res
                 baseline_summary = summ
         assert baseline_results is not None and baseline_summary is not None
-        # Chunking probe: rebuild with adjacent max_chars, same queries.
-        chunking: dict[str, Any] = {"probes": [], "selected_max_chars": 1500}
-        for width in (1000, 1500, 2400):
-            probe_full = build_fixture_full(max_chars=width)
+        # Chunking probe: rebuild with adjacent E5-token budgets, same queries.
+        chunking: dict[str, Any] = {"probes": [], "selected_max_tokens": 256}
+        for width in (128, 256, 512):
+            probe_full = build_fixture_full(max_tokens=width)
             probe_index = build_hybrid_index(
                 probe_full,
                 ru_manifest=ru_manifest,
@@ -1449,7 +1458,7 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
                                 en_chunks += len(en_list)
             chunking["probes"].append(
                 {
-                    "max_chars": width,
+                    "max_tokens": width,
                     "recall_at_5": probe_sum.recall_at_5,
                     "mean_source_tokens": probe_sum.mean_source_tokens,
                     "ru_chunks": ru_chunks,
@@ -1459,8 +1468,8 @@ def run_qualification(*, repo_root: Path) -> dict[str, Any]:
         chunking["rationale"] = (
             "At fixture scale every probe width collapses to identical "
             "whole-paragraph chunking with equal recall and source tokens; "
-            "1500 is retained as the middle ground grouping whole sentences "
-            "within one paragraph."
+            "256 E5 tokens is retained as the initial baseline grouping whole "
+            "adjacent sentences within one paragraph."
         )
         expansion: dict[str, Any] = {
             "selected_before": 1,

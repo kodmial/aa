@@ -1,0 +1,105 @@
+{
+  "cases": [
+    {
+      "case_id": "abbr-g-n-td",
+      "category": "abbreviation",
+      "gold_sentences": [
+        "Г-н Иванов и т.д. пришли вовремя.",
+        "Они обсудили план."
+      ],
+      "paragraph": "Г-н Иванов и т.д. пришли вовремя. Они обсудили план."
+    },
+    {
+      "case_id": "abbr-year-str",
+      "category": "abbreviation",
+      "gold_sentences": [
+        "В 1991 г. многое изменилось.",
+        "См. стр. 12.",
+        "Все понятно."
+      ],
+      "paragraph": "В 1991 г. многое изменилось. См. стр. 12. Все понятно."
+    },
+    {
+      "case_id": "initials-pushkin",
+      "category": "initials",
+      "gold_sentences": [
+        "А. С. Пушкин писал стихи.",
+        "И. И. Иванов читал их вслух."
+      ],
+      "paragraph": "А. С. Пушкин писал стихи. И. И. Иванов читал их вслух."
+    },
+    {
+      "case_id": "dialogue-dash",
+      "category": "dialogue",
+      "gold_sentences": [
+        "Он сказал: «Привет!»",
+        "Она ответила: — Здравствуй.",
+        "Разговор продолжился."
+      ],
+      "paragraph": "Он сказал: «Привет!» Она ответила: — Здравствуй. Разговор продолжился."
+    },
+    {
+      "case_id": "dialogue-direct",
+      "category": "dialogue",
+      "gold_sentences": [
+        "— Ты придешь? — спросил он.",
+        "— Конечно, — ответила она.",
+        "Они пошли вместе."
+      ],
+      "paragraph": "— Ты придешь? — спросил он. — Конечно, — ответила она. Они пошли вместе."
+    },
+    {
+      "case_id": "quotes-book",
+      "category": "quotes",
+      "gold_sentences": [
+        "«В начале было слово», — подумал он.",
+        "Потом наступила тишина."
+      ],
+      "paragraph": "«В начале было слово», — подумал он. Потом наступила тишина."
+    },
+    {
+      "case_id": "ellipsis-pause",
+      "category": "ellipsis",
+      "gold_sentences": [
+        "А потом… наступила пауза.",
+        "Все молчали.",
+        "Наконец он заговорил."
+      ],
+      "paragraph": "А потом… наступила пауза. Все молчали. Наконец он заговорил."
+    },
+    {
+      "case_id": "list-steps",
+      "category": "list",
+      "gold_sentences": [
+        "Шаги такие.",
+        "Первый: признать бессилие.",
+        "Второй: поверить в помощь.",
+        "Третий: принять решение."
+      ],
+      "paragraph": "Шаги такие. Первый: признать бессилие. Второй: поверить в помощь. Третий: принять решение."
+    },
+    {
+      "case_id": "decimal-temp",
+      "category": "decimal",
+      "gold_sentences": [
+        "Температура была 36.6 градуса.",
+        "Давление 120.80 на 80.",
+        "Все в норме."
+      ],
+      "paragraph": "Температура была 36.6 градуса. Давление 120.80 на 80. Все в норме."
+    },
+    {
+      "case_id": "chapter-head",
+      "category": "chapter-typography",
+      "gold_sentences": [
+        "Глава 5.",
+        "Как это работает.",
+        "Честность прежде всего.",
+        "Так написано в книге."
+      ],
+      "paragraph": "Глава 5. Как это работает. Честность прежде всего. Так написано в книге."
+    }
+  ],
+  "fixture_version": "aa-sentence-boundary-fixture/1",
+  "note": "Frozen AA-corpus sentence-boundary fixture: abbreviations, initials, dialogue/quotes, ellipses, lists, decimals and chapter typography. Gold sentences tile each paragraph exactly modulo single-space gaps."
+}

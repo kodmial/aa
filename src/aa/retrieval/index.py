@@ -1,30 +1,39 @@
-"""RU-first hybrid retrieval index with aligned EN control (issue #17).
+"""RU-first hybrid retrieval index with aligned EN control (issue #115).
 
 Fixed production baseline per planner aspect:
 
 1. preserve/use the original Russian query;
 2. add same-language Russian rewrites from #46;
-3. lexical retrieval: SQLite FTS5/BM25 over RU canonical chunks;
+3. lexical retrieval: RAM-resident SQLite FTS5/BM25 over RU canonical chunks;
 4. semantic retrieval: pinned local ``intfloat/multilingual-e5-base`` over
-   RU canonical chunks, normalized embeddings + exact ``IndexFlatIP``;
+   RU canonical chunks, normalized embeddings + exact in-memory
+   ``faiss.IndexFlatIP``;
 5. fuse with RRF (``k=60``);
 6. deduplicate overlaps and retain section/chapter diversity.
 
 Fixed search parameters: lexical top 40, dense top 40, RRF ``k=60``,
-max 12 compact candidates per aspect. Ordinary turns reuse the built
-index; search never rebuilds or re-embeds the corpus.
+max 12 compact candidates per aspect. Ordinary turns reuse the RAM-resident
+index; search never rebuilds or re-embeds the corpus and never reads
+``lexical.db`` / canonical text from disk.
+
+Canonical substrate: RU source -> standardized razdel sentence segmentation
+-> E5-token child chunks (256-token baseline) -> exact child Documents ->
+RAM SQLite FTS5 + RAM E5/FAISS -> structured ``RetrievalHit`` with exact
+canonical Russian text plus provenance.
 
 EN is reference/control only: the index carries aligned EN section
 metadata so #47 can benchmark an optional EN secondary discovery
 branch, but the Russian path never routes RU queries through EN.
 
 On-disk layout (all under ``corpus/generated/retrieval/``, ignored by
-Git, never stored in Actions cache):
+Git, never stored in Actions cache; startup/persistence only):
 
 - ``index.json`` — version metadata, RU chunk records with exact text,
   and EN control metadata;
-- ``lexical.db`` — SQLite FTS5/BM25 table over RU chunks;
-- ``dense.json`` — normalized dense vectors parallel to chunk ids.
+- ``lexical.db`` — persisted SQLite FTS5/BM25 table (copied to ``:memory:``
+  at startup via the backup mechanism);
+- ``dense.json`` — normalized dense vectors parallel to chunk ids (loaded
+  into one long-lived FAISS ``IndexFlatIP`` at startup).
 """
 
 from __future__ import annotations
@@ -55,11 +64,19 @@ from aa.retrieval.fusion import (
     enforce_diversity,
     rrf_fuse,
 )
-from aa.retrieval.lexical import FTS_TABLE, LEXICAL_TOP_K, build_lexical_db, lexical_search
+from aa.retrieval.lexical import (
+    FTS_TABLE,
+    LEXICAL_TOP_K,
+    build_lexical_db,
+    lexical_search_conn,
+    load_lexical_into_memory,
+)
 from aa.retrieval.planner import QueryPlan, aspect_search_queries
 
-INDEX_FORMAT = "aa-hybrid-index/1"
-INDEX_BUILDER_VERSION = 1
+INDEX_FORMAT = "aa-hybrid-index/2"
+INDEX_BUILDER_VERSION = 2
+LEGACY_INDEX_FORMAT = "aa-hybrid-index/1"
+LEGACY_BUILDER_VERSION = 1
 PREVIEW_CHARS = 240
 
 LEXICAL_DB_NAME = "lexical.db"
@@ -77,7 +94,7 @@ class StaleIndexError(HybridIndexError):
 
 @dataclass(frozen=True)
 class ChunkRecord:
-    """One RU canonical chunk with exact provenance and EN control links."""
+    """One RU canonical child document with exact text and provenance."""
 
     chunk_id: str
     logical_chunk_id: str
@@ -94,11 +111,17 @@ class ChunkRecord:
     text_sha256: str
     text: str
     corpus_version: str
+    tokens: int | None = None
 
 
 @dataclass(frozen=True)
 class RetrievalHit:
-    """One fused candidate with the full index contract."""
+    """One fused child-document hit with exact canonical Russian text.
+
+    The exact ``text`` plus provenance is the evidence substrate; ranking
+    fields are internal metadata. ``preview`` is retained as navigation-only
+    text and must never substitute for ``text`` in generation.
+    """
 
     logical_chunk_id: str
     chunk_id: str
@@ -108,6 +131,7 @@ class RetrievalHit:
     char_start: int
     char_end: int
     text_sha256: str
+    text: str
     lexical_rank: int | None
     dense_rank: int | None
     lexical_score: float | None
@@ -124,12 +148,34 @@ class RetrievalHit:
     en_control_section: str
     en_control_title: str
 
+    @property
+    def section_id(self) -> str:
+        """Return the section id (contract alias)."""
+        return self.section
+
+    @property
+    def parent_id(self) -> str:
+        """Return the parent paragraph id (contract alias)."""
+        return self.parent
+
+    @property
+    def prev_id(self) -> str | None:
+        """Return the previous chunk id (contract alias)."""
+        return self.prev
+
+    @property
+    def next_id(self) -> str | None:
+        """Return the next chunk id (contract alias)."""
+        return self.next
+
     def to_dict(self) -> dict[str, Any]:
-        """Return the JSON-serializable hit contract."""
+        """Return the JSON-serializable hit contract (exact text included)."""
         return {
             "logical_chunk_id": self.logical_chunk_id,
             "chunk_id": self.chunk_id,
             "section": self.section,
+            "section_id": self.section,
+            "text": self.text,
             "ru_locator": {
                 "source_id": self.source_id,
                 "source_file": self.source_file,
@@ -146,7 +192,14 @@ class RetrievalHit:
             "fused_rank": self.fused_rank,
             "fused_score": self.fused_score,
             "preview": self.preview,
-            "neighbors": {"parent": self.parent, "prev": self.prev, "next": self.next},
+            "neighbors": {
+                "parent": self.parent,
+                "parent_id": self.parent,
+                "prev": self.prev,
+                "prev_id": self.prev,
+                "next": self.next,
+                "next_id": self.next,
+            },
             "versions": {
                 "index_version": self.index_version,
                 "ru_corpus_version": self.ru_corpus_version,
@@ -162,12 +215,22 @@ class RetrievalHit:
 
 @dataclass
 class HybridIndex:
-    """Opened RU-first hybrid index (reused across ordinary turns)."""
+    """Opened RAM-resident RU-first hybrid index (reused across turns).
+
+    After :func:`open_hybrid_index` returns, all hot-path data lives in
+    process memory: canonical child text plus metadata/neighbor maps in
+    ``chunks``, the FTS5 table in ``lexical_conn`` (``:memory:``), dense
+    vectors in ``dense`` (long-lived FAISS ``IndexFlatIP``), and the cached
+    E5 tokenizer/model reused by queries. Ordinary search/read/neighbor
+    lookup performs no filesystem reads.
+    """
 
     directory: Path
     metadata: dict[str, Any]
     chunks: dict[str, ChunkRecord]
     dense: ExactIPIndex
+    lexical_conn: sqlite3.Connection | None = None
+    ram_resident: bool = False
     en_control: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
@@ -257,6 +320,7 @@ def extract_ru_chunks(
             if _sha256_text(text) != str(node["text_sha256"]):
                 raise HybridIndexError(f"RU chunk checksum mismatch: {node.get('id')!r}")
             physical = str(node["id"])
+            tokens_raw = node.get("tokens")
             records.append(
                 ChunkRecord(
                     chunk_id=physical,
@@ -274,6 +338,7 @@ def extract_ru_chunks(
                     text_sha256=str(node["text_sha256"]),
                     text=text,
                     corpus_version=str(node["corpus_version"]),
+                    tokens=int(str(tokens_raw)) if tokens_raw is not None else None,
                 )
             )
     if not records:
@@ -308,6 +373,27 @@ def _embed_backend_vectors(
     raise HybridIndexError(f"unknown embedding backend: {backend!r}")
 
 
+def _chunking_proof_from_structure(full_structure: dict[str, Any]) -> dict[str, Any]:
+    """Extract chunker/tokenizer proof fields from the full structure."""
+    proof: dict[str, Any] = {
+        "sentence_segmenter": str(
+            full_structure.get("sentence_segmenter", full_structure.get("sentence_rule", ""))
+        ),
+        "sentence_rule": str(full_structure.get("sentence_rule", "")),
+        "chunker": str(full_structure.get("chunker", "")),
+        "chunker_version": full_structure.get("chunker_version"),
+        "tokenizer": str(full_structure.get("tokenizer", "")),
+        "chunk_policy": str(full_structure.get("chunk_policy", "")),
+        "chunk_max_tokens": full_structure.get("chunk_max_tokens"),
+        "e5_hard_input_tokens": full_structure.get("e5_hard_input_tokens"),
+    }
+    # Fail closed on missing proof: no pinned-default backfill here, so a
+    # structure without segmenter/chunker/tokenizer/chunk-limit provenance
+    # reaches the build_hybrid_index checks below and raises instead of
+    # building with claimed provenance.
+    return proof
+
+
 def build_hybrid_index(
     full_structure: dict[str, Any],
     *,
@@ -318,7 +404,7 @@ def build_hybrid_index(
     backend: str = "hashing",
     dim: int = HASHING_DIM,
 ) -> HybridIndex:
-    """Build the RU-first hybrid index into ``out_dir`` (generated artifact)."""
+    """Build the RAM-resident RU-first hybrid index (generated artifact)."""
     records, en_control = extract_ru_chunks(full_structure)
     ru_artifact = str(ru_manifest.get("artifact_sha256", ""))
     en_artifact = str(en_manifest.get("artifact_sha256", ""))
@@ -328,6 +414,19 @@ def build_hybrid_index(
     revision = str(embedding_lock.get("revision", ""))
     if not model_id or not revision:
         raise HybridIndexError("embedding lock must carry model_id + revision")
+    proof = _chunking_proof_from_structure(full_structure)
+    if not proof.get("sentence_segmenter") or not proof.get("chunker"):
+        raise HybridIndexError("full structure must carry chunker/segmenter proof")
+    if not proof.get("tokenizer"):
+        raise HybridIndexError("full structure must carry tokenizer identity")
+    if (
+        proof.get("chunker_version") is None
+        or proof.get("chunk_max_tokens") is None
+        or proof.get("e5_hard_input_tokens") is None
+    ):
+        raise HybridIndexError("full structure must carry chunk-limit proof")
+    if not proof.get("chunk_policy"):
+        raise HybridIndexError("full structure must carry chunk-policy proof")
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -351,6 +450,10 @@ def build_hybrid_index(
         json.dumps(dense_payload, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
+    try:
+        from aa.qualification.sentence_qualification import FIXTURE_VERSION as _fixture_version
+    except Exception:
+        _fixture_version = "aa-sentence-boundary-fixture/1"
     metadata: dict[str, Any] = {
         "format": INDEX_FORMAT,
         "builder_version": INDEX_BUILDER_VERSION,
@@ -364,6 +467,18 @@ def build_hybrid_index(
         "embedding_revision": revision,
         "embedding_backend": backend_name,
         "embedding_dim": used_dim,
+        "sentence_segmenter": proof.get("sentence_segmenter"),
+        "sentence_rule": proof.get("sentence_rule"),
+        "sentence_fixture_version": _fixture_version,
+        "chunker": proof.get("chunker"),
+        "chunker_version": proof.get("chunker_version"),
+        "tokenizer": proof.get("tokenizer"),
+        "tokenizer_model": model_id,
+        "tokenizer_revision": revision,
+        "chunk_policy": proof.get("chunk_policy"),
+        "chunk_max_tokens": proof.get("chunk_max_tokens"),
+        "e5_hard_input_tokens": proof.get("e5_hard_input_tokens"),
+        "ram_resident": True,
         "search_params": {
             "lexical_top_k": LEXICAL_TOP_K,
             "dense_top_k": DENSE_TOP_K,
@@ -393,6 +508,7 @@ def build_hybrid_index(
                 "text_sha256": record.text_sha256,
                 "text": record.text,
                 "corpus_version": record.corpus_version,
+                "tokens": record.tokens,
             }
             for record in records
         ],
@@ -402,11 +518,14 @@ def build_hybrid_index(
         encoding="utf-8",
     )
     chunks = {record.chunk_id: record for record in records}
+    lexical_conn = load_lexical_into_memory(directory / LEXICAL_DB_NAME)
     return HybridIndex(
         directory=directory,
         metadata=metadata,
         chunks=chunks,
         dense=dense_index,
+        lexical_conn=lexical_conn,
+        ram_resident=True,
         en_control=en_control,
     )
 
@@ -431,6 +550,18 @@ def _expected_from_live(
     return expected
 
 
+def close_hybrid_index(index: HybridIndex) -> None:
+    """Release the RAM-resident lexical connection (persistence files stay)."""
+    conn = index.lexical_conn
+    index.lexical_conn = None
+    index.ram_resident = False
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def open_hybrid_index(
     directory: str | Path,
     *,
@@ -438,7 +569,13 @@ def open_hybrid_index(
     en_manifest_path: str | Path | None = None,
     lock_path: str | Path | None = None,
 ) -> HybridIndex:
-    """Open a built index, rejecting stale corpus/model bindings."""
+    """Open a built index into RAM, rejecting stale corpus/model bindings.
+
+    Startup loads the persisted FTS5 into ``:memory:`` via the backup
+    mechanism, dense vectors into one long-lived FAISS ``IndexFlatIP``,
+    and canonical child text/metadata into process memory. Disk remains
+    startup/persistence storage only.
+    """
     directory_path = Path(directory)
     payload = _load_json(directory_path / INDEX_NAME, "hybrid index")
     metadata_raw = payload.get("metadata")
@@ -446,10 +583,25 @@ def open_hybrid_index(
     if not isinstance(metadata_raw, dict) or not isinstance(chunks_raw, list):
         raise HybridIndexError("hybrid index payload is malformed")
     metadata: dict[str, Any] = dict(metadata_raw)
+    if metadata.get("format") == LEGACY_INDEX_FORMAT:
+        raise StaleIndexError(
+            "hybrid index format aa-hybrid-index/1 is stale; rebuild via the "
+            "trusted canonical-artifact bootstrap"
+        )
     if metadata.get("format") != INDEX_FORMAT:
         raise HybridIndexError(f"unsupported hybrid index format: {metadata.get('format')!r}")
     if metadata.get("builder_version") != INDEX_BUILDER_VERSION:
         raise StaleIndexError("hybrid index builder version is stale")
+    for required in (
+        "sentence_segmenter",
+        "chunker",
+        "chunker_version",
+        "tokenizer",
+        "chunk_policy",
+        "chunk_max_tokens",
+    ):
+        if metadata.get(required) in (None, ""):
+            raise StaleIndexError(f"hybrid index is stale: missing {required}")
 
     expected = _expected_from_live(
         ru_manifest_path=Path(ru_manifest_path) if ru_manifest_path is not None else None,
@@ -468,6 +620,7 @@ def open_hybrid_index(
         if _sha256_text(text) != str(node.get("text_sha256", "")):
             raise HybridIndexError(f"index chunk checksum mismatch: {node.get('chunk_id')!r}")
         physical = str(node.get("chunk_id", ""))
+        tokens_raw = node.get("tokens")
         record = ChunkRecord(
             chunk_id=physical,
             logical_chunk_id=str(node.get("logical_chunk_id", logical_chunk_id(physical))),
@@ -484,6 +637,7 @@ def open_hybrid_index(
             text_sha256=str(node.get("text_sha256", "")),
             text=text,
             corpus_version=str(node.get("corpus_version", "")),
+            tokens=int(str(tokens_raw)) if tokens_raw is not None else None,
         )
         chunks[physical] = record
     if len(chunks) != int(metadata.get("chunk_count", len(chunks))):
@@ -510,17 +664,17 @@ def open_hybrid_index(
         raise HybridIndexError(str(exc)) from exc
 
     lexical_path = directory_path / LEXICAL_DB_NAME
-    if not lexical_path.is_file():
-        raise HybridIndexError("lexical database is missing")
     try:
-        connection = sqlite3.connect(str(lexical_path))
-        try:
-            count = connection.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()
-        finally:
-            connection.close()
+        lexical_conn = load_lexical_into_memory(lexical_path)
+    except ValueError as exc:
+        raise HybridIndexError(str(exc)) from exc
+    try:
+        count = lexical_conn.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()
     except sqlite3.Error as exc:
-        raise HybridIndexError(f"lexical database is unreadable: {exc}") from exc
+        lexical_conn.close()
+        raise HybridIndexError(f"lexical memory index is unreadable: {exc}") from exc
     if count is None or int(count[0]) != len(chunks):
+        lexical_conn.close()
         raise HybridIndexError("lexical database chunk count does not match index")
 
     en_control_raw = metadata.get("en_control", {})
@@ -534,6 +688,8 @@ def open_hybrid_index(
         metadata=metadata,
         chunks=chunks,
         dense=dense_index,
+        lexical_conn=lexical_conn,
+        ram_resident=True,
         en_control=en_control,
     )
 
@@ -569,17 +725,19 @@ def search_aspect(
 ) -> list[RetrievalHit]:
     """Search one planner aspect (original + rewrites) and fuse to <= max_n hits.
 
-    The opened index is reused as-is; corpus embedding is never repeated.
+    The opened RAM-resident index is reused as-is; corpus embedding is never
+    repeated and no filesystem read occurs on this hot path.
     """
     if not queries:
         raise HybridIndexError("aspect queries must be non-empty")
     for query in queries:
         if not isinstance(query, str) or not query.strip():
             raise HybridIndexError("aspect queries must be non-empty strings")
+    if index.lexical_conn is None or not index.ram_resident:
+        raise HybridIndexError("index is not RAM-resident; open it via open_hybrid_index")
     ranked_lists: list[list[tuple[str, float]]] = []
-    lexical_path = index.directory / LEXICAL_DB_NAME
     for query in queries:
-        ranked_lists.append(lexical_search(lexical_path, query, top_k=lexical_top_k))
+        ranked_lists.append(lexical_search_conn(index.lexical_conn, query, top_k=lexical_top_k))
         ranked_lists.append(
             index.dense.search(
                 _embed_query(index, query), top_k=min(dense_top_k, len(index.chunks))
@@ -608,6 +766,8 @@ def search_aspect(
         sorted(diverse, key=lambda item: item.fused_score, reverse=True), start=1
     ):
         record = index.chunks[candidate.chunk_id]
+        if _sha256_text(record.text) != record.text_sha256:
+            raise HybridIndexError(f"RAM chunk checksum mismatch: {record.chunk_id!r}")
         control = index.en_control.get(record.section, {})
         hits.append(
             RetrievalHit(
@@ -619,6 +779,7 @@ def search_aspect(
                 char_start=record.char_start,
                 char_end=record.char_end,
                 text_sha256=record.text_sha256,
+                text=record.text,
                 lexical_rank=candidate.lexical_rank,
                 dense_rank=candidate.dense_rank,
                 lexical_score=candidate.lexical_score,

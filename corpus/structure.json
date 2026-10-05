@@ -1,22 +1,30 @@
 {
   "alignment_policy": "Section/chapter alignment is mandatory and one-to-one across RU/EN. Paragraph/chunk alignment is never forced: translations split/merge differently, so paragraphs and chunks are per-language physical units under explicit section-only alignment. Retrieval uses RU chunks as primary evidence units for Russian users; EN chunks are reference/control.",
   "book": "aa-big-book",
-  "builder_version": 1,
+  "builder_version": 2,
+  "chunk_max_tokens": 256,
+  "chunk_policy": "adjacent-sentences-within-paragraph",
+  "chunker": "e5-token-chunker/1",
+  "chunker_version": 1,
   "chunking": {
-    "max_chunk_chars": 1500,
-    "note": "Chunks group whole sentences within one paragraph only; sentences are never split. Paragraph/chunk instances with exact text live in corpus/generated/ and never in this file.",
+    "chunk_max_tokens": 256,
+    "chunk_policy": "adjacent-sentences-within-paragraph",
+    "chunker": "e5-token-chunker/1",
+    "note": "Chunks group whole adjacent sentences within one paragraph only up to 256 E5 tokens; sentences are never split. Paragraph/chunk instances with exact text live in corpus/generated/ and never in this file.",
     "paragraph_rule": "blank-line-separated blocks; exact section offsets",
-    "sentence_rule": "sentence-rule/1"
+    "sentence_rule": "sentence-seg/razdel-0.5.0",
+    "sentence_segmenter": "razdel-0.5.0",
+    "tokenizer": "intfloat/multilingual-e5-base@d1287505"
   },
+  "e5_hard_input_tokens": 512,
   "en": {
     "artifact_sha256": "7bd1b398090ecc9dbea829b7107841972a2a55daf4484935a33d7ec33ed7463b",
     "edition": "Alcoholics Anonymous, First Edition (1939)",
     "manifest_format": "aa-canonical-manifest/1"
   },
   "format": "aa-aligned-structure/1",
-  "max_chunk_chars": 1500,
   "ru": {
-    "artifact_sha256": "0a0cf5feee03792d314936b27e4366c41002eadecfc2e9e60fbdf398cdb92967",
+    "artifact_sha256": "310367aa06976b66b484ac11f4a4d05131605be29a917e059eb62f8e2b72509b",
     "edition": "АНОНИМНЫЕ АЛКОГОЛИКИ (Четвертое издание). Перевод с английского. Нью-Йорк: Alcoholics Anonymous World Services, Inc; Фонд «Единство», 2013. ISBN 978-5-906531-01-8 (Фонд «Единство»)",
     "manifest_format": "aa-canonical-manifest-ru/1"
   },
@@ -500,5 +508,7 @@
       "topic_en": "Vision for you: fellowship growth and invitation"
     }
   ],
-  "sentence_rule": "sentence-rule/1"
+  "sentence_rule": "sentence-seg/razdel-0.5.0",
+  "sentence_segmenter": "razdel-0.5.0",
+  "tokenizer": "intfloat/multilingual-e5-base@d1287505"
 }

@@ -180,7 +180,7 @@ def _library_versions() -> dict[str, str]:
     except Exception:  # noqa: BLE001 - version probing never fails the key
         versions["zstandard"] = "unknown"
     try:
-        import faiss  # type: ignore[import-not-found]
+        import faiss  # type: ignore[import-untyped]
 
         versions["faiss"] = str(getattr(faiss, "__version__", "present"))
     except Exception:  # noqa: BLE001 - faiss is optional
@@ -549,9 +549,9 @@ def write_extracted_bundle(
 
 
 def self_test_index(retrieval_dir: str | Path) -> dict[str, Any]:
-    """Open SQLite/Faiss state and run a lightweight self-test (fails closed)."""
-    from aa.retrieval.index import INDEX_BUILDER_VERSION, open_hybrid_index
-    from aa.retrieval.lexical import lexical_search
+    """Open RAM-resident state and run a lightweight self-test (fails closed)."""
+    from aa.retrieval.index import INDEX_BUILDER_VERSION, close_hybrid_index, open_hybrid_index
+    from aa.retrieval.lexical import lexical_search_conn
 
     directory = Path(retrieval_dir)
     index = open_hybrid_index(directory)
@@ -563,28 +563,35 @@ def self_test_index(retrieval_dir: str | Path) -> dict[str, Any]:
     top = index.dense.search(stored_vector, top_k=1)
     if not top or top[0][0] != stored_id:
         raise DerivedCacheError("derived cache dense self-test failed")
-    # Lexical round-trip: a real indexed token must resolve through FTS5.
+    # Lexical round-trip via the RAM-resident FTS5 connection (no disk I/O).
     lexical_ok = False
-    for record in list(index.chunks.values())[:5]:
-        for token in record.text.split():
-            cleaned = "".join(ch for ch in token if ch.isalnum()).strip()
-            if len(cleaned) < 4:
-                continue
-            try:
-                hits = lexical_search(directory / "lexical.db", cleaned, top_k=3)
-            except ValueError as exc:
-                raise DerivedCacheError(f"derived cache lexical self-test failed: {exc}") from exc
-            if hits:
-                lexical_ok = True
+    if index.lexical_conn is None:
+        raise DerivedCacheError("derived cache index is not RAM-resident")
+    try:
+        for record in list(index.chunks.values())[:5]:
+            for token in record.text.split():
+                cleaned = "".join(ch for ch in token if ch.isalnum()).strip()
+                if len(cleaned) < 4:
+                    continue
+                try:
+                    hits = lexical_search_conn(index.lexical_conn, cleaned, top_k=3)
+                except ValueError as exc:
+                    raise DerivedCacheError(
+                        f"derived cache lexical self-test failed: {exc}"
+                    ) from exc
+                if hits:
+                    lexical_ok = True
+                    break
+            if lexical_ok:
                 break
-        if lexical_ok:
-            break
-    if not lexical_ok:
-        raise DerivedCacheError("derived cache lexical self-test found no indexed token")
-    return {
-        "chunk_count": index.chunk_count,
-        "index_version": int(index.metadata.get("builder_version", INDEX_BUILDER_VERSION)),
-    }
+        if not lexical_ok:
+            raise DerivedCacheError("derived cache lexical self-test found no indexed token")
+        return {
+            "chunk_count": index.chunk_count,
+            "index_version": int(index.metadata.get("builder_version", INDEX_BUILDER_VERSION)),
+        }
+    finally:
+        close_hybrid_index(index)
 
 
 def clear_directory(directory: str | Path) -> None:

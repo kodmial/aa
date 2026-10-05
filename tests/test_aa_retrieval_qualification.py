@@ -234,12 +234,14 @@ def test_simplest_passing_config_versioned() -> None:
     assert index_config["dense_top_k"] == DENSE_TOP_K == 40
     assert index_config["rrf_k"] == RRF_K == 60
     assert index_config["max_per_aspect"] == MAX_CANDIDATES_PER_ASPECT == 12
-    assert index_config["chunk_max_chars"] == 1500
+    assert index_config["chunk_max_tokens"] == 256
+    assert index_config["chunk_policy"] == "adjacent-sentences-within-paragraph"
+    assert index_config["sentence_segmenter"] == "razdel-0.5.0"
     assert artifact["tool_config"]["expand_before"] == 1
     assert artifact["tool_config"]["expand_after"] == 1
     assert artifact["tuning"]
     assert any(t["candidate"].startswith("baseline") and t["passed"] for t in artifact["tuning"])
-    assert artifact["chunking"]["selected_max_chars"] == 1500
+    assert artifact["chunking"]["selected_max_tokens"] == 256
     assert artifact["expansion"]["selected_before"] == 1
 
 

@@ -30,12 +30,32 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
+
+from aa.corpus.e5_tokens import (
+    CHILD_MAX_TOKENS,
+    CHUNKER_ID,
+    CHUNKER_VERSION,
+    E5_HARD_INPUT_TOKENS,
+    TOKENIZER_ID,
+    ChunkTokenError,
+    build_token_chunks,
+)
+from aa.corpus.sentences import (
+    SEGMENTER_ID,
+    SEGMENTER_VERSION,
+    SentenceSpan,
+    split_sentences_razdel,
+)
 
 BOOK_ID = "aa-big-book"
 STRUCTURE_FORMAT = "aa-aligned-structure/1"
-FULL_FORMAT = "aa-corpus-structure-full/1"
-BUILDER_VERSION = 1
+FULL_FORMAT = "aa-corpus-structure-full/2"
+BUILDER_VERSION = 2
+# Legacy character budget replaced by E5-token budgeting (issue #115).
+LEGACY_MAX_CHUNK_CHARS = 1500
 
 SECTION_IDS = (
     "doctors-opinion",
@@ -52,8 +72,8 @@ SECTION_IDS = (
     "chapter-11",
 )
 
-MAX_CHUNK_CHARS = 1500
-SENTENCE_RULE_VERSION = "sentence-rule/1"
+SENTENCE_RULE_VERSION = SEGMENTER_VERSION
+CHUNKER_RULE_VERSION = CHUNKER_ID
 
 SECTION_ALIGNMENT_STATUS = "aligned"
 PARAGRAPH_ALIGNMENT_STATUS = "section-aligned-only"
@@ -86,10 +106,6 @@ TOPICS_EN = {
 # Matches blocks of consecutive non-blank lines (paragraphs). Surrounding
 # blank separators are not part of any paragraph span.
 _PARAGRAPH_RE = re.compile(r"(?:[^\n]*\S[^\n]*)(?:\n(?!\s*\n)[^\n]*)*")
-# A sentence ends at terminal punctuation plus optional closers.
-_SENTENCE_END_RE = re.compile(r"[.!?…]+[\"'\"'\u00bb\)\]]*")
-_OPENERS = set('"\'"("«[')
-_SENTENCE_WS = set(" \t\r\n")
 
 
 @dataclass(frozen=True)
@@ -102,14 +118,46 @@ class ParagraphSpan:
     text: str
 
 
-@dataclass(frozen=True)
-class SentenceSpan:
-    """One sentence slice of a paragraph (section-relative offsets)."""
+# Re-exported for backward-compatible imports: production sentences always
+# come from the qualified standard segmenter (razdel); see sentences.py.
+__all__ = [
+    "BOOK_ID",
+    "STRUCTURE_FORMAT",
+    "FULL_FORMAT",
+    "BUILDER_VERSION",
+    "SECTION_IDS",
+    "CHILD_MAX_TOKENS",
+    "SENTENCE_RULE_VERSION",
+    "CHUNKER_RULE_VERSION",
+    "ParagraphSpan",
+    "SentenceSpan",
+    "sha256_text",
+    "split_paragraphs",
+    "split_sentences",
+    "build_chunks",
+    "paragraph_id",
+    "chunk_id",
+    "section_prev_next",
+    "build_section_units",
+    "build_full_structure",
+    "strip_text",
+    "build_public_structure",
+    "render_book_map",
+    "chunker_identity",
+    "segmenter_identity",
+]
 
-    index: int  # 1-based per paragraph
-    char_start: int
-    char_end: int
-    text: str
+
+def chunker_identity(*, max_tokens: int = CHILD_MAX_TOKENS) -> dict[str, Any]:
+    """Return chunker/tokenizer identity for index manifests."""
+    from aa.corpus.e5_tokens import chunker_identity as _chunker_identity
+
+    return _chunker_identity(max_tokens=max_tokens)
+
+
+def segmenter_identity() -> dict[str, str]:
+    """Return the pinned production segmenter identity."""
+    return {"segmenter_id": SEGMENTER_ID, "segmenter_version": SEGMENTER_VERSION}
 
 
 def sha256_text(text: str) -> str:
@@ -148,78 +196,45 @@ def split_paragraphs(section_text: str) -> list[ParagraphSpan]:
 def split_sentences(paragraph_text: str, base_offset: int) -> list[SentenceSpan]:
     """Split one paragraph into sentences (section-relative offsets).
 
-    Boundaries are natural sentence punctuation only; sentences tile the
-    paragraph exactly so chunks built from them never split a sentence.
+    Production uses only the qualified standard Russian segmenter
+    (``razdel.sentenize``); see :mod:`aa.corpus.sentences`. Every span
+    round-trips exactly to the owning section text.
     """
-    if base_offset < 0:
-        raise ValueError("base_offset must be >= 0")
-    if not paragraph_text:
-        raise ValueError("refusing to split an empty paragraph")
-    boundaries: list[int] = []
-    start = 0
-    text_len = len(paragraph_text)
-    for match in _SENTENCE_END_RE.finditer(paragraph_text):
-        end_punct = match.end()
-        cursor = end_punct
-        while cursor < text_len and paragraph_text[cursor] in _SENTENCE_WS:
-            cursor += 1
-        if cursor >= text_len:
-            boundaries.append(text_len)
-            start = text_len
-            break
-        next_char = paragraph_text[cursor]
-        if next_char.isupper() or next_char.isdigit() or next_char in _OPENERS:
-            boundaries.append(cursor)
-            start = cursor
-    if start < text_len:
-        boundaries.append(text_len)
-    sentences: list[SentenceSpan] = []
-    cursor_start = 0
-    for number, end in enumerate(boundaries, start=1):
-        if end <= cursor_start:
-            continue
-        sentences.append(
-            SentenceSpan(
-                index=number,
-                char_start=base_offset + cursor_start,
-                char_end=base_offset + end,
-                text=paragraph_text[cursor_start:end],
-            )
-        )
-        cursor_start = end
-    if not sentences:
-        raise ValueError("sentence split produced no sentences")
-    return sentences
+    try:
+        return split_sentences_razdel(paragraph_text, base_offset)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def build_chunks(
     sentences: list[SentenceSpan],
     *,
-    max_chars: int = MAX_CHUNK_CHARS,
+    max_tokens: int = CHILD_MAX_TOKENS,
+    token_counter: Callable[[str], int] | None = None,
+    paragraph_end: int | None = None,
 ) -> list[tuple[int, int]]:
     """Group sentence spans into chunk ``(char_start, char_end)`` ranges.
 
-    Sentences are never split; a chunk holds one or more whole sentences up
-    to ``max_chars``. A single oversize sentence becomes its own chunk (it
-    must be re-chunked upstream, never truncated here).
+    Token-aware: sentences are never split; a chunk holds one or more whole
+    adjacent sentences within one paragraph up to ``max_tokens`` E5 tokens.
+    A single sentence may exceed ``max_tokens`` and remain one atomic child
+    only while it still fits the E5 hard input limit; a harder breach fails
+    closed. No overlapping duplicate windows are emitted.
     """
-    if max_chars <= 0:
-        raise ValueError("max_chars must be > 0")
-    if not sentences:
-        raise ValueError("refusing to chunk an empty sentence list")
-    chunks: list[tuple[int, int]] = []
-    current_start = sentences[0].char_start
-    current_end = sentences[0].char_end
-    for previous, current in zip(sentences, sentences[1:], strict=False):
-        if previous.char_end != current.char_start:
-            raise ValueError("sentences must tile the paragraph contiguously")
-        candidate_len = current.char_end - current_start
-        if candidate_len > max_chars and current_end > current_start:
-            chunks.append((current_start, current_end))
-            current_start = current.char_start
-        current_end = current.char_end
-    chunks.append((current_start, current_end))
-    return chunks
+    if paragraph_end is None:
+        if not sentences:
+            raise ValueError("refusing to chunk an empty sentence list")
+        paragraph_end = sentences[-1].char_end
+    try:
+        return build_token_chunks(
+            sentences,
+            paragraph_end=paragraph_end,
+            max_tokens=max_tokens,
+            hard_limit=E5_HARD_INPUT_TOKENS,
+            token_counter=token_counter,
+        )
+    except ChunkTokenError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def paragraph_id(section_id: str, lang: str, index: int) -> str:
@@ -250,14 +265,20 @@ def build_section_units(
     source_sha256: str,
     edition: str,
     corpus_version: str,
-    max_chars: int = MAX_CHUNK_CHARS,
+    max_tokens: int = CHILD_MAX_TOKENS,
+    token_counter: Callable[[str], int] | None = None,
+    **kwargs: Any,
 ) -> dict[str, object]:
     """Build per-language paragraph/sentence/chunk units for one section.
 
-    Every chunk round-trips: ``section_text[chunk_start:chunk_end]`` is the
-    exact chunk text. Units carry parent/previous/next links and alignment
-    status; cross-language paragraph equality is never forced.
+    Every paragraph/sentence/chunk round-trips:
+    ``section_text[span.char_start:span.char_end]`` is the exact span text.
+    Chunks group whole adjacent sentences within one paragraph up to
+    ``max_tokens`` E5 tokens. Units carry parent/previous/next links and
+    alignment status; cross-language paragraph equality is never forced.
     """
+    if kwargs.get("max_chars") is not None:
+        raise ValueError("max_chars was replaced by E5-token max_tokens (issue #115)")
     if section_id not in SECTION_IDS:
         raise ValueError(f"unknown section id: {section_id!r}")
     if lang not in ("en", "ru"):
@@ -274,13 +295,24 @@ def build_section_units(
         for sentence in sentences:
             if section_text[sentence.char_start : sentence.char_end] != sentence.text:
                 raise ValueError("sentence span does not round-trip to section text")
-        chunk_ranges = build_chunks(sentences, max_chars=max_chars)
+        chunk_ranges = build_chunks(
+            sentences,
+            max_tokens=max_tokens,
+            token_counter=token_counter,
+            paragraph_end=para.char_end,
+        )
         first_chunk = chunk_index + 1
         for range_start, range_end in chunk_ranges:
             chunk_index += 1
             chunk_text = section_text[range_start:range_end]
             if not chunk_text.strip():
                 raise ValueError("refusing an empty chunk")
+            if token_counter is not None:
+                chunk_tokens = int(token_counter(chunk_text))
+            else:
+                from aa.corpus.e5_tokens import count_e5_tokens as _count
+
+                chunk_tokens = int(_count(chunk_text))
             chunk_nodes.append(
                 {
                     "id": chunk_id(section_id, lang, chunk_index),
@@ -300,6 +332,7 @@ def build_section_units(
                     "char_start": range_start,
                     "char_end": range_end,
                     "chars": range_end - range_start,
+                    "tokens": chunk_tokens,
                     "text_sha256": sha256_text(chunk_text),
                     "text": chunk_text,
                     "alignment": {
@@ -357,7 +390,9 @@ def build_full_structure(
     ru_edition: str,
     en_corpus_version: str,
     ru_corpus_version: str,
-    max_chars: int = MAX_CHUNK_CHARS,
+    max_tokens: int = CHILD_MAX_TOKENS,
+    token_counter: Callable[[str], int] | None = None,
+    **kwargs: Any,
 ) -> dict[str, object]:
     """Build the full text-bearing hierarchy for EN+RU section inputs.
 
@@ -366,6 +401,8 @@ def build_full_structure(
     across languages in canonical order; paragraph/chunk counts may differ
     (split/merge is represented, never forced).
     """
+    if kwargs.get("max_chars") is not None:
+        raise ValueError("max_chars was replaced by E5-token max_tokens (issue #115)")
     en_by_id = {str(item["id"]): item for item in en_sections}
     ru_by_id = {str(item["id"]): item for item in ru_sections}
     if [str(item["id"]) for item in en_sections] != list(SECTION_IDS):
@@ -390,7 +427,8 @@ def build_full_structure(
             source_sha256=str(en_item["source_sha256"]),
             edition=en_edition,
             corpus_version=en_corpus_version,
-            max_chars=max_chars,
+            max_tokens=max_tokens,
+            token_counter=token_counter,
         )
         ru_units = build_section_units(
             section_id=section_id,
@@ -401,7 +439,8 @@ def build_full_structure(
             source_sha256=str(ru_item["source_sha256"]),
             edition=ru_edition,
             corpus_version=ru_corpus_version,
-            max_chars=max_chars,
+            max_tokens=max_tokens,
+            token_counter=token_counter,
         )
         sections.append(
             {
@@ -444,7 +483,13 @@ def build_full_structure(
         "builder_version": BUILDER_VERSION,
         "book": BOOK_ID,
         "sentence_rule": SENTENCE_RULE_VERSION,
-        "max_chunk_chars": max_chars,
+        "sentence_segmenter": SEGMENTER_ID,
+        "chunker": CHUNKER_ID,
+        "chunker_version": CHUNKER_VERSION,
+        "tokenizer": TOKENIZER_ID,
+        "chunk_policy": "adjacent-sentences-within-paragraph",
+        "chunk_max_tokens": max_tokens,
+        "e5_hard_input_tokens": E5_HARD_INPUT_TOKENS,
         "alignment_policy": ALIGNMENT_POLICY,
         "sections": sections,
     }
@@ -534,16 +579,27 @@ def build_public_structure(
         "builder_version": BUILDER_VERSION,
         "book": BOOK_ID,
         "sentence_rule": SENTENCE_RULE_VERSION,
-        "max_chunk_chars": MAX_CHUNK_CHARS,
+        "sentence_segmenter": SEGMENTER_ID,
+        "chunker": CHUNKER_ID,
+        "chunker_version": CHUNKER_VERSION,
+        "tokenizer": TOKENIZER_ID,
+        "chunk_policy": "adjacent-sentences-within-paragraph",
+        "chunk_max_tokens": CHILD_MAX_TOKENS,
+        "e5_hard_input_tokens": E5_HARD_INPUT_TOKENS,
         "alignment_policy": ALIGNMENT_POLICY,
         "chunking": {
             "paragraph_rule": "blank-line-separated blocks; exact section offsets",
             "sentence_rule": SENTENCE_RULE_VERSION,
-            "max_chunk_chars": MAX_CHUNK_CHARS,
+            "sentence_segmenter": SEGMENTER_ID,
+            "chunker": CHUNKER_ID,
+            "chunk_policy": "adjacent-sentences-within-paragraph",
+            "chunk_max_tokens": CHILD_MAX_TOKENS,
+            "tokenizer": TOKENIZER_ID,
             "note": (
-                "Chunks group whole sentences within one paragraph only; "
-                "sentences are never split. Paragraph/chunk instances with "
-                "exact text live in corpus/generated/ and never in this file."
+                "Chunks group whole adjacent sentences within one paragraph only "
+                "up to 256 E5 tokens; sentences are never split. Paragraph/chunk "
+                "instances with exact text live in corpus/generated/ and never "
+                "in this file."
             ),
         },
         "en": {
