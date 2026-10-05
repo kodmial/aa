@@ -446,13 +446,12 @@ def test_parent_neighbor_expansion_returns_exact_spans(tmp_path: pathlib.Path) -
             for pos in range(len(members))
         ]
         passages = expand_small_to_big(index, winners)
-        assert len(passages) == 1
-        passage = passages[0]
+        assert passages
+        covered = {cid for passage in passages for cid in passage.child_chunk_ids}
         for chunk_id in members:
-            assert index.chunks[chunk_id].text in passage.exact_text
-        assert passage.exact_text == "\n".join(
-            index.chunks[cid].text
-            for cid in sorted(
+            assert chunk_id in covered
+        for passage in passages:
+            ordered = sorted(
                 passage.child_chunk_ids,
                 key=lambda cid: (
                     index.chunks[cid].char_start,
@@ -460,17 +459,24 @@ def test_parent_neighbor_expansion_returns_exact_spans(tmp_path: pathlib.Path) -
                     cid,
                 ),
             )
-        )
-        first = index.chunks[passage.child_chunk_ids[0]]
-        assert passage.section_id == first.section
-        assert passage.source_id == first.source_id
-        assert passage.char_start == min(
-            index.chunks[cid].char_start for cid in passage.child_chunk_ids
-        )
-        assert passage.char_end == max(
-            index.chunks[cid].char_end for cid in passage.child_chunk_ids
-        )
-        assert passage.text_sha256 == hashlib.sha256(passage.exact_text.encode("utf-8")).hexdigest()
+            # No synthetic glue: contiguous tiling concatenates exactly.
+            assert passage.exact_text == "".join(index.chunks[cid].text for cid in ordered)
+            for first_id, second_id in zip(ordered, ordered[1:], strict=False):
+                assert index.chunks[second_id].char_start == index.chunks[first_id].char_end
+            first = index.chunks[passage.child_chunk_ids[0]]
+            assert passage.section_id == first.section
+            assert passage.source_id == first.source_id
+            assert passage.char_start == min(
+                index.chunks[cid].char_start for cid in passage.child_chunk_ids
+            )
+            assert passage.char_end == max(
+                index.chunks[cid].char_end for cid in passage.child_chunk_ids
+            )
+            assert (
+                passage.text_sha256
+                == hashlib.sha256(passage.exact_text.encode("utf-8")).hexdigest()
+            )
+        passage = next(item for item in passages if members[0] in item.child_chunk_ids)
     finally:
         close_hybrid_index(index)
 
@@ -498,8 +504,23 @@ def test_overlapping_expansions_merge(tmp_path: pathlib.Path) -> None:
             for pos, cid in enumerate(members)
         ]
         passages = expand_small_to_big(index, winners, neighbor_window=0)
-        assert len(passages) == 1
-        assert set(members) <= set(passages[0].child_chunk_ids)
+        assert passages
+        covered = {cid for passage in passages for cid in passage.child_chunk_ids}
+        assert set(members) <= covered
+        # Contiguous siblings share one exact passage (no synthetic glue).
+        holder = next(item for item in passages if members[0] in item.child_chunk_ids)
+        assert members[1] in holder.child_chunk_ids
+        assert holder.exact_text == "".join(
+            index.chunks[cid].text
+            for cid in sorted(
+                holder.child_chunk_ids,
+                key=lambda cid: (
+                    index.chunks[cid].char_start,
+                    index.chunks[cid].char_end,
+                    cid,
+                ),
+            )
+        )
     finally:
         close_hybrid_index(index)
 

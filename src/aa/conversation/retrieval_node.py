@@ -24,6 +24,7 @@ expansion -> pack``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -111,7 +112,7 @@ async def retrieval_node(
 ) -> dict[str, Any]:
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
-    Runs the RRF-only pipeline synchronously on the RAM-resident index.
+    Runs the RRF-only pipeline in a worker thread on the RAM-resident index.
     The per-turn wall-clock latency against
     ``INTERACTIVE_LATENCY_BUDGET_MS`` is measured and propagated in
     state (``retrieval_latency_ms``/``retrieval_over_budget``) for
@@ -144,7 +145,7 @@ async def retrieval_node(
         }
     active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
-    pack = retrieve_evidence(index, queries, config=active_config)
+    pack = await asyncio.to_thread(retrieve_evidence, index, queries, config=active_config)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     hits, pack_dicts = pack_to_state(pack)

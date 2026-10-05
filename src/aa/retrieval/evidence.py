@@ -504,7 +504,9 @@ def expand_small_to_big(
                 collapsed.append((section_id, window))
         merged = collapsed
     passages: list[EvidencePassageData] = []
-    for seq, (section_id, window) in enumerate(merged):
+    passage_ranks: list[int] = []
+    seq = 0
+    for section_id, window in merged:
         members = sorted(
             window,
             key=lambda item: (
@@ -518,27 +520,56 @@ def expand_small_to_big(
             record = index.chunks[item]
             if _sha256_text(text) != record.text_sha256 or text != record.text:
                 raise EvidenceError(f"expansion checksum mismatch: {item!r}")
-        exact_text = "\n".join(texts)
-        first = index.chunks[members[0]]
-        starts = [index.chunks[item].char_start for item in members]
-        ends = [index.chunks[item].char_end for item in members]
-        passages.append(
-            EvidencePassageData(
-                passage_id=f"{section_id}#exp{seq:04d}",
-                exact_text=exact_text,
-                source_id=first.source_id,
-                section_id=section_id,
-                child_chunk_ids=tuple(members),
-                char_start=min(starts),
-                char_end=max(ends),
-                text_sha256=_sha256_text(exact_text),
-                source_sha256=first.source_sha256,
+        # Partition into exactly contiguous runs. Chunks tile their
+        # paragraph exactly (next.char_start == prev.char_end), so only
+        # adjacent runs concatenate to the exact source slice with no
+        # synthetic glue. Any gap or overlap becomes separate passages.
+        runs: list[list[str]] = []
+        for item in members:
+            record = index.chunks[item]
+            if runs:
+                prev = index.chunks[runs[-1][-1]]
+                if (
+                    record.source_id == prev.source_id
+                    and record.section == prev.section
+                    and record.char_start == prev.char_end
+                ):
+                    runs[-1].append(item)
+                    continue
+            runs.append([item])
+        for run in runs:
+            run_texts = [index.chunks[item].text for item in run]
+            exact_text = "".join(run_texts)
+            first = index.chunks[run[0]]
+            starts = [index.chunks[item].char_start for item in run]
+            ends = [index.chunks[item].char_end for item in run]
+            window_ranks = [rank_of[cid] for cid in window if cid in rank_of]
+            run_best = min(window_ranks) if window_ranks else max(rank_of.values(), default=0) + 1
+            passages.append(
+                EvidencePassageData(
+                    passage_id=f"{section_id}#exp{seq:04d}",
+                    exact_text=exact_text,
+                    source_id=first.source_id,
+                    section_id=section_id,
+                    child_chunk_ids=tuple(run),
+                    char_start=min(starts),
+                    char_end=max(ends),
+                    text_sha256=_sha256_text(exact_text),
+                    source_sha256=first.source_sha256,
+                )
             )
+            passage_ranks.append(run_best)
+            seq += 1
+    # Highest-value (best fused order) passages first. Each run inherits
+    # the best fused position of its merged window, so neighbor-only runs
+    # (no direct winner) still order deterministically.
+    passages = [
+        passage
+        for passage, _ in sorted(
+            zip(passages, passage_ranks, strict=True),
+            key=lambda pair: (pair[1], pair[0].char_start, pair[0].passage_id),
         )
-    # Highest-value (best fused order) passages first.
-    passages.sort(
-        key=lambda item: min(rank_of[cid] for cid in item.child_chunk_ids if cid in rank_of)
-    )
+    ]
     return passages
 
 
