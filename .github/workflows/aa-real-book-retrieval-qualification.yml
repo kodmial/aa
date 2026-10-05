@@ -1,0 +1,399 @@
+name: AA real-book retrieval qualification
+
+# Dedicated least-privilege trusted workflow for the #130 real-book
+# retrieval qualification (issue #131). This is a validation run, not a
+# generic OpenCode implementation task: it never routes through the
+# ordinary issue-scheduler OpenCode implementation semantics.
+#
+# Trusted runtime contract:
+# - checks out the exact required main SHA (revalidated before + after);
+# - restores the canonical Russian corpus via the existing trusted
+#   restore path with AA_BOOK_AGE_IDENTITY (never printed);
+# - installs project/runtime dependencies for the production path;
+# - provisions/validates the pinned intfloat/multilingual-e5-base
+#   snapshot via the public model-cache/bootstrap mechanism;
+# - invokes the real mandatory planner through the production OpenCode
+#   structured-output adapter/profile (aa-planner-v2);
+# - builds/opens the production RAM-resident BM25 + E5/FAISS index;
+# - executes the frozen real-world benchmark input selected by #130;
+# - captures the exact #130 diagnostics per turn;
+# - encrypts any artifact holding source text before upload;
+# - publishes only a compact non-sensitive summary/manifest publicly.
+# Secrets/privacy: the identity is never echoed, plaintext book text is
+# never uploaded or logged, decrypted corpus/index artifacts never enter
+# the Actions cache, and logs carry IDs/checksums/counts/latencies only.
+# Deterministic exit status: PASS / FAIL / INCOMPLETE / STALE.
+
+on:
+  workflow_dispatch:
+    inputs:
+      exact_sha:
+        description: "Exact main SHA to qualify (defaults to current main HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: aa-real-book-retrieval-qualification
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      exact_sha: ${{ steps.resolve.outputs.exact_sha }}
+    steps:
+      - name: Resolve exact main SHA
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const requested = ((context.payload.inputs && context.payload.inputs.exact_sha) || '').trim();
+            if (requested && !/^[0-9a-f]{40}$/.test(requested)) {
+              core.setFailed('exact_sha must be an exact 40-hex main SHA');
+              return;
+            }
+            if (requested) {
+              core.setOutput('exact_sha', requested);
+              core.notice(`real-book qualification pinned to dispatch SHA ${requested}.`);
+              return;
+            }
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const head = (mainRef.object.sha || '').trim();
+            if (!/^[0-9a-f]{40}$/.test(head)) {
+              core.setFailed('current main HEAD is not a valid exact SHA');
+              return;
+            }
+            core.setOutput('exact_sha', head);
+            core.notice(`real-book qualification defaults to main HEAD ${head}.`);
+
+  qualify:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    env:
+      EXACT_SHA: ${{ needs.resolve.outputs.exact_sha }}
+      OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+      OPENCODE_FALLBACK_MODEL: ${{ vars.OPENCODE_FALLBACK_MODEL }}
+    steps:
+      - name: Check out exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.exact_sha }}
+          fetch-depth: 0
+
+      - name: Revalidate exact SHA before run
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXACT_SHA"
+          echo "$EXACT_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$(git rev-parse HEAD)" = "$EXACT_SHA"
+          echo "exact-main checkout verified: $(git rev-parse HEAD)"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project and runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Restore pip download cache (public wheels only)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: aa-public-pip-v1-${{ runner.os }}-${{ runner.arch }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            aa-public-pip-v1-${{ runner.os }}-${{ runner.arch }}-py3.12-
+
+      - name: Restore pinned E5 model cache (public weights only)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: aa-public-model-v1-${{ runner.os }}-${{ runner.arch }}-intfloat-multilingual-e5-base-d128750597153bb5987e10b1c3493a34e5a4502a-${{ hashFiles('corpus/embedding.lock.json') }}
+
+      - name: Validate secret presence fail-closed (never print identity)
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Secret presence is validated fail-closed; the value itself is
+          # never echoed, logged, or passed on any command line.
+          python3 - <<'PY'
+          import os
+          import sys
+          if not os.environ.get("AA_BOOK_AGE_IDENTITY", "").strip():
+              print("AA_BOOK_AGE_IDENTITY is not configured; refusing trusted run", file=sys.stderr)
+              raise SystemExit(2)
+          print("trusted secret is configured (value never printed)")
+          PY
+
+      - name: Provision and validate pinned E5 snapshot (public cache mechanism)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prefetch_public_assets.py --check-only
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "src")
+          from aa.corpus.public_cache import (
+              default_lock_path,
+              load_embedding_lock,
+              resolve_hf_cache_dir,
+              resolve_model_root,
+              verify_cached_model,
+          )
+          lock = load_embedding_lock(default_lock_path())
+          assert lock.get("model_id") == "intfloat/multilingual-e5-base", lock.get("model_id")
+          assert lock.get("revision") == "d128750597153bb5987e10b1c3493a34e5a4502a"
+          root = resolve_model_root(resolve_hf_cache_dir())
+          if not verify_cached_model(root, lock):
+              print("pinned E5 snapshot is not cached locally; downloading via public prefetch", flush=True)
+          PY
+          python3 scripts/prefetch_public_assets.py
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "src")
+          from aa.corpus.public_cache import (
+              default_lock_path,
+              load_embedding_lock,
+              resolve_hf_cache_dir,
+              resolve_model_root,
+              verify_cached_model,
+          )
+          lock = load_embedding_lock(default_lock_path())
+          root = resolve_model_root(resolve_hf_cache_dir())
+          if not verify_cached_model(root, lock):
+              print("pinned E5 snapshot unavailable; qualification yields INCOMPLETE, never PASS", flush=True)
+              raise SystemExit(2)
+          print("pinned E5 snapshot verified: intfloat/multilingual-e5-base@d1287505")
+          PY
+
+      - name: Restore canonical RU corpus (trusted restore path)
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_ALLOW_NETWORK_FETCH: "0"
+        run: |
+          set -euo pipefail
+          # Uses the existing trusted restore path only; the identity is
+          # consumed inside Python and never printed. Network fallback stays
+          # disabled so a missing snapshot fails closed to INCOMPLETE.
+          python3 scripts/restore_canonical.py --lang ru --no-network-fallback
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("corpus/canonical.ru.manifest.json").read_text(encoding="utf-8"))
+          expected = manifest["artifact_sha256"]
+          actual = hashlib.sha256(Path("corpus/generated/canonical.ru.json").read_bytes()).hexdigest()
+          assert actual == expected, "canonical RU checksum mismatch"
+          print(f"canonical RU verified: sha={actual[:16]} bytes={Path('corpus/generated/canonical.ru.json').stat().st_size}")
+          PY
+
+      - name: Build corpus structure for retrieval (no plaintext caching)
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_ALLOW_NETWORK_FETCH: "0"
+        run: |
+          set -euo pipefail
+          if [ ! -f corpus/generated/canonical.json ]; then
+            python3 scripts/restore_canonical.py --lang en --no-network-fallback
+          fi
+          python3 scripts/build_corpus_structure.py
+          # Decrypted corpus/index artifacts never enter the Actions cache:
+          # only pip wheels and public HF weights are cached above.
+
+      - name: Build and open production RAM-resident BM25 + E5/FAISS index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_retrieval_index.py --backend e5
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "src")
+          from pathlib import Path
+          from aa.retrieval.index import open_hybrid_index, close_hybrid_index
+          index = open_hybrid_index(
+              "corpus/generated/retrieval",
+              ru_manifest_path="corpus/canonical.ru.manifest.json",
+          )
+          try:
+              backend = index.metadata.get("embedding_backend")
+              assert backend == "intfloat-multilingual-e5-base/1", f"production E5 backend required, got {backend!r}"
+              print(f"production index open: chunks={index.chunk_count} backend={backend} ram_resident={index.ram_resident}")
+          finally:
+              close_hybrid_index(index)
+          PY
+
+      - name: Execute frozen benchmark via real planner + production retrieval
+        id: execute
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_EVAL_RECIPIENT: ${{ secrets.AA_EVAL_AGE_RECIPIENT }}
+          OPENCODE_BASE_URL: "http://127.0.0.1:4096"
+        run: |
+          set -euo pipefail
+          # The real mandatory planner runs through the same OpenCode
+          # structured-output adapter/profile used by production
+          # (aa-planner-v2 + json_schema). Missing E5/planner/provider
+          # prerequisites yield INCOMPLETE, never a fake PASS. Per-turn logs
+          # carry IDs/checksums/counts/latencies only, never literary text.
+          # Frozen real-world benchmark input selected by #130:
+          # qualification/ru_realworld_alcohol_help.v1_1.input.jsonl with the
+          # evaluation-only oracle at
+          # qualification/ru_realworld_alcohol_help.v1_1.oracle.jsonl (the
+          # oracle never reaches planner/generator inputs).
+          test -n "$AA_EVAL_RECIPIENT"
+          set +e
+          python3 scripts/run_real_book_retrieval_qualification.py \
+            --main-sha "$EXACT_SHA" \
+            --out-dir eval-real-book-out \
+            --recipient "$AA_EVAL_RECIPIENT"
+          status=$?
+          set -e
+          echo "qualification exit status: $status"
+          cat eval-real-book-out/result.json
+          if [ "$status" -eq 0 ]; then echo "result=PASS" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 1 ]; then echo "result=FAIL" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 2 ]; then echo "result=INCOMPLETE" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 3 ]; then echo "result=STALE" >> "$GITHUB_OUTPUT"; fi
+          if [ -z "${{ steps.execute.outputs.result }}" ]; then :; fi
+          # Never fail the job itself on FAIL/INCOMPLETE/STALE: the result is
+          # published deterministically as the marker below.
+          exit 0
+
+      - name: Revalidate exact SHA after run
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXACT_SHA"
+          echo "exact SHA still pinned after run: $(git rev-parse HEAD)"
+
+      - name: Guard encrypted-only upload (never plaintext book text)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age
+          test -f eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
+          test -f eval-real-book-out/real-book-retrieval-summary.json
+          test -f eval-real-book-out/result.json
+          # Plaintext corpus/index must never be staged for upload.
+          if ls eval-real-book-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null | grep -v -e summary -e result; then
+            echo "protected exact text outside the encrypted bundle" >&2
+            exit 1
+          fi
+          if grep -R "AA_BOOK_AGE_IDENTITY" eval-real-book-out/ 2>/dev/null; then
+            echo "secret material in outputs" >&2
+            exit 1
+          fi
+          echo "encrypted-only upload guard passed"
+
+      - name: Upload encrypted protected artifact (source text stays encrypted)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-real-book-retrieval-protected-encrypted
+          path: |
+            eval-real-book-out/real-book-retrieval-protected.tar.zst.age
+            eval-real-book-out/real-book-retrieval-protected.tar.zst.age.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload compact public summary (metrics only, no book text)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-real-book-retrieval-summary
+          path: |
+            eval-real-book-out/real-book-retrieval-summary.json
+            eval-real-book-out/result.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish idempotent #130 result marker (SHA + corpus + benchmark + retrieval)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const testedSha = '${{ needs.resolve.outputs.exact_sha }}';
+            const runId = `${context.runId}`;
+            let status = {};
+            try {
+              status = JSON.parse(fs.readFileSync('eval-real-book-out/result.json', 'utf8'));
+            } catch (error) {
+              core.setFailed(`result file unreadable: ${error.message}`);
+              return;
+            }
+            const result = status.result || 'INCOMPLETE';
+            if (!['PASS', 'FAIL', 'INCOMPLETE', 'STALE'].includes(result)) {
+              core.setFailed(`invalid deterministic result: ${result}`);
+              return;
+            }
+            // Revalidate main at publication: a moved main yields STALE.
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const currentMain = (mainRef.object.sha || '').trim();
+            let finalResult = result;
+            if (currentMain !== testedSha) finalResult = 'STALE';
+            const corpus = status.corpus_sha256 || '0'.repeat(64);
+            const benchmark = status.benchmark_sha256 || '0'.repeat(64);
+            const retrieval = status.retrieval_config_sha256 || '0'.repeat(64);
+            const markerRe = /aa-real-book-retrieval-result\s+issue=130\s+sha=([0-9a-f]{40})\s+corpus=([0-9a-f]{64})\s+benchmark=([0-9a-f]{64})\s+retrieval=([0-9a-f]{64})\s+result=(PASS|FAIL|INCOMPLETE|STALE)\s+run=(\S+?)\s*-->/;
+            let duplicate = false;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 130, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc = c.author_association || '';
+                const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+                if (!isTrusted) continue;
+                const m = (c.body || '').match(markerRe);
+                if (m && m[1] === testedSha && m[2] === corpus && m[3] === benchmark && m[4] === retrieval) {
+                  duplicate = true;
+                  break;
+                }
+              }
+              if (duplicate) break;
+            }
+            const marker = `<!-- aa-real-book-retrieval-result issue=130 sha=${testedSha} corpus=${corpus} benchmark=${benchmark} retrieval=${retrieval} result=${finalResult} run=${runId} -->`;
+            if (!duplicate) {
+              const body = finalResult === 'PASS'
+                ? `${marker}\n\nTrusted real-book retrieval qualification is PASS at the exact tested SHA (production planner + real RU corpus + BM25/E5 path). Protected per-case details are in the encrypted artifact; the public summary carries metrics only.`
+                : finalResult === 'FAIL'
+                  ? `${marker}\n\nTrusted real-book retrieval qualification is FAIL at the exact tested SHA (see the compact summary for branch-union/RRF/dedup/budget diagnostics). #130 stays open.`
+                  : finalResult === 'STALE'
+                    ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #130 stays open for the fresh exact SHA.`
+                    : `${marker}\n\nTrusted real-book retrieval qualification is INCOMPLETE (missing E5/planner/provider prerequisites or infrastructure fallout, never a fake PASS). #130 stays open.`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 130, body,
+              });
+            } else {
+              core.notice('identical SHA+corpus+benchmark+retrieval tuple already marked on #130; no duplicate posted.');
+            }
