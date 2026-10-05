@@ -880,7 +880,7 @@ async def test_timeouts_fall_back_without_user_content_leak() -> None:
         _TimeoutClient(),
         agent=PLANNER_AGENT_V2,
         primary_model="opencode/space-bunny-free",
-        fallback_model="opencode/space-bunny-free",
+        fallback_model="opencode/muse-spark-1.3-contributor-free",
     )
     reply = await model.ainvoke([HumanMessage(content="план")])
     assert str(reply.content) == "ok"
