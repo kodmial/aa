@@ -17,17 +17,25 @@ metadata (RRF/BM25/dense/rerank scores, embeddings, planner reasoning,
 search previews) stays in internal retrieval metadata and never enters
 the user-facing prompt. Logs carry only routes, counts and token
 lengths, never prompts or user text.
+
+Performance note: the pinned BGE path records ~20-22s warm latency per
+turn (per-turn RRF plus 64-candidate CPU rerank) against the 5s
+interactive budget, so production cutover stays blocked until explicit
+performance acceptance or optimization (see
+``aa.qualification.v2_retrieval.require_v2_cutover_acceptance``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
 from aa.retrieval.evidence import (
+    INTERACTIVE_LATENCY_BUDGET_MS,
     EvidencePack,
     RetrievalConfig,
     retrieve_evidence,
@@ -113,10 +121,22 @@ async def retrieval_node(
     """
     raw_queries = state.get("search_queries", [])
     queries = list(raw_queries) if isinstance(raw_queries, list) else []
+    started = time.perf_counter()
     pack = await asyncio.to_thread(
         retrieve_evidence, index, queries, config=config, reranker=reranker
     )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     hits, pack_dicts = pack_to_state(pack)
+    if over_budget:
+        logger.warning(
+            "v2 retrieval over interactive budget",
+            extra={
+                "queries": len(queries),
+                "latency_ms": round(elapsed_ms, 1),
+                "budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+            },
+        )
     logger.info(
         "v2 retrieval done",
         extra={
@@ -124,6 +144,8 @@ async def retrieval_node(
             "hits": len(hits),
             "passages": len(pack_dicts),
             "tokens": pack.total_tokens,
+            "latency_ms": round(elapsed_ms, 1),
+            "over_budget": over_budget,
         },
     )
     return {"retrieval_hits": hits, "evidence_pack": pack_dicts}

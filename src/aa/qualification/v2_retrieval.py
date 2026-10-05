@@ -46,9 +46,15 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from aa.qualification.aa_retrieval import GoldCase
-from aa.retrieval.evidence import EvidencePack, RetrievalConfig, retrieve_evidence
+from aa.retrieval.evidence import (
+    INTERACTIVE_LATENCY_BUDGET_MS,
+    EvidencePack,
+    RetrievalConfig,
+    retrieve_evidence,
+)
 from aa.retrieval.index import HybridIndex
 from aa.retrieval.normalize import ru_tokens
 from aa.retrieval.reranker import CrossEncoderReranker
@@ -57,12 +63,26 @@ V2_BENCHMARK_VERSION = "aa-v2-retrieval-benchmark/1"
 V2_EVAL_SET_VERSION = "aa-v2-conversational-eval/1"
 
 # Interactive Telegram budget for one warm retrieval turn (RRF plus
-# 64-candidate CPU BGE reranking). The frozen BGE validation records
-# ~20-22s p50/p95 per case, far above interactive expectations: cutover
-# requires explicit performance acceptance or optimization (smaller
-# reranker pool, quantized/GPU serving, or a documented higher budget)
-# before this gate can pass.
-V2_TARGET_P95_LATENCY_BUDGET_MS = 5000.0
+# 64-candidate CPU BGE reranking). Single-sourced from the hot-path
+# evidence pipeline so the gate and per-turn metadata share one value.
+# The frozen BGE validation records ~20-22s p50/p95 per case, far above
+# interactive expectations: cutover requires explicit performance
+# acceptance or optimization (smaller reranker pool, quantized/GPU
+# serving, or a documented higher budget) before this gate can pass.
+V2_TARGET_P95_LATENCY_BUDGET_MS = INTERACTIVE_LATENCY_BUDGET_MS
+
+# Production cutover is explicitly out of scope for #116. The committed
+# BGE validation fails the latency gate (warm p95 ~22s vs the 5s
+# interactive budget from per-turn RRF plus 64-candidate CPU BGE
+# rerank), so the v2 pipeline must stay behind the legacy production
+# path until explicit performance acceptance or optimization lands.
+V2_PRODUCTION_CONFIG_VERSION = "v2-blocked-latency/1"
+V2_CUTOVER_BLOCKED_REASON = (
+    "v2 retrieval warm p95 ~21-22s exceeds the 5s interactive budget "
+    "(per-turn RRF plus 64-candidate CPU BGE rerank); production "
+    "cutover is blocked until explicit performance acceptance or "
+    "optimization lands"
+)
 
 PROXY_QUERY_COUNT = 12
 BROAD_CATEGORIES = (
@@ -530,6 +550,50 @@ def v2_quality_gate(summary: V2Summary) -> tuple[bool, list[str]]:
     return (not failures, failures)
 
 
+def v2_production_status(summary: V2Summary) -> dict[str, Any]:
+    """Return the machine-readable v2 production promotion status.
+
+    Mirrors the ``production_promotion_blocked`` pattern from the
+    qualified retrieval artifact: any quality-gate failure (currently
+    the warm-p95 interactive-latency breach) keeps the v2 pipeline
+    blocked behind the legacy production path. Cutover also stays
+    blocked when the gate passes because #116 explicitly leaves cutover
+    out of scope; a later cutover task must re-evaluate the gate with
+    explicit performance acceptance or optimization.
+    """
+    passed, failures = v2_quality_gate(summary)
+    blocked = True
+    config_id = "blocked"
+    reason = V2_CUTOVER_BLOCKED_REASON
+    if passed:
+        reason = (
+            "v2 quality gate passed but production cutover remains out of "
+            "scope for #116; a later cutover task must re-evaluate with "
+            "explicit performance acceptance"
+        )
+    return {
+        "config_id": config_id,
+        "config_version": V2_PRODUCTION_CONFIG_VERSION,
+        "cutover_allowed": not blocked,
+        "production_promotion_blocked": blocked,
+        "quality_gate_passed": passed,
+        "quality_gate_failures": list(failures),
+        "reason": reason,
+    }
+
+
+def require_v2_cutover_acceptance(*, performance_accepted: bool) -> None:
+    """Fail closed unless explicit v2 performance acceptance is recorded.
+
+    The frozen BGE validation exceeds the interactive budget by ~4x, so
+    any production-cutover caller must pass ``performance_accepted=True``
+    after documenting acceptance or landing an optimization. The default
+    (``False``) raises instead of silently promoting the slow path.
+    """
+    if not performance_accepted:
+        raise ValueError(V2_CUTOVER_BLOCKED_REASON)
+
+
 def find_repo_root() -> Path:
     """Return the repository root containing qualification + corpus."""
     here = Path(__file__).resolve()
@@ -543,7 +607,9 @@ __all__ = [
     "BROAD_CATEGORIES",
     "PROXY_QUERY_COUNT",
     "V2_BENCHMARK_VERSION",
+    "V2_CUTOVER_BLOCKED_REASON",
     "V2_EVAL_SET_VERSION",
+    "V2_PRODUCTION_CONFIG_VERSION",
     "V2_TARGET_P95_LATENCY_BUDGET_MS",
     "V2CaseResult",
     "V2Summary",
@@ -551,7 +617,9 @@ __all__ = [
     "find_repo_root",
     "planner_proxy_queries",
     "query_diversity",
+    "require_v2_cutover_acceptance",
     "run_v2_case",
     "summarize_v2",
+    "v2_production_status",
     "v2_quality_gate",
 ]

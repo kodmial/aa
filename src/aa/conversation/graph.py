@@ -186,7 +186,10 @@ def build_turn_graph(
     Evidence Pack selection) instead of the ``retrieval_stub`` no-op.
     ``reranker`` (one long-lived worker instance) and
     ``retrieval_config`` are forwarded when provided. The legacy
-    production path stays untouched until the later cutover task.
+    production path stays untouched until the later cutover task:
+    the v2 BGE path exceeds the 5s interactive budget (~20-22s warm
+    p50/p95) so production cutover stays blocked pending explicit
+    performance acceptance or optimization.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model

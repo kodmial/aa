@@ -76,6 +76,12 @@ RERANKER_POOL_CAP = 64
 POST_RERANK_CHILD_CAP = 16
 MAX_PER_SECTION = 4
 NEIGHBOR_WINDOW = 1
+# Interactive Telegram budget for one warm retrieval turn (mirrors the
+# frozen v2 qualification gate). The qualified BGE validation records
+# ~20-22s p50/p95 with per-turn RRF plus 64-candidate CPU BGE rerank,
+# far above this budget: production cutover stays blocked until explicit
+# performance acceptance or optimization lands.
+INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
 
 
 class EvidenceError(ValueError):
@@ -658,6 +664,8 @@ def retrieve_evidence(
         "budget_tokens": active.budget_tokens,
         "total_tokens": total,
         "latency_ms": elapsed_ms,
+        "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+        "latency_over_budget": elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS,
     }
     logger.info(
         "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d",
@@ -717,6 +725,7 @@ def render_book_evidence(pack: EvidencePack) -> str:
 
 __all__ = [
     "BRANCH_TOP_K",
+    "INTERACTIVE_LATENCY_BUDGET_MS",
     "MAX_PER_SECTION",
     "MAX_PLANNER_QUERIES",
     "MIN_PLANNER_QUERIES",
