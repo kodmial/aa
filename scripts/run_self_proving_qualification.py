@@ -1138,6 +1138,9 @@ def _gate_c_live_evidence(
         main_sha = payload.get("main_sha", payload.get("sha"))
         if str(main_sha or "") != expected_sha:
             continue
+        payload_run = str(payload.get("run_id", payload.get("run", "")) or "")
+        if payload_run != run_id:
+            continue
         # Telemetry-shaped evidence: evaluate scenario families + diversity.
         raw_turns = payload.get("turns")
         if isinstance(raw_turns, list) and raw_turns:
@@ -1450,7 +1453,7 @@ def _gate_d_marker_verdict(
             continue
         if marker.sha != expected_sha or marker.run_id != run_id:
             continue
-        if marker.phase in ("READY", "STOPPED"):
+        if marker.phase == "STOPPED":
             return GateEvidence(
                 gate="D",
                 status="PASS",
@@ -1460,6 +1463,18 @@ def _gate_d_marker_verdict(
                 component="telegram-readiness",
                 run_id=run_id,
                 live_trusted=True,
+            )
+        if marker.phase == "READY":
+            return GateEvidence(
+                gate="D",
+                status="BLOCKED",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category="telegram-readiness-unproven",
+                component="telegram-readiness",
+                run_id=run_id,
+                detail="runtime-ready-requires-clean-stop",
             )
         if marker.phase == "FAILED":
             return GateEvidence(

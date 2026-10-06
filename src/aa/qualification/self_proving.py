@@ -609,7 +609,7 @@ def diversity_passes(reply_signatures: list[str]) -> tuple[bool, str]:
     if len(cleaned) < 2:
         return False, "diversity needs at least two unrelated family replies"
     distinct = set(cleaned)
-    if len(distinct) <= 1:
+    if len(distinct) < len(cleaned):
         return False, "unrelated inputs collapsed to one generic fallback"
     return True, f"{len(distinct)}/{len(cleaned)} distinct replies"
 
