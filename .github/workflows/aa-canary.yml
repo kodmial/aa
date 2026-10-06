@@ -131,41 +131,34 @@ jobs:
           # synthetic Updates at the production adapter boundary), consumed
           # by the self-proving Gate C live mapping below. Missing
           # secrets/assets fail closed (no mocked PASS).
+          set +e
           python scripts/run_product_contract_live_qualification.py \
             --main-sha "$sha" --out-dir live-out \
             --run-id "${{ github.run_id }}-canary"
-          python scripts/run_self_proving_qualification.py \
-            --main-sha "$sha" --out-dir canary-self-proving-out \
-            --run-id "${{ github.run_id }}-canary"
-          python - <<'PY'
-          import json, sys
-          from pathlib import Path
-          summary = Path("canary-self-proving-out/self-proving-summary.json")
-          if not summary.is_file():
-              print("canary Gate C smoke BLOCKED: no summary", file=sys.stderr)
-              sys.exit(2)
-          payload = json.loads(summary.read_text(encoding="utf-8"))
-          gates = {g["gate"]: g["status"] for g in payload.get("gates", [])}
-          print(f"canary gates: {gates}")
-          # Fail-closed Gate C smoke + diversity requirement: the canary
-          # passes only when the live Gate C production path (scenario
-          # families + diversity) holds PASS for current main. A live Gate
-          # C BLOCKED/FAIL fails the canary even when deterministic Gates
-          # A/B PASS. Missing secrets stay BLOCKED (no mocked PASS) so
-          # automatic P0 repair marks current main UNQUALIFIED. The canary
-          # never blocks owner /run; manual testing stays available labeled
-          # UNQUALIFIED.
-          if payload.get("status") != "PASS":
-              print(
-                  f"canary Gate C smoke FAILED: verdict={payload.get('status')} "
-                  f"blocking={payload.get('blocking_gate')}",
-                  file=sys.stderr,
-              )
-              sys.exit(1 if payload.get("status") == "FAIL" else 2)
-          for required in ("A", "B", "C"):
-              if gates.get(required) != "PASS":
-                  print(f"canary Gate C smoke FAILED: Gate {required}={gates.get(required)}", file=sys.stderr)
-                  sys.exit(1 if gates.get(required) == "FAIL" else 2)
+          product_rc=$?
+          set -e
+          if [[ "$product_rc" -eq 75 ]]; then
+            echo "::error::Canary Gate C provider 429; leave UNQUALIFIED and retry ownerlessly."
+            exit 75
+          fi
+          CANARY_SHA="$sha" CANARY_RUN="${{ github.run_id }}-canary" python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          sys.path.insert(0, "src")
+          import scripts.run_self_proving_qualification as runner
+
+          sha = os.environ["CANARY_SHA"]
+          run_id = os.environ["CANARY_RUN"]
+          evidence, _, _ = runner._gate_c(
+              sha,
+              run_id,
+              runner._product_fingerprint(),
+              runner._runtime_fingerprint(),
+          )
+          print(f"canary Gate C {evidence.status}: {evidence.failure_category or evidence.component}")
+          if evidence.status != "PASS" or not evidence.live_trusted or evidence.mocked_only:
+              raise SystemExit(1 if evidence.status == "FAIL" else 2)
           PY
 
       - name: Gate D readiness - Telegram getMe and runtime marker
@@ -308,6 +301,8 @@ jobs:
 
           asyncio.run(_probe())
           PY
+          mkdir -p self-proving-out
+          cp canary-runtime-status.json self-proving-out/runtime-status.json
 
       - name: Gate E latency guard - p50/p95 and heartbeat
         shell: bash
@@ -315,11 +310,16 @@ jobs:
           set -euo pipefail
           # Gate E for the canary: end-to-end and per-stage latency p50/p95
           # from Gate C smoke; hard guard fails on any ordinary turn >= 30s;
-          # typing heartbeat continuity verified independently.
+          # typing heartbeat continuity verified independently. Gate D has
+          # now produced its trusted marker, so a complete A-E evaluation is valid.
+          sha="$(git rev-parse HEAD)"
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "$sha" --out-dir self-proving-out \
+            --run-id "${{ github.run_id }}-canary"
           python - <<'PY'
           import json, sys
           from pathlib import Path
-          path = Path("canary-self-proving-out/self-proving-summary.json")
+          path = Path("self-proving-out/self-proving-summary.json")
           if not path.is_file():
               print("canary Gate E BLOCKED: no latency evidence", file=sys.stderr)
               sys.exit(2)
@@ -364,25 +364,31 @@ jobs:
               print("canary Gate E BLOCKED: no live transport evidence for heartbeat", file=sys.stderr)
               sys.exit(2)
           live = json.loads(live_path.read_text(encoding="utf-8"))
-          transport_lane = next(
-              (lane for lane in live.get("lanes", []) if lane.get("lane") == "telegram-transport-25-32"),
+          live_lane = next(
+              (lane for lane in live.get("lanes", []) if lane.get("lane") == "live-telegram-evidence"),
               None,
           )
-          if transport_lane is None:
-              print("canary Gate E BLOCKED: missing live transport lane", file=sys.stderr)
+          if live_lane is None:
+              print("canary Gate E BLOCKED: missing live production lane", file=sys.stderr)
               sys.exit(2)
           try:
-              heartbeat_sends = int((transport_lane.get("metrics", {}) or {}).get("heartbeat_sends", 0))
+              metrics = live_lane.get("metrics", {}) or {}
+              heartbeat_sends = int(metrics.get("typing_heartbeat_sends", 0))
+              heartbeat_failures = int(metrics.get("heartbeat_continuity_failures", 0))
           except (TypeError, ValueError):
               print("canary Gate E BLOCKED: heartbeat evidence is not numeric", file=sys.stderr)
               sys.exit(2)
-          if heartbeat_sends < 1:
+          if heartbeat_sends < 1 or heartbeat_failures != 0:
               print(
-                  f"canary Gate E BLOCKED: heartbeat never fired (sends={heartbeat_sends})",
+                  "canary Gate E BLOCKED: heartbeat continuity failed "
+                  f"(sends={heartbeat_sends}, failures={heartbeat_failures})",
                   file=sys.stderr,
               )
               sys.exit(2)
-          print(f"canary Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms heartbeat_sends={heartbeat_sends}")
+          print(
+              f"canary Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms "
+              f"max={max_turn:.0f}ms heartbeat_sends={heartbeat_sends}"
+          )
           PY
 
       - name: Record canary summary
