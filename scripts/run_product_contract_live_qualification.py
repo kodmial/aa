@@ -103,6 +103,16 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     except ProductContractLiveError as exc:
         return _fail_incomplete(out_dir, reason=str(exc), main_sha=expected_sha)
+    except Exception as exc:
+        # Fail-closed machine-readable INCOMPLETE (issue #150): an unhandled
+        # harness/import failure (for example a missing third-party module on
+        # a minimal runner) must still emit result.json instead of crashing
+        # with no evidence. Only the exception type travels outward.
+        return _fail_incomplete(
+            out_dir,
+            reason=f"live-harness-error:{type(exc).__name__}",
+            main_sha=expected_sha,
+        )
 
     (out_dir / "product-contract-live-summary.json").write_text(
         json.dumps(summary.to_dict(), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
