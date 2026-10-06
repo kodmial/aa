@@ -319,98 +319,44 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
     except Exception as exc:
         return _fail_b(expected_sha, run_id, product, runtime, "corpus-restore", type(exc).__name__)
 
-    # -- real BM25 + dense index build and full retrieval pipeline --
+    # -- canonical RU BM25 + pinned E5/FAISS production index proof --
+    # Gate B must validate the same generated retrieval substrate the runtime
+    # consumes. Synthetic chunks or the hermetic hashing backend are not
+    # acceptable evidence for Product Contract qualification.
     try:
-        import hashlib
-        import tempfile
-
-        from aa.retrieval.dense import (
-            HASHING_BACKEND_NAME,
-            HASHING_DIM,
-            ExactIPIndex,
-            hashing_embed,
+        from aa.retrieval.dense import E5_BACKEND_NAME
+        from aa.retrieval.index import (
+            close_hybrid_index,
+            open_hybrid_index,
+            search_aspect,
         )
-        from aa.retrieval.evidence import (
-            dedup_and_diversify,
-            expand_small_to_big,
-            fuse_query_pool,
-            retrieve_evidence,
-            run_branch_searches,
-            select_top_candidates,
+
+        retrieval_dir = ROOT / "corpus" / "generated" / "retrieval"
+        required = (
+            ROOT / "corpus" / "generated" / "canonical.ru.json",
+            ROOT / "corpus" / "generated" / "corpus_structure.json",
+            retrieval_dir / "index.json",
+            retrieval_dir / "dense.json",
+            retrieval_dir / "lexical.db",
         )
-        from aa.retrieval.index import ChunkRecord, HybridIndex
-        from aa.retrieval.lexical import build_lexical_db, load_lexical_into_memory
-
-        topics = ["алкоголизм тяга трезвость", "семья отношения поддержка"]
-        sections = ["ru-test/sec-a", "ru-test/sec-b"]
-        chunk_ids: list[str] = []
-        chunk_texts: list[str] = []
-        records: dict[str, ChunkRecord] = {}
-        for sec_idx, section in enumerate(sections):
-            for para in range(3):
-                cid = f"ru-test:{sec_idx}:{para}"
-                text = (
-                    f"Канонический русский абзац {para} раздела {section} "
-                    f"про {topics[sec_idx]} выздоровление программа шаги. "
-                    f"Уникальный маркер параграфа p{sec_idx}{para}."
-                )
-                chunk_ids.append(cid)
-                chunk_texts.append(text)
-                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                records[cid] = ChunkRecord(
-                    chunk_id=cid,
-                    logical_chunk_id=cid,
-                    section=section,
-                    book="ru-test-book",
-                    parent=f"parent-{sec_idx}-{para // 2}",
-                    prev=chunk_ids[-2] if len(chunk_ids) > 1 else None,
-                    next=None,
-                    source_id="ru-fourth-edition-txt",
-                    source_file="corpus/source/raw-ru/aa-big-book.txt",
-                    source_sha256=hashlib.sha256(b"ru-source").hexdigest(),
-                    char_start=para * 100,
-                    char_end=para * 100 + len(text),
-                    text_sha256=digest,
-                    text=text,
-                    corpus_version="ru-test-v1",
-                )
-        # Link next pointers for small-to-big neighbor traversal.
-        for pos, cid in enumerate(chunk_ids):
-            rec = records[cid]
-            nxt = chunk_ids[pos + 1] if pos + 1 < len(chunk_ids) else None
-            if rec.next != nxt:
-                records[cid] = ChunkRecord(
-                    **{**rec.__dict__, "next": nxt},
-                )
-        import shutil as _shutil
-
-        tmp = tempfile.mkdtemp(prefix="aa-gate-b-lexical-")
-        try:
-            db_path = Path(tmp) / "lexical.db"
-            build_lexical_db(
-                db_path,
-                chunk_ids=chunk_ids,
-                sections=[records[c].section for c in chunk_ids],
-                texts=chunk_texts,
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            return _fail_b(
+                expected_sha,
+                run_id,
+                product,
+                runtime,
+                "corpus-restore",
+                "missing production artifacts: " + ",".join(missing),
             )
-            lexical_conn = load_lexical_into_memory(db_path)
-        except Exception:
-            _shutil.rmtree(tmp, ignore_errors=True)
-            raise
+
+        index = open_hybrid_index(
+            retrieval_dir,
+            ru_manifest_path=ROOT / "corpus" / "canonical.ru.manifest.json",
+            en_manifest_path=ROOT / "corpus" / "canonical.manifest.json",
+            lock_path=ROOT / "corpus" / "embedding.lock.json",
+        )
         try:
-            vectors = [hashing_embed(text, dim=HASHING_DIM) for text in chunk_texts]
-            dense = ExactIPIndex.build(chunk_ids, vectors, backend=HASHING_BACKEND_NAME)
-            index = HybridIndex(
-                directory=Path(tmp),
-                metadata={
-                    "embedding_backend": HASHING_BACKEND_NAME,
-                    "embedding_dim": HASHING_DIM,
-                },
-                chunks=records,
-                dense=dense,
-                lexical_conn=lexical_conn,
-                ram_resident=True,
-            )
             if not index.ram_resident or index.lexical_conn is None:
                 return _fail_b(
                     expected_sha,
@@ -418,154 +364,92 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                     product,
                     runtime,
                     "bm25-index",
-                    "index not RAM-resident",
+                    "production lexical index is not RAM-resident",
                 )
-            if index.dense.dim != HASHING_DIM or len(index.chunks) < 4:
+            if index.metadata.get("embedding_backend") != E5_BACKEND_NAME:
                 return _fail_b(
                     expected_sha,
                     run_id,
                     product,
                     runtime,
                     "e5-faiss-index",
-                    "dense substrate shape invalid",
+                    "production index is not pinned E5",
                 )
-            queries = [f"тяга к алкоголю вариант {i}" for i in range(12)]
-            ranked_lists, per_query_ids = run_branch_searches(index, queries)
-            # Every planner query must run both branches (lexical + dense).
-            if len(ranked_lists) != 2 * len(queries):
+            if not getattr(index.dense, "use_faiss", False):
+                return _fail_b(
+                    expected_sha,
+                    run_id,
+                    product,
+                    runtime,
+                    "e5-faiss-index",
+                    "production dense index is not FAISS IndexFlatIP",
+                )
+            if index.metadata.get("embedding_model_id") != "intfloat/multilingual-e5-base":
+                return _fail_b(
+                    expected_sha,
+                    run_id,
+                    product,
+                    runtime,
+                    "e5-faiss-index",
+                    "production embedding model identity mismatch",
+                )
+            queries = [
+                "как оставаться трезвым сегодня",
+                "что книга говорит о тяге к алкоголю",
+                "как признать бессилие перед алкоголем",
+                "отношения с семьёй и выздоровление",
+                "что делать после срыва",
+                "страх и честность в выздоровлении",
+                "помощь другим алкоголикам",
+                "духовные принципы без религиозного давления",
+                "обиды и инвентаризация",
+                "ежедневная практика трезвости",
+                "как просить о помощи",
+                "надежда на изменение жизни",
+            ]
+            hits = search_aspect(index, queries)
+            if not hits:
                 return _fail_b(
                     expected_sha,
                     run_id,
                     product,
                     runtime,
                     "retrieval-rrf",
-                    "branch coverage incomplete",
+                    "production BM25+E5/FAISS search returned no fused hits",
                 )
-            if any(not ids for ids in per_query_ids):
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-rrf",
-                    "query produced no candidates",
-                )
-            fused, pool_ids = fuse_query_pool(
-                ranked_lists,
-                per_query_ids,
-                rrf_k=config.rrf_k,
-                pool_cap=config.pool_cap,
-            )
-            if not fused or not pool_ids:
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-rrf",
-                    "RRF fusion yielded empty pool",
-                )
-            # Per-query retention: every distinct per-query best must be
-            # retained (small fixtures may have fewer chunks than queries).
-            distinct_bests: set[str] = set()
-            for contributed in per_query_ids:
-                for chunk_id in contributed:
-                    if chunk_id in fused and chunk_id not in distinct_bests:
-                        distinct_bests.add(chunk_id)
-                        break
-            if not distinct_bests or any(best not in set(pool_ids) for best in distinct_bests):
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-rrf",
-                    "per-query retention violated",
-                )
-            diverse = dedup_and_diversify(
-                index,
-                pool_ids,
-                fused,
-                pool_cap=config.pool_cap,
-                max_per_section=config.max_per_section,
-            )
-            if not diverse:
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-dedup",
-                    "dedup emptied the pool",
-                )
-            from collections import Counter as _Counter
-
-            section_of = {cid: records[cid].section for cid in records}
-            counts = _Counter(section_of[c.chunk_id] for c in diverse)
-            if any(n > config.max_per_section for n in counts.values()):
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-diversity",
-                    "section cap violated",
-                )
-            winners = select_top_candidates(
-                diverse, top_cap=config.top_child_cap, sections=section_of
-            )
-            if not winners:
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "retrieval-diversity",
-                    "no winners selected",
-                )
-            expanded = expand_small_to_big(index, winners, neighbor_window=config.neighbor_window)
-            if not expanded:
+            if any(
+                not hit.source_id
+                or not hit.text_sha256
+                or not hit.section
+                or not hit.logical_chunk_id
+                for hit in hits
+            ):
                 return _fail_b(
                     expected_sha,
                     run_id,
                     product,
                     runtime,
                     "small-to-big",
-                    "expansion yielded no passages",
-                )
-            for passage in expanded:
-                joined = "".join(records[c].text for c in passage.child_chunk_ids)
-                if hashlib.sha256(joined.encode("utf-8")).hexdigest() != passage.text_sha256:
-                    return _fail_b(
-                        expected_sha,
-                        run_id,
-                        product,
-                        runtime,
-                        "small-to-big",
-                        "expansion checksum mismatch",
-                    )
-            pack = retrieve_evidence(index, queries, config=config)
-            if not pack.passages or pack.total_tokens <= 0:
-                return _fail_b(
-                    expected_sha,
-                    run_id,
-                    product,
-                    runtime,
-                    "small-to-big",
-                    "end-to-end pack empty",
+                    "production retrieval hit lacks canonical provenance",
                 )
         finally:
-            try:
-                lexical_conn.close()
-            except Exception:
-                pass
-            _shutil.rmtree(tmp, ignore_errors=True)
+            close_hybrid_index(index)
     except Exception as exc:
         label = type(exc).__name__
-        component = "bm25-index" if "Lexical" in label else "e5-faiss-index"
-        if isinstance(exc, ValueError) and "pool" in str(exc).lower():
-            component = "retrieval-rrf"
-        return _fail_b(expected_sha, run_id, product, runtime, component, f"{label}: {exc}"[:96])
+        component = "e5-faiss-index"
+        message = str(exc).lower()
+        if "lexical" in message or "sqlite" in message or "fts" in message:
+            component = "bm25-index"
+        elif "stale" in message or "manifest" in message or "canonical" in message:
+            component = "corpus-restore"
+        return _fail_b(
+            expected_sha,
+            run_id,
+            product,
+            runtime,
+            component,
+            f"{label}: {exc}"[:96],
+        )
 
     # -- grounding / verifier (deterministic, no model calls) --
     try:
