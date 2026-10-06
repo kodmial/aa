@@ -764,6 +764,15 @@ class PollingTelegramTransport(TelegramTransport):
                         break
                     continue
                 self._consecutive_poll_failures = 0
+                if not batch:
+                    # Yield when long-poll returns immediately with no
+                    # updates (tests use timeout 0 with an instant mock).
+                    # Without this, a mock ``getUpdates`` that never blocks
+                    # would busy-spin without yielding and starve ordinary
+                    # turns/heartbeats sharing the same event loop.
+                    # Production long-poll blocks server-side, so this is a
+                    # no-op there.
+                    await asyncio.sleep(0)
                 for raw in batch:
                     if self._stop_event.is_set():
                         break
