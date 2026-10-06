@@ -1182,3 +1182,104 @@ def test_natural_clarification_fits_envelope_without_leak() -> None:
     assert contains_cyrillic(NATURAL_CLARIFICATION_REPLY)
     assert not leaks_internal_terms(NATURAL_CLARIFICATION_REPLY)
     assert envelope_passes(NATURAL_CLARIFICATION_REPLY)
+
+
+async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
+    """Gate C repair (run 37530425848): weak fallback flaky structured output.
+
+    A first verifier verdict with wrong unit ids (VerifierValidationError)
+    gets exactly one bounded retry; a valid second verdict grounds the turn
+    instead of collapsing to generic clarification.
+    """
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    class _FlakyVerifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "units": [
+                        {
+                            "unit_id": "wrong-id",
+                            "scope": "book",
+                            "supported": True,
+                            "evidence_passage_ids": ["chapter-3#exp0000"],
+                        }
+                    ],
+                    "all_required_supported": True,
+                }
+            return _support_result(["u1"])
+
+    draft = "Поддержка рядом помогает спокойно."
+    verifier = _FlakyVerifier()
+    units, result, passed = await _verify_draft(draft, [_pack_entry()], verifier_model=verifier)
+    assert passed is True
+    assert result is not None
+    assert result.all_required_supported is True
+    assert verifier.calls == 2
+    assert [unit.unit_id for unit in units] == ["u1"]
+
+
+async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
+    """Two consecutive invalid verdicts fail closed with exactly two calls."""
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    class _AlwaysInvalid:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            return {
+                "units": [
+                    {
+                        "unit_id": "wrong-id",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": ["chapter-3#exp0000"],
+                    }
+                ],
+                "all_required_supported": True,
+            }
+
+    verifier = _AlwaysInvalid()
+    units, result, passed = await _verify_draft(
+        "Поддержка рядом помогает спокойно.", [_pack_entry()], verifier_model=verifier
+    )
+    assert passed is False
+    assert result is None
+    assert verifier.calls == 2
+    assert len(units) == 1
+
+
+async def test_verifier_provider_error_does_not_retry() -> None:
+    """Provider/transient failures after fallback never retry here (latency)."""
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    class _DownVerifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            raise TimeoutError("verifier down")
+
+    verifier = _DownVerifier()
+    _, result, passed = await _verify_draft(
+        "Поддержка рядом помогает спокойно.", [_pack_entry()], verifier_model=verifier
+    )
+    assert passed is False
+    assert result is None
+    assert verifier.calls == 1
