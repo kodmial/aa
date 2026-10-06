@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
-
 from aa.qualification.product_contract_live import (  # noqa: E402
     EXIT_BY_STATUS,
     ProductContractLiveError,
