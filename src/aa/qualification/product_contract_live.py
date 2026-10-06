@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from aa.opencode.errors import OpenCodeRateLimitError
+
 RESULT_ISSUE = 7
 CAPABILITY_ISSUE = 6
 SCHEMA_VERSION = "aa-product-contract-live-qualification/1"
@@ -675,7 +677,7 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
         failed.append("25b-heartbeat-cancel-clean")
 
     metrics = {
-        "scenarios_executed": 8,
+        "scenarios_executed": len(scenarios) if "scenarios" in locals() else 0,
         "heartbeat_sends": heartbeat_sends,
         "concurrency_peak_chats": concurrency_peak,
         "real_telegram_token_configured": bool(
@@ -1221,7 +1223,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     latencies: list[float] = []
     collapsed_count = 0
     typing_sends = 0
+    heartbeat_continuity_failures = 0
     stage_snapshots: list[dict[str, Any]] = []
+    served_models_by_agent: dict[str, list[str]] = {}
 
     def _check(name: str, ok: bool) -> None:
         (passed if ok else failed).append(name)
@@ -1260,7 +1264,15 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             contains_cyrillic,
             leaks_internal_terms,
         )
+        from aa.conversation.model_adapter import (
+            ANSWER_AGENT_V2,
+            PLANNER_AGENT_V2,
+            SUMMARIZER_AGENT_V2,
+            VERIFIER_AGENT_V2,
+            OpenCodeChatModel,
+        )
         from aa.telegram.transport import PollingTelegramTransport, TelegramApi
+        from langchain_core.messages import HumanMessage
 
         class _QualificationTelegramApi(TelegramApi):
             """Deterministic Telegram network seam; production transport stays real."""
@@ -1348,6 +1360,19 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             _check(
                 "live-real-retrieval-index-loaded",
                 app.graph_runtime is not None and app.graph_runtime.running,
+            )
+
+            # Short ordinary turns intentionally skip memory compaction, so
+            # explicitly exercise the production summarizer agent once. The
+            # same real OpenCode client enforces the served provider/model.
+            summarizer_probe = OpenCodeChatModel(
+                app.opencode_runtime.client,
+                agent=SUMMARIZER_AGENT_V2,
+                primary_model=settings.opencode_model,
+                fallback_model=settings.opencode_fallback_model,
+            )
+            await summarizer_probe.ainvoke(
+                [HumanMessage(content="Кратко суммируй нейтральную тестовую фразу.")]
             )
 
             # Frozen core plus held-out differently worded variants. Repair
@@ -1488,11 +1513,17 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     and envelope_passes(reply),
                 )
                 if family in ordinary_families:
-                    _check(
-                        f"live-typing-heartbeat-{family}",
-                        api.chat_actions > before_typing,
+                    heartbeat_delta = max(0, api.chat_actions - before_typing)
+                    typing_sends += heartbeat_delta
+                    interval = float(settings.typing_heartbeat_seconds)
+                    minimum_heartbeats = max(
+                        1,
+                        int(max(0.0, elapsed - interval) / interval),
                     )
-                    typing_sends += max(0, api.chat_actions - before_typing)
+                    heartbeat_ok = heartbeat_delta >= minimum_heartbeats
+                    _check(f"live-typing-heartbeat-{family}", heartbeat_ok)
+                    if not heartbeat_ok:
+                        heartbeat_continuity_failures += 1
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
@@ -1510,12 +1541,47 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
             _check("live-answer-diversity", len(set(replies)) >= 8)
             _check(
-                "live-typing-heartbeat-observed",
-                typing_sends >= len(ordinary_families),
+                "live-typing-heartbeat-continuous",
+                typing_sends >= len(ordinary_families)
+                and heartbeat_continuity_failures == 0,
             )
             _check(
                 "live-delivery-sendmessage-observed",
                 len(api.sent_texts) == len(scenarios),
+            )
+
+            audit = getattr(app.opencode_runtime.client, "served_model_audit", ())
+            allowed_models = {
+                settings.opencode_model,
+                settings.opencode_fallback_model,
+            }
+            allowed_models.discard("")
+            for item in audit:
+                if not isinstance(item, dict):
+                    continue
+                agent = str(item.get("agent", ""))
+                served = str(item.get("served", ""))
+                requested = str(item.get("requested", ""))
+                if agent and served:
+                    served_models_by_agent.setdefault(agent, [])
+                    if served not in served_models_by_agent[agent]:
+                        served_models_by_agent[agent].append(served)
+                if requested != served or served not in allowed_models:
+                    failed.append("live-served-model-policy-mismatch")
+            required_agents = {
+                PLANNER_AGENT_V2,
+                SUMMARIZER_AGENT_V2,
+                ANSWER_AGENT_V2,
+                VERIFIER_AGENT_V2,
+            }
+            _check(
+                "live-actual-served-model-identity",
+                required_agents.issubset(served_models_by_agent)
+                and all(
+                    model in allowed_models
+                    for models in served_models_by_agent.values()
+                    for model in models
+                ),
             )
             _check(
                 "live-planner-retrieval-answer-verifier-telemetry",
@@ -1589,6 +1655,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 voice_elapsed = 0.0
         finally:
             await app.stop()
+    except OpenCodeRateLimitError:
+        raise
     except Exception:
         failed.append("live-production-telegram-harness")
 
@@ -1610,13 +1678,15 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "clarification_count": collapsed_count,
         "typing_heartbeat_sends": typing_sends,
+        "heartbeat_continuity_failures": heartbeat_continuity_failures,
+        "served_models_by_agent": served_models_by_agent,
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1)
             if "voice_elapsed" in locals()
             else 0.0
         ),
         "live_prerequisites_present": True,
-        "production_boundary": "PollingTelegramTransport._process_raw_update",
+        "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
     }
     if failed:
         status = "FAIL"
