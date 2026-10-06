@@ -292,7 +292,11 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     assert verifier.calls == 1
     assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
     telemetry = outcome["telemetry"]
-    assert telemetry["planner_outcome"] == "skipped-verifier-unavailable"
+    # Gate C repair: verifier outage still skips futile repair, but the
+    # concrete upstream stage outcomes are preserved for diagnosis instead
+    # of being flattened to a generic skipped-verifier-unavailable token.
+    assert telemetry["planner_outcome"] != "skipped-verifier-unavailable"
+    assert telemetry["retrieval_outcome"] != "skipped-verifier-unavailable"
     assert telemetry["verifier_outcome"] == "unavailable"
     assert telemetry["answer_outcome"] == "clarification"
 

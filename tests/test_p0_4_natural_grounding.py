@@ -1283,3 +1283,87 @@ async def test_verifier_provider_error_does_not_retry() -> None:
     assert passed is False
     assert result is None
     assert verifier.calls == 1
+
+
+def test_verifier_native_schema_is_ref_free() -> None:
+    """Gate C repair: weak fallback providers reject $ref/$defs schemas.
+
+    The native OpenCode transport schema must be flat ($ref-free) while
+    AA-side Pydantic validation stays strict. A $ref-bearing schema made
+    the verifier never serve on the fallback model (all ordinary turns
+    collapsing to generic clarification with slow internal retries).
+    """
+    import json
+    from typing import cast
+
+    schema = verifier_json_schema()
+    assert schema["type"] == "object"
+    properties = cast(dict[str, Any], schema["properties"])
+    assert "units" in properties
+    assert "$defs" not in schema
+    assert "$ref" not in json.dumps(schema)
+    # Units items are inlined (no $ref indirection).
+    units = cast(dict[str, Any], properties["units"])
+    items = cast(dict[str, Any], units["items"])
+    assert items["type"] == "object"
+    assert "$ref" not in items
+    # Scopes still enumerate the closed vocabulary for the transport.
+    item_properties = cast(dict[str, Any], items["properties"])
+    scope = cast(dict[str, Any], item_properties["scope"])
+    assert set(cast(list[str], scope["enum"])) == {"book", "product_meta", "conversation_glue"}
+    # A native-shaped payload still validates strictly in AA code.
+    result = validate_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": ["chapter-3#exp0000"],
+                }
+            ],
+            "all_required_supported": True,
+        },
+        expected_unit_ids=["u1"],
+    )
+    assert result.all_required_supported is True
+
+
+async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
+    """Gate C repair: verifier outage must not flatten planner/retrieval.
+
+    When the verifier produces no verdict, repair is still skipped (no
+    futile re-planning), but planner/retrieval outcomes stay at their real
+    upstream values so the next failure attributes to the concrete stage
+    instead of generic skipped-verifier-unavailable.
+    """
+
+    class _DownVerifier:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            raise TimeoutError("verifier down")
+
+    class _AnswerModel:
+        async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
+            _ = messages
+            return AIMessage(content="Поддержка рядом помогает спокойно разбирать тягу.")
+
+    outcome = await run_v2_answer_turn(
+        user_message="Как обходиться с тягой вечером?",
+        summary="",
+        recent=[],
+        evidence_pack=[_pack_entry()],
+        answer_model=_AnswerModel(),
+        verifier_model=_DownVerifier(),
+        planner_model=None,
+        retrieval_index=None,
+        initial_query_count=12,
+    )
+    telemetry = dict(outcome["telemetry"])
+    assert telemetry["verifier_outcome"] == "unavailable"
+    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
+    # Upstream stages are preserved, never flattened to a generic token.
+    assert telemetry["planner_outcome"] != "skipped-verifier-unavailable"
+    assert telemetry["retrieval_outcome"] != "skipped-verifier-unavailable"
