@@ -1013,6 +1013,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     failed: list[str] = []
     incomplete: list[str] = []
     latencies: list[float] = []
+    collapsed_count = 0
 
     def _check(name: str, ok: bool) -> None:
         (passed if ok else failed).append(name)
@@ -1143,12 +1144,21 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 and all(envelope_passes(item) for item in replies[1:]),
             )
             collapsed = [item for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY]
+            collapsed_count = len(collapsed)
             _check("live-no-generic-collapse", len(collapsed) == 0)
             _check("live-replies-distinguishable", len(set(replies)) > 1)
             if stage_snapshots:
                 _check("live-stage-telemetry-present", True)
-                outcomes = {str(item.get("verifier_outcome", "")) for item in stage_snapshots}
-                _check("live-stage-outcomes-distinguishable", len(outcomes) >= 1)
+                stage_signatures = {
+                    (
+                        str(item.get("planner_outcome", "")),
+                        str(item.get("retrieval_outcome", "")),
+                        str(item.get("answer_outcome", "")),
+                        str(item.get("verifier_outcome", "")),
+                    )
+                    for item in stage_snapshots
+                }
+                _check("live-stage-outcomes-distinguishable", len(stage_signatures) > 1)
             else:
                 # Telemetry missing is a harness gap, not proof of grounding.
                 incomplete.append("live-stage-telemetry-missing")
@@ -1169,7 +1179,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_p50_s": round(p50, 4),
         "latency_p95_s": round(p95, 4),
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-        "clarification_count": 0,
+        "clarification_count": collapsed_count,
         "live_prerequisites_present": True,
         "production_boundary": "Application.respond/GraphTurnRuntime",
     }
