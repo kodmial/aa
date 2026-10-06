@@ -291,8 +291,15 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 "retrieval-rrf",
                 "second-stage reranker present",
             )
-    except ValueError as exc:
-        return _fail_b(expected_sha, run_id, product, runtime, "retrieval-rrf", str(exc))
+    except Exception as exc:
+        return _fail_b(
+            expected_sha,
+            run_id,
+            product,
+            runtime,
+            "retrieval-rrf",
+            f"{type(exc).__name__}: {exc}"[:96],
+        )
 
     # -- corpus-restore layout (real pinned artifacts must exist) --
     try:
@@ -992,7 +999,8 @@ def _gate_c_live_evidence(
             )
         if not isinstance(payload, dict):
             continue
-        if str(payload.get("main_sha", payload.get("sha", expected_sha))) != expected_sha:
+        main_sha = payload.get("main_sha", payload.get("sha"))
+        if str(main_sha or "") != expected_sha:
             continue
         # Telemetry-shaped evidence: evaluate scenario families + diversity.
         raw_turns = payload.get("turns")
@@ -1570,18 +1578,68 @@ def main(argv: list[str] | None = None) -> int:
             detail=fingerprint_recompute_failed[:64],
         )
 
-    gate_b = _gate_b(expected, run_id, product, runtime)
-    gate_c, latencies, aggregate_slo = _gate_c(expected, run_id, product, runtime)
-    gate_d = _gate_d(expected, run_id, product, runtime)
-    gate_e = _gate_e(
-        expected,
-        run_id,
-        product,
-        runtime,
-        latencies,
-        gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted),
-        aggregate_slo_ms=aggregate_slo,
-    )
+    try:
+        gate_b = _gate_b(expected, run_id, product, runtime)
+    except Exception as exc:
+        gate_b = _fail_b(
+            expected,
+            run_id,
+            product,
+            runtime,
+            "planner-shape",
+            f"{type(exc).__name__}: {exc}"[:96],
+        )
+    try:
+        gate_c, latencies, aggregate_slo = _gate_c(expected, run_id, product, runtime)
+    except Exception as exc:
+        gate_c = GateEvidence(
+            gate="C",
+            status="BLOCKED",
+            sha=expected,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="runner-error",
+            component="live-production-path",
+            run_id=run_id,
+            detail=f"{type(exc).__name__}: {exc}"[:64],
+        )
+        latencies, aggregate_slo = [], None
+    try:
+        gate_d = _gate_d(expected, run_id, product, runtime)
+    except Exception as exc:
+        gate_d = GateEvidence(
+            gate="D",
+            status="BLOCKED",
+            sha=expected,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="runner-error",
+            component="telegram-readiness",
+            run_id=run_id,
+            detail=f"{type(exc).__name__}: {exc}"[:64],
+        )
+    try:
+        gate_e = _gate_e(
+            expected,
+            run_id,
+            product,
+            runtime,
+            latencies,
+            gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted),
+            aggregate_slo_ms=aggregate_slo,
+        )
+    except Exception as exc:
+        gate_e = GateEvidence(
+            gate="E",
+            status="BLOCKED",
+            sha=expected,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="runner-error",
+            component="slo",
+            run_id=run_id,
+            detail=f"{type(exc).__name__}: {exc}"[:64],
+        )
 
     evidences = [gate_a, gate_b, gate_c, gate_d, gate_e]
     try:
