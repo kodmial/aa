@@ -124,6 +124,7 @@ jobs:
         shell: bash
         env:
           AA_ALLOW_NETWORK_FETCH: "0"
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
         run: |
           set -euo pipefail
           # Real RU corpus restore + real BM25/E5/FAISS index bootstrap, then
@@ -134,6 +135,11 @@ jobs:
           python scripts/restore_canonical.py --no-network-fallback
           python scripts/restore_canonical.py --lang ru --no-network-fallback
           python scripts/build_corpus_structure.py
+          # Gate B must exercise the production dense substrate, never the
+          # hermetic hashing fallback. Public model prefetch is allowed here;
+          # a missing/unloadable pinned model is a qualification failure.
+          python scripts/prefetch_public_assets.py
+          python scripts/build_retrieval_index.py --backend e5
           python -m pytest -q tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py \
             tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py \
             tests/test_output_envelope.py tests/test_sessions_safety_control.py \
