@@ -53,6 +53,19 @@ jobs:
               core.info(`No ${markerName}; leave non-429 failure to the product repair loop.`);
               return;
             }
+            const currentMain = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+            const currentSha = String(currentMain.data.commit.sha || '');
+            if (currentSha && sha && currentSha !== sha) {
+              core.info(`Discarding stale 429 evidence for ${sha.slice(0, 12)}; current main is ${currentSha.slice(0, 12)}.`);
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentSha },
+              });
+              return;
+            }
             if (attempt < 10) {
               core.info(`Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`);
               await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: runId });
