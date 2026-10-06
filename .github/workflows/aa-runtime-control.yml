@@ -290,10 +290,11 @@ jobs:
               // (OpenCode health + Telegram bootstrap + long polling not
               // yet confirmed), READY once a live poller is active,
               // STOPPED otherwise. The phase carries ids/counters only.
-              const livePoller = active.filter(r => r.status === 'in_progress');
               const runtimePhase = pending && !active.length
                 ? 'STARTING'
-                : livePoller.length ? 'READY' : (active.length ? 'STARTING' : 'STOPPED');
+                : active.some(r => pollerStateForRun(r, comments) === 'ready')
+                  ? 'READY'
+                  : (active.length ? 'STARTING' : 'STOPPED');
               const expiresInH = Math.max(0, (accepted + DAY_MS - nowMs) / 3600000).toFixed(1);
               // Only READY is an active usable poller; in_progress alone is
               // starting. Duplicate prevention is unchanged: starting still
