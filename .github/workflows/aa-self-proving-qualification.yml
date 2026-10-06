@@ -542,6 +542,10 @@ jobs:
         # Always emit the machine-readable final verdict so a failed Gate C/D/E
         # never degrades to unknown-gate-failure: the repair publisher maps the
         # concrete blocking gate/component from self-proving-summary.json.
+        # Live env is preserved here (issue #153) so Gate F re-evaluation
+        # cannot replace a real Gate C live-path-failed with
+        # live-execution-not-enabled; the runner additionally prefers the
+        # persisted live-out artifact regardless of env.
         if: always()
         shell: bash
         env:

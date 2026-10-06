@@ -248,6 +248,55 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
     assert outcome["telemetry"]["repair_rounds"] == 1
 
 
+async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
+    """Verifier-unavailable turns (issue #153) must not burn repair rounds.
+
+    When the verifier produces no verdict at all (provider/transient/timeout
+    after fallback, or validation failure), re-planning cannot help and each
+    repair round burns another full planner+retrieval+answer+verifier sequence
+    of slow provider calls (the live 40-80s pathology). The turn must clarify
+    directly with explicit telemetry instead.
+    """
+    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
+
+    draft = "Поддержка рядом помогает пережить тягу спокойно. Обратитесь за помощью."
+    answer = _AnswerModel([draft])
+
+    class _UnavailableVerifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    verifier = _UnavailableVerifier()
+    planner = _PlannerModel()
+    outcome = await run_v2_answer_turn(
+        user_message="К вечеру тянет выпить, как с этим обходиться?",
+        summary="",
+        recent=[],
+        evidence_pack=[_pack_entry()],
+        answer_model=answer,
+        verifier_model=verifier,
+        planner_model=planner,
+        retrieval_index=object(),
+        initial_query_count=12,
+    )
+    assert outcome["rounds"] == 0
+    assert planner.calls == 0
+    assert answer.calls == 1
+    assert verifier.calls == 1
+    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
+    telemetry = outcome["telemetry"]
+    assert telemetry["planner_outcome"] == "skipped-verifier-unavailable"
+    assert telemetry["verifier_outcome"] == "unavailable"
+    assert telemetry["answer_outcome"] == "clarification"
+
+
 async def test_runtime_publishes_starting_ready_stopped() -> None:
     from aa.app import RUNTIME_READY, RUNTIME_STARTING, RUNTIME_STOPPED
 
