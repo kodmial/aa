@@ -763,13 +763,79 @@ def _coerce_turn_telemetries(raw_turns: object) -> list[object] | None:
     return coerced
 
 
-def _live_latencies_from_product_summary(payload: object) -> list[float] | None:
-    """Extract real measured per-turn latencies (ms) from a live summary."""
+def _live_real_latencies_from_product_summary(payload: object) -> list[float] | None:
+    """Return explicit per-turn latencies (ms) when the payload carries them.
+
+    Only real measured per-turn samples are returned. Aggregate-only
+    summaries (p50/p95/max without a per-turn array) yield ``None`` so the
+    caller evaluates the aggregate SLO directly instead of synthesising a
+    representative sample (synthesis distorts recomputed p95/max).
+    """
     if not isinstance(payload, dict):
         return None
     lanes = payload.get("lanes", [])
     if not isinstance(lanes, list):
         return None
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        metrics = lane.get("metrics", {})
+        if not isinstance(metrics, dict):
+            continue
+        for key in (
+            "turn_latencies_ms",
+            "per_turn_latencies_ms",
+            "per_turn_ms",
+            "latencies_ms",
+            "turn_ms",
+        ):
+            raw = metrics.get(key, None)
+            if isinstance(raw, list) and raw:
+                try:
+                    values = [float(v) for v in raw]
+                except (TypeError, ValueError):
+                    continue
+                values = [v for v in values if v > 0]
+                if values:
+                    return values
+        turns = lane.get("turns", None)
+        if isinstance(turns, list) and turns:
+            values: list[float] = []
+            for entry in turns:
+                if not isinstance(entry, dict):
+                    break
+                for key in ("latency_ms", "total_ms", "end_to_end_ms"):
+                    if key in entry:
+                        try:
+                            values.append(float(entry[key]))
+                        except (TypeError, ValueError):
+                            break
+                        break
+            else:
+                values = [v for v in values if v > 0]
+                if values:
+                    return values
+    return None
+
+
+def _live_aggregate_slo_from_product_summary(payload: object) -> dict[str, float] | None:
+    """Extract the measured aggregate SLO (ms) directly, without synthesis.
+
+    Units come from key names only (``*_s`` seconds convert to ms,
+    ``*_ms`` are already ms). Returns ``{"p50_ms","p95_ms","max_ms",
+    "turns"}`` with the conservative cross-lane maximum, or ``None`` when
+    no usable aggregate exists.
+    """
+    if not isinstance(payload, dict):
+        return None
+    lanes = payload.get("lanes", [])
+    if not isinstance(lanes, list):
+        return None
+    best_p50 = 0.0
+    best_p95 = 0.0
+    best_max = 0.0
+    total_turns = 0
+    seen = False
     for lane in lanes:
         if not isinstance(lane, dict):
             continue
@@ -808,20 +874,81 @@ def _live_latencies_from_product_summary(payload: object) -> list[float] | None:
             continue
         if count <= 0 or p50_ms <= 0:
             continue
-        # Reconstruct a privacy-safe representative sample from the measured
-        # aggregates (never text): half the turns at p50, the rest spread to
-        # p95, plus the observed max so the 30s guard sees real outliers.
-        samples = [p50_ms] * (count // 2 + 1)
-        samples += [p95_ms] * (count - len(samples))
-        if max_ms > 0:
-            samples[-1] = max_ms
-        return [float(v) for v in samples]
-    return None
+        # When the lane reports no explicit max, the max is at least p95.
+        lane_max = max_ms if max_ms > 0 else p95_ms
+        best_p50 = max(best_p50, p50_ms)
+        best_p95 = max(best_p95, p95_ms)
+        best_max = max(best_max, lane_max)
+        total_turns += count
+        seen = True
+    if not seen or total_turns <= 0 or best_p50 <= 0:
+        return None
+    return {
+        "p50_ms": float(best_p50),
+        "p95_ms": float(best_p95),
+        "max_ms": float(best_max),
+        "turns": float(total_turns),
+    }
+
+
+def _live_latencies_from_product_summary(payload: object) -> list[float] | None:
+    """Back-compat wrapper: return only real per-turn samples, never synthesis."""
+    return _live_real_latencies_from_product_summary(payload)
+
+
+# Gate C lane-evidence strictness (fail-closed, no exact-question whitelist).
+#
+# A lane with ``passed=["trivial"]`` plus a network-deferred ``incomplete``
+# must never become Gate C PASS. Every lane must carry multiple explicit
+# production checks, and the only accepted ``incomplete`` entries are the
+# exact real-Telegram dialing deferrals owned by Gate D. Any other
+# incomplete (missing identity/models/runtime, harness gaps) stays BLOCKED.
+_ALLOWED_GATE_C_DEFERRED: frozenset[str] = frozenset(
+    {
+        "real-telegram-typing-stream-not-dialed-in-qualification",
+        "real-telegram-typing-stream-requires-token",
+    }
+)
+
+_PRODUCTION_CHECK_TOKENS: tuple[str, ...] = (
+    "planner",
+    "queries",
+    "retrieval",
+    "rrf",
+    "grounding",
+    "verifier",
+    "answer",
+    "safety",
+    "envelope",
+    "transport",
+    "typing",
+    "heartbeat",
+    "concurrency",
+    "fifo",
+    "controller",
+    "ready",
+    "delivery",
+    "greeting",
+    "capability",
+    "memory",
+    "quote",
+    "citation",
+    "leak",
+)
+
+
+def _lane_has_production_checks(passed: object) -> bool:
+    if not isinstance(passed, list) or len(passed) < 3:
+        return False
+    lowered = [str(item).lower() for item in passed if isinstance(item, str) and str(item).strip()]
+    if len(lowered) < 3:
+        return False
+    return any(token in name for name in lowered for token in _PRODUCTION_CHECK_TOKENS)
 
 
 def _gate_c_live_evidence(
     expected_sha: str, run_id: str, product: str, runtime: str
-) -> tuple[GateEvidence, list[float]] | None:
+) -> tuple[GateEvidence, list[float], dict[str, float] | None] | None:
     """Map repository-owned live evidence to a Gate C verdict, if present.
 
     Consumes the ``live-out`` artifact produced by
@@ -830,6 +957,11 @@ def _gate_c_live_evidence(
     production index, synthetic Updates injected only at the production
     Telegram adapter boundary). Returns ``None`` when no usable live
     evidence exists (caller stays BLOCKED fail-closed).
+
+    The third tuple element carries the measured aggregate SLO
+    (p50/p95/max_ms + turns) evaluated directly from ``*_s``/``*_ms``
+    keys. Gate E consumes real per-turn samples when present, otherwise
+    the aggregate SLO directly; it never consumes synthesised samples.
     """
     candidates = [
         ROOT / "live-out" / "product-contract-live-summary.json",
@@ -842,18 +974,22 @@ def _gate_c_live_evidence(
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return GateEvidence(
-                gate="C",
-                status="BLOCKED",
-                sha=expected_sha,
-                product_fingerprint=product,
-                runtime_fingerprint=runtime,
-                failure_category="live-evidence-invalid",
-                component="live-production-path",
-                run_id=run_id,
-                mocked_only=False,
-                detail="unreadable-live-summary"[:64],
-            ), []
+            return (
+                GateEvidence(
+                    gate="C",
+                    status="BLOCKED",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category="live-evidence-invalid",
+                    component="live-production-path",
+                    run_id=run_id,
+                    mocked_only=False,
+                    detail="unreadable-live-summary"[:64],
+                ),
+                [],
+                None,
+            )
         if not isinstance(payload, dict):
             continue
         if str(payload.get("main_sha", payload.get("sha", expected_sha))) != expected_sha:
@@ -863,18 +999,22 @@ def _gate_c_live_evidence(
         if isinstance(raw_turns, list) and raw_turns:
             turns = _coerce_turn_telemetries(raw_turns)
             if turns is None:
-                return GateEvidence(
-                    gate="C",
-                    status="BLOCKED",
-                    sha=expected_sha,
-                    product_fingerprint=product,
-                    runtime_fingerprint=runtime,
-                    failure_category="live-evidence-invalid",
-                    component="live-production-path",
-                    run_id=run_id,
-                    mocked_only=False,
-                    detail="telemetry-shape-invalid"[:64],
-                ), []
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="BLOCKED",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="live-evidence-invalid",
+                        component="live-production-path",
+                        run_id=run_id,
+                        mocked_only=False,
+                        detail="telemetry-shape-invalid"[:64],
+                    ),
+                    [],
+                    None,
+                )
             try:
                 from aa.conversation.stage_telemetry import evaluate_gate_c_telemetry
                 from aa.qualification.self_proving import SCENARIO_FAMILIES
@@ -883,51 +1023,82 @@ def _gate_c_live_evidence(
                     turns,
                     required_families=len(SCENARIO_FAMILIES),
                 )
-                latencies = [float(t.total_ms()) for t in turns]
+                try:
+                    latencies = [float(t.total_ms()) for t in turns]
+                except Exception as exc:
+                    return (
+                        GateEvidence(
+                            gate="C",
+                            status="BLOCKED",
+                            sha=expected_sha,
+                            product_fingerprint=product,
+                            runtime_fingerprint=runtime,
+                            failure_category="live-evidence-invalid",
+                            component="live-production-path",
+                            run_id=run_id,
+                            mocked_only=False,
+                            detail=type(exc).__name__[:64],
+                        ),
+                        [],
+                        None,
+                    )
             except Exception as exc:
-                return GateEvidence(
-                    gate="C",
-                    status="BLOCKED",
-                    sha=expected_sha,
-                    product_fingerprint=product,
-                    runtime_fingerprint=runtime,
-                    failure_category="live-evidence-invalid",
-                    component="live-production-path",
-                    run_id=run_id,
-                    mocked_only=False,
-                    detail=type(exc).__name__[:64],
-                ), []
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="BLOCKED",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="live-evidence-invalid",
+                        component="live-production-path",
+                        run_id=run_id,
+                        mocked_only=False,
+                        detail=type(exc).__name__[:64],
+                    ),
+                    [],
+                    None,
+                )
             if ok:
-                return GateEvidence(
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="PASS",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                    ),
+                    latencies,
+                    None,
+                )
+            return (
+                GateEvidence(
                     gate="C",
-                    status="PASS",
+                    status="FAIL",
                     sha=expected_sha,
                     product_fingerprint=product,
                     runtime_fingerprint=runtime,
+                    failure_category="live-path-failed",
                     component="live-production-path",
                     run_id=run_id,
                     live_trusted=True,
                     mocked_only=False,
-                ), latencies
-            return GateEvidence(
-                gate="C",
-                status="FAIL",
-                sha=expected_sha,
-                product_fingerprint=product,
-                runtime_fingerprint=runtime,
-                failure_category="live-path-failed",
-                component="live-production-path",
-                run_id=run_id,
-                live_trusted=True,
-                mocked_only=False,
-                detail=str(detail)[:160],
-            ), latencies
+                    detail=str(detail)[:160],
+                ),
+                latencies,
+                None,
+            )
         # Product-contract lane evidence: the exact production conversation
         # path (synthetic Updates at the production adapter boundary) must
         # have no failed lane. Lanes may additionally carry INCOMPLETE live-
         # network sublanes (real Telegram dialing deferred to Gate D); those
-        # are accepted only when explicitly network-deferred, every lane
-        # has at least one passed production check, and nothing failed.
+        # are accepted only as the exact deferred markers below, every lane
+        # must carry multiple explicit production checks, and nothing may
+        # have failed. A single trivial passed check never yields PASS.
         status = str(payload.get("status", ""))
         lanes = payload.get("lanes", [])
         if isinstance(lanes, list) and lanes and status in ("PASS", "INCOMPLETE"):
@@ -936,9 +1107,108 @@ def _gate_c_live_evidence(
                 for lane in lanes
                 if not isinstance(lane, dict) or lane.get("status") not in ("PASS", "INCOMPLETE")
             ]
+            aggregate = _live_aggregate_slo_from_product_summary(payload)
+            real_latencies = _live_real_latencies_from_product_summary(payload) or []
             if lane_failures:
-                latencies = _live_latencies_from_product_summary(payload) or []
-                return GateEvidence(
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="FAIL",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="live-path-failed",
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                        detail="live-lane-failed"[:160],
+                    ),
+                    real_latencies,
+                    aggregate,
+                )
+            complete = True
+            for lane in lanes:
+                assert isinstance(lane, dict)
+                passed = lane.get("passed", [])
+                incomplete = lane.get("incomplete", [])
+                if not _lane_has_production_checks(passed):
+                    complete = False
+                    break
+                if isinstance(incomplete, list):
+                    for item in incomplete:
+                        if not isinstance(item, str) or item not in _ALLOWED_GATE_C_DEFERRED:
+                            complete = False
+                            break
+                    if not complete:
+                        break
+                else:
+                    complete = False
+                    break
+            # The union of passed checks must prove the production pipeline
+            # stages (planner/retrieval/answer-verifier/delivery); otherwise
+            # an INCOMPLETE summary with trivial passes could be promoted.
+            if complete:
+                union = " ".join(
+                    str(item).lower()
+                    for lane in lanes
+                    if isinstance(lane, dict)
+                    for item in (lane.get("passed", []) or [])
+                    if isinstance(item, str)
+                )
+                stage_groups = (
+                    ("planner", "queries", "rrf"),
+                    ("retrieval", "rrf", "grounding"),
+                    ("verifier", "grounding", "safety", "answer"),
+                    (
+                        "transport",
+                        "typing",
+                        "concurrency",
+                        "fifo",
+                        "controller",
+                        "ready",
+                        "delivery",
+                    ),
+                )
+                if not all(any(token in union for token in group) for group in stage_groups):
+                    complete = False
+            if complete:
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="PASS",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                    ),
+                    real_latencies,
+                    aggregate,
+                )
+            return (
+                GateEvidence(
+                    gate="C",
+                    status="BLOCKED",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category="live-evidence-incomplete",
+                    component="live-production-path",
+                    run_id=run_id,
+                    mocked_only=False,
+                    detail="live-lane-incomplete"[:64],
+                ),
+                real_latencies,
+                aggregate,
+            )
+        if status in ("FAIL",):
+            real_latencies = _live_real_latencies_from_product_summary(payload) or []
+            aggregate = _live_aggregate_slo_from_product_summary(payload)
+            return (
+                GateEvidence(
                     gate="C",
                     status="FAIL",
                     sha=expected_sha,
@@ -950,98 +1220,54 @@ def _gate_c_live_evidence(
                     live_trusted=True,
                     mocked_only=False,
                     detail="live-lane-failed"[:160],
-                ), latencies
-            deferred: tuple[str, ...] = ("real-telegram", "requires-token", "not-dialed")
-            complete = True
-            for lane in lanes:
-                assert isinstance(lane, dict)
-                passed = lane.get("passed", [])
-                incomplete = lane.get("incomplete", [])
-                if not isinstance(passed, list) or len(passed) == 0:
-                    complete = False
-                    break
-                if isinstance(incomplete, list) and any(
-                    not isinstance(item, str) or not any(token in item for token in deferred)
-                    for item in incomplete
-                ):
-                    complete = False
-                    break
-            latencies = _live_latencies_from_product_summary(payload) or []
-            if complete:
-                return GateEvidence(
-                    gate="C",
-                    status="PASS",
-                    sha=expected_sha,
-                    product_fingerprint=product,
-                    runtime_fingerprint=runtime,
-                    component="live-production-path",
-                    run_id=run_id,
-                    live_trusted=True,
-                    mocked_only=False,
-                ), latencies
-            return GateEvidence(
-                gate="C",
-                status="BLOCKED",
-                sha=expected_sha,
-                product_fingerprint=product,
-                runtime_fingerprint=runtime,
-                failure_category="live-evidence-incomplete",
-                component="live-production-path",
-                run_id=run_id,
-                mocked_only=False,
-                detail="live-lane-incomplete"[:64],
-            ), latencies
-        if status in ("FAIL",):
-            latencies = _live_latencies_from_product_summary(payload) or []
-            return GateEvidence(
-                gate="C",
-                status="FAIL",
-                sha=expected_sha,
-                product_fingerprint=product,
-                runtime_fingerprint=runtime,
-                failure_category="live-path-failed",
-                component="live-production-path",
-                run_id=run_id,
-                live_trusted=True,
-                mocked_only=False,
-                detail="live-lane-failed"[:160],
-            ), latencies
+                ),
+                real_latencies,
+                aggregate,
+            )
     return None
 
 
 def _gate_c(
     expected_sha: str, run_id: str, product: str, runtime: str
-) -> tuple[GateEvidence, list[float]]:
+) -> tuple[GateEvidence, list[float], dict[str, float] | None]:
     ready, reason = _live_prerequisites()
     if not ready:
-        return GateEvidence(
-            gate="C",
-            status="BLOCKED",
-            sha=expected_sha,
-            product_fingerprint=product,
-            runtime_fingerprint=runtime,
-            failure_category=reason,
-            component="live-production-path",
-            run_id=run_id,
-            mocked_only=True,
-        ), []
+        return (
+            GateEvidence(
+                gate="C",
+                status="BLOCKED",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category=reason,
+                component="live-production-path",
+                run_id=run_id,
+                mocked_only=True,
+            ),
+            [],
+            None,
+        )
     # Live prerequisites hold: map the repository-owned live artifact to
     # PASS/FAIL. Without usable live evidence this gate stays BLOCKED
     # (fail-closed); it never reports mocked PASS.
     decided = _gate_c_live_evidence(expected_sha, run_id, product, runtime)
     if decided is not None:
         return decided
-    return GateEvidence(
-        gate="C",
-        status="BLOCKED",
-        sha=expected_sha,
-        product_fingerprint=product,
-        runtime_fingerprint=runtime,
-        failure_category="live-evidence-required",
-        component="live-production-path",
-        run_id=run_id,
-        mocked_only=False,
-    ), []
+    return (
+        GateEvidence(
+            gate="C",
+            status="BLOCKED",
+            sha=expected_sha,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="live-evidence-required",
+            component="live-production-path",
+            run_id=run_id,
+            mocked_only=False,
+        ),
+        [],
+        None,
+    )
 
 
 def _telegram_get_json(token: str, method: str, *, timeout_s: int = 15) -> dict[str, object]:
@@ -1204,8 +1430,15 @@ def _gate_e(
     runtime: str,
     latencies_ms: list[float],
     gate_c_live: bool,
+    aggregate_slo_ms: dict[str, float] | None = None,
 ) -> GateEvidence:
-    if not gate_c_live or not latencies_ms:
+    from aa.qualification.self_proving import (
+        ORDINARY_TURN_BUDGET_MS,
+        P95_TARGET_MS,
+        slo_guards,
+    )
+
+    def _blocked() -> GateEvidence:
         return GateEvidence(
             gate="E",
             status="BLOCKED",
@@ -1216,19 +1449,29 @@ def _gate_e(
             component="slo",
             run_id=run_id,
         )
-    from aa.qualification.self_proving import percentile_ms
 
-    p50 = percentile_ms(latencies_ms, 50)
-    p95 = percentile_ms(latencies_ms, 95)
-    maximum = max(latencies_ms)
-    if p95 > 15_000 or maximum >= 30_000:
+    def _verdict(p50: float, p95: float, maximum: float) -> GateEvidence:
+        if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
+            return GateEvidence(
+                gate="E",
+                status="FAIL",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category="latency-budget-exceeded",
+                component="slo",
+                run_id=run_id,
+                live_trusted=True,
+                latency_p50_ms=p50,
+                latency_p95_ms=p95,
+                max_turn_ms=maximum,
+            )
         return GateEvidence(
             gate="E",
-            status="FAIL",
+            status="PASS",
             sha=expected_sha,
             product_fingerprint=product,
             runtime_fingerprint=runtime,
-            failure_category="latency-budget-exceeded",
             component="slo",
             run_id=run_id,
             live_trusted=True,
@@ -1236,19 +1479,33 @@ def _gate_e(
             latency_p95_ms=p95,
             max_turn_ms=maximum,
         )
-    return GateEvidence(
-        gate="E",
-        status="PASS",
-        sha=expected_sha,
-        product_fingerprint=product,
-        runtime_fingerprint=runtime,
-        component="slo",
-        run_id=run_id,
-        live_trusted=True,
-        latency_p50_ms=p50,
-        latency_p95_ms=p95,
-        max_turn_ms=maximum,
-    )
+
+    if not gate_c_live:
+        return _blocked()
+    # Prefer real measured per-turn samples; they carry the true variance.
+    if latencies_ms:
+        ok, detail, metrics = slo_guards(latencies_ms)
+        p50 = float(metrics["p50_ms"])
+        p95 = float(metrics["p95_ms"])
+        maximum = float(metrics["max_ms"])
+        if not ok:
+            return _verdict(p50, p95, maximum)
+        return _verdict(p50, p95, maximum)
+    # Aggregate-only live summaries: evaluate the measured aggregates
+    # directly against the canonical SLO (no sample synthesis, which
+    # distorts recomputed p95/max).
+    if aggregate_slo_ms is not None:
+        try:
+            p50 = float(aggregate_slo_ms.get("p50_ms", 0.0))
+            p95 = float(aggregate_slo_ms.get("p95_ms", 0.0))
+            maximum = float(aggregate_slo_ms.get("max_ms", 0.0))
+            turns = float(aggregate_slo_ms.get("turns", 0.0))
+        except (TypeError, ValueError):
+            return _blocked()
+        if turns <= 0 or p50 <= 0 or p95 <= 0 or maximum <= 0:
+            return _blocked()
+        return _verdict(p50, p95, maximum)
+    return _blocked()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1286,11 +1543,35 @@ def main(argv: list[str] | None = None) -> int:
         _write(out_dir, None, "STALE", main_sha=expected, run_id=run_id)
         print("self-proving qualification STALE: SHA mismatch", file=sys.stderr)
         return EXIT_STALE
-    product = gate_a.product_fingerprint or _product_fingerprint()
-    runtime = gate_a.runtime_fingerprint or _runtime_fingerprint()
+    # Fail-closed fingerprint backfill: Gate A may return empty fingerprints
+    # on fingerprint-error. Recomputing here must never crash the runner
+    # with no result.json/summary (that would violate the BLOCKED contract).
+    fingerprint_recompute_failed = ""
+    try:
+        product = gate_a.product_fingerprint or _product_fingerprint()
+    except Exception as exc:
+        product = ""
+        fingerprint_recompute_failed = type(exc).__name__
+    try:
+        runtime = gate_a.runtime_fingerprint or _runtime_fingerprint()
+    except Exception as exc:
+        runtime = ""
+        fingerprint_recompute_failed = fingerprint_recompute_failed or type(exc).__name__
+    if fingerprint_recompute_failed:
+        gate_a = GateEvidence(
+            gate="A",
+            status="BLOCKED",
+            sha=expected,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="fingerprint-error",
+            component="fingerprint-consistency",
+            run_id=run_id,
+            detail=fingerprint_recompute_failed[:64],
+        )
 
     gate_b = _gate_b(expected, run_id, product, runtime)
-    gate_c, latencies = _gate_c(expected, run_id, product, runtime)
+    gate_c, latencies, aggregate_slo = _gate_c(expected, run_id, product, runtime)
     gate_d = _gate_d(expected, run_id, product, runtime)
     gate_e = _gate_e(
         expected,
@@ -1299,6 +1580,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime,
         latencies,
         gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted),
+        aggregate_slo_ms=aggregate_slo,
     )
 
     evidences = [gate_a, gate_b, gate_c, gate_d, gate_e]
