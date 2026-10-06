@@ -191,7 +191,16 @@ def evaluate_gate_c_telemetry(
                     "failed": failed,
                 },
             )
-    signatures = [turn.reply_signature for turn in telemetries if turn.reply_signature]
+    if any(not turn.reply_signature for turn in telemetries):
+        return (
+            False,
+            "missing reply signatures for diversity check",
+            {
+                "turns": len(telemetries),
+                "families": sorted({turn.family for turn in telemetries}),
+            },
+        )
+    signatures = [turn.reply_signature for turn in telemetries]
     ok, detail = diversity_passes(signatures)
     metrics: dict[str, Any] = {
         "turns": len(telemetries),
