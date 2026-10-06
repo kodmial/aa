@@ -1772,6 +1772,27 @@ def main(argv: list[str] | None = None) -> int:
             run_id=run_id,
             detail=fingerprint_recompute_failed[:64],
         )
+    elif not gate_a.product_fingerprint or not gate_a.runtime_fingerprint:
+        # Preserve the original Gate A failure category while attaching the
+        # successfully recomputed fingerprints. Otherwise the final exact-SHA
+        # consistency check can misclassify dirty-tree/git-unavailable as a
+        # fingerprint mismatch and send the repair loop at the wrong component.
+        gate_a = GateEvidence(
+            gate=gate_a.gate,
+            status=gate_a.status,
+            sha=gate_a.sha,
+            product_fingerprint=gate_a.product_fingerprint or product,
+            runtime_fingerprint=gate_a.runtime_fingerprint or runtime,
+            failure_category=gate_a.failure_category,
+            component=gate_a.component,
+            run_id=gate_a.run_id,
+            live_trusted=gate_a.live_trusted,
+            mocked_only=gate_a.mocked_only,
+            latency_p50_ms=gate_a.latency_p50_ms,
+            latency_p95_ms=gate_a.latency_p95_ms,
+            max_turn_ms=gate_a.max_turn_ms,
+            detail=gate_a.detail,
+        )
 
     try:
         gate_b = _gate_b(expected, run_id, product, runtime)
