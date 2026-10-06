@@ -1,0 +1,697 @@
+name: AA self-proving qualification
+
+# Authoritative layered qualification DAG for issue #146 (Gates A-F).
+# Repository-owned workflow with required repository secrets/assets (never a
+# generic coding-agent runner that lacks them). Owner /run for manual testing
+# stays available regardless of qualification state; qualification controls
+# only the QUALIFIED/UNQUALIFIED label. INCOMPLETE, missing secret/model,
+# stale SHA, mocked-only evidence, or unknown state all mean FAIL/BLOCKED
+# for qualification, never a restriction on owner-initiated manual testing.
+#
+# Gate order with checkpoint resume:
+#   A static/build -> B deterministic integration -> C live production path
+#   -> D Telegram readiness -> E performance/SLO -> F exact-main verdict.
+# On failure the failed gate reruns first, then downstream gates, then the
+# final exact-main gate, bounded by MAX_REPAIR_CYCLES. Provider 429
+# (OPENCODE_429_RESTART_REQUIRED) retires
+# the runner and resumes from the last completed gate checkpoint. HTTP 403
+# uses bounded exponential retry (>= 5s base). Infrastructure failure is
+# never misreported as product PASS.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/aa/**"
+      - "prompts/**"
+      - "opencode.json"
+      - "corpus/**"
+      - "qualification/**"
+      - "scripts/run_self_proving_qualification.py"
+      - ".github/workflows/aa-self-proving-qualification.yml"
+  workflow_dispatch:
+    inputs:
+      required_sha:
+        description: "Exact current main SHA to qualify (defaults to current main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: aa-self-proving-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.required_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact current main identity and clean tree
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_sha="$(git rev-parse HEAD)"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Refusing qualification on a dirty tree."
+            exit 2
+          fi
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main --depth=1
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$checked_sha" != "$current_main" ]]; then
+            echo "::error::Refusing stale qualification: checked=$checked_sha current-main=$current_main"
+            mkdir -p self-proving-out
+            printf '{"reason_code":"STALE_MAIN","checked_sha":"%s","current_main":"%s"}\n' \
+              "$checked_sha" "$current_main" > self-proving-out/stale-main.json
+            exit 3
+          fi
+          echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
+          echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project and dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
+              bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Restore gate checkpoints from previous attempt
+        # RUNNER_TEMP is ephemeral per runner, so a 429 runner retire would
+        # otherwise lose completed-gate checkpoints. Persist them as a
+        # run-scoped artifact and restore them here so the next runner
+        # resumes from the last completed gate instead of rerunning Gate A.
+        if: ${{ github.run_attempt > 1 }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-self-proving-checkpoints
+          path: /tmp/aa-self-proving-checkpoints-restore
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage restored gate checkpoints
+        if: ${{ github.run_attempt > 1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          RESTORE_DIR="/tmp/aa-self-proving-checkpoints-restore"
+          mkdir -p "$CKPT_DIR"
+          if compgen -G "$RESTORE_DIR/gate-*.done" > /dev/null; then
+            cp "$RESTORE_DIR"/gate-*.done "$CKPT_DIR"/
+            echo "restored gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          elif compgen -G "$RESTORE_DIR/**/gate-*.done" > /dev/null; then
+            find "$RESTORE_DIR" -name 'gate-*.done' -exec cp {} "$CKPT_DIR"/ \;
+            echo "restored nested gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          else
+            echo "no previous gate checkpoints found"
+          fi
+          if [[ -d "$RESTORE_DIR/live-out" ]]; then
+            rm -rf live-out
+            cp -R "$RESTORE_DIR/live-out" live-out
+            echo "restored Gate C privacy-safe live evidence"
+          fi
+          if [[ -f "$RESTORE_DIR/runtime-status.json" ]]; then
+            mkdir -p self-proving-out
+            cp "$RESTORE_DIR/runtime-status.json" self-proving-out/runtime-status.json
+            echo "restored Gate D runtime evidence"
+          fi
+
+      - name: Gate A - static/build
+        id: gate-a
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: skip this gate when its checkpoint already
+          # exists (provider 429 runner retire resumes from the last
+          # completed gate instead of re-running from the start).
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-A.done" ]]; then
+            echo "Gate A checkpoint present; skipping (resume)."
+            exit 0
+          fi
+          # Exact SHA + clean tree verified above; canonical restore
+          # metadata/fingerprints, unit/type/lint, and prompt/config/model/
+          # retrieval fingerprint consistency run here fail-closed.
+          bash scripts/verify.sh
+          python scripts/verify_product_contract_qualification.py --require-active
+          python scripts/verify_runtime_qualification.py
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "A" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-A.done"
+
+      - name: Gate B - deterministic component integration
+        id: gate-b
+        shell: bash
+        env:
+          AA_ALLOW_NETWORK_FETCH: "0"
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: skip when Gate B already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-B.done" ]]; then
+            echo "Gate B checkpoint present; skipping (resume)."
+            exit 0
+          fi
+          # Real RU corpus restore + real BM25/E5/FAISS index bootstrap, then
+          # planner cardinality/shape, retrieval/RRF/dedup/diversity/
+          # small-to-big, grounding/verifier and output envelope, memory/FIFO/
+          # concurrency/safety, voice fixtures/cache/resource checks. Failures
+          # attribute to a concrete component, never a generic PASS.
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
+          python scripts/build_corpus_structure.py
+          # Gate B must exercise the production dense substrate, never the
+          # hermetic hashing fallback. Public model prefetch is allowed here;
+          # a missing/unloadable pinned model is a qualification failure.
+          python scripts/prefetch_public_assets.py
+          # Voice is part of the Product Contract too. Qualification must
+          # provision and verify the pinned GigaAM/Silero/presentation assets
+          # rather than leaving the voice lane permanently INCOMPLETE.
+          python scripts/prefetch_voice_assets.py
+          python scripts/build_retrieval_index.py --backend e5
+          python -m pytest -q tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py \
+            tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py \
+            tests/test_output_envelope.py tests/test_sessions_safety_control.py \
+            tests/test_telegram_concurrency.py tests/test_idempotent_dispatch.py
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "B" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-B.done"
+
+      - name: Gate C - LIVE exact production conversation path
+        id: gate-c
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: skip when Gate C already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-C.done" ]]; then
+            echo "Gate C checkpoint present; skipping (resume)."
+            exit 0
+          fi
+          # Repository-owned live gate: real local OpenCode process and real
+          # configured runtime provider/model policy, real decrypted RU corpus
+          # + real production index, synthetic Telegram Updates injected only
+          # at the production Telegram adapter boundary through the exact
+          # Application -> dispatcher -> LangGraph -> planner -> retrieval ->
+          # answer -> verifier -> delivery serialization path. Planner/answer/
+          # verifier/provider/retrieval are never stubbed here. Scenario
+          # families (meta/capability, substantive drinking,
+          # family/relationship, follow-ups/ellipsis, topic shift,
+          # unsupported/out-of-book, emergency, long conversation) with a
+          # response-diversity assertion and privacy-safe per-stage
+          # outcomes/latency only. Missing secret/model yields BLOCKED, never
+          # mocked PASS.
+          # The live runner may legitimately return INCOMPLETE for evidence
+          # explicitly owned by downstream Gate D. Always let the self-proving
+          # mapper classify PASS/FAIL/BLOCKED from the produced evidence.
+          # Provider 429 is different: retire this VM immediately and persist
+          # the restart marker for the workflow_run recovery controller.
+          set +e
+          python scripts/run_product_contract_live_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir live-out --run-id "${{ github.run_id }}"
+          product_rc=$?
+          set -e
+          if [[ "$product_rc" -eq 75 ]]; then
+            mkdir -p self-proving-out
+            cp live-out/restart-required.json self-proving-out/restart-required.json
+            echo "::error::Gate C provider 429: retire runner and resume on a fresh VM."
+            exit 75
+          fi
+          QUAL_SHA="${{ steps.sha.outputs.sha }}" QUAL_RUN="${{ github.run_id }}" python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          sys.path.insert(0, "src")
+          import scripts.run_self_proving_qualification as runner
+
+          sha = os.environ["QUAL_SHA"]
+          run_id = os.environ["QUAL_RUN"]
+          product = runner._product_fingerprint()
+          runtime = runner._runtime_fingerprint()
+          evidence, _, _ = runner._gate_c(sha, run_id, product, runtime)
+          print(f"Gate C {evidence.status}: {evidence.failure_category or evidence.component}")
+          if evidence.status != "PASS" or not evidence.live_trusted or evidence.mocked_only:
+              raise SystemExit(1 if evidence.status == "FAIL" else 2)
+          PY
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "C" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-C.done"
+
+      - name: Gate D - real Telegram network/runtime readiness
+        id: gate-d
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          QUAL_SHA: ${{ steps.sha.outputs.sha }}
+          QUAL_RUN: ${{ github.run_id }}
+          OPENCODE_BASE_URL: http://127.0.0.1:4096
+          OPENCODE_COMMAND: opencode
+          OPENCODE_WORKDIR: .
+          OPENCODE_AGENT: aa
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: skip when Gate D already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-D.done" ]]; then
+            echo "Gate D checkpoint present; skipping (resume)."
+            exit 0
+          fi
+          # Real bot token, OpenCode health, Telegram getMe, webhook cleanup/
+          # config, commands setup, long polling actually started. Publishes
+          # the durable STARTING -> READY -> STOPPED|FAILED marker with the
+          # exact run id/SHA; /bot status reports that marker.
+          # Single-poller lock: this step runs under the workflow concurrency
+          # group aa-self-proving-qualification (cancel-in-progress: false),
+          # so only one qualification poller ever starts. The bounded probe
+          # below starts the actual Application with the real
+          # PollingTelegramTransport, proves OpenCode health + getMe +
+          # deleteWebhook/setMyCommands + transport.running with a live poll
+          # task, publishes READY only from the running app, then stops
+          # cleanly with no leaked poll task. A bare getMe + write_marker
+          # without the live Application is forbidden and fails this gate.
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+            echo "::error::Gate D BLOCKED: TELEGRAM_BOT_TOKEN is not configured."
+            exit 2
+          fi
+          # HTTP 403 uses bounded exponential retry with >= 5s base.
+          delay=5
+          for attempt in 1 2 3 4 5; do
+            code="$(curl -s -o /tmp/getme.json -w '%{http_code}' --max-time 15 \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)"
+            if [[ "$code" == "200" ]]; then
+              break
+            fi
+            if [[ "$code" == "403" && "$attempt" -lt 5 ]]; then
+              echo "Telegram getMe 403; retry $attempt in ${delay}s."
+              sleep "$delay"
+              delay=$((delay * 2))
+              continue
+            fi
+            echo "::error::Gate D BLOCKED: Telegram getMe failed (http=$code)."
+            exit 2
+          done
+          python - <<'PY'
+          import json
+          payload = json.loads(open("/tmp/getme.json", encoding="utf-8").read())
+          assert payload.get("ok") is True, "Telegram getMe ok != true"
+          assert (payload.get("result") or {}).get("is_bot") is True, "not a bot identity"
+          print("Telegram getMe readiness: OK")
+          PY
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          import sys
+          import time
+          from pathlib import Path
+          sys.path.insert(0, "src")
+          from aa.app import create_application
+          from aa.config import Settings
+          from aa.control.runtime_status import RuntimeMarker, write_marker
+          from aa.opencode.errors import OpenCodeRateLimitError
+          from aa.telegram.transport import PollingTelegramTransport
+
+          async def _active_telegram_poller_running() -> bool:
+              """Return True when another Telegram poller holds getUpdates (409)."""
+              import urllib.error
+              import urllib.request
+
+              token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+              if not token:
+                  return False
+              url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=0&limit=1"
+
+              def _check() -> bool:
+                  req = urllib.request.Request(url, method="GET")
+                  try:
+                      with urllib.request.urlopen(req, timeout=10):
+                          return False
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 409:
+                          return True
+                      return False
+                  except Exception:
+                      return False
+
+              return await asyncio.to_thread(_check)
+
+          async def _probe() -> None:
+              sha = os.environ.get("QUAL_SHA", "")
+              run_id = os.environ.get("QUAL_RUN", "")
+              out = Path("self-proving-out/runtime-status.json")
+              starting = RuntimeMarker(run_id=run_id, sha=sha, phase="STARTING", timestamp_s=time.time())
+              write_marker(out, starting)
+              print(f"runtime marker STARTING published run={run_id} sha={sha[:12]}")
+              settings = Settings.from_env(None)
+              assert settings.has_bot_token, "Gate D BLOCKED: bot token missing for Application"
+              app = create_application(settings)
+              assert isinstance(app.transport, PollingTelegramTransport), (
+                  "Gate D BLOCKED: Application is not using real PollingTelegramTransport"
+              )
+              try:
+                  active = await _active_telegram_poller_running()
+                  assert not active, "Gate D BLOCKED: owner runtime poller active; retry when idle to avoid getUpdates conflict"
+                  await app.start()
+              except OpenCodeRateLimitError:
+                  failed = RuntimeMarker(
+                      run_id=run_id,
+                      sha=sha,
+                      phase="FAILED",
+                      timestamp_s=time.time(),
+                  )
+                  write_marker(out, failed)
+                  restart = Path("self-proving-out/restart-required.json")
+                  restart.parent.mkdir(parents=True, exist_ok=True)
+                  restart.write_text(
+                      json.dumps(
+                          {
+                              "reason_code": "OPENCODE_429_RESTART_REQUIRED",
+                              "sha": sha,
+                              "run_id": run_id,
+                              "gate": "D",
+                          },
+                          sort_keys=True,
+                          indent=2,
+                      )
+                      + "\n",
+                      encoding="utf-8",
+                  )
+                  raise SystemExit(75)
+              except Exception as exc:
+                  failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
+                  write_marker(out, failed)
+                  raise SystemExit(f"Gate D BLOCKED: Application.start failed: {type(exc).__name__}")
+              try:
+                  try:
+                      # OpenCode health proved by start (ensure_ready passed).
+                      assert app.running, "Application not running after start"
+                      assert app.opencode_runtime.running, "OpenCode runtime not running"
+                      assert app.opencode_runtime.ready, "OpenCode health not ready"
+                      # Real Telegram bootstrap proved by live transport.
+                      transport = app.transport
+                      assert isinstance(transport, PollingTelegramTransport)
+                      assert transport.running, "transport.running is not live"
+                      poll_task = getattr(transport, "_poll_task", None)
+                      assert poll_task is not None, "live poll task missing"
+                      assert not poll_task.done(), "poll task already done; polling not live"
+                      bot_info = transport.bot_info
+                      assert isinstance(bot_info, dict) and bot_info.get("is_bot") is True, "getMe identity not live"
+                      handlers = getattr(transport, "_command_handlers", {})
+                      assert "start" in handlers and "new" in handlers, "webhook/commands bootstrap incomplete"
+                      # READY is published only from the running app.
+                      assert app.readiness_marker, "READY was not published from the running app"
+                      assert "READY" in app.readiness_marker, "running app readiness is not READY"
+                      ready = RuntimeMarker(run_id=run_id, sha=sha, phase="READY", timestamp_s=time.time())
+                      write_marker(out, ready)
+                      print(f"runtime marker READY published from live app run={run_id} sha={sha[:12]}")
+                      print(f"polling live: transport.running={transport.running} poll_task_live={not poll_task.done()}")
+                  finally:
+                    await app.stop()
+                    leaked = [t for t in asyncio.all_tasks() if t.get_name() == "telegram-polling" and not t.done()]
+                    assert not app.running, "Application leaked running state after stop"
+                    assert not app.transport.running, "transport leaked running state after stop"
+                    assert not leaked, f"poll task leaked: {len(leaked)} live telegram-polling tasks"
+                    print("Application stopped cleanly with no leaked poll task")
+                  stopped = RuntimeMarker(run_id=run_id, sha=sha, phase="STOPPED", timestamp_s=time.time())
+                  write_marker(out, stopped)
+                  print(f"runtime marker STOPPED published run={run_id} sha={sha[:12]}")
+              except Exception:
+                  failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
+                  write_marker(out, failed)
+                  raise
+
+          asyncio.run(_probe())
+          PY
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "D" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-D.done"
+
+      - name: Gate E - live performance/SLO
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: skip when Gate E already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-E.done" ]]; then
+            echo "Gate E checkpoint present; skipping (resume)."
+            exit 0
+          fi
+          # End-to-end and per-stage latency p50/p95 from Gate C evidence.
+          # Gate D has now produced trusted runtime evidence, so this is the
+          # first point where a full A-E evaluation is valid.
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+          # Hard guard: no ordinary qualification turn may take >= 30s; p95
+          # target materially below that. Typing heartbeat continuity is
+          # verified independently. Pathological latency fails the gate.
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path("self-proving-out/self-proving-summary.json")
+          if not path.is_file():
+              print("Gate E BLOCKED: no Gate C latency evidence", file=sys.stderr)
+              sys.exit(2)
+          summary = json.loads(path.read_text(encoding="utf-8"))
+          gates = {g.get("gate"): g for g in summary.get("gates", [])}
+          print(json.dumps({"gates": [(k, v.get("status")) for k, v in gates.items()]}))
+          gate_e = gates.get("E")
+          if gate_e is None:
+              print("Gate E BLOCKED: missing Gate E evidence", file=sys.stderr)
+              sys.exit(2)
+          if gate_e.get("status") != "PASS":
+              print(f"Gate E BLOCKED: status={gate_e.get('status')}", file=sys.stderr)
+              sys.exit(2 if gate_e.get("status") in ("BLOCKED", "STALE") else 1)
+          try:
+              p50 = float(gate_e.get("latency_p50_ms", 0.0))
+              p95 = float(gate_e.get("latency_p95_ms", 0.0))
+              max_turn = float(gate_e.get("max_turn_ms", 0.0))
+          except (TypeError, ValueError):
+              print("Gate E BLOCKED: latency evidence is not numeric", file=sys.stderr)
+              sys.exit(2)
+          # Sample-count guard: zero/negative latencies mean no live samples.
+          if p50 <= 0 or p95 <= 0 or max_turn <= 0:
+              print(
+                  f"Gate E BLOCKED: no live latency samples (p50={p50} p95={p95} max={max_turn})",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          # Hard SLO guard (machine-enforced): p95 target 15s, ordinary-turn
+          # budget 30s. Any ordinary turn >= 30s fails, as does p95 > 15s.
+          if p95 > 15000:
+              print(f"Gate E FAIL: p95 {p95:.0f}ms exceeds 15000ms target", file=sys.stderr)
+              sys.exit(1)
+          if max_turn >= 30000:
+              print(f"Gate E FAIL: ordinary turn {max_turn:.0f}ms >= 30000ms budget", file=sys.stderr)
+              sys.exit(1)
+          print(f"Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms")
+          PY
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "E" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-E.done"
+
+      - name: Gate F - exact-main final verdict
+        id: gate-f
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checkpoint resume: Gate F is terminal; re-verify unconditionally
+          # so a stale final verdict can never be reused after resume.
+          # PASS only if A-E PASS for the exact same current main SHA with
+          # matching product/runtime fingerprints. No stale reuse, no manual
+          # override. INCOMPLETE/missing/stale/mocked-only = FAIL/BLOCKED.
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+
+      - name: Stage gate checkpoints for resume
+        # Mirror ephemeral RUNNER_TEMP checkpoints into the workspace so the
+        # artifact upload below captures completed gates even when this run
+        # fails (including provider 429 runner retire).
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          STAGE_DIR="aa-self-proving-checkpoints"
+          mkdir -p "$STAGE_DIR"
+          if compgen -G "$CKPT_DIR/gate-*.done" > /dev/null; then
+            cp "$CKPT_DIR"/gate-*.done "$STAGE_DIR"/
+          fi
+          if [[ -f live-out/product-contract-live-summary.json ]]; then
+            mkdir -p "$STAGE_DIR/live-out"
+            cp live-out/product-contract-live-summary.json "$STAGE_DIR/live-out/"
+            [[ ! -f live-out/result.json ]] || cp live-out/result.json "$STAGE_DIR/live-out/"
+          fi
+          if [[ -f self-proving-out/runtime-status.json ]]; then
+            cp self-proving-out/runtime-status.json "$STAGE_DIR/runtime-status.json"
+          fi
+          echo "staged privacy-safe gate checkpoints/evidence for resume:"
+          find "$STAGE_DIR" -maxdepth 2 -type f -print || true
+
+      - name: Upload gate checkpoints (429 resume)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-checkpoints
+          path: aa-self-proving-checkpoints/
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload provider 429 restart marker
+        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-restart-${{ github.run_attempt }}
+          path: self-proving-out/restart-required.json
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload stale-main recovery marker
+        if: ${{ failure() && hashFiles('self-proving-out/stale-main.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-stale-${{ github.run_attempt }}
+          path: self-proving-out/stale-main.json
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+      - name: Publish machine-readable failure and repair marker
+        # Provider 429 is infrastructure recovery, not a product repair issue.
+        # A workflow_run recovery controller reruns failed jobs on a fresh VM
+        # from the persisted gate checkpoints.
+        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        uses: actions/github-script@v7
+        env:
+          FAILED_SHA: ${{ steps.sha.outputs.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // Automatic repair loop (issue #146): post the machine-readable
+            // failure category + run/SHA + privacy-safe timings, then create
+            // or reuse exactly one P0 repair issue scoped to the failing
+            // component(s). The Continuum scheduler takes it automatically;
+            // PR -> review/repair -> merge reruns the failed gate first, then
+            // downstream gates, then the final exact-main gate, boundedly
+            // until PASS. Provider 429 retires/restarts the runner and resumes
+            // from the last completed qualification gate checkpoint. HTTP 403
+            // uses bounded exponential retry >= 5s. Infrastructure failure is
+            // never misreported as product PASS.
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = process.env.FAILED_SHA || context.sha;
+            const runId = String(context.runId);
+            let category = 'unknown-gate-failure';
+            let blocking = 'unknown';
+            try {
+              const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
+              blocking = summary.blocking_gate || blocking;
+              const failed = (summary.gates || []).find(g => g.status !== 'PASS');
+              if (failed) category = `${failed.gate}:${failed.failure_category || failed.status}`;
+            } catch (error) {
+              core.warning('No self-proving summary; using generic failure category: ' + error.message);
+            }
+            const marker = '<!-- aa-self-proving-repair:v1 -->';
+            const fingerprint = `${blocking}:${category}:${sha.slice(0, 12)}`;
+            const title = `P0: Repair self-proving qualification failure (Gate ${blocking})`;
+            const body = [
+              marker,
+              '',
+              '## Automatic self-proving repair',
+              '',
+              `Failure category: \`${category}\``,
+              `Blocking gate: \`${blocking}\``,
+              `Main SHA: \`${sha}\``,
+              `Run id: \`${runId}\``,
+              `Repair fingerprint: \`${fingerprint}\``,
+              'Timings: see the failing workflow run (privacy-safe per-stage p50/p95 only).',
+              '',
+              '### Required repair behavior',
+              '',
+              '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.',
+              '- Fix without exact-question special cases; Product Contract #110 stays immutable.',
+              '- Rerun the failed gate first, then downstream gates, then the exact-main final gate.',
+              '- Repeat boundedly until PASS; no owner comments, manual labels, or manual merge required.',
+              '- Provider 429: retire/restart the runner and resume from the last completed gate checkpoint.',
+              '',
+              'This issue is generated and refreshed automatically; duplicate failures must reuse it.',
+            ].join('\n');
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const existing = openIssues.find(
+              issue => !issue.pull_request && String(issue.body || '').includes(marker) &&
+                String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
+            );
+            if (existing) {
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body, labels: ['priority:p0', 'automation:ready'] });
+              core.info(`Refreshed existing self-proving repair issue #${existing.number}.`);
+              return;
+            }
+            // Exactly one P0 repair issue per failing component series: reuse
+            // any open marker issue before creating a new one.
+            const anyExisting = openIssues.find(
+              issue => !issue.pull_request && String(issue.body || '').includes(marker)
+            );
+            if (anyExisting) {
+              await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
+              core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
+              return;
+            }
+            const created = await github.rest.issues.create({
+              owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
+            });
+            core.info(`Created self-proving repair issue #${created.data.number}.`);
+
+      - name: Handle provider 429 runner retire
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f self-proving-out/restart-required.json ]]; then
+            echo "::error::OpenCode 429: retire this runner and resume from the last completed gate checkpoint."
+            exit 75
+          fi

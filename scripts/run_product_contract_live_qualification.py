@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
 from aa.qualification.product_contract_live import (  # noqa: E402
     EXIT_BY_STATUS,
     ProductContractLiveError,
@@ -81,6 +82,25 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         summary = evaluate_live(expected_sha, repo_root=ROOT, run_id=str(args.run_id))
+    except OpenCodeRateLimitError:
+        (out_dir / "restart-required.json").write_text(
+            json.dumps(
+                {
+                    "reason_code": "OPENCODE_429_RESTART_REQUIRED",
+                    "main_sha": expected_sha,
+                    "run_id": str(args.run_id),
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "product-contract live qualification: provider 429, runner restart required",
+            file=sys.stderr,
+        )
+        return 75
     except ProductContractLiveError as exc:
         return _fail_incomplete(out_dir, reason=str(exc), main_sha=expected_sha)
 

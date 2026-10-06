@@ -331,15 +331,24 @@ jobs:
               const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
               const active = activeRunsOf(runs);
               const resolved = resolveCampaign(comments, runs, Date.now(), null);
+              // /bot status reports the durable aa-runtime-status marker
+              // (STARTING -> READY -> STOPPED|FAILED with exact run id/SHA),
+              // never a generic workflow in_progress string.
+              const markerComment = [...comments].reverse().find(c =>
+                String(c.body || '').includes('aa-runtime-status')
+              );
+              const markerLine = markerComment
+                ? `Runtime marker: ${(markerComment.body || '').split('\n').find(l => l.includes('aa-runtime-status')) || 'present'}`
+                : 'Runtime marker: none (no Telegram poller is READY).';
               if (resolved === null) {
                 await comment(
                   'No active campaign. Post `/run` (owner only) to start one bounded 5h run ' +
-                  '(max 4 starts / 20h requested / 24h wall clock).'
+                  '(max 4 starts / 20h requested / 24h wall clock).\n' + markerLine
                 );
                 return;
               }
               const generation = generationForComment(resolved.sourceCommentId);
-              await comment(['AA campaign status (authoritative):', describeCampaign(resolved.accepted, generation, runs, active, comments, Date.now())].join('\n'));
+              await comment(['AA campaign status (authoritative):', describeCampaign(resolved.accepted, generation, runs, active, comments, Date.now()), markerLine].join('\n'));
               return;
             }
 
@@ -400,6 +409,47 @@ jobs:
               return;
             }
 
+            // Self-proving qualification label (issue #146, control issue
+            // #31): owner /run for manual testing stays available regardless
+            // of qualification state. Qualification controls only the
+            // QUALIFIED/UNQUALIFIED label, never the launch. INCOMPLETE,
+            // missing secret/model, stale SHA, mocked-only evidence, or
+            // unknown state all mean FAIL/BLOCKED for qualification and an
+            // UNQUALIFIED label here, never a refusal of /run.
+            const guardQualification = async () => {
+              let headSha = '';
+              try {
+                const { data: repo } = await github.rest.repos.get({ owner, repo });
+                headSha = repo.default_branch || 'main';
+              } catch (_) {
+                headSha = '';
+              }
+              let mainSha = '';
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+                mainSha = (branch.commit && branch.commit.sha) || '';
+              } catch (error) {
+                core.warning('Self-proving guard: cannot read current main SHA: ' + (error && error.message ? error.message : error));
+                return { allowed: false, blocking: 'unknown', reason: 'cannot read current main SHA' };
+              }
+              try {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id: 'aa-self-proving-qualification.yml',
+                  branch: 'main', per_page: 20,
+                });
+                const runsForSha = (data.workflow_runs || []).filter(run => run.head_sha === mainSha).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                  const latest = runsForSha[0];
+                  const fresh = latest && latest.conclusion === 'success' ? latest : null;
+                if (!fresh) {
+                  return { allowed: false, blocking: 'F', reason: `no fresh trusted PASS for exact main ${String(mainSha).slice(0, 12)}`, sha: mainSha };
+                }
+                return { allowed: true, blocking: '', sha: mainSha };
+              } catch (error) {
+                core.warning('Self-proving guard: qualification lookup failed: ' + (error && error.message ? error.message : error));
+                return { allowed: false, blocking: 'unknown', reason: 'qualification evidence unknown' };
+              }
+            };
+
             // Fresh campaign: the new generation is anchored at the immutable
             // event comment (id + payload timestamp), committed atomically
             // with the single dispatch below. First accepted dispatch is
@@ -408,6 +458,27 @@ jobs:
               ? generationForComment(currentCommentId)
               : `manual-${nowMs}`;
             const duration = '5h';
+            // Advisory label only: never refuse /run. Without fresh
+            // exact-main PASS the runtime starts labeled UNQUALIFIED and the
+            // runtime publishes READY (UNQUALIFIED) once the poller is live;
+            // with PASS it is READY (QUALIFIED). Repair/requalification is
+            // automatic and proceeds independently.
+            const guard = await guardQualification();
+            try {
+              if (!guard.allowed) {
+                await comment(
+                  `UNQUALIFIED: current main has no fresh trusted PASS (blocking gate ${guard.blocking || 'unknown'}; ` +
+                  `${guard.reason || 'no fresh trusted PASS evidence'}). ` +
+                  'Owner `/run` stays available and starts labeled UNQUALIFIED; the runtime will publish READY (UNQUALIFIED) once live. ' +
+                  'Repair/requalification is automatic. ' +
+                  'Use `/bot status` for the authoritative runtime marker (aa-runtime-status STARTING -> READY -> STOPPED|FAILED).'
+                );
+              }
+            } catch (error) {
+              // Advisory labeling is fail-open: a transient comment-API
+              // failure/rate-limit must never skip dispatch or block /run.
+              core.warning('Advisory UNQUALIFIED label failed; continuing fail-open to dispatch: ' + ((error && error.message) || error));
+            }
             let dispatchAccepted = false;
             try {
               // Campaign ordinal 1/4 is plumbed to the runtime so its READY
@@ -437,7 +508,8 @@ jobs:
             // poller. Never dispatch a second runtime to repair an uncertain
             // listing below.
             let marker = formatMarker(generation, 1, currentCommentId);
-            const markerBody = `Start 1/${MAX_STARTS} committed for generation ${generation}.\n` + marker;
+            const qualificationLabel = guard.allowed ? 'QUALIFIED' : 'UNQUALIFIED';
+            const markerBody = `Start 1/${MAX_STARTS} committed for generation ${generation} (${qualificationLabel}).\n` + marker;
             let markerCommitted = false;
             for (let attempt = 0; attempt < 3 && !markerCommitted; attempt++) {
               try {

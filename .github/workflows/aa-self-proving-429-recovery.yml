@@ -1,0 +1,123 @@
+name: AA self-proving 429 recovery
+
+on:
+  workflow_run:
+    workflows:
+      - AA self-proving qualification
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  recover:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Recover self-proving control-plane failure
+        uses: actions/github-script@v7
+        env:
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          FAILED_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          FAILED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = Number(process.env.FAILED_RUN_ID);
+            const attempt = Number(process.env.FAILED_RUN_ATTEMPT || '1');
+            const failedSha = String(process.env.FAILED_HEAD_SHA || '');
+            if (!Number.isInteger(runId) || runId <= 0) {
+              core.setFailed('Invalid failed run id for self-proving recovery.');
+              return;
+            }
+
+            const restartName = `aa-self-proving-restart-${attempt}`;
+            const staleName = `aa-self-proving-stale-${attempt}`;
+            let restartFound = false;
+            let staleFound = false;
+            for (let check = 1; check <= 5; check++) {
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                { owner, repo, run_id: runId, per_page: 100 }
+              );
+              restartFound = artifacts.some(a => a.name === restartName && !a.expired);
+              staleFound = artifacts.some(a => a.name === staleName && !a.expired);
+              if (restartFound || staleFound) break;
+              if (check < 5) await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+
+            const { data: main } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main',
+            });
+            const currentMain = String((main.commit && main.commit.sha) || '');
+            if (!currentMain) {
+              core.setFailed('Cannot resolve current main SHA for self-proving recovery.');
+              return;
+            }
+
+            if (staleFound) {
+              core.info(
+                `Stale qualification target detected; qualifying current main ${currentMain.slice(0, 12)}.`
+              );
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentMain },
+              });
+              return;
+            }
+
+            if (!restartFound) {
+              core.info(
+                `No ${restartName} or ${staleName}; product/other failure stays with the repair loop.`
+              );
+              return;
+            }
+
+            if (failedSha && currentMain !== failedSha) {
+              core.info(
+                `Discarding stale 429 evidence for ${failedSha.slice(0, 12)}; qualifying current main ${currentMain.slice(0, 12)}.`
+              );
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentMain },
+              });
+              return;
+            }
+
+            const delaySeconds = Math.min(
+              300, 5 * (2 ** Math.min(Math.max(attempt - 1, 0), 6))
+            );
+            core.info(`Provider 429 backoff: waiting ${delaySeconds}s before fresh-VM recovery.`);
+            await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+
+            if (attempt < 10) {
+              core.info(
+                `Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`
+              );
+              await github.rest.actions.reRunWorkflowFailedJobs({
+                owner, repo, run_id: runId,
+              });
+              return;
+            }
+
+            core.info(
+              `Provider 429 persisted through ${attempt} attempts; dispatching a fresh exact-main qualification run.`
+            );
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'aa-self-proving-qualification.yml',
+              ref: 'main',
+              inputs: { required_sha: currentMain },
+            });

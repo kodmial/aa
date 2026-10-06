@@ -375,7 +375,10 @@ async def test_telegram_text_reaches_correct_session_and_chats_isolated() -> Non
     app = Application(_settings(), transport=transport, opencode_runtime=_stub_runtime())
     await app.start()
     try:
-        await _wait_for(lambda: len(api.sent_payloads) == 2)
+        # Both turns run the full LangGraph pipeline; under a loaded CI
+        # worker this can take longer than the default 3s probe budget
+        # (observed timeout with both replies arriving during drain).
+        await _wait_for(lambda: len(api.sent_payloads) == 2, timeout=10.0)
         by_chat = {payload["chat_id"]: payload["text"] for payload in api.sent_payloads}
         # Cutover #118: ordinary turns use only the LangGraph runtime with
         # natural Russian replies (no legacy fake echo, no technical

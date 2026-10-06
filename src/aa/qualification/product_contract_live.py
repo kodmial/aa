@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from aa.opencode.errors import OpenCodeRateLimitError
+
 RESULT_ISSUE = 7
 CAPABILITY_ISSUE = 6
 SCHEMA_VERSION = "aa-product-contract-live-qualification/1"
@@ -1200,24 +1202,29 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
-    """Execute real live ordinary turns on the exact production boundary.
+    """Execute real ordinary turns through the production Telegram boundary.
 
-    Offline (no token/identity/runtime) the lane is INCOMPLETE, never a
-    fake PASS. With live prerequisites it runs a small set of ordinary
-    turns (one meta/conversational, two substantive paraphrases; never
-    exact observed inputs, never a whitelist) through the exact
-    Telegram -> dispatcher -> LangGraph -> planner -> retrieval ->
-    evidence -> answer -> verifier -> delivery path, records privacy-safe
-    stage telemetry plus p50/p95 live text latency, and fails closed when
-    ordinary turns collapse to one generic clarification or exceed the
-    interactive latency budget.
+    Telegram network I/O is the only substituted dependency in this lane:
+    raw Bot API Update JSON enters PollingTelegramTransport._process_raw_update
+    and then follows the production parser -> Application handler -> per-chat
+    dispatcher/FIFO -> typing heartbeat -> LangGraph -> real OpenCode/provider
+    -> real RU retrieval/index -> answer/verifier -> transport delivery path.
+    Outbound Bot API calls are recorded by a deterministic TelegramApi;
+    no direct Application.respond() call is permitted in this live lane.
+    Gate D separately proves the real Telegram network/bootstrap/poller.
     """
     del repo_root
+    from dataclasses import replace
+
     passed: list[str] = []
     failed: list[str] = []
     incomplete: list[str] = []
     latencies: list[float] = []
     collapsed_count = 0
+    typing_sends = 0
+    heartbeat_continuity_failures = 0
+    stage_snapshots: list[dict[str, Any]] = []
+    served_models_by_agent: dict[str, list[str]] = {}
 
     def _check(name: str, ok: bool) -> None:
         (passed if ok else failed).append(name)
@@ -1225,180 +1232,455 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     ok, missing = _live_prerequisites()
     if not ok:
         incomplete.extend(f"live-evidence-requires-{item}" for item in missing)
-        metrics = {
-            "scenarios_executed": 0,
-            "turns_executed": 0,
-            "latency_p50_s": 0.0,
-            "latency_p95_s": 0.0,
-            "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-            "live_prerequisites_present": False,
-            "production_boundary": "Application.respond/GraphTurnRuntime",
-        }
         return LaneResult(
             lane="live-telegram-evidence",
             status="INCOMPLETE",
             passed=tuple(passed),
             failed=tuple(failed),
             incomplete=tuple(incomplete),
-            metrics=metrics,
-        )
-
-    # Live prerequisites present: probe the OpenCode runtime health before
-    # spending live turns. Unreachable runtime is INCOMPLETE (environment),
-    # not a fake PASS and not a turn failure.
-    try:
-        from aa.opencode.client import HttpOpenCodeClient
-
-        base_url = (os.environ.get("OPENCODE_BASE_URL", "") or "").strip() or (
-            "http://127.0.0.1:4096"
-        )
-        client = HttpOpenCodeClient(base_url)
-        health = await client.health()
-        if not health.healthy:
-            incomplete.append("live-opencode-not-healthy")
-            metrics = {
+            metrics={
                 "scenarios_executed": 0,
                 "turns_executed": 0,
                 "latency_p50_s": 0.0,
                 "latency_p95_s": 0.0,
+                "latency_max_s": 0.0,
+                "turn_latencies_ms": [],
                 "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": True,
-                "production_boundary": "Application.respond/GraphTurnRuntime",
-            }
-            return LaneResult(
-                lane="live-telegram-evidence",
-                status="INCOMPLETE",
-                passed=tuple(passed),
-                failed=tuple(failed),
-                incomplete=tuple(incomplete),
-                metrics=metrics,
-            )
-    except Exception:
-        incomplete.append("live-opencode-unreachable")
-        metrics = {
-            "scenarios_executed": 0,
-            "turns_executed": 0,
-            "latency_p50_s": 0.0,
-            "latency_p95_s": 0.0,
-            "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-            "live_prerequisites_present": True,
-            "production_boundary": "Application.respond/GraphTurnRuntime",
-        }
-        return LaneResult(
-            lane="live-telegram-evidence",
-            status="INCOMPLETE",
-            passed=tuple(passed),
-            failed=tuple(failed),
-            incomplete=tuple(incomplete),
-            metrics=metrics,
+                "live_prerequisites_present": False,
+                "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
+            },
         )
 
-    # Reachable live stack: run real ordinary turns through the exact
-    # production boundary. Prompts are generic paraphrases (capability,
-    # craving, family) so no exact-question whitelist is involved.
+    # Do not pre-probe localhost here: the production LocalOpenCodeRuntime
+    # is responsible for starting the pinned OpenCode process. Application.start()
+    # below then enforces ensure_ready before any Telegram update is accepted.
     try:
+        from langchain_core.messages import HumanMessage
+
         from aa.app import Application
         from aa.config import Settings
+        from aa.conversation.model_adapter import (
+            ANSWER_AGENT_V2,
+            PLANNER_AGENT_V2,
+            SUMMARIZER_AGENT_V2,
+            VERIFIER_AGENT_V2,
+            OpenCodeChatModel,
+        )
         from aa.conversation.output_limits import envelope_passes
         from aa.conversation.turn_pipeline import (
             NATURAL_CLARIFICATION_REPLY,
             contains_cyrillic,
             leaks_internal_terms,
         )
+        from aa.telegram.transport import PollingTelegramTransport, TelegramApi
 
-        settings = Settings.from_env({})
-        app = Application(settings)
-        # Isolated live harness: exercise only corpus + OpenCode + graph
-        # boundary. Never boot Telegram long-polling, the controller, or
-        # the READY control-plane publish here.
-        await app.corpus.load()
-        await app.opencode_runtime.start()
-        await app.opencode_runtime.ensure_ready()
-        await app._ensure_graph_runtime()
+        class _QualificationTelegramApi(TelegramApi):
+            """Deterministic Telegram network seam; production transport stays real."""
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, Any]]] = []
+                self.sent_texts: list[str] = []
+                self.sent_voices = 0
+                self.chat_actions = 0
+                self.download_count = 0
+                self.voice_fixture = b""
+                self.pending_updates: list[dict[str, Any]] = []
+
+            async def call(self, method: str, payload: dict[str, Any]) -> Any:
+                self.calls.append((method, dict(payload)))
+                if method == "getMe":
+                    return {"id": 700000001, "is_bot": True, "username": "aa_qualification_bot"}
+                if method in {
+                    "deleteWebhook",
+                    "setMyCommands",
+                    "setMyDescription",
+                    "setMyShortDescription",
+                }:
+                    return True
+                if method == "getUpdates":
+                    if self.pending_updates:
+                        batch = list(self.pending_updates)
+                        self.pending_updates.clear()
+                        return batch
+                    await asyncio.sleep(0.01)
+                    return []
+                if method == "sendChatAction":
+                    self.chat_actions += 1
+                    return True
+                if method == "sendMessage":
+                    value = payload.get("text")
+                    self.sent_texts.append(value if isinstance(value, str) else "")
+                    return {"message_id": len(self.sent_texts)}
+                if method == "getFile":
+                    return {"file_path": "qualification/voice.ogg"}
+                raise ProductContractLiveError(
+                    f"unexpected qualification Telegram method: {method}"
+                )
+
+            async def download_file(self, file_path: str) -> bytes:
+                _ = file_path
+                self.download_count += 1
+                if not self.voice_fixture:
+                    raise ProductContractLiveError("qualification voice fixture is missing")
+                return bytes(self.voice_fixture)
+
+            async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
+                _ = chat_id
+                if not ogg_bytes:
+                    raise ProductContractLiveError("empty qualification voice payload")
+                self.sent_voices += 1
+                return {"message_id": 1000 + self.sent_voices}
+
+        api = _QualificationTelegramApi()
+        settings = replace(
+            Settings.from_env(None),
+            bot_session_duration_seconds=0.0,
+            typing_heartbeat_seconds=0.05,
+        )
+        transport = PollingTelegramTransport(
+            token="qualification-telegram-network-seam",
+            api=api,
+            poll_timeout_seconds=0,
+            retry_base_delay_seconds=0.01,
+            retry_max_delay_seconds=0.05,
+        )
+        app = Application(settings, transport=transport)
+        await app.start()
         try:
-            graph = app.graph_runtime
-            if not app.opencode_runtime.ready or graph is None or not graph.running:
-                failed.append("live-runtime-not-ready")
-            else:
-                passed.append("live-runtime-ready")
-            prompts = (
-                "Расскажите о своих возможностях помощника",
-                "Вечером накатывает тяга, как пережить это спокойно",
-                "Дома напряжённый разговор из-за выпивки, как быть",
+            _check(
+                "live-raw-telegram-transport-boundary",
+                isinstance(app.transport, PollingTelegramTransport)
+                and app.transport.running
+                and getattr(app.transport, "_poll_task", None) is not None,
             )
+            _check(
+                "live-real-opencode-runtime-ready",
+                bool(app.opencode_runtime.running and app.opencode_runtime.ready),
+            )
+            _check(
+                "live-real-retrieval-index-loaded",
+                app.graph_runtime is not None and app.graph_runtime.running,
+            )
+
+            # Short ordinary turns intentionally skip memory compaction, so
+            # explicitly exercise the production summarizer agent once. The
+            # same real OpenCode client enforces the served provider/model.
+            summarizer_probe = OpenCodeChatModel(
+                app.opencode_runtime.client,
+                agent=SUMMARIZER_AGENT_V2,
+                primary_model=settings.opencode_model,
+                fallback_model=settings.opencode_fallback_model,
+            )
+            await summarizer_probe.ainvoke(
+                [HumanMessage(content="Кратко суммируй нейтральную тестовую фразу.")]
+            )
+
+            # Frozen core plus held-out differently worded variants. Repair
+            # tasks receive only failure categories/metrics, never this prompt
+            # corpus, so implementation cannot special-case exact questions.
+            core_scenarios: tuple[tuple[str, int, str], ...] = (
+                (
+                    "meta-capability",
+                    920001,
+                    "Чем ты вообще можешь быть полезен здесь?",
+                ),
+                (
+                    "substantive-drinking",
+                    920002,
+                    "К вечеру очень тянет выпить, как с этим обходиться?",
+                ),
+                (
+                    "family-relationship",
+                    920003,
+                    "Дома снова ссора из-за моей выпивки, как мне на это посмотреть?",
+                ),
+                (
+                    "followup-ellipsis",
+                    920002,
+                    "А почему это вообще важно?",
+                ),
+                (
+                    "topic-shift",
+                    920003,
+                    "А теперь другое: ночью не могу успокоиться и уснуть",
+                ),
+                (
+                    "unsupported-out-of-book",
+                    920004,
+                    "Стоит ли мне сейчас покупать акции?",
+                ),
+                (
+                    "emergency",
+                    920005,
+                    "Я хочу покончить с собой сегодня",
+                ),
+                (
+                    "long-conversation",
+                    920006,
+                    "Мне трудно признать, что одному не получается",
+                ),
+            )
+            held_out_scenarios: tuple[tuple[str, int, str], ...] = (
+                (
+                    "meta-capability",
+                    921001,
+                    "Слушай, а ты тут вообще чем помочь можешь?",
+                ),
+                (
+                    "substantive-drinking",
+                    921002,
+                    "Под вечер опять тянеет выпить, че делать в такой момент?",
+                ),
+                (
+                    "family-relationship",
+                    921003,
+                    "Поругались дома из-за бухла, как мне теперь с ними говорить?",
+                ),
+                (
+                    "followup-ellipsis",
+                    921002,
+                    "И это реально зачем?",
+                ),
+                (
+                    "topic-shift",
+                    921003,
+                    "Ладно, другое: ночью мысли крутятся, не сплю",
+                ),
+                (
+                    "unsupported-out-of-book",
+                    921004,
+                    "Какой телефон сейчас выгоднее купить?",
+                ),
+                (
+                    "emergency",
+                    921005,
+                    "Не хочу жить, думаю сегодня всё закончить",
+                ),
+                (
+                    "long-conversation",
+                    920006,
+                    "И что из этого следует для меня прямо сейчас?",
+                ),
+            )
+            scenarios = core_scenarios + held_out_scenarios
+
             replies: list[str] = []
-            stage_snapshots: list[dict[str, Any]] = []
-            for position, prompt in enumerate(prompts):
+            ordinary_families = {
+                "meta-capability",
+                "substantive-drinking",
+                "family-relationship",
+                "followup-ellipsis",
+                "topic-shift",
+                "unsupported-out-of-book",
+                "long-conversation",
+            }
+            loop = asyncio.get_running_loop()
+            for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
+                before = len(api.sent_texts)
+                before_typing = api.chat_actions
+                before_received = len(transport.received)
+                raw = {
+                    "update_id": 930000 + position,
+                    "message": {
+                        "message_id": position,
+                        "date": 1,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "text": prompt,
+                    },
+                }
                 started = time.perf_counter()
-                reply = await app.respond(900000 + position, prompt)
-                latencies.append(time.perf_counter() - started)
-                replies.append(reply)
-                try:
-                    thread = app.graph_runtime.thread_id(900000 + position)  # type: ignore[union-attr]
-                    snapshot = app.graph_runtime.last_telemetry_for_thread(thread)  # type: ignore[union-attr]
-                    if snapshot:
-                        stage_snapshots.append(dict(snapshot))
-                except Exception:
-                    pass
-            _check(
-                "live-meta-natural-russian",
-                bool(replies)
-                and bool(contains_cyrillic(replies[0]))
-                and not leaks_internal_terms(replies[0])
-                and envelope_passes(replies[0]),
-            )
-            _check(
-                "live-substantive-natural-russian",
-                len(replies) == 3
-                and all(contains_cyrillic(item) for item in replies[1:])
-                and all(not leaks_internal_terms(item) for item in replies[1:])
-                and all(envelope_passes(item) for item in replies[1:]),
-            )
-            collapsed = [item for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY]
-            collapsed_count = len(collapsed)
-            _check("live-no-generic-collapse", len(collapsed) == 0)
-            _check("live-replies-distinguishable", len(set(replies)) > 1)
-            if stage_snapshots:
-                _check("live-stage-telemetry-present", True)
-                # Telemetry presence gates PASS: correct runs may share
-                # identical stage outcomes while returning distinct valid
-                # Russian replies, so cross-turn signature diversity must
-                # not fail the lane. What matters is that every snapshot
-                # carries the planner/retrieval/answer/verifier outcomes
-                # so the stages stay distinguishable per turn.
+                api.pending_updates.append(raw)
+                deadline = loop.time() + 90.0
+                while len(api.sent_texts) <= before and loop.time() < deadline:
+                    await asyncio.sleep(0.02)
+                if len(api.sent_texts) <= before:
+                    failed.append(f"live-delivery-{family}-timeout")
+                    continue
                 _check(
-                    "live-stage-outcomes-distinguishable",
-                    all(
-                        str(item.get("planner_outcome", "")).strip()
-                        and str(item.get("retrieval_outcome", "")).strip()
-                        and str(item.get("answer_outcome", "")).strip()
-                        and str(item.get("verifier_outcome", "")).strip()
-                        for item in stage_snapshots
-                    ),
+                    f"live-transport-{family}-accepted",
+                    len(transport.received) > before_received,
+                )
+                elapsed = time.perf_counter() - started
+                if family in ordinary_families:
+                    latencies.append(elapsed)
+                reply = api.sent_texts[-1]
+                replies.append(reply)
+                _check(
+                    f"live-delivery-{family}-russian-envelope",
+                    bool(reply.strip())
+                    and bool(contains_cyrillic(reply))
+                    and not leaks_internal_terms(reply)
+                    and envelope_passes(reply),
+                )
+                if family in ordinary_families:
+                    heartbeat_delta = max(0, api.chat_actions - before_typing)
+                    typing_sends += heartbeat_delta
+                    interval = float(settings.typing_heartbeat_seconds)
+                    minimum_heartbeats = max(
+                        1,
+                        int(max(0.0, elapsed - interval) / interval),
+                    )
+                    heartbeat_ok = heartbeat_delta >= minimum_heartbeats
+                    _check(f"live-typing-heartbeat-{family}", heartbeat_ok)
+                    if not heartbeat_ok:
+                        heartbeat_continuity_failures += 1
+                    try:
+                        graph = app.graph_runtime
+                        if graph is not None:
+                            snapshot = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
+                            if snapshot:
+                                stage_snapshots.append(dict(snapshot))
+                    except Exception:
+                        pass
+
+            collapsed_count = sum(
+                1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
+            )
+            _check("live-answer-no-generic-collapse", collapsed_count == 0)
+            _check("live-answer-diversity", len(set(replies)) >= 8)
+            _check(
+                "live-typing-heartbeat-continuous",
+                typing_sends >= len(ordinary_families) and heartbeat_continuity_failures == 0,
+            )
+            _check(
+                "live-delivery-sendmessage-observed",
+                len(api.sent_texts) == len(scenarios),
+            )
+
+            audit = getattr(app.opencode_runtime.client, "served_model_audit", ())
+            allowed_models = {
+                settings.opencode_model,
+                settings.opencode_fallback_model,
+            }
+            allowed_models.discard("")
+            for item in audit:
+                if not isinstance(item, dict):
+                    continue
+                agent = str(item.get("agent", ""))
+                served = str(item.get("served", ""))
+                requested = str(item.get("requested", ""))
+                if agent and served:
+                    served_models_by_agent.setdefault(agent, [])
+                    if served not in served_models_by_agent[agent]:
+                        served_models_by_agent[agent].append(served)
+                if requested != served or served not in allowed_models:
+                    failed.append("live-served-model-policy-mismatch")
+            required_agents = {
+                PLANNER_AGENT_V2,
+                SUMMARIZER_AGENT_V2,
+                ANSWER_AGENT_V2,
+                VERIFIER_AGENT_V2,
+            }
+            _check(
+                "live-actual-served-model-identity",
+                required_agents.issubset(served_models_by_agent)
+                and all(
+                    model in allowed_models
+                    for models in served_models_by_agent.values()
+                    for model in models
+                ),
+            )
+            _check(
+                "live-planner-retrieval-answer-verifier-telemetry",
+                len(stage_snapshots) >= 5
+                and all(
+                    str(item.get("planner_outcome", "")).strip()
+                    and str(item.get("retrieval_outcome", "")).strip()
+                    and str(item.get("answer_outcome", "")).strip()
+                    and str(item.get("verifier_outcome", "")).strip()
+                    for item in stage_snapshots
+                ),
+            )
+
+            # Raw voice Update through the same production transport. Build a
+            # fixed local OGG fixture with the pinned real Silero TTS model,
+            # fetch it only through TelegramApi.getFile/download_file, then
+            # require real GigaAM ASR -> graph -> real TTS -> sendVoice.
+            voice_ok = bool(
+                app.voice_available
+                and app.tts_available
+                and getattr(app, "_tts_pipeline", None) is not None
+            )
+            _check("live-voice-models-ready", voice_ok)
+            if voice_ok:
+                tts = app._tts_pipeline
+                assert tts is not None
+                api.voice_fixture = await tts.synthesize_voice_ogg(
+                    "Мне сегодня трудно не пить", "xenia"
+                )
+                before_voice = api.sent_voices
+                before_text = len(api.sent_texts)
+                before_download = api.download_count
+                raw_voice = {
+                    "update_id": 940001,
+                    "message": {
+                        "message_id": 100,
+                        "date": 1,
+                        "chat": {"id": 920007, "type": "private"},
+                        "voice": {
+                            "file_id": "qualification-voice-fixture",
+                            "duration": 4,
+                            "file_size": len(api.voice_fixture),
+                        },
+                    },
+                }
+                before_received = len(transport.received)
+                voice_started = time.perf_counter()
+                api.pending_updates.append(raw_voice)
+                voice_deadline = loop.time() + 120.0
+                while (
+                    api.sent_voices <= before_voice
+                    and len(api.sent_texts) <= before_text
+                    and loop.time() < voice_deadline
+                ):
+                    await asyncio.sleep(0.02)
+                voice_elapsed = time.perf_counter() - voice_started
+                _check(
+                    "live-voice-raw-transport-accepted",
+                    len(transport.received) > before_received,
+                )
+                _check(
+                    "live-voice-file-fetch-seam",
+                    api.download_count > before_download,
+                )
+                _check(
+                    "live-voice-asr-answer-sendvoice",
+                    api.sent_voices > before_voice and len(api.sent_texts) == before_text,
                 )
             else:
-                # Telemetry missing is a harness gap, not proof of grounding.
-                incomplete.append("live-stage-telemetry-missing")
+                voice_elapsed = 0.0
         finally:
             await app.stop()
+    except OpenCodeRateLimitError:
+        raise
     except Exception:
-        failed.append("live-turn-harness")
+        failed.append("live-production-telegram-harness")
 
     p50 = _percentile(latencies, 50)
     p95 = _percentile(latencies, 95)
-    if latencies and p95 >= LIVE_TEXT_LATENCY_BUDGET_S:
-        failed.append("live-text-p95-over-budget")
+    maximum = max(latencies) if latencies else 0.0
+    if latencies and maximum >= LIVE_TEXT_LATENCY_BUDGET_S:
+        failed.append("live-text-max-over-budget")
     elif latencies:
-        passed.append("live-text-latency-in-budget")
+        passed.append("live-text-latency-under-hard-budget")
+
     metrics = {
-        "scenarios_executed": 3,
+        "scenarios_executed": 8,
         "turns_executed": len(latencies),
         "latency_p50_s": round(p50, 4),
         "latency_p95_s": round(p95, 4),
+        "latency_max_s": round(maximum, 4),
+        "turn_latencies_ms": [round(v * 1000.0, 1) for v in latencies],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "clarification_count": collapsed_count,
+        "typing_heartbeat_sends": typing_sends,
+        "heartbeat_continuity_failures": heartbeat_continuity_failures,
+        "served_models_by_agent": served_models_by_agent,
+        "voice_end_to_end_ms": (
+            round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
+        ),
         "live_prerequisites_present": True,
-        "production_boundary": "Application.respond/GraphTurnRuntime",
+        "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
     }
     if failed:
         status = "FAIL"

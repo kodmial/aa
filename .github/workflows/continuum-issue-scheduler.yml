@@ -156,10 +156,12 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      # AA explicitly runs three concurrent implementation slots. A manual
-      # workflow_dispatch may override this for one invocation, but scheduled
-      # and event-driven reconciliation defaults to 3 regardless of repository
-      # variable drift.
+      # Knobs below are forwarded as bare `inputs.*` passthroughs so an empty
+      # value lets the engine fall back to the consumer's `vars.AUTOMATION_*`.
+      # Two intentional exceptions per issue #146: wip_limit defaults to '3'
+      # (three concurrent implementation slots) and pause_on_failure is pinned
+      # to hard "false" (non-terminal convergence; a passthrough would let
+      # variable drift rearm terminal pause).
       wip_limit: "${{ inputs.wip_limit || '3' }}"
       lease_minutes: "${{ inputs.lease_minutes }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
@@ -182,7 +184,7 @@ jobs:
       execution_label_routes: "${{ inputs.execution_label_routes }}"
       child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
       count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip }}"
-      pause_on_failure: "${{ inputs.pause_on_failure }}"
+      pause_on_failure: "false"
       # Event plumbing for the child wake-up gate. A called workflow always
       # sees github.event_name as workflow_call with an empty github.event,
       # so the caller forwards its own trigger name and issue number.

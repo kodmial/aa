@@ -824,9 +824,17 @@ class _CaptureServeHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
         _CaptureServeHandler.captured.append({"path": self.path, "body": body})
-        payload = json.dumps(
-            {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": "ok"}]}
-        ).encode("utf-8")
+        info: dict[str, Any] = {"role": "assistant"}
+        if isinstance(body, dict) and isinstance(body.get("model"), dict):
+            model = body["model"]
+            provider = model.get("providerID")
+            model_id = model.get("modelID")
+            if isinstance(provider, str) and isinstance(model_id, str):
+                info["providerID"] = provider
+                info["modelID"] = model_id
+        payload = json.dumps({"info": info, "parts": [{"type": "text", "text": "ok"}]}).encode(
+            "utf-8"
+        )
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
