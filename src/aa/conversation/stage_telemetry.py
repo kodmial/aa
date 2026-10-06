@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aa.qualification.self_proving import (
+    ORDINARY_TURN_BUDGET_MS,
     SelfProvingError,
     assert_no_text_leak,
     diversity_passes,
@@ -207,6 +208,21 @@ def evaluate_gate_e_telemetry(
     p95_target_ms: float = 15000.0,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Evaluate Gate E SLO telemetry: p50/p95, budget, heartbeat."""
+    if not telemetries:
+        return (
+            False,
+            "no live latency samples",
+            {
+                "turns": 0,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0,
+                "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
+                "p95_target_ms": float(p95_target_ms),
+                "heartbeat": "heartbeat never fired",
+                "heartbeat_sends": int(heartbeat_sends),
+            },
+        )
     latencies = [turn.total_ms() for turn in telemetries]
     ok, detail, slo = slo_guards(latencies, p95_target_ms=p95_target_ms)
     duration = sum(latencies)

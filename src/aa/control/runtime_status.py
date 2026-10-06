@@ -93,10 +93,10 @@ def transition_allowed(previous: str | None, nxt: str) -> bool:
 
 def format_marker(marker: RuntimeMarker) -> str:
     """Format one marker as a machine-readable HTML comment."""
-    validate_run_id(marker.run_id)
-    validate_sha(marker.sha)
-    validate_phase(marker.phase)
-    return f"<!-- {MARKER_KIND} run={marker.run_id} sha={marker.sha} phase={marker.phase} -->"
+    run_id = validate_run_id(marker.run_id)
+    sha = validate_sha(marker.sha)
+    phase = validate_phase(marker.phase)
+    return f"<!-- {MARKER_KIND} run={run_id} sha={sha} phase={phase} -->"
 
 
 def parse_marker(body: str) -> RuntimeMarker | None:

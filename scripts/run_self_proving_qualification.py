@@ -254,6 +254,16 @@ def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
         "flagembedding",
         "rerank",
     )
+    # Short fragments (``bge``, ``rerank``) are only meaningful inside the
+    # evidence module's own executable code/attributes. For globally loaded
+    # modules they false-positive on unrelated transitive imports, so the
+    # ``sys.modules`` scan uses only distinctive long package markers.
+    loaded_module_fragments = (
+        "cross_encoder",
+        "crossencoder",
+        "sentence_transformers",
+        "flagembedding",
+    )
 
     def _code_hit(name: str) -> bool:
         lowered = name.lower()
@@ -296,7 +306,7 @@ def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
             return True
     for loaded in sys.modules:
         lowered = str(loaded).lower()
-        if any(fragment in lowered for fragment in code_fragments):
+        if any(fragment in lowered for fragment in loaded_module_fragments):
             return True
         if "cross-encoder" in lowered:
             return True
@@ -367,7 +377,7 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
             product,
             runtime,
             "retrieval-rrf",
-            f"{type(exc).__name__}: {exc}"[:96],
+            type(exc).__name__[:96],
         )
 
     # -- corpus-restore layout (real pinned artifacts must exist) --
@@ -1576,6 +1586,23 @@ def _gate_e(
             run_id=run_id,
         )
 
+    def _fail(p50: float, p95: float, maximum: float, detail: str = "") -> GateEvidence:
+        return GateEvidence(
+            gate="E",
+            status="FAIL",
+            sha=expected_sha,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="latency-budget-exceeded",
+            component="slo",
+            run_id=run_id,
+            live_trusted=True,
+            latency_p50_ms=p50,
+            latency_p95_ms=p95,
+            max_turn_ms=maximum,
+            detail=detail[:160],
+        )
+
     def _verdict(p50: float, p95: float, maximum: float) -> GateEvidence:
         if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
             return GateEvidence(
@@ -1615,7 +1642,7 @@ def _gate_e(
         p95 = float(metrics["p95_ms"])
         maximum = float(metrics["max_ms"])
         if not ok:
-            return _verdict(p50, p95, maximum)
+            return _fail(p50, p95, maximum, detail)
         return _verdict(p50, p95, maximum)
     # Aggregate-only live summaries: evaluate the measured aggregates
     # directly against the canonical SLO (no sample synthesis, which
@@ -1630,6 +1657,8 @@ def _gate_e(
             return _blocked()
         if turns <= 0 or p50 <= 0 or p95 <= 0 or maximum <= 0:
             return _blocked()
+        if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
+            return _fail(p50, p95, maximum, "aggregate p95/budget exceeds canonical guard")
         return _verdict(p50, p95, maximum)
     return _blocked()
 
