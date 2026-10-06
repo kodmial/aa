@@ -76,6 +76,9 @@ class GraphTurnRuntime:
         self._histories: dict[str, list[str]] = {}
         self._lock = asyncio.Lock()
         self._running = False
+        # Privacy-safe per-turn stage telemetry (counts/latencies/outcomes
+        # only). Keyed by thread digest; never holds user or evidence text.
+        self._last_telemetry: dict[str, dict[str, Any]] = {}
 
     @property
     def running(self) -> bool:
@@ -133,6 +136,8 @@ class GraphTurnRuntime:
 
     async def run_turn(self, chat_id: int, text: str) -> str:
         """Run one ordinary user turn in that chat's thread and return text."""
+        import time as _time
+
         cleaned = text.strip() if isinstance(text, str) else ""
         if not cleaned:
             raise GraphRuntimeError("empty-turn", "refusing an empty turn")
@@ -140,6 +145,7 @@ class GraphTurnRuntime:
         if self._delegate is not None:
             async with self._lock:
                 history = self._histories.setdefault(thread, [])
+            started = _time.perf_counter()
             try:
                 reply = await self._delegate(thread, cleaned)
             except GraphRuntimeError:
@@ -151,22 +157,92 @@ class GraphTurnRuntime:
             async with self._lock:
                 history.append(cleaned)
                 history.append(reply.strip())
-            logger.info("graph turn completed", extra={"reply_len": len(reply.strip())})
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
+            logger.info(
+                "graph turn completed",
+                extra={"reply_len": len(reply.strip()), "latency_ms": round(elapsed_ms, 1)},
+            )
             return reply.strip()
         graph = self._graph
         if graph is None:
             raise GraphRuntimeError("not-started", "graph runtime has no compiled graph")
+        started = _time.perf_counter()
         try:
             result = await self._invoke_graph(graph, thread, cleaned)
         except GraphRuntimeError:
             raise
         except Exception as exc:
             raise GraphRuntimeError("graph-failed", type(exc).__name__) from exc
+        elapsed_ms = (_time.perf_counter() - started) * 1000.0
         final = str(result.get("final_response", "") or result.get("draft_response", ""))
         if not final.strip():
             raise GraphRuntimeError("empty-reply", "graph returned no text")
-        logger.info("graph turn completed", extra={"reply_len": len(final.strip())})
+        self._record_stage_telemetry(thread, result, elapsed_ms, len(final.strip()))
+        logger.info(
+            "graph turn completed",
+            extra={
+                "reply_len": len(final.strip()),
+                "latency_ms": round(elapsed_ms, 1),
+                "route": str(result.get("route", "normal")),
+            },
+        )
         return final.strip()
+
+    def _record_stage_telemetry(
+        self, thread: str, result: dict[str, Any], total_ms: float, reply_len: int
+    ) -> None:
+        """Store one privacy-safe stage snapshot for later qualification."""
+        try:
+            retry = result.get("retry_state", {})
+            retry_d = dict(retry) if isinstance(retry, dict) else {}
+            embedded = retry_d.get("turn_telemetry", {})
+            embedded_d = dict(embedded) if isinstance(embedded, dict) else {}
+            queries = result.get("search_queries", [])
+            query_count = len(queries) if isinstance(queries, list) else 0
+            pack = result.get("evidence_pack", [])
+            pack_count = len(pack) if isinstance(pack, list) else 0
+            grounding = result.get("grounding_result", {})
+            grounding_d = dict(grounding) if isinstance(grounding, dict) else {}
+            snapshot: dict[str, Any] = {
+                "planner_query_count": int(embedded_d.get("planner_query_count", query_count)),
+                "planner_outcome": str(
+                    embedded_d.get("planner_outcome", "invoked" if query_count else "glue")
+                ),
+                "planner_latency_ms": float(embedded_d.get("planner_latency_ms", 0.0)),
+                "retrieval_passages": int(embedded_d.get("retrieval_passages", pack_count)),
+                "retrieval_outcome": str(embedded_d.get("retrieval_outcome", "unknown")),
+                "retrieval_latency_ms": float(
+                    embedded_d.get(
+                        "retrieval_latency_ms",
+                        float(result.get("retrieval_latency_ms", 0.0) or 0.0),
+                    )
+                ),
+                "retrieval_over_budget": bool(result.get("retrieval_over_budget", False)),
+                "answer_outcome": str(embedded_d.get("answer_outcome", "unknown")),
+                "answer_rounds": int(retry_d.get("answer_rounds", 0)),
+                "verifier_outcome": str(embedded_d.get("verifier_outcome", "unknown")),
+                "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
+                "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
+                "total_latency_ms": round(total_ms, 1),
+                "reply_len": int(reply_len),
+            }
+            self._last_telemetry[thread] = snapshot
+            logger.info(
+                "v2 turn telemetry",
+                extra={
+                    "planner_outcome": snapshot["planner_outcome"],
+                    "retrieval_outcome": snapshot["retrieval_outcome"],
+                    "answer_outcome": snapshot["answer_outcome"],
+                    "verifier_outcome": snapshot["verifier_outcome"],
+                    "latency_ms": snapshot["total_latency_ms"],
+                },
+            )
+        except Exception:
+            pass
+
+    def last_telemetry_for_thread(self, thread: str) -> dict[str, Any]:
+        """Return the last privacy-safe stage snapshot for ``thread``."""
+        return dict(self._last_telemetry.get(thread, {}))
 
     async def _invoke_graph(self, graph: Any, thread: str, text: str) -> dict[str, Any]:
         from langchain_core.messages import HumanMessage

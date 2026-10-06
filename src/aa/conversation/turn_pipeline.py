@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -273,19 +274,55 @@ async def run_v2_answer_turn(
     retrieval_config: Any | None = None,
     recent_quote_ranges: list[dict[str, Any]] | None = None,
     max_repair_rounds: int = MAX_TARGETED_REPAIR_ROUNDS,
+    initial_query_count: int | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
     Returns ``{"text": ..., "units": ..., "verification": ...,
-    "rounds": ..., "recent_quote_ranges": ...}``. The returned text is
-    always natural Russian inside the #83 envelope, with no unsupported
-    substantive claim and no internal mechanics leaked.
+    "rounds": ..., "recent_quote_ranges": ..., "telemetry": ...}``.
+    The returned text is always natural Russian inside the #83 envelope,
+    with no unsupported substantive claim and no internal mechanics
+    leaked. ``telemetry`` is a privacy-safe stage outcome + latency
+    snapshot (counts/latencies/outcomes only, never user text or
+    evidence text) so planner, retrieval, answer, verifier, repair and
+    delivery stages can be distinguished in live qualification.
     """
+    turn_started = time.perf_counter()
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
+    initial_pack_empty = not pack
+    initial_pack_passages = len(pack)
+
+    telemetry: dict[str, Any] = {
+        "planner_outcome": "skipped-initial",
+        "planner_latency_ms": 0.0,
+        "planner_query_count": 0,
+        "retrieval_outcome": "skipped-initial" if not pack else "preloaded",
+        "retrieval_latency_ms": 0.0,
+        "retrieval_passages": initial_pack_passages,
+        "retrieval_over_budget": False,
+        "answer_outcome": "unknown",
+        "answer_latency_ms": 0.0,
+        "answer_rounds": 0,
+        "verifier_outcome": "unknown",
+        "verifier_latency_ms": 0.0,
+        "repair_rounds": 0,
+        "total_latency_ms": 0.0,
+        "initial_pack_empty": initial_pack_empty,
+    }
+
+    def _finish_telemetry() -> None:
+        telemetry["total_latency_ms"] = round((time.perf_counter() - turn_started) * 1000.0, 1)
+        try:
+            telemetry["repair_rounds"] = rounds
+        except NameError:
+            telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
+
+    rounds = 0
 
     async def _draft_with_pack(active_pack: list[dict[str, Any]], prompt_text: str) -> str | None:
         passages = state_passages_to_prompt(active_pack)
+        started = time.perf_counter()
         try:
             return await generate_draft(
                 model=answer_model,
@@ -296,27 +333,79 @@ async def run_v2_answer_turn(
             )
         except Exception as exc:
             logger.info("v2 answer generation failed", extra={"category": type(exc).__name__})
+            telemetry["answer_outcome"] = "failed"
             return None
+        finally:
+            telemetry["answer_latency_ms"] = round(
+                telemetry["answer_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
+            )
+            telemetry["answer_rounds"] = int(telemetry["answer_rounds"]) + 1
+
+    async def _verify_with_telemetry(
+        draft_text: str, active_pack: list[dict[str, Any]]
+    ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
+        started = time.perf_counter()
+        try:
+            return await _verify_draft(draft_text, active_pack, verifier_model=verifier_model)
+        finally:
+            telemetry["verifier_latency_ms"] = round(
+                telemetry["verifier_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
+            )
 
     draft = await _draft_with_pack(pack, user_message)
     if draft is None:
+        telemetry["answer_outcome"] = "failed"
+        telemetry["verifier_outcome"] = "skipped"
+        _finish_telemetry()
         return {
             "text": NATURAL_RETRY_REPLY,
             "units": [],
             "verification": grounding_result_to_state(None),
             "rounds": 0,
             "recent_quote_ranges": recent_ranges,
+            "telemetry": dict(telemetry),
         }
 
-    units, result, passed = await _verify_draft(draft, pack, verifier_model=verifier_model)
-    rounds = 0
+    telemetry["answer_outcome"] = "draft-ok"
+    units, result, passed = await _verify_with_telemetry(draft, pack)
+    if passed:
+        telemetry["verifier_outcome"] = "passed"
+    elif result is None:
+        telemetry["verifier_outcome"] = "unavailable"
+    else:
+        telemetry["verifier_outcome"] = "unsupported"
     current_draft: str = draft
 
     # Bounded targeted retrieval/regeneration for unsupported claims.
-    while not passed and rounds < max_repair_rounds:
+    # Only a glue-judged turn (planner issued zero queries, hence an
+    # expectedly empty Evidence Pack) skips re-planning: re-planning
+    # contradicts that judgment and costs two full
+    # planner+retrieval+answer+verifier rounds (the 30-60s pathology seen
+    # live). An empty pack with a positive planner query count is a
+    # retrieval miss or transient failure for a substantive turn, so it
+    # keeps a bounded recovery chance via the repair loop below. When
+    # the upstream query count is unknown (None, e.g. direct calls),
+    # preserve the historical glue assumption and skip repair.
+    # Telemetry stays explicit (initial_pack_empty + verifier outcome)
+    # instead of burning latency on true glue turns.
+    is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
+    repair_allowed = (not initial_pack_empty) or (
+        initial_query_count is not None and initial_query_count > 0
+    )
+    if not passed and is_glue:
+        logger.info(
+            "v2 repair skipped for glue-judged turn",
+            extra={"initial_pack_empty": True},
+        )
+        telemetry["planner_outcome"] = "skipped-glue"
+        telemetry["retrieval_outcome"] = "skipped-glue"
+    elif not passed and initial_pack_empty:
+        telemetry["retrieval_outcome"] = "empty-pack"
+    while not passed and rounds < max_repair_rounds and repair_allowed:
         missing = unsupported_unit_texts(units, result) if units else [draft]
         missing = [text for text in missing if text.strip()]
         if planner_model is None or retrieval_index is None:
+            telemetry["planner_outcome"] = "skipped-no-planner"
             break
         focus = user_message
         if missing:
@@ -325,10 +414,19 @@ async def run_v2_answer_turn(
         try:
             from aa.conversation.planner_node import run_planner as _run_planner
 
+            repair_started = time.perf_counter()
             plan = await _run_planner(focus, model=planner_model, summary=summary, recent=recent)
             queries = list(plan.queries)
+            telemetry["planner_latency_ms"] = round(
+                float(telemetry["planner_latency_ms"])
+                + (time.perf_counter() - repair_started) * 1000.0,
+                1,
+            )
+            telemetry["planner_query_count"] = len(queries)
+            telemetry["planner_outcome"] = "replanned" if queries else "empty-replan"
         except Exception as exc:
             logger.info("v2 targeted re-plan failed", extra={"category": type(exc).__name__})
+            telemetry["planner_outcome"] = "failed"
             break
         if not queries:
             break
@@ -336,12 +434,21 @@ async def run_v2_answer_turn(
             from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
 
             active_config = retrieval_config if retrieval_config is not None else RetrievalConfig()
+            retrieval_started = time.perf_counter()
             new_pack = retrieve_evidence(retrieval_index, queries, config=active_config)
             from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
 
             _, new_dicts = _pack_to_state(new_pack)
+            telemetry["retrieval_latency_ms"] = round(
+                float(telemetry["retrieval_latency_ms"])
+                + (time.perf_counter() - retrieval_started) * 1000.0,
+                1,
+            )
+            telemetry["retrieval_passages"] = len(new_dicts)
+            telemetry["retrieval_outcome"] = "repaired" if new_dicts else "empty"
         except Exception as exc:
             logger.info("v2 targeted retrieval failed", extra={"category": type(exc).__name__})
+            telemetry["retrieval_outcome"] = "failed"
             break
         if not new_dicts:
             break
@@ -354,9 +461,13 @@ async def run_v2_answer_turn(
         if next_draft is None:
             break
         current_draft = next_draft
-        units, result, passed = await _verify_draft(
-            current_draft, pack, verifier_model=verifier_model
-        )
+        units, result, passed = await _verify_with_telemetry(current_draft, pack)
+        if passed:
+            telemetry["verifier_outcome"] = "passed-after-repair"
+        elif result is None:
+            telemetry["verifier_outcome"] = "unavailable"
+        else:
+            telemetry["verifier_outcome"] = "unsupported"
 
     if passed and units and result is not None:
         final = current_draft
@@ -370,6 +481,8 @@ async def run_v2_answer_turn(
                 final = narrowed_paging
             else:
                 final = NATURAL_CLARIFICATION_REPLY
+                telemetry["answer_outcome"] = "paging-guard"
+                _finish_telemetry()
                 return {
                     "text": final,
                     "units": units,
@@ -378,6 +491,7 @@ async def run_v2_answer_turn(
                     "recent_quote_ranges": merge_recent_ranges(
                         recent_ranges, ranges_from_pack(pack)
                     ),
+                    "telemetry": dict(telemetry),
                 }
         if not envelope_passes(final):
             # At most one compact regeneration from the same pack.
@@ -388,8 +502,8 @@ async def run_v2_answer_turn(
             )
             second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
             if second is not None:
-                second_units, second_result, second_passed = await _verify_draft(
-                    second, pack, verifier_model=verifier_model
+                second_units, second_result, second_passed = await _verify_with_telemetry(
+                    second, pack
                 )
                 if second_passed and second_units and second_result is not None:
                     if envelope_passes(second):
@@ -419,12 +533,17 @@ async def run_v2_answer_turn(
                 final = NATURAL_CLARIFICATION_REPLY
         if not contains_cyrillic(final) or leaks_internal_terms(final):
             final = NATURAL_CLARIFICATION_REPLY
+        telemetry["answer_outcome"] = (
+            "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
+        )
+        _finish_telemetry()
         return {
             "text": final,
             "units": units,
             "verification": grounding_result_to_state(result),
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+            "telemetry": dict(telemetry),
         }
 
     # Repair budget exhausted: narrow to supported material or clarify.
@@ -436,12 +555,15 @@ async def run_v2_answer_turn(
         and envelope_passes(narrowed)
         and aggregate_quote_chars(narrowed) <= QUOTE_BUDGET_CHARS
     ):
+        telemetry["answer_outcome"] = "narrowed-supported"
+        _finish_telemetry()
         return {
             "text": narrowed,
             "units": units,
             "verification": grounding_result_to_state(result),
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+            "telemetry": dict(telemetry),
         }
     if narrowed and (not envelope_passes(narrowed)):
         compacted = compact_text_to_envelope(narrowed)
@@ -451,19 +573,25 @@ async def run_v2_answer_turn(
             and not leaks_internal_terms(compacted)
             and aggregate_quote_chars(compacted) <= QUOTE_BUDGET_CHARS
         ):
+            telemetry["answer_outcome"] = "narrowed-compacted"
+            _finish_telemetry()
             return {
                 "text": compacted,
                 "units": units,
                 "verification": grounding_result_to_state(result),
                 "rounds": rounds,
                 "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+                "telemetry": dict(telemetry),
             }
+    telemetry["answer_outcome"] = "clarification"
+    _finish_telemetry()
     return {
         "text": NATURAL_CLARIFICATION_REPLY,
         "units": units,
         "verification": grounding_result_to_state(result),
         "rounds": rounds,
         "recent_quote_ranges": recent_ranges,
+        "telemetry": dict(telemetry),
     }
 
 
@@ -490,6 +618,8 @@ async def answer_pipeline_node(
             "retry_state": {"answer_rounds": 0},
         }
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
+    _search_queries = state.get("search_queries", [])
+    _initial_query_count = len(_search_queries) if isinstance(_search_queries, list) else 0
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -503,12 +633,78 @@ async def answer_pipeline_node(
         recent_quote_ranges=[
             item for item in state.get("recent_quote_ranges", []) if isinstance(item, dict)
         ],
+        initial_query_count=_initial_query_count,
     )
+    telemetry = dict(outcome.get("telemetry", {}))
+    # Enrich with upstream graph stages so one privacy-safe snapshot
+    # distinguishes planner, retrieval, answer, verifier and repair.
+    # Only counts/latencies/outcomes travel here, never prompts or text.
+    try:
+        search_queries = state.get("search_queries", [])
+        query_count = len(search_queries) if isinstance(search_queries, list) else 0
+        retrieval_latency = state.get("retrieval_latency_ms", 0.0)
+        retrieval_latency_f = (
+            float(retrieval_latency) if isinstance(retrieval_latency, (int, float)) else 0.0
+        )
+        over_budget = bool(state.get("retrieval_over_budget", False))
+        pack_items = state.get("evidence_pack", [])
+        pack_count = len(pack_items) if isinstance(pack_items, list) else 0
+        planner_invoked = bool(state.get("planner_invoked", False))
+        prior_retry = state.get("retry_state", {})
+        prior_retry_d = dict(prior_retry) if isinstance(prior_retry, dict) else {}
+        prior_planner_latency = prior_retry_d.get("planner_latency_ms", 0.0)
+        try:
+            prior_planner_latency_f = float(prior_planner_latency)
+        except (TypeError, ValueError):
+            prior_planner_latency_f = 0.0
+        prior_planner_outcome = str(prior_retry_d.get("planner_outcome", ""))
+        telemetry["planner_query_count"] = max(
+            int(telemetry.get("planner_query_count", 0) or 0), query_count
+        )
+        if prior_planner_latency_f:
+            telemetry["planner_latency_ms"] = round(
+                float(telemetry.get("planner_latency_ms", 0.0) or 0.0) + prior_planner_latency_f,
+                1,
+            )
+        telemetry["retrieval_latency_ms"] = round(
+            float(telemetry.get("retrieval_latency_ms", 0.0) or 0.0) + retrieval_latency_f,
+            1,
+        )
+        telemetry["retrieval_passages"] = max(
+            int(telemetry.get("retrieval_passages", 0) or 0), pack_count
+        )
+        telemetry["retrieval_over_budget"] = bool(
+            telemetry.get("retrieval_over_budget", False) or over_budget
+        )
+        if "retrieval_outcome" not in telemetry or telemetry.get("retrieval_outcome") in (
+            "skipped-initial",
+            "preloaded",
+        ):
+            if query_count == 0 and pack_count == 0:
+                telemetry["retrieval_outcome"] = "skipped-glue"
+            elif pack_count:
+                telemetry["retrieval_outcome"] = "evidence-ready"
+            else:
+                telemetry["retrieval_outcome"] = "empty-pack"
+        if "planner_outcome" not in telemetry or telemetry.get("planner_outcome") in (
+            "skipped-initial",
+        ):
+            if prior_planner_outcome:
+                telemetry["planner_outcome"] = prior_planner_outcome
+            else:
+                telemetry["planner_outcome"] = "invoked" if planner_invoked else "unknown"
+    except Exception:
+        pass
+    retry_state: dict[str, Any] = {"answer_rounds": int(outcome["rounds"])}
+    if telemetry:
+        # Privacy-safe stage telemetry travels in orchestration state only;
+        # it carries counts/latencies/outcomes, never user or evidence text.
+        retry_state["turn_telemetry"] = telemetry
     return {
         "draft_response": str(outcome["text"]),
         "final_response": str(outcome["text"]),
         "grounding_result": dict(outcome["verification"]),
-        "retry_state": {"answer_rounds": int(outcome["rounds"])},
+        "retry_state": retry_state,
         "recent_quote_ranges": list(outcome["recent_quote_ranges"]),
     }
 

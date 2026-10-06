@@ -16,8 +16,8 @@ def test_from_env_defaults_without_secrets() -> None:
     assert settings.aa_corpus_path == "./corpus"
     assert settings.aa_corpus_version == "local"
     assert settings.opencode_agent == "aa"
-    assert settings.opencode_model == "opencode/space-bunny-free"
-    assert settings.opencode_fallback_model == "opencode/muse-spark-1.3-contributor-free"
+    assert settings.opencode_model == "opencode/muse-spark-1.3-contributor-free"
+    assert settings.opencode_fallback_model == "opencode/space-bunny-free"
     assert not settings.has_bot_token
     settings.validate()
 
