@@ -16,6 +16,7 @@ from aa.opencode.client import SessionInfo
 from aa.opencode.errors import (
     OpenCodeProviderAccessError,
     OpenCodeRateLimitError,
+    OpenCodeTransientError,
 )
 
 PRIMARY = "opencode/space-bunny-free"
@@ -228,3 +229,104 @@ async def test_primary_recovery_closes_circuit(
     assert await model._ainvoke_text("hello again") == "primary-ok"
     assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
     assert model._primary_access_rejected_at is None
+
+
+async def test_transient_fallback_does_not_open_primary_403_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeTransientError("temporary"),
+            OpenCodeTransientError("temporary"),
+            OpenCodeTransientError("temporary"),
+            "fallback-ok",
+            "primary-ok",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await model._ainvoke_text("hello") == "fallback-ok"
+    assert model._primary_access_rejected_at is None
+    assert await model._ainvoke_text("hello again") == "primary-ok"
+    assert client.models[-1] == PRIMARY
+
+
+async def test_fallback_403_clears_primary_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("fallback-403"),
+            "primary-recovered",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    with pytest.raises(OpenCodeProviderAccessError):
+        await model._ainvoke_text("hello")
+    assert model._primary_access_rejected_at is None
+    assert await model._ainvoke_text("hello again") == "primary-recovered"
+    assert client.models[-1] == PRIMARY
+
+
+async def test_structured_fallback_403_clears_primary_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedClient(
+        structured_outcomes=[
+            OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("fallback-403"),
+            {"ok": True},
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    with pytest.raises(OpenCodeProviderAccessError):
+        await model.ainvoke_structured(
+            "hello",
+            system="planner",
+            schema={"type": "object"},
+        )
+    assert model._primary_access_rejected_at is None
+    assert await model.ainvoke_structured(
+        "hello again",
+        system="planner",
+        schema={"type": "object"},
+    ) == {"ok": True}
+    assert client.models[-1] == PRIMARY
