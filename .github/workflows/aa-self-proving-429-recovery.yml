@@ -36,7 +36,9 @@ jobs:
               return;
             }
             const markerName = `aa-self-proving-restart-${attempt}`;
+            const staleName = `aa-self-proving-stale-${attempt}`;
             let markerFound = false;
+            let staleFound = false;
             // Artifacts are normally visible when workflow_run fires, but
             // allow bounded eventual-consistency delay before deciding this
             // was an ordinary product/infrastructure failure.
@@ -46,11 +48,25 @@ jobs:
                 { owner, repo, run_id: runId, per_page: 100 }
               );
               markerFound = artifacts.some(a => a.name === markerName && !a.expired);
-              if (markerFound) break;
+              staleFound = artifacts.some(a => a.name === staleName && !a.expired);
+              if (markerFound || staleFound) break;
               if (check < 5) await new Promise(resolve => setTimeout(resolve, 5000));
             }
+            const currentMain = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+            const currentSha = String(currentMain.data.commit.sha || '');
+            if (staleFound) {
+              core.info(`Stale qualification detected; dispatching current main ${currentSha.slice(0, 12)}.`);
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentSha },
+              });
+              return;
+            }
             if (!markerFound) {
-              core.info(`No ${markerName}; leave non-429 failure to the product repair loop.`);
+              core.info(`No ${markerName} or ${staleName}; leave product/other failure to the repair loop.`);
               return;
             }
             const currentMain = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
