@@ -49,7 +49,14 @@ VERIFIER_AGENT_V2 = "aa-verifier-v2"
 RUNTIME_AGENT_V2 = "aa-runtime-v2"
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
-MODEL_ACCESS_RETRY_DELAYS = (5.0, 10.0, 20.0)
+# Live SLO guard (Gate C/E): a persistent provider-access (403) rejection
+# for the pinned primary must fail over fast. Retrying the same rejected
+# primary three times burns 35s of pure sleep per provider call before the
+# configured fallback is tried (the 50-86s ordinary-turn pathology in Gate C
+# run 37498373507: 3 delivery timeouts, p50 50s/p95 86s over the 30s budget).
+# A single bounded 5s retry preserves the required >=5s base and the exact
+# primary-then-fallback policy while keeping ordinary turns within budget.
+MODEL_ACCESS_RETRY_DELAYS = (5.0,)
 
 
 def _message_text(message: BaseMessage) -> str:

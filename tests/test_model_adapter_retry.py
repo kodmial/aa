@@ -93,10 +93,11 @@ async def test_text_429_escalates_immediately_for_fresh_runner_recovery(
 async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Live SLO guard: a persistent 403 for the pinned primary must fail over
+    # fast (single bounded >=5s retry, then fallback) instead of burning 35s
+    # of sleep per provider call (Gate C run 37498373507: p50 50s/p95 86s).
     client = _ScriptedClient(
         text_outcomes=[
-            OpenCodeProviderAccessError("http=403"),
-            OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             "fallback-ok",
@@ -116,8 +117,9 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     )
 
     assert await model._ainvoke_text("hello") == "fallback-ok"
-    assert client.models == [PRIMARY, PRIMARY, PRIMARY, PRIMARY, FALLBACK]
-    assert sleeps == [5.0, 10.0, 20.0]
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [5.0]
+    assert sleeps[0] >= 5.0
 
 
 async def test_structured_429_escalates_immediately_for_fresh_runner_recovery(
