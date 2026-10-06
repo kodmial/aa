@@ -320,38 +320,43 @@ jobs:
                   write_marker(out, failed)
                   raise SystemExit(f"Gate D BLOCKED: Application.start failed: {type(exc).__name__}")
               try:
-                  # OpenCode health proved by start (ensure_ready passed).
-                  assert app.running, "Application not running after start"
-                  assert app.opencode_runtime.running, "OpenCode runtime not running"
-                  assert app.opencode_runtime.ready, "OpenCode health not ready"
-                  # Real Telegram bootstrap proved by live transport.
-                  transport = app.transport
-                  assert isinstance(transport, PollingTelegramTransport)
-                  assert transport.running, "transport.running is not live"
-                  poll_task = getattr(transport, "_poll_task", None)
-                  assert poll_task is not None, "live poll task missing"
-                  assert not poll_task.done(), "poll task already done; polling not live"
-                  bot_info = transport.bot_info
-                  assert isinstance(bot_info, dict) and bot_info.get("is_bot") is True, "getMe identity not live"
-                  handlers = getattr(transport, "_command_handlers", {})
-                  assert "start" in handlers and "new" in handlers, "webhook/commands bootstrap incomplete"
-                  # READY is published only from the running app.
-                  assert app.readiness_marker, "READY was not published from the running app"
-                  assert "READY" in app.readiness_marker, "running app readiness is not READY"
-                  ready = RuntimeMarker(run_id=run_id, sha=sha, phase="READY", timestamp_s=time.time())
-                  write_marker(out, ready)
-                  print(f"runtime marker READY published from live app run={run_id} sha={sha[:12]}")
-                  print(f"polling live: transport.running={transport.running} poll_task_live={not poll_task.done()}")
-              finally:
-                  await app.stop()
-                  leaked = [t for t in asyncio.all_tasks() if t.get_name() == "telegram-polling" and not t.done()]
-                  assert not app.running, "Application leaked running state after stop"
-                  assert not app.transport.running, "transport leaked running state after stop"
-                  assert not leaked, f"poll task leaked: {len(leaked)} live telegram-polling tasks"
-                  print("Application stopped cleanly with no leaked poll task")
-              stopped = RuntimeMarker(run_id=run_id, sha=sha, phase="STOPPED", timestamp_s=time.time())
-              write_marker(out, stopped)
-              print(f"runtime marker STOPPED published run={run_id} sha={sha[:12]}")
+                  try:
+                      # OpenCode health proved by start (ensure_ready passed).
+                      assert app.running, "Application not running after start"
+                      assert app.opencode_runtime.running, "OpenCode runtime not running"
+                      assert app.opencode_runtime.ready, "OpenCode health not ready"
+                      # Real Telegram bootstrap proved by live transport.
+                      transport = app.transport
+                      assert isinstance(transport, PollingTelegramTransport)
+                      assert transport.running, "transport.running is not live"
+                      poll_task = getattr(transport, "_poll_task", None)
+                      assert poll_task is not None, "live poll task missing"
+                      assert not poll_task.done(), "poll task already done; polling not live"
+                      bot_info = transport.bot_info
+                      assert isinstance(bot_info, dict) and bot_info.get("is_bot") is True, "getMe identity not live"
+                      handlers = getattr(transport, "_command_handlers", {})
+                      assert "start" in handlers and "new" in handlers, "webhook/commands bootstrap incomplete"
+                      # READY is published only from the running app.
+                      assert app.readiness_marker, "READY was not published from the running app"
+                      assert "READY" in app.readiness_marker, "running app readiness is not READY"
+                      ready = RuntimeMarker(run_id=run_id, sha=sha, phase="READY", timestamp_s=time.time())
+                      write_marker(out, ready)
+                      print(f"runtime marker READY published from live app run={run_id} sha={sha[:12]}")
+                      print(f"polling live: transport.running={transport.running} poll_task_live={not poll_task.done()}")
+                  finally:
+                    await app.stop()
+                    leaked = [t for t in asyncio.all_tasks() if t.get_name() == "telegram-polling" and not t.done()]
+                    assert not app.running, "Application leaked running state after stop"
+                    assert not app.transport.running, "transport leaked running state after stop"
+                    assert not leaked, f"poll task leaked: {len(leaked)} live telegram-polling tasks"
+                    print("Application stopped cleanly with no leaked poll task")
+                  stopped = RuntimeMarker(run_id=run_id, sha=sha, phase="STOPPED", timestamp_s=time.time())
+                  write_marker(out, stopped)
+                  print(f"runtime marker STOPPED published run={run_id} sha={sha[:12]}")
+              except Exception:
+                  failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
+                  write_marker(out, failed)
+                  raise
 
           asyncio.run(_probe())
           PY

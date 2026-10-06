@@ -129,17 +129,22 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
     for line in dirty_raw.splitlines():
         if not line.strip():
             continue
-        path = line[3:].strip().strip('"')
-        ignored = False
-        for prefix in ignored_prefixes:
-            if prefix.endswith("/"):
-                if path.startswith(prefix):
-                    ignored = True
-                    break
-            elif path == prefix:
-                ignored = True
-                break
-        if ignored:
+        raw_path = line[3:].strip()
+        candidates = [p.strip().strip('"') for p in raw_path.split(" -> ") if p.strip()]
+        if not candidates:
+            dirty_lines.append(line)
+            continue
+
+        def _is_ignored(path: str) -> bool:
+            for prefix in ignored_prefixes:
+                if prefix.endswith("/"):
+                    if path.startswith(prefix):
+                        return True
+                elif path == prefix:
+                    return True
+            return False
+
+        if all(_is_ignored(path) for path in candidates):
             continue
         dirty_lines.append(line)
     if dirty_lines:

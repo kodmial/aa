@@ -183,12 +183,13 @@ def evaluate_gate_c_telemetry(
             [i for i, s in enumerate(turn.stages) if s.stage == "repair" and s.ok],
             default=-1,
         )
-        verifier_repassed = False
+        verifier_healed = False
         if repair_idx >= 0:
-            verifier_repassed = any(
-                i > repair_idx and s.stage == "verifier" and s.ok for i, s in enumerate(turn.stages)
-            )
-        if verifier_failed and verifier_repassed:
+            after_repair = [
+                s for i, s in enumerate(turn.stages) if i > repair_idx and s.stage == "verifier"
+            ]
+            verifier_healed = bool(after_repair) and all(s.ok for s in after_repair)
+        if verifier_failed and verifier_healed:
             failed = [stage for stage in failed if stage != "verifier"]
         if failed:
             return (
