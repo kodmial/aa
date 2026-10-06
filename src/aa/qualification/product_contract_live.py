@@ -1201,7 +1201,6 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
-
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
@@ -1528,9 +1527,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
-                            snapshot = graph.last_telemetry_for_thread(
-                                graph.thread_id(chat_id)
-                            )
+                            snapshot = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
                             if snapshot:
                                 stage_snapshots.append(dict(snapshot))
                     except Exception:
@@ -1543,8 +1540,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             _check("live-answer-diversity", len(set(replies)) >= 8)
             _check(
                 "live-typing-heartbeat-continuous",
-                typing_sends >= len(ordinary_families)
-                and heartbeat_continuity_failures == 0,
+                typing_sends >= len(ordinary_families) and heartbeat_continuity_failures == 0,
             )
             _check(
                 "live-delivery-sendmessage-observed",
@@ -1649,8 +1645,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 )
                 _check(
                     "live-voice-asr-answer-sendvoice",
-                    api.sent_voices > before_voice
-                    and len(api.sent_texts) == before_text,
+                    api.sent_voices > before_voice and len(api.sent_texts) == before_text,
                 )
             else:
                 voice_elapsed = 0.0
@@ -1682,9 +1677,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "heartbeat_continuity_failures": heartbeat_continuity_failures,
         "served_models_by_agent": served_models_by_agent,
         "voice_end_to_end_ms": (
-            round(voice_elapsed * 1000.0, 1)
-            if "voice_elapsed" in locals()
-            else 0.0
+            round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
         ),
         "live_prerequisites_present": True,
         "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",

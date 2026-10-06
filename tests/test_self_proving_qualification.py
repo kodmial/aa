@@ -433,9 +433,9 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # pause semantics or fewer than the required three implementation slots.
     assert "automation:ready" in workflow
     assert "aa-self-proving-restart" in workflow
-    recovery = (
-        REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml"
-    ).read_text(encoding="utf-8")
+    recovery = (REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml").read_text(
+        encoding="utf-8"
+    )
     assert "workflow_run" in recovery
     assert "AA self-proving qualification" in recovery
     assert "aa-self-proving-restart" in recovery

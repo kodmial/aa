@@ -832,9 +832,9 @@ class _CaptureServeHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(provider, str) and isinstance(model_id, str):
                 info["providerID"] = provider
                 info["modelID"] = model_id
-        payload = json.dumps(
-            {"info": info, "parts": [{"type": "text", "text": "ok"}]}
-        ).encode("utf-8")
+        payload = json.dumps({"info": info, "parts": [{"type": "text", "text": "ok"}]}).encode(
+            "utf-8"
+        )
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))

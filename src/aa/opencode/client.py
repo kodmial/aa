@@ -320,9 +320,7 @@ class HttpOpenCodeClient(OpenCodeClient):
             return
         served = self._served_model_from_info(info)
         if not served:
-            raise OpenCodeDeterministicError(
-                "opencode response omitted served model identity"
-            )
+            raise OpenCodeDeterministicError("opencode response omitted served model identity")
         if served != expected:
             raise OpenCodeDeterministicError(
                 f"opencode served model mismatch: expected {expected}, got {served}"
