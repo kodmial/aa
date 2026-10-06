@@ -1404,6 +1404,160 @@ def test_verifier_user_text_repeats_closed_contract() -> None:
     assert "all_required_supported" in user_text
 
 
+def test_verifier_normalizes_weak_provider_formatting() -> None:
+    """Gate C repair (run 37544234331): tolerate weak-model formatting variance.
+
+    The weak fallback emits schema-valid-intent verdicts with capitalized
+    scopes, surrounding whitespace, and hyphen/underscore confusion, which
+    failed strict validation so the verifier never served (14/14
+    clarifications, missing verifier identity). Normalization is
+    turn-independent: the closed vocabulary and id completeness stay
+    strict, only case/whitespace/separator are tolerated.
+    """
+    from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
+
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 8
+    units = split_response_units("Понимаю. Тяга проходит спокойно.")
+    pack = [_pack_entry()]
+    payload = {
+        "units": [
+            {
+                "unit_id": f"  {unit.unit_id}  ",
+                "scope": "Book" if i == 0 else " conversation-glue ",
+                "supported": True,
+                "evidence_passage_ids": ([f"  {pack[0]['passage_id']}  "] if i == 0 else []),
+            }
+            for i, unit in enumerate(units)
+        ],
+        "all_required_supported": True,
+    }
+    result = coerce_grounding_result(payload, units=units, passages=pack)
+    assert [v.unit_id for v in result.units] == [u.unit_id for u in units]
+    assert {v.scope for v in result.units} <= {"book", "conversation_glue"}
+    assert result.all_required_supported is True
+
+
+def test_verifier_evidence_window_bounds_prompt_size() -> None:
+    """Gate C repair (run 37544234331): bound verifier input latency.
+
+    The full 16k-token pack makes the verifier prompt the largest per-turn
+    model input; weak providers are slow/flaky on it (p95 38.7s/max 41.1s
+    over the 30s budget) while the planner (small prompt) serves. The
+    display window keeps top-ranked passages only; stored-pack cite/quote/
+    checksum checks stay full-pack strict.
+    """
+    from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
+
+    units = split_response_units("Понимаю. Тяга проходит.")
+    passages = [
+        _pack_entry(
+            passage_id=f"chapter-3#exp{i:04d}",
+            text=f"Фиктивная поддержка рядом {i}. Тяга проходит.",
+        )
+        for i in range(12)
+    ]
+    user_text = build_verifier_user_text(units=units, passages=passages)
+    assert "chapter-3#exp0007" in user_text
+    assert "chapter-3#exp0008" not in user_text
+    assert "chapter-3#exp0011" not in user_text
+    assert len(passages) == 12
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 8
+
+
+async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
+    """Gate C repair (run 37544234331): retry flake, fail fast on grounding.
+
+    Weak-formatting validation errors (scope case) get exactly one more
+    sampling chance; deterministic cite failures (book unit, empty pack)
+    fail closed immediately without burning live latency.
+    """
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    draft = "Поддержка рядом помогает спокойно разбирать тягу."
+    pack = [_pack_entry()]
+    units = split_response_units(draft)
+
+    class _FlakyThenGood:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            if self.calls == 1:
+                # Wrong verdict count: sampling flake, retryable once.
+                extra = [
+                    {
+                        "unit_id": f"u{len(units) + 1}",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": [pack[0]["passage_id"]],
+                    }
+                ]
+                return {
+                    "units": [
+                        {
+                            "unit_id": unit.unit_id,
+                            "scope": "book",
+                            "supported": True,
+                            "evidence_passage_ids": [pack[0]["passage_id"]],
+                        }
+                        for unit in units
+                    ]
+                    + extra,
+                    "all_required_supported": True,
+                }
+            return {
+                "units": [
+                    {
+                        "unit_id": unit.unit_id,
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": [pack[0]["passage_id"]],
+                    }
+                    for unit in units
+                ],
+                "all_required_supported": True,
+            }
+
+    flaky = _FlakyThenGood()
+    returned_units, result, passed = await _verify_draft(draft, pack, verifier_model=flaky)
+    assert passed is True
+    assert result is not None
+    assert flaky.calls == 2
+    assert len(returned_units) == len(units)
+
+    class _DeterministicCiteFail:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            return {
+                "units": [
+                    {
+                        "unit_id": unit.unit_id,
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                    }
+                    for unit in units
+                ],
+                "all_required_supported": True,
+            }
+
+    deterministic = _DeterministicCiteFail()
+    _, no_result, not_passed = await _verify_draft(draft, pack, verifier_model=deterministic)
+    assert not_passed is False
+    assert no_result is None
+    assert deterministic.calls == 1
+
+
 async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
     """Gate C repair: verifier outage must not flatten planner/retrieval.
 

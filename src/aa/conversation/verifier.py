@@ -36,6 +36,21 @@ logger = logging.getLogger("aa.conversation.verifier")
 
 VERIFIER_AGENT_V2 = "aa-verifier-v2"
 
+# Bounded verifier evidence window (Gate C live repair, run 37544234331:
+# 14/14 ordinary turns collapsed to generic clarification with the verifier
+# never served (missing aa-verifier-v2 identity) and p50 18.8s/p95 38.7s/
+# max 41.1s over the 30s hard budget on the weak fallback model. The full
+# 16k-token Evidence Pack (up to 12 passages) makes the verifier prompt the
+# largest per-turn model input; weak providers are slow and flaky on large
+# structured prompts while the planner (small prompt) serves. The display
+# window keeps the top-ranked passages only, cutting verifier input tokens
+# and latency while the stored-pack deterministic checks below still use
+# the full pack, so grounding strictness is unchanged: the model may only
+# cite listed ids, and every cited id is still validated against the full
+# pack plus checksum/quote gates. Turn-independent, never an
+# exact-question special case.
+VERIFIER_MAX_EVIDENCE_PASSAGES = 8
+
 
 def _escape(value: str) -> str:
     return _xml_escape(value, {"'": "&apos;", '"': "&quot;"})
@@ -70,8 +85,9 @@ def build_verifier_user_text(
         lines.append(f"<unit id={_xml_quoteattr(unit.unit_id)}>{_escape(unit.text)}</unit>")
     lines.append("</response_units>")
     lines.append("<book_evidence>")
-    if passages:
-        for passage in passages:
+    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    if window:
+        for passage in window:
             passage_id = str(passage.get("passage_id", ""))
             source_id = str(passage.get("source_id", passage.get("source", "")))
             section_id = str(passage.get("section_id", passage.get("section", "")))
@@ -176,6 +192,48 @@ def check_exact_quotes(
     return result
 
 
+def _normalize_verifier_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize weak-provider formatting before strict Pydantic validation.
+
+    Gate C live repair, run 37544234331: the weak fallback model emits
+    schema-valid-intent verdicts with systematic formatting variance
+    (capitalized scopes like ``Book``, surrounding whitespace in ids,
+    hyphen/underscore confusion in ``conversation-glue``) that fail the
+    strict native/Pydantic enum and the ID-completeness gate, so the
+    verifier never serves and every ordinary turn clarifies. Normalization
+    is turn-independent hardening, never an exact-question special case:
+    the closed scope vocabulary, exact id matching (after trim), and the
+    cite/quote/checksum gates below stay strict; only case, surrounding
+    whitespace, and the hyphen/underscore separator are tolerated.
+    """
+    normalized: dict[str, Any] = dict(data)
+    raw_units = normalized.get("units")
+    if not isinstance(raw_units, list):
+        return normalized
+    fixed_units: list[Any] = []
+    for entry in raw_units:
+        if not isinstance(entry, dict):
+            fixed_units.append(entry)
+            continue
+        fixed = dict(entry)
+        unit_id = fixed.get("unit_id")
+        if isinstance(unit_id, str):
+            stripped = unit_id.strip()
+            fixed["unit_id"] = stripped
+        scope = fixed.get("scope")
+        if isinstance(scope, str):
+            cleaned = scope.strip().lower().replace("-", "_")
+            fixed["scope"] = cleaned
+        evidence_ids = fixed.get("evidence_passage_ids")
+        if isinstance(evidence_ids, list):
+            fixed["evidence_passage_ids"] = [
+                item.strip() if isinstance(item, str) else item for item in evidence_ids
+            ]
+        fixed_units.append(fixed)
+    normalized["units"] = fixed_units
+    return normalized
+
+
 def coerce_grounding_result(
     data: object,
     *,
@@ -188,7 +246,7 @@ def coerce_grounding_result(
         result = validate_grounding_result(data, expected_unit_ids=expected)
     elif isinstance(data, dict):
         try:
-            parsed = GroundingResult.model_validate(data)
+            parsed = GroundingResult.model_validate(_normalize_verifier_payload(data))
         except PydanticValidationError as exc:
             raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
         result = validate_grounding_result(parsed, expected_unit_ids=expected)
@@ -248,6 +306,7 @@ async def run_verifier(
 
 __all__ = [
     "VERIFIER_AGENT_V2",
+    "VERIFIER_MAX_EVIDENCE_PASSAGES",
     "build_verifier_user_text",
     "check_cited_passage_ids",
     "check_exact_quotes",
