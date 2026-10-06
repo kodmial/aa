@@ -16,7 +16,15 @@ from pydantic import BaseModel, Field
 
 ScopeName = Literal["book", "product_meta", "conversation_glue"]
 
-VERIFIER_MAX_ATTEMPTS = 2
+# Bounded native retry for one verifier call (Gate C live repair, run
+# 37538518277: p50 16.4s/p95 34.4s/max 42.7s over the 30s hard budget with
+# the verifier never served and all ordinary turns collapsed to generic
+# clarification). OpenCode owns this retry; AA code adds at most one more
+# id-completeness retry in turn_pipeline. Two server retries plus the
+# AA-side retry burned up to six slow fallback model calls per flaky turn.
+# One server retry halves the worst-case verifier latency while the
+# AA-side strict Pydantic + completeness gate stays unchanged.
+VERIFIER_MAX_ATTEMPTS = 1
 
 
 class UnitVerdict(BaseModel):
@@ -53,17 +61,25 @@ def verifier_json_schema() -> dict[str, object]:
     for the same reason. AA-side validation stays strict Pydantic
     (``validate_grounding_result`` with ``extra=forbid`` and ID
     completeness); this native schema is only the OpenCode transport hint.
+
+    The transport hint is additionally minimal on purpose (Gate C run
+    37538518277): ``minLength``/``minItems`` are omitted because weak
+    fallback providers reject or flake on length constraints while the
+    same constraints stay enforced in AA code (Pydantic ``min_length`` /
+    ``min_length`` plus the exactly-one-verdict-per-unit completeness
+    gate). ``enum`` and ``required`` stay because they are the essential
+    guidance a weak model needs to emit a schema-valid verdict on the
+    first try instead of burning retry cycles.
     """
     return {
         "type": "object",
         "properties": {
             "units": {
                 "type": "array",
-                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "unit_id": {"type": "string", "minLength": 1},
+                        "unit_id": {"type": "string"},
                         "scope": {
                             "type": "string",
                             "enum": ["book", "product_meta", "conversation_glue"],
