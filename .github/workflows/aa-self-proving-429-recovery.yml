@@ -66,19 +66,46 @@ jobs:
               });
               return;
             }
+            const { data: main } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main',
+            });
+            const currentMain = String(main.commit && main.commit.sha || '');
+            if (!currentMain) {
+              core.setFailed('Cannot resolve current main SHA for 429 recovery.');
+              return;
+            }
+            if (currentMain !== sha) {
+              core.info(
+                `Failed 429 run is stale (${sha.slice(0, 12)}); qualifying current main ${currentMain.slice(0, 12)} instead.`
+              );
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentMain },
+              });
+              return;
+            }
+            const delaySeconds = Math.min(300, 5 * (2 ** Math.min(Math.max(attempt - 1, 0), 6)));
+            core.info(`Provider 429 backoff: waiting ${delaySeconds}s before fresh-VM recovery.`);
+            await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
             if (attempt < 10) {
-              core.info(`Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`);
+              core.info(
+                `Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`
+              );
               await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: runId });
               return;
             }
-            // GitHub caps re-runs. Continue convergence ownerlessly by
-            // dispatching a fresh exact-SHA qualification run instead of
-            // entering a terminal paused/human-required state.
-            core.info(`Provider 429 persisted through ${attempt} attempts; dispatching a fresh qualification run.`);
+            // GitHub caps re-runs. Continue convergence ownerlessly on the
+            // exact current main instead of entering a terminal pause.
+            core.info(
+              `Provider 429 persisted through ${attempt} attempts; dispatching a fresh exact-main qualification run.`
+            );
             await github.rest.actions.createWorkflowDispatch({
               owner,
               repo,
               workflow_id: 'aa-self-proving-qualification.yml',
               ref: 'main',
-              inputs: { required_sha: sha },
+              inputs: { required_sha: currentMain },
             });
