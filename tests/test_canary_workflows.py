@@ -14,9 +14,15 @@ def test_canary_runs_every_four_hours_only_after_final_qualification() -> None:
     text = _read("aa-canary.yml")
     assert 'cron: "17 */4 * * *"' in text
     assert "workflow_dispatch:" in text
-    assert "issue_number: 80" in text
-    assert "issue.state === 'closed'" in text
-    assert "issue.state_reason === 'completed'" in text
+    # Final qualification gate is capability #6 plus exact-main
+    # qualification #7 (commit ff43249). Legacy #80 is superseded and must
+    # never activate the canary, so no activation may reference it.
+    assert "issue_number: 6" in text
+    assert "issue_number: 7" in text
+    assert "issue_number: 80" not in text
+    assert "capability.state === 'closed'" in text
+    assert "qualification.state === 'closed'" in text
+    assert "state_reason === 'completed'" in text
     assert "needs: activation" in text
     assert "needs.activation.outputs.active == 'true'" in text
     assert "canary stays inactive" in text

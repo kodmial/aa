@@ -413,7 +413,7 @@ jobs:
           {
             echo "## AA canary"
             echo
-            echo "- final activation gate: qualification #80 completed"
+            echo "- final activation gate: capability #6 and exact-main qualification #7 completed"
             echo "- repository verification: executed"
             echo "- real local OpenCode server lifecycle: executed"
             echo "- Gate C smoke (exact production path, scenario families, diversity): executed"
