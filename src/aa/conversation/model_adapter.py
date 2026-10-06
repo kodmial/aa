@@ -331,12 +331,24 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-            if isinstance(last_transient, OpenCodeProviderAccessError):
+            primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
+            if primary_access_rejected:
                 self._record_primary_rejection()
             logger.info("opencode model fallback used")
-            return await self._invoke_ephemeral(
-                prompt, model=self.fallback_model, agent=self.agent, system=system
-            )
+            try:
+                return await self._invoke_ephemeral(
+                    prompt, model=self.fallback_model, agent=self.agent, system=system
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeProviderAccessError,
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+            ):
+                if primary_access_rejected:
+                    self._clear_primary_rejection()
+                raise
         if last_transient is not None:
             raise last_transient
         raise OpenCodeProviderAccessError("opencode primary model access rejected")
@@ -413,17 +425,29 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-            if isinstance(last_transient, OpenCodeProviderAccessError):
+            primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
+            if primary_access_rejected:
                 self._record_primary_rejection()
             logger.info("opencode model fallback used")
-            return await self._invoke_ephemeral_structured(
-                prompt,
-                system=system,
-                schema=schema,
-                model=self.fallback_model,
-                agent=self.agent,
-                retry_count=retry_count,
-            )
+            try:
+                return await self._invoke_ephemeral_structured(
+                    prompt,
+                    system=system,
+                    schema=schema,
+                    model=self.fallback_model,
+                    agent=self.agent,
+                    retry_count=retry_count,
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeProviderAccessError,
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+            ):
+                if primary_access_rejected:
+                    self._clear_primary_rejection()
+                raise
         if last_transient is not None:
             raise last_transient
         raise OpenCodeProviderAccessError("opencode primary model access rejected")
