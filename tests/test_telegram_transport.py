@@ -453,7 +453,11 @@ async def test_application_new_command_resets_only_that_chat() -> None:
     app = Application(Settings.from_env({}), transport=transport, opencode_runtime=runtime)
     await app.start()
     try:
-        await _wait_for(lambda: len(api.sent_payloads) == 4)
+        # Bounded delivery wait is 10s (not 2s): same-SHA CI run 37542216087
+        # passed while 37542222739 timed out waiting for 4 concurrent turns.
+        # Precedent is tests/test_telegram_concurrency.py (5-10s for 2-4
+        # payloads). Assertions below are unchanged.
+        await _wait_for(lambda: len(api.sent_payloads) == 4, timeout=10.0)
         # Cross-chat completion order is intentionally concurrent (issue #5);
         # assert per-chat FIFO and isolation instead of a global order.
         by_chat: dict[int, list[str]] = {}
