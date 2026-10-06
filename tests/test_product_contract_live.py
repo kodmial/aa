@@ -17,6 +17,7 @@ import pytest
 from aa.qualification.product_contract_live import (
     EXIT_BY_STATUS,
     ProductContractLiveError,
+    _count_stage_outcomes,
     assert_no_text_leak,
     build_result_marker,
     collect_static_gates,
@@ -293,3 +294,50 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
         (tmp_path / "product-contract-live-summary.json").read_text(encoding="utf-8")
     )
     assert_no_text_leak(summary)
+
+
+def test_count_stage_outcomes_aggregates_fixed_vocabularies() -> None:
+    # Gate C repair diagnostics (issue #168): per-stage outcome histograms
+    # must attribute a live collapse to the concrete stage without
+    # carrying any prompt, reply, or evidence text.
+    snapshots = [
+        {
+            "planner_outcome": "ok",
+            "retrieval_outcome": "evidence-ready",
+            "answer_outcome": "served",
+            "verifier_outcome": "passed",
+        },
+        {
+            "planner_outcome": "ok",
+            "retrieval_outcome": "evidence-ready",
+            "answer_outcome": "clarification",
+            "verifier_outcome": "unsupported",
+        },
+        {
+            "planner_outcome": "empty",
+            "retrieval_outcome": "skipped-glue",
+            "answer_outcome": "clarification",
+            "verifier_outcome": "unavailable",
+        },
+    ]
+    counts = _count_stage_outcomes(snapshots)
+    assert counts["planner_outcome"] == {"ok": 2, "empty": 1}
+    assert counts["retrieval_outcome"] == {"evidence-ready": 2, "skipped-glue": 1}
+    assert counts["answer_outcome"] == {"served": 1, "clarification": 2}
+    assert counts["verifier_outcome"] == {"passed": 1, "unsupported": 1, "unavailable": 1}
+    assert_no_text_leak(counts)
+
+
+def test_count_stage_outcomes_ignores_malformed_snapshots() -> None:
+    counts = _count_stage_outcomes(
+        [
+            {"planner_outcome": "ok"},
+            "not-a-snapshot",  # type: ignore[list-item]
+            {"planner_outcome": "", "retrieval_outcome": "  "},
+            {},
+        ]
+    )
+    assert counts["planner_outcome"] == {"ok": 1}
+    assert counts["retrieval_outcome"] == {}
+    assert counts["answer_outcome"] == {}
+    assert counts["verifier_outcome"] == {}
