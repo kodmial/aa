@@ -1313,6 +1313,12 @@ def _gate_c_live_evidence(
                 ]
                 if not _union_has_distinct_stage_cover(names):
                     complete = False
+                # Trusted Gate C PASS additionally requires explicit proof
+                # that at least one live lane entered through raw Bot API
+                # Update JSON at the production PollingTelegramTransport
+                # boundary. Direct Application.respond() evidence is invalid.
+                if "live-raw-telegram-transport-boundary" not in names:
+                    complete = False
             if complete:
                 return (
                     GateEvidence(
