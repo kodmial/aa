@@ -603,7 +603,9 @@ def decide_reconcile(
     )
 
 
-def runtime_phase(*, pending_dispatch: bool, runtime_active: bool, stopped: bool) -> str:
+def runtime_phase(
+    *, pending_dispatch: bool, runtime_active: bool, stopped: bool, has_ready: bool = False
+) -> str:
     """Return the explicit runtime phase for ``/bot status``.
 
     ``STARTING`` means a dispatch is committed but no live poller has
@@ -613,10 +615,12 @@ def runtime_phase(*, pending_dispatch: bool, runtime_active: bool, stopped: bool
     expired and idle states. The phase carries only lifecycle state,
     never message or prompt content.
     """
-    if pending_dispatch and not runtime_active:
-        return "STARTING"
-    if runtime_active and not stopped:
+    if stopped:
+        return "STOPPED"
+    if runtime_active and has_ready:
         return "READY"
+    if runtime_active or pending_dispatch:
+        return "STARTING"
     return "STOPPED"
 
 
@@ -677,7 +681,10 @@ def status_snapshot(
         "expired": campaign_is_expired(now, generation.accepted_at),
         "runtime_active": runtime_active,
         "runtime_phase": runtime_phase(
-            pending_dispatch=pending, runtime_active=runtime_active, stopped=stopped
+            pending_dispatch=pending,
+            runtime_active=runtime_active,
+            stopped=stopped,
+            has_ready=has_ready,
         ),
         "has_ready": has_ready,
         "usable_poller": usable_poller_active(runtime_active=runtime_active, has_ready=has_ready),

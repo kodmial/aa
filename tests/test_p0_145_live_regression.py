@@ -269,7 +269,14 @@ async def test_runtime_publishes_starting_ready_stopped() -> None:
 
 def test_bot_status_distinguishes_starting_vs_ready() -> None:
     assert runtime_phase(pending_dispatch=True, runtime_active=False, stopped=False) == "STARTING"
-    assert runtime_phase(pending_dispatch=False, runtime_active=True, stopped=False) == "READY"
+    assert (
+        runtime_phase(pending_dispatch=False, runtime_active=True, stopped=False, has_ready=True)
+        == "READY"
+    )
+    assert (
+        runtime_phase(pending_dispatch=False, runtime_active=True, stopped=False, has_ready=False)
+        == "STARTING"
+    )
     assert runtime_phase(pending_dispatch=False, runtime_active=False, stopped=False) == "STOPPED"
     assert runtime_phase(pending_dispatch=False, runtime_active=True, stopped=True) == "STOPPED"
 
