@@ -25,6 +25,40 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const run = context.payload.workflow_run;
+
+            // Canary repair is post-qualification only. Ignore any stale,
+            // manual, or legacy canary failure while #6/#7 are not complete.
+            try {
+              const [{ data: capability }, { data: qualification }] = await Promise.all([
+                github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                }),
+                github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                }),
+              ]);
+              const qualified =
+                capability.state === 'closed' &&
+                capability.state_reason === 'completed' &&
+                qualification.state === 'closed' &&
+                qualification.state_reason === 'completed';
+              if (!qualified) {
+                core.info(
+                  `AA canary repair suppressed before final qualification: #6=${capability.state}/${capability.state_reason || 'none'}, #7=${qualification.state}/${qualification.state_reason || 'none'}.`
+                );
+                return;
+              }
+            } catch (error) {
+              core.warning(
+                `Unable to verify #6/#7; suppressing canary repair fail-closed: ${error.message}`
+              );
+              return;
+            }
+
             const actionable = new Set([
               'failure',
               'timed_out',
