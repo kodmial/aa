@@ -440,8 +440,8 @@ jobs:
           OPENCODE_COMMAND: opencode
           OPENCODE_WORKDIR: .
           OPENCODE_AGENT: aa
-          OPENCODE_MODEL: opencode/space-bunny-free
-          OPENCODE_FALLBACK_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
           OPENCODE_CONTEXT_LIMIT_TOKENS: "200000"
           GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
