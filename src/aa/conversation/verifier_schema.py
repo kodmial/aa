@@ -42,8 +42,45 @@ class VerifierValidationError(ValueError):
 
 
 def verifier_json_schema() -> dict[str, object]:
-    """Derive the native OpenCode JSON Schema from the Pydantic model."""
-    return dict(GroundingResult.model_json_schema())
+    """Build the native OpenCode JSON Schema for the verifier.
+
+    The schema is flattened and ``$ref``-free on purpose (Gate C live
+    repair): the raw Pydantic ``model_json_schema()`` emits ``$defs`` plus
+    ``$ref`` for the nested ``UnitVerdict`` model, and weak fallback
+    providers reject or flake on ``$ref`` (verifier never served, all
+    ordinary turns collapsing to generic clarification with slow internal
+    retries). The planner already uses a flat ``$ref``-free native schema
+    for the same reason. AA-side validation stays strict Pydantic
+    (``validate_grounding_result`` with ``extra=forbid`` and ID
+    completeness); this native schema is only the OpenCode transport hint.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "units": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "unit_id": {"type": "string", "minLength": 1},
+                        "scope": {
+                            "type": "string",
+                            "enum": ["book", "product_meta", "conversation_glue"],
+                        },
+                        "supported": {"type": "boolean"},
+                        "evidence_passage_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["unit_id", "scope", "supported"],
+                },
+            },
+            "all_required_supported": {"type": "boolean"},
+        },
+        "required": ["units", "all_required_supported"],
+    }
 
 
 def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> GroundingResult:

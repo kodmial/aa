@@ -108,6 +108,23 @@ jobs:
             sleep $((attempt * 10))
           done
 
+      - name: Install system voice media dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gate C live voice end-to-end (GigaAM ASR decode + Silero TTS
+          # OGG/Opus encode) shells out to system ffmpeg. Ubuntu runners do
+          # not preinstall it, so every Gate C run failed
+          # live-voice-fixture-synthesis-encode-failed with no voice
+          # end-to-end evidence. Install once so all gates share it.
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already present: $(ffmpeg -version | head -n 1)"
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
       - name: Restore gate checkpoints from previous attempt
         # RUNNER_TEMP is ephemeral per runner, so a 429 runner retire would
         # otherwise lose completed-gate checkpoints. Persist them as a
