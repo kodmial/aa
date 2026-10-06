@@ -1738,48 +1738,71 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             if voice_ok:
                 tts = app._tts_pipeline
                 assert tts is not None
-                api.voice_fixture = await tts.synthesize_voice_ogg(
-                    "Мне сегодня трудно не пить", "xenia"
-                )
-                before_voice = api.sent_voices
-                before_text = len(api.sent_texts)
-                before_download = api.download_count
-                raw_voice = {
-                    "update_id": 940001,
-                    "message": {
-                        "message_id": 100,
-                        "date": 1,
-                        "chat": {"id": 920007, "type": "private"},
-                        "voice": {
-                            "file_id": "qualification-voice-fixture",
-                            "duration": 4,
-                            "file_size": len(api.voice_fixture),
+                # Gate C live repair (run 37530425848): fixture synthesis
+                # raised into generic live-production-telegram-harness with
+                # voice_end_to_end_ms 0.0 and no voice end-to-end checks,
+                # hiding whether ASR/TTS/encoding failed. Attribute a
+                # synthesis/encoding failure to its concrete voice component
+                # (bounded categories only) instead of the generic harness.
+                try:
+                    api.voice_fixture = await tts.synthesize_voice_ogg(
+                        "Мне сегодня трудно не пить", "xenia"
+                    )
+                except Exception as fixture_exc:
+                    from aa.telegram.tts import TtsError as _LiveTtsError
+
+                    if isinstance(fixture_exc, _LiveTtsError):
+                        failed.append(f"live-voice-fixture-synthesis-{fixture_exc.category}")
+                    else:
+                        failed.append("live-voice-fixture-synthesis")
+                    voice_elapsed = 0.0
+                    _check("live-voice-raw-transport-accepted", False)
+                    _check("live-voice-file-fetch-seam", False)
+                    _check("live-voice-asr-answer-sendvoice", False)
+                    # Skip the voice delivery wait; the outer finally still
+                    # stops the app and the lane fails with the concrete
+                    # voice component above, never the generic harness.
+                    voice_ok = False
+                if voice_ok:
+                    before_voice = api.sent_voices
+                    before_text = len(api.sent_texts)
+                    before_download = api.download_count
+                    raw_voice = {
+                        "update_id": 940001,
+                        "message": {
+                            "message_id": 100,
+                            "date": 1,
+                            "chat": {"id": 920007, "type": "private"},
+                            "voice": {
+                                "file_id": "qualification-voice-fixture",
+                                "duration": 4,
+                                "file_size": len(api.voice_fixture),
+                            },
                         },
-                    },
-                }
-                before_received = len(transport.received)
-                voice_started = time.perf_counter()
-                api.pending_updates.append(raw_voice)
-                voice_deadline = loop.time() + 120.0
-                while (
-                    api.sent_voices <= before_voice
-                    and len(api.sent_texts) <= before_text
-                    and loop.time() < voice_deadline
-                ):
-                    await asyncio.sleep(0.02)
-                voice_elapsed = time.perf_counter() - voice_started
-                _check(
-                    "live-voice-raw-transport-accepted",
-                    len(transport.received) > before_received,
-                )
-                _check(
-                    "live-voice-file-fetch-seam",
-                    api.download_count > before_download,
-                )
-                _check(
-                    "live-voice-asr-answer-sendvoice",
-                    api.sent_voices > before_voice and len(api.sent_texts) == before_text,
-                )
+                    }
+                    before_received = len(transport.received)
+                    voice_started = time.perf_counter()
+                    api.pending_updates.append(raw_voice)
+                    voice_deadline = loop.time() + 120.0
+                    while (
+                        api.sent_voices <= before_voice
+                        and len(api.sent_texts) <= before_text
+                        and loop.time() < voice_deadline
+                    ):
+                        await asyncio.sleep(0.02)
+                    voice_elapsed = time.perf_counter() - voice_started
+                    _check(
+                        "live-voice-raw-transport-accepted",
+                        len(transport.received) > before_received,
+                    )
+                    _check(
+                        "live-voice-file-fetch-seam",
+                        api.download_count > before_download,
+                    )
+                    _check(
+                        "live-voice-asr-answer-sendvoice",
+                        api.sent_voices > before_voice and len(api.sent_texts) == before_text,
+                    )
             else:
                 voice_elapsed = 0.0
         finally:
