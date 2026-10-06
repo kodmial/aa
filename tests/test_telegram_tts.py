@@ -854,3 +854,79 @@ async def test_temp_audio_cleaned_after_voice_turn(tmp_path: Path) -> None:
         assert list(tmp_path.iterdir()) == []
     finally:
         await app.stop()
+
+
+def test_silero_missing_torch_package_fails_with_package_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate C regression: live voice-models-ready failed with TTS disabled.
+
+    `import torch` alone does not guarantee `torch.package` is loaded; the
+    synthesizer must import the submodule explicitly before using
+    `torch.package.PackageImporter`. When the submodule is unavailable the
+    failure must surface as `torch.package is not installed` (not a bare
+    AttributeError collapsed to generic construction failure).
+    """
+    import sys
+    import types
+
+    model_file = tmp_path / "v5_5_ru.pt"
+    model_file.write_bytes(b"fake-silero-bytes")
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = TORCH_VERSION  # type: ignore[attr-defined]
+    fake_torch.device = lambda name: name  # type: ignore[attr-defined]
+    # NOTE: deliberately not a package (no __path__) and no
+    # `torch.package` in sys.modules, so `import torch.package` raises
+    # ModuleNotFoundError (an ImportError).
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.delitem(sys.modules, "torch.package", raising=False)
+    monkeypatch.setattr("aa.telegram.tts.ensure_tts_model_file", lambda path: model_file)
+
+    synth = SileroSynthesizer(model_file)
+    with pytest.raises(TtsError) as excinfo:
+        synth.ensure_loaded()
+    assert excinfo.value.category == "tts-unavailable"
+    assert synth.load_error == "torch.package is not installed"
+
+
+def test_silero_ensure_loaded_succeeds_with_torch_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: explicit `torch.package` import enables model loading."""
+    import sys
+    import types
+
+    model_file = tmp_path / "v5_5_ru.pt"
+    model_file.write_bytes(b"fake-silero-bytes")
+
+    class _FakeModel:
+        def to(self, device: object) -> _FakeModel:
+            _ = device
+            return self
+
+        def eval(self) -> _FakeModel:
+            return self
+
+    class _FakeImporter:
+        def __init__(self, path: str) -> None:
+            _ = path
+
+        def load_pickle(self, package: str, resource: str) -> _FakeModel:
+            assert package == "tts_models"
+            assert resource == "model"
+            return _FakeModel()
+
+    fake_package = types.ModuleType("torch.package")
+    fake_package.PackageImporter = _FakeImporter  # type: ignore[attr-defined]
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = TORCH_VERSION  # type: ignore[attr-defined]
+    fake_torch.device = lambda name: name  # type: ignore[attr-defined]
+    fake_torch.package = fake_package  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.package", fake_package)
+    monkeypatch.setattr("aa.telegram.tts.ensure_tts_model_file", lambda path: model_file)
+
+    synth = SileroSynthesizer(model_file)
+    synth.ensure_loaded()
+    assert synth.available

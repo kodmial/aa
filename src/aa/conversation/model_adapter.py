@@ -61,14 +61,66 @@ MODEL_ACCESS_RETRY_DELAYS = (5.0,)
 
 # Persistent-403 circuit breaker (Gate C run 37504648482: p50 35s/p95 50s/max
 # 59s with 14 generic clarifications, all heartbeat checks failing on 2%
-# scheduling jitter, verifier never served). When the pinned primary is
-# rejected, every subsequent provider call in the same process would otherwise
-# burn another 5s sleep plus two slow primary attempts before reaching the
-# working fallback (15s of pure overhead per ordinary turn). Remember the
-# rejection briefly and fail over directly to the configured fallback on later
-# calls. The first failure still performs the required >=5s retry; the circuit
-# re-closes after the TTL so a recovered primary is retried.
+# scheduling jitter, verifier never served; Gate C run 37519360307: p50 17s/
+# p95 36s/max 45s with 14 clarifications and verifier never served). When the
+# pinned primary is rejected, every subsequent provider call in the same
+# process would otherwise burn another 5s sleep plus slow primary attempts
+# before reaching the working fallback. Remember the rejection briefly and
+# fail over directly to the configured fallback on later calls. The first
+# failure still performs the required >=5s retry; the circuit re-closes after
+# the TTL so a recovered primary is retried.
+#
+# The circuit is process-wide per primary model (not per agent instance):
+# planner/answer/verifier/summarizer share one OpenCode client in the live
+# graph, and a per-instance circuit would make every agent burn its own
+# primary retry on every turn (verifier never reaching fallback fast enough
+# to serve within the live SLO, answers collapsing to generic clarification).
 PRIMARY_ACCESS_CIRCUIT_TTL_S = 300.0
+
+_PRIMARY_CIRCUIT: dict[str, float] = {}
+_CIRCUIT_LOCK = threading.Lock()
+
+
+def _circuit_key(primary_model: str) -> str:
+    """Return the process-wide circuit key for one pinned primary model."""
+    return (primary_model or "").strip()
+
+
+def _global_circuit_open(key: str) -> bool:
+    """Whether the shared circuit for ``key`` is currently open."""
+    if not key:
+        return False
+    with _CIRCUIT_LOCK:
+        rejected_at = _PRIMARY_CIRCUIT.get(key)
+    if rejected_at is None:
+        return False
+    try:
+        return (time.monotonic() - float(rejected_at)) < PRIMARY_ACCESS_CIRCUIT_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
+def _global_circuit_record(key: str) -> float:
+    """Open the shared circuit for ``key`` and return the timestamp."""
+    now = time.monotonic()
+    if key:
+        with _CIRCUIT_LOCK:
+            _PRIMARY_CIRCUIT[key] = now
+    return now
+
+
+def _global_circuit_clear(key: str) -> None:
+    """Close the shared circuit for ``key`` (primary recovered)."""
+    if not key:
+        return
+    with _CIRCUIT_LOCK:
+        _PRIMARY_CIRCUIT.pop(key, None)
+
+
+def clear_primary_circuit() -> None:
+    """Close all shared primary circuits (tests only)."""
+    with _CIRCUIT_LOCK:
+        _PRIMARY_CIRCUIT.clear()
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -181,17 +233,33 @@ class OpenCodeChatModel(BaseChatModel):
         return self._client
 
     def with_agent(self, agent: str) -> OpenCodeChatModel:
-        """Return a copy of this model bound to another named agent."""
-        return OpenCodeChatModel(
+        """Return a copy of this model bound to another named agent.
+
+        The process-wide primary circuit is shared: a new agent bound after
+        the primary was rejected fast-fallbacks immediately instead of
+        burning its own primary retry per turn.
+        """
+        nxt = OpenCodeChatModel(
             self._client,
             agent=agent,
             primary_model=self.primary_model,
             fallback_model=self.fallback_model,
             request_timeout=self.request_timeout,
         )
+        try:
+            key = _circuit_key(self.primary_model)
+            with _CIRCUIT_LOCK:
+                shared_at = _PRIMARY_CIRCUIT.get(key)
+            if shared_at is not None:
+                nxt._primary_access_rejected_at = float(shared_at)
+        except Exception:
+            pass
+        return nxt
 
     def _primary_circuit_open(self) -> bool:
         """Whether the primary was recently rejected (fast fallback allowed)."""
+        if _global_circuit_open(_circuit_key(self.primary_model)):
+            return True
         rejected_at = self._primary_access_rejected_at
         if rejected_at is None:
             return False
@@ -203,12 +271,20 @@ class OpenCodeChatModel(BaseChatModel):
     def _record_primary_rejection(self) -> None:
         """Remember a persistent primary 403 to skip redundant retries."""
         try:
-            self._primary_access_rejected_at = time.monotonic()
+            now = _global_circuit_record(_circuit_key(self.primary_model))
+        except Exception:
+            now = 0.0
+        try:
+            self._primary_access_rejected_at = now
         except Exception:
             self._primary_access_rejected_at = 0.0
 
     def _clear_primary_rejection(self) -> None:
         """Clear the circuit when the primary serves again."""
+        try:
+            _global_circuit_clear(_circuit_key(self.primary_model))
+        except Exception:
+            pass
         self._primary_access_rejected_at = None
 
     def _fast_fallback_available(self) -> bool:
@@ -490,6 +566,7 @@ __all__ = [
     "SUMMARIZER_AGENT_V2",
     "VERIFIER_AGENT_V2",
     "OpenCodeChatModel",
+    "clear_primary_circuit",
     "render_messages_text",
     "split_system_and_user",
 ]
