@@ -113,6 +113,8 @@ class GraphTurnRuntime:
         self._running = False
         ctx, self._checkpointer_ctx = self._checkpointer_ctx, None
         self._checkpointer = None
+        if self._factory is not None:
+            self._graph = None
         if ctx is not None:
             try:
                 await ctx.__aexit__(None, None, None)
