@@ -1,43 +1,19 @@
-"""AA conversation package (issue #9).
+"""AA conversation package (issue #118 cutover).
 
-Deterministic Russian-first grounded conversational runtime. The
-orchestrator state machine lives in :mod:`aa.conversation.orchestrator`.
+The LangGraph runtime under :mod:`aa.conversation.graph`,
+:mod:`aa.conversation.graph_runtime`, :mod:`aa.conversation.planner_node`,
+:mod:`aa.conversation.retrieval_node` and
+:mod:`aa.conversation.turn_pipeline` is the only ordinary conversational
+path in production.
+
+The retired ``aa.conversation.orchestrator`` / ``aa.conversation.meta``
+modules remain on disk for offline qualification history only. They are
+deliberately not imported here so production processes (``aa.app`` and
+the LangGraph turn graph) never load the obsolete router, planner tables,
+or fail-closed path. Import those modules directly only from offline
+evaluation tooling, never from production code.
 """
 
 from __future__ import annotations
 
-from aa.conversation.orchestrator import (
-    COVERAGE_SCHEMA_VERSION,
-    FAIL_CLOSED_REPLY,
-    RUNTIME_VERSION,
-    SUPPORT_SCHEMA_VERSION,
-    AnswerUnit,
-    CoverageResult,
-    EvidencePack,
-    GroundedResponse,
-    ResponseUnit,
-    TurnDiagnostics,
-    TurnFailed,
-    build_local_plan_payload,
-    is_substantive,
-    validate_coverage_payload,
-    validate_support_payload,
-)
-
-__all__ = [
-    "FAIL_CLOSED_REPLY",
-    "COVERAGE_SCHEMA_VERSION",
-    "RUNTIME_VERSION",
-    "SUPPORT_SCHEMA_VERSION",
-    "AnswerUnit",
-    "CoverageResult",
-    "EvidencePack",
-    "GroundedResponse",
-    "ResponseUnit",
-    "TurnDiagnostics",
-    "TurnFailed",
-    "build_local_plan_payload",
-    "is_substantive",
-    "validate_coverage_payload",
-    "validate_support_payload",
-]
+__all__: list[str] = []

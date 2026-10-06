@@ -598,6 +598,12 @@ async def test_polling_transport_send_voice_uses_sendvoice() -> None:
 
 
 async def test_voice_input_delivers_russian_sendvoice(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись. Приходи."
+
     transport = StubTelegramTransport()
     pipeline, _, _ = _pipeline(work_parent=tmp_path)
     app = Application(
@@ -606,16 +612,11 @@ async def test_voice_input_delivers_russian_sendvoice(tmp_path: Path) -> None:
         opencode_runtime=_stub_runtime(),
         voice_pipeline=_FakeVoicePipeline("привет"),  # type: ignore[arg-type]
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
         assert app.tts_available
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            assert voice_mode is True
-            return "Привет. Держись. Приходи."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         incoming = _voice_incoming(chat_id=77)
         await app._process_dispatched_update(incoming)
         assert len(transport.sent_voices) == 1
@@ -626,6 +627,12 @@ async def test_voice_input_delivers_russian_sendvoice(tmp_path: Path) -> None:
 
 
 async def test_text_input_stays_text_with_tts_wired(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     transport = StubTelegramTransport()
     pipeline, synth, _ = _pipeline(work_parent=tmp_path)
     app = Application(
@@ -633,15 +640,10 @@ async def test_text_input_stays_text_with_tts_wired(tmp_path: Path) -> None:
         transport=transport,
         opencode_runtime=_stub_runtime(),
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            assert voice_mode is False
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         incoming = TelegramIncoming(
             update_id=60, chat_id=80, message_id=1, text="привет", command=None
         )
@@ -654,6 +656,12 @@ async def test_text_input_stays_text_with_tts_wired(tmp_path: Path) -> None:
 
 
 async def test_tts_failure_falls_back_to_text(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись. Приходи."
+
     transport = StubTelegramTransport()
     pipeline, _, _ = _pipeline(synthesizer=FakeSynthesizer(fail=True), work_parent=tmp_path)
     app = Application(
@@ -662,14 +670,10 @@ async def test_tts_failure_falls_back_to_text(tmp_path: Path) -> None:
         opencode_runtime=_stub_runtime(),
         voice_pipeline=_FakeVoicePipeline("привет"),  # type: ignore[arg-type]
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            return "Привет. Держись. Приходи."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=81))
         assert len(transport.sent_voices) == 0
         assert len(transport.sent) == 1
@@ -679,6 +683,12 @@ async def test_tts_failure_falls_back_to_text(tmp_path: Path) -> None:
 
 
 async def test_encoder_failure_falls_back_to_text(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись. Приходи."
+
     transport = StubTelegramTransport()
     pipeline, _, _ = _pipeline(encoder=FakeEncoder(fail=True), work_parent=tmp_path)
     app = Application(
@@ -687,14 +697,10 @@ async def test_encoder_failure_falls_back_to_text(tmp_path: Path) -> None:
         opencode_runtime=_stub_runtime(),
         voice_pipeline=_FakeVoicePipeline("привет"),  # type: ignore[arg-type]
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            return "Привет. Держись. Приходи."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=82))
         assert len(transport.sent_voices) == 0
         assert len(transport.sent) == 1
@@ -703,21 +709,23 @@ async def test_encoder_failure_falls_back_to_text(tmp_path: Path) -> None:
 
 
 async def test_voice_unavailable_falls_back_to_text() -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     transport = StubTelegramTransport()
     app = Application(
         _settings(),
         transport=transport,
         opencode_runtime=_stub_runtime(),
         tts_pipeline=None,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
         assert not app.tts_available
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=83))
         assert len(transport.sent_voices) == 0
         assert len(transport.sent) == 1
@@ -764,24 +772,27 @@ async def test_emergency_voice_is_not_truncated_and_still_voiced(tmp_path: Path)
 
 
 async def test_voice_turn_never_logs_reply_or_audio(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
     stream = io.StringIO()
     aa_logging.configure_logging("INFO", stream=stream)
     secret = "секретный голосовой ответ трезвость"
     transport = StubTelegramTransport()
     pipeline, _, _ = _pipeline(work_parent=tmp_path)
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return secret + ". Держись."
+
     app = Application(
         _settings(),
         transport=transport,
         opencode_runtime=_stub_runtime(),
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            return secret + ". Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         incoming = TelegramIncoming(
             update_id=61,
             chat_id=81,
@@ -821,6 +832,12 @@ async def test_injected_tts_pipeline_loads_once_and_reused() -> None:
 
 
 async def test_temp_audio_cleaned_after_voice_turn(tmp_path: Path) -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     transport = StubTelegramTransport()
     pipeline, _, _ = _pipeline(work_parent=tmp_path)
     app = Application(
@@ -829,14 +846,10 @@ async def test_temp_audio_cleaned_after_voice_turn(tmp_path: Path) -> None:
         opencode_runtime=_stub_runtime(),
         voice_pipeline=_FakeVoicePipeline("привет"),  # type: ignore[arg-type]
         tts_pipeline=pipeline,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=90))
         assert list(tmp_path.iterdir()) == []
     finally:

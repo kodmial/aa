@@ -22,6 +22,7 @@ DEFAULT_FALLBACK_MODEL = "opencode/muse-spark-1.3-contributor-free"
 # so the worker cannot overload OpenCode/provider/runtime resources.
 DEFAULT_MAX_CONCURRENT_TURNS = 4
 DEFAULT_PER_CHAT_QUEUE_SIZE = 8
+DEFAULT_TYPING_HEARTBEAT_SECONDS = 4.0
 
 
 def _get_str(name: str, default: str) -> str:
@@ -94,6 +95,11 @@ class Settings:
     max_concurrent_turns: int = DEFAULT_MAX_CONCURRENT_TURNS
     per_chat_queue_size: int = DEFAULT_PER_CHAT_QUEUE_SIZE
 
+    # Telegram typing heartbeat cadence (issue #118, #112 UI contract):
+    # the independent ``sendChatAction(typing)`` refresh interval while an
+    # ordinary turn is being processed. Must stay positive.
+    typing_heartbeat_seconds: float = DEFAULT_TYPING_HEARTBEAT_SECONDS
+
     # Local Russian voice recognition (issue #76): filesystem directory
     # holding the pinned GigaAM model files. The recognizer is loaded once
     # per worker; voice capability fails closed when unavailable.
@@ -131,6 +137,7 @@ class Settings:
             "OPENCODE_MAX_OUTPUT_TOKENS",
             "MAX_CONCURRENT_TURNS",
             "PER_CHAT_QUEUE_SIZE",
+            "TYPING_HEARTBEAT_SECONDS",
             "AA_VOICE_MODEL_DIR",
             "AA_TTS_MODEL_PATH",
             "AA_VOICE_PRESENTATION_MODEL_PATH",
@@ -166,6 +173,9 @@ class Settings:
                 per_chat_queue_size=int(
                     source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
                 ),
+                typing_heartbeat_seconds=float(
+                    source.get("TYPING_HEARTBEAT_SECONDS", "") or DEFAULT_TYPING_HEARTBEAT_SECONDS
+                ),
                 aa_voice_model_dir=_get_str("AA_VOICE_MODEL_DIR", "./models/gigaam"),
                 aa_tts_model_path=_get_str("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
                 aa_voice_presentation_model_path=_get_str(
@@ -194,6 +204,9 @@ class Settings:
             ),
             per_chat_queue_size=int(
                 source.get("PER_CHAT_QUEUE_SIZE", "") or DEFAULT_PER_CHAT_QUEUE_SIZE
+            ),
+            typing_heartbeat_seconds=float(
+                source.get("TYPING_HEARTBEAT_SECONDS", "") or DEFAULT_TYPING_HEARTBEAT_SECONDS
             ),
             aa_voice_model_dir=source.get("AA_VOICE_MODEL_DIR", "./models/gigaam"),
             aa_tts_model_path=source.get("AA_TTS_MODEL_PATH", "./models/tts/v5_5_ru.pt"),
@@ -233,6 +246,8 @@ class Settings:
             raise ValueError("MAX_CONCURRENT_TURNS must be > 0")
         if self.per_chat_queue_size <= 0:
             raise ValueError("PER_CHAT_QUEUE_SIZE must be > 0")
+        if self.typing_heartbeat_seconds <= 0:
+            raise ValueError("TYPING_HEARTBEAT_SECONDS must be > 0")
         if not self.aa_voice_model_dir.strip():
             raise ValueError("AA_VOICE_MODEL_DIR must not be empty")
         if not self.aa_tts_model_path.strip():
@@ -261,6 +276,7 @@ class Settings:
             "opencode_max_output_tokens": self.opencode_max_output_tokens,
             "max_concurrent_turns": self.max_concurrent_turns,
             "per_chat_queue_size": self.per_chat_queue_size,
+            "typing_heartbeat_seconds": self.typing_heartbeat_seconds,
             "aa_voice_model_dir": self.aa_voice_model_dir,
             "aa_tts_model_path": self.aa_tts_model_path,
             "aa_voice_presentation_model_path": self.aa_voice_presentation_model_path,

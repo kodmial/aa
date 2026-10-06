@@ -1,4 +1,10 @@
-"""Production-boundary regression fixtures and evaluator (issue #106).
+"""Offline production-boundary regression fixtures and evaluator (issue #106).
+
+Offline qualification history for the retired pre-#118 routing split
+(meta/capability vs grounded vs fail-closed via ``is_substantive``).
+The authoritative post-cutover production-boundary suite is the LangGraph
+cutover regression in ``tests/test_cutover_p0_5.py``; this module is not
+imported by production code.
 
 The qualification corpus must contain production-boundary fixtures for
 routing classes (meta/capability/identity, broad recovery, narrow
