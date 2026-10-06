@@ -339,6 +339,7 @@ jobs:
           PY
           python - <<'PY'
           import asyncio
+          import json
           import os
           import sys
           import time
@@ -347,6 +348,7 @@ jobs:
           from aa.app import create_application
           from aa.config import Settings
           from aa.control.runtime_status import RuntimeMarker, write_marker
+          from aa.opencode.errors import OpenCodeRateLimitError
           from aa.telegram.transport import PollingTelegramTransport
 
           async def _active_telegram_poller_running() -> bool:
@@ -390,6 +392,31 @@ jobs:
                   active = await _active_telegram_poller_running()
                   assert not active, "Gate D BLOCKED: owner runtime poller active; retry when idle to avoid getUpdates conflict"
                   await app.start()
+              except OpenCodeRateLimitError:
+                  failed = RuntimeMarker(
+                      run_id=run_id,
+                      sha=sha,
+                      phase="FAILED",
+                      timestamp_s=time.time(),
+                  )
+                  write_marker(out, failed)
+                  restart = Path("self-proving-out/restart-required.json")
+                  restart.parent.mkdir(parents=True, exist_ok=True)
+                  restart.write_text(
+                      json.dumps(
+                          {
+                              "reason_code": "OPENCODE_429_RESTART_REQUIRED",
+                              "sha": sha,
+                              "run_id": run_id,
+                              "gate": "D",
+                          },
+                          sort_keys=True,
+                          indent=2,
+                      )
+                      + "\n",
+                      encoding="utf-8",
+                  )
+                  raise SystemExit(75)
               except Exception as exc:
                   failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
                   write_marker(out, failed)
