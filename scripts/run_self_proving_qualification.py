@@ -233,6 +233,76 @@ def _fail_b(
     )
 
 
+def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
+    """Detect real second-stage reranker code (ignores comments/strings).
+
+    Substring search over source text false-positives on docstrings,
+    comments, or log strings and false-negatives on renamed wiring.
+    This inspects executable code only: AST import/name/attribute nodes
+    plus live module attributes and loaded reranker libraries. String
+    constants (docstrings, log messages) never trigger.
+    """
+
+    import ast
+    import sys
+
+    code_fragments = (
+        "bge",
+        "cross_encoder",
+        "crossencoder",
+        "sentence_transformers",
+        "flagembedding",
+        "rerank",
+    )
+
+    def _code_hit(name: str) -> bool:
+        lowered = name.lower()
+        if "cross-encoder" in lowered:
+            return True
+        return any(fragment in lowered for fragment in code_fragments)
+
+    try:
+        module_file = getattr(evidence_mod, "__file__", "")
+        tree = ast.parse(Path(str(module_file)).read_text(encoding="utf-8"))
+    except Exception:
+        raise
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _code_hit(alias.name or ""):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            if _code_hit(node.module or ""):
+                return True
+            for alias in node.names:
+                if _code_hit(alias.name or ""):
+                    return True
+        elif isinstance(node, ast.Name):
+            # Skip the local binding of the imported RRF primitive itself;
+            # presence of ``rrf_fuse`` is the expected RRF-only path.
+            if node.id == "rrf_fuse":
+                continue
+            if _code_hit(node.id or ""):
+                return True
+        elif isinstance(node, ast.Attribute):
+            if node.attr == "rrf_fuse":
+                continue
+            if _code_hit(node.attr or ""):
+                return True
+    for attr_name in dir(evidence_mod):
+        if attr_name in ("rrf_fuse",):
+            continue
+        if _code_hit(attr_name):
+            return True
+    for loaded in sys.modules:
+        lowered = str(loaded).lower()
+        if any(fragment in lowered for fragment in code_fragments):
+            return True
+        if "cross-encoder" in lowered:
+            return True
+    return False
+
+
 def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateEvidence:
     # Deterministic component integration through real production modules
     # (no network, no secrets). Any component failure names its component.
@@ -281,8 +351,7 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
             )
         import aa.retrieval.evidence as evidence_mod
 
-        source = Path(evidence_mod.__file__).read_text(encoding="utf-8").lower()
-        if "cross_encoder" in source or "bge-rerank" in source:
+        if _evidence_has_second_stage_reranker(evidence_mod):
             return _fail_b(
                 expected_sha,
                 run_id,
@@ -783,6 +852,7 @@ def _live_real_latencies_from_product_summary(payload: object) -> list[float] | 
     lanes = payload.get("lanes", [])
     if not isinstance(lanes, list):
         return None
+    collected: list[float] = []
     for lane in lanes:
         if not isinstance(lane, dict):
             continue
@@ -804,7 +874,7 @@ def _live_real_latencies_from_product_summary(payload: object) -> list[float] | 
                     continue
                 values = [v for v in values if v > 0]
                 if values:
-                    return values
+                    collected.extend(values)
         turns = lane.get("turns", None)
         if isinstance(turns, list) and turns:
             values: list[float] = []
@@ -821,7 +891,9 @@ def _live_real_latencies_from_product_summary(payload: object) -> list[float] | 
             else:
                 values = [v for v in values if v > 0]
                 if values:
-                    return values
+                    collected.extend(values)
+    if collected:
+        return collected
     return None
 
 
