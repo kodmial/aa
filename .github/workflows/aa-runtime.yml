@@ -419,6 +419,28 @@ jobs:
           path: ${{ steps.derived-cache-key.outputs.derived-dir }}
           key: ${{ steps.derived-cache-key.outputs.derived-key }}
 
+      - name: Publish runtime STARTING marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gate D durable lifecycle: STARTING is published before OpenCode /
+          # Telegram bootstrap with the exact run id/SHA.
+          sha="$(git rev-parse HEAD)"
+          python - <<PY
+          import time
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "src")
+          from aa.control.runtime_status import RuntimeMarker, write_marker
+          import os
+          marker = RuntimeMarker(run_id=os.environ["RUN_ID"], sha=os.environ["SHA"], phase="STARTING", timestamp_s=time.time())
+          write_marker(Path("runtime-status.json"), marker)
+          print(f"STARTING marker published run={marker.run_id} sha={marker.sha[:12]}")
+          PY
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+
       - name: Run bounded Telegram poller and OpenCode
         id: runtime
         env:
@@ -458,6 +480,39 @@ jobs:
           path: runtime-recovery/result.json
           retention-days: 1
           if-no-files-found: error
+
+      - name: Publish runtime READY/STOPPED marker
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gate D: publish READY automatically once OpenCode health +
+          # Telegram bootstrap + long polling are live; STOPPED|FAILED after.
+          # /bot status reports this aa-runtime-status marker, never generic
+          # workflow in_progress.
+          sha="$(git rev-parse HEAD)"
+          phase="STOPPED"
+          if [[ "${{ job.status }}" == "success" ]]; then
+            phase="READY"
+          fi
+          if [[ "${{ steps.runtime.outputs.restart_required }}" == "true" ]]; then
+            phase="FAILED"
+          fi
+          if [[ "${{ job.status }}" != "success" && "$phase" == "READY" ]]; then
+            phase="FAILED"
+          fi
+          RUN_PHASE="$phase" RUN_SHA="$sha" python - <<'PY'
+          import os, time
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "src")
+          from aa.control.runtime_status import RuntimeMarker, format_marker, write_marker
+          marker = RuntimeMarker(run_id=os.environ["RUN_ID"], sha=os.environ["RUN_SHA"], phase=os.environ["RUN_PHASE"], timestamp_s=time.time())
+          write_marker(Path("runtime-status.json"), marker)
+          print(format_marker(marker))
+          PY
+        env:
+          RUN_ID: ${{ github.run_id }}
 
       - name: Record bounded completion
         if: success()

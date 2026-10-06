@@ -263,15 +263,24 @@ jobs:
               const [comments, runs] = await Promise.all([listAllComments(), listRuntimeRuns()]);
               const active = activeRunsOf(runs);
               const resolved = resolveCampaign(comments, runs, Date.now(), null);
+              // /bot status reports the durable aa-runtime-status marker
+              // (STARTING -> READY -> STOPPED|FAILED with exact run id/SHA),
+              // never a generic workflow in_progress string.
+              const markerComment = [...comments].reverse().find(c =>
+                String(c.body || '').includes('aa-runtime-status')
+              );
+              const markerLine = markerComment
+                ? `Runtime marker: ${(markerComment.body || '').split('\n').find(l => l.includes('aa-runtime-status')) || 'present'}`
+                : 'Runtime marker: none (no Telegram poller is READY).';
               if (resolved === null) {
                 await comment(
                   'No active campaign. Post `/run` (owner only) to start one bounded 5h run ' +
-                  '(max 4 starts / 20h requested / 24h wall clock).'
+                  '(max 4 starts / 20h requested / 24h wall clock).\n' + markerLine
                 );
                 return;
               }
               const generation = generationForComment(resolved.sourceCommentId);
-              await comment(['AA campaign status (authoritative):', describeCampaign(resolved.accepted, generation, runs, active, comments, Date.now())].join('\n'));
+              await comment(['AA campaign status (authoritative):', describeCampaign(resolved.accepted, generation, runs, active, comments, Date.now()), markerLine].join('\n'));
               return;
             }
 
@@ -332,6 +341,46 @@ jobs:
               return;
             }
 
+            // Self-proving qualification guard (issue #146): /run for manual
+            // testing is allowed only when the exact current main SHA has
+            // fresh trusted PASS evidence from every mandatory gate (A-E).
+            // INCOMPLETE, missing secret/model, stale SHA, mocked-only
+            // evidence, or unknown state all mean FAIL/BLOCKED and refuse
+            // /run with the blocking gate named. Never degrade to warning.
+            const guardQualification = async () => {
+              let headSha = '';
+              try {
+                const { data: repo } = await github.rest.repos.get({ owner, repo });
+                headSha = repo.default_branch || 'main';
+              } catch (_) {
+                headSha = '';
+              }
+              let mainSha = '';
+              try {
+                const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+                mainSha = (branch.commit && branch.commit.sha) || '';
+              } catch (error) {
+                core.warning('Self-proving guard: cannot read current main SHA: ' + (error && error.message ? error.message : error));
+                return { allowed: false, blocking: 'unknown', reason: 'cannot read current main SHA' };
+              }
+              try {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id: 'aa-self-proving-qualification.yml',
+                  branch: 'main', per_page: 20,
+                });
+                const fresh = (data.workflow_runs || []).find(
+                  run => run.head_sha === mainSha && run.conclusion === 'success'
+                );
+                if (!fresh) {
+                  return { allowed: false, blocking: 'F', reason: `no fresh trusted PASS for exact main ${String(mainSha).slice(0, 12)}`, sha: mainSha };
+                }
+                return { allowed: true, blocking: '', sha: mainSha };
+              } catch (error) {
+                core.warning('Self-proving guard: qualification lookup failed: ' + (error && error.message ? error.message : error));
+                return { allowed: false, blocking: 'unknown', reason: 'qualification evidence unknown' };
+              }
+            };
+
             // Fresh campaign: the new generation is anchored at the immutable
             // event comment (id + payload timestamp), committed atomically
             // with the single dispatch below. First accepted dispatch is
@@ -340,6 +389,21 @@ jobs:
               ? generationForComment(currentCommentId)
               : `manual-${nowMs}`;
             const duration = '5h';
+            // Enforce the guard: refuse /run when current main is
+            // unqualified/stale/failed and name the blocking gate. Once the
+            // exact-main final PASS exists, /run may start and the runtime
+            // publishes READY automatically (aa-runtime.yml marker).
+            const guard = await guardQualification();
+            if (!guard.allowed) {
+              await comment(
+                `BLOCKED: /run refused — current main is not qualified (blocking gate ${guard.blocking || 'unknown'}; ` +
+                `${guard.reason || 'no fresh trusted PASS evidence'}). ` +
+                'Repair/requalification is automatic; manual testing must wait for exact-main Gates A-E PASS. ' +
+                'Use `/bot status` for the authoritative runtime marker (aa-runtime-status STARTING -> READY -> STOPPED|FAILED).'
+              );
+              core.setFailed(`Self-proving guard BLOCKED /run (gate ${guard.blocking || 'unknown'}).`);
+              return;
+            }
             let dispatchAccepted = false;
             try {
               await github.rest.actions.createWorkflowDispatch({

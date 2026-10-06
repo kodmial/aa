@@ -1,0 +1,471 @@
+"""Self-proving qualification contracts (issue #146, Gates A-F).
+
+Proves the non-negotiable invariant: ``/run`` is allowed only when the
+exact current ``main`` SHA holds fresh trusted PASS evidence from every
+mandatory gate. INCOMPLETE, missing secret/model, stale SHA, mocked-only
+evidence, or unknown state all mean FAIL/BLOCKED, never a warning.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from aa.control.runtime_status import (
+    RuntimeMarker,
+    format_marker,
+    parse_marker,
+    status_report,
+    transition_allowed,
+)
+from aa.conversation.stage_telemetry import (
+    TurnTelemetry,
+    evaluate_gate_c_telemetry,
+    evaluate_gate_e_telemetry,
+    record_stage,
+    reply_signature,
+)
+from aa.qualification.self_proving import (
+    CONTROL_ISSUE_NUMBER,
+    GATE_B_COMPONENTS,
+    GATE_C_STAGES,
+    ISSUE_NUMBER,
+    MANDATORY_GATES,
+    SCENARIO_FAMILIES,
+    FinalVerdict,
+    GateEvidence,
+    SelfProvingError,
+    assert_no_text_leak,
+    build_result_marker,
+    canary_scope,
+    decide_final_verdict,
+    diversity_passes,
+    effective_gate_status,
+    failure_report_for_gate,
+    find_reusable_repair,
+    heartbeat_continuity_ok,
+    is_429_restart,
+    is_run_allowed,
+    refusal_explanation,
+    repair_fingerprint,
+    rerun_plan,
+    retry_delay_403,
+    slo_guards,
+    validate_exact_sha,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHA = "a" * 40
+OTHER_SHA = "b" * 40
+PRODUCT = "c" * 64
+RUNTIME = "d" * 64
+
+
+def _pass_gate(gate: str, *, live: bool = False) -> GateEvidence:
+    return GateEvidence(
+        gate=gate,
+        status="PASS",
+        sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        run_id="run-1",
+        live_trusted=True
+        if gate in ("C", "D", "E") and live
+        else (gate not in ("C", "D", "E") or live),
+        mocked_only=False,
+    )
+
+
+def _verdict(statuses: dict[str, str]) -> FinalVerdict:
+    evidences = []
+    for gate in MANDATORY_GATES:
+        status = statuses.get(gate, "PASS")
+        live = gate in ("C", "D", "E")
+        evidences.append(
+            GateEvidence(
+                gate=gate,
+                status=status,
+                sha=SHA,
+                product_fingerprint=PRODUCT,
+                runtime_fingerprint=RUNTIME,
+                run_id="run-1",
+                failure_category="" if status == "PASS" else "test-failure",
+                component="test-component" if status != "PASS" else "",
+                live_trusted=live if status == "PASS" else False,
+                mocked_only=status != "PASS",
+            )
+        )
+    return decide_final_verdict(
+        evidences,
+        current_sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        run_id="run-1",
+    )
+
+
+def test_invariant_run_allowed_only_on_exact_main_pass() -> None:
+    verdict = _verdict({})
+    assert verdict.status == "PASS"
+    assert is_run_allowed(verdict, current_sha=SHA) is True
+    # Stale SHA blocks.
+    assert is_run_allowed(verdict, current_sha=OTHER_SHA) is False
+    # Missing verdict blocks.
+    assert is_run_allowed(None, current_sha=SHA) is False
+
+
+def test_incomplete_missing_stale_mocked_all_block() -> None:
+    for bad in ("INCOMPLETE", "STALE", "BLOCKED"):
+        verdict = _verdict({"C": bad})
+        assert verdict.status in ("FAIL", "BLOCKED")
+        assert is_run_allowed(verdict, current_sha=SHA) is False
+    verdict = _verdict({"D": "FAIL"})
+    assert verdict.status == "FAIL"
+    assert is_run_allowed(verdict, current_sha=SHA) is False
+    # Mocked-only PASS evidence blocks.
+    mocked = GateEvidence(gate="C", status="PASS", sha=SHA, run_id="r", mocked_only=True)
+    assert effective_gate_status(mocked, current_sha=SHA) == "BLOCKED"
+    # Live gates without live trust block.
+    untrusted = GateEvidence(gate="E", status="PASS", sha=SHA, run_id="r")
+    assert effective_gate_status(untrusted, current_sha=SHA) == "BLOCKED"
+    # Stale SHA blocks.
+    stale = GateEvidence(gate="A", status="PASS", sha=OTHER_SHA, run_id="r")
+    assert effective_gate_status(stale, current_sha=SHA) == "STALE"
+
+
+def test_unknown_status_never_warns() -> None:
+    with pytest.raises(SelfProvingError):
+        effective_gate_status(
+            GateEvidence(gate="A", status="MAYBE", sha=SHA, run_id="r"),
+            current_sha=SHA,
+        )
+    with pytest.raises(SelfProvingError):
+        validate_exact_sha("short")
+
+
+def test_gate_b_components_are_attributable() -> None:
+    assert len(GATE_B_COMPONENTS) >= 10
+    for component in (
+        "corpus-restore",
+        "retrieval-rrf",
+        "grounding",
+        "verifier",
+        "output-envelope",
+        "memory-fifo",
+        "safety",
+    ):
+        assert component in GATE_B_COMPONENTS
+
+
+def test_gate_c_stages_and_families_no_whitelist() -> None:
+    assert tuple(GATE_C_STAGES) == (
+        "application",
+        "dispatcher",
+        "langgraph",
+        "planner",
+        "retrieval",
+        "answer",
+        "verifier",
+        "delivery",
+    )
+    assert len(SCENARIO_FAMILIES) == 8
+    for family in (
+        "meta-capability",
+        "substantive-drinking",
+        "family-relationship",
+        "followup-ellipsis",
+        "topic-shift",
+        "unsupported-out-of-book",
+        "emergency",
+        "long-conversation",
+    ):
+        assert family in SCENARIO_FAMILIES
+    # Families are behavioral, not exact questions: no family id may look
+    # like a hardcoded user utterance.
+    for family in SCENARIO_FAMILIES:
+        assert "?" not in family
+        assert len(family) < 40
+
+
+def test_gate_c_diversity_catches_generic_fallback_collapse() -> None:
+    collapsed = [reply_signature("same generic clarification") for _ in range(3)]
+    ok, _ = diversity_passes(collapsed)
+    assert ok is False
+    diverse = [reply_signature(f"natural reply variant {i}") for i in range(3)]
+    ok, detail = diversity_passes(diverse)
+    assert ok is True
+    assert "distinct" in detail
+
+
+def _telemetry(family: str, signature: str, total_ms: float = 1200.0) -> TurnTelemetry:
+    turn = TurnTelemetry(family=family, reply_signature=signature, reply_len=42)
+    per = total_ms / 6.0
+    for stage in ("planner", "retrieval", "answer", "verifier", "repair", "delivery"):
+        record_stage(turn, stage=stage, ok=True, latency_ms=per)
+    return turn
+
+
+def test_gate_c_telemetry_requires_stages_and_diversity() -> None:
+    turns = [_telemetry(f"family-{i}", reply_signature(f"reply {i}")) for i in range(4)]
+    ok, _, metrics = evaluate_gate_c_telemetry(turns, required_families=4)
+    assert ok is True
+    assert metrics["turns"] == 4
+    collapsed = [_telemetry(f"family-{i}", reply_signature("same fallback")) for i in range(4)]
+    ok, detail, _ = evaluate_gate_c_telemetry(collapsed, required_families=4)
+    assert ok is False
+    assert "fallback" in detail
+
+
+def test_gate_e_slo_guard_rejects_pathological_latency() -> None:
+    # The runtime #37422302821 failure (~30-60s ordinary turns) must fail.
+    slow = [
+        _telemetry(f"family-{i}", reply_signature(f"reply {i}"), total_ms=45000.0) for i in range(2)
+    ]
+    ok, detail, metrics = evaluate_gate_e_telemetry(
+        slow, heartbeat_sends=12, heartbeat_interval_ms=4000.0
+    )
+    assert ok is False
+    assert "30000" in detail or "budget" in detail
+    assert metrics["max_ms"] >= 30000.0
+    fast = [
+        _telemetry(f"family-{i}", reply_signature(f"reply {i}"), total_ms=1200.0) for i in range(4)
+    ]
+    ok, _, metrics = evaluate_gate_e_telemetry(
+        fast, heartbeat_sends=4, heartbeat_interval_ms=4000.0
+    )
+    assert ok is True
+    assert metrics["p95_ms"] < 15000.0
+
+
+def test_gate_e_slo_helpers() -> None:
+    ok, _, metrics = slo_guards([1000.0, 1200.0, 1400.0])
+    assert ok is True
+    assert metrics["p50_ms"] > 0
+    ok, _, _ = slo_guards([])
+    assert ok is False
+    ok, _, _ = slo_guards([1000.0, 45000.0])
+    assert ok is False
+    ok, _ = heartbeat_continuity_ok(sends=3, duration_ms=9000.0, interval_ms=4000.0)
+    assert ok is True
+    ok, _ = heartbeat_continuity_ok(sends=0, duration_ms=9000.0, interval_ms=4000.0)
+    assert ok is False
+
+
+def test_gate_f_exact_main_no_stale_reuse() -> None:
+    verdict = _verdict({})
+    assert verdict.status == "PASS"
+    assert verdict.blocking_gate == ""
+    # Fingerprint mismatch blocks.
+    evidences = [
+        GateEvidence(
+            gate=gate,
+            status="PASS",
+            sha=SHA,
+            product_fingerprint=("f" * 64 if gate == "B" else PRODUCT),
+            runtime_fingerprint=RUNTIME,
+            run_id="run-1",
+            live_trusted=True,
+        )
+        for gate in MANDATORY_GATES
+    ]
+    verdict = decide_final_verdict(
+        evidences,
+        current_sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        run_id="run-1",
+    )
+    assert verdict.status == "BLOCKED"
+    assert verdict.blocking_gate == "B"
+    # Missing gate blocks.
+    verdict = decide_final_verdict(
+        [_pass_gate("A")],
+        current_sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        run_id="run-1",
+    )
+    assert verdict.status == "BLOCKED"
+
+
+def test_refusal_names_blocking_gate() -> None:
+    verdict = _verdict({"C": "FAIL"})
+    explanation = refusal_explanation(verdict, current_sha=SHA)
+    assert "BLOCKED" in explanation
+    assert "Gate C" in explanation
+    assert is_run_allowed(verdict, current_sha=SHA) is False
+    ready = refusal_explanation(_verdict({}), current_sha=SHA)
+    assert "READY" in ready
+
+
+def test_repair_loop_single_issue_and_rerun_order() -> None:
+    evidence = GateEvidence(
+        gate="C",
+        status="FAIL",
+        sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        failure_category="fallback-collapse",
+        component="answer",
+        run_id="run-9",
+        latency_p50_ms=1200.0,
+        latency_p95_ms=2500.0,
+        max_turn_ms=4000.0,
+    )
+    report = failure_report_for_gate(evidence)
+    assert report.gate == "C"
+    assert report.category == "fallback-collapse"
+    fingerprint = repair_fingerprint(report)
+    assert len(fingerprint) == 16
+    assert find_reusable_repair([(12, fingerprint), (13, "other")], fingerprint=fingerprint) == 12
+    assert find_reusable_repair([(12, "other")], fingerprint=fingerprint) is None
+    assert rerun_plan("C") == ["C", "D", "E", "F"]
+    assert rerun_plan("A") == ["A", "B", "C", "D", "E", "F"]
+    with pytest.raises(SelfProvingError):
+        rerun_plan("Z")
+
+
+def test_provider_429_and_403_policy() -> None:
+    assert is_429_restart("OPENCODE_429_RESTART_REQUIRED") is True
+    assert is_429_restart("ok") is False
+    assert retry_delay_403(0) >= 5.0
+    assert retry_delay_403(1) >= retry_delay_403(0)
+    assert retry_delay_403(100) >= 5.0
+
+
+def test_runtime_marker_lifecycle_and_status() -> None:
+    assert transition_allowed(None, "STARTING") is True
+    assert transition_allowed(None, "READY") is False
+    assert transition_allowed("STARTING", "READY") is True
+    assert transition_allowed("READY", "STOPPED") is True
+    assert transition_allowed("READY", "FAILED") is True
+    assert transition_allowed("STOPPED", "READY") is False
+    marker = RuntimeMarker(run_id="123", sha=SHA, phase="READY", timestamp_s=1.0)
+    text = format_marker(marker)
+    assert "aa-runtime-status" in text
+    assert "READY" in text
+    parsed = parse_marker(text)
+    assert parsed is not None
+    assert parsed.phase == "READY"
+    report = status_report(marker)
+    assert "READY" in report
+    assert "in_progress" not in report
+    assert "STARTING" in status_report(
+        RuntimeMarker(run_id="1", sha=SHA, phase="STARTING", timestamp_s=0.0)
+    )
+
+
+def test_canary_scope_blocks_run_until_green() -> None:
+    scope = canary_scope()
+    assert scope["schedule_hours"] == 4
+    assert "C-smoke" in scope["gates"]
+    assert "D-readiness" in scope["gates"]
+    assert "E-latency-guard" in scope["gates"]
+    assert scope["blocks_new_run_until_green"] is True
+    assert scope["auto_repair"] is True
+
+
+def test_privacy_no_user_or_corpus_text() -> None:
+    with pytest.raises(SelfProvingError):
+        assert_no_text_leak({"answer": "secret"})
+    with pytest.raises(SelfProvingError):
+        build_result_marker(sha="short", status="PASS", run="1")
+    marker = build_result_marker(sha=SHA, status="PASS", run="1")
+    assert SHA in marker
+    turn = _telemetry("meta-capability", reply_signature("hello"))
+    payload = turn.to_dict()
+    assert "hello" not in json.dumps(payload)
+    assert_no_text_leak(payload)
+
+
+def test_workflows_own_secrets_assets_and_repair() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    ).read_text(encoding="utf-8")
+    for needle in (
+        "Gate A - static/build",
+        "Gate B - deterministic component integration",
+        "Gate C - LIVE exact production conversation path",
+        "Gate D - real Telegram network/runtime readiness",
+        "Gate E - live performance/SLO",
+        "Gate F - exact-main final verdict",
+        "TELEGRAM_BOT_TOKEN",
+        "AA_BOOK_AGE_IDENTITY",
+        "OPENCODE_MODEL",
+        "aa-self-proving-repair:v1",
+        "priority:p0",
+        "OPENCODE_429_RESTART_REQUIRED",
+        "retry",
+    ):
+        assert needle in workflow
+    control = (REPO_ROOT / ".github" / "workflows" / "aa-runtime-control.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "aa-self-proving-qualification.yml" in control
+    assert "BLOCKED: /run refused" in control
+    assert "aa-runtime-status" in control
+    assert "STARTING -> READY -> STOPPED|FAILED" in control
+    runtime = (REPO_ROOT / ".github" / "workflows" / "aa-runtime.yml").read_text(encoding="utf-8")
+    assert "aa-runtime-status" in runtime
+    assert "STARTING" in runtime
+    assert "READY" in runtime
+    canary = (REPO_ROOT / ".github" / "workflows" / "aa-canary.yml").read_text(encoding="utf-8")
+    assert 'cron: "17 */4 * * *"' in canary
+    assert "Gate C smoke" in canary
+    assert "Gate D readiness" in canary
+    assert "Gate E latency guard" in canary
+    assert CONTROL_ISSUE_NUMBER == 31
+    assert ISSUE_NUMBER == 146
+
+
+def test_runner_stale_and_blocked_contract(tmp_path: Path) -> None:
+    proc = subprocess.run(
+        [
+            "python3",
+            "scripts/run_self_proving_qualification.py",
+            "--main-sha",
+            OTHER_SHA,
+            "--out-dir",
+            str(tmp_path / "stale"),
+            "--run-id",
+            "test-run",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    assert proc.returncode == 3
+    payload = json.loads((tmp_path / "stale" / "result.json").read_text(encoding="utf-8"))
+    assert payload["result"] == "STALE"
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        check=False,
+    ).stdout.strip()
+    proc = subprocess.run(
+        [
+            "python3",
+            "scripts/run_self_proving_qualification.py",
+            "--main-sha",
+            head,
+            "--out-dir",
+            str(tmp_path / "live"),
+            "--run-id",
+            "test-run",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    # Offline working tree carries the new repair files (dirty) or lacks live
+    # secrets: either way the runner must stay fail-closed BLOCKED, never PASS.
+    assert proc.returncode in (1, 2)
+    payload = json.loads((tmp_path / "live" / "result.json").read_text(encoding="utf-8"))
+    assert payload["result"] in ("FAIL", "BLOCKED")
