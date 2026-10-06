@@ -620,6 +620,17 @@ def runtime_phase(*, pending_dispatch: bool, runtime_active: bool, stopped: bool
     return "STOPPED"
 
 
+def usable_poller_active(*, runtime_active: bool, has_ready: bool) -> bool:
+    """Whether an active poller is usable for manual testing (READY only).
+
+    Duplicate prevention is unchanged: a workflow that is merely active
+    (``runtime_active``) still suppresses any second dispatch while it is
+    in the ``starting`` window. Only ``has_ready`` (a trusted READY marker
+    for the exact active run) makes the poller usable.
+    """
+    return bool(runtime_active and has_ready)
+
+
 def status_snapshot(
     *,
     comments: list[ControlComment],
@@ -627,6 +638,7 @@ def status_snapshot(
     run_created_at: list[float],
     runtime_active: bool,
     now: float,
+    has_ready: bool = False,
 ) -> dict[str, object]:
     """Return a privacy-safe status snapshot with pending-dispatch awareness."""
     generation = resolve_active_generation(comments, run_created_at, now)
@@ -642,6 +654,11 @@ def status_snapshot(
         for c in comments
     )
     pending = markers > runs_after
+    poller_state = (
+        "ready"
+        if usable_poller_active(runtime_active=runtime_active, has_ready=has_ready)
+        else ("starting" if runtime_active else "idle")
+    )
     return {
         "active": campaign_is_active(
             now,
@@ -662,4 +679,7 @@ def status_snapshot(
         "runtime_phase": runtime_phase(
             pending_dispatch=pending, runtime_active=runtime_active, stopped=stopped
         ),
+        "has_ready": has_ready,
+        "usable_poller": usable_poller_active(runtime_active=runtime_active, has_ready=has_ready),
+        "poller_state": poller_state,
     }

@@ -26,11 +26,25 @@ user text, summaries, model outputs, corpus text or raw chat identifiers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import urllib.request
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from aa.config import Settings
+from aa.control.readiness import (
+    CONTROL_ISSUE_NUMBER,
+    RuntimeIdentity,
+    assert_marker_privacy_safe,
+    current_timestamp_seconds,
+    format_ready_marker,
+    format_startup_failed_marker,
+    resolve_runtime_identity,
+    validate_category,
+)
 from aa.control.runtime_control import RuntimeController
 from aa.conversation.graph_runtime import GraphRuntimeError, GraphTurnRuntime
 from aa.conversation.output_limits import (
@@ -120,6 +134,8 @@ class Application:
         tts_pipeline: TtsPipeline | None = None,
         presentation_classifier: VoicePresentationClassifier | None = None,
         graph_runtime: GraphTurnRuntime | None = None,
+        readiness_publisher: Callable[[str], Awaitable[None]] | None = None,
+        runtime_identity: RuntimeIdentity | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport or StubTelegramTransport()
@@ -174,6 +190,14 @@ class Application:
         # Explicit lifecycle state: STARTING during bootstrap, READY only
         # after OpenCode health + Telegram bootstrap + long polling live.
         self._runtime_state = RUNTIME_STOPPED
+        # Authoritative readiness control plane (issue #144): READY is
+        # published to control issue #31 only after long polling is live.
+        # Tests inject an in-memory publisher; production uses the default
+        # GitHub issue publisher (best-effort, privacy-safe).
+        self._readiness_publisher = readiness_publisher
+        self._runtime_identity = runtime_identity
+        self.readiness_marker: str | None = None
+        self.startup_failure_marker: str | None = None
         # Transport/orchestration only: the dispatcher calls the LangGraph
         # production boundary via ``respond`` and never creates another
         # LLM/provider client or knowledge pipeline.
@@ -315,6 +339,171 @@ class Application:
         )
         logger.info("tts capability ready", extra={"injected": False})
 
+    def _transport_polling_live(self) -> bool:
+        """Whether Telegram long polling is actually live (not merely starting).
+
+        READY must be emitted only after the polling task is live: the
+        transport reports running and, for the polling transport, holds an
+        active poll task. A GitHub Actions step that is merely
+        ``in_progress`` never satisfies this.
+        """
+        try:
+            if not self.transport.running:
+                return False
+        except Exception:
+            return False
+        poll_task = getattr(self.transport, "_poll_task", None)
+        if poll_task is None:
+            # Stub/offline transports have no background task; running is live.
+            return True
+        try:
+            return not bool(poll_task.done())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _categorize_startup_failure(exc: BaseException) -> str:
+        """Map a startup exception to a bounded privacy-safe category."""
+        from aa.opencode.errors import (
+            OpenCodeNotReadyError,
+            OpenCodeRateLimitError,
+            OpenCodeStartupError,
+            OpenCodeTimeoutError,
+        )
+        from aa.telegram.transport import TelegramAuthError
+
+        if isinstance(exc, OpenCodeRateLimitError):
+            return "opencode-429"
+        if isinstance(exc, (OpenCodeNotReadyError, OpenCodeTimeoutError)):
+            return "opencode-not-ready"
+        if isinstance(exc, OpenCodeStartupError):
+            return "opencode-startup"
+        if isinstance(exc, TelegramAuthError):
+            return "telegram-auth"
+        if isinstance(exc, TelegramApiError):
+            return "telegram-bootstrap"
+        if isinstance(exc, ValueError):
+            message = str(exc).lower()
+            if "bot_session_duration_seconds" in message or "telegram" in message:
+                return "config-invalid"
+            if "corpus" in message:
+                return "corpus-unavailable"
+            return "config-invalid"
+        if exc.__class__.__name__ == "GraphRuntimeError":
+            if "corpus" in str(exc).lower():
+                return "corpus-unavailable"
+            return "unknown"
+        if "controller" in exc.__class__.__name__.lower():
+            return "controller-start"
+        return "unknown"
+
+    async def _publish_readiness_text(self, marker: str) -> None:
+        """Publish one readiness marker via the injected or default publisher."""
+        assert_marker_privacy_safe(marker)
+        publisher = self._readiness_publisher
+        if publisher is not None:
+            await publisher(marker)
+            return
+        await self._publish_marker_to_control_issue(marker)
+
+    @staticmethod
+    async def _publish_marker_to_control_issue(marker: str) -> None:
+        """Best-effort default publisher to control issue #31 (GitHub API).
+
+        Hermetic by default: unit tests and local runs never touch the
+        network. Publication is enabled only when the bounded runtime sets
+        ``AA_ENABLE_READY_PUBLISH=1`` (aa-runtime.yml, issues:write), which
+        posts the privacy-safe marker as an issue comment. Failures are
+        logged by category only and never carry secrets or message text.
+        """
+        enabled = os.environ.get("AA_ENABLE_READY_PUBLISH", "").strip().lower()
+        if enabled not in ("1", "true", "yes"):
+            logger.info("readiness marker kept local-only (publish not enabled)")
+            return
+        token = (os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")).strip()
+        repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+        if not token or not repository or "/" not in repository:
+            logger.info("readiness marker not published (no GitHub context)")
+            return
+        owner, repo = repository.split("/", 1)
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{CONTROL_ISSUE_NUMBER}/comments"
+        payload = json.dumps({"body": marker}).encode("utf-8")
+
+        def _post() -> None:
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "aa-runtime-readiness/1",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response.read()
+
+        for attempt in (1, 2, 3):
+            try:
+                await asyncio.to_thread(_post)
+                logger.info("readiness marker published", extra={"attempt": attempt})
+                return
+            except Exception:
+                logger.warning("readiness marker publish failed", extra={"attempt": attempt})
+                if attempt < 3:
+                    await asyncio.sleep(float(attempt))
+        logger.warning("readiness marker publish gave up after retries")
+
+    async def _publish_ready(self) -> None:
+        """Publish the READY marker for the current run (best-effort)."""
+        identity = self._runtime_identity or resolve_runtime_identity()
+        if identity is None:
+            logger.info("readiness identity unavailable; READY kept local-only")
+            return
+        marker = format_ready_marker(
+            run_id=identity.run_id,
+            sha=identity.sha,
+            ready_at=current_timestamp_seconds(),
+            ordinal=identity.ordinal,
+        )
+        assert_marker_privacy_safe(marker)
+        self.readiness_marker = marker
+        try:
+            await self._publish_readiness_text(marker)
+        except Exception:
+            logger.warning("READY publish failed; poller stays live")
+        logger.info(
+            "worker ready",
+            extra={"run_id": identity.run_id, "ordinal": identity.ordinal},
+        )
+
+    async def _publish_startup_failed(self, exc: BaseException) -> None:
+        """Publish a STARTUP_FAILED marker (best-effort, never masks ``exc``)."""
+        try:
+            category = validate_category(self._categorize_startup_failure(exc))
+        except ValueError:
+            category = "unknown"
+        identity = self._runtime_identity or resolve_runtime_identity()
+        if identity is None:
+            return
+        try:
+            marker = format_startup_failed_marker(
+                run_id=identity.run_id,
+                sha=identity.sha,
+                failed_at=current_timestamp_seconds(),
+                ordinal=identity.ordinal,
+                category=category,
+            )
+        except ValueError:
+            return
+        self.startup_failure_marker = marker
+        try:
+            await self._publish_readiness_text(marker)
+        except Exception:
+            logger.warning("STARTUP_FAILED publish failed", extra={"category": category})
+        logger.warning("worker startup failed", extra={"category": category})
+
     async def start(self) -> None:
         """Start all components in dependency order.
 
@@ -322,6 +511,10 @@ class Application:
         are ready, so bootstrap time never consumes the requested live window.
         READY is published only after OpenCode health, Telegram bootstrap
         (getMe/deleteWebhook/commands) and long polling are all live.
+        A privacy-safe READY marker is published to control issue #31 only
+        after long polling is live and the controller has started; startup
+        failures before READY publish STARTUP_FAILED and invoke the bounded
+        recovery path (notably the 429 runner-restart exit 75 upstream).
         """
         if self._running:
             return
@@ -330,50 +523,49 @@ class Application:
         logger.info("starting worker", extra={"config": self.settings.to_safe_dict()})
         try:
             await self.corpus.load()
+            await self.opencode_runtime.start()
+            # Readiness gate: no Telegram traffic is accepted until the
+            # local OpenCode runtime has proven healthy.
+            await self.opencode_runtime.ensure_ready()
+            await self.sessions.start()
+            await self.safety.start()
+            await self.dispatcher.start()
+            # Voice capability loads once here and is reused for all turns.
+            # Initialization failure disables voice only, never the poller.
+            await self._init_presentation_capability()
+            await self._init_voice_capability()
+            self._attach_presentation_classifier()
+            # TTS capability loads once here and is reused for voice replies.
+            # Initialization failure falls back to text, never the poller.
+            await self._init_tts_capability()
+            await self._ensure_graph_runtime()
+            await self.transport.start()
+            # Long polling is live only after transport.start() resolves
+            # its bootstrap (getMe -> deleteWebhook -> commands) and the
+            # poll loop task is running.
+            # Start the requested fixed 5h window only after the poller
+            # is live and all dependencies have completed bootstrap.
+            await self.controller.start()
+            if not self._transport_polling_live():
+                raise TelegramApiError("telegram polling is not live after start")
+        except Exception as exc:
+            self._runtime_state = RUNTIME_FAILED
             try:
-                await self.opencode_runtime.start()
-                # Readiness gate: no Telegram traffic is accepted until the
-                # local OpenCode runtime has proven healthy.
-                await self.opencode_runtime.ensure_ready()
-                await self.sessions.start()
-                await self.safety.start()
-                await self.dispatcher.start()
-                # Voice capability loads once here and is reused for all turns.
-                # Initialization failure disables voice only, never the poller.
-                await self._init_presentation_capability()
-                await self._init_voice_capability()
-                self._attach_presentation_classifier()
-                # TTS capability loads once here and is reused for voice replies.
-                # Initialization failure falls back to text, never the poller.
-                await self._init_tts_capability()
-                await self._ensure_graph_runtime()
-                await self.transport.start()
-                # Long polling is live only after transport.start() resolves
-                # its bootstrap (getMe -> deleteWebhook -> commands) and the
-                # poll loop task is running.
-                polling_live = bool(self.transport.running)
-                if isinstance(self.transport, PollingTelegramTransport) and not polling_live:
-                    raise RuntimeError("telegram polling is not live after bootstrap")
-                # Start the requested fixed 5h window only after the poller
-                # is live and all dependencies have completed bootstrap.
-                await self.controller.start()
+                await self._publish_startup_failed(exc)
             except Exception:
-                self._runtime_state = RUNTIME_FAILED
-                await self.transport.stop()
-                await self.dispatcher.stop()
-                await self.safety.stop()
-                await self.sessions.stop()
-                await self.opencode_runtime.stop()
-                await self.corpus.unload()
-                await self.controller.stop()
-                raise
-        except Exception:
-            if self._runtime_state != RUNTIME_FAILED:
-                self._runtime_state = RUNTIME_FAILED
+                logger.warning("STARTUP_FAILED publish failed", extra={"category": "unknown"})
+            await self.transport.stop()
+            await self.dispatcher.stop()
+            await self.safety.stop()
+            await self.sessions.stop()
+            await self.opencode_runtime.stop()
+            await self.corpus.unload()
+            await self.controller.stop()
             raise
         self._running = True
         self._runtime_state = RUNTIME_READY
         logger.info("worker started", extra={"runtime_state": RUNTIME_READY})
+        await self._publish_ready()
 
     async def stop(self) -> None:
         """Stop all components in reverse order (idempotent)."""

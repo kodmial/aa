@@ -188,6 +188,46 @@ jobs:
               });
             };
             const generationForComment = commentId => `c${commentId}`;
+            // Authoritative readiness (issue #144): a workflow that is merely
+            // in_progress is never readiness. Only a trusted READY marker for
+            // the exact active run counts as ready; STARTUP_FAILED marks a
+            // failed bootstrap. Markers carry run id, SHA, timestamp and
+            // ordinal only, never secrets or message text.
+            const parseReady = body => {
+              const m = /<!--\s*aa-runtime-ready\s+run=(\d+)\s+sha=([0-9a-f]{40})\s+ready_at=(\d+)\s+ordinal=(\d+)\s*-->/.exec(body || '');
+              if (!m) return null;
+              return { runId: Number(m[1]), sha: m[2], readyAt: Number(m[3]), ordinal: Number(m[4]) };
+            };
+            const parseStartupFailed = body => {
+              const m = /<!--\s*aa-runtime-startup-failed\s+run=(\d+)\s+sha=([0-9a-f]{40})\s+failed_at=(\d+)\s+ordinal=(\d+)\s+category=([a-z0-9-]+)\s*-->/.exec(body || '');
+              if (!m) return null;
+              return { runId: Number(m[1]), sha: m[2], failedAt: Number(m[3]), ordinal: Number(m[4]), category: m[5] };
+            };
+            const hasReadyForRun = (comments, runId) =>
+              comments.some(c => {
+                const parsed = parseReady(c.body || '');
+                return parsed !== null && parsed.runId === Number(runId);
+              });
+            const failureForRun = (comments, runId) => {
+              for (const c of comments) {
+                const parsed = parseStartupFailed(c.body || '');
+                if (parsed !== null && parsed.runId === Number(runId)) return parsed;
+              }
+              return null;
+            };
+            const pollerStateForRun = (run, comments) => {
+              const active = run && run.conclusion === null && ACTIVE.includes(run.status);
+              const ready = run ? hasReadyForRun(comments, run.id) : false;
+              const failed = run ? failureForRun(comments, run.id) !== null : false;
+              if (failed) return 'failed';
+              if (ready && active) return 'ready';
+              if (active) return 'starting';
+              if (!run) return 'idle';
+              if (run.conclusion === 'cancelled') return 'stopped';
+              if (run.conclusion === 'success') return 'completed';
+              if (run.conclusion === 'failure' || run.conclusion === 'timed_out') return 'failed';
+              return 'stopped';
+            };
 
             // Shared resolver: re-read authoritative state immediately before
             // deciding. Owner `/run` epochs exclude the current event comment
@@ -255,15 +295,32 @@ jobs:
                 ? 'STARTING'
                 : livePoller.length ? 'READY' : (active.length ? 'STARTING' : 'STOPPED');
               const expiresInH = Math.max(0, (accepted + DAY_MS - nowMs) / 3600000).toFixed(1);
+              // Only READY is an active usable poller; in_progress alone is
+              // starting. Duplicate prevention is unchanged: starting still
+              // suppresses any second dispatch.
               const runLines = active.length
-                ? active.map(r => `- #${r.id}: **${r.status}** — ${r.html_url}`).join('\n')
+                ? active.map(r => {
+                    const state = pollerStateForRun(r, comments);
+                    const detail = state === 'ready'
+                      ? 'ready — poller is live, safe to test'
+                      : state === 'starting'
+                        ? 'starting — workflow active but READY marker absent, wait for READY'
+                        : state;
+                    return `- #${r.id}: **${r.status}** (${detail}) — ${r.html_url}`;
+                  }).join('\n')
                 : '- none';
               const pendingLine = pending
                 ? `\nDispatch pending: start ${startsUsed}/${MAX_STARTS} committed, runtime appearing.`
                 : '';
+              const usable = active.some(r => pollerStateForRun(r, comments) === 'ready');
+              const usabilityLine = active.length
+                ? (usable
+                    ? '\nUsable poller: ready (exact active run has a trusted READY marker).'
+                    : '\nUsable poller: none yet (starting — no trusted READY marker for the active run).')
+                : '';
               return [
                 `Active campaign: started ${new Date(accepted).toISOString()}, expires in ~${expiresInH}h.`,
-                `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).${pendingLine}`,
+                `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).${pendingLine}${usabilityLine}`,
                 `Runtime phase: **${runtimePhase}** (STARTING = bootstrap in progress, READY = poller live after OpenCode health + Telegram bootstrap + long polling).`,
                 `Active runtime:\n${runLines}`,
               ].join('\n');
@@ -352,8 +409,10 @@ jobs:
             const duration = '5h';
             let dispatchAccepted = false;
             try {
+              // Campaign ordinal 1/4 is plumbed to the runtime so its READY
+              // marker carries the exact start ordinal (privacy-safe).
               await github.rest.actions.createWorkflowDispatch({
-                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration },
+                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration, seq: '1' },
               });
               dispatchAccepted = true;
             } catch (error) {

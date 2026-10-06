@@ -94,6 +94,20 @@ jobs:
               return [...seqs].sort((a, b) => a - b);
             };
             const generationForComment = commentId => `c${commentId}`;
+            // Authoritative readiness (issue #144): only READY is an active
+            // usable poller. An active workflow without READY is starting:
+            // the reconciler still no-ops (never queues a second poller)
+            // but must not treat the poller as usable.
+            const parseReady = body => {
+              const m = /<!--\s*aa-runtime-ready\s+run=(\d+)\s+sha=([0-9a-f]{40})\s+ready_at=(\d+)\s+ordinal=(\d+)\s*-->/.exec(body || '');
+              if (!m) return null;
+              return { runId: Number(m[1]), sha: m[2], readyAt: Number(m[3]), ordinal: Number(m[4]) };
+            };
+            const hasReadyForRun = (comments, runId) =>
+              comments.some(c => {
+                const parsed = parseReady(c.body || '');
+                return parsed !== null && parsed.runId === Number(runId);
+              });
 
             // Shared resolver (verbatim with the control workflow): owner
             // `/run` epochs with no exclusion here, owner `/bot stop`
@@ -151,7 +165,12 @@ jobs:
               .filter(r => r.conclusion === null && ACTIVE.includes(r.status))
               .sort((a, b) => a.id - b.id);
             if (active.length) {
-              core.info(`Reconciler no-op: runtime #${active[0].id} already ${active[0].status}; never queue a second poller.`);
+              const ready = hasReadyForRun(comments, active[0].id);
+              if (ready) {
+                core.info(`Reconciler no-op: ready poller #${active[0].id} already ${active[0].status} with trusted READY; never queue a second poller.`);
+              } else {
+                core.info(`Reconciler no-op: runtime #${active[0].id} already ${active[0].status} but starting (no trusted READY yet); waiting for READY, never queue a second poller.`);
+              }
               return;
             }
 
@@ -175,7 +194,7 @@ jobs:
             const nextSeq = startsUsed + 1;
             try {
               await github.rest.actions.createWorkflowDispatch({
-                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration: '5h' },
+                owner, repo, workflow_id: 'aa-runtime.yml', ref: 'main', inputs: { duration: '5h', seq: String(nextSeq) },
               });
             } catch (error) {
               core.warning('Reconciler dispatch not committed; no start consumed: ' + (error && error.message ? error.message : error));

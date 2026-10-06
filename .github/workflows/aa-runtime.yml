@@ -10,6 +10,11 @@ on:
         type: choice
         options:
           - 5h
+      seq:
+        description: "Campaign start ordinal 1..4 for the READY marker"
+        required: false
+        type: string
+        default: "1"
 
 permissions:
   # Cache save needs write; restore needs read. Runtime itself stays read-only
@@ -420,6 +425,13 @@ jobs:
           key: ${{ steps.derived-cache-key.outputs.derived-key }}
 
       - name: Run bounded Telegram poller and OpenCode
+        # Authoritative readiness (issue #144): Application.start() publishes
+        # a privacy-safe READY marker (run id, exact main SHA, timestamp,
+        # campaign ordinal) to control issue #31 only after OpenCode health,
+        # Telegram getMe, webhook/commands bootstrap, long polling live and
+        # the bounded controller start. Startup failures before READY publish
+        # STARTUP_FAILED with a bounded category; a GitHub step that is
+        # merely in_progress is never readiness.
         id: runtime
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -433,6 +445,8 @@ jobs:
           OPENCODE_CONTEXT_LIMIT_TOKENS: "200000"
           GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          AA_CAMPAIGN_SEQ: ${{ inputs.seq }}
+          AA_ENABLE_READY_PUBLISH: "1"
           LOG_LEVEL: INFO
         shell: bash
         run: |
