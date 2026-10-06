@@ -147,3 +147,78 @@ async def test_structured_429_escalates_immediately_for_fresh_runner_recovery(
         )
     assert client.models == [PRIMARY]
     assert sleeps == []
+
+
+async def test_persistent_403_skips_redundant_primary_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent primary 403 (Gate C 37504648482) must fast-failover.
+
+    The first call performs the required >=5s retry then fallback. Later
+    calls in the same process go directly to fallback without burning
+    another 5s sleep plus slow primary attempts per call (15s overhead
+    per ordinary turn).
+    """
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            "fallback-ok-1",
+            "fallback-ok-2",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await model._ainvoke_text("hello") == "fallback-ok-1"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [5.0]
+
+    assert await model._ainvoke_text("hello again") == "fallback-ok-2"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert sleeps == [5.0]
+
+
+async def test_primary_recovery_closes_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered primary must be retried after the circuit TTL."""
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            "fallback-ok",
+            "primary-ok",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await model._ainvoke_text("hello") == "fallback-ok"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    # Force circuit expiry without waiting 5 minutes.
+    assert model._primary_access_rejected_at is not None
+    model._primary_access_rejected_at = 0.0
+    assert await model._ainvoke_text("hello again") == "primary-ok"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
+    assert model._primary_access_rejected_at is None
