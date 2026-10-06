@@ -24,6 +24,7 @@ from aa.qualification.product_contract_live import (
     run_control_lane,
     run_voice_lane,
     validate_exact_sha,
+    working_tree_clean,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +99,57 @@ def test_voice_lane_policy_and_gates() -> None:
     assert result.metrics["scenarios_executed"] == 16
     assert result.metrics["peak_rss_mb"] <= 12288
     assert_no_text_leak(result.to_dict())
+
+
+def test_working_tree_clean_ignores_ephemeral_outputs(tmp_path: Path) -> None:
+    # Regression for kodmial/aa#151 (Gate unknown): Gate C created live-out/
+    # before the clean check, and Gate B downloads models/, so a pristine
+    # checkout always reported "working tree is not clean". Ephemeral outputs
+    # must never count as dirty; real source edits still fail closed.
+    import subprocess
+
+    repo = tmp_path / "probe-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True)
+    (repo / "tracked.txt").write_text("base", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo), check=True)
+    assert working_tree_clean(repo) is True
+    for name in (
+        "live-out",
+        "self-proving-out",
+        "eval-self-proving-out",
+        "aa-self-proving-checkpoints",
+        "models",
+    ):
+        target = repo / name
+        target.mkdir(exist_ok=True)
+        (target / "output.json").write_text("{}", encoding="utf-8")
+    assert working_tree_clean(repo) is True
+    (repo / "runtime-status.json").write_text("{}", encoding="utf-8")
+    assert working_tree_clean(repo) is True
+    # Real untracked sources still fail closed.
+    (repo / "new-source.py").write_text("x=1", encoding="utf-8")
+    assert working_tree_clean(repo) is False
+    (repo / "new-source.py").unlink()
+    assert working_tree_clean(repo) is True
+    # Tracked modifications still fail closed.
+    (repo / "tracked.txt").write_text("edited", encoding="utf-8")
+    assert working_tree_clean(repo) is False
+
+
+def test_self_proving_gate_f_always_emits_verdict() -> None:
+    # Regression for kodmial/aa#151 unknown-gate-failure: Gate F must run even
+    # after a Gate C failure so the repair publisher maps a concrete blocking
+    # gate instead of "unknown".
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    ).read_text(encoding="utf-8")
+    gate_f_index = workflow.index("Gate F - exact-main final verdict")
+    gate_f_block = workflow[gate_f_index : gate_f_index + 800]
+    assert "if: always()" in gate_f_block
 
 
 def test_live_runner_stale_on_sha_mismatch(tmp_path: Path) -> None:

@@ -533,6 +533,10 @@ jobs:
 
       - name: Gate F - exact-main final verdict
         id: gate-f
+        # Always emit the machine-readable final verdict so a failed Gate C/D/E
+        # never degrades to unknown-gate-failure: the repair publisher maps the
+        # concrete blocking gate/component from self-proving-summary.json.
+        if: always()
         shell: bash
         run: |
           set -euo pipefail

@@ -153,8 +153,50 @@ def checked_out_sha(repo_root: Path | None = None) -> str:
     return proc.stdout.strip()
 
 
+_EPHEMERAL_TREE_PREFIXES: tuple[str, ...] = (
+    "live-out/",
+    "self-proving-out/",
+    "eval-self-proving-out/",
+    "eval-product-contract-live-out/",
+    "eval-",
+    "aa-self-proving-checkpoints/",
+    "models/",
+)
+
+_EPHEMERAL_TREE_FILES: frozenset[str] = frozenset(
+    {
+        "runtime-status.json",
+    }
+)
+
+
+def _is_ephemeral_tree_path(path: str) -> bool:
+    """Whether ``path`` is workflow-generated output, never a source edit."""
+    normalized = path.strip().strip('"')
+    if normalized in _EPHEMERAL_TREE_FILES:
+        return True
+    for prefix in _EPHEMERAL_TREE_PREFIXES:
+        if prefix == "eval-":
+            if normalized.startswith(prefix) and "/" in normalized:
+                return True
+        elif prefix.endswith("/"):
+            if normalized == prefix[:-1] or normalized.startswith(prefix):
+                return True
+        elif normalized == prefix or normalized.startswith(prefix):
+            return True
+    return False
+
+
 def working_tree_clean(repo_root: Path | None = None) -> bool:
-    """Return whether ``git status --porcelain`` is empty."""
+    """Return whether the working tree has non-ephemeral changes.
+
+    Workflow-generated outputs (``live-out/``, ``self-proving-out/``,
+    ``eval-*/``, ``aa-self-proving-checkpoints/``, downloaded ``models/``,
+    and gitignored files) never count as dirty. Tracked source edits still
+    fail closed. The live runner creates its ``out_dir`` before this check,
+    so the out dir itself must be ignored or every Gate C run would report
+    ``working tree is not clean`` on a pristine checkout.
+    """
     root = repo_root or _repo_root()
     proc = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -165,7 +207,49 @@ def working_tree_clean(repo_root: Path | None = None) -> bool:
     )
     if proc.returncode != 0:
         return False
-    return not proc.stdout.strip()
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return True
+    untracked: list[str] = []
+    tracked_dirty: list[str] = []
+    for line in lines:
+        raw_path = line[3:].strip() if len(line) > 3 else ""
+        if not raw_path:
+            return False
+        candidates = [part.strip().strip('"') for part in raw_path.split(" -> ") if part.strip()]
+        if not candidates:
+            return False
+        status = line[:2]
+        if "?" in status:
+            untracked.extend(candidates)
+        else:
+            tracked_dirty.extend(candidates)
+    # Tracked modifications to real sources are always dirty, except for
+    # ephemeral output paths that the workflow itself regenerates.
+    tracked_real = [path for path in tracked_dirty if not _is_ephemeral_tree_path(path)]
+    if tracked_real:
+        return False
+    # Untracked ephemeral outputs are never dirty.
+    untracked_real = [path for path in untracked if not _is_ephemeral_tree_path(path)]
+    if not untracked_real:
+        return True
+    # Remaining untracked paths are dirty unless git ignores them (model
+    # downloads, caches, and other workflow artifacts covered by .gitignore).
+    try:
+        check = subprocess.run(
+            ["git", "check-ignore", "--stdin"],
+            input="\n".join(untracked_real) + "\n",
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+            check=False,
+        )
+        ignored = set(
+            line.strip().strip('"') for line in (check.stdout or "").splitlines() if line.strip()
+        )
+    except OSError:
+        return False
+    return all(path in ignored for path in untracked_real)
 
 
 def assert_no_text_leak(payload: Any, owner: str = "live-summary") -> None:
