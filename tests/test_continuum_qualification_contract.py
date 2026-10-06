@@ -82,16 +82,18 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
     assert "continuum_ref: main" in body
     # AA intentionally runs three concurrent implementation slots: wip_limit
     # defaults to '3' so scheduled and event-driven reconciliation does not
-    # depend on repository variable drift. All other knobs stay as bare
-    # passthroughs so an empty value lets the engine fall back to
-    # vars.AUTOMATION_*.
+    # depend on repository variable drift. Issue #146 mandates non-terminal
+    # convergence semantics, so pause_on_failure is pinned to hard "false"
+    # (a bare inputs passthrough would let repository variable drift rearm
+    # terminal pause). All other knobs stay as bare passthroughs so an empty
+    # value lets the engine fall back to vars.AUTOMATION_*.
     assert "\"${{ inputs.wip_limit || '3' }}\"" in body
+    assert 'pause_on_failure: "false"' in body
     for knob in (
         "max_dispatch_attempts",
         "require_priority_label",
         "opencode_dispatch",
         "count_open_prs_as_wip",
-        "pause_on_failure",
     ):
         assert f'"${{{{ inputs.{knob} }}}}"' in body
         assert f"inputs.{knob} ||" not in body

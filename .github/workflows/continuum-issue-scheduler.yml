@@ -156,10 +156,12 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      # Every knob below is forwarded as a bare `inputs.*` passthrough, never a
-      # literal. An empty passthrough is what lets the engine fall back to the
-      # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
-      # override that repository variable for every installed caller.
+      # Knobs below are forwarded as bare `inputs.*` passthroughs so an empty
+      # value lets the engine fall back to the consumer's `vars.AUTOMATION_*`.
+      # Two intentional exceptions per issue #146: wip_limit defaults to '3'
+      # (three concurrent implementation slots) and pause_on_failure is pinned
+      # to hard "false" (non-terminal convergence; a passthrough would let
+      # variable drift rearm terminal pause).
       wip_limit: "${{ inputs.wip_limit || '3' }}"
       lease_minutes: "${{ inputs.lease_minutes }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"

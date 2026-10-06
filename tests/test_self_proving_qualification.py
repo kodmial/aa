@@ -432,11 +432,11 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # scheduler-admissible repair and AA must never drift back to terminal
     # pause semantics or fewer than the required three implementation slots.
     assert "automation:ready" in workflow
-    scheduler = (
-        REPO_ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
-    ).read_text(encoding="utf-8")
-    assert "ready_label: \"automation:ready\"" in scheduler
-    assert "pause_on_failure: \"false\"" in scheduler
+    scheduler = (REPO_ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'ready_label: "automation:ready"' in scheduler
+    assert 'pause_on_failure: "false"' in scheduler
     assert "wip_limit: \"${{ inputs.wip_limit || '3' }}\"" in scheduler
 
 
