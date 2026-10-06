@@ -11,6 +11,7 @@ import pytest
 from aa.conversation.model_adapter import (
     PRIMARY_ACCESS_CIRCUIT_TTL_S,
     OpenCodeChatModel,
+    clear_primary_circuit,
 )
 from aa.opencode.client import SessionInfo
 from aa.opencode.errors import (
@@ -21,6 +22,14 @@ from aa.opencode.errors import (
 
 PRIMARY = "opencode/space-bunny-free"
 FALLBACK = "opencode/muse-spark-1.3-contributor-free"
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_primary_circuit() -> Any:
+    """Isolate the process-wide primary circuit between tests."""
+    clear_primary_circuit()
+    yield
+    clear_primary_circuit()
 
 
 class _ScriptedClient:
@@ -224,8 +233,14 @@ async def test_primary_recovery_closes_circuit(
     # Force circuit expiry without waiting for the TTL. Setting the stamp to
     # 0.0 is not sufficient: time.monotonic() on a freshly booted runner can
     # be below the TTL, leaving the circuit open. Expire relative to now.
+    # The circuit is process-wide per primary model, so expire the shared
+    # entry as well as the per-instance stamp.
     assert model._primary_access_rejected_at is not None
-    model._primary_access_rejected_at = time.monotonic() - PRIMARY_ACCESS_CIRCUIT_TTL_S - 1.0
+    from aa.conversation import model_adapter as _ma
+
+    _expired = time.monotonic() - PRIMARY_ACCESS_CIRCUIT_TTL_S - 1.0
+    model._primary_access_rejected_at = _expired
+    _ma._PRIMARY_CIRCUIT[_ma._circuit_key(PRIMARY)] = _expired
     assert await model._ainvoke_text("hello again") == "primary-ok"
     assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
     assert model._primary_access_rejected_at is None
@@ -330,3 +345,82 @@ async def test_structured_fallback_403_clears_primary_circuit(
         schema={"type": "object"},
     ) == {"ok": True}
     assert client.models[-1] == PRIMARY
+
+
+async def test_cross_agent_shares_primary_403_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate C regression: verifier must fast-fallback after planner 403.
+
+    Run 37519360307 showed p50 17s/p95 36s/max 45s with verifier never
+    served and 14 generic clarifications: each agent burned its own primary
+    retry per turn. A planner rejection must open the process-wide circuit
+    so answer/verifier bound via with_agent go directly to fallback.
+    """
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            "planner-fallback-ok",
+            "answer-fallback-ok",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    planner = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+
+    assert await planner._ainvoke_text("planner hello") == "planner-fallback-ok"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [5.0]
+
+    answer = planner.with_agent("aa-v2")
+    assert await answer._ainvoke_text("answer hello") == "answer-fallback-ok"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert sleeps == [5.0]
+
+
+async def test_with_agent_created_after_rejection_fast_fallbacks_structured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structured verifier bound after planner 403 must skip primary retry."""
+    client = _ScriptedClient(
+        structured_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            {"queries": ["q0"] * 12},
+            {"units": [], "all_required_supported": True},
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    planner = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+    assert await planner.ainvoke_structured("planner", system="p", schema={"type": "object"}) == {
+        "queries": ["q0"] * 12
+    }
+    assert sleeps == [5.0]
+
+    verifier = planner.with_agent("aa-verifier-v2")
+    assert await verifier.ainvoke_structured("verifier", system="v", schema={"type": "object"}) == {
+        "units": [],
+        "all_required_supported": True,
+    }
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert sleeps == [5.0]

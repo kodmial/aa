@@ -296,6 +296,15 @@ class SileroSynthesizer:
             self._load_error = "model provisioning failed"
             raise TtsError("tts-unavailable", "model provisioning failed") from exc
         try:
+            # torch.package is a separate submodule: `import torch` alone
+            # does not guarantee `torch.package` is loaded (Gate C live
+            # voice-models-ready failed with TTS disabled while GigaAM and
+            # presentation loaded). Import it explicitly before use.
+            import torch.package  # noqa: PLC0415,F401
+        except ImportError as exc:
+            self._load_error = "torch.package is not installed"
+            raise TtsError("tts-unavailable", "torch.package is not installed") from exc
+        try:
             device = torch.device("cpu")
             importer = torch.package.PackageImporter(str(model_file))  # type: ignore[attr-defined]
             model = importer.load_pickle("tts_models", "model")
