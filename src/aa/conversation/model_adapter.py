@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Any
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -57,6 +58,17 @@ MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 # A single bounded 5s retry preserves the required >=5s base and the exact
 # primary-then-fallback policy while keeping ordinary turns within budget.
 MODEL_ACCESS_RETRY_DELAYS = (5.0,)
+
+# Persistent-403 circuit breaker (Gate C run 37504648482: p50 35s/p95 50s/max
+# 59s with 14 generic clarifications, all heartbeat checks failing on 2%
+# scheduling jitter, verifier never served). When the pinned primary is
+# rejected, every subsequent provider call in the same process would otherwise
+# burn another 5s sleep plus two slow primary attempts before reaching the
+# working fallback (15s of pure overhead per ordinary turn). Remember the
+# rejection briefly and fail over directly to the configured fallback on later
+# calls. The first failure still performs the required >=5s retry; the circuit
+# re-closes after the TTL so a recovered primary is retried.
+PRIMARY_ACCESS_CIRCUIT_TTL_S = 300.0
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -140,6 +152,7 @@ class OpenCodeChatModel(BaseChatModel):
     request_timeout: float = 120.0
 
     _client: OpenCodeClient = PrivateAttr()
+    _primary_access_rejected_at: float | None = PrivateAttr(default=None)
 
     def __init__(
         self,
@@ -175,6 +188,35 @@ class OpenCodeChatModel(BaseChatModel):
             primary_model=self.primary_model,
             fallback_model=self.fallback_model,
             request_timeout=self.request_timeout,
+        )
+
+    def _primary_circuit_open(self) -> bool:
+        """Whether the primary was recently rejected (fast fallback allowed)."""
+        rejected_at = self._primary_access_rejected_at
+        if rejected_at is None:
+            return False
+        try:
+            return (time.monotonic() - float(rejected_at)) < PRIMARY_ACCESS_CIRCUIT_TTL_S
+        except (TypeError, ValueError):
+            return False
+
+    def _record_primary_rejection(self) -> None:
+        """Remember a persistent primary 403 to skip redundant retries."""
+        try:
+            self._primary_access_rejected_at = time.monotonic()
+        except Exception:
+            self._primary_access_rejected_at = 0.0
+
+    def _clear_primary_rejection(self) -> None:
+        """Clear the circuit when the primary serves again."""
+        self._primary_access_rejected_at = None
+
+    def _fast_fallback_available(self) -> bool:
+        """Whether a direct fallback is allowed under an open circuit."""
+        return (
+            bool(self.fallback_model.strip())
+            and self.fallback_model != self.primary_model
+            and self._primary_circuit_open()
         )
 
     async def _invoke_ephemeral(
@@ -236,14 +278,38 @@ class OpenCodeChatModel(BaseChatModel):
     async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
+        # Fast path for a persistently rejected primary: the first failure
+        # already performed the required >=5s retry. Later calls in the same
+        # process go directly to the configured fallback instead of burning
+        # another 5s sleep plus two slow primary attempts per call.
+        if self._fast_fallback_available():
+            logger.info("opencode primary circuit open, fast fallback used")
+            try:
+                reply = await self._invoke_ephemeral(
+                    prompt, model=self.fallback_model, agent=self.agent, system=system
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+                OpenCodeProviderAccessError,
+            ):
+                # Fallback failure: close the circuit so the next call
+                # re-probes the primary instead of sticking to a bad fallback.
+                self._clear_primary_rejection()
+                raise
+            return reply
         last_transient: BaseException | None = None
         access_attempt = 0
         transient_attempt = 0
         while True:
             try:
-                return await self._invoke_ephemeral(
+                reply = await self._invoke_ephemeral(
                     prompt, model=self.primary_model, agent=self.agent, system=system
                 )
+                self._clear_primary_rejection()
+                return reply
             except OpenCodeProviderAccessError as exc:
                 last_transient = exc
                 if access_attempt < len(MODEL_ACCESS_RETRY_DELAYS):
@@ -265,10 +331,24 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
+            primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
+            if primary_access_rejected:
+                self._record_primary_rejection()
             logger.info("opencode model fallback used")
-            return await self._invoke_ephemeral(
-                prompt, model=self.fallback_model, agent=self.agent, system=system
-            )
+            try:
+                return await self._invoke_ephemeral(
+                    prompt, model=self.fallback_model, agent=self.agent, system=system
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeProviderAccessError,
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+            ):
+                if primary_access_rejected:
+                    self._clear_primary_rejection()
+                raise
         if last_transient is not None:
             raise last_transient
         raise OpenCodeProviderAccessError("opencode primary model access rejected")
@@ -289,12 +369,32 @@ class OpenCodeChatModel(BaseChatModel):
         """
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
+        if self._fast_fallback_available():
+            logger.info("opencode primary circuit open, fast fallback used")
+            try:
+                return await self._invoke_ephemeral_structured(
+                    prompt,
+                    system=system,
+                    schema=schema,
+                    model=self.fallback_model,
+                    agent=self.agent,
+                    retry_count=retry_count,
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+                OpenCodeProviderAccessError,
+            ):
+                self._clear_primary_rejection()
+                raise
         last_transient: BaseException | None = None
         access_attempt = 0
         transient_attempt = 0
         while True:
             try:
-                return await self._invoke_ephemeral_structured(
+                result = await self._invoke_ephemeral_structured(
                     prompt,
                     system=system,
                     schema=schema,
@@ -302,6 +402,8 @@ class OpenCodeChatModel(BaseChatModel):
                     agent=self.agent,
                     retry_count=retry_count,
                 )
+                self._clear_primary_rejection()
+                return result
             except OpenCodeProviderAccessError as exc:
                 last_transient = exc
                 if access_attempt < len(MODEL_ACCESS_RETRY_DELAYS):
@@ -323,15 +425,29 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
+            primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
+            if primary_access_rejected:
+                self._record_primary_rejection()
             logger.info("opencode model fallback used")
-            return await self._invoke_ephemeral_structured(
-                prompt,
-                system=system,
-                schema=schema,
-                model=self.fallback_model,
-                agent=self.agent,
-                retry_count=retry_count,
-            )
+            try:
+                return await self._invoke_ephemeral_structured(
+                    prompt,
+                    system=system,
+                    schema=schema,
+                    model=self.fallback_model,
+                    agent=self.agent,
+                    retry_count=retry_count,
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except (
+                OpenCodeProviderAccessError,
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+            ):
+                if primary_access_rejected:
+                    self._clear_primary_rejection()
+                raise
         if last_transient is not None:
             raise last_transient
         raise OpenCodeProviderAccessError("opencode primary model access rejected")
@@ -368,6 +484,7 @@ class OpenCodeChatModel(BaseChatModel):
 __all__ = [
     "ANSWER_AGENT_V2",
     "PLANNER_AGENT_V2",
+    "PRIMARY_ACCESS_CIRCUIT_TTL_S",
     "RUNTIME_AGENT_V2",
     "STRUCTURED_RETRY_COUNT",
     "SUMMARIZER_AGENT_V2",

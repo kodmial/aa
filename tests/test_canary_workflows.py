@@ -14,9 +14,10 @@ def test_canary_runs_every_four_hours_only_after_final_qualification() -> None:
     text = _read("aa-canary.yml")
     assert 'cron: "17 */4 * * *"' in text
     assert "workflow_dispatch:" in text
-    # Post-qualification gate: capability #6 and exact-main qualification #7
-    # must both be terminal-success; legacy #80 is superseded and must never
-    # activate the canary.
+    # Final qualification gate is capability #6 plus exact-main
+    # qualification #7 (commit ff43249); both must be terminal-success
+    # (closed/completed). Legacy #80 is superseded and must never
+    # activate the canary, so no activation may reference it.
     assert "issue_number: 6" in text
     assert "issue_number: 7" in text
     assert "issue_number: 80" not in text
