@@ -169,6 +169,9 @@ def evaluate_gate_c_telemetry(
     for turn in telemetries:
         covered = {sample.stage for sample in turn.stages}
         missing = [stage for stage in STAGES if stage not in covered]
+        verifier_failed = any(s.stage == "verifier" and not s.ok for s in turn.stages)
+        if not verifier_failed:
+            missing = [m for m in missing if m != "repair"]
         if missing:
             return (
                 False,

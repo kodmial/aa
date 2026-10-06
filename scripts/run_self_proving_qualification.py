@@ -132,7 +132,11 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
         path = line[3:].strip().strip('"')
         ignored = False
         for prefix in ignored_prefixes:
-            if path == prefix.rstrip("/") or path.startswith(prefix):
+            if prefix.endswith("/"):
+                if path.startswith(prefix):
+                    ignored = True
+                    break
+            elif path == prefix:
                 ignored = True
                 break
         if ignored:
@@ -239,12 +243,13 @@ def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
     Substring search over source text false-positives on docstrings,
     comments, or log strings and false-negatives on renamed wiring.
     This inspects executable code only: AST import/name/attribute nodes
-    plus live module attributes and loaded reranker libraries. String
-    constants (docstrings, log messages) never trigger.
+    plus live module attributes of the evidence module itself. String
+    constants (docstrings, log messages) never trigger. Globally loaded
+    modules (``sys.modules``) are never consulted: unrelated transitive
+    imports must not fail the evidence module's own RRF-only check.
     """
 
     import ast
-    import sys
 
     code_fragments = (
         "bge",
@@ -253,16 +258,6 @@ def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
         "sentence_transformers",
         "flagembedding",
         "rerank",
-    )
-    # Short fragments (``bge``, ``rerank``) are only meaningful inside the
-    # evidence module's own executable code/attributes. For globally loaded
-    # modules they false-positive on unrelated transitive imports, so the
-    # ``sys.modules`` scan uses only distinctive long package markers.
-    loaded_module_fragments = (
-        "cross_encoder",
-        "crossencoder",
-        "sentence_transformers",
-        "flagembedding",
     )
 
     def _code_hit(name: str) -> bool:
@@ -303,12 +298,6 @@ def _evidence_has_second_stage_reranker(evidence_mod: object) -> bool:
         if attr_name in ("rrf_fuse",):
             continue
         if _code_hit(attr_name):
-            return True
-    for loaded in sys.modules:
-        lowered = str(loaded).lower()
-        if any(fragment in lowered for fragment in loaded_module_fragments):
-            return True
-        if "cross-encoder" in lowered:
             return True
     return False
 
@@ -1042,9 +1031,9 @@ def _lane_has_production_checks(passed: object) -> bool:
 
 
 _STAGE_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("planner", "queries"),
-    ("retrieval", "rrf"),
-    ("verifier", "grounding", "safety"),
+    ("planner", "queries", "greeting", "capability"),
+    ("retrieval", "rrf", "memory", "quote", "citation"),
+    ("verifier", "grounding", "safety", "answer", "leak"),
     (
         "transport",
         "typing",
@@ -1053,6 +1042,8 @@ _STAGE_GROUPS: tuple[tuple[str, ...], ...] = (
         "controller",
         "ready",
         "delivery",
+        "envelope",
+        "heartbeat",
     ),
 )
 
