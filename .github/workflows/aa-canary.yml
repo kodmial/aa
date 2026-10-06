@@ -141,7 +141,9 @@ jobs:
           print(f"canary gates: {gates}")
           # Canary smoke requires at least deterministic Gates A/B PASS;
           # live Gates C-E BLOCKED without secrets still fails the canary
-          # fail-closed so repair/requalification blocks new /run.
+          # fail-closed so automatic P0 repair marks current main
+          # UNQUALIFIED. The canary never blocks owner /run; manual testing
+          # stays available labeled UNQUALIFIED.
           if gates.get("A") != "PASS" or gates.get("B") != "PASS":
               print("canary Gate C smoke FAILED on deterministic gates", file=sys.stderr)
               sys.exit(1)

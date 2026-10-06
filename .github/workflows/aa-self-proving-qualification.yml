@@ -2,11 +2,11 @@ name: AA self-proving qualification
 
 # Authoritative layered qualification DAG for issue #146 (Gates A-F).
 # Repository-owned workflow with required repository secrets/assets (never a
-# generic coding-agent runner that lacks them). Human Telegram testing (/run)
-# is allowed only when the exact current main SHA holds fresh trusted PASS
-# evidence from every mandatory gate. INCOMPLETE, missing secret/model, stale
-# SHA, mocked-only evidence, or unknown state all mean FAIL/BLOCKED, never a
-# warning.
+# generic coding-agent runner that lacks them). Owner /run for manual testing
+# stays available regardless of qualification state; qualification controls
+# only the QUALIFIED/UNQUALIFIED label. INCOMPLETE, missing secret/model,
+# stale SHA, mocked-only evidence, or unknown state all mean FAIL/BLOCKED
+# for qualification, never a restriction on owner-initiated manual testing.
 #
 # Gate order with checkpoint resume:
 #   A static/build -> B deterministic integration -> C live production path

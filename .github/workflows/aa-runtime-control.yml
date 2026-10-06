@@ -341,12 +341,13 @@ jobs:
               return;
             }
 
-            // Self-proving qualification guard (issue #146): /run for manual
-            // testing is allowed only when the exact current main SHA has
-            // fresh trusted PASS evidence from every mandatory gate (A-E).
-            // INCOMPLETE, missing secret/model, stale SHA, mocked-only
-            // evidence, or unknown state all mean FAIL/BLOCKED and refuse
-            // /run with the blocking gate named. Never degrade to warning.
+            // Self-proving qualification label (issue #146, control issue
+            // #31): owner /run for manual testing stays available regardless
+            // of qualification state. Qualification controls only the
+            // QUALIFIED/UNQUALIFIED label, never the launch. INCOMPLETE,
+            // missing secret/model, stale SHA, mocked-only evidence, or
+            // unknown state all mean FAIL/BLOCKED for qualification and an
+            // UNQUALIFIED label here, never a refusal of /run.
             const guardQualification = async () => {
               let headSha = '';
               try {
@@ -389,20 +390,20 @@ jobs:
               ? generationForComment(currentCommentId)
               : `manual-${nowMs}`;
             const duration = '5h';
-            // Enforce the guard: refuse /run when current main is
-            // unqualified/stale/failed and name the blocking gate. Once the
-            // exact-main final PASS exists, /run may start and the runtime
-            // publishes READY automatically (aa-runtime.yml marker).
+            // Advisory label only: never refuse /run. Without fresh
+            // exact-main PASS the runtime starts labeled UNQUALIFIED and the
+            // runtime publishes READY (UNQUALIFIED) once the poller is live;
+            // with PASS it is READY (QUALIFIED). Repair/requalification is
+            // automatic and proceeds independently.
             const guard = await guardQualification();
             if (!guard.allowed) {
               await comment(
-                `BLOCKED: /run refused — current main is not qualified (blocking gate ${guard.blocking || 'unknown'}; ` +
+                `UNQUALIFIED: current main has no fresh trusted PASS (blocking gate ${guard.blocking || 'unknown'}; ` +
                 `${guard.reason || 'no fresh trusted PASS evidence'}). ` +
-                'Repair/requalification is automatic; manual testing must wait for exact-main Gates A-E PASS. ' +
+                'Owner `/run` stays available and starts labeled UNQUALIFIED; the runtime will publish READY (UNQUALIFIED) once live. ' +
+                'Repair/requalification is automatic. ' +
                 'Use `/bot status` for the authoritative runtime marker (aa-runtime-status STARTING -> READY -> STOPPED|FAILED).'
               );
-              core.setFailed(`Self-proving guard BLOCKED /run (gate ${guard.blocking || 'unknown'}).`);
-              return;
             }
             let dispatchAccepted = false;
             try {
@@ -431,7 +432,8 @@ jobs:
             // poller. Never dispatch a second runtime to repair an uncertain
             // listing below.
             let marker = formatMarker(generation, 1, currentCommentId);
-            const markerBody = `Start 1/${MAX_STARTS} committed for generation ${generation}.\n` + marker;
+            const qualificationLabel = guard.allowed ? 'QUALIFIED' : 'UNQUALIFIED';
+            const markerBody = `Start 1/${MAX_STARTS} committed for generation ${generation} (${qualificationLabel}).\n` + marker;
             let markerCommitted = false;
             for (let attempt = 0; attempt < 3 && !markerCommitted; attempt++) {
               try {

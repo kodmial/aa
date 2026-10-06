@@ -1,9 +1,11 @@
 """Self-proving qualification contracts (issue #146, Gates A-F).
 
-Proves the non-negotiable invariant: ``/run`` is allowed only when the
-exact current ``main`` SHA holds fresh trusted PASS evidence from every
-mandatory gate. INCOMPLETE, missing secret/model, stale SHA, mocked-only
-evidence, or unknown state all mean FAIL/BLOCKED, never a warning.
+Proves the non-negotiable invariant: owner ``/run`` for manual testing stays
+available regardless of qualification state. Qualification state controls only
+the QUALIFIED/UNQUALIFIED label, never the launch. INCOMPLETE, missing
+secret/model, stale SHA, mocked-only evidence, or unknown state all mean
+FAIL/BLOCKED for qualification, never a restriction on owner-initiated manual
+testing.
 """
 
 from __future__ import annotations
@@ -107,24 +109,27 @@ def _verdict(statuses: dict[str, str]) -> FinalVerdict:
     )
 
 
-def test_invariant_run_allowed_only_on_exact_main_pass() -> None:
+def test_invariant_owner_run_always_allowed_qualification_labels_only() -> None:
     verdict = _verdict({})
     assert verdict.status == "PASS"
+    # Owner /run stays available regardless of qualification state; the
+    # verdict only controls the QUALIFIED/UNQUALIFIED label.
     assert is_run_allowed(verdict, current_sha=SHA) is True
-    # Stale SHA blocks.
-    assert is_run_allowed(verdict, current_sha=OTHER_SHA) is False
-    # Missing verdict blocks.
-    assert is_run_allowed(None, current_sha=SHA) is False
+    # Stale SHA still allows /run (labeled UNQUALIFIED).
+    assert is_run_allowed(verdict, current_sha=OTHER_SHA) is True
+    # Missing verdict still allows /run (labeled UNQUALIFIED).
+    assert is_run_allowed(None, current_sha=SHA) is True
 
 
-def test_incomplete_missing_stale_mocked_all_block() -> None:
+def test_incomplete_missing_stale_mocked_all_block_qualification_not_run() -> None:
     for bad in ("INCOMPLETE", "STALE", "BLOCKED"):
         verdict = _verdict({"C": bad})
         assert verdict.status in ("FAIL", "BLOCKED")
-        assert is_run_allowed(verdict, current_sha=SHA) is False
+        # Qualification is BLOCKED, but owner /run stays available.
+        assert is_run_allowed(verdict, current_sha=SHA) is True
     verdict = _verdict({"D": "FAIL"})
     assert verdict.status == "FAIL"
-    assert is_run_allowed(verdict, current_sha=SHA) is False
+    assert is_run_allowed(verdict, current_sha=SHA) is True
     # Mocked-only PASS evidence blocks.
     mocked = GateEvidence(gate="C", status="PASS", sha=SHA, run_id="r", mocked_only=True)
     assert effective_gate_status(mocked, current_sha=SHA) == "BLOCKED"
@@ -294,11 +299,12 @@ def test_gate_f_exact_main_no_stale_reuse() -> None:
 def test_refusal_names_blocking_gate() -> None:
     verdict = _verdict({"C": "FAIL"})
     explanation = refusal_explanation(verdict, current_sha=SHA)
-    assert "BLOCKED" in explanation
+    assert "UNQUALIFIED" in explanation
     assert "Gate C" in explanation
-    assert is_run_allowed(verdict, current_sha=SHA) is False
+    # Owner /run is never refused; the label is advisory.
+    assert is_run_allowed(verdict, current_sha=SHA) is True
     ready = refusal_explanation(_verdict({}), current_sha=SHA)
-    assert "READY" in ready
+    assert "QUALIFIED" in ready
 
 
 def test_repair_loop_single_issue_and_rerun_order() -> None:
@@ -358,13 +364,14 @@ def test_runtime_marker_lifecycle_and_status() -> None:
     )
 
 
-def test_canary_scope_blocks_run_until_green() -> None:
+def test_canary_never_blocks_owner_run() -> None:
     scope = canary_scope()
     assert scope["schedule_hours"] == 4
     assert "C-smoke" in scope["gates"]
     assert "D-readiness" in scope["gates"]
     assert "E-latency-guard" in scope["gates"]
-    assert scope["blocks_new_run_until_green"] is True
+    assert scope["blocks_new_run_until_green"] is False
+    assert scope["never_blocks_owner_run"] is True
     assert scope["auto_repair"] is True
 
 
@@ -405,7 +412,8 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
         encoding="utf-8"
     )
     assert "aa-self-proving-qualification.yml" in control
-    assert "BLOCKED: /run refused" in control
+    assert "UNQUALIFIED" in control
+    assert "/run" in control
     assert "aa-runtime-status" in control
     assert "STARTING -> READY -> STOPPED|FAILED" in control
     runtime = (REPO_ROOT / ".github" / "workflows" / "aa-runtime.yml").read_text(encoding="utf-8")

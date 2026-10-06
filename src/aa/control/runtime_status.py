@@ -126,8 +126,9 @@ def status_report(marker: RuntimeMarker | None, *, run_id: str = "") -> str:
     """
     if marker is None:
         return (
-            "No authoritative runtime marker. No Telegram poller is READY. "
-            "Post `/run` (owner only) after exact-main qualification PASS."
+            "No authoritative runtime marker. No Telegram poller is READY yet. "
+            "Owner `/run` stays available any time; without fresh exact-main "
+            "PASS the runtime is labeled UNQUALIFIED."
         )
     return (
         f"Authoritative runtime marker: phase={marker.phase} "
@@ -135,7 +136,7 @@ def status_report(marker: RuntimeMarker | None, *, run_id: str = "") -> str:
         + (
             "Telegram long polling is READY."
             if marker.phase == "READY"
-            else ("Telegram long polling is not READY; manual testing must wait for READY.")
+            else ("Telegram long polling is not READY yet; owner `/run` stays available.")
         )
         + (f" (request {run_id})" if run_id.strip() else "")
     )

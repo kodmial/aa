@@ -32,11 +32,14 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
   same current main SHA and matching product/runtime fingerprints. No stale
   reuse, no manual override.
 
-Non-negotiable invariant: ``/run`` is allowed only when the exact current
-``main`` SHA has fresh trusted PASS evidence from every mandatory gate.
-``INCOMPLETE``, missing secret/model, stale SHA, mocked-only evidence, or
-unknown state all mean FAIL/BLOCKED. This module never degrades that to a
-warning.
+Non-negotiable invariant: owner ``/run`` for manual testing stays available
+regardless of qualification state. Qualification state controls only whether
+the system may claim the product is READY/qualified, never whether the owner
+may launch it. ``INCOMPLETE``, missing secret/model, stale SHA, mocked-only
+evidence, or unknown state all mean FAIL/BLOCKED for qualification, never a
+restriction on owner-initiated manual testing. The launched runtime is
+labeled ``UNQUALIFIED`` without fresh exact-main PASS and publishes
+``READY (UNQUALIFIED)`` or ``READY (QUALIFIED)`` once the poller is live.
 
 All decision helpers here are pure (no network) so repository workflows
 and unit tests share one implementation. Live execution lives in
@@ -438,48 +441,42 @@ def decide_final_verdict(
 
 
 def is_run_allowed(verdict: FinalVerdict | None, *, current_sha: str) -> bool:
-    """Return whether ``/run`` may start for ``current_sha``.
+    """Return whether owner ``/run`` may start.
 
-    Allowed only when the exact current ``main`` SHA has fresh trusted PASS
-    evidence from every mandatory gate. Everything else is BLOCKED.
+    The non-negotiable invariant (issue #146, control issue #31) is that
+    owner/manual ``/run`` stays available regardless of qualification state.
+    Qualification controls only the QUALIFIED/UNQUALIFIED label, never the
+    launch itself. This helper therefore always returns ``True``; use
+    :func:`decide_final_verdict` / :func:`effective_gate_status` for the
+    separate qualification verdict (FAIL/BLOCKED vs PASS).
     """
-    try:
-        current = validate_exact_sha(current_sha)
-    except SelfProvingError:
-        return False
-    if verdict is None:
-        return False
-    if verdict.sha != current:
-        return False
-    if verdict.status != "PASS":
-        return False
-    if verdict.blocking_gate:
-        return False
-    for gate in verdict.gates:
-        if effective_gate_status(gate, current_sha=current) != "PASS":
-            return False
-        if gate.sha != current:
-            return False
-    if len({gate.gate for gate in verdict.gates} & set(MANDATORY_GATES)) != len(MANDATORY_GATES):
-        return False
     return True
 
 
 def refusal_explanation(verdict: FinalVerdict | None, *, current_sha: str) -> str:
-    """Explain which gate blocks ``/run`` (privacy-safe, no text)."""
+    """Describe the qualification label for an owner ``/run`` (advisory only).
+
+    Never refuses the launch: the owner may always start manual testing. The
+    returned text labels the runtime ``UNQUALIFIED`` (with the blocking gate
+    named) or ``READY (QUALIFIED)`` when exact-main PASS holds. Privacy-safe,
+    no user/corpus text.
+    """
     try:
         current = validate_exact_sha(current_sha)
     except SelfProvingError:
-        return "BLOCKED: current main SHA is unknown; /run refused."
+        return "UNQUALIFIED: current main SHA is unknown; /run allowed as UNQUALIFIED."
     if verdict is None:
-        return "BLOCKED: no self-proving qualification verdict for current main; /run refused."
+        return (
+            "UNQUALIFIED: no self-proving qualification verdict for current main; "
+            "/run allowed as UNQUALIFIED."
+        )
     if verdict.sha != current:
         return (
-            f"BLOCKED: qualification verdict is for stale SHA {verdict.sha[:12]}; "
-            f"current main is {current[:12]}; /run refused until requalification."
+            f"UNQUALIFIED: qualification verdict is for stale SHA {verdict.sha[:12]}; "
+            f"current main is {current[:12]}; /run allowed as UNQUALIFIED pending requalification."
         )
     if verdict.status == "PASS" and not verdict.blocking_gate:
-        return f"READY: exact main {current[:12]} holds fresh trusted PASS for Gates A-E."
+        return f"READY (QUALIFIED): exact main {current[:12]} holds fresh trusted PASS."
     blocking = verdict.blocking_gate or next(
         (
             gate.gate
@@ -498,9 +495,9 @@ def refusal_explanation(verdict: FinalVerdict | None, *, current_sha: str) -> st
         else (effective_gate_status(detail, current_sha=current) if detail else "unknown")
     )
     return (
-        f"BLOCKED: Gate {blocking} blocks /run (state={category}, "
+        f"UNQUALIFIED: Gate {blocking} blocks qualification (state={category}, "
         f"verdict={verdict.status}, sha={current[:12]}, run={verdict.run_id}); "
-        "repair/requalification required before manual testing."
+        "/run allowed as UNQUALIFIED; repair/requalification proceeds automatically."
     )
 
 
@@ -636,11 +633,17 @@ def is_429_restart(reason: str) -> bool:
 
 
 def canary_scope() -> dict[str, Any]:
-    """Return the bounded current-main canary scope (every 4h)."""
+    """Return the bounded current-main canary scope (every 4h).
+
+    The canary never blocks owner ``/run``; on failure it marks current main
+    ``UNQUALIFIED`` and schedules automatic P0 repair while manual testing
+    stays available labeled ``UNQUALIFIED``.
+    """
     return {
         "schedule_hours": _CANARY_EVERY_HOURS,
         "gates": ["C-smoke", "D-readiness", "E-latency-guard"],
-        "blocks_new_run_until_green": True,
+        "blocks_new_run_until_green": False,
+        "never_blocks_owner_run": True,
         "auto_repair": True,
     }
 
