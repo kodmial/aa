@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
 
-from aa.conversation.model_adapter import OpenCodeChatModel
+from aa.conversation.model_adapter import (
+    PRIMARY_ACCESS_CIRCUIT_TTL_S,
+    OpenCodeChatModel,
+)
 from aa.opencode.client import SessionInfo
 from aa.opencode.errors import (
     OpenCodeProviderAccessError,
@@ -216,9 +220,11 @@ async def test_primary_recovery_closes_circuit(
 
     assert await model._ainvoke_text("hello") == "fallback-ok"
     assert client.models == [PRIMARY, PRIMARY, FALLBACK]
-    # Force circuit expiry without waiting 5 minutes.
+    # Force circuit expiry without waiting for the TTL. Setting the stamp to
+    # 0.0 is not sufficient: time.monotonic() on a freshly booted runner can
+    # be below the TTL, leaving the circuit open. Expire relative to now.
     assert model._primary_access_rejected_at is not None
-    model._primary_access_rejected_at = 0.0
+    model._primary_access_rejected_at = time.monotonic() - PRIMARY_ACCESS_CIRCUIT_TTL_S - 1.0
     assert await model._ainvoke_text("hello again") == "primary-ok"
     assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
     assert model._primary_access_rejected_at is None
