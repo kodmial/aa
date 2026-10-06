@@ -449,6 +449,60 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "wip_limit: \"${{ inputs.wip_limit || '3' }}\"" in scheduler
 
 
+def test_gate_c_preserves_live_failure_without_live_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate F re-evaluation (issue #153) must not mask a real Gate C failure.
+
+    When the repository-owned live artifact already carries a matching
+    SHA/run FAIL, ``_gate_c`` must return ``live-path-failed`` even if the
+    current process lacks ``SELF_PROVING_LIVE``/secrets (Gate E/F context).
+    Only with no usable live evidence may it report
+    ``live-execution-not-enabled``.
+    """
+    import scripts.run_self_proving_qualification as runner
+
+    monkeypatch.delenv("SELF_PROVING_LIVE", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("AA_BOOK_AGE_IDENTITY", raising=False)
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    live_dir = tmp_path / "live-out"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / "product-contract-live-summary.json").write_text(
+        json.dumps({"main_sha": SHA, "run_id": "run-1", "status": "FAIL", "lanes": []}),
+        encoding="utf-8",
+    )
+    evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
+    assert evidence.status == "FAIL"
+    assert evidence.failure_category == "live-path-failed"
+
+
+def test_gate_c_still_blocked_without_evidence_or_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without live evidence or live env, Gate C stays fail-closed BLOCKED."""
+    import scripts.run_self_proving_qualification as runner
+
+    monkeypatch.delenv("SELF_PROVING_LIVE", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("AA_BOOK_AGE_IDENTITY", raising=False)
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
+    assert evidence.status == "BLOCKED"
+    assert evidence.failure_category == "live-execution-not-enabled"
+
+
+def test_gate_e_f_preserve_live_execution_context() -> None:
+    """Gate E/F re-evaluation must carry the Gate C live context (issue #153)."""
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    ).read_text(encoding="utf-8")
+    # Gate C plus the Gate E and Gate F re-evaluations must all set the live
+    # execution context so a real live-path-failed is never reclassified as
+    # live-execution-not-enabled.
+    assert workflow.count('SELF_PROVING_LIVE: "1"') >= 3
+
+
 def test_runner_stale_and_blocked_contract(tmp_path: Path) -> None:
     proc = subprocess.run(
         [

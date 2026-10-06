@@ -388,9 +388,18 @@ async def run_v2_answer_turn(
     # preserve the historical glue assumption and skip repair.
     # Telemetry stays explicit (initial_pack_empty + verifier outcome)
     # instead of burning latency on true glue turns.
+    # A turn whose verifier produced no verdict at all (result is None:
+    # draft split failure, language/leak guard, verifier validation error,
+    # or provider/transient/timeout after fallback) also skips repair
+    # (issue #153): re-planning cannot help when the verifier itself is
+    # unavailable, and each repair round burns another full
+    # planner+retrieval+answer+verifier sequence of slow provider calls.
+    # Grounding is preserved: without a verifier verdict the turn cannot
+    # be proven grounded, so it clarifies directly instead of burning
+    # latency on futile repair.
     is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
-    repair_allowed = (not initial_pack_empty) or (
-        initial_query_count is not None and initial_query_count > 0
+    repair_allowed = result is not None and (
+        (not initial_pack_empty) or (initial_query_count is not None and initial_query_count > 0)
     )
     if not passed and is_glue:
         logger.info(
@@ -399,6 +408,14 @@ async def run_v2_answer_turn(
         )
         telemetry["planner_outcome"] = "skipped-glue"
         telemetry["retrieval_outcome"] = "skipped-glue"
+    elif not passed and result is None:
+        logger.info(
+            "v2 repair skipped for verifier-unavailable turn",
+            extra={"initial_pack_empty": initial_pack_empty},
+        )
+        telemetry["planner_outcome"] = "skipped-verifier-unavailable"
+        if telemetry.get("retrieval_outcome") in ("skipped-initial", "preloaded"):
+            telemetry["retrieval_outcome"] = "skipped-verifier-unavailable"
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:

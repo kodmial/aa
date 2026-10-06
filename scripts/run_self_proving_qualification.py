@@ -28,6 +28,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aa.conversation.stage_telemetry import TurnTelemetry
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -807,7 +811,7 @@ def _live_prerequisites() -> tuple[bool, str]:
     return True, ""
 
 
-def _coerce_turn_telemetries(raw_turns: object) -> list[object] | None:
+def _coerce_turn_telemetries(raw_turns: object) -> list[TurnTelemetry] | None:
     """Coerce a JSON ``turns`` list into ``TurnTelemetry`` objects, if possible."""
     if not isinstance(raw_turns, list) or not raw_turns:
         return None
@@ -815,7 +819,7 @@ def _coerce_turn_telemetries(raw_turns: object) -> list[object] | None:
         from aa.conversation.stage_telemetry import TurnTelemetry, record_stage
     except Exception:
         return None
-    coerced: list[object] = []
+    coerced: list[TurnTelemetry] = []
     for entry in raw_turns:
         if not isinstance(entry, dict):
             return None
@@ -1377,6 +1381,18 @@ def _gate_c_live_evidence(
 def _gate_c(
     expected_sha: str, run_id: str, product: str, runtime: str
 ) -> tuple[GateEvidence, list[float], dict[str, float] | None]:
+    # Preserve repository-owned live evidence first (issue #153): when Gate C
+    # already produced a matching-SHA/run live artifact (PASS or FAIL), that
+    # verdict is authoritative even if the current process lacks the live
+    # execution context (Gate E/F re-evaluation must still preserve it, and
+    # this runner-level ordering is the backstop). This prevents Gate F from
+    # replacing a real live-path-failed with live-execution-not-enabled and
+    # sending the repair loop at the wrong category. Only when no usable live
+    # evidence exists does the prerequisite check apply (fail-closed, never
+    # mocked PASS).
+    decided = _gate_c_live_evidence(expected_sha, run_id, product, runtime)
+    if decided is not None:
+        return decided
     ready, reason = _live_prerequisites()
     if not ready:
         return (
@@ -1394,12 +1410,8 @@ def _gate_c(
             [],
             None,
         )
-    # Live prerequisites hold: map the repository-owned live artifact to
-    # PASS/FAIL. Without usable live evidence this gate stays BLOCKED
-    # (fail-closed); it never reports mocked PASS.
-    decided = _gate_c_live_evidence(expected_sha, run_id, product, runtime)
-    if decided is not None:
-        return decided
+    # Live prerequisites hold but no usable live artifact exists: stay BLOCKED
+    # (fail-closed); never report mocked PASS.
     return (
         GateEvidence(
             gate="C",
@@ -1709,8 +1721,8 @@ def main(argv: list[str] | None = None) -> int:
     run_id = str(args.run_id)
 
     if os.environ.get("OPENCODE_429_RESTART_REQUIRED", "") == "1":
-        marker = out_dir / "restart-required.json"
-        marker.write_text(
+        restart_marker = out_dir / "restart-required.json"
+        restart_marker.write_text(
             json.dumps(
                 {"reason_code": "OPENCODE_429_RESTART_REQUIRED", "sha": expected},
                 sort_keys=True,

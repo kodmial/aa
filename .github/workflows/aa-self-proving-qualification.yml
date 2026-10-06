@@ -470,6 +470,12 @@ jobs:
 
       - name: Gate E - live performance/SLO
         shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
           # Checkpoint resume: skip when Gate E already completed.
@@ -536,8 +542,18 @@ jobs:
         # Always emit the machine-readable final verdict so a failed Gate C/D/E
         # never degrades to unknown-gate-failure: the repair publisher maps the
         # concrete blocking gate/component from self-proving-summary.json.
+        # Live env is preserved here (issue #153) so Gate F re-evaluation
+        # cannot replace a real Gate C live-path-failed with
+        # live-execution-not-enabled; the runner additionally prefers the
+        # persisted live-out artifact regardless of env.
         if: always()
         shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
+          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
