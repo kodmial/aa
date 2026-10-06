@@ -1256,14 +1256,10 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     # is responsible for starting the pinned OpenCode process. Application.start()
     # below then enforces ensure_ready before any Telegram update is accepted.
     try:
+        from langchain_core.messages import HumanMessage
+
         from aa.app import Application
         from aa.config import Settings
-        from aa.conversation.output_limits import envelope_passes
-        from aa.conversation.turn_pipeline import (
-            NATURAL_CLARIFICATION_REPLY,
-            contains_cyrillic,
-            leaks_internal_terms,
-        )
         from aa.conversation.model_adapter import (
             ANSWER_AGENT_V2,
             PLANNER_AGENT_V2,
@@ -1271,8 +1267,13 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             VERIFIER_AGENT_V2,
             OpenCodeChatModel,
         )
+        from aa.conversation.output_limits import envelope_passes
+        from aa.conversation.turn_pipeline import (
+            NATURAL_CLARIFICATION_REPLY,
+            contains_cyrillic,
+            leaks_internal_terms,
+        )
         from aa.telegram.transport import PollingTelegramTransport, TelegramApi
-        from langchain_core.messages import HumanMessage
 
         class _QualificationTelegramApi(TelegramApi):
             """Deterministic Telegram network seam; production transport stays real."""
