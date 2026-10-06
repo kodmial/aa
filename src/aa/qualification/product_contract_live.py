@@ -1203,8 +1203,8 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
-    Telegram network I/O is the only substituted dependency in this lane.
-    Raw Bot API Update JSON enters PollingTelegramTransport._process_raw_update
+    Telegram network I/O is the only substituted dependency in this lane:
+    raw Bot API Update JSON enters PollingTelegramTransport._process_raw_update
     and then follows the production parser -> Application handler -> per-chat
     dispatcher/FIFO -> typing heartbeat -> LangGraph -> real OpenCode/provider
     -> real RU retrieval/index -> answer/verifier -> transport delivery path.
@@ -1248,56 +1248,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             },
         )
 
-    try:
-        from aa.opencode.client import HttpOpenCodeClient
-
-        base_url = (os.environ.get("OPENCODE_BASE_URL", "") or "").strip() or (
-            "http://127.0.0.1:4096"
-        )
-        health = await HttpOpenCodeClient(base_url).health()
-        if not health.healthy:
-            incomplete.append("live-opencode-not-healthy")
-            raise ProductContractLiveError("OpenCode runtime not healthy")
-    except ProductContractLiveError:
-        return LaneResult(
-            lane="live-telegram-evidence",
-            status="INCOMPLETE",
-            passed=tuple(passed),
-            failed=tuple(failed),
-            incomplete=tuple(incomplete),
-            metrics={
-                "scenarios_executed": 0,
-                "turns_executed": 0,
-                "latency_p50_s": 0.0,
-                "latency_p95_s": 0.0,
-                "latency_max_s": 0.0,
-                "turn_latencies_ms": [],
-                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": True,
-                "production_boundary": "PollingTelegramTransport._process_raw_update",
-            },
-        )
-    except Exception:
-        incomplete.append("live-opencode-unreachable")
-        return LaneResult(
-            lane="live-telegram-evidence",
-            status="INCOMPLETE",
-            passed=tuple(passed),
-            failed=tuple(failed),
-            incomplete=tuple(incomplete),
-            metrics={
-                "scenarios_executed": 0,
-                "turns_executed": 0,
-                "latency_p50_s": 0.0,
-                "latency_p95_s": 0.0,
-                "latency_max_s": 0.0,
-                "turn_latencies_ms": [],
-                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": True,
-                "production_boundary": "PollingTelegramTransport._process_raw_update",
-            },
-        )
-
+    # Do not pre-probe localhost here: the production LocalOpenCodeRuntime
+    # is responsible for starting the pinned OpenCode process. Application.start()
+    # below then enforces ensure_ready before any Telegram update is accepted.
     try:
         from aa.app import Application
         from aa.config import Settings
@@ -1317,6 +1270,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 self.sent_texts: list[str] = []
                 self.sent_voices = 0
                 self.chat_actions = 0
+                self.download_count = 0
+                self.voice_fixture = b""
 
             async def call(self, method: str, payload: dict[str, Any]) -> Any:
                 self.calls.append((method, dict(payload)))
@@ -1340,11 +1295,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     return {"message_id": len(self.sent_texts)}
                 if method == "getFile":
                     return {"file_path": "qualification/voice.ogg"}
-                raise ProductContractLiveError(f"unexpected qualification Telegram method: {method}")
+                raise ProductContractLiveError(
+                    f"unexpected qualification Telegram method: {method}"
+                )
 
             async def download_file(self, file_path: str) -> bytes:
                 _ = file_path
-                return b"OggS-qualification-fixture"
+                self.download_count += 1
+                if not self.voice_fixture:
+                    raise ProductContractLiveError("qualification voice fixture is missing")
+                return bytes(self.voice_fixture)
 
             async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
                 _ = chat_id
@@ -1394,6 +1354,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 ("emergency", 920005, "Я хочу покончить с собой сегодня"),
                 ("long-conversation", 920006, "Мне трудно признать, что одному не получается"),
             )
+
+            replies: list[str] = []
             ordinary_families = {
                 "meta-capability",
                 "substantive-drinking",
@@ -1403,7 +1365,6 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 "unsupported-out-of-book",
                 "long-conversation",
             }
-            replies: list[str] = []
             loop = asyncio.get_running_loop()
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 before = len(api.sent_texts)
@@ -1447,7 +1408,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
-                            snapshot = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
+                            snapshot = graph.last_telemetry_for_thread(
+                                graph.thread_id(chat_id)
+                            )
                             if snapshot:
                                 stage_snapshots.append(dict(snapshot))
                     except Exception:
@@ -1458,8 +1421,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             )
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
             _check("live-answer-diversity", len(set(replies)) >= 4)
-            _check("live-typing-heartbeat-observed", typing_sends >= len(ordinary_families))
-            _check("live-delivery-sendmessage-observed", len(api.sent_texts) == len(scenarios))
+            _check(
+                "live-typing-heartbeat-observed",
+                typing_sends >= len(ordinary_families),
+            )
+            _check(
+                "live-delivery-sendmessage-observed",
+                len(api.sent_texts) == len(scenarios),
+            )
             _check(
                 "live-planner-retrieval-answer-verifier-telemetry",
                 len(stage_snapshots) >= 5
@@ -1471,6 +1440,61 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     for item in stage_snapshots
                 ),
             )
+
+            # Raw voice Update through the same production transport. Build a
+            # fixed local OGG fixture with the pinned real Silero TTS model,
+            # fetch it only through TelegramApi.getFile/download_file, then
+            # require real GigaAM ASR -> graph -> real TTS -> sendVoice.
+            voice_ok = bool(
+                app.voice_available
+                and app.tts_available
+                and getattr(app, "_tts_pipeline", None) is not None
+            )
+            _check("live-voice-models-ready", voice_ok)
+            if voice_ok:
+                tts = getattr(app, "_tts_pipeline")
+                assert tts is not None
+                api.voice_fixture = await tts.synthesize_voice_ogg(
+                    "Мне сегодня трудно не пить", "xenia"
+                )
+                before_voice = api.sent_voices
+                before_text = len(api.sent_texts)
+                before_download = api.download_count
+                raw_voice = {
+                    "update_id": 940001,
+                    "message": {
+                        "message_id": 100,
+                        "date": 1,
+                        "chat": {"id": 920007, "type": "private"},
+                        "voice": {
+                            "file_id": "qualification-voice-fixture",
+                            "duration": 4,
+                            "file_size": len(api.voice_fixture),
+                        },
+                    },
+                }
+                voice_started = time.perf_counter()
+                handled = await transport._process_raw_update(raw_voice)
+                _check("live-voice-raw-transport-accepted", bool(handled))
+                voice_deadline = loop.time() + 120.0
+                while (
+                    api.sent_voices <= before_voice
+                    and len(api.sent_texts) <= before_text
+                    and loop.time() < voice_deadline
+                ):
+                    await asyncio.sleep(0.02)
+                voice_elapsed = time.perf_counter() - voice_started
+                _check(
+                    "live-voice-file-fetch-seam",
+                    api.download_count > before_download,
+                )
+                _check(
+                    "live-voice-asr-answer-sendvoice",
+                    api.sent_voices > before_voice
+                    and len(api.sent_texts) == before_text,
+                )
+            else:
+                voice_elapsed = 0.0
         finally:
             await app.stop()
     except Exception:
@@ -1494,6 +1518,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "clarification_count": collapsed_count,
         "typing_heartbeat_sends": typing_sends,
+        "voice_end_to_end_ms": round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0,
         "live_prerequisites_present": True,
         "production_boundary": "PollingTelegramTransport._process_raw_update",
     }
@@ -1511,6 +1536,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         incomplete=tuple(incomplete),
         metrics=metrics,
     )
+
 
 # ---------------------------------------------------------------------------
 # Top-level evaluation
