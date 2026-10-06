@@ -431,20 +431,19 @@ jobs:
           # Gate D durable lifecycle: STARTING is published before OpenCode /
           # Telegram bootstrap with the exact run id/SHA.
           sha="$(git rev-parse HEAD)"
-          python - <<PY
+          RUN_PHASE="STARTING" RUN_SHA="$sha" python - <<'PY'
           import time
           from pathlib import Path
           import sys
           sys.path.insert(0, "src")
           from aa.control.runtime_status import RuntimeMarker, write_marker
           import os
-          marker = RuntimeMarker(run_id=os.environ["RUN_ID"], sha=os.environ["SHA"], phase="STARTING", timestamp_s=time.time())
+          marker = RuntimeMarker(run_id=os.environ["RUN_ID"], sha=os.environ["RUN_SHA"], phase=os.environ["RUN_PHASE"], timestamp_s=time.time())
           write_marker(Path("runtime-status.json"), marker)
           print(f"STARTING marker published run={marker.run_id} sha={marker.sha[:12]}")
           PY
         env:
           RUN_ID: ${{ github.run_id }}
-          SHA: ${{ github.sha }}
 
       - name: Run bounded Telegram poller and OpenCode
         # Authoritative readiness (issue #144): Application.start() publishes
@@ -512,7 +511,7 @@ jobs:
           if [[ "${{ steps.runtime.outputs.restart_required }}" == "true" ]]; then
             phase="FAILED"
           fi
-          if [[ "${{ job.status }}" != "success" && "$phase" == "READY" ]]; then
+          if [[ "${{ job.status }}" != "success" ]]; then
             phase="FAILED"
           fi
           RUN_PHASE="$phase" RUN_SHA="$sha" python - <<'PY'
