@@ -179,8 +179,16 @@ def evaluate_gate_c_telemetry(
                 },
             )
         failed = [sample.stage for sample in turn.stages if not sample.ok]
-        repair_ok = any(s.stage == "repair" and s.ok for s in turn.stages)
-        if verifier_failed and repair_ok:
+        repair_idx = max(
+            [i for i, s in enumerate(turn.stages) if s.stage == "repair" and s.ok],
+            default=-1,
+        )
+        verifier_repassed = False
+        if repair_idx >= 0:
+            verifier_repassed = any(
+                i > repair_idx and s.stage == "verifier" and s.ok for i, s in enumerate(turn.stages)
+            )
+        if verifier_failed and verifier_repassed:
             failed = [stage for stage in failed if stage != "verifier"]
         if failed:
             return (

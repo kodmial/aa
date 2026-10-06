@@ -50,6 +50,7 @@ and unit tests share one implementation. Live execution lives in
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -574,6 +575,13 @@ def slo_guards(
     }
     if not latencies_ms:
         return False, "no latency samples; INCOMPLETE", metrics
+    for sample in latencies_ms:
+        try:
+            value = float(sample)
+        except (TypeError, ValueError):
+            return False, "non-numeric latency sample; INCOMPLETE", metrics
+        if not math.isfinite(value) or value <= 0:
+            return False, "invalid latency sample; INCOMPLETE", metrics
     if metrics["max_ms"] >= float(ORDINARY_TURN_BUDGET_MS):
         return (
             False,
