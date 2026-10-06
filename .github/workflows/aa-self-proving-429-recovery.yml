@@ -1,0 +1,75 @@
+name: AA self-proving 429 recovery
+
+on:
+  workflow_run:
+    workflows:
+      - AA self-proving qualification
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  recover:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download provider 429 marker
+        id: marker
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-self-proving-restart
+          path: /tmp/aa-self-proving-restart
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Re-run qualification on a fresh VM
+        if: ${{ steps.marker.outcome == 'success' }}
+        uses: actions/github-script@v7
+        env:
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          FAILED_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          FAILED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const markerPath = '/tmp/aa-self-proving-restart/restart-required.json';
+            if (!fs.existsSync(markerPath)) {
+              core.info('No 429 restart marker; product/other failures are handled by the repair loop.');
+              return;
+            }
+            const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+            if (marker.reason_code !== 'OPENCODE_429_RESTART_REQUIRED') {
+              core.info('Restart artifact is not a provider 429 marker; no VM restart.');
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = Number(process.env.FAILED_RUN_ID);
+            const attempt = Number(process.env.FAILED_RUN_ATTEMPT || '1');
+            const sha = String(process.env.FAILED_HEAD_SHA || '');
+            if (!Number.isInteger(runId) || runId <= 0) {
+              core.setFailed('Invalid failed run id for 429 recovery.');
+              return;
+            }
+            if (attempt < 10) {
+              core.info(`Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`);
+              await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: runId });
+              return;
+            }
+            // GitHub caps re-runs. Continue convergence ownerlessly by
+            // dispatching a fresh exact-SHA qualification run instead of
+            // entering a terminal paused/human-required state.
+            core.info(`Provider 429 persisted through ${attempt} attempts; dispatching a fresh qualification run.`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'aa-self-proving-qualification.yml',
+              ref: 'main',
+              inputs: { required_sha: sha },
+            });
