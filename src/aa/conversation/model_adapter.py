@@ -153,6 +153,7 @@ class OpenCodeChatModel(BaseChatModel):
 
     _client: OpenCodeClient = PrivateAttr()
     _primary_access_rejected_at: float | None = PrivateAttr(default=None)
+    _circuit_shared: dict[str, float | None] = PrivateAttr(default_factory=dict)
 
     def __init__(
         self,
@@ -170,6 +171,11 @@ class OpenCodeChatModel(BaseChatModel):
             request_timeout=request_timeout,
         )
         self._client = client
+        # Fresh shared store per root instance; with_agent() siblings share
+        # the same dict object so a primary 403 on planner also fast-fails
+        # answer/verifier on the same turn (Gate C live SLO).
+        if not isinstance(getattr(self, "_circuit_shared", None), dict):
+            self._circuit_shared = {}
 
     @property
     def _llm_type(self) -> str:
@@ -182,34 +188,60 @@ class OpenCodeChatModel(BaseChatModel):
 
     def with_agent(self, agent: str) -> OpenCodeChatModel:
         """Return a copy of this model bound to another named agent."""
-        return OpenCodeChatModel(
+        sibling = OpenCodeChatModel(
             self._client,
             agent=agent,
             primary_model=self.primary_model,
             fallback_model=self.fallback_model,
             request_timeout=self.request_timeout,
         )
+        # Share the primary-403 circuit across planner/answer/verifier
+        # siblings built from the same production runtime: the first 403
+        # already performed the required >=5s retry, later agents on the
+        # same turn must fast-fallback instead of burning another 5s sleep
+        # plus slow primary attempts each.
+        try:
+            sibling._circuit_shared = self._circuit_shared
+            if self._primary_access_rejected_at is not None:
+                sibling._primary_access_rejected_at = self._primary_access_rejected_at
+        except Exception:
+            pass
+        return sibling
 
     def _primary_circuit_open(self) -> bool:
         """Whether the primary was recently rejected (fast fallback allowed)."""
-        rejected_at = self._primary_access_rejected_at
-        if rejected_at is None:
-            return False
-        try:
-            return (time.monotonic() - float(rejected_at)) < PRIMARY_ACCESS_CIRCUIT_TTL_S
-        except (TypeError, ValueError):
-            return False
+        for rejected_at in (
+            self._primary_access_rejected_at,
+            self._circuit_shared.get(self.primary_model),
+        ):
+            if rejected_at is None:
+                continue
+            try:
+                if (time.monotonic() - float(rejected_at)) < PRIMARY_ACCESS_CIRCUIT_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _record_primary_rejection(self) -> None:
         """Remember a persistent primary 403 to skip redundant retries."""
         try:
-            self._primary_access_rejected_at = time.monotonic()
+            stamp = time.monotonic()
         except Exception:
-            self._primary_access_rejected_at = 0.0
+            stamp = 0.0
+        self._primary_access_rejected_at = stamp
+        try:
+            self._circuit_shared[self.primary_model] = stamp
+        except Exception:
+            pass
 
     def _clear_primary_rejection(self) -> None:
         """Clear the circuit when the primary serves again."""
         self._primary_access_rejected_at = None
+        try:
+            self._circuit_shared.pop(self.primary_model, None)
+        except Exception:
+            pass
 
     def _fast_fallback_available(self) -> bool:
         """Whether a direct fallback is allowed under an open circuit."""

@@ -224,8 +224,12 @@ async def test_primary_recovery_closes_circuit(
     # Force circuit expiry without waiting for the TTL. Setting the stamp to
     # 0.0 is not sufficient: time.monotonic() on a freshly booted runner can
     # be below the TTL, leaving the circuit open. Expire relative to now.
+    # The circuit is shared across with_agent() siblings via _circuit_shared,
+    # so expire both stores.
     assert model._primary_access_rejected_at is not None
-    model._primary_access_rejected_at = time.monotonic() - PRIMARY_ACCESS_CIRCUIT_TTL_S - 1.0
+    expired = time.monotonic() - PRIMARY_ACCESS_CIRCUIT_TTL_S - 1.0
+    model._primary_access_rejected_at = expired
+    model._circuit_shared[PRIMARY] = expired
     assert await model._ainvoke_text("hello again") == "primary-ok"
     assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
     assert model._primary_access_rejected_at is None
@@ -330,3 +334,46 @@ async def test_structured_fallback_403_clears_primary_circuit(
         schema={"type": "object"},
     ) == {"ok": True}
     assert client.models[-1] == PRIMARY
+
+
+async def test_sibling_agents_share_primary_403_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner 403 must fast-failover answer/verifier siblings on one turn.
+
+    Production builds planner once then derives summarizer/answer/verifier
+    via with_agent(). A per-instance circuit would burn another 5s sleep
+    plus two slow primary attempts for every sibling on the same turn
+    (Gate C live SLO: 3x overhead per ordinary turn). Siblings share one
+    circuit store; the first 403 still performs the required >=5s retry.
+    """
+    client = _ScriptedClient(
+        text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
+            "fallback-planner",
+            "fallback-answer",
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    planner = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+    )
+    answer = planner.with_agent("aa-v2")
+
+    assert await planner._ainvoke_text("hello") == "fallback-planner"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert sleeps == [5.0]
+
+    # Answer sibling must skip redundant primary retries via shared circuit.
+    assert await answer._ainvoke_text("hello again") == "fallback-answer"
+    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert sleeps == [5.0]
