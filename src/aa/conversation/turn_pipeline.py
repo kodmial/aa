@@ -441,13 +441,20 @@ async def run_v2_answer_turn(
         telemetry["planner_outcome"] = "skipped-glue"
         telemetry["retrieval_outcome"] = "skipped-glue"
     elif not passed and result is None:
+        # Gate C live repair: preserve the concrete upstream stage outcomes
+        # for diagnosis instead of flattening them. The planner actually ran
+        # (its query count/pack state is enriched upstream in
+        # answer_pipeline_node); overwriting it here with
+        # skipped-verifier-unavailable hid whether the collapse came from
+        # planner vs retrieval vs verifier. Repair is still skipped (no
+        # verifier verdict means re-planning cannot help and each round
+        # burns slow provider calls), but telemetry keeps the real
+        # planner/retrieval state so the next failure attributes to the
+        # concrete stage.
         logger.info(
             "v2 repair skipped for verifier-unavailable turn",
             extra={"initial_pack_empty": initial_pack_empty},
         )
-        telemetry["planner_outcome"] = "skipped-verifier-unavailable"
-        if telemetry.get("retrieval_outcome") in ("skipped-initial", "preloaded"):
-            telemetry["retrieval_outcome"] = "skipped-verifier-unavailable"
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:
