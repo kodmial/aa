@@ -290,8 +290,12 @@ class OpenCodeChatModel(BaseChatModel):
                 )
             except OpenCodeRateLimitError:
                 raise
-            except (OpenCodeTransientError, OpenCodeTimeoutError):
-                # Fallback transient: close the circuit so the next call
+            except (
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+                OpenCodeProviderAccessError,
+            ):
+                # Fallback failure: close the circuit so the next call
                 # re-probes the primary instead of sticking to a bad fallback.
                 self._clear_primary_rejection()
                 raise
@@ -327,7 +331,8 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-            self._record_primary_rejection()
+            if isinstance(last_transient, OpenCodeProviderAccessError):
+                self._record_primary_rejection()
             logger.info("opencode model fallback used")
             return await self._invoke_ephemeral(
                 prompt, model=self.fallback_model, agent=self.agent, system=system
@@ -365,7 +370,11 @@ class OpenCodeChatModel(BaseChatModel):
                 )
             except OpenCodeRateLimitError:
                 raise
-            except (OpenCodeTransientError, OpenCodeTimeoutError):
+            except (
+                OpenCodeTransientError,
+                OpenCodeTimeoutError,
+                OpenCodeProviderAccessError,
+            ):
                 self._clear_primary_rejection()
                 raise
         last_transient: BaseException | None = None
@@ -404,7 +413,8 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
         if self.fallback_model.strip() and self.fallback_model != self.primary_model:
-            self._record_primary_rejection()
+            if isinstance(last_transient, OpenCodeProviderAccessError):
+                self._record_primary_rejection()
             logger.info("opencode model fallback used")
             return await self._invoke_ephemeral_structured(
                 prompt,
