@@ -398,6 +398,11 @@ async def test_logs_contain_no_token_or_message_bodies() -> None:
 
 
 async def test_application_routes_polling_message_to_opencode_and_back() -> None:
+    # Cutover #118: ordinary turns use only the LangGraph runtime (never a
+    # direct OpenCode prompt); the reply is a natural Russian turn inside
+    # the envelope, never the retired canned reply.
+    from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
+
     api = FakeTelegramApi(get_updates_scripts=[[_private_message(80, 42, 1, "hello")]])
     transport = _fast_transport(api)
     runtime = StubOpenCodeRuntime(
@@ -412,13 +417,21 @@ async def test_application_routes_polling_message_to_opencode_and_back() -> None
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 1)
         assert api.sent_payloads[0]["chat_id"] == 42
-        assert api.sent_payloads[0]["text"] == "Фиктивный ответ 1"
+        text = api.sent_payloads[0]["text"]
+        assert text.strip()
+        assert contains_cyrillic(text)
+        assert not leaks_internal_terms(text)
+        assert "Фиктивный ответ" not in text
         assert app.sessions.session_count() == 1
     finally:
         await app.stop()
 
 
 async def test_application_new_command_resets_only_that_chat() -> None:
+    # Cutover #118: `/new` clears only that chat's LangGraph thread state;
+    # ordinary turns are natural Russian replies, never canned model text.
+    from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
+
     api = FakeTelegramApi(
         get_updates_scripts=[
             [
@@ -446,13 +459,17 @@ async def test_application_new_command_resets_only_that_chat() -> None:
         by_chat: dict[int, list[str]] = {}
         for payload in api.sent_payloads:
             by_chat.setdefault(payload["chat_id"], []).append(payload["text"])
-        assert by_chat[8] == ["Фиктивный ответ 1"]
+        assert len(by_chat[8]) == 1
         assert len(by_chat[7]) == 3
-        assert by_chat[7][0] == "Фиктивный ответ 1"
+        for text in (by_chat[8][0], by_chat[7][0], by_chat[7][2]):
+            assert text.strip()
+            assert contains_cyrillic(text)
+            assert not leaks_internal_terms(text)
+            assert "Фиктивный ответ" not in text
         assert "Новая беседа начата" in by_chat[7][1]
-        # Chat 7 gets a fresh OpenCode session after /new.
-        assert by_chat[7][2] == "Фиктивный ответ 1"
-        assert app.sessions.get_opencode_session_id(7) != app.sessions.get_opencode_session_id(8)
+        # Both chats stay tracked; the LangGraph thread (not an OpenCode
+        # session binding) owns conversation memory after the cutover.
+        assert app.sessions.session_count() == 2
     finally:
         await app.stop()
 

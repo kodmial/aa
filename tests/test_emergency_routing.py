@@ -362,11 +362,18 @@ def test_safety_logs_never_contain_raw_message_bodies(
 
 
 async def test_emergency_path_precedes_opencode_and_skips_llm() -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
     settings = Settings.from_env({})
     runtime = StubOpenCodeRuntime(
         OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
     )
-    app = Application(settings, opencode_runtime=runtime)
+
+    async def _delegate(thread: str, text: str) -> str:
+        return "Понял вас. Давайте разберём это спокойно. Что сейчас важнее?"
+
+    graph_runtime = GraphTurnRuntime(delegate=_delegate)
+    app = Application(settings, opencode_runtime=runtime, graph_runtime=graph_runtime)
     await app.start()
     try:
         reply = await app.respond(123, "I want to kill myself tonight")
@@ -381,13 +388,15 @@ async def test_emergency_path_precedes_opencode_and_skips_llm() -> None:
         client = runtime.client
         assert isinstance(client, FakeOpenCodeClient)
         assert client._sessions == {}
-        # A substantive turn without a qualified RU index fails closed
-        # (issue #9): no invented answer is ever returned from memory.
-        from aa.conversation.orchestrator import FAIL_CLOSED_REPLY
+        # An ordinary turn uses only the LangGraph runtime (issue #118):
+        # it returns a natural Russian reply, never the retired
+        # technical fail-closed reply and never implementation mechanics.
+        from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
 
         normal = await app.respond(123, "What does the Big Book say about fear?")
-        assert normal == FAIL_CLOSED_REPLY
-        assert len(client._sessions) == 1
+        assert contains_cyrillic(normal)
+        assert not leaks_internal_terms(normal)
+        assert client._sessions == {}
     finally:
         await app.stop()
 
