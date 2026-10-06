@@ -140,6 +140,58 @@ def test_working_tree_clean_ignores_ephemeral_outputs(tmp_path: Path) -> None:
     assert working_tree_clean(repo) is False
 
 
+def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
+    # Regression for kodmial/aa#150: a missing third-party module
+    # (langchain_core on a minimal runner) raised an unhandled
+    # ModuleNotFoundError from the production import chain, so the live
+    # runner produced no result.json and no lane evidence. Each lane must
+    # degrade to an attributable FAIL instead of aborting the evaluation.
+    import asyncio
+
+    import aa.qualification.product_contract_live as live_mod
+    from aa.qualification.product_contract_live import LaneResult
+
+    async def _boom() -> LaneResult:
+        raise ModuleNotFoundError("No module named 'langchain_core'")
+
+    async def _ok_transport() -> LaneResult:
+        return LaneResult(lane="telegram-transport-25-32", status="PASS", passed=("ok",))
+
+    async def _ok_live() -> LaneResult:
+        return LaneResult(
+            lane="live-telegram-evidence", status="INCOMPLETE", incomplete=("deferred",)
+        )
+
+    original_message = live_mod.run_message_lane
+    original_transport = live_mod.run_transport_lane
+    original_live = live_mod.run_live_telegram_evidence_lane
+    live_mod.run_message_lane = _boom  # type: ignore[assignment]
+    live_mod.run_transport_lane = _ok_transport  # type: ignore[assignment]
+    live_mod.run_live_telegram_evidence_lane = _ok_live  # type: ignore[assignment]
+    try:
+        message, transport, live_evidence = asyncio.run(live_mod._run_async_lanes())
+    finally:
+        live_mod.run_message_lane = original_message
+        live_mod.run_transport_lane = original_transport
+        live_mod.run_live_telegram_evidence_lane = original_live
+    assert message.lane == "product-contract-1-24"
+    assert message.status == "FAIL"
+    assert any("ModuleNotFoundError" in item for item in message.failed)
+    assert_no_text_leak(message.to_dict())
+    assert transport.status == "PASS"
+    assert live_evidence.status == "INCOMPLETE"
+
+
+def test_ephemeral_gate_checkpoints_stay_untracked() -> None:
+    # Regression for kodmial/aa#150: root gate-*.done resume markers were
+    # committed as tracked files although the workflow stages checkpoints
+    # under aa-self-proving-checkpoints/. They must stay gitignored.
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "gate-*.done" in gitignore
+    assert not (REPO_ROOT / "gate-A.done").exists()
+    assert not (REPO_ROOT / "gate-B.done").exists()
+
+
 def test_self_proving_gate_f_always_emits_verdict() -> None:
     # Regression for kodmial/aa#151 unknown-gate-failure: Gate F must run even
     # after a Gate C failure so the repair publisher maps a concrete blocking

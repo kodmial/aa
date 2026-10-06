@@ -1798,10 +1798,50 @@ def decide_status(lane_statuses: list[str]) -> str:
     return "INCOMPLETE"
 
 
+def _failed_lane(lane: str, reason: str, scenarios_executed: int = 0) -> LaneResult:
+    """Build a fail-closed lane result when the harness itself crashes.
+
+    Issue #150: a missing third-party module (for example ``langchain_core``
+    on a minimal runner) raised an unhandled ``ModuleNotFoundError`` from the
+    production import chain, so no lane evidence and no ``result.json`` was
+    produced. Attribute the crash to the concrete lane as FAIL (never a fake
+    PASS, never silence) with only the exception type in the failure name.
+    """
+    return LaneResult(
+        lane=lane,
+        status="FAIL",
+        passed=(),
+        failed=(f"{lane}:{reason}",),
+        metrics={
+            "scenarios_executed": scenarios_executed,
+            "turns_executed": 0,
+            "harness_error": reason,
+        },
+    )
+
+
 async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult]:
-    message = await run_message_lane()
-    transport = await run_transport_lane()
-    live_evidence = await run_live_telegram_evidence_lane()
+    # Per-lane fail-closed (issue #150): one lane's harness/import crash must
+    # not abort the whole evaluation with no evidence. Each lane degrades to
+    # an attributable FAIL so the summary still names the concrete lane.
+    try:
+        message = await run_message_lane()
+    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        message = _failed_lane("product-contract-1-24", type(exc).__name__)
+    try:
+        transport = await run_transport_lane()
+    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        transport = _failed_lane("telegram-transport-25-32", type(exc).__name__)
+    try:
+        live_evidence = await run_live_telegram_evidence_lane()
+    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        live_evidence = _failed_lane("live-telegram-evidence", type(exc).__name__)
     return message, transport, live_evidence
 
 
@@ -1833,8 +1873,18 @@ def evaluate_live(
         )
     static_gates = collect_static_gates(root)
     message, transport, live_evidence = asyncio.run(_run_async_lanes())
-    control = run_control_lane(root)
-    voice = run_voice_lane(root)
+    try:
+        control = run_control_lane(root)
+    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        control = _failed_lane("runtime-control-33-41", type(exc).__name__)
+    try:
+        voice = run_voice_lane(root)
+    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        voice = _failed_lane("voice-1-16", type(exc).__name__)
     lanes = (message, transport, control, voice, live_evidence)
     status = decide_status([lane.status for lane in lanes])
     summary = LiveSummary(
