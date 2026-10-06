@@ -839,7 +839,7 @@ def test_opencode_agents_keep_legacy_and_add_locked_down_v2() -> None:
         assert agent["permission"] == expected_permission
         assert agent["prompt"] == "{file:./prompts/" + prompt_file + "}"
         assert (root / "prompts" / prompt_file).exists()
-        assert agent["model"] == "opencode/space-bunny-free"
+        assert agent["model"] == "opencode/muse-spark-1.3-contributor-free"
 
 
 def test_typed_state_contract_fields() -> None:

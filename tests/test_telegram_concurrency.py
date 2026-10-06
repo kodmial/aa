@@ -604,7 +604,7 @@ def test_book_map_and_tools_available_in_every_session() -> None:
     declared = _json.loads((root / "opencode.json").read_text(encoding="utf-8"))
     agent = declared["agent"]["aa"]
     assert agent["mode"] == "primary"
-    assert agent["model"] == "opencode/space-bunny-free"
+    assert agent["model"] == "opencode/muse-spark-1.3-contributor-free"
     permissions = agent["permission"]
     assert permissions["*"] == "deny"
     for tool in ("book_search", "book_read", "book_expand", "book_section"):

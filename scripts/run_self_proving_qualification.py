@@ -401,7 +401,14 @@ def main(argv: list[str] | None = None) -> int:
     gate_b = _gate_b(expected, run_id, product, runtime)
     gate_c, latencies = _gate_c(expected, run_id, product, runtime)
     gate_d = _gate_d(expected, run_id, product, runtime)
-    gate_e = _gate_e(expected, run_id, product, runtime, latencies, gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted))
+    gate_e = _gate_e(
+        expected,
+        run_id,
+        product,
+        runtime,
+        latencies,
+        gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted),
+    )
 
     evidences = [gate_a, gate_b, gate_c, gate_d, gate_e]
     try:
