@@ -33,3 +33,17 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+
+# Downloaded public voice models (pinned by corpus/voice.lock.json, never committed).
+/models/
+
+# Ephemeral qualification outputs (workflow-generated, never committed).
+# Gate C creates live-out/ before the clean-tree check, so it must stay
+# untracked or every exact-main run reports "working tree is not clean".
+/live-out/
+/self-proving-out/
+/eval-self-proving-out/
+/eval-product-contract-live-out/
+/eval-*/
+/aa-self-proving-checkpoints/
+runtime-status.json
