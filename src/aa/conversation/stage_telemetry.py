@@ -181,8 +181,11 @@ def evaluate_gate_c_telemetry(
                     "missing": missing,
                 },
             )
-        if any(not sample.ok for sample in turn.stages):
-            failed = [sample.stage for sample in turn.stages if not sample.ok]
+        failed = [sample.stage for sample in turn.stages if not sample.ok]
+        repair_ok = any(s.stage == "repair" and s.ok for s in turn.stages)
+        if verifier_failed and repair_ok:
+            failed = [stage for stage in failed if stage != "verifier"]
+        if failed:
             return (
                 False,
                 f"family {turn.family} stage failed: {','.join(failed)}",

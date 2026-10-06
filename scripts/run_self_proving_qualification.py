@@ -1027,7 +1027,13 @@ def _lane_has_production_checks(passed: object) -> bool:
     lowered = [str(item).lower() for item in passed if isinstance(item, str) and str(item).strip()]
     if len(lowered) < 4:
         return False
-    return any(token in name for name in lowered for token in _PRODUCTION_CHECK_TOKENS)
+    matched: set[str] = set()
+    for name in lowered:
+        for token in _PRODUCTION_CHECK_TOKENS:
+            if token in name:
+                matched.add(token)
+                break
+    return len(matched) >= 4
 
 
 _STAGE_GROUPS: tuple[tuple[str, ...], ...] = (
