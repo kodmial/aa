@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1676,6 +1677,8 @@ def _gate_e(
         except (TypeError, ValueError):
             return _blocked()
         if turns <= 0 or p50 <= 0 or p95 <= 0 or maximum <= 0:
+            return _blocked()
+        if not all(math.isfinite(v) for v in (p50, p95, maximum, turns)):
             return _blocked()
         if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
             return _fail(p50, p95, maximum, "aggregate p95/budget exceeds canonical guard")
