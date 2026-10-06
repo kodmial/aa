@@ -296,7 +296,11 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
                 info: dict[str, Any] = {"role": "assistant"}
                 requested_model = body.get("model") if isinstance(body, dict) else None
                 served_override = self._state.get("served_model_override")
-                served_model = served_override if isinstance(served_override, dict) else requested_model
+                served_model = (
+                    served_override
+                    if isinstance(served_override, dict)
+                    else requested_model
+                )
                 if isinstance(served_model, dict):
                     provider = served_model.get("providerID")
                     model = served_model.get("modelID")
