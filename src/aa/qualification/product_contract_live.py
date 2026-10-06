@@ -1308,9 +1308,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
 
         settings = Settings.from_env({})
         app = Application(settings)
-        await app.start()
+        # Isolated live harness: exercise only corpus + OpenCode + graph
+        # boundary. Never boot Telegram long-polling, the controller, or
+        # the READY control-plane publish here.
+        await app.corpus.load()
+        await app.opencode_runtime.start()
+        await app.opencode_runtime.ensure_ready()
+        await app._ensure_graph_runtime()
         try:
-            if app.runtime_state != "READY":
+            graph = app.graph_runtime
+            if not app.opencode_runtime.ready or graph is None or not graph.running:
                 failed.append("live-runtime-not-ready")
             else:
                 passed.append("live-runtime-ready")
