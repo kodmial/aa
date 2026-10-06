@@ -1811,7 +1811,7 @@ def _failed_lane(lane: str, reason: str, scenarios_executed: int = 0) -> LaneRes
         lane=lane,
         status="FAIL",
         passed=(),
-        failed=(f"live-production-telegram-harness:{reason}",),
+        failed=(f"{lane}:{reason}",),
         metrics={
             "scenarios_executed": scenarios_executed,
             "turns_executed": 0,
@@ -1827,21 +1827,21 @@ async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult]:
     try:
         message = await run_message_lane()
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        message = _failed_lane("product-contract-1-24", type(exc).__name__, scenarios_executed=24)
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        message = _failed_lane("product-contract-1-24", type(exc).__name__)
     try:
         transport = await run_transport_lane()
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        transport = _failed_lane(
-            "telegram-transport-25-32", type(exc).__name__, scenarios_executed=8
-        )
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        transport = _failed_lane("telegram-transport-25-32", type(exc).__name__)
     try:
         live_evidence = await run_live_telegram_evidence_lane()
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
         if isinstance(exc, OpenCodeRateLimitError):
             raise
-        live_evidence = _failed_lane(
-            "live-telegram-evidence", type(exc).__name__, scenarios_executed=8
-        )
+        live_evidence = _failed_lane("live-telegram-evidence", type(exc).__name__)
     return message, transport, live_evidence
 
 
@@ -1876,11 +1876,15 @@ def evaluate_live(
     try:
         control = run_control_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        control = _failed_lane("runtime-control-33-41", type(exc).__name__, scenarios_executed=15)
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        control = _failed_lane("runtime-control-33-41", type(exc).__name__)
     try:
         voice = run_voice_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        voice = _failed_lane("voice-1-16", type(exc).__name__, scenarios_executed=16)
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        voice = _failed_lane("voice-1-16", type(exc).__name__)
     lanes = (message, transport, control, voice, live_evidence)
     status = decide_status([lane.status for lane in lanes])
     summary = LiveSummary(
