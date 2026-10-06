@@ -40,6 +40,9 @@ __pycache__/
 # Ephemeral qualification outputs (workflow-generated, never committed).
 # Gate C creates live-out/ before the clean-tree check, so it must stay
 # untracked or every exact-main run reports "working tree is not clean".
+# Root gate-*.done checkpoints are equally ephemeral (issue #150): the
+# workflow stages resume markers under aa-self-proving-checkpoints/, never
+# as tracked files at the repository root.
 /live-out/
 /self-proving-out/
 /eval-self-proving-out/
@@ -47,3 +50,4 @@ __pycache__/
 /eval-*/
 /aa-self-proving-checkpoints/
 runtime-status.json
+gate-*.done
