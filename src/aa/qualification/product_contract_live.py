@@ -346,6 +346,28 @@ def _percentile(values: list[float], pct: float) -> float:
     return float(ordered[rank])
 
 
+def _count_stage_outcomes(snapshots: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Count per-stage outcomes over one live run (privacy-safe).
+
+    Only code-generated outcome tokens are counted (for example
+    ``passed``/``unsupported``/``clarification``/``empty-pack``); no
+    prompt, reply, or evidence text ever enters the counts. Repair tasks
+    use these histograms to attribute a collapse to the concrete stage
+    (planner vs retrieval vs answer vs verifier) without seeing questions.
+    """
+    stages = ("planner_outcome", "retrieval_outcome", "answer_outcome", "verifier_outcome")
+    counts: dict[str, dict[str, int]] = {stage: {} for stage in stages}
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        for stage in stages:
+            outcome = snapshot.get(stage, "")
+            if isinstance(outcome, str) and outcome.strip():
+                bucket = counts[stage]
+                bucket[outcome] = bucket.get(outcome, 0) + 1
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Lane 1: deterministic production-message lane (scenarios 1-24)
 # ---------------------------------------------------------------------------
@@ -1309,6 +1331,13 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     heartbeat_continuity_failures = 0
     stage_snapshots: list[dict[str, Any]] = []
     served_models_by_agent: dict[str, list[str]] = {}
+    voice_readiness: dict[str, Any] = {
+        "voice_available": False,
+        "tts_available": False,
+        "tts_pipeline_present": False,
+        "voice_load_error": "",
+        "tts_load_error": "",
+    }
 
     def _check(name: str, ok: bool) -> None:
         (passed if ok else failed).append(name)
@@ -1693,6 +1722,18 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 and app.tts_available
                 and getattr(app, "_tts_pipeline", None) is not None
             )
+            # Privacy-safe readiness detail (booleans plus closed-vocabulary
+            # load categories only) so the next failure attributes to ASR vs
+            # TTS instead of failing blind.
+            recognizer = getattr(getattr(app, "_voice_pipeline", None), "recognizer", None)
+            synthesizer = getattr(getattr(app, "_tts_pipeline", None), "synthesizer", None)
+            voice_readiness = {
+                "voice_available": bool(app.voice_available),
+                "tts_available": bool(app.tts_available),
+                "tts_pipeline_present": getattr(app, "_tts_pipeline", None) is not None,
+                "voice_load_error": str(getattr(recognizer, "load_error", "") or ""),
+                "tts_load_error": str(getattr(synthesizer, "load_error", "") or ""),
+            }
             _check("live-voice-models-ready", voice_ok)
             if voice_ok:
                 tts = app._tts_pipeline
@@ -1768,6 +1809,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "typing_heartbeat_sends": typing_sends,
         "heartbeat_continuity_failures": heartbeat_continuity_failures,
         "served_models_by_agent": served_models_by_agent,
+        "stage_snapshots_count": len(stage_snapshots),
+        "stage_outcome_counts": _count_stage_outcomes(stage_snapshots),
+        "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
         ),
