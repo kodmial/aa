@@ -110,6 +110,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Checkpoint resume: skip this gate when its checkpoint already
+          # exists (provider 429 runner retire resumes from the last
+          # completed gate instead of re-running from the start).
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-A.done" ]]; then
+            echo "Gate A checkpoint present; skipping (resume)."
+            exit 0
+          fi
           # Exact SHA + clean tree verified above; canonical restore
           # metadata/fingerprints, unit/type/lint, and prompt/config/model/
           # retrieval fingerprint consistency run here fail-closed.
@@ -127,6 +135,12 @@ jobs:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
         run: |
           set -euo pipefail
+          # Checkpoint resume: skip when Gate B already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-B.done" ]]; then
+            echo "Gate B checkpoint present; skipping (resume)."
+            exit 0
+          fi
           # Real RU corpus restore + real BM25/E5/FAISS index bootstrap, then
           # planner cardinality/shape, retrieval/RRF/dedup/diversity/
           # small-to-big, grounding/verifier and output envelope, memory/FIFO/
@@ -158,6 +172,12 @@ jobs:
           OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
+          # Checkpoint resume: skip when Gate C already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-C.done" ]]; then
+            echo "Gate C checkpoint present; skipping (resume)."
+            exit 0
+          fi
           # Repository-owned live gate: real local OpenCode process and real
           # configured runtime provider/model policy, real decrypted RU corpus
           # + real production index, synthetic Telegram Updates injected only
@@ -195,6 +215,12 @@ jobs:
           OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
+          # Checkpoint resume: skip when Gate D already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-D.done" ]]; then
+            echo "Gate D checkpoint present; skipping (resume)."
+            exit 0
+          fi
           # Real bot token, OpenCode health, Telegram getMe, webhook cleanup/
           # config, commands setup, long polling actually started. Publishes
           # the durable STARTING -> READY -> STOPPED|FAILED marker with the
@@ -329,11 +355,19 @@ jobs:
 
           asyncio.run(_probe())
           PY
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "D" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-D.done"
 
       - name: Gate E - live performance/SLO
         shell: bash
         run: |
           set -euo pipefail
+          # Checkpoint resume: skip when Gate E already completed.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if [[ -f "$CKPT_DIR/gate-E.done" ]]; then
+            echo "Gate E checkpoint present; skipping (resume)."
+            exit 0
+          fi
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
           # Hard guard: no ordinary qualification turn may take >= 30s; p95
           # target materially below that. Typing heartbeat continuity is
@@ -379,12 +413,16 @@ jobs:
               sys.exit(1)
           print(f"Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms")
           PY
+          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          echo "E" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-E.done"
 
       - name: Gate F - exact-main final verdict
         id: gate-f
         shell: bash
         run: |
           set -euo pipefail
+          # Checkpoint resume: Gate F is terminal; re-verify unconditionally
+          # so a stale final verdict can never be reused after resume.
           # PASS only if A-E PASS for the exact same current main SHA with
           # matching product/runtime fingerprints. No stale reuse, no manual
           # override. INCOMPLETE/missing/stale/mocked-only = FAIL/BLOCKED.

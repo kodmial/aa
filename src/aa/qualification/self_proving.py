@@ -485,11 +485,15 @@ def refusal_explanation(verdict: FinalVerdict | None, *, current_sha: str) -> st
         (gate for gate in verdict.gates if gate.gate == blocking),
         None,
     )
-    category = (
-        detail.failure_category.strip()
-        if detail and detail.failure_category
-        else (effective_gate_status(detail, current_sha=current) if detail else "unknown")
-    )
+    if detail and detail.failure_category:
+        category = detail.failure_category.strip()
+    elif detail is not None:
+        try:
+            category = effective_gate_status(detail, current_sha=current)
+        except SelfProvingError:
+            category = "unknown"
+    else:
+        category = "unknown"
     return (
         f"UNQUALIFIED: Gate {blocking} blocks qualification (state={category}, "
         f"verdict={verdict.status}, sha={current[:12]}, run={verdict.run_id}); "

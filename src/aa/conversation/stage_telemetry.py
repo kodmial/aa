@@ -3,7 +3,8 @@
 Gate C must record per-stage outcomes and latency for the exact
 production conversation path without logging user or corpus text::
 
-    planner -> retrieval -> answer -> verifier -> repair -> delivery
+    application -> dispatcher -> langgraph -> planner -> retrieval ->
+    answer -> verifier -> delivery
 
 Gate E consumes the same samples for p50/p95 SLO guards and typing
 heartbeat continuity. Diversity detection consumes reply signatures:
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aa.qualification.self_proving import (
+    GATE_C_STAGES,
     ORDINARY_TURN_BUDGET_MS,
     SelfProvingError,
     assert_no_text_leak,
@@ -33,14 +35,11 @@ from aa.qualification.self_proving import (
     slo_guards,
 )
 
-STAGES: tuple[str, ...] = (
-    "planner",
-    "retrieval",
-    "answer",
-    "verifier",
-    "repair",
-    "delivery",
-)
+STAGES: tuple[str, ...] = GATE_C_STAGES
+
+# Legacy optional stage: recorded repairs may appear in stored telemetry but
+# are never required for Gate C coverage (GATE_C_STAGES is authoritative).
+OPTIONAL_STAGES: tuple[str, ...] = ("repair",)
 
 
 def reply_signature(reply: str) -> str:
@@ -114,7 +113,7 @@ def record_stage(
 ) -> None:
     """Append one stage sample (validates stage name and latency)."""
     normalized = (stage or "").strip().lower()
-    if normalized not in STAGES:
+    if normalized not in STAGES and normalized not in OPTIONAL_STAGES:
         raise SelfProvingError(f"unknown telemetry stage {stage!r}")
     try:
         value = float(latency_ms)
@@ -135,7 +134,7 @@ def record_stage(
 
 def stage_totals(telemetries: list[TurnTelemetry]) -> dict[str, float]:
     """Return summed per-stage latency across turns (ms, privacy-safe)."""
-    totals: dict[str, float] = {stage: 0.0 for stage in STAGES}
+    totals: dict[str, float] = {stage: 0.0 for stage in (*STAGES, *OPTIONAL_STAGES)}
     for turn in telemetries:
         for sample in turn.stages:
             if sample.stage in totals:
@@ -170,8 +169,6 @@ def evaluate_gate_c_telemetry(
         covered = {sample.stage for sample in turn.stages}
         missing = [stage for stage in STAGES if stage not in covered]
         verifier_failed = any(s.stage == "verifier" and not s.ok for s in turn.stages)
-        if not verifier_failed:
-            missing = [m for m in missing if m != "repair"]
         if missing:
             return (
                 False,
@@ -269,6 +266,7 @@ def evaluate_gate_e_telemetry(
 
 
 __all__ = [
+    "OPTIONAL_STAGES",
     "STAGES",
     "StageSample",
     "TurnTelemetry",

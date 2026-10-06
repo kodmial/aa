@@ -207,8 +207,8 @@ def test_gate_c_diversity_catches_generic_fallback_collapse() -> None:
 
 def _telemetry(family: str, signature: str, total_ms: float = 1200.0) -> TurnTelemetry:
     turn = TurnTelemetry(family=family, reply_signature=signature, reply_len=42)
-    per = total_ms / 6.0
-    for stage in ("planner", "retrieval", "answer", "verifier", "repair", "delivery"):
+    per = total_ms / float(len(GATE_C_STAGES))
+    for stage in GATE_C_STAGES:
         record_stage(turn, stage=stage, ok=True, latency_ms=per)
     return turn
 
