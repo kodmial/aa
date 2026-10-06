@@ -28,29 +28,44 @@ jobs:
         with:
           github-token: ${{ github.token }}
           script: |
+            // The recurring canary is post-qualification only. #6 is the
+            // capability and #7 is the exact-main final qualification tracker.
+            // Require both terminal-success states; legacy #80 is superseded
+            // and must never activate the canary.
             let active = false;
-            let detail = 'qualification #80 is not complete';
+            let detail = 'final Product Contract qualification is not complete';
             try {
-              const { data: issue } = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 80,
-              });
-              active = issue.state === 'closed' && issue.state_reason === 'completed';
+              const [{ data: capability }, { data: qualification }] = await Promise.all([
+                github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                }),
+                github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                }),
+              ]);
+              const capabilityDone =
+                capability.state === 'closed' && capability.state_reason === 'completed';
+              const qualificationDone =
+                qualification.state === 'closed' && qualification.state_reason === 'completed';
+              active = capabilityDone && qualificationDone;
               detail = active
-                ? 'qualification #80 is complete'
-                : `qualification #80 state=${issue.state}, reason=${issue.state_reason || 'none'}`;
+                ? 'capability #6 and exact-main qualification #7 are complete'
+                : `#6 state=${capability.state}/${capability.state_reason || 'none'}; #7 state=${qualification.state}/${qualification.state_reason || 'none'}`;
             } catch (error) {
               core.warning(
-                `Unable to verify final qualification #80; canary stays inactive: ${error.message}`
+                `Unable to verify #6/#7 final qualification; canary stays inactive: ${error.message}`
               );
-              detail = 'qualification #80 could not be verified';
+              detail = 'final qualification could not be verified';
             }
 
             core.setOutput('active', active ? 'true' : 'false');
             core.notice(
               active
-                ? 'AA canary activated by completed final qualification #80.'
+                ? 'AA canary activated by completed #6/#7 final qualification.'
                 : `AA canary cleanly skipped: ${detail}.`
             );
             await core.summary
