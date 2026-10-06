@@ -173,7 +173,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             retry = dict(update.get("retry_state", {}) or {})
             retry["planner_latency_ms"] = round(elapsed_ms, 1)
             retry["planner_query_count"] = count
-            retry["planner_outcome"] = "ok" if count or count == 0 else "ok"
+            retry["planner_outcome"] = "ok" if count else "empty"
             update["retry_state"] = retry
             return update
         except QueryPlanValidationError as exc:

@@ -274,6 +274,7 @@ async def run_v2_answer_turn(
     retrieval_config: Any | None = None,
     recent_quote_ranges: list[dict[str, Any]] | None = None,
     max_repair_rounds: int = MAX_TARGETED_REPAIR_ROUNDS,
+    initial_query_count: int | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -376,20 +377,30 @@ async def run_v2_answer_turn(
     current_draft: str = draft
 
     # Bounded targeted retrieval/regeneration for unsupported claims.
-    # When the initial planner judgment was glue (empty Evidence Pack),
-    # re-planning contradicts that judgment and costs two full
+    # Only a glue-judged turn (planner issued zero queries, hence an
+    # expectedly empty Evidence Pack) skips re-planning: re-planning
+    # contradicts that judgment and costs two full
     # planner+retrieval+answer+verifier rounds (the 30-60s pathology seen
-    # live). Skip repair there: the turn falls through to the supported
-    # narrowing/clarification below with clear telemetry
-    # (initial_pack_empty + verifier outcome) instead of burning latency.
-    repair_allowed = not initial_pack_empty
-    if not passed and initial_pack_empty:
+    # live). An empty pack with a positive planner query count is a
+    # retrieval miss or transient failure for a substantive turn, so it
+    # keeps a bounded recovery chance via the repair loop below. When
+    # the upstream query count is unknown (None, e.g. direct calls),
+    # preserve the historical glue assumption and skip repair.
+    # Telemetry stays explicit (initial_pack_empty + verifier outcome)
+    # instead of burning latency on true glue turns.
+    is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
+    repair_allowed = (not initial_pack_empty) or (
+        initial_query_count is not None and initial_query_count > 0
+    )
+    if not passed and is_glue:
         logger.info(
             "v2 repair skipped for glue-judged turn",
             extra={"initial_pack_empty": True},
         )
         telemetry["planner_outcome"] = "skipped-glue"
         telemetry["retrieval_outcome"] = "skipped-glue"
+    elif not passed and initial_pack_empty:
+        telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:
         missing = unsupported_unit_texts(units, result) if units else [draft]
         missing = [text for text in missing if text.strip()]
@@ -607,6 +618,8 @@ async def answer_pipeline_node(
             "retry_state": {"answer_rounds": 0},
         }
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
+    _search_queries = state.get("search_queries", [])
+    _initial_query_count = len(_search_queries) if isinstance(_search_queries, list) else 0
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -620,6 +633,7 @@ async def answer_pipeline_node(
         recent_quote_ranges=[
             item for item in state.get("recent_quote_ranges", []) if isinstance(item, dict)
         ],
+        initial_query_count=_initial_query_count,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot
