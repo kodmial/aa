@@ -138,6 +138,16 @@ jobs:
           else
             echo "no previous gate checkpoints found"
           fi
+          if [[ -d "$RESTORE_DIR/live-out" ]]; then
+            rm -rf live-out
+            cp -R "$RESTORE_DIR/live-out" live-out
+            echo "restored Gate C privacy-safe live evidence"
+          fi
+          if [[ -f "$RESTORE_DIR/runtime-status.json" ]]; then
+            mkdir -p self-proving-out
+            cp "$RESTORE_DIR/runtime-status.json" self-proving-out/runtime-status.json
+            echo "restored Gate D runtime evidence"
+          fi
 
       - name: Gate A - static/build
         id: gate-a
@@ -246,9 +256,22 @@ jobs:
             echo "::error::Gate C provider 429: retire runner and resume on a fresh VM."
             exit 75
           fi
-          python scripts/run_self_proving_qualification.py \
-            --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+          QUAL_SHA="${{ steps.sha.outputs.sha }}" QUAL_RUN="${{ github.run_id }}" python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          sys.path.insert(0, "src")
+          import scripts.run_self_proving_qualification as runner
+
+          sha = os.environ["QUAL_SHA"]
+          run_id = os.environ["QUAL_RUN"]
+          product = runner._product_fingerprint()
+          runtime = runner._runtime_fingerprint()
+          evidence, _, _ = runner._gate_c(sha, run_id, product, runtime)
+          print(f"Gate C {evidence.status}: {evidence.failure_category or evidence.component}")
+          if evidence.status != "PASS" or not evidence.live_trusted or evidence.mocked_only:
+              raise SystemExit(1 if evidence.status == "FAIL" else 2)
+          PY
           mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
           echo "C" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-C.done"
 
@@ -426,6 +449,11 @@ jobs:
             exit 0
           fi
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
+          # Gate D has now produced trusted runtime evidence, so this is the
+          # first point where a full A-E evaluation is valid.
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}"
           # Hard guard: no ordinary qualification turn may take >= 30s; p95
           # target materially below that. Typing heartbeat continuity is
           # verified independently. Pathological latency fails the gate.
@@ -500,18 +528,24 @@ jobs:
           mkdir -p "$STAGE_DIR"
           if compgen -G "$CKPT_DIR/gate-*.done" > /dev/null; then
             cp "$CKPT_DIR"/gate-*.done "$STAGE_DIR"/
-            echo "staged gate checkpoints for resume:"
-            ls -la "$STAGE_DIR"
-          else
-            echo "no gate checkpoints to stage"
           fi
+          if [[ -f live-out/product-contract-live-summary.json ]]; then
+            mkdir -p "$STAGE_DIR/live-out"
+            cp live-out/product-contract-live-summary.json "$STAGE_DIR/live-out/"
+            [[ ! -f live-out/result.json ]] || cp live-out/result.json "$STAGE_DIR/live-out/"
+          fi
+          if [[ -f self-proving-out/runtime-status.json ]]; then
+            cp self-proving-out/runtime-status.json "$STAGE_DIR/runtime-status.json"
+          fi
+          echo "staged privacy-safe gate checkpoints/evidence for resume:"
+          find "$STAGE_DIR" -maxdepth 2 -type f -print || true
 
       - name: Upload gate checkpoints (429 resume)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aa-self-proving-checkpoints
-          path: aa-self-proving-checkpoints/gate-*.done
+          path: aa-self-proving-checkpoints/
           retention-days: 7
           if-no-files-found: warn
           overwrite: true
