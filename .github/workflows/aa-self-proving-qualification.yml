@@ -229,9 +229,23 @@ jobs:
           # response-diversity assertion and privacy-safe per-stage
           # outcomes/latency only. Missing secret/model yields BLOCKED, never
           # mocked PASS.
+          # The live runner may legitimately return INCOMPLETE for evidence
+          # explicitly owned by downstream Gate D. Always let the self-proving
+          # mapper classify PASS/FAIL/BLOCKED from the produced evidence.
+          # Provider 429 is different: retire this VM immediately and persist
+          # the restart marker for the workflow_run recovery controller.
+          set +e
           python scripts/run_product_contract_live_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir live-out --run-id "${{ github.run_id }}"
+          product_rc=$?
+          set -e
+          if [[ "$product_rc" -eq 75 ]]; then
+            mkdir -p self-proving-out
+            cp live-out/restart-required.json self-proving-out/restart-required.json
+            echo "::error::Gate C provider 429: retire runner and resume on a fresh VM."
+            exit 75
+          fi
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}"
