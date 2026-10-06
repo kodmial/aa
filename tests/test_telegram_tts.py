@@ -930,3 +930,96 @@ def test_silero_ensure_loaded_succeeds_with_torch_package(
     synth = SileroSynthesizer(model_file)
     synth.ensure_loaded()
     assert synth.available
+
+
+def test_silero_ensure_loaded_tolerates_model_without_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate C regression (run 37524228680, issue #168).
+
+    The pinned ``v5_5_ru`` packaged class (``TTSModelMultiAcc_v3``) is a
+    plain object, not a ``torch.nn.Module``: it exposes ``apply_tts``/``to``
+    but no ``eval``. ``ensure_loaded`` must not crash on the missing method
+    (every Gate C run failed ``live-voice-models-ready`` with TTS disabled
+    while GigaAM and presentation loaded).
+    """
+    import sys
+    import types
+
+    model_file = tmp_path / "v5_5_ru.pt"
+    model_file.write_bytes(b"fake-silero-bytes")
+
+    class _EvalLessModel:
+        def to(self, device: object) -> _EvalLessModel:
+            _ = device
+            return self
+
+    class _FakeImporter:
+        def __init__(self, path: str) -> None:
+            _ = path
+
+        def load_pickle(self, package: str, resource: str) -> _EvalLessModel:
+            assert package == "tts_models"
+            assert resource == "model"
+            return _EvalLessModel()
+
+    fake_package = types.ModuleType("torch.package")
+    fake_package.PackageImporter = _FakeImporter  # type: ignore[attr-defined]
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = TORCH_VERSION  # type: ignore[attr-defined]
+    fake_torch.device = lambda name: name  # type: ignore[attr-defined]
+    fake_torch.package = fake_package  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.package", fake_package)
+    monkeypatch.setattr("aa.telegram.tts.ensure_tts_model_file", lambda path: model_file)
+
+    synth = SileroSynthesizer(model_file)
+    synth.ensure_loaded()
+    assert synth.available
+    assert synth.load_error is None
+
+
+def test_silero_ensure_loaded_still_evals_nn_module_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eval-mode opt-in is preserved for real ``nn.Module`` models."""
+    import sys
+    import types
+
+    model_file = tmp_path / "v5_5_ru.pt"
+    model_file.write_bytes(b"fake-silero-bytes")
+
+    calls: list[str] = []
+
+    class _ModuleStyleModel:
+        def to(self, device: object) -> _ModuleStyleModel:
+            _ = device
+            return self
+
+        def eval(self) -> _ModuleStyleModel:
+            calls.append("eval")
+            return self
+
+    class _FakeImporter:
+        def __init__(self, path: str) -> None:
+            _ = path
+
+        def load_pickle(self, package: str, resource: str) -> _ModuleStyleModel:
+            assert package == "tts_models"
+            assert resource == "model"
+            return _ModuleStyleModel()
+
+    fake_package = types.ModuleType("torch.package")
+    fake_package.PackageImporter = _FakeImporter  # type: ignore[attr-defined]
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = TORCH_VERSION  # type: ignore[attr-defined]
+    fake_torch.device = lambda name: name  # type: ignore[attr-defined]
+    fake_torch.package = fake_package  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.package", fake_package)
+    monkeypatch.setattr("aa.telegram.tts.ensure_tts_model_file", lambda path: model_file)
+
+    synth = SileroSynthesizer(model_file)
+    synth.ensure_loaded()
+    assert synth.available
+    assert calls == ["eval"]

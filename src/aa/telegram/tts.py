@@ -309,7 +309,15 @@ class SileroSynthesizer:
             importer = torch.package.PackageImporter(str(model_file))  # type: ignore[attr-defined]
             model = importer.load_pickle("tts_models", "model")
             model.to(device)
-            model.eval()
+            # The pinned v5_5_ru packaged class (TTSModelMultiAcc_v3) is a
+            # plain object, not a torch.nn.Module: it exposes apply_tts/to
+            # but no eval (Gate C live voice-models-ready failed on every
+            # run with TTS disabled while GigaAM and presentation loaded).
+            # Enter eval mode only when the loaded model supports it; the
+            # packaged inference entry point needs no mode switch.
+            eval_fn = getattr(model, "eval", None)
+            if callable(eval_fn):
+                eval_fn()
         except Exception as exc:
             self._load_error = "synthesizer construction failed"
             raise TtsError("tts-unavailable", "synthesizer construction failed") from exc
