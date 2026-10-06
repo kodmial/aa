@@ -51,14 +51,19 @@ def build_verifier_user_text(
     The payload repeats the closed output contract uniformly for every
     turn (Gate C live repair, run 37538518277: the scope vocabulary lived
     only in the system prompt, and the weak fallback model emitted
-    schema-invalid scopes/ids so the verifier never served). Repeating
-    the exact ``unit_id`` copy rule and the closed scope vocabulary here
-    is turn-independent hardening, never an exact-question special case:
-    AA-side Pydantic + completeness + checksum + quote checks stay strict.
+    schema-invalid scopes/ids so the verifier never served, with 13
+    clarifications, missing verifier identity, and p95 34.4s/max 42.7s
+    over the 30s budget). Repeating the exact ``unit_id`` copy rule, the
+    closed scope vocabulary, the cite-only-supplied-ids rule, and the
+    all_required_supported derivation rule here is turn-independent
+    hardening, never an exact-question special case: AA-side Pydantic +
+    completeness + checksum + quote checks stay strict.
     """
     lines: list[str] = [
         "Return one verdict per <unit> in order, copying each id attribute exactly;",
         'scope must be exactly one of "book", "product_meta", "conversation_glue".',
+        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids.",
+        "Set all_required_supported true only when every unit is supported.",
         "<response_units>",
     ]
     for unit in units:

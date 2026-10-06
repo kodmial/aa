@@ -1388,8 +1388,9 @@ def test_verifier_user_text_repeats_closed_contract() -> None:
 
     The scope vocabulary lived only in the system prompt, so the weak
     fallback emitted schema-invalid scopes and the verifier never served.
-    The user payload repeats the id-copy rule and closed scope vocabulary
-    uniformly for every turn (never an exact-question special case).
+    The user payload repeats the id-copy rule, closed scope vocabulary,
+    cite-only-supplied-ids rule, and flag derivation uniformly for every
+    turn (never an exact-question special case).
     """
     user_text = build_verifier_user_text(
         units=split_response_units("Понимаю. Тяга проходит."),
@@ -1399,6 +1400,8 @@ def test_verifier_user_text_repeats_closed_contract() -> None:
     assert "<book_evidence>" in user_text
     assert "product_meta" in user_text
     assert "conversation_glue" in user_text
+    assert "Cite only passage ids" in user_text
+    assert "all_required_supported" in user_text
 
 
 async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
