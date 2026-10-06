@@ -19,6 +19,7 @@ summaries, prompts or secrets.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -115,13 +116,17 @@ def record_stage(
     normalized = (stage or "").strip().lower()
     if normalized not in STAGES:
         raise SelfProvingError(f"unknown telemetry stage {stage!r}")
-    if latency_ms < 0:
-        raise SelfProvingError("stage latency must be >= 0")
+    try:
+        value = float(latency_ms)
+    except (TypeError, ValueError) as exc:
+        raise SelfProvingError("stage latency must be finite and >= 0") from exc
+    if not math.isfinite(value) or value < 0:
+        raise SelfProvingError("stage latency must be finite and >= 0")
     telemetry.stages.append(
         StageSample(
             stage=normalized,
             ok=bool(ok),
-            latency_ms=float(latency_ms),
+            latency_ms=value,
             category=(category or "").strip()[:64],
             model=(model or "").strip()[:128],
         )
