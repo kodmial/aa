@@ -505,10 +505,10 @@ jobs:
           # /bot status reports this aa-runtime-status marker, never generic
           # workflow in_progress.
           sha="$(git rev-parse HEAD)"
+          # The bounded runtime step has already ended here. Application.start()
+          # publishes READY while the poller is actually live; completion can
+          # only publish STOPPED (or FAILED below), never READY.
           phase="STOPPED"
-          if [[ "${{ job.status }}" == "success" ]]; then
-            phase="READY"
-          fi
           if [[ "${{ steps.runtime.outputs.restart_required }}" == "true" ]]; then
             phase="FAILED"
           fi
