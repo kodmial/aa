@@ -341,3 +341,17 @@ def test_count_stage_outcomes_ignores_malformed_snapshots() -> None:
     assert counts["retrieval_outcome"] == {}
     assert counts["answer_outcome"] == {}
     assert counts["verifier_outcome"] == {}
+
+
+def test_live_voice_fixture_failure_has_concrete_component() -> None:
+    # Gate C repair (run 37530425848): voice fixture synthesis raised into
+    # generic live-production-telegram-harness with voice_end_to_end_ms 0.0
+    # and no voice end-to-end checks. A synthesis/encoding failure must map
+    # to its concrete voice component, never the generic harness.
+    source = (REPO_ROOT / "src" / "aa" / "qualification" / "product_contract_live.py").read_text(
+        encoding="utf-8"
+    )
+    assert "live-voice-fixture-synthesis" in source
+    assert "live-voice-raw-transport-accepted" in source
+    assert "live-voice-file-fetch-seam" in source
+    assert "live-voice-asr-answer-sendvoice" in source

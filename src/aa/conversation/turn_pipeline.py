@@ -248,9 +248,41 @@ async def _verify_draft(
     try:
         result = await run_verifier(units, pack_dicts, model=verifier_model)
     except (VerifierValidationError, ValueError) as exc:
-        logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
+        # Gate C live repair (run 37530425848, 14 clarifications with
+        # verifier never served): a weaker fallback model can emit a verdict
+        # with wrong unit ids/count on the first attempt while succeeding on
+        # a bounded second attempt (sampling variance). Retry exactly once
+        # only for id-completeness mismatches; citation/quote/checksum
+        # failures are deterministic for the same draft/pack (a book unit
+        # with no evidence, e.g. glue with empty pack, always fails) so an
+        # immediate fail-closed avoids burning live latency. Provider or
+        # transport failures below never retry here (the model adapter
+        # already exhausted primary/fallback). Grounding is preserved: only
+        # a model verdict passing full Pydantic + completeness checks is
+        # accepted.
+        message = str(exc).lower()
+        retryable = (
+            "exactly one verdict" in message
+            or "missing or duplicated" in message
+            or "unknown unit" in message
+        )
+        if not retryable:
+            logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
+            return units, None, False
+        logger.info(
+            "v2 verification invalid, bounded retry scheduled",
+            extra={"category": "verifier-invalid"},
+        )
         _ = exc
-        return units, None, False
+        try:
+            result = await run_verifier(units, pack_dicts, model=verifier_model)
+        except (VerifierValidationError, ValueError) as retry_exc:
+            logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
+            _ = retry_exc
+            return units, None, False
+        except Exception as retry_exc:  # provider/transient/timeout after fallback
+            logger.info("v2 verifier unavailable", extra={"category": type(retry_exc).__name__})
+            return units, None, False
     except Exception as exc:  # provider/transient/timeout after fallback
         logger.info("v2 verifier unavailable", extra={"category": type(exc).__name__})
         return units, None, False
