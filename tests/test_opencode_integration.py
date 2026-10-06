@@ -293,10 +293,20 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
                     },
                 )
             else:
+                info: dict[str, Any] = {"role": "assistant"}
+                requested_model = body.get("model") if isinstance(body, dict) else None
+                served_override = self._state.get("served_model_override")
+                served_model = served_override if isinstance(served_override, dict) else requested_model
+                if isinstance(served_model, dict):
+                    provider = served_model.get("providerID")
+                    model = served_model.get("modelID")
+                    if isinstance(provider, str) and isinstance(model, str):
+                        info["providerID"] = provider
+                        info["modelID"] = model
                 self._send_json(
                     200,
                     {
-                        "info": {"role": "assistant"},
+                        "info": info,
                         "parts": [{"type": "text", "text": "server-reply"}],
                     },
                 )
@@ -380,12 +390,38 @@ async def test_http_model_pointer_is_forwarded() -> None:
     try:
         client = HttpOpenCodeClient(base_url, request_timeout=5.0)
         created = await client.create_session("t")
-        await client.send_message(created.id, "hi", model="zen/spark")
+        await client.send_message(created.id, "hi", model="zen/spark", agent="aa-v2")
         posted = [entry for entry in server.state["requests"] if entry["path"].endswith("/message")]
         assert posted[-1]["body"]["model"] == {
             "providerID": "zen",
             "modelID": "spark",
         }
+        assert client.served_model_audit[-1] == {
+            "agent": "aa-v2",
+            "requested": "zen/spark",
+            "served": "zen/spark",
+        }
+    finally:
+        server.shutdown()
+        thread.join(timeout=5.0)
+
+
+async def test_http_served_model_mismatch_fails_closed() -> None:
+    server, thread, base_url = _run_fake_serve()
+    try:
+        server.state["served_model_override"] = {
+            "providerID": "zen",
+            "modelID": "unexpected",
+        }
+        client = HttpOpenCodeClient(base_url, request_timeout=5.0)
+        created = await client.create_session("t")
+        with pytest.raises(OpenCodeDeterministicError, match="served model mismatch"):
+            await client.send_message(
+                created.id,
+                "hi",
+                model="zen/spark",
+                agent="aa-v2",
+            )
     finally:
         server.shutdown()
         thread.join(timeout=5.0)
