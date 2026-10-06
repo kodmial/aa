@@ -171,9 +171,9 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     try:
         message, transport, live_evidence = asyncio.run(live_mod._run_async_lanes())
     finally:
-        live_mod.run_message_lane = original_message  # type: ignore[assignment]
-        live_mod.run_transport_lane = original_transport  # type: ignore[assignment]
-        live_mod.run_live_telegram_evidence_lane = original_live  # type: ignore[assignment]
+        live_mod.run_message_lane = original_message
+        live_mod.run_transport_lane = original_transport
+        live_mod.run_live_telegram_evidence_lane = original_live
     assert message.lane == "product-contract-1-24"
     assert message.status == "FAIL"
     assert any("ModuleNotFoundError" in item for item in message.failed)

@@ -1827,9 +1827,7 @@ async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult]:
     try:
         message = await run_message_lane()
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        message = _failed_lane(
-            "product-contract-1-24", type(exc).__name__, scenarios_executed=24
-        )
+        message = _failed_lane("product-contract-1-24", type(exc).__name__, scenarios_executed=24)
     try:
         transport = await run_transport_lane()
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
@@ -1878,9 +1876,7 @@ def evaluate_live(
     try:
         control = run_control_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        control = _failed_lane(
-            "runtime-control-33-41", type(exc).__name__, scenarios_executed=15
-        )
+        control = _failed_lane("runtime-control-33-41", type(exc).__name__, scenarios_executed=15)
     try:
         voice = run_voice_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
