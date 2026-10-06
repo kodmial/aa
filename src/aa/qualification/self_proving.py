@@ -582,23 +582,49 @@ def slo_guards(
     latencies_ms: list[float], *, p95_target_ms: float = float(P95_TARGET_MS)
 ) -> tuple[bool, str, dict[str, float]]:
     """Evaluate Gate E SLO guards (fail-closed on pathological latency)."""
-    metrics = {
-        "p50_ms": percentile_ms(latencies_ms, 50),
-        "p95_ms": percentile_ms(latencies_ms, 95),
-        "max_ms": max(latencies_ms) if latencies_ms else 0.0,
-        "turns": float(len(latencies_ms)),
-        "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
-        "p95_target_ms": float(p95_target_ms),
-    }
-    if not latencies_ms:
+    if not isinstance(latencies_ms, list) or not latencies_ms:
+        metrics = {
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "max_ms": 0.0,
+            "turns": 0.0,
+            "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
+            "p95_target_ms": float(p95_target_ms),
+        }
         return False, "no latency samples; INCOMPLETE", metrics
+    validated: list[float] = []
     for sample in latencies_ms:
         try:
             value = float(sample)
         except (TypeError, ValueError):
+            metrics = {
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0,
+                "turns": float(len(latencies_ms)),
+                "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
+                "p95_target_ms": float(p95_target_ms),
+            }
             return False, "non-numeric latency sample; INCOMPLETE", metrics
         if not math.isfinite(value) or value <= 0:
+            metrics = {
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0,
+                "turns": float(len(latencies_ms)),
+                "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
+                "p95_target_ms": float(p95_target_ms),
+            }
             return False, "invalid latency sample; INCOMPLETE", metrics
+        validated.append(value)
+    metrics = {
+        "p50_ms": percentile_ms(validated, 50),
+        "p95_ms": percentile_ms(validated, 95),
+        "max_ms": max(validated),
+        "turns": float(len(validated)),
+        "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
+        "p95_target_ms": float(p95_target_ms),
+    }
     if metrics["max_ms"] >= float(ORDINARY_TURN_BUDGET_MS):
         return (
             False,

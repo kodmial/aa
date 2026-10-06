@@ -49,9 +49,12 @@ EXIT_429_RESTART = 75
 
 
 def _git(args: list[str]) -> str:
-    proc = subprocess.run(
-        ["git", *args], capture_output=True, text=True, cwd=str(ROOT), check=False
-    )
+    try:
+        proc = subprocess.run(
+            ["git", *args], capture_output=True, text=True, cwd=str(ROOT), check=False
+        )
+    except OSError as exc:
+        raise SelfProvingError(f"git {' '.join(args)} unavailable: {exc}") from exc
     if proc.returncode != 0:
         raise SelfProvingError(f"git {' '.join(args)} failed")
     return proc.stdout.strip()
@@ -91,7 +94,7 @@ def _product_fingerprint() -> str:
 def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
     try:
         checked = _git(["rev-parse", "HEAD"])
-    except SelfProvingError as exc:
+    except (SelfProvingError, OSError) as exc:
         return GateEvidence(
             gate="A",
             status="BLOCKED",
@@ -110,7 +113,7 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
         )
     try:
         dirty_raw = _git(["status", "--porcelain"])
-    except SelfProvingError as exc:
+    except (SelfProvingError, OSError) as exc:
         return GateEvidence(
             gate="A",
             status="BLOCKED",
@@ -1710,7 +1713,26 @@ def main(argv: list[str] | None = None) -> int:
         print("self-proving qualification: provider 429, runner restart required", file=sys.stderr)
         return EXIT_429_RESTART
 
-    gate_a = _gate_a(expected, run_id)
+    try:
+        gate_a = _gate_a(expected, run_id)
+    except (SelfProvingError, OSError) as exc:
+        gate_a = GateEvidence(
+            gate="A",
+            status="BLOCKED",
+            sha=expected,
+            failure_category="git-unavailable",
+            run_id=run_id,
+            detail=f"{type(exc).__name__}: {exc}"[:160],
+        )
+    except Exception as exc:
+        gate_a = GateEvidence(
+            gate="A",
+            status="BLOCKED",
+            sha=expected,
+            failure_category="runner-error",
+            run_id=run_id,
+            detail=f"{type(exc).__name__}: {exc}"[:160],
+        )
     if gate_a.status in ("STALE",):
         _write(out_dir, None, "STALE", main_sha=expected, run_id=run_id)
         print("self-proving qualification STALE: SHA mismatch", file=sys.stderr)
