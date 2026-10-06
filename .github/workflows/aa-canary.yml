@@ -225,6 +225,30 @@ jobs:
           from aa.control.runtime_status import RuntimeMarker, write_marker
           from aa.telegram.transport import PollingTelegramTransport
 
+          async def _active_telegram_poller_running(token: str) -> bool:
+              """Return True when another Telegram poller holds getUpdates (409)."""
+              import urllib.error
+              import urllib.request
+
+              token = (token or "").strip()
+              if not token:
+                  return False
+              url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=0&limit=1"
+
+              def _check() -> bool:
+                  req = urllib.request.Request(url, method="GET")
+                  try:
+                      with urllib.request.urlopen(req, timeout=10):
+                          return False
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 409:
+                          return True
+                      return False
+                  except Exception:
+                      return False
+
+              return await asyncio.to_thread(_check)
+
           async def _probe() -> None:
               sha = os.environ["CANARY_SHA"]
               run_id = os.environ["CANARY_RUN"]
@@ -239,6 +263,8 @@ jobs:
                   "Canary Gate D BLOCKED: Application is not using real PollingTelegramTransport"
               )
               try:
+                  active = await _active_telegram_poller_running(settings.telegram_bot_token)
+                  assert not active, "Canary Gate D BLOCKED: owner runtime poller active; retry when idle to avoid getUpdates conflict"
                   await app.start()
               except Exception as exc:
                   failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())

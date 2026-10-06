@@ -781,21 +781,31 @@ def _live_latencies_from_product_summary(payload: object) -> list[float] | None:
             count = int(turns or 0)
         except (TypeError, ValueError):
             count = 0
-        p50 = metrics.get("latency_p50_s", metrics.get("end_to_end_p50_ms", None))
-        p95 = metrics.get("latency_p95_s", metrics.get("end_to_end_p95_ms", None))
-        maximum = metrics.get("latency_max_s", metrics.get("max_ms", None))
+        p50_s = metrics.get("latency_p50_s", None)
+        p95_s = metrics.get("latency_p95_s", None)
+        max_s = metrics.get("latency_max_s", None)
+        p50_ms_raw = metrics.get("end_to_end_p50_ms", None)
+        p95_ms_raw = metrics.get("end_to_end_p95_ms", None)
+        max_ms_raw = metrics.get("max_ms", None)
         try:
-            # Lane metrics record seconds; telemetry records ms. Accept both.
-            p50_ms = float(p50 or 0.0)
-            p95_ms = float(p95 or 0.0)
-            max_ms = float(maximum or 0.0)
+            # Units are determined by key name, never by magnitude: `*_s`
+            # keys are seconds and convert to ms; `*_ms` keys are already
+            # ms and must not be scaled (a magnitude heuristic cannot
+            # distinguish seconds-scale from small-ms-scale values).
+            if p50_s is not None:
+                p50_ms = float(p50_s or 0.0) * 1000.0
+            else:
+                p50_ms = float(p50_ms_raw or 0.0)
+            if p95_s is not None:
+                p95_ms = float(p95_s or 0.0) * 1000.0
+            else:
+                p95_ms = float(p95_ms_raw or 0.0)
+            if max_s is not None:
+                max_ms = float(max_s or 0.0) * 1000.0
+            else:
+                max_ms = float(max_ms_raw or 0.0)
         except (TypeError, ValueError):
             continue
-        if p50_ms > 0 and p50_ms < 60:
-            # Seconds-scale values: convert to ms.
-            p50_ms *= 1000.0
-            p95_ms *= 1000.0
-            max_ms *= 1000.0
         if count <= 0 or p50_ms <= 0:
             continue
         # Reconstruct a privacy-safe representative sample from the measured
@@ -867,11 +877,13 @@ def _gate_c_live_evidence(
                 ), []
             try:
                 from aa.conversation.stage_telemetry import evaluate_gate_c_telemetry
+                from aa.qualification.self_proving import SCENARIO_FAMILIES
 
                 ok, detail, _ = evaluate_gate_c_telemetry(
                     turns,
-                    required_families=4,  # type: ignore[arg-type]
+                    required_families=len(SCENARIO_FAMILIES),
                 )
+                latencies = [float(t.total_ms()) for t in turns]
             except Exception as exc:
                 return GateEvidence(
                     gate="C",
@@ -885,7 +897,6 @@ def _gate_c_live_evidence(
                     mocked_only=False,
                     detail=type(exc).__name__[:64],
                 ), []
-            latencies = [float(t.total_ms()) for t in turns]  # type: ignore[attr-defined]
             if ok:
                 return GateEvidence(
                     gate="C",
@@ -921,7 +932,9 @@ def _gate_c_live_evidence(
         lanes = payload.get("lanes", [])
         if isinstance(lanes, list) and lanes and status in ("PASS", "INCOMPLETE"):
             lane_failures = [
-                lane for lane in lanes if not isinstance(lane, dict) or lane.get("status") == "FAIL"
+                lane
+                for lane in lanes
+                if not isinstance(lane, dict) or lane.get("status") not in ("PASS", "INCOMPLETE")
             ]
             if lane_failures:
                 latencies = _live_latencies_from_product_summary(payload) or []
