@@ -1248,56 +1248,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             },
         )
 
-    try:
-        from aa.opencode.client import HttpOpenCodeClient
-
-        base_url = (os.environ.get("OPENCODE_BASE_URL", "") or "").strip() or (
-            "http://127.0.0.1:4096"
-        )
-        health = await HttpOpenCodeClient(base_url).health()
-        if not health.healthy:
-            incomplete.append("live-opencode-not-healthy")
-            raise ProductContractLiveError("OpenCode runtime not healthy")
-    except ProductContractLiveError:
-        return LaneResult(
-            lane="live-telegram-evidence",
-            status="INCOMPLETE",
-            passed=tuple(passed),
-            failed=tuple(failed),
-            incomplete=tuple(incomplete),
-            metrics={
-                "scenarios_executed": 0,
-                "turns_executed": 0,
-                "latency_p50_s": 0.0,
-                "latency_p95_s": 0.0,
-                "latency_max_s": 0.0,
-                "turn_latencies_ms": [],
-                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": True,
-                "production_boundary": "PollingTelegramTransport._process_raw_update",
-            },
-        )
-    except Exception:
-        incomplete.append("live-opencode-unreachable")
-        return LaneResult(
-            lane="live-telegram-evidence",
-            status="INCOMPLETE",
-            passed=tuple(passed),
-            failed=tuple(failed),
-            incomplete=tuple(incomplete),
-            metrics={
-                "scenarios_executed": 0,
-                "turns_executed": 0,
-                "latency_p50_s": 0.0,
-                "latency_p95_s": 0.0,
-                "latency_max_s": 0.0,
-                "turn_latencies_ms": [],
-                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": True,
-                "production_boundary": "PollingTelegramTransport._process_raw_update",
-            },
-        )
-
+    # Do not pre-probe localhost here: the production LocalOpenCodeRuntime
+    # is responsible for starting the pinned OpenCode process. Application.start()
+    # below then enforces ensure_ready before any Telegram update is accepted.
     try:
         from aa.app import Application
         from aa.config import Settings
