@@ -448,6 +448,20 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert 'pause_on_failure: "false"' in scheduler
     assert "wip_limit: \"${{ inputs.wip_limit || '3' }}\"" in scheduler
 
+    # Gate E and terminal Gate F must preserve the same live prerequisites as
+    # Gate C. Otherwise the final verdict can falsely downgrade valid live
+    # evidence to C:live-execution-not-enabled.
+    gate_e = workflow.split("Gate E - live performance/SLO", 1)[1].split(
+        "Gate F - exact-main final verdict", 1
+    )[0]
+    gate_f = workflow.split("Gate F - exact-main final verdict", 1)[1].split(
+        "Stage gate checkpoints for resume", 1
+    )[0]
+    for block in (gate_e, gate_f):
+        assert 'SELF_PROVING_LIVE: "1"' in block
+        assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block
+        assert "AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}" in block
+
 
 def test_gate_c_preserves_live_failure_without_live_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
