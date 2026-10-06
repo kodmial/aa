@@ -264,10 +264,10 @@ def resolve_poller_state(
     yields ``ready``. A STARTUP_FAILED marker (or a concluded run)
     yields ``failed``/``stopped``/``completed`` and never readiness.
     """
-    if has_ready and run_active:
-        return POLLER_READY
     if has_failed:
         return POLLER_FAILED
+    if has_ready and run_active:
+        return POLLER_READY
     if run_active:
         return POLLER_STARTING
     if run_conclusion in ("failure", "timed_out"):

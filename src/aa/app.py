@@ -526,7 +526,10 @@ class Application:
             if not self._transport_polling_live():
                 raise TelegramApiError("telegram polling is not live after start")
         except Exception as exc:
-            await self._publish_startup_failed(exc)
+            try:
+                await self._publish_startup_failed(exc)
+            except Exception:
+                logger.warning("STARTUP_FAILED publish failed", extra={"category": "unknown"})
             await self.transport.stop()
             await self.dispatcher.stop()
             await self.safety.stop()

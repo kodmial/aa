@@ -219,8 +219,8 @@ jobs:
               const active = run && run.conclusion === null && ACTIVE.includes(run.status);
               const ready = run ? hasReadyForRun(comments, run.id) : false;
               const failed = run ? failureForRun(comments, run.id) !== null : false;
-              if (ready && active) return 'ready';
               if (failed) return 'failed';
+              if (ready && active) return 'ready';
               if (active) return 'starting';
               if (!run) return 'idle';
               if (run.conclusion === 'cancelled') return 'stopped';
