@@ -131,9 +131,9 @@ jobs:
           # small-to-big, grounding/verifier and output envelope, memory/FIFO/
           # concurrency/safety, voice fixtures/cache/resource checks. Failures
           # attribute to a concrete component, never a generic PASS.
-          python scripts/restore_canonical.py --no-network-fallback || true
-          python scripts/restore_canonical.py --lang ru --no-network-fallback || true
-          python scripts/build_corpus_structure.py || true
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
+          python scripts/build_corpus_structure.py
           python -m pytest -q tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py \
             tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py \
             tests/test_output_envelope.py tests/test_sessions_safety_control.py \
@@ -167,7 +167,7 @@ jobs:
           # mocked PASS.
           python scripts/run_product_contract_live_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir live-out --run-id "${{ github.run_id }}" || true
+            --out-dir live-out --run-id "${{ github.run_id }}"
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}"
@@ -325,7 +325,7 @@ jobs:
                 String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
             );
             if (existing) {
-              await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body });
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body, labels: ['priority:p0', 'automation:ready'] });
               core.info(`Refreshed existing self-proving repair issue #${existing.number}.`);
               return;
             }
@@ -335,12 +335,12 @@ jobs:
               issue => !issue.pull_request && String(issue.body || '').includes(marker)
             );
             if (anyExisting) {
-              await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body });
+              await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
               core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
               return;
             }
             const created = await github.rest.issues.create({
-              owner, repo, title, body, labels: ['priority:p0'],
+              owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
             });
             core.info(`Created self-proving repair issue #${created.data.number}.`);
 
