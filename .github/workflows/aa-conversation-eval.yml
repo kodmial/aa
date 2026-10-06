@@ -1,19 +1,23 @@
 name: AA conversation eval
 
 # Reusable exact-main Russian conversation benchmark harness (#72).
-# Evaluation infrastructure only: this workflow executes the frozen #61
-# corpus against the transport-independent production turn boundary
-# (safety gating + session coordination + planner/retrieval/evidence/
-# synthesis/grounding behind the OpenCode runtime). It never sends bulk
-# cases through the public Telegram Bot API and never routes #62 through
-# the ordinary issue-scheduler OpenCode implementation.
+# Evaluation infrastructure only: this workflow executes the frozen Product
+# Contract vNext benchmark (#127) against the exact new production turn
+# boundary from #118 (v2 LangGraph turn graph: safety gating + managed
+# memory compaction + mandatory hidden planner + RRF-only retrieval/Evidence
+# Pack + natural answer pipeline with claim-level verification and bounded
+# targeted repair). It never sends bulk cases through the public Telegram
+# Bot API and never routes #62 through the ordinary issue-scheduler OpenCode
+# implementation.
 # Canonical #62 marker carries result=complete|incomplete|stale.
+# Authoritative readiness uses the trusted #7 PASS on the exact same current
+# main SHA (never a legacy tracker).
 
 on:
   workflow_dispatch:
     inputs:
       exact_sha:
-        description: "Exact main SHA to evaluate (defaults to current #40 PASS SHA)"
+        description: "Exact main SHA to evaluate (defaults to current #7 PASS SHA)"
         required: false
         type: string
       shard_count:
@@ -27,7 +31,7 @@ on:
   issues:
     types: [closed]
   # Automatic requalification: a product-qualification input change that
-  # advances main must rerun #62 for the new trusted #40 PASS SHA instead
+  # advances main must rerun #62 for the new trusted #7 PASS SHA instead
   # of stranding downstream work. Unrelated scheduler/docs-only commits
   # no-op at readiness because the product fingerprint is unchanged.
   push:
@@ -44,12 +48,12 @@ on:
       - "src/aa/app.py"
       - "src/aa/config.py"
       - "src/aa/__main__.py"
-      - "prompts/aa-agent-system.md"
+      - "prompts/aa-agent-system-v2.md"
       - "opencode.json"
       - "corpus/**"
       - "qualification/**"
       - "qualification/production_boundary.v1.json"
-      - "scripts/verify_runtime_qualification.py"
+      - "scripts/verify_product_contract_qualification.py"
       - ".opencode/tools/book_search.ts"
       - ".opencode/tools/book_read.ts"
       - ".opencode/tools/book_expand.ts"
@@ -70,12 +74,12 @@ env:
 
 jobs:
   # Lightweight readiness gate (read-only). Every automatic wake-up uses
-  # trusted result state, never issue closed state: #40 is a reusable
+  # trusted result state, never issue closed state: #7 is a reusable
   # tracker that stays open across many SHAs, so readiness requires the
-  # current trusted #40 PASS tuple (not `#40.state == closed`) plus frozen
-  # #61 corpus and merged #72 harness readiness. Closing #72 is sufficient
-  # to trigger the first authoritative run when #40 already passed before
-  # #72 merged.
+  # current trusted #7 PASS tuple (not `#7.state == closed`) plus the frozen
+  # vNext benchmark tuple (#127) and the migrated #72 harness readiness.
+  # Closing #72 is sufficient to trigger the first authoritative run when
+  # #7 already passed before #72 merged.
   readiness:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -90,7 +94,7 @@ jobs:
       shard_count: ${{ steps.gate.outputs.shard_count }}
       shard_matrix: ${{ steps.gate.outputs.shard_matrix }}
     steps:
-      - name: Re-fetch prerequisite tracker state (#40/#61/#72) and decide
+      - name: Re-fetch prerequisite tracker state (#7/vNext/#72) and decide
         id: gate
         env:
           INPUT_SHARD_COUNT: ${{ inputs.shard_count }}
@@ -115,7 +119,7 @@ jobs:
             }
             const eventName = context.eventName;
             // Manual dispatch satisfies the same exact-main/current-PASS
-            // contract as automatic runs: fetch the current trusted #40 PASS
+            // contract as automatic runs: fetch the current trusted #7 PASS
             // SHA, require the requested SHA (or default) to equal it, and
             // resolve the frozen corpus checksum. Arbitrary SHAs never proceed.
             if (eventName === 'workflow_dispatch') {
@@ -130,25 +134,25 @@ jobs:
               }
               const requested = ((context.payload.inputs && context.payload.inputs.exact_sha) || '').trim();
               // Manual dispatches enforce the same result-state contract as
-              // automatic runs: the frozen #61 corpus and merged #72
-              // harness must be ready, and a current trusted #40 PASS tuple
-              // must exist. #40 stays open as a reusable tracker, so its
-              // closed state is never required.
+              // automatic runs: the frozen vNext benchmark (#127) and the
+              // migrated #72 harness must be ready, and a current trusted
+              // #7 PASS tuple must exist. #7 stays open as a reusable
+              // tracker, so its closed state is never required.
               async function getDispatchIssue(num) {
                 const { data } = await github.rest.issues.get({
                   owner: context.repo.owner, repo: context.repo.repo, issue_number: num,
                 });
                 return data;
               }
-              const [d61, d72] = await Promise.all([
-                getDispatchIssue(61), getDispatchIssue(72),
+              const [d127, d72] = await Promise.all([
+                getDispatchIssue(127), getDispatchIssue(72),
               ]);
-              if (d61.state !== 'closed') {
+              if (d127.state !== 'closed') {
                 core.setOutput('proceed', 'false');
                 core.setOutput('exact_sha', '');
                 core.setOutput('corpus_sha', '');
-                core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
-                core.notice('aa-conversation-eval no-op: #61 not closed (manual dispatch).');
+                core.setOutput('reason', 'no-op: vNext benchmark #127 is not frozen/closed');
+                core.notice('aa-conversation-eval no-op: #127 not closed (manual dispatch).');
                 setShardOutputs(n);
                 return;
               }
@@ -161,13 +165,13 @@ jobs:
                 setShardOutputs(n);
                 return;
               }
-              // #40 is reusable and stays open: readiness uses the trusted
+              // #7 is reusable and stays open: readiness uses the trusted
               // PASS tuple below, never the tracker closed state.
-              const markerReDispatch = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
+              const markerReDispatch = /continuum-qualification-result\s+issue=7\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
               let passShaDispatch = '';
               for await (const { data: comments } of github.paginate.iterator(
                 github.rest.issues.listComments,
-                { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: 7, per_page: 100 },
               )) {
                 for (const c of comments) {
                   const assocDispatch = c.author_association || '';
@@ -184,8 +188,8 @@ jobs:
                 core.setOutput('proceed', 'false');
                 core.setOutput('exact_sha', '');
                 core.setOutput('corpus_sha', '');
-                core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
-                core.notice('aa-conversation-eval no-op: no #40 PASS SHA for manual dispatch.');
+                core.setOutput('reason', 'no-op: no current #7 PASS marker with an exact SHA');
+                core.notice('aa-conversation-eval no-op: no #7 PASS SHA for manual dispatch.');
                 setShardOutputs(n);
                 return;
               }
@@ -194,8 +198,8 @@ jobs:
                 core.setOutput('proceed', 'false');
                 core.setOutput('exact_sha', '');
                 core.setOutput('corpus_sha', '');
-                core.setOutput('reason', 'no-op: manual exact_sha is not the current trusted #40 PASS SHA');
-                core.notice('aa-conversation-eval no-op: manual SHA is not current #40 PASS.');
+                core.setOutput('reason', 'no-op: manual exact_sha is not the current trusted #7 PASS SHA');
+                core.notice('aa-conversation-eval no-op: manual SHA is not current #7 PASS.');
                 setShardOutputs(n);
                 return;
               }
@@ -203,7 +207,7 @@ jobs:
               try {
                 const { data: content } = await github.rest.repos.getContent({
                   owner: context.repo.owner, repo: context.repo.repo,
-                  path: 'qualification/ru_realworld_alcohol_help.v1_1.input.jsonl',
+                  path: 'qualification/ru_product_contract.v1_2.input.jsonl',
                   ref: passShaDispatch,
                 });
                 const raw = Buffer.from(content.content, 'base64');
@@ -247,23 +251,23 @@ jobs:
               core.setOutput('proceed', 'true');
               core.setOutput('exact_sha', passShaDispatch);
               core.setOutput('corpus_sha', corpusShaDispatch);
-              core.setOutput('reason', `ready: manual dispatch validated against current #40 PASS sha=${passShaDispatch}`);
+              core.setOutput('reason', `ready: manual dispatch validated against current #7 PASS sha=${passShaDispatch}`);
               setShardOutputs(n);
               return;
             }
             // Automatic wake-ups react to prerequisite readiness and to
-            // product-input pushes: #61/#72 closures plus main pushes
-            // touching the product-qualification input set. #40 stays open
+            // product-input pushes: vNext/#72 closures plus main pushes
+            // touching the product-qualification input set. #7 stays open
             // as a reusable tracker, so its closed state is never required;
-            // readiness below uses the current trusted #40 PASS tuple.
+            // readiness below uses the current trusted #7 PASS tuple.
             const issueNumber = context.payload.issue ? context.payload.issue.number : 0;
             if (eventName === 'push') {
               core.notice('aa-conversation-eval: product-input push wakes revalidation.');
-            } else if (eventName !== 'issues' || ![61, 72, 40].includes(issueNumber)) {
+            } else if (eventName !== 'issues' || ![7, 72, 127].includes(issueNumber)) {
               core.setOutput('proceed', 'false');
               core.setOutput('exact_sha', '');
               core.setOutput('corpus_sha', '');
-              core.setOutput('reason', `no-op: wake-up is not a #61/#72 readiness event or product push (issue ${issueNumber})`);
+              core.setOutput('reason', `no-op: wake-up is not a vNext/#72 readiness event or product push (issue ${issueNumber})`);
               core.notice('aa-conversation-eval no-op: unrelated issue event.');
               setShardOutputs(4);
               return;
@@ -274,16 +278,17 @@ jobs:
               });
               return data;
             }
-            const [i61, i72] = await Promise.all([getIssue(61), getIssue(72)]);
-            // Every automatic wake-up revalidates frozen corpus/harness
-            // readiness and the current trusted #40 PASS tuple below. #40
-            // may remain open/reusable; only its PASS tuple matters.
-            if (i61.state !== 'closed') {
+            const [i127, i72] = await Promise.all([getIssue(127), getIssue(72)]);
+            // Every automatic wake-up revalidates the frozen vNext
+            // benchmark/harness readiness and the current trusted #7 PASS
+            // tuple below. #7 may remain open/reusable; only its PASS tuple
+            // matters.
+            if (i127.state !== 'closed') {
               core.setOutput('proceed', 'false');
               core.setOutput('exact_sha', '');
               core.setOutput('corpus_sha', '');
-              core.setOutput('reason', 'no-op: #61 corpus is not frozen/closed');
-              core.notice('aa-conversation-eval no-op: #61 not closed.');
+              core.setOutput('reason', 'no-op: vNext benchmark #127 is not frozen/closed');
+              core.notice('aa-conversation-eval no-op: #127 not closed.');
               setShardOutputs(4);
               return;
             }
@@ -296,15 +301,15 @@ jobs:
               setShardOutputs(4);
               return;
             }
-            // Find the latest trusted #40 PASS marker for the exact SHA.
+            // Find the latest trusted #7 PASS marker for the exact SHA.
             // A later FAIL supersedes any earlier PASS, so a FAIL clears the
             // recorded passSha instead of leaving a stale PASS current.
-            // #40 stays open/reusable: only this tuple gates execution.
-            const markerRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
+            // #7 stays open/reusable: only this tuple gates execution.
+            const markerRe = /continuum-qualification-result\s+issue=7\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 7, per_page: 100 },
             )) {
               for (const c of comments) {
                 const assoc = c.author_association || '';
@@ -321,8 +326,8 @@ jobs:
               core.setOutput('proceed', 'false');
               core.setOutput('exact_sha', '');
               core.setOutput('corpus_sha', '');
-              core.setOutput('reason', 'no-op: no current #40 PASS marker with an exact SHA');
-              core.notice('aa-conversation-eval no-op: no #40 PASS SHA.');
+              core.setOutput('reason', 'no-op: no current #7 PASS marker with an exact SHA');
+              core.notice('aa-conversation-eval no-op: no #7 PASS SHA.');
               setShardOutputs(4);
               return;
             }
@@ -348,7 +353,7 @@ jobs:
             try {
               const { data: content } = await github.rest.repos.getContent({
                 owner: context.repo.owner, repo: context.repo.repo,
-                path: 'qualification/ru_realworld_alcohol_help.v1_1.input.jsonl',
+                path: 'qualification/ru_product_contract.v1_2.input.jsonl',
                 ref: passSha,
               });
               const raw = Buffer.from(content.content, 'base64');
@@ -394,12 +399,13 @@ jobs:
             core.setOutput('proceed', 'true');
             core.setOutput('exact_sha', passSha);
             core.setOutput('corpus_sha', corpusSha);
-            core.setOutput('reason', `ready: #40 PASS sha=${passSha}; closing #72 triggers first run; later #40 cycles rerun exactly once per SHA+corpus tuple`);
+            core.setOutput('reason', `ready: #7 PASS sha=${passSha}; closing #72 triggers first run; later #7 cycles rerun exactly once per SHA+corpus tuple`);
             core.notice(`aa-conversation-eval ready at exact SHA ${passSha}.`);
             setShardOutputs(shardCount);
 
-  # Validate the frozen #61 schema/checksums and the current #40 PASS SHA,
-  # then check out and verify that exact SHA before any execution.
+  # Validate the frozen vNext benchmark (#127) schema/checksums and the
+  # current #7 PASS SHA, then check out and verify that exact SHA before
+  # any execution.
   validate:
     needs: readiness
     if: needs.readiness.outputs.proceed == 'true'
@@ -414,14 +420,14 @@ jobs:
         with:
           ref: ${{ needs.readiness.outputs.exact_sha || github.sha }}
           fetch-depth: 0
-      - name: Verify checked-out SHA equals trusted #40 PASS SHA
+      - name: Verify checked-out SHA equals trusted #7 PASS SHA
         shell: bash
         run: |
           set -euo pipefail
           test -n "${{ needs.readiness.outputs.exact_sha }}"
           test "$(git rev-parse HEAD)" = "${{ needs.readiness.outputs.exact_sha }}"
           echo "exact-main checkout verified: $(git rev-parse HEAD)"
-      - name: Verify exact SHA is current trusted #40 PASS SHA with corpus checksum
+      - name: Verify exact SHA is current trusted #7 PASS SHA with corpus checksum
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
@@ -436,11 +442,11 @@ jobs:
               core.setFailed('corpus_sha is not a valid 64-hex frozen corpus checksum; refusing unqualified run');
               return;
             }
-            const trustedRe = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
+            const trustedRe = /continuum-qualification-result\s+issue=7\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passSha = '';
             for await (const { data: comments } of github.paginate.iterator(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 },
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 7, per_page: 100 },
             )) {
               for (const c of comments) {
                 const assocValidate = c.author_association || '';
@@ -454,14 +460,17 @@ jobs:
               }
             }
             if (!passSha) {
-              core.setFailed('no current trusted #40 PASS SHA; refusing run');
+              core.setFailed('no current trusted #7 PASS SHA; refusing run');
               return;
             }
+            // Bind the frozen vNext benchmark/rubric tuple: the version
+            // record plus the rubric sidecar must verify at the PASS SHA.
+            // Scoring dimensions are never retuned after seeing outputs.
             if (exactSha !== passSha) {
-              core.setFailed(`exact SHA ${exactSha} is not the current trusted #40 PASS SHA ${passSha}`);
+              core.setFailed(`exact SHA ${exactSha} is not the current trusted #7 PASS SHA ${passSha}`);
               return;
             }
-            core.notice(`exact SHA verified as current trusted #40 PASS with corpus ${corpusSha.slice(0, 16)}…`);
+            core.notice(`exact SHA verified as current trusted #7 PASS with corpus ${corpusSha.slice(0, 16)}…`);
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -472,12 +481,12 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Validate frozen #61 schema and checksums
+      - name: Validate frozen vNext benchmark and rubric tuple
         shell: bash
         run: |
           set -euo pipefail
-          python -m pytest -q tests/test_ru_realworld_corpus.py
-          python scripts/validate_ru_realworld_corpus.py
+          python -m pytest -q tests/test_product_contract_vnext.py
+          python -c "from aa.qualification.conversation_eval import verify_vnext_tuple_unchanged; print(verify_vnext_tuple_unchanged())"
       - name: Validate harness contract without running the benchmark
         shell: bash
         run: |
@@ -655,7 +664,8 @@ jobs:
                   manifests, expected_case_ids=expected_case_ids(singles, journeys)
               )
               # Resumability tuple: shards must agree with each other and pin
-              # the exact SHA plus the frozen corpus checksums under test.
+              # the exact SHA plus the frozen vNext benchmark checksums,
+              # rubric checksum, harness version, and production boundary.
               base_identity = manifests[0].eval_identity
               for other in manifests[1:]:
                   if not is_resumable(base_identity, other.eval_identity):
@@ -663,10 +673,14 @@ jobs:
               if base_identity.get("main_sha") != exact_sha:
                   raise ConversationEvalError("shard identity main_sha is not the exact SHA")
               frozen = corpus_checksums()
-              if base_identity.get("corpus_input_sha256") != frozen["input"]:
-                  raise ConversationEvalError("shard corpus input checksum is stale")
-              if base_identity.get("corpus_oracle_sha256") != frozen["oracle"]:
-                  raise ConversationEvalError("shard corpus oracle checksum is stale")
+              corpus_input = base_identity.get("benchmark_input_sha256") or base_identity.get("corpus_input_sha256")
+              corpus_oracle = base_identity.get("benchmark_oracle_sha256") or base_identity.get("corpus_oracle_sha256")
+              if corpus_input != frozen["input"]:
+                  raise ConversationEvalError("shard vNext input checksum is stale")
+              if corpus_oracle != frozen["oracle"]:
+                  raise ConversationEvalError("shard vNext oracle checksum is stale")
+              if base_identity.get("benchmark_sources_sha256") and base_identity.get("benchmark_sources_sha256") != frozen["sources"]:
+                  raise ConversationEvalError("shard vNext sources checksum is stale")
               # Provider/infrastructure outcomes are segmented, never quality:
               # any turn that did not cleanly complete on the primary model
               # (including fallback-used) makes the run INCOMPLETE, not failed.
@@ -690,8 +704,13 @@ jobs:
               # to the qualification-results branch keyed by SHA+corpus+run.
               identity = EvalIdentity(
                   main_sha=str(base_identity["main_sha"]),
-                  corpus_input_sha256=str(base_identity["corpus_input_sha256"]),
-                  corpus_oracle_sha256=str(base_identity["corpus_oracle_sha256"]),
+                  benchmark_version=str(base_identity.get("benchmark_version", "ru_product_contract.v1_2")),
+                  benchmark_input_sha256=str(corpus_input),
+                  benchmark_oracle_sha256=str(corpus_oracle),
+                  benchmark_sources_sha256=str(base_identity.get("benchmark_sources_sha256", frozen["sources"])),
+                  rubric_sha256=str(base_identity.get("rubric_sha256", frozen["rubric"])),
+                  harness_version=str(base_identity.get("harness_version", frozen["harness_version"])),
+                  production_boundary_version=str(base_identity.get("production_boundary_version", "aa-v2-turn-graph/118")),
                   runtime_version=str(base_identity["runtime_version"]),
                   prompt_version=str(base_identity["prompt_version"]),
                   retrieval_version=str(base_identity["retrieval_version"]),
@@ -764,12 +783,12 @@ jobs:
             const mergeResult = '${{ steps.merge.outputs.result }}' || 'incomplete';
             let result = mergeResult;
             if (currentMain !== testedSha) result = 'stale';
-            // Revalidate the current trusted #40 PASS marker at publication
+            // Revalidate the current trusted #7 PASS marker at publication
             // time: a FAIL superseding the PASS after shards start must not
             // still publish COMPLETE.
-            const trustedRePublish = /continuum-qualification-result\s+issue=40\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
+            const trustedRePublish = /continuum-qualification-result\s+issue=7\s+sha=([0-9a-f]{40})(?:\s+product=[0-9a-f]{64})?\s+result=(pass|fail)/;
             let passShaPublish = '';
-            for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 40, per_page: 100 })) {
+            for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: 7, per_page: 100 })) {
               for (const c of comments) {
                 const assocP = c.author_association || '';
                 const isTrustedP = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assocP);
@@ -842,7 +861,7 @@ jobs:
             const body = result === 'complete'
               ? `${marker}\n\nAuthoritative benchmark harness run is COMPLETE. Full transcript is the compressed + age-encrypted workflow artifact above (checksum recorded). Compact manifest is on the qualification-results branch keyed by SHA+corpus+run. Answer quality grading is owned by #63.`
               : result === 'stale'
-                ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #62 stays open for a fresh #40-qualified SHA.`
+                ? `${marker}\n\nMain advanced during/after execution (tested=${testedSha} main=${currentMain}). Artifact kept for diagnostics. #62 stays open for a fresh #7-qualified SHA.`
                 : `${marker}\n\nBenchmark run is INCOMPLETE: required cases could not be completed (provider/infrastructure failures are segmented, not quality failures; fallback output never counts as primary). #62 stays open.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo, issue_number: 62, body,
@@ -869,7 +888,7 @@ jobs:
               }
             } else {
               // On INCOMPLETE or stale, leave #62 open and record why.
-              // If a newer exact-main #40 PASS needs a fresh run, reopen #62.
+              // If a newer exact-main #7 PASS needs a fresh run, reopen #62.
               try {
                 const { data: i62 } = await github.rest.issues.get({
                   owner: context.repo.owner, repo: context.repo.repo, issue_number: 62,

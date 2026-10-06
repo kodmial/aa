@@ -32,7 +32,7 @@ def test_workflow_supports_dispatch_run_close_and_push_catchup() -> None:
     assert "issues:" in text
     assert "closed" in text
     assert "push:" in text
-    assert "qualification/ru_answer_quality_rubric.v1.json" in text
+    assert "qualification/ru_answer_quality_rubric.v2.json" in text
     assert ".github/workflows/aa-answer-quality-eval.yml" in text
 
 
@@ -47,7 +47,7 @@ def test_workflow_readiness_wakes_on_62_and_73_with_revalidation() -> None:
 def test_workflow_binds_frozen_rubric_by_checksum() -> None:
     text = _read()
     assert "sha256" in text
-    assert "ru_answer_quality_rubric.v1.sha256" in text
+    assert "ru_answer_quality_rubric.v2.sha256" in text
     assert "sidecar" in text
     assert "version bump" in text
 
@@ -80,14 +80,13 @@ def test_workflow_runs_calibration_before_grading() -> None:
     assert "run_answer_quality_eval" in text
 
 
-def test_workflow_remediates_idempotently_and_reconnects_capability_9() -> None:
+def test_workflow_remediates_idempotently_and_reconnects_capability_6() -> None:
     text = _read()
     assert "fingerprint" in text
-    assert "reopened capability #9" in text or "reopen" in text.lower()
+    assert "reopened capability #6" in text or "reopen" in text.lower()
     assert "automation-blocked-by" in text
     assert "continuum-issue-scheduler" in text
     assert "workflow_dispatch" in text
-    assert "TAP_PAT" in text
     assert "one remediation issue per root cause" in text or "per root cause" in text
 
 

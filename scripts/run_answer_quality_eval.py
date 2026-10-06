@@ -1,4 +1,4 @@
-"""Answer-quality evaluator runner for the frozen RU rubric (#73).
+"""Answer-quality evaluator runner for the frozen vNext RU rubric (#73).
 
 Two modes (evaluation infrastructure only, never product behavior):
 
@@ -242,7 +242,7 @@ def run_transcript(
     )
     result = {
         "schema": "ru-answer-quality-result/1",
-        "rubric_version": "ru-answer-quality-rubric-v1",
+        "rubric_version": "ru-answer-quality-rubric-v2",
         "rubric_sha256": rubric_sha,
         "tuple_key": tuple_key(entry),
         "artifact_verdict": verdict.verdict,
