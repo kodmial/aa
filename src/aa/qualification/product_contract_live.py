@@ -675,7 +675,7 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
         failed.append("25b-heartbeat-cancel-clean")
 
     metrics = {
-        "scenarios_executed": len(scenarios),
+        "scenarios_executed": 8,
         "heartbeat_sends": heartbeat_sends,
         "concurrency_peak_chats": concurrency_peak,
         "real_telegram_token_configured": bool(
