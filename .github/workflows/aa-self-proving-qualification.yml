@@ -71,6 +71,9 @@ jobs:
           current_main="$(git rev-parse refs/remotes/origin/main)"
           if [[ "$checked_sha" != "$current_main" ]]; then
             echo "::error::Refusing stale qualification: checked=$checked_sha current-main=$current_main"
+            mkdir -p self-proving-out
+            printf '{"reason_code":"STALE_MAIN","checked_sha":"%s","current_main":"%s"}\n' \
+              "$checked_sha" "$current_main" > self-proving-out/stale-main.json
             exit 3
           fi
           echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
@@ -586,11 +589,20 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+      - name: Upload stale-main recovery marker
+        if: ${{ failure() && hashFiles('self-proving-out/stale-main.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-stale-${{ github.run_attempt }}
+          path: self-proving-out/stale-main.json
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
       - name: Publish machine-readable failure and repair marker
         # Provider 429 is infrastructure recovery, not a product repair issue.
         # A workflow_run recovery controller reruns failed jobs on a fresh VM
         # from the persisted gate checkpoints.
-        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' }}
+        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
