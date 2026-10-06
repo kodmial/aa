@@ -710,7 +710,16 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
 
 
 def run_control_lane(repo_root: Path | None = None) -> LaneResult:
-    """Execute scenarios 33-41: campaign bounds + restore-before-readiness."""
+    """Execute scenarios 33-41: campaign bounds + restore-before-readiness.
+
+    Issue #144 readiness/control-plane evidence is consumed here on the
+    exact main SHA: READY/STARTUP_FAILED marker round-trips, the
+    in_progress-alone-is-starting rule, READY-only-after-polling-live via
+    the exact production ``Application.start()`` boundary, and the
+    starting/ready/failed status contract. These checks execute offline
+    with stubbed externals; the encrypted-restore/E5 sublanes stay
+    fail-closed INCOMPLETE without live prerequisites.
+    """
     root = repo_root or _repo_root()
     passed: list[str] = []
     failed: list[str] = []
@@ -745,6 +754,196 @@ def run_control_lane(repo_root: Path | None = None) -> LaneResult:
         asyncio.run(controller.stop())
         live_stopped = controller.should_stop()
         _check("33b-controller-lifecycle-live", bool(live_started and live_stopped))
+        # Issue #144 readiness/control-plane evidence on the exact SHA.
+        try:
+            from aa.control.campaign import usable_poller_active
+            from aa.control.readiness import (
+                assert_marker_privacy_safe,
+                find_ready_for_run,
+                format_ready_marker,
+                format_startup_failed_marker,
+                is_usable_poller,
+                parse_ready_marker,
+                parse_startup_failed_marker,
+                resolve_poller_state,
+            )
+
+            sha = checked_out_sha(root)
+            # 42: READY marker round-trip carries only run/SHA/time/ordinal.
+            ready_text = format_ready_marker(run_id=4242, sha=sha, ready_at=1700000000, ordinal=1)
+            parsed_ready = parse_ready_marker(f"human line\n{ready_text}\n")
+            _check(
+                "42-ready-marker-round-trip",
+                parsed_ready is not None
+                and parsed_ready.run_id == 4242
+                and parsed_ready.sha == sha
+                and parsed_ready.ordinal == 1,
+            )
+            try:
+                assert_marker_privacy_safe(ready_text)
+                _check("42b-ready-marker-privacy-safe", True)
+            except ValueError:
+                _check("42b-ready-marker-privacy-safe", False)
+            # 43: in_progress alone is starting, never ready (fail-closed).
+            starting = resolve_poller_state(
+                run_active=True, run_conclusion=None, has_ready=False, has_failed=False
+            )
+            usable_without_ready = is_usable_poller(run_active=True, has_ready=False)
+            usable_with_ready = is_usable_poller(run_active=True, has_ready=True)
+            poller_ready = resolve_poller_state(
+                run_active=True, run_conclusion=None, has_ready=True, has_failed=False
+            )
+            _check(
+                "43-in-progress-without-ready-is-starting",
+                starting == "starting" and not usable_without_ready,
+            )
+            _check(
+                "43b-ready-marker-means-usable-poller",
+                poller_ready == "ready" and usable_with_ready,
+            )
+            _check(
+                "43c-usable-poller-requires-ready",
+                usable_poller_active(runtime_active=True, has_ready=False) is False
+                and usable_poller_active(runtime_active=True, has_ready=True) is True,
+            )
+
+            # 44: READY emitted only after polling is live (production boundary).
+            async def _ready_boundary() -> bool:
+                from aa.app import Application
+                from aa.config import Settings
+                from aa.conversation.graph_runtime import GraphTurnRuntime
+                from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
+
+                published: list[str] = []
+
+                async def _sink(marker: str) -> None:
+                    published.append(marker)
+
+                async def _delegate(thread: str, text: str) -> str:
+                    return "Понял вас. Давайте разберём спокойно."
+
+                settings = Settings.from_env()
+                app = Application(
+                    settings,
+                    opencode_runtime=StubOpenCodeRuntime(
+                        OpenCodeConfig(
+                            base_url="http://127.0.0.1:4096",
+                            command="opencode",
+                            workdir=".",
+                        )
+                    ),
+                    graph_runtime=GraphTurnRuntime(delegate=_delegate),
+                    readiness_publisher=_sink,
+                    runtime_identity=None,
+                )
+                # No marker before start: bootstrap has not completed.
+                if app.readiness_marker is not None or published:
+                    return False
+                # Offline runs have no GitHub identity, so inject one to prove
+                # the exact READY shape without network I/O.
+                from aa.control.readiness import RuntimeIdentity
+
+                app._runtime_identity = RuntimeIdentity(run_id=4243, sha=sha, ordinal=1)
+                await app.start()
+                try:
+                    live = app._transport_polling_live()
+                    marker = app.readiness_marker
+                    if not live or marker is None or not published:
+                        return False
+                    found = find_ready_for_run(published, 4243)
+                    return found is not None and found.sha == sha
+                finally:
+                    await app.stop()
+
+            try:
+                _check("44-ready-only-after-polling-live", bool(asyncio.run(_ready_boundary())))
+            except Exception:
+                _check("44-ready-only-after-polling-live", False)
+            # 45: STARTUP_FAILED marker round-trip with bounded category.
+            failed_text = format_startup_failed_marker(
+                run_id=4244,
+                sha=sha,
+                failed_at=1700000001,
+                ordinal=1,
+                category="telegram-auth",
+            )
+            parsed_failed = parse_startup_failed_marker(failed_text)
+            _check(
+                "45-startup-failed-marker-round-trip",
+                parsed_failed is not None
+                and parsed_failed.run_id == 4244
+                and parsed_failed.category == "telegram-auth",
+            )
+
+            # 46: startup failure publishes FAILED (not READY) + stops bounded.
+            async def _failed_boundary() -> bool:
+                from aa.app import Application
+                from aa.config import Settings
+                from aa.control.readiness import RuntimeIdentity
+                from aa.opencode.errors import OpenCodeNotReadyError
+                from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
+
+                published: list[str] = []
+
+                async def _sink(marker: str) -> None:
+                    published.append(marker)
+
+                class _NeverReady(StubOpenCodeRuntime):
+                    async def ensure_ready(self, timeout: float | None = None) -> None:
+                        raise OpenCodeNotReadyError("not ready")
+
+                settings = Settings.from_env()
+                app = Application(
+                    settings,
+                    opencode_runtime=_NeverReady(
+                        OpenCodeConfig(
+                            base_url="http://127.0.0.1:4096",
+                            command="opencode",
+                            workdir=".",
+                        )
+                    ),
+                    readiness_publisher=_sink,
+                    runtime_identity=RuntimeIdentity(run_id=4245, sha=sha, ordinal=2),
+                )
+                try:
+                    await app.start()
+                except OpenCodeNotReadyError:
+                    pass
+                else:
+                    return False
+                if app.readiness_marker is not None:
+                    return False
+                marker = app.startup_failure_marker
+                if marker is None:
+                    return False
+                parsed = parse_startup_failed_marker(marker)
+                return parsed is not None and parsed.category == "opencode-not-ready"
+
+            try:
+                failed_ok = bool(asyncio.run(_failed_boundary()))
+                _check("46-startup-failed-no-ambiguous-ready", failed_ok)
+            except Exception:
+                _check("46-startup-failed-no-ambiguous-ready", False)
+            # 47: workflow control plane mirrors READY states (static contract).
+            control_text = (root / ".github" / "workflows" / "aa-runtime-control.yml").read_text(
+                encoding="utf-8"
+            )
+            reconciler_text = (
+                root / ".github" / "workflows" / "aa-runtime-reconciler.yml"
+            ).read_text(encoding="utf-8")
+            _check(
+                "47-status-distinguishes-starting-ready",
+                "starting" in control_text
+                and "aa-runtime-ready" in control_text
+                and "aa-runtime-startup-failed" in control_text,
+            )
+            _check(
+                "47b-reconciler-ready-only-usable-poller",
+                "aa-runtime-ready" in reconciler_text
+                and "never queue a second poller" in reconciler_text,
+            )
+        except Exception:
+            failed.append("readiness-control-plane-harness")
         # 41: fresh-runner encrypted restore + bootstrap before readiness.
         identity = (os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip()
         if not identity:
@@ -787,12 +986,17 @@ def run_control_lane(repo_root: Path | None = None) -> LaneResult:
         failed.append("control-lane-harness")
 
     metrics = {
-        "scenarios_executed": 9,
+        "scenarios_executed": 15,
         "max_starts": 4,
         "runtime_seconds": 18000,
         "aggregate_requested_seconds_max": 72000,
         "campaign_lifetime_seconds": 86400,
         "identity_configured": bool((os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip()),
+        "readiness_checks_passed": len(
+            [name for name in passed if name[:2] in ("42", "43", "44", "45", "46", "47")]
+        ),
+        "ready_marker_kind": "aa-runtime-ready",
+        "failed_marker_kind": "aa-runtime-startup-failed",
     }
     if failed:
         status = "FAIL"
