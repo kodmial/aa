@@ -426,9 +426,9 @@ jobs:
                   owner, repo, workflow_id: 'aa-self-proving-qualification.yml',
                   branch: 'main', per_page: 20,
                 });
-                const fresh = (data.workflow_runs || []).find(
-                  run => run.head_sha === mainSha && run.conclusion === 'success'
-                );
+                const runsForSha = (data.workflow_runs || []).filter(run => run.head_sha === mainSha).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                  const latest = runsForSha[0];
+                  const fresh = latest && latest.conclusion === 'success' ? latest : null;
                 if (!fresh) {
                   return { allowed: false, blocking: 'F', reason: `no fresh trusted PASS for exact main ${String(mainSha).slice(0, 12)}`, sha: mainSha };
                 }

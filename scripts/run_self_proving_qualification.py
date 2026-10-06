@@ -70,7 +70,7 @@ def _runtime_fingerprint() -> str:
 
     from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL, Settings
 
-    settings = Settings.from_env({})
+    settings = Settings.from_env(None)
     material = "\x00".join(
         (
             "aa-conversation-runtime/1",
@@ -109,7 +109,7 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             run_id=run_id,
         )
     try:
-        dirty = _git(["status", "--porcelain"])
+        dirty_raw = _git(["status", "--porcelain"])
     except SelfProvingError as exc:
         return GateEvidence(
             gate="A",
@@ -119,7 +119,26 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             run_id=run_id,
             detail=str(exc)[:160],
         )
-    if dirty.strip():
+    ignored_prefixes = (
+        "eval-self-proving-out/",
+        "self-proving-out/",
+        "live-out/",
+        "runtime-status.json",
+    )
+    dirty_lines = []
+    for line in dirty_raw.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip().strip('"')
+        ignored = False
+        for prefix in ignored_prefixes:
+            if path == prefix.rstrip("/") or path.startswith(prefix):
+                ignored = True
+                break
+        if ignored:
+            continue
+        dirty_lines.append(line)
+    if dirty_lines:
         return GateEvidence(
             gate="A",
             status="BLOCKED",
@@ -149,6 +168,34 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             runtime_fingerprint=runtime,
             failure_category="fingerprint-mismatch",
             component="fingerprint-consistency",
+            run_id=run_id,
+        )
+    try:
+        from aa.config import (
+            DEFAULT_AA_AGENT,
+            DEFAULT_FALLBACK_MODEL,
+            DEFAULT_PRIMARY_MODEL,
+            Settings,
+        )
+
+        _policy = Settings.from_env(None)
+        _policy_ok = (
+            _policy.opencode_agent == DEFAULT_AA_AGENT
+            and _policy.opencode_model == DEFAULT_PRIMARY_MODEL
+            and _policy.opencode_fallback_model == DEFAULT_FALLBACK_MODEL
+            and _policy.opencode_model != _policy.opencode_fallback_model
+        )
+    except Exception:
+        _policy_ok = False
+    if not _policy_ok:
+        return GateEvidence(
+            gate="A",
+            status="FAIL",
+            sha=expected_sha,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="model-policy-mismatch",
+            component="model-policy",
             run_id=run_id,
         )
     # Static/build trust: exact SHA + clean tree + computable fingerprints.
@@ -335,7 +382,10 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 records[cid] = ChunkRecord(
                     **{**rec.__dict__, "next": nxt},
                 )
-        with tempfile.TemporaryDirectory(prefix="aa-gate-b-lexical-") as tmp:
+        import shutil as _shutil
+
+        tmp = tempfile.mkdtemp(prefix="aa-gate-b-lexical-")
+        try:
             db_path = Path(tmp) / "lexical.db"
             build_lexical_db(
                 db_path,
@@ -344,11 +394,14 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 texts=chunk_texts,
             )
             lexical_conn = load_lexical_into_memory(db_path)
+        except Exception:
+            _shutil.rmtree(tmp, ignore_errors=True)
+            raise
         try:
             vectors = [hashing_embed(text, dim=HASHING_DIM) for text in chunk_texts]
             dense = ExactIPIndex.build(chunk_ids, vectors, backend=HASHING_BACKEND_NAME)
             index = HybridIndex(
-                directory=Path(tmp) if False else Path("."),
+                directory=Path(tmp),
                 metadata={
                     "embedding_backend": HASHING_BACKEND_NAME,
                     "embedding_dim": HASHING_DIM,
@@ -506,6 +559,7 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 lexical_conn.close()
             except Exception:
                 pass
+            _shutil.rmtree(tmp, ignore_errors=True)
     except Exception as exc:
         label = type(exc).__name__
         component = "bm25-index" if "Lexical" in label else "e5-faiss-index"
@@ -1137,7 +1191,7 @@ def _gate_d_marker_verdict(
             marker = read_marker(candidate)
         except RuntimeStatusError:
             continue
-        if marker.sha != expected_sha:
+        if marker.sha != expected_sha or marker.run_id != run_id:
             continue
         if marker.phase in ("READY", "STOPPED"):
             return GateEvidence(
@@ -1186,8 +1240,12 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
     marker_verdict = _gate_d_marker_verdict(expected_sha, run_id, product, runtime)
     if marker_verdict is not None:
         return marker_verdict
-    # Otherwise prove real Telegram network readiness live: getMe identity
-    # plus webhook-clean polling state. Fail-closed on any network/API error.
+    # Otherwise prove real Telegram network reachability live, but never PASS
+    # on getMe/webhook alone: PASS requires the durable READY/STOPPED marker
+    # published from the running Application after proving OpenCode health,
+    # getMe identity, webhook/commands bootstrap, ``transport.running`` with
+    # a live poll task, and a clean stop with no leaked poll task. A bare
+    # getMe-only script is forbidden and stays BLOCKED here.
     try:
         me_payload = _telegram_get_json(token, "getMe")
         if me_payload.get("ok") is not True:
@@ -1231,13 +1289,14 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
         )
     return GateEvidence(
         gate="D",
-        status="PASS",
+        status="BLOCKED",
         sha=expected_sha,
         product_fingerprint=product,
         runtime_fingerprint=runtime,
+        failure_category="telegram-readiness-unproven",
         component="telegram-readiness",
         run_id=run_id,
-        live_trusted=True,
+        detail="live-application-proof-required",
     )
 
 
