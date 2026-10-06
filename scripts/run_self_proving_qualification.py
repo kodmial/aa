@@ -877,21 +877,26 @@ def _live_real_latencies_from_product_summary(payload: object) -> list[float] | 
                     collected.extend(values)
         turns = lane.get("turns", None)
         if isinstance(turns, list) and turns:
-            values: list[float] = []
+            turn_values: list[float] = []
+            valid = True
             for entry in turns:
                 if not isinstance(entry, dict):
+                    valid = False
                     break
+                found: float | None = None
                 for key in ("latency_ms", "total_ms", "end_to_end_ms"):
                     if key in entry:
                         try:
-                            values.append(float(entry[key]))
+                            found = float(entry[key])
                         except (TypeError, ValueError):
-                            break
+                            found = None
                         break
-            else:
-                values = [v for v in values if v > 0]
-                if values:
-                    collected.extend(values)
+                if found is None or not found > 0:
+                    valid = False
+                    break
+                turn_values.append(found)
+            if valid and turn_values:
+                collected.extend(turn_values)
     if collected:
         return collected
     return None
@@ -1018,12 +1023,58 @@ _PRODUCTION_CHECK_TOKENS: tuple[str, ...] = (
 
 
 def _lane_has_production_checks(passed: object) -> bool:
-    if not isinstance(passed, list) or len(passed) < 3:
+    if not isinstance(passed, list) or len(passed) < 4:
         return False
     lowered = [str(item).lower() for item in passed if isinstance(item, str) and str(item).strip()]
-    if len(lowered) < 3:
+    if len(lowered) < 4:
         return False
     return any(token in name for name in lowered for token in _PRODUCTION_CHECK_TOKENS)
+
+
+_STAGE_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("planner", "queries"),
+    ("retrieval", "rrf"),
+    ("verifier", "grounding", "safety"),
+    (
+        "transport",
+        "typing",
+        "concurrency",
+        "fifo",
+        "controller",
+        "ready",
+        "delivery",
+    ),
+)
+
+
+def _stage_group_covers(name: str, group: tuple[str, ...]) -> bool:
+    return any(token in name for token in group)
+
+
+def _union_has_distinct_stage_cover(names: list[str]) -> bool:
+    """Whether distinct passed checks cover every pipeline stage group.
+
+    Each group must be satisfied by a different check name, so one token
+    (e.g. ``rrf``) cannot satisfy two stages. Groups are disjoint by
+    construction.
+    """
+    used: set[int] = set()
+
+    def _assign(group_idx: int) -> bool:
+        if group_idx == len(_STAGE_GROUPS):
+            return True
+        group = _STAGE_GROUPS[group_idx]
+        for name_idx, name in enumerate(names):
+            if name_idx in used:
+                continue
+            if _stage_group_covers(name, group):
+                used.add(name_idx)
+                if _assign(group_idx + 1):
+                    return True
+                used.remove(name_idx)
+        return False
+
+    return _assign(0)
 
 
 def _gate_c_live_evidence(
@@ -1227,31 +1278,21 @@ def _gate_c_live_evidence(
                     complete = False
                     break
             # The union of passed checks must prove the production pipeline
-            # stages (planner/retrieval/answer-verifier/delivery); otherwise
-            # an INCOMPLETE summary with trivial passes could be promoted.
+            # stages (planner/retrieval/answer-verifier/delivery) with
+            # distinct evidence per stage; otherwise an INCOMPLETE summary
+            # with trivial passes could be promoted. Groups are disjoint
+            # (see _STAGE_GROUPS) and each group must be satisfied by a
+            # distinct passed check name, so one token (e.g. ``rrf``)
+            # cannot satisfy two stages.
             if complete:
-                union = " ".join(
+                names = [
                     str(item).lower()
                     for lane in lanes
                     if isinstance(lane, dict)
                     for item in (lane.get("passed", []) or [])
-                    if isinstance(item, str)
-                )
-                stage_groups = (
-                    ("planner", "queries", "rrf"),
-                    ("retrieval", "rrf", "grounding"),
-                    ("verifier", "grounding", "safety", "answer"),
-                    (
-                        "transport",
-                        "typing",
-                        "concurrency",
-                        "fifo",
-                        "controller",
-                        "ready",
-                        "delivery",
-                    ),
-                )
-                if not all(any(token in union for token in group) for group in stage_groups):
+                    if isinstance(item, str) and str(item).strip()
+                ]
+                if not _union_has_distinct_stage_cover(names):
                     complete = False
             if complete:
                 return (
