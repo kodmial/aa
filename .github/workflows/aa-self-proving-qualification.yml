@@ -519,7 +519,7 @@ jobs:
         if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: aa-self-proving-restart
+          name: aa-self-proving-restart-${{ github.run_attempt }}
           path: self-proving-out/restart-required.json
           retention-days: 1
           if-no-files-found: error
