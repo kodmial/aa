@@ -338,6 +338,8 @@ def decide_final_verdict(
     current = validate_exact_sha(current_sha)
     product = validate_hex64(product_fingerprint)
     runtime = validate_hex64(runtime_fingerprint)
+    if not product or not runtime:
+        raise SelfProvingError("product/runtime fingerprints must be known 64-hex")
     if not run_id.strip() or any(c.isspace() for c in run_id):
         raise SelfProvingError("run_id must be a non-empty token")
     by_gate = {item.gate: item for item in evidences}
