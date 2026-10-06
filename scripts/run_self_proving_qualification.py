@@ -881,8 +881,9 @@ def _live_aggregate_slo_from_product_summary(payload: object) -> dict[str, float
             continue
         if count <= 0 or p50_ms <= 0:
             continue
-        # When the lane reports no explicit max, the max is at least p95.
-        lane_max = max_ms if max_ms > 0 else p95_ms
+        if max_ms <= 0:
+            continue
+        lane_max = max_ms
         best_p50 = max(best_p50, p50_ms)
         best_p95 = max(best_p95, p95_ms)
         best_max = max(best_max, lane_max)
@@ -1393,13 +1394,17 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
         hook_url = str(hook_result.get("url", "") or "")
         pending = hook_result.get("pending_update_count", 0)
         if hook_url:
-            # Webhook set: long polling would miss updates; clean it first.
-            _telegram_get_json(token, "deleteWebhook?drop_pending_updates=true")
-            hook_payload = _telegram_get_json(token, "getWebhookInfo")
-            hook_result = hook_payload.get("result")
-            if not isinstance(hook_result, dict) or str(hook_result.get("url", "") or ""):
-                raise SelfProvingError("telegram webhook cleanup failed")
-            pending = hook_result.get("pending_update_count", 0)
+            return GateEvidence(
+                gate="D",
+                status="BLOCKED",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category="telegram-readiness-unproven",
+                component="telegram-readiness",
+                run_id=run_id,
+                detail="webhook-configured-polling-blocked",
+            )
         try:
             pending_count = int(pending or 0)
         except (TypeError, ValueError):
@@ -1652,6 +1657,56 @@ def main(argv: list[str] | None = None) -> int:
         )
     except SelfProvingError as exc:
         print(f"self-proving qualification BLOCKED: {exc}", file=sys.stderr)
+        marker = build_result_marker(sha=expected, status="BLOCKED", run=run_id)
+        blocking_gate = next((item.gate for item in evidences if item.status != "PASS"), "A")
+        blocked_failures: list[object] = []
+        for evidence in evidences:
+            if evidence.status == "PASS":
+                continue
+            try:
+                report = failure_report_for_gate(evidence)
+            except SelfProvingError:
+                continue
+            payload = report.to_dict()
+            payload["repair_fingerprint"] = repair_fingerprint(report)
+            blocked_failures.append(payload)
+        (out_dir / "self-proving-summary.json").write_text(
+            json.dumps(
+                {
+                    "sha": expected,
+                    "status": "BLOCKED",
+                    "product_fingerprint": product,
+                    "runtime_fingerprint": runtime,
+                    "blocking_gate": blocking_gate,
+                    "run_id": run_id,
+                    "gates": [item.to_dict() for item in evidences],
+                    "failures": blocked_failures,
+                    "marker": marker,
+                    "error": str(exc)[:160],
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (out_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "result": "BLOCKED",
+                    "main_sha": expected,
+                    "run_id": run_id,
+                    "blocking_gate": blocking_gate,
+                    "marker": marker,
+                    "gates": [{"gate": item.gate, "status": item.status} for item in evidences],
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return EXIT_BLOCKED
 
     failures = []

@@ -363,7 +363,7 @@ def decide_final_verdict(
                 )
             )
             continue
-        if evidence.product_fingerprint and product and (evidence.product_fingerprint != product):
+        if evidence.product_fingerprint != product:
             blocking = blocking or gate
             overall = "BLOCKED"
             ordered.append(
@@ -381,7 +381,7 @@ def decide_final_verdict(
                 )
             )
             continue
-        if evidence.runtime_fingerprint and runtime and (evidence.runtime_fingerprint != runtime):
+        if evidence.runtime_fingerprint != runtime:
             blocking = blocking or gate
             overall = "BLOCKED"
             ordered.append(
