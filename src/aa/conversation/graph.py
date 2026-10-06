@@ -5,8 +5,9 @@ application-command/safety handling -> mandatory hidden planner -> managed
 conversation memory -> retrieval/Evidence Pack -> natural AA answer with
 claim-level verification and bounded repair.
 
-The legacy ``aa.conversation.orchestrator`` path is untouched and remains
-the production path until the later cutover task. No legacy lexical
+This graph is the production conversational path (issue #118 cutover).
+The retired ``aa.conversation.orchestrator`` module is never imported
+here and is not consulted by any node. No legacy lexical
 semantic-routing behavior (substantive/trivial classifiers, keyword, slang
 or theme tables, legacy aspect-taxonomy planners) is imported or
 reproduced here.
@@ -191,8 +192,8 @@ def build_turn_graph(
     pipeline (multi-query hybrid plus small-to-big Evidence Pack
     selection: ``QueryPlan -> BM25+E5 -> RRF -> dedup/diversity ->
     small-to-big``) instead of the ``retrieval_stub`` no-op.
-    ``retrieval_config`` is forwarded when provided. The legacy
-    production path stays untouched until the later cutover task.
+    ``retrieval_config`` is forwarded when provided. The retired
+    orchestrator module is never consulted by this graph.
 
     ``answer_model``/``verifier_model`` bind the natural answer pipeline:
     when both are given, an ``answer`` node runs AA generation,

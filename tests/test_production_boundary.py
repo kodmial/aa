@@ -6,7 +6,6 @@ from aa.app import Application
 from aa.config import Settings
 from aa.conversation.meta import META_CAPABILITY_REPLY, is_meta_capability_request
 from aa.conversation.orchestrator import (
-    FAIL_CLOSED_REPLY,
     contains_english_fallback,
     is_substantive,
     meets_russian_only,
@@ -61,6 +60,11 @@ def test_meta_capability_reply_is_deterministic_russian() -> None:
 
 
 async def test_app_serves_meta_without_grounded_or_model_work() -> None:
+    # Cutover #118: meta/capability turns are ordinary LangGraph turns with
+    # natural Russian replies (no deterministic canned reply, no legacy
+    # trivial/grounded split, no technical fail-closed).
+    from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
+
     settings = Settings.from_env({})
     runtime = StubOpenCodeRuntime(
         OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
@@ -68,20 +72,13 @@ async def test_app_serves_meta_without_grounded_or_model_work() -> None:
     app = Application(settings, opencode_runtime=runtime)
     await app.start()
     try:
-
-        async def _forbidden_grounded(*_args: object, **_kwargs: object) -> str:
-            raise AssertionError("meta turn must not call the grounded pipeline")
-
-        async def _forbidden_trivial(*_args: object, **_kwargs: object) -> str:
-            raise AssertionError("meta turn must not call the model path")
-
-        app._run_grounded_turn = _forbidden_grounded  # type: ignore[method-assign]
-        app._run_trivial_turn = _forbidden_trivial  # type: ignore[method-assign]
         for text in ("А что ты можешь?", "Тогда зачем ты?"):
             reply = await app.respond(1001, text)
-            assert reply == META_CAPABILITY_REPLY
-            assert reply != FAIL_CLOSED_REPLY
-            assert meets_russian_only(reply) is True
+            assert reply.strip()
+            assert envelope_passes(reply) is True
+            assert contains_cyrillic(reply) is True
+            assert leaks_internal_terms(reply) is False
+            assert "Не могу дать обоснованный ответ" not in reply
     finally:
         await app.stop()
 

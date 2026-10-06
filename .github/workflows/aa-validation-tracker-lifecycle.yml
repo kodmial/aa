@@ -1,0 +1,99 @@
+name: AA validation tracker lifecycle
+
+# Keep validation trackers out of the permanent open-task queue.
+# #7 is opened only while an exact-main Product Contract qualification is
+# active and is closed automatically only by trusted PASS evidence for the
+# exact current main SHA. A later product-changing dispatch reopens it first.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  settle-product-contract-tracker:
+    if: >-
+      github.event.issue.number == 7 &&
+      github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close #7 only on trusted exact-current-main PASS
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const body = context.payload.comment?.body || '';
+            const association = String(
+              context.payload.comment?.author_association || ''
+            ).toUpperCase();
+            const login = String(context.payload.comment?.user?.login || '');
+            const trusted =
+              ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association) ||
+              login === 'github-actions[bot]' ||
+              login === context.repo.owner;
+            if (!trusted) {
+              core.notice('Ignoring untrusted qualification result comment.');
+              return;
+            }
+
+            const marker = body.match(
+              /<!--\s*continuum-qualification-result\b[^>]*\bissue\s*=\s*7\b[^>]*\bsha\s*=\s*([0-9a-f]{40})\b[^>]*\bresult\s*=\s*(pass|fail)\b[^>]*-->/i
+            );
+            if (!marker) {
+              core.info('Comment is not a canonical #7 qualification result.');
+              return;
+            }
+
+            const testedSha = marker[1].toLowerCase();
+            const result = marker[2].toLowerCase();
+            const { data: branch } = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: 'main',
+            });
+            const currentMain = String(branch.commit.sha || '').toLowerCase();
+
+            if (result !== 'pass') {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 7,
+              });
+              if (issue.state !== 'open') {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  state: 'open',
+                });
+              }
+              core.notice('Qualification FAIL keeps #7 open for repair/retry.');
+              return;
+            }
+
+            if (testedSha !== currentMain) {
+              core.warning(
+                `Ignoring stale #7 PASS: tested=${testedSha} current-main=${currentMain}`
+              );
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 7,
+              body:
+                'Lifecycle complete: trusted Product Contract PASS matches exact current main ' +
+                '`' + currentMain + '`. Closing the validation tracker; a future ' +
+                'product-changing qualification dispatch will reopen it automatically.',
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 7,
+              state: 'closed',
+              state_reason: 'completed',
+            });

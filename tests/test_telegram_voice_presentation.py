@@ -519,6 +519,12 @@ async def test_app_selects_opposite_voice_per_turn(tmp_path: Path) -> None:
         ("female-presenting", "eugene"),
         ("unknown", "xenia"),
     ):
+        from aa.conversation.graph_runtime import GraphTurnRuntime
+
+        async def _reply(thread: str, text: str) -> str:
+            _ = (thread, text)
+            return "Привет. Держись. Приходи."
+
         transport = StubTelegramTransport()
         synth = _FakeSynth()
         tts = build_tts_pipeline(
@@ -532,15 +538,10 @@ async def test_app_selects_opposite_voice_per_turn(tmp_path: Path) -> None:
             opencode_runtime=_stub_runtime(),
             voice_pipeline=_VoicePipelineWithPresentation("привет", presentation),  # type: ignore[arg-type]
             tts_pipeline=tts,
+            graph_runtime=GraphTurnRuntime(delegate=_reply),
         )
         await app.start()
         try:
-
-            async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-                _ = (session_id, text, voice_mode)
-                return "Привет. Держись. Приходи."
-
-            app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
             await app._process_dispatched_update(_voice_incoming())
             assert transport.sent_voices, presentation
             assert synth.seen_speakers == [expected], presentation
@@ -568,6 +569,12 @@ async def test_app_classifier_failure_still_delivers_xenia(tmp_path: Path) -> No
             _ = samples
             raise RuntimeError("boom")
 
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     voice = build_pipeline(
         fetcher=_FakeFetcher(),
         decoder=_FakeDecoder(_sine(4.0)),
@@ -581,15 +588,10 @@ async def test_app_classifier_failure_still_delivers_xenia(tmp_path: Path) -> No
         opencode_runtime=_stub_runtime(),
         voice_pipeline=voice,
         tts_pipeline=tts,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            _ = (session_id, text, voice_mode)
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=91))
         # Voice reply still succeeds with the deterministic default.
         assert len(transport.sent_voices) == 1
@@ -609,6 +611,12 @@ async def test_app_turns_do_not_persist_presentation(tmp_path: Path) -> None:
         encoder=_FakeEncoder(),
         work_parent=tmp_path,
     )
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     first = _VoicePipelineWithPresentation("привет", "female-presenting")
     app = Application(
         _settings(),
@@ -616,15 +624,10 @@ async def test_app_turns_do_not_persist_presentation(tmp_path: Path) -> None:
         opencode_runtime=_stub_runtime(),
         voice_pipeline=first,  # type: ignore[arg-type]
         tts_pipeline=tts,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            _ = (session_id, text, voice_mode)
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=92))
         assert synth.seen_speakers == ["eugene"]
         # Next turn is unknown: it must not reuse the previous turn's voice.
@@ -651,6 +654,12 @@ async def test_app_never_logs_or_exposes_presentation(tmp_path: Path) -> None:
         encoder=_FakeEncoder(),
         work_parent=tmp_path,
     )
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _reply(thread: str, text: str) -> str:
+        _ = (thread, text)
+        return "Привет. Держись."
+
     app = Application(
         _settings(),
         transport=transport,
@@ -659,15 +668,10 @@ async def test_app_never_logs_or_exposes_presentation(tmp_path: Path) -> None:
             "привет", "female-presenting"
         ),
         tts_pipeline=tts,
+        graph_runtime=GraphTurnRuntime(delegate=_reply),
     )
     await app.start()
     try:
-
-        async def _fake_trivial(session_id: str, text: str, *, voice_mode: bool = False) -> str:
-            _ = (session_id, text, voice_mode)
-            return "Привет. Держись."
-
-        app._run_trivial_turn = _fake_trivial  # type: ignore[method-assign]
         await app._process_dispatched_update(_voice_incoming(chat_id=93))
         delivered_text = transport.sent[0].text if transport.sent else ""
         voice_bytes = transport.sent_voices[0].voice_bytes if transport.sent_voices else b""

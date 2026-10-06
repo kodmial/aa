@@ -274,6 +274,10 @@ async def test_trivial_english_fallback_fails_closed() -> None:
 
 
 async def test_app_respond_maps_grounding_failure_to_ru_fail_closed() -> None:
+    # Cutover #118: ordinary turns use only the LangGraph runtime with a
+    # natural Russian fallback (no technical FAIL_CLOSED_REPLY).
+    from aa.conversation.output_limits import envelope_passes
+
     settings = Settings.from_env({})
     runtime = StubOpenCodeRuntime(
         OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
@@ -281,19 +285,19 @@ async def test_app_respond_maps_grounding_failure_to_ru_fail_closed() -> None:
     app = Application(settings, opencode_runtime=runtime)
     await app.start()
     try:
-
-        async def _leaking_grounded(_session_id: str, _text: str, **_kw: object) -> str:
-            return OBSERVED_EN_FALLBACK
-
-        app._run_grounded_turn = _leaking_grounded  # type: ignore[assignment]
         reply = await app.respond(42, "я бухаю каждый вечер, что делать")
-        assert reply == FAIL_CLOSED_REPLY
+        assert meets_russian_only(reply)
         assert not contains_english_fallback(reply)
+        assert envelope_passes(reply)
     finally:
         await app.stop()
 
 
 async def test_app_respond_maps_trivial_english_leak_to_ru_fail_closed() -> None:
+    # Cutover #118: greeting turns are natural LangGraph turns, never an
+    # English leak and never the retired technical fail-closed reply.
+    from aa.conversation.output_limits import envelope_passes
+
     settings = Settings.from_env({})
     runtime = StubOpenCodeRuntime(
         OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
@@ -301,14 +305,10 @@ async def test_app_respond_maps_trivial_english_leak_to_ru_fail_closed() -> None
     app = Application(settings, opencode_runtime=runtime)
     await app.start()
     try:
-
-        async def _leaking_trivial(_session_id: str, _text: str, **_kw: object) -> str:
-            return "Could not process the message. Please try again."
-
-        app._run_trivial_turn = _leaking_trivial  # type: ignore[assignment]
         reply = await app.respond(43, "привет")
-        assert reply == FAIL_CLOSED_REPLY
+        assert meets_russian_only(reply)
         assert not contains_english_fallback(reply)
+        assert envelope_passes(reply)
     finally:
         await app.stop()
 

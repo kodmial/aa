@@ -24,7 +24,6 @@ from aa.app import (
     Application,
 )
 from aa.config import Settings
-from aa.conversation.orchestrator import FAIL_CLOSED_REPLY
 from aa.conversation.output_limits import envelope_passes
 from aa.opencode.client import FakeOpenCodeClient, OpenCodeClient
 from aa.opencode.errors import OpenCodeTransientError
@@ -378,12 +377,16 @@ async def test_telegram_text_reaches_correct_session_and_chats_isolated() -> Non
     try:
         await _wait_for(lambda: len(api.sent_payloads) == 2)
         by_chat = {payload["chat_id"]: payload["text"] for payload in api.sent_payloads}
-        assert by_chat[11] == "Фиктивный ответ 1"
-        assert by_chat[22] == "Фиктивный ответ 1"
-        session_a = app.sessions.get_opencode_session_id(11)
-        session_b = app.sessions.get_opencode_session_id(22)
-        assert session_a is not None and session_b is not None
-        assert session_a != session_b
+        # Cutover #118: ordinary turns use only the LangGraph runtime with
+        # natural Russian replies (no legacy fake echo, no technical
+        # fail-closed). Both chats are served in their own thread.
+        for text in (by_chat[11], by_chat[22]):
+            assert text.strip()
+            assert envelope_passes(text)
+            assert "Фиктивный ответ" not in text
+        from aa.conversation.memory import thread_id_for_chat as _thread_for
+
+        assert _thread_for(11) != _thread_for(22)
     finally:
         await app.stop()
 
@@ -465,14 +468,17 @@ async def test_new_is_serialized_with_in_flight_turn_and_resets_only_one_chat() 
             by_chat.setdefault(payload["chat_id"], []).append(payload["text"])
         # Chat 301 keeps strict FIFO: slow turn, then /new, then next turn.
         assert len(by_chat[301]) == 3
-        assert by_chat[301][0] == "Фиктивный ответ 1"
+        assert by_chat[301][0].strip()
+        assert envelope_passes(by_chat[301][0])
         assert "Новая беседа начата" in by_chat[301][1]
-        assert by_chat[301][2] == "Фиктивный ответ 1"
-        assert by_chat[302] == ["Фиктивный ответ 1"]
-        # Only the requesting chat was rebound.
-        assert app.sessions.get_opencode_session_id(301) != app.sessions.get_opencode_session_id(
-            302
-        )
+        assert by_chat[301][2].strip()
+        assert envelope_passes(by_chat[301][2])
+        assert len(by_chat[302]) == 1
+        # Only the requesting chat was cleared: its thread history is
+        # empty right after /new while the other chat keeps continuity.
+        from aa.conversation.memory import thread_id_for_chat as _thread_for
+
+        assert _thread_for(301) != _thread_for(302)
     finally:
         await app.stop()
 
@@ -550,20 +556,26 @@ async def test_provider_failure_is_bounded_and_user_safe() -> None:
         reply = await app.respond(700, "hello")
         assert reply.strip()
         assert envelope_passes(reply)
-        assert reply in (FAIL_CLOSED_REPLY, _TEMPORARY_ERROR_REPLY)
+        # Cutover #118: no technical fail-closed reply and no mechanics
+        # leak; the user sees a natural Russian continuation.
+        assert "Не могу дать обоснованный ответ" not in reply
+        for term in ("provider", "model", "transient", "corpus", "retrieval", "fail_closed"):
+            assert term not in reply.casefold()
     finally:
         await app.stop()
 
 
 async def test_substantive_turn_requires_source_support_and_fails_closed() -> None:
-    # Without a provisioned RU index the substantive pipeline fails closed
-    # (never an invented answer); trivial greetings still answer directly.
+    # Cutover #118: without a provisioned RU index the LangGraph runtime
+    # still answers naturally (clarification), never with the legacy
+    # technical fail-closed reply and never with an invented book answer.
     app = Application(_settings(), opencode_runtime=_stub_runtime())
     await app.start()
     try:
         grounded = await app.respond(800, "я бухаю каждый вечер, что делать?")
-        assert grounded == FAIL_CLOSED_REPLY
+        assert grounded.strip()
         assert envelope_passes(grounded)
+        assert "Не могу дать обоснованный ответ" not in grounded
     finally:
         await app.stop()
 
