@@ -330,7 +330,7 @@ def _gate_e(
     p50 = percentile_ms(latencies_ms, 50)
     p95 = percentile_ms(latencies_ms, 95)
     maximum = max(latencies_ms)
-    if maximum >= 30_000:
+    if p95 > 15_000 or maximum >= 30_000:
         return GateEvidence(
             gate="E",
             status="FAIL",
@@ -401,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     gate_b = _gate_b(expected, run_id, product, runtime)
     gate_c, latencies = _gate_c(expected, run_id, product, runtime)
     gate_d = _gate_d(expected, run_id, product, runtime)
-    gate_e = _gate_e(expected, run_id, product, runtime, latencies, gate_c_live=False)
+    gate_e = _gate_e(expected, run_id, product, runtime, latencies, gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted))
 
     evidences = [gate_a, gate_b, gate_c, gate_d, gate_e]
     try:
