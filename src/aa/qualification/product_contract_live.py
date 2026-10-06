@@ -1346,8 +1346,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
 
             scenarios: tuple[tuple[str, int, str], ...] = (
                 ("meta-capability", 920001, "Чем ты вообще можешь быть полезен здесь?"),
-                ("substantive-drinking", 920002, "К вечеру очень тянет выпить, как с этим обходиться?"),
-                ("family-relationship", 920003, "Дома снова ссора из-за моей выпивки, как мне на это посмотреть?"),
+                (
+                    "substantive-drinking",
+                    920002,
+                    "К вечеру очень тянет выпить, как с этим обходиться?",
+                ),
+                (
+                    "family-relationship",
+                    920003,
+                    "Дома снова ссора из-за моей выпивки, как мне на это посмотреть?",
+                ),
                 ("followup-ellipsis", 920002, "А почему это вообще важно?"),
                 ("topic-shift", 920003, "А теперь другое: ночью не могу успокоиться и уснуть"),
                 ("unsupported-out-of-book", 920004, "Стоит ли мне сейчас покупать акции?"),
@@ -1452,7 +1460,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             )
             _check("live-voice-models-ready", voice_ok)
             if voice_ok:
-                tts = getattr(app, "_tts_pipeline")
+                tts = app._tts_pipeline
                 assert tts is not None
                 api.voice_fixture = await tts.synthesize_voice_ogg(
                     "Мне сегодня трудно не пить", "xenia"
@@ -1518,7 +1526,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "clarification_count": collapsed_count,
         "typing_heartbeat_sends": typing_sends,
-        "voice_end_to_end_ms": round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0,
+        "voice_end_to_end_ms": (
+            round(voice_elapsed * 1000.0, 1)
+            if "voice_elapsed" in locals()
+            else 0.0
+        ),
         "live_prerequisites_present": True,
         "production_boundary": "PollingTelegramTransport._process_raw_update",
     }
