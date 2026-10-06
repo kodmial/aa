@@ -176,7 +176,10 @@ def _is_ephemeral_tree_path(path: str) -> bool:
     if normalized in _EPHEMERAL_TREE_FILES:
         return True
     for prefix in _EPHEMERAL_TREE_PREFIXES:
-        if prefix.endswith("/"):
+        if prefix == "eval-":
+            if normalized.startswith(prefix) and "/" in normalized:
+                return True
+        elif prefix.endswith("/"):
             if normalized == prefix[:-1] or normalized.startswith(prefix):
                 return True
         elif normalized == prefix or normalized.startswith(prefix):
