@@ -202,6 +202,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         if request_timeout <= 0:
             raise ValueError("request_timeout must be > 0")
         self._request_timeout = request_timeout
+        self._served_model_audit: list[dict[str, str]] = []
 
     @property
     def base_url(self) -> str:
@@ -289,6 +290,53 @@ class HttpOpenCodeClient(OpenCodeClient):
         logger.info("opencode session deleted")
         return True
 
+    @property
+    def served_model_audit(self) -> tuple[dict[str, str], ...]:
+        """Return privacy-safe actual served-model evidence for qualification."""
+        return tuple(dict(item) for item in self._served_model_audit)
+
+    @staticmethod
+    def _served_model_from_info(info: object) -> str:
+        """Extract provider/model from OpenCode assistant response metadata."""
+        if not isinstance(info, dict):
+            return ""
+        candidates: list[object] = [info, info.get("assistant")]
+        metadata = info.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.extend((metadata, metadata.get("assistant")))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            provider = candidate.get("providerID", candidate.get("provider_id", ""))
+            model = candidate.get("modelID", candidate.get("model_id", ""))
+            if isinstance(provider, str) and isinstance(model, str) and provider and model:
+                return f"{provider}/{model}"
+        return ""
+
+    def _validate_served_model(self, info: object, *, requested: str, agent: str) -> None:
+        """Fail closed when OpenCode served a model other than the pinned request."""
+        expected = (requested or "").strip()
+        if not expected:
+            return
+        served = self._served_model_from_info(info)
+        if not served:
+            raise OpenCodeDeterministicError(
+                "opencode response omitted served model identity"
+            )
+        if served != expected:
+            raise OpenCodeDeterministicError(
+                f"opencode served model mismatch: expected {expected}, got {served}"
+            )
+        self._served_model_audit.append(
+            {
+                "agent": (agent or "").strip()[:128],
+                "requested": expected[:128],
+                "served": served[:128],
+            }
+        )
+        if len(self._served_model_audit) > 512:
+            del self._served_model_audit[:-512]
+
     async def send_message(
         self,
         session_id: str,
@@ -327,6 +375,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
+        self._validate_served_model(info, requested=model, agent=agent)
         reply = _extract_text(payload.get("parts"))
         # Never log the prompt or the reply; only the fact of completion.
         logger.info("opencode message completed")
@@ -375,6 +424,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
+        self._validate_served_model(info, requested=model, agent=agent)
         structured = _extract_structured(payload)
         if structured is None:
             raise OpenCodeDeterministicError("opencode structured output missing")
