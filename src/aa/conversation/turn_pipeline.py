@@ -658,12 +658,24 @@ async def answer_pipeline_node(
         except (TypeError, ValueError):
             prior_planner_latency_f = 0.0
         prior_planner_outcome = str(prior_retry_d.get("planner_outcome", ""))
-        telemetry.setdefault("planner_query_count", query_count)
+        telemetry["planner_query_count"] = max(
+            int(telemetry.get("planner_query_count", 0) or 0), query_count
+        )
         if prior_planner_latency_f:
-            telemetry.setdefault("planner_latency_ms", round(prior_planner_latency_f, 1))
-        telemetry.setdefault("retrieval_latency_ms", round(retrieval_latency_f, 1))
-        telemetry.setdefault("retrieval_passages", pack_count)
-        telemetry.setdefault("retrieval_over_budget", over_budget)
+            telemetry["planner_latency_ms"] = round(
+                float(telemetry.get("planner_latency_ms", 0.0) or 0.0) + prior_planner_latency_f,
+                1,
+            )
+        telemetry["retrieval_latency_ms"] = round(
+            float(telemetry.get("retrieval_latency_ms", 0.0) or 0.0) + retrieval_latency_f,
+            1,
+        )
+        telemetry["retrieval_passages"] = max(
+            int(telemetry.get("retrieval_passages", 0) or 0), pack_count
+        )
+        telemetry["retrieval_over_budget"] = bool(
+            telemetry.get("retrieval_over_budget", False) or over_budget
+        )
         if "retrieval_outcome" not in telemetry or telemetry.get("retrieval_outcome") in (
             "skipped-initial",
             "preloaded",
