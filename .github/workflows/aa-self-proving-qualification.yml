@@ -179,6 +179,8 @@ jobs:
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          QUAL_SHA: ${{ steps.sha.outputs.sha }}
+          QUAL_RUN: ${{ github.run_id }}
         run: |
           set -euo pipefail
           # Real bot token, OpenCode health, Telegram getMe, webhook cleanup/
@@ -225,9 +227,6 @@ jobs:
           write_marker(Path("self-proving-out/runtime-status.json"), marker)
           print("runtime marker READY published")
           PY
-        env:
-          QUAL_SHA: ${{ steps.sha.outputs.sha }}
-          QUAL_RUN: ${{ github.run_id }}
 
       - name: Gate E - live performance/SLO
         shell: bash
