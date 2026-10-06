@@ -46,8 +46,21 @@ def build_verifier_user_text(
     units: Sequence[ResponseUnitDraft],
     passages: Sequence[dict[str, Any]],
 ) -> str:
-    """Render verifier input: ordered units plus exact book evidence."""
-    lines: list[str] = ["<response_units>"]
+    """Render verifier input: ordered units plus exact book evidence.
+
+    The payload repeats the closed output contract uniformly for every
+    turn (Gate C live repair, run 37538518277: the scope vocabulary lived
+    only in the system prompt, and the weak fallback model emitted
+    schema-invalid scopes/ids so the verifier never served). Repeating
+    the exact ``unit_id`` copy rule and the closed scope vocabulary here
+    is turn-independent hardening, never an exact-question special case:
+    AA-side Pydantic + completeness + checksum + quote checks stay strict.
+    """
+    lines: list[str] = [
+        "Return one verdict per <unit> in order, copying each id attribute exactly;",
+        'scope must be exactly one of "book", "product_meta", "conversation_glue".',
+        "<response_units>",
+    ]
     for unit in units:
         lines.append(f"<unit id={_xml_quoteattr(unit.unit_id)}>{_escape(unit.text)}</unit>")
     lines.append("</response_units>")

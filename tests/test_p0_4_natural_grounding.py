@@ -1329,6 +1329,78 @@ def test_verifier_native_schema_is_ref_free() -> None:
     assert result.all_required_supported is True
 
 
+def test_verifier_transport_schema_is_minimal_but_strict() -> None:
+    """Gate C repair (run 37538518277): bound weak-provider flake + latency.
+
+    The transport hint omits length constraints (``minLength``/``minItems``)
+    that weak fallback providers reject, while AA-side Pydantic validation
+    still rejects empty ids and enforces exactly-one-verdict-per-unit.
+    The native retry budget stays bounded (single server retry).
+    """
+    import json
+
+    from aa.conversation.verifier_schema import VERIFIER_MAX_ATTEMPTS
+
+    schema = verifier_json_schema()
+    dumped = json.dumps(schema)
+    assert "$ref" not in dumped
+    assert "minLength" not in dumped
+    assert "minItems" not in dumped
+    # Essential guidance stays: closed scope enum + required ids.
+    assert "book" in dumped and "product_meta" in dumped and "conversation_glue" in dumped
+    assert VERIFIER_MAX_ATTEMPTS == 1
+    # AA-side stays strict: empty unit ids are rejected.
+    with pytest.raises(VerifierValidationError):
+        validate_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": ["chapter-3#exp0000"],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            expected_unit_ids=["u1"],
+        )
+    # AA-side stays strict: unknown scopes are rejected.
+    with pytest.raises(VerifierValidationError):
+        validate_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "u1",
+                        "scope": "Book",
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            expected_unit_ids=["u1"],
+        )
+
+
+def test_verifier_user_text_repeats_closed_contract() -> None:
+    """Gate C repair: weak fallback models need the contract in the payload.
+
+    The scope vocabulary lived only in the system prompt, so the weak
+    fallback emitted schema-invalid scopes and the verifier never served.
+    The user payload repeats the id-copy rule and closed scope vocabulary
+    uniformly for every turn (never an exact-question special case).
+    """
+    user_text = build_verifier_user_text(
+        units=split_response_units("Понимаю. Тяга проходит."),
+        passages=[_pack_entry()],
+    )
+    assert "<response_units>" in user_text
+    assert "<book_evidence>" in user_text
+    assert "product_meta" in user_text
+    assert "conversation_glue" in user_text
+
+
 async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
     """Gate C repair: verifier outage must not flatten planner/retrieval.
 
