@@ -128,7 +128,7 @@ jobs:
           sha="$(git rev-parse HEAD)"
           python scripts/run_self_proving_qualification.py \
             --main-sha "$sha" --out-dir canary-self-proving-out \
-            --run-id "${{ github.run_id }}-canary" || true
+            --run-id "${{ github.run_id }}-canary"
           python - <<'PY'
           import json, sys
           from pathlib import Path
@@ -139,14 +139,25 @@ jobs:
           payload = json.loads(summary.read_text(encoding="utf-8"))
           gates = {g["gate"]: g["status"] for g in payload.get("gates", [])}
           print(f"canary gates: {gates}")
-          # Canary smoke requires at least deterministic Gates A/B PASS;
-          # live Gates C-E BLOCKED without secrets still fails the canary
-          # fail-closed so automatic P0 repair marks current main
-          # UNQUALIFIED. The canary never blocks owner /run; manual testing
-          # stays available labeled UNQUALIFIED.
-          if gates.get("A") != "PASS" or gates.get("B") != "PASS":
-              print("canary Gate C smoke FAILED on deterministic gates", file=sys.stderr)
-              sys.exit(1)
+          # Fail-closed Gate C smoke + diversity requirement: the canary
+          # passes only when the live Gate C production path (scenario
+          # families + diversity) holds PASS for current main. A live Gate
+          # C BLOCKED/FAIL fails the canary even when deterministic Gates
+          # A/B PASS. Missing secrets stay BLOCKED (no mocked PASS) so
+          # automatic P0 repair marks current main UNQUALIFIED. The canary
+          # never blocks owner /run; manual testing stays available labeled
+          # UNQUALIFIED.
+          if payload.get("status") != "PASS":
+              print(
+                  f"canary Gate C smoke FAILED: verdict={payload.get('status')} "
+                  f"blocking={payload.get('blocking_gate')}",
+                  file=sys.stderr,
+              )
+              sys.exit(1 if payload.get("status") == "FAIL" else 2)
+          for required in ("A", "B", "C"):
+              if gates.get(required) != "PASS":
+                  print(f"canary Gate C smoke FAILED: Gate {required}={gates.get(required)}", file=sys.stderr)
+                  sys.exit(1 if gates.get(required) == "FAIL" else 2)
           PY
 
       - name: Gate D readiness - Telegram getMe and runtime marker

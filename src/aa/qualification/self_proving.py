@@ -401,16 +401,10 @@ def decide_final_verdict(
         if resolved == "PASS":
             ordered.append(evidence)
             continue
-        if resolved == "FAIL" and overall != "BLOCKED":
-            overall = "FAIL"
-        else:
-            overall = "BLOCKED" if overall == "PASS" else overall
-            if resolved in ("STALE", "BLOCKED") and overall == "PASS":
-                overall = "BLOCKED"
-            elif overall not in ("FAIL", "BLOCKED"):
-                overall = "BLOCKED"
-        if resolved in ("FAIL", "BLOCKED", "STALE") and overall == "PASS":
+        if resolved in ("STALE", "BLOCKED"):
             overall = "BLOCKED"
+        elif resolved == "FAIL" and overall != "BLOCKED":
+            overall = "FAIL"
         blocking = blocking or gate
         ordered.append(evidence)
     if overall == "PASS":

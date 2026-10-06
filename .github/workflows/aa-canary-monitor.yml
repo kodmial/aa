@@ -62,7 +62,7 @@ jobs:
               '- If it is a deterministic repository defect, fix it without weakening tests or canary coverage.',
               '- If it is transient infrastructure, do not make speculative product changes; rerun/prove the canary green.',
               '- Preserve the 4-hour schedule, Gate C smoke, Gate D readiness, and Gate E latency guard.',
-              '- New `/run` manual testing stays blocked until the canary is repaired and requalified green.',
+              '- Owner `/run` manual testing stays available regardless of canary/qualification state; canary failure only labels current main UNQUALIFIED.',
               '- Do not add release/publish behavior to this canary.',
               '- Close this issue only after a current-main canary run is green.',
               '',
