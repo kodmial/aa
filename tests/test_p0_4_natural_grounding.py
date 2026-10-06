@@ -1330,12 +1330,15 @@ def test_verifier_native_schema_is_ref_free() -> None:
 
 
 def test_verifier_transport_schema_is_minimal_but_strict() -> None:
-    """Gate C repair (run 37538518277): bound weak-provider flake + latency.
+    """Gate C repair (run 37538518277): strict transport hint + strict AA gate.
 
-    The transport hint omits length constraints (``minLength``/``minItems``)
-    that weak fallback providers reject, while AA-side Pydantic validation
-    still rejects empty ids and enforces exactly-one-verdict-per-unit.
-    The native retry budget stays bounded (single server retry).
+    The native OpenCode transport schema stays flat (``$ref``-free) with
+    the closed scope enum, required ids, and length guidance
+    (``minLength``/``minItems``), consistent with the planner native
+    schema which proves weak fallback providers handle length
+    constraints. AA-side Pydantic validation still rejects empty ids
+    and enforces exactly-one-verdict-per-unit. The native retry budget
+    stays bounded and consistent with the planner (two attempts).
     """
     import json
 
@@ -1344,11 +1347,11 @@ def test_verifier_transport_schema_is_minimal_but_strict() -> None:
     schema = verifier_json_schema()
     dumped = json.dumps(schema)
     assert "$ref" not in dumped
-    assert "minLength" not in dumped
-    assert "minItems" not in dumped
+    assert "minLength" in dumped
+    assert "minItems" in dumped
     # Essential guidance stays: closed scope enum + required ids.
     assert "book" in dumped and "product_meta" in dumped and "conversation_glue" in dumped
-    assert VERIFIER_MAX_ATTEMPTS == 1
+    assert VERIFIER_MAX_ATTEMPTS == 2
     # AA-side stays strict: empty unit ids are rejected.
     with pytest.raises(VerifierValidationError):
         validate_grounding_result(
