@@ -734,6 +734,11 @@ def test_adapter_carries_no_semantic_policy() -> None:
         "_agenerate",
         "_llm_type",
         "_runner",
+        "_circuit_key",
+        "_global_circuit_open",
+        "_global_circuit_record",
+        "_global_circuit_clear",
+        "clear_primary_circuit",
     }
 
 
