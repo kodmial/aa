@@ -105,6 +105,40 @@ jobs:
             sleep $((attempt * 10))
           done
 
+      - name: Restore gate checkpoints from previous attempt
+        # RUNNER_TEMP is ephemeral per runner, so a 429 runner retire would
+        # otherwise lose completed-gate checkpoints. Persist them as a
+        # run-scoped artifact and restore them here so the next runner
+        # resumes from the last completed gate instead of rerunning Gate A.
+        if: ${{ github.run_attempt > 1 }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-self-proving-checkpoints
+          path: /tmp/aa-self-proving-checkpoints-restore
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage restored gate checkpoints
+        if: ${{ github.run_attempt > 1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          RESTORE_DIR="/tmp/aa-self-proving-checkpoints-restore"
+          mkdir -p "$CKPT_DIR"
+          if compgen -G "$RESTORE_DIR/gate-*.done" > /dev/null; then
+            cp "$RESTORE_DIR"/gate-*.done "$CKPT_DIR"/
+            echo "restored gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          elif compgen -G "$RESTORE_DIR/**/gate-*.done" > /dev/null; then
+            find "$RESTORE_DIR" -name 'gate-*.done' -exec cp {} "$CKPT_DIR"/ \;
+            echo "restored nested gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          else
+            echo "no previous gate checkpoints found"
+          fi
+
       - name: Gate A - static/build
         id: gate-a
         shell: bash
@@ -434,6 +468,35 @@ jobs:
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}"
+
+      - name: Stage gate checkpoints for resume
+        # Mirror ephemeral RUNNER_TEMP checkpoints into the workspace so the
+        # artifact upload below captures completed gates even when this run
+        # fails (including provider 429 runner retire).
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          STAGE_DIR="aa-self-proving-checkpoints"
+          mkdir -p "$STAGE_DIR"
+          if compgen -G "$CKPT_DIR/gate-*.done" > /dev/null; then
+            cp "$CKPT_DIR"/gate-*.done "$STAGE_DIR"/
+            echo "staged gate checkpoints for resume:"
+            ls -la "$STAGE_DIR"
+          else
+            echo "no gate checkpoints to stage"
+          fi
+
+      - name: Upload gate checkpoints (429 resume)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-checkpoints
+          path: aa-self-proving-checkpoints/gate-*.done
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
 
       - name: Publish machine-readable failure and repair marker
         if: failure()

@@ -464,14 +464,20 @@ jobs:
             // with PASS it is READY (QUALIFIED). Repair/requalification is
             // automatic and proceeds independently.
             const guard = await guardQualification();
-            if (!guard.allowed) {
-              await comment(
-                `UNQUALIFIED: current main has no fresh trusted PASS (blocking gate ${guard.blocking || 'unknown'}; ` +
-                `${guard.reason || 'no fresh trusted PASS evidence'}). ` +
-                'Owner `/run` stays available and starts labeled UNQUALIFIED; the runtime will publish READY (UNQUALIFIED) once live. ' +
-                'Repair/requalification is automatic. ' +
-                'Use `/bot status` for the authoritative runtime marker (aa-runtime-status STARTING -> READY -> STOPPED|FAILED).'
-              );
+            try {
+              if (!guard.allowed) {
+                await comment(
+                  `UNQUALIFIED: current main has no fresh trusted PASS (blocking gate ${guard.blocking || 'unknown'}; ` +
+                  `${guard.reason || 'no fresh trusted PASS evidence'}). ` +
+                  'Owner `/run` stays available and starts labeled UNQUALIFIED; the runtime will publish READY (UNQUALIFIED) once live. ' +
+                  'Repair/requalification is automatic. ' +
+                  'Use `/bot status` for the authoritative runtime marker (aa-runtime-status STARTING -> READY -> STOPPED|FAILED).'
+                );
+              }
+            } catch (error) {
+              // Advisory labeling is fail-open: a transient comment-API
+              // failure/rate-limit must never skip dispatch or block /run.
+              core.warning('Advisory UNQUALIFIED label failed; continuing fail-open to dispatch: ' + ((error && error.message) || error));
             }
             let dispatchAccepted = false;
             try {

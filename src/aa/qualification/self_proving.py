@@ -409,7 +409,24 @@ def decide_final_verdict(
         elif resolved == "FAIL" and overall != "BLOCKED":
             overall = "FAIL"
         blocking = blocking or gate
-        ordered.append(evidence)
+        ordered.append(
+            GateEvidence(
+                gate=evidence.gate,
+                status=resolved,
+                sha=evidence.sha,
+                product_fingerprint=evidence.product_fingerprint,
+                runtime_fingerprint=evidence.runtime_fingerprint,
+                failure_category=evidence.failure_category or resolved.lower(),
+                component=evidence.component,
+                run_id=evidence.run_id or run_id,
+                live_trusted=evidence.live_trusted,
+                mocked_only=evidence.mocked_only,
+                latency_p50_ms=evidence.latency_p50_ms,
+                latency_p95_ms=evidence.latency_p95_ms,
+                max_turn_ms=evidence.max_turn_ms,
+                detail=evidence.detail,
+            )
+        )
     if overall == "PASS":
         # Any mismatch above already flipped overall; re-assert unanimity.
         if any(effective_gate_status(item, current_sha=current) != "PASS" for item in ordered):
