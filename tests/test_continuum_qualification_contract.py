@@ -80,12 +80,13 @@ def test_scheduler_preserves_aa_knobs_and_main_ref() -> None:
     body = _read(SCHEDULER_CALLER)
     assert "kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main" in body
     assert "continuum_ref: main" in body
-    # Bare-passthrough contract synced with Continuum main: every knob is
-    # forwarded as `"${{ inputs.<knob> }}"` with no `|| '<literal>'` default.
-    # An empty passthrough lets the engine fall back to vars.AUTOMATION_*;
-    # pinning a literal here would override that repository variable.
+    # AA intentionally runs three concurrent implementation slots: wip_limit
+    # defaults to '3' so scheduled and event-driven reconciliation does not
+    # depend on repository variable drift. All other knobs stay as bare
+    # passthroughs so an empty value lets the engine fall back to
+    # vars.AUTOMATION_*.
+    assert "\"${{ inputs.wip_limit || '3' }}\"" in body
     for knob in (
-        "wip_limit",
         "max_dispatch_attempts",
         "require_priority_label",
         "opencode_dispatch",

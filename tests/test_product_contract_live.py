@@ -36,9 +36,9 @@ def test_validate_exact_sha_rejects_malformed() -> None:
 
 
 def test_decide_status_is_fail_closed() -> None:
-    assert decide_status(["PASS", "PASS", "PASS", "PASS"]) == "PASS"
-    assert decide_status(["PASS", "INCOMPLETE", "PASS", "PASS"]) == "INCOMPLETE"
-    assert decide_status(["PASS", "FAIL", "INCOMPLETE", "PASS"]) == "FAIL"
+    assert decide_status(["PASS", "PASS", "PASS", "PASS", "PASS"]) == "PASS"
+    assert decide_status(["PASS", "INCOMPLETE", "PASS", "PASS", "PASS"]) == "INCOMPLETE"
+    assert decide_status(["PASS", "FAIL", "INCOMPLETE", "PASS", "PASS"]) == "FAIL"
 
 
 def test_result_marker_format() -> None:
@@ -148,7 +148,7 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
     )
     # Offline working tree may be dirty (new untracked files) before the
     # repair merges; the runner stays fail-closed INCOMPLETE then. The key
-    # assertion: either all four lanes executed with structured evidence,
+    # assertion: either all five lanes executed with structured evidence,
     # or the runner refused the dirty tree without faking a result.
     assert proc.returncode in (EXIT_BY_STATUS["PASS"], EXIT_BY_STATUS["INCOMPLETE"])
     payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
@@ -156,12 +156,13 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
     if "lanes" not in payload:
         assert "clean" in str(payload.get("reason", "")).casefold()
         return
-    assert len(payload["lanes"]) == 4
+    assert len(payload["lanes"]) == 5
     assert {lane["lane"] for lane in payload["lanes"]} == {
         "product-contract-1-24",
         "telegram-transport-25-32",
         "runtime-control-33-41",
         "voice-1-16",
+        "live-telegram-evidence",
     }
     summary = json.loads(
         (tmp_path / "product-contract-live-summary.json").read_text(encoding="utf-8")
