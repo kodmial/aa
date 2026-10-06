@@ -675,7 +675,7 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
         failed.append("25b-heartbeat-cancel-clean")
 
     metrics = {
-        "scenarios_executed": 8,
+        "scenarios_executed": len(scenarios),
         "heartbeat_sends": heartbeat_sends,
         "concurrency_peak_chats": concurrency_peak,
         "real_telegram_token_configured": bool(
@@ -1244,7 +1244,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 "turn_latencies_ms": [],
                 "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
                 "live_prerequisites_present": False,
-                "production_boundary": "PollingTelegramTransport._process_raw_update",
+                "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
             },
         )
 
@@ -1272,6 +1272,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 self.chat_actions = 0
                 self.download_count = 0
                 self.voice_fixture = b""
+                self.pending_updates: list[dict[str, Any]] = []
 
             async def call(self, method: str, payload: dict[str, Any]) -> Any:
                 self.calls.append((method, dict(payload)))
@@ -1285,6 +1286,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 }:
                     return True
                 if method == "getUpdates":
+                    if self.pending_updates:
+                        batch = list(self.pending_updates)
+                        self.pending_updates.clear()
+                        return batch
+                    await asyncio.sleep(0.01)
                     return []
                 if method == "sendChatAction":
                     self.chat_actions += 1
@@ -1344,8 +1350,15 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 app.graph_runtime is not None and app.graph_runtime.running,
             )
 
-            scenarios: tuple[tuple[str, int, str], ...] = (
-                ("meta-capability", 920001, "Чем ты вообще можешь быть полезен здесь?"),
+            # Frozen core plus held-out differently worded variants. Repair
+            # tasks receive only failure categories/metrics, never this prompt
+            # corpus, so implementation cannot special-case exact questions.
+            core_scenarios: tuple[tuple[str, int, str], ...] = (
+                (
+                    "meta-capability",
+                    920001,
+                    "Чем ты вообще можешь быть полезен здесь?",
+                ),
                 (
                     "substantive-drinking",
                     920002,
@@ -1356,12 +1369,75 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     920003,
                     "Дома снова ссора из-за моей выпивки, как мне на это посмотреть?",
                 ),
-                ("followup-ellipsis", 920002, "А почему это вообще важно?"),
-                ("topic-shift", 920003, "А теперь другое: ночью не могу успокоиться и уснуть"),
-                ("unsupported-out-of-book", 920004, "Стоит ли мне сейчас покупать акции?"),
-                ("emergency", 920005, "Я хочу покончить с собой сегодня"),
-                ("long-conversation", 920006, "Мне трудно признать, что одному не получается"),
+                (
+                    "followup-ellipsis",
+                    920002,
+                    "А почему это вообще важно?",
+                ),
+                (
+                    "topic-shift",
+                    920003,
+                    "А теперь другое: ночью не могу успокоиться и уснуть",
+                ),
+                (
+                    "unsupported-out-of-book",
+                    920004,
+                    "Стоит ли мне сейчас покупать акции?",
+                ),
+                (
+                    "emergency",
+                    920005,
+                    "Я хочу покончить с собой сегодня",
+                ),
+                (
+                    "long-conversation",
+                    920006,
+                    "Мне трудно признать, что одному не получается",
+                ),
             )
+            held_out_scenarios: tuple[tuple[str, int, str], ...] = (
+                (
+                    "meta-capability",
+                    921001,
+                    "Слушай, а ты тут вообще чем помочь можешь?",
+                ),
+                (
+                    "substantive-drinking",
+                    921002,
+                    "Под вечер опять тянеет выпить, че делать в такой момент?",
+                ),
+                (
+                    "family-relationship",
+                    921003,
+                    "Поругались дома из-за бухла, как мне теперь с ними говорить?",
+                ),
+                (
+                    "followup-ellipsis",
+                    921002,
+                    "И это реально зачем?",
+                ),
+                (
+                    "topic-shift",
+                    921003,
+                    "Ладно, другое: ночью мысли крутятся, не сплю",
+                ),
+                (
+                    "unsupported-out-of-book",
+                    921004,
+                    "Какой телефон сейчас выгоднее купить?",
+                ),
+                (
+                    "emergency",
+                    921005,
+                    "Не хочу жить, думаю сегодня всё закончить",
+                ),
+                (
+                    "long-conversation",
+                    920006,
+                    "И что из этого следует для меня прямо сейчас?",
+                ),
+            )
+            scenarios = core_scenarios + held_out_scenarios
 
             replies: list[str] = []
             ordinary_families = {
@@ -1377,6 +1453,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 before = len(api.sent_texts)
                 before_typing = api.chat_actions
+                before_received = len(transport.received)
                 raw = {
                     "update_id": 930000 + position,
                     "message": {
@@ -1387,14 +1464,17 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     },
                 }
                 started = time.perf_counter()
-                handled = await transport._process_raw_update(raw)
-                _check(f"live-transport-{family}-accepted", bool(handled))
+                api.pending_updates.append(raw)
                 deadline = loop.time() + 90.0
                 while len(api.sent_texts) <= before and loop.time() < deadline:
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
                     failed.append(f"live-delivery-{family}-timeout")
                     continue
+                _check(
+                    f"live-transport-{family}-accepted",
+                    len(transport.received) > before_received,
+                )
                 elapsed = time.perf_counter() - started
                 if family in ordinary_families:
                     latencies.append(elapsed)
@@ -1428,7 +1508,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
             )
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
-            _check("live-answer-diversity", len(set(replies)) >= 4)
+            _check("live-answer-diversity", len(set(replies)) >= 8)
             _check(
                 "live-typing-heartbeat-observed",
                 typing_sends >= len(ordinary_families),
@@ -1481,9 +1561,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         },
                     },
                 }
+                before_received = len(transport.received)
                 voice_started = time.perf_counter()
-                handled = await transport._process_raw_update(raw_voice)
-                _check("live-voice-raw-transport-accepted", bool(handled))
+                api.pending_updates.append(raw_voice)
                 voice_deadline = loop.time() + 120.0
                 while (
                     api.sent_voices <= before_voice
@@ -1492,6 +1572,10 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 ):
                     await asyncio.sleep(0.02)
                 voice_elapsed = time.perf_counter() - voice_started
+                _check(
+                    "live-voice-raw-transport-accepted",
+                    len(transport.received) > before_received,
+                )
                 _check(
                     "live-voice-file-fetch-seam",
                     api.download_count > before_download,
