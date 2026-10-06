@@ -92,6 +92,15 @@ _NEW_REPLY = "Новая беседа начата."
 _TEMPORARY_ERROR_REPLY = "Не удалось обработать сообщение. Попробуйте ещё раз."
 _BUSY_REPLY = "Сейчас много сообщений. Попробуйте ещё раз через минуту."
 
+# Explicit runtime lifecycle states (issue #145). READY is published only
+# after OpenCode health + Telegram bootstrap + long polling are all live;
+# /bot status distinguishes STARTING (bootstrap in progress) from READY.
+RUNTIME_STARTING = "STARTING"
+RUNTIME_READY = "READY"
+RUNTIME_STOPPING = "STOPPING"
+RUNTIME_STOPPED = "STOPPED"
+RUNTIME_FAILED = "FAILED"
+
 
 class Application:
     """Composes module boundaries and owns startup/shutdown order."""
@@ -162,6 +171,9 @@ class Application:
                 pass
         self._running = False
         self._fatal_error: BaseException | None = None
+        # Explicit lifecycle state: STARTING during bootstrap, READY only
+        # after OpenCode health + Telegram bootstrap + long polling live.
+        self._runtime_state = RUNTIME_STOPPED
         # Transport/orchestration only: the dispatcher calls the LangGraph
         # production boundary via ``respond`` and never creates another
         # LLM/provider client or knowledge pipeline.
@@ -176,6 +188,11 @@ class Application:
     def running(self) -> bool:
         """Whether the application is running."""
         return self._running
+
+    @property
+    def runtime_state(self) -> str:
+        """Explicit lifecycle state: STARTING/READY/STOPPING/STOPPED/FAILED."""
+        return self._runtime_state
 
     @property
     def graph_runtime(self) -> GraphTurnRuntime | None:
@@ -303,49 +320,66 @@ class Application:
 
         The bounded runtime clock is armed only after OpenCode and Telegram
         are ready, so bootstrap time never consumes the requested live window.
+        READY is published only after OpenCode health, Telegram bootstrap
+        (getMe/deleteWebhook/commands) and long polling are all live.
         """
         if self._running:
             return
+        self._runtime_state = RUNTIME_STARTING
         self.settings.validate(require_bot_token=False)
         logger.info("starting worker", extra={"config": self.settings.to_safe_dict()})
-        await self.corpus.load()
         try:
-            await self.opencode_runtime.start()
-            # Readiness gate: no Telegram traffic is accepted until the
-            # local OpenCode runtime has proven healthy.
-            await self.opencode_runtime.ensure_ready()
-            await self.sessions.start()
-            await self.safety.start()
-            await self.dispatcher.start()
-            # Voice capability loads once here and is reused for all turns.
-            # Initialization failure disables voice only, never the poller.
-            await self._init_presentation_capability()
-            await self._init_voice_capability()
-            self._attach_presentation_classifier()
-            # TTS capability loads once here and is reused for voice replies.
-            # Initialization failure falls back to text, never the poller.
-            await self._init_tts_capability()
-            await self._ensure_graph_runtime()
-            await self.transport.start()
-            # Start the requested fixed 5h window only after the poller
-            # is live and all dependencies have completed bootstrap.
-            await self.controller.start()
+            await self.corpus.load()
+            try:
+                await self.opencode_runtime.start()
+                # Readiness gate: no Telegram traffic is accepted until the
+                # local OpenCode runtime has proven healthy.
+                await self.opencode_runtime.ensure_ready()
+                await self.sessions.start()
+                await self.safety.start()
+                await self.dispatcher.start()
+                # Voice capability loads once here and is reused for all turns.
+                # Initialization failure disables voice only, never the poller.
+                await self._init_presentation_capability()
+                await self._init_voice_capability()
+                self._attach_presentation_classifier()
+                # TTS capability loads once here and is reused for voice replies.
+                # Initialization failure falls back to text, never the poller.
+                await self._init_tts_capability()
+                await self._ensure_graph_runtime()
+                await self.transport.start()
+                # Long polling is live only after transport.start() resolves
+                # its bootstrap (getMe -> deleteWebhook -> commands) and the
+                # poll loop task is running.
+                polling_live = bool(self.transport.running)
+                if isinstance(self.transport, PollingTelegramTransport) and not polling_live:
+                    raise RuntimeError("telegram polling is not live after bootstrap")
+                # Start the requested fixed 5h window only after the poller
+                # is live and all dependencies have completed bootstrap.
+                await self.controller.start()
+            except Exception:
+                self._runtime_state = RUNTIME_FAILED
+                await self.transport.stop()
+                await self.dispatcher.stop()
+                await self.safety.stop()
+                await self.sessions.stop()
+                await self.opencode_runtime.stop()
+                await self.corpus.unload()
+                await self.controller.stop()
+                raise
         except Exception:
-            await self.transport.stop()
-            await self.dispatcher.stop()
-            await self.safety.stop()
-            await self.sessions.stop()
-            await self.opencode_runtime.stop()
-            await self.corpus.unload()
-            await self.controller.stop()
+            if self._runtime_state != RUNTIME_FAILED:
+                self._runtime_state = RUNTIME_FAILED
             raise
         self._running = True
-        logger.info("worker started")
+        self._runtime_state = RUNTIME_READY
+        logger.info("worker started", extra={"runtime_state": RUNTIME_READY})
 
     async def stop(self) -> None:
         """Stop all components in reverse order (idempotent)."""
         if not self._running:
             # Still ensure subcomponents are stopped for partial startups.
+            self._runtime_state = RUNTIME_STOPPING
             await self.transport.stop()
             await self.dispatcher.stop()
             await self.safety.stop()
@@ -358,9 +392,12 @@ class Application:
                     await self._graph_runtime.stop()
                 except Exception:
                     pass
+            if self._runtime_state != RUNTIME_FAILED:
+                self._runtime_state = RUNTIME_STOPPED
             return
         logger.info("stopping worker")
         self._running = False
+        self._runtime_state = RUNTIME_STOPPING
         # Stop accepting new Telegram updates first, then drain dispatched
         # turns (bounded) before releasing OpenCode/corpus resources. This
         # keeps clean shutdown/handoff safe; the remaining crash window
@@ -378,7 +415,9 @@ class Application:
                 await self._graph_runtime.stop()
             except Exception:
                 pass
-        logger.info("worker stopped")
+        if self._runtime_state != RUNTIME_FAILED:
+            self._runtime_state = RUNTIME_STOPPED
+        logger.info("worker stopped", extra={"runtime_state": self._runtime_state})
 
     async def run(self) -> None:
         """Run until the controller requests shutdown."""
@@ -685,8 +724,20 @@ class Application:
 
     async def _send_text_reply(self, incoming: TelegramIncoming, reply: str) -> None:
         """Deliver one bounded text reply with envelope fallback handling."""
+        import time as _time
+
+        started = _time.perf_counter()
         try:
             await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
+            logger.info(
+                "telegram delivery done",
+                extra={
+                    "delivery_outcome": "sent",
+                    "delivery_latency_ms": round(elapsed_ms, 1),
+                    "reply_len": len(reply),
+                },
+            )
         except TelegramEnvelopeError:
             logger.warning("telegram outbound reply blocked by envelope guard")
             try:
@@ -768,6 +819,9 @@ class Application:
         Replies are returned as a single message; overflow is never split.
         """
         logger.info("turn started", extra={"voice_input": voice_input, "text_len": len(text)})
+        import time as _time
+
+        turn_started = _time.perf_counter()
         result, _emergency_reply = self.safety.route(text)
         if result.decision is SafetyDecision.EMERGENCY and result.classification is not None:
             # Production Telegram runtime is RU-only: the emergency reply
@@ -783,6 +837,7 @@ class Application:
         if not self._graph_runtime or not self._graph_runtime.running:
             await self._ensure_graph_runtime()
         assert self._graph_runtime is not None
+        fallback_used = False
         try:
             reply = await self._graph_runtime.run_turn(chat_id, text)
         except OpenCodeRateLimitError:
@@ -790,20 +845,48 @@ class Application:
         except GraphRuntimeError as exc:
             logger.warning("graph turn used natural fallback", extra={"category": exc.category})
             reply = NATURAL_RETRY_REPLY
+            fallback_used = True
         except OpenCodeError:
             logger.warning("graph turn used natural fallback")
             reply = NATURAL_RETRY_REPLY
+            fallback_used = True
         except ValueError:
             raise
         except Exception:
             logger.warning("graph turn used natural fallback")
             reply = NATURAL_RETRY_REPLY
+            fallback_used = True
         if voice_input and reply.strip():
             reply = self._apply_voice_brevity(reply)
         if not reply.strip():
             reply = NATURAL_CLARIFICATION_REPLY
-        logger.info("normal response served")
-        return self._fit_envelope(reply)
+            fallback_used = True
+        is_clarification = reply.strip() == NATURAL_CLARIFICATION_REPLY
+        fitted = self._fit_envelope(reply)
+        total_ms = (_time.perf_counter() - turn_started) * 1000.0
+        # Privacy-safe turn telemetry: stage outcomes come from the graph
+        # runtime snapshot (counts/latencies/outcomes only); this log
+        # carries no user text, reply text or identifiers.
+        try:
+            thread = self._graph_runtime.thread_id(chat_id)
+            stage = self._graph_runtime.last_telemetry_for_thread(thread)
+        except Exception:
+            stage = {}
+        logger.info(
+            "normal response served",
+            extra={
+                "latency_ms": round(total_ms, 1),
+                "reply_len": len(fitted),
+                "fallback_used": fallback_used or is_clarification,
+                "is_clarification": is_clarification,
+                "planner_outcome": str(stage.get("planner_outcome", "unknown")),
+                "retrieval_outcome": str(stage.get("retrieval_outcome", "unknown")),
+                "answer_outcome": str(stage.get("answer_outcome", "unknown")),
+                "verifier_outcome": str(stage.get("verifier_outcome", "unknown")),
+                "repair_rounds": int(stage.get("repair_rounds", 0) or 0),
+            },
+        )
+        return fitted
 
     def _apply_voice_brevity(self, reply: str) -> str:
         """Apply the existing #77 voice-mode brevity to grounded text."""

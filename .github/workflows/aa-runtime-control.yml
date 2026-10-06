@@ -245,6 +245,15 @@ jobs:
               const runsAfter = runs.filter(r => Date.parse(r.created_at) > accepted).length;
               const markers = generation ? markersForGeneration(comments, generation).length : 0;
               const pending = markers > runsAfter;
+              // Explicit runtime phase (issue #145): STARTING while a
+              // dispatch is committed but no live poller has appeared
+              // (OpenCode health + Telegram bootstrap + long polling not
+              // yet confirmed), READY once a live poller is active,
+              // STOPPED otherwise. The phase carries ids/counters only.
+              const livePoller = active.filter(r => r.status === 'in_progress');
+              const runtimePhase = pending && !active.length
+                ? 'STARTING'
+                : livePoller.length ? 'READY' : (active.length ? 'STARTING' : 'STOPPED');
               const expiresInH = Math.max(0, (accepted + DAY_MS - nowMs) / 3600000).toFixed(1);
               const runLines = active.length
                 ? active.map(r => `- #${r.id}: **${r.status}** — ${r.html_url}`).join('\n')
@@ -255,6 +264,7 @@ jobs:
               return [
                 `Active campaign: started ${new Date(accepted).toISOString()}, expires in ~${expiresInH}h.`,
                 `Starts used: ${startsUsed}/${MAX_STARTS} (fixed 5h each, 20h aggregate max).${pendingLine}`,
+                `Runtime phase: **${runtimePhase}** (STARTING = bootstrap in progress, READY = poller live after OpenCode health + Telegram bootstrap + long polling).`,
                 `Active runtime:\n${runLines}`,
               ].join('\n');
             };

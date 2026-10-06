@@ -102,6 +102,22 @@ def make_memory_node(
     async def ensure_memory(state: TurnState) -> dict[str, Any]:
         messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
         ensure_message_ids(messages)
+        # Fast path for ordinary turns: token-driven compaction needs no
+        # model call when history is far below the trigger. Skipping the
+        # summarizer here removes one sequential model round-trip per
+        # ordinary turn (part of the 30-60s live pathology) without
+        # changing semantics: under-trigger history compacts to itself.
+        from aa.conversation.memory import needs_compaction
+
+        try:
+            if not needs_compaction(messages, trigger_tokens=memory_config.trigger_tokens):
+                logger.info(
+                    "v2 memory ensured",
+                    extra={"compacted": False, "fast_path": True},
+                )
+                return {}
+        except Exception:
+            pass
         previous = str(state.get("conversation_summary", ""))
         context = dict(state.get("context", {}) or {})
         running = running_summary_from_state(summary_text=previous, context=context)
@@ -138,14 +154,40 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
     """Build the mandatory hidden planner node bound to one model."""
 
     async def run_hidden_planner(state: TurnState) -> dict[str, Any]:
+        import time as _time
+
+        started = _time.perf_counter()
         try:
-            return await planner_node(state, model=planner_model)
+            result = await planner_node(state, model=planner_model)
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
+            queries = result.get("search_queries", [])
+            count = len(queries) if isinstance(queries, list) else 0
+            logger.info(
+                "v2 planner done",
+                extra={
+                    "queries": count,
+                    "latency_ms": round(elapsed_ms, 1),
+                },
+            )
+            update = dict(result)
+            retry = dict(update.get("retry_state", {}) or {})
+            retry["planner_latency_ms"] = round(elapsed_ms, 1)
+            retry["planner_query_count"] = count
+            retry["planner_outcome"] = "ok" if count or count == 0 else "ok"
+            update["retry_state"] = retry
+            return update
         except QueryPlanValidationError as exc:
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.warning("v2 planner failed closed", extra={"category": "planner-invalid"})
             return {
                 "search_queries": [],
                 "planner_invoked": True,
-                "retry_state": {"planner_error": str(exc)[:120]},
+                "retry_state": {
+                    "planner_error": str(exc)[:120],
+                    "planner_latency_ms": round(elapsed_ms, 1),
+                    "planner_query_count": 0,
+                    "planner_outcome": "invalid",
+                },
             }
 
     return run_hidden_planner

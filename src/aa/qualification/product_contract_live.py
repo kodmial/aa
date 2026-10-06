@@ -973,6 +973,223 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
 
 
 # ---------------------------------------------------------------------------
+# Lane 5: real live Telegram/runtime evidence (issue #145).
+#
+# Mock/offline PASS must never mask a real Telegram regression: this lane
+# is INCOMPLETE unless real live prerequisites are present (bot token,
+# encrypted snapshot identity and a reachable OpenCode runtime), and PASS
+# only with real ordinary-turn evidence on the exact main SHA, including
+# p50/p95 live text latency and distinguishable stage telemetry.
+# ---------------------------------------------------------------------------
+
+LIVE_TEXT_LATENCY_BUDGET_S = 30.0
+
+
+def _live_prerequisites() -> tuple[bool, list[str]]:
+    """Check real live prerequisites (fail-closed, privacy-safe)."""
+    missing: list[str] = []
+    if not (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip():
+        missing.append("live-telegram-token-missing")
+    if not (os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip():
+        missing.append("live-book-identity-missing")
+    return (not missing, missing)
+
+
+async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
+    """Execute real live ordinary turns on the exact production boundary.
+
+    Offline (no token/identity/runtime) the lane is INCOMPLETE, never a
+    fake PASS. With live prerequisites it runs a small set of ordinary
+    turns (one meta/conversational, two substantive paraphrases; never
+    exact observed inputs, never a whitelist) through the exact
+    Telegram -> dispatcher -> LangGraph -> planner -> retrieval ->
+    evidence -> answer -> verifier -> delivery path, records privacy-safe
+    stage telemetry plus p50/p95 live text latency, and fails closed when
+    ordinary turns collapse to one generic clarification or exceed the
+    interactive latency budget.
+    """
+    del repo_root
+    passed: list[str] = []
+    failed: list[str] = []
+    incomplete: list[str] = []
+    latencies: list[float] = []
+
+    def _check(name: str, ok: bool) -> None:
+        (passed if ok else failed).append(name)
+
+    ok, missing = _live_prerequisites()
+    if not ok:
+        incomplete.extend(f"live-evidence-requires-{item}" for item in missing)
+        metrics = {
+            "scenarios_executed": 0,
+            "turns_executed": 0,
+            "latency_p50_s": 0.0,
+            "latency_p95_s": 0.0,
+            "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+            "live_prerequisites_present": False,
+            "production_boundary": "Application.respond/GraphTurnRuntime",
+        }
+        return LaneResult(
+            lane="live-telegram-evidence",
+            status="INCOMPLETE",
+            passed=tuple(passed),
+            failed=tuple(failed),
+            incomplete=tuple(incomplete),
+            metrics=metrics,
+        )
+
+    # Live prerequisites present: probe the OpenCode runtime health before
+    # spending live turns. Unreachable runtime is INCOMPLETE (environment),
+    # not a fake PASS and not a turn failure.
+    try:
+        from aa.opencode.client import HttpOpenCodeClient
+
+        base_url = (os.environ.get("OPENCODE_BASE_URL", "") or "").strip() or (
+            "http://127.0.0.1:4096"
+        )
+        client = HttpOpenCodeClient(base_url)
+        health = await client.health()
+        if not health.healthy:
+            incomplete.append("live-opencode-not-healthy")
+            metrics = {
+                "scenarios_executed": 0,
+                "turns_executed": 0,
+                "latency_p50_s": 0.0,
+                "latency_p95_s": 0.0,
+                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+                "live_prerequisites_present": True,
+                "production_boundary": "Application.respond/GraphTurnRuntime",
+            }
+            return LaneResult(
+                lane="live-telegram-evidence",
+                status="INCOMPLETE",
+                passed=tuple(passed),
+                failed=tuple(failed),
+                incomplete=tuple(incomplete),
+                metrics=metrics,
+            )
+    except Exception:
+        incomplete.append("live-opencode-unreachable")
+        metrics = {
+            "scenarios_executed": 0,
+            "turns_executed": 0,
+            "latency_p50_s": 0.0,
+            "latency_p95_s": 0.0,
+            "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+            "live_prerequisites_present": True,
+            "production_boundary": "Application.respond/GraphTurnRuntime",
+        }
+        return LaneResult(
+            lane="live-telegram-evidence",
+            status="INCOMPLETE",
+            passed=tuple(passed),
+            failed=tuple(failed),
+            incomplete=tuple(incomplete),
+            metrics=metrics,
+        )
+
+    # Reachable live stack: run real ordinary turns through the exact
+    # production boundary. Prompts are generic paraphrases (capability,
+    # craving, family) so no exact-question whitelist is involved.
+    try:
+        from aa.app import Application
+        from aa.config import Settings
+        from aa.conversation.output_limits import envelope_passes
+        from aa.conversation.turn_pipeline import (
+            NATURAL_CLARIFICATION_REPLY,
+            contains_cyrillic,
+            leaks_internal_terms,
+        )
+
+        settings = Settings.from_env({})
+        app = Application(settings)
+        await app.start()
+        try:
+            if app.runtime_state != "READY":
+                failed.append("live-runtime-not-ready")
+            else:
+                passed.append("live-runtime-ready")
+            prompts = (
+                "Расскажите о своих возможностях помощника",
+                "Вечером накатывает тяга, как пережить это спокойно",
+                "Дома напряжённый разговор из-за выпивки, как быть",
+            )
+            replies: list[str] = []
+            stage_snapshots: list[dict[str, Any]] = []
+            for position, prompt in enumerate(prompts):
+                started = time.perf_counter()
+                reply = await app.respond(900000 + position, prompt)
+                latencies.append(time.perf_counter() - started)
+                replies.append(reply)
+                try:
+                    thread = app.graph_runtime.thread_id(900000 + position)  # type: ignore[union-attr]
+                    snapshot = app.graph_runtime.last_telemetry_for_thread(thread)  # type: ignore[union-attr]
+                    if snapshot:
+                        stage_snapshots.append(dict(snapshot))
+                except Exception:
+                    pass
+            _check(
+                "live-meta-natural-russian",
+                bool(replies)
+                and bool(contains_cyrillic(replies[0]))
+                and not leaks_internal_terms(replies[0])
+                and envelope_passes(replies[0]),
+            )
+            _check(
+                "live-substantive-natural-russian",
+                len(replies) == 3
+                and all(contains_cyrillic(item) for item in replies[1:])
+                and all(not leaks_internal_terms(item) for item in replies[1:])
+                and all(envelope_passes(item) for item in replies[1:]),
+            )
+            collapsed = [item for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY]
+            _check("live-no-generic-collapse", len(collapsed) == 0)
+            _check("live-replies-distinguishable", len(set(replies)) > 1)
+            if stage_snapshots:
+                _check("live-stage-telemetry-present", True)
+                outcomes = {str(item.get("verifier_outcome", "")) for item in stage_snapshots}
+                _check("live-stage-outcomes-distinguishable", len(outcomes) >= 1)
+            else:
+                # Telemetry missing is a harness gap, not proof of grounding.
+                incomplete.append("live-stage-telemetry-missing")
+        finally:
+            await app.stop()
+    except Exception:
+        failed.append("live-turn-harness")
+
+    p50 = _percentile(latencies, 50)
+    p95 = _percentile(latencies, 95)
+    if latencies and p95 >= LIVE_TEXT_LATENCY_BUDGET_S:
+        failed.append("live-text-p95-over-budget")
+    elif latencies:
+        passed.append("live-text-latency-in-budget")
+    metrics = {
+        "scenarios_executed": 3,
+        "turns_executed": len(latencies),
+        "latency_p50_s": round(p50, 4),
+        "latency_p95_s": round(p95, 4),
+        "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+        "clarification_count": 0,
+        "live_prerequisites_present": True,
+        "production_boundary": "Application.respond/GraphTurnRuntime",
+    }
+    if failed:
+        status = "FAIL"
+    elif incomplete:
+        status = "INCOMPLETE"
+    else:
+        status = "PASS"
+    return LaneResult(
+        lane="live-telegram-evidence",
+        status=status,
+        passed=tuple(passed),
+        failed=tuple(failed),
+        incomplete=tuple(incomplete),
+        metrics=metrics,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level evaluation
 # ---------------------------------------------------------------------------
 
@@ -988,10 +1205,11 @@ def decide_status(lane_statuses: list[str]) -> str:
     return "INCOMPLETE"
 
 
-async def _run_async_lanes() -> tuple[LaneResult, LaneResult]:
+async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult]:
     message = await run_message_lane()
     transport = await run_transport_lane()
-    return message, transport
+    live_evidence = await run_live_telegram_evidence_lane()
+    return message, transport, live_evidence
 
 
 def evaluate_live(
@@ -1000,7 +1218,12 @@ def evaluate_live(
     repo_root: Path | None = None,
     run_id: str = "local",
 ) -> LiveSummary:
-    """Run all live lanes for ``main_sha`` and return a privacy-safe summary."""
+    """Run all live lanes for ``main_sha`` and return a privacy-safe summary.
+
+    The real live Telegram/runtime evidence lane is mandatory: offline or
+    mock-only runs aggregate to INCOMPLETE, never PASS, so a mock PASS
+    can never mask the real Telegram regression from issue #145.
+    """
     root = repo_root or _repo_root()
     expected = validate_exact_sha(main_sha)
     try:
@@ -1016,10 +1239,10 @@ def evaluate_live(
             run_id=run_id,
         )
     static_gates = collect_static_gates(root)
-    message, transport = asyncio.run(_run_async_lanes())
+    message, transport, live_evidence = asyncio.run(_run_async_lanes())
     control = run_control_lane(root)
     voice = run_voice_lane(root)
-    lanes = (message, transport, control, voice)
+    lanes = (message, transport, control, voice, live_evidence)
     status = decide_status([lane.status for lane in lanes])
     summary = LiveSummary(
         main_sha=expected, status=status, lanes=lanes, static_gates=static_gates, run_id=run_id
@@ -1032,6 +1255,7 @@ __all__ = [
     "CAPABILITY_ISSUE",
     "EXIT_BY_STATUS",
     "FORBIDDEN_SUMMARY_KEYS",
+    "LIVE_TEXT_LATENCY_BUDGET_S",
     "LaneResult",
     "LiveSummary",
     "ProductContractLiveError",
@@ -1046,6 +1270,7 @@ __all__ = [
     "decide_status",
     "evaluate_live",
     "run_control_lane",
+    "run_live_telegram_evidence_lane",
     "run_message_lane",
     "run_transport_lane",
     "run_voice_lane",

@@ -603,6 +603,23 @@ def decide_reconcile(
     )
 
 
+def runtime_phase(*, pending_dispatch: bool, runtime_active: bool, stopped: bool) -> str:
+    """Return the explicit runtime phase for ``/bot status``.
+
+    ``STARTING`` means a dispatch is committed but no live poller has
+    appeared yet (bootstrap in progress: OpenCode health, Telegram
+    bootstrap and long polling not yet confirmed). ``READY`` means a live
+    poller is active after bootstrap. ``STOPPED`` covers stopped,
+    expired and idle states. The phase carries only lifecycle state,
+    never message or prompt content.
+    """
+    if pending_dispatch and not runtime_active:
+        return "STARTING"
+    if runtime_active and not stopped:
+        return "READY"
+    return "STOPPED"
+
+
 def status_snapshot(
     *,
     comments: list[ControlComment],
@@ -624,6 +641,7 @@ def status_snapshot(
         and c.created_at > generation.accepted_at
         for c in comments
     )
+    pending = markers > runs_after
     return {
         "active": campaign_is_active(
             now,
@@ -637,8 +655,11 @@ def status_snapshot(
         "accepted_at": generation.accepted_at,
         "starts_used": starts,
         "starts_max": MAX_STARTS,
-        "pending_dispatch": markers > runs_after,
+        "pending_dispatch": pending,
         "stopped": stopped,
         "expired": campaign_is_expired(now, generation.accepted_at),
         "runtime_active": runtime_active,
+        "runtime_phase": runtime_phase(
+            pending_dispatch=pending, runtime_active=runtime_active, stopped=stopped
+        ),
     }
