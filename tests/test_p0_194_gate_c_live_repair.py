@@ -241,13 +241,18 @@ def test_verifier_suffix_has_explicit_example() -> None:
     assert "No other text" in VERIFIER_TEXT_JSON_SUFFIX
 
 
-def test_production_verifier_is_muse_spark_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifier never falls through to Space Bunny; other agents keep fallback."""
+def test_production_verifier_keeps_configured_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifier keeps the configured fallback like every other agent.
+
+    P0 kodmial/aa#196: live evidence showed the pinned primary rejected with
+    403 while the configured fallback served planner/answer. A verifier with
+    no fallback is guaranteed verifier-unavailable with generic clarification
+    collapse whenever the primary is rejected, so the fallback is preserved.
+    """
     from types import SimpleNamespace
 
     import aa.conversation.graph as graph_module
     import aa.conversation.model_adapter as adapter_module
-    from aa.config import DEFAULT_PRIMARY_MODEL
     from aa.conversation.graph_runtime import _ProductionGraphRuntime
 
     class _DummyModel:
@@ -266,7 +271,7 @@ def test_production_verifier_is_muse_spark_only(monkeypatch: pytest.MonkeyPatch)
             self.fallback_model = fallback_model
             self.request_timeout = request_timeout
 
-        def with_agent(self, agent: str) -> "_DummyModel":
+        def with_agent(self, agent: str) -> _DummyModel:
             return _DummyModel(
                 self.client,
                 agent=agent,
@@ -292,6 +297,5 @@ def test_production_verifier_is_muse_spark_only(monkeypatch: pytest.MonkeyPatch)
 
     assert planner.fallback_model == "opencode/space-bunny-free"
     assert verifier.agent == "aa-verifier-v2"
-    assert verifier.primary_model == DEFAULT_PRIMARY_MODEL
     assert verifier.primary_model == "opencode/muse-spark-1.3-contributor-free"
-    assert verifier.fallback_model == ""
+    assert verifier.fallback_model == "opencode/space-bunny-free"

@@ -52,6 +52,7 @@ from aa.conversation.verifier_schema import (
 )
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
+    OpenCodeError,
     OpenCodeProviderAccessError,
     OpenCodeRateLimitError,
     OpenCodeTimeoutError,
@@ -775,13 +776,28 @@ async def _verify_single_unit(
             mark_structured_unavailable(model)
             return await _text_decision()
         except _STRUCTURED_TRANSIENT_ERRORS as exc:
-            # One transient/timeout: retry once via text without poisoning
-            # the per-model capability cache, so later turns still probe
-            # native structured output after recovery.
+            # One transient/timeout: retry once via text and prefer the text
+            # path for subsequent turns (TTL-bounded) so every later turn
+            # does not burn two slow provider round-trips per unit (the live
+            # max-latency pathology). The TTL expiry re-probes structured
+            # output after recovery.
             logger.info(
                 "verifier structured transient; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            mark_structured_unavailable(model)
+            return await _text_decision()
+        except OpenCodeError as exc:
+            # Any other provider-side structured failure (for example a
+            # startup/not-ready/session error from the OpenCode boundary)
+            # retries once via the bounded text path instead of collapsing
+            # the turn to verifier-unavailable without a text attempt.
+            # Provider 429 is already re-raised above and never falls back.
+            logger.info(
+                "verifier structured provider error; text fallback used",
+                extra={"category": type(exc).__name__},
+            )
+            mark_structured_unavailable(model)
             return await _text_decision()
         if not isinstance(raw, dict):
             logger.info(
@@ -799,14 +815,15 @@ async def _verify_single_unit(
             # fallback route emitting extra keys, or a content grounding
             # failure like bad passage ids). The text path with its
             # explicit single-object instruction may still serve; try it
-            # once before failing closed without poisoning the
-            # process-wide capability cache on one bad decision.
-            # Grounding stays strict: the text decision is still fully
-            # Pydantic-validated.
+            # once before failing closed and prefer text subsequently
+            # (TTL-bounded) so later turns do not pay two provider
+            # round-trips per unit. Grounding stays strict: the text
+            # decision is still fully Pydantic-validated.
             logger.info(
                 "verifier structured decision invalid; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            mark_structured_unavailable(model)
             return await _text_decision()
     elif callable(structured_invoke) and prefer_text:
         return await _text_decision()
