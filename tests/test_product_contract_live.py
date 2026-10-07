@@ -164,12 +164,12 @@ def test_heartbeat_tolerance_allows_scheduling_jitter() -> None:
 
 def test_gate_c_records_latency_but_gate_e_owns_slo_verdict() -> None:
     """Gate C records latency evidence; Gate E owns the SLO verdict."""
-    source = (
-        REPO_ROOT / "src" / "aa" / "qualification" / "product_contract_live.py"
-    ).read_text(encoding="utf-8")
-    self_proving = (
-        REPO_ROOT / "scripts" / "run_self_proving_qualification.py"
-    ).read_text(encoding="utf-8")
+    source = (REPO_ROOT / "src" / "aa" / "qualification" / "product_contract_live.py").read_text(
+        encoding="utf-8"
+    )
+    self_proving = (REPO_ROOT / "scripts" / "run_self_proving_qualification.py").read_text(
+        encoding="utf-8"
+    )
     assert 'failed.append("live-text-max-over-budget")' not in source
     assert 'passed.append("live-text-latency-measured")' in source
     assert "P95_TARGET_MS" in self_proving
