@@ -267,6 +267,23 @@ async def run_planner(
     the same plan is retried once as bounded plain-text JSON and strictly
     validated. Content validation failures fail closed immediately.
     Provider 429 always propagates for runner retire/restart.
+
+    Gate C+E live repair (kodmial/aa#217 recurrence 4 on exact main
+    7a9c907 run 37697730282: planner p50 7.0s / p95 16.4s / max 28.7s
+    with retrieval healthy at p50 0.5s and repair_turns=0): the persistent
+    planner remainder after three token-display repairs is a capability
+    round-trip, not token count. Once the omitted structured channel is
+    cached unavailable for this model path, every later planner call still
+    pays a weak-fallback structured round-trip before the strong-model
+    text fallback, doubling planner cost per turn (weak structured ~4s +
+    strong text ~4s) and serving weak-model queries that retrieve a poor
+    pack the verifier then rejects into generic clarification. When the
+    cache is set for an explicitly omitted-wire model, this goes directly
+    to the single bounded text path (which itself tries the strong primary
+    first), skipping the doomed weak structured call. Grounding is
+    unchanged (strict Pydantic 0-or-10..16 validation); 429 propagates and
+    never triggers the text path. Turn-independent, never an
+    exact-question special case.
     """
     messages = build_planner_messages(
         user_message=user_message, summary=summary, recent=list(recent or [])
@@ -275,6 +292,41 @@ async def run_planner(
     user_text = str(messages[1].content)
     structured_invoke = getattr(model, "ainvoke_structured", None)
     if callable(structured_invoke):
+        try:
+            from aa.conversation.model_adapter import omitted_structured_unavailable
+        except Exception:
+            omitted_structured_unavailable = None  # type: ignore[assignment]
+        if omitted_structured_unavailable is not None:
+            try:
+                is_omitted_wire = getattr(model, "wire_agent", None) == ""
+                if is_omitted_wire and bool(omitted_structured_unavailable(model)):
+                    logger.info(
+                        "planner omitted structured cached; direct text path used",
+                        extra={"category": "capability-cached"},
+                    )
+                    text_reply = await _invoke_planner_text(
+                        model, user_text=user_text, system_text=system_text
+                    )
+                    plan = validate_structured_plan(parse_planner_text_json(text_reply))
+                    logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+                    return plan
+            except Exception as exc:
+                from aa.opencode.errors import OpenCodeError as _ProviderError
+                from aa.opencode.errors import OpenCodeRateLimitError as _RateLimit
+
+                if isinstance(exc, _RateLimit):
+                    raise
+                if isinstance(exc, _ProviderError):
+                    logger.info(
+                        "planner direct text path failed; structured attempt follows",
+                        extra={"category": type(exc).__name__},
+                    )
+                elif isinstance(exc, QueryPlanValidationError):
+                    raise
+                # Any other probe failure falls through to the normal
+                # structured-first path below (fail-open to structured,
+                # fail-closed on content).
+                pass
         try:
             raw = await structured_invoke(
                 user_text,
