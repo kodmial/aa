@@ -1842,6 +1842,45 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     if latencies:
         passed.append("live-text-latency-measured")
 
+    stage_latency_ms: dict[str, dict[str, float]] = {}
+    for stage, key in (
+        ("planner", "planner_latency_ms"),
+        ("retrieval", "retrieval_latency_ms"),
+        ("answer", "answer_latency_ms"),
+        ("verifier", "verifier_latency_ms"),
+        ("total", "total_latency_ms"),
+    ):
+        values: list[float] = []
+        for snapshot in stage_snapshots:
+            value = snapshot.get(key)
+            if isinstance(value, (int, float)) and float(value) >= 0:
+                values.append(float(value))
+        if values:
+            stage_latency_ms[stage] = {
+                "p50": round(_percentile(values, 50), 1),
+                "p95": round(_percentile(values, 95), 1),
+                "max": round(max(values), 1),
+            }
+
+    repair_rounds = [
+        int(snapshot.get("repair_rounds", 0) or 0)
+        for snapshot in stage_snapshots
+        if isinstance(snapshot.get("repair_rounds", 0), (int, float))
+    ]
+    answer_rounds = [
+        int(snapshot.get("answer_rounds", 0) or 0)
+        for snapshot in stage_snapshots
+        if isinstance(snapshot.get("answer_rounds", 0), (int, float))
+    ]
+    repair_metrics = {
+        "turns_with_repair": sum(1 for value in repair_rounds if value > 0),
+        "repair_rounds_total": sum(repair_rounds),
+        "answer_rounds_total": sum(answer_rounds),
+        "repair_budget_exceeded_turns": sum(
+            1 for snapshot in stage_snapshots if bool(snapshot.get("repair_budget_exceeded", False))
+        ),
+    }
+
     metrics = {
         "scenarios_executed": 8,
         "turns_executed": len(latencies),
@@ -1856,6 +1895,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "served_models_by_agent": served_models_by_agent,
         "stage_snapshots_count": len(stage_snapshots),
         "stage_outcome_counts": _count_stage_outcomes(stage_snapshots),
+        "stage_latency_ms": stage_latency_ms,
+        "repair_metrics": repair_metrics,
         "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
