@@ -248,15 +248,12 @@ async def _verify_draft(
     try:
         result = await run_verifier(units, pack_dicts, model=verifier_model)
     except (VerifierValidationError, ValueError) as exc:
-        # Gate C live repair (run 37547434287, 14/14 clarifications with
-        # the verifier never served and max 35s over the 30s budget):
-        # run_verifier already performs its own bounded per-unit fallback
-        # (simpler single-verdict task, concurrent, no id copying) on a
-        # validation-shaped or batch provider-flake failure. Repeating the same batch prompt here
-        # only burns a second slow-model round and pushes ordinary turns
-        # over budget without fixing systematic id-copy flake. Fail closed
-        # immediately: only a verdict passing full Pydantic + completeness
-        # + cite/quote/checksum gates is accepted. Provider or transport
+        # Per-unit only verifier (kodmial/aa#190): run_verifier performs
+        # exactly one concurrent per-unit round of minimal boolean
+        # decisions. A validation-shaped failure fails closed immediately
+        # here without re-running planner/retrieval/answer: only a verdict
+        # passing full Pydantic + completeness + cite/quote/checksum gates
+        # is accepted. Provider or transport
         # failures below never retry here (the model adapter already
         # exhausted primary/fallback).
         logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
