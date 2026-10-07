@@ -61,17 +61,26 @@ VERIFIER_MAX_EVIDENCE_PASSAGES = 8
 # reject or time out large structured requests (no served audit) while the
 # small-prompt planner serves. Truncating display text bounds input tokens
 # and latency while deterministic cite/quote/checksum gates still use the
-# full stored pack, so grounding strictness is unchanged (truncation may
-# only cause safe false-unsupported, never false-supported). Turn-
-# independent, never an exact-question special case.
+# full stored pack. Display truncation is explicitly marked with
+# ``... [truncated ...]`` so the model can see the passage is incomplete
+# and withhold support instead of judging on a silently cut prefix
+# (a qualifier or contradiction after the cut is invisible to the model,
+# so silent truncation could cause false-supported, not only safe
+# false-unsupported). Turn-independent, never an exact-question
+# special case.
 VERIFIER_MAX_PASSAGE_CHARS = 1200
+
+VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
 
 def _display_passage_text(text: str) -> str:
     """Bound one passage display text for the verifier prompt (no semantics)."""
     if len(text) <= VERIFIER_MAX_PASSAGE_CHARS:
         return text
-    return text[:VERIFIER_MAX_PASSAGE_CHARS]
+    omitted = len(text) - VERIFIER_MAX_PASSAGE_CHARS
+    return text[:VERIFIER_MAX_PASSAGE_CHARS] + VERIFIER_TRUNCATION_SUFFIX_FORMAT.format(
+        omitted=omitted
+    )
 
 
 def _escape(value: str) -> str:
@@ -288,9 +297,21 @@ def _remap_units_by_order(
     extra latency: scope/supported/evidence content is untouched, and the
     full cite/quote/checksum gates below still validate against the full
     stored pack. Turn-independent, never an exact-question special case.
-    Returns ``None`` when counts mismatch or entries are not dicts.
+    Returns ``None`` when counts mismatch, entries are not dicts, or the
+    returned id set already matches expected (count equality does not
+    prove order preservation: remapping a shuffled but id-correct list
+    would silently misattribute supported status and evidence to the
+    wrong unit). Remap applies only when ids are systematically wrong;
+    any overlap with expected ids fails closed instead of clobbering a
+    correct binding by position.
     """
     if len(raw_units) != len(expected_ids) or not expected_ids:
+        return None
+    raw_ids = [entry.get("unit_id") if isinstance(entry, dict) else None for entry in raw_units]
+    if set(raw_ids) == set(expected_ids):
+        return None
+    expected_set = set(expected_ids)
+    if any(raw_id in expected_set for raw_id in raw_ids):
         return None
     remapped: list[dict[str, Any]] = []
     for entry, expected_id in zip(raw_units, expected_ids, strict=True):
