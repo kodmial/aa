@@ -1185,11 +1185,12 @@ def test_natural_clarification_fits_envelope_without_leak() -> None:
 
 
 async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
-    """Gate C repair (run 37530425848): weak fallback flaky structured output.
+    """Gate C repair (run 37530425848, run 37547434287): weak id-copy flake.
 
-    A first verifier verdict with wrong unit ids (VerifierValidationError)
-    gets exactly one bounded retry; a valid second verdict grounds the turn
-    instead of collapsing to generic clarification.
+    A batch verdict with wrong unit ids falls back once to the simpler
+    concurrent per-unit single-verdict task (no id copying); a valid
+    single verdict grounds the turn instead of collapsing to generic
+    clarification.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
@@ -1214,7 +1215,11 @@ async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
                     ],
                     "all_required_supported": True,
                 }
-            return _support_result(["u1"])
+            return {
+                "scope": "book",
+                "supported": True,
+                "evidence_passage_ids": ["chapter-3#exp0000"],
+            }
 
     draft = "Поддержка рядом помогает спокойно."
     verifier = _FlakyVerifier()
@@ -1465,11 +1470,11 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
 
 
 async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
-    """Gate C repair (run 37544234331): retry flake, fail fast on grounding.
+    """Gate C repair (run 37544234331, run 37547434287): per-unit fallback.
 
-    Weak-formatting validation errors (scope case) get exactly one more
-    sampling chance; deterministic cite failures (book unit, empty pack)
-    fail closed immediately without burning live latency.
+    Id/format validation errors fall back once to the simpler per-unit
+    single-verdict task; deterministic cite failures (book unit, empty
+    pack) fail closed immediately without burning live latency.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
@@ -1486,8 +1491,10 @@ async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.calls += 1
-            if self.calls == 1:
-                # Wrong verdict count: sampling flake, retryable once.
+            props = schema.get("properties", {})
+            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
+            if not is_single:
+                # Batch fast path: wrong verdict count (id flake).
                 extra = [
                     {
                         "unit_id": f"u{len(units) + 1}",
@@ -1510,16 +1517,9 @@ async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
                     "all_required_supported": True,
                 }
             return {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [pack[0]["passage_id"]],
-                    }
-                    for unit in units
-                ],
-                "all_required_supported": True,
+                "scope": "book",
+                "supported": True,
+                "evidence_passage_ids": [pack[0]["passage_id"]],
             }
 
     flaky = _FlakyThenGood()
@@ -1596,3 +1596,120 @@ async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
     # Upstream stages are preserved, never flattened to a generic token.
     assert telemetry["planner_outcome"] != "skipped-verifier-unavailable"
     assert telemetry["retrieval_outcome"] != "skipped-verifier-unavailable"
+
+
+def test_verifier_single_schema_is_ref_free_without_ids() -> None:
+    """Gate C repair (run 37547434287): minimal single-verdict transport hint."""
+    import json
+    from typing import Any, cast
+
+    from aa.conversation.verifier_schema import verifier_single_json_schema
+
+    schema = verifier_single_json_schema()
+    dumped = json.dumps(schema)
+    assert "$ref" not in dumped
+    assert "minLength" not in dumped
+    assert "minItems" not in dumped
+    assert "unit_id" not in dumped
+    props = cast(dict[str, Any], schema["properties"])
+    scope = cast(dict[str, Any], props["scope"])
+    assert set(cast(list[str], scope["enum"])) == {"book", "product_meta", "conversation_glue"}
+    assert schema["required"] == ["scope", "supported"]
+
+
+def test_verifier_single_text_has_no_id_copying() -> None:
+    """Single-unit payload judges one unit without u1..uN copying."""
+    from aa.conversation.verifier import build_single_unit_text
+
+    units = split_response_units("Понимаю. Тяга проходит.")
+    text = build_single_unit_text(unit=units[0], passages=[_pack_entry()])
+    assert "<response_unit>" in text
+    assert "<book_evidence>" in text
+    assert "unit_id" not in text
+    assert "u1" not in text
+
+
+async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
+    """Batch id flake falls back to concurrent single verdicts and serves."""
+    from aa.conversation.verifier import run_verifier
+
+    pack = [_pack_entry()]
+    units = split_response_units("Понимаю. Поддержка рядом помогает.")
+
+    class _BatchFlakySingleGood:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system)
+            self.calls += 1
+            props = schema.get("properties", {})
+            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
+            if not is_single:
+                return {
+                    "units": [
+                        {
+                            "unit_id": "wrong-id",
+                            "scope": "book",
+                            "supported": True,
+                            "evidence_passage_ids": [pack[0]["passage_id"]],
+                        }
+                    ],
+                    "all_required_supported": True,
+                }
+            if "Понимаю" in prompt:
+                return {"scope": "conversation_glue", "supported": True}
+            return {
+                "scope": "book",
+                "supported": True,
+                "evidence_passage_ids": [pack[0]["passage_id"]],
+            }
+
+    model = _BatchFlakySingleGood()
+    result = await run_verifier(units, pack, model=model)
+    assert result.all_required_supported is True
+    assert len(result.units) == len(units)
+    # One batch attempt plus one concurrent single per unit.
+    assert model.calls == 1 + len(units)
+
+
+async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
+    """Per-unit fallback still rejects unknown passages (fail-closed)."""
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    pack = [_pack_entry()]
+    draft = "Поддержка рядом помогает."
+    units = split_response_units(draft)
+    assert len(units) == 1
+
+    class _UnknownCite:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            props = schema.get("properties", {})
+            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
+            if is_single:
+                return {
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": ["no-such-passage"],
+                }
+            return {
+                "units": [
+                    {
+                        "unit_id": unit.unit_id,
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": ["no-such-passage"],
+                    }
+                    for unit in units
+                ],
+                "all_required_supported": True,
+            }
+
+    _, result, passed = await _verify_draft(draft, pack, verifier_model=_UnknownCite())
+    assert passed is False
+    assert result is None
