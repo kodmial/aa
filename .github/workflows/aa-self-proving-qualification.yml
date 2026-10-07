@@ -665,11 +665,22 @@ jobs:
           retention-days: 1
           if-no-files-found: error
           overwrite: true
+      - name: Upload external/transient blocker marker
+        if: ${{ failure() && hashFiles('self-proving-out/transient-blocked.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-transient-${{ github.run_attempt }}
+          path: self-proving-out/transient-blocked.json
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
       - name: Publish machine-readable failure and repair marker
-        # Provider 429 is infrastructure recovery, not a product repair issue.
+        # Provider 429 and external/transient blockers are recovery states,
+        # not product-code repair issues.
         # A workflow_run recovery controller reruns failed jobs on a fresh VM
         # from the persisted gate checkpoints.
-        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' && hashFiles('self-proving-out/transient-blocked.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
