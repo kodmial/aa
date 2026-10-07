@@ -669,6 +669,7 @@ jobs:
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
             let timingLine = 'Timings: unavailable in self-proving summary.';
+            let stageTimingLine = 'Stage timings: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
@@ -691,6 +692,26 @@ jobs:
             } catch (error) {
               core.warning('No self-proving summary; using generic failure category: ' + error.message);
             }
+            try {
+              const live = JSON.parse(fs.readFileSync('live-out/product-contract-live-summary.json', 'utf8'));
+              const lane = (live.lanes || []).find(item => item && item.lane === 'live-telegram-evidence');
+              const metrics = (lane && lane.metrics) || {};
+              const stages = metrics.stage_latency_ms || {};
+              const names = ['planner', 'retrieval', 'answer', 'verifier', 'total'];
+              const rendered = names
+                .filter(name => stages[name])
+                .map(name => {
+                  const item = stages[name] || {};
+                  return `${name}=p50:${Math.round(Number(item.p50 || 0))}/p95:${Math.round(Number(item.p95 || 0))}/max:${Math.round(Number(item.max || 0))}ms`;
+                });
+              const repair = metrics.repair_metrics || {};
+              if (rendered.length) {
+                stageTimingLine = 'Stage timings: ' + rendered.join('; ') +
+                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+              }
+            } catch (error) {
+              core.info('No per-stage live timing evidence yet: ' + error.message);
+            }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
             const fingerprint = `${blocking}:${category}:${sha.slice(0, 12)}`;
             const title = `P0: Repair self-proving qualification failure (Gate ${blocking})`;
@@ -705,6 +726,7 @@ jobs:
               `Run id: \`${runId}\``,
               `Repair fingerprint: \`${fingerprint}\``,
               timingLine,
+              stageTimingLine,
               '',
               '### Required repair behavior',
               '',
