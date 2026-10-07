@@ -935,15 +935,23 @@ async def _verify_per_unit_concurrent(
     # product boundary; successfully verified units remain eligible for
     # deterministic narrowing. Provider 429 is different: the whole runner
     # must retire/restart and therefore always propagates.
+    expected_unavailable_errors = (OpenCodeError, VerifierValidationError)
     for item in raw_results:
         if isinstance(item, OpenCodeRateLimitError):
+            raise item
+        if isinstance(item, BaseException) and not isinstance(
+            item, expected_unavailable_errors
+        ):
+            # Cancellation/system exceptions and programming defects are not
+            # transport unavailability. Do not silently turn them into a
+            # partial user answer.
             raise item
 
     verdicts: list[UnitVerdict] = []
     unavailable_unit_ids: list[str] = []
     first_unavailable: BaseException | None = None
     for unit, item in zip(units, raw_results, strict=True):
-        if isinstance(item, BaseException):
+        if isinstance(item, expected_unavailable_errors):
             if first_unavailable is None:
                 first_unavailable = item
             unavailable_unit_ids.append(unit.unit_id)
@@ -960,6 +968,7 @@ async def _verify_per_unit_concurrent(
                 extra={"category": type(item).__name__},
             )
         else:
+            assert isinstance(item, UnitVerdict)
             verdicts.append(item)
 
     # If every unit failed at the provider/format boundary there is no
