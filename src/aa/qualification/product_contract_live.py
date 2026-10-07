@@ -1915,11 +1915,18 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         for snapshot in stage_snapshots
         if isinstance(snapshot.get("verifier_unavailable_units", 0), (int, float))
     ]
+    response_unit_counts = [
+        int(snapshot.get("response_units", 0) or 0)
+        for snapshot in stage_snapshots
+        if isinstance(snapshot.get("response_units", 0), (int, float))
+    ]
     verifier_metrics = {
         "turns_with_unavailable_units": sum(
             1 for value in verifier_unavailable_units if value > 0
         ),
         "unavailable_units_total": sum(verifier_unavailable_units),
+        "response_units_total": sum(response_unit_counts),
+        "response_units_max": max(response_unit_counts) if response_unit_counts else 0,
     }
 
     request_latency_ms: dict[str, dict[str, float | int]] = {}
