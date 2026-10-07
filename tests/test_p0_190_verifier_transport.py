@@ -175,29 +175,30 @@ async def test_unknown_and_missing_citations_fail_closed() -> None:
 
 
 class _PartiallyUnavailableVerifier:
-    """One unit succeeds while another transport call fails."""
+    """One grounded unit succeeds while another transport call fails."""
 
     async def ainvoke_structured(
         self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
     ) -> dict[str, object]:
         _ = (system, schema, retry_count)
-        if "Понимаю." in prompt:
+        if "Поддержка рядом помогает." in prompt:
             return {
-                "requires_book_evidence": False,
+                "requires_book_evidence": True,
                 "supported": True,
-                "evidence_passage_ids": [],
+                "evidence_passage_ids": ["p1"],
             }
         raise RuntimeError("fixture verifier transport failure")
 
 
 async def test_partial_verifier_failure_preserves_verified_units() -> None:
     pack = [_pack_entry()]
-    units = split_response_units("Понимаю. Поддержка рядом помогает.")
+    units = split_response_units("Поддержка рядом помогает. Ещё одна мысль.")
     result = await run_verifier(units, pack, model=_PartiallyUnavailableVerifier())
     assert result.all_required_supported is False
     assert result.unavailable_unit_ids == ["u2"]
     assert result.units[0].unit_id == "u1"
     assert result.units[0].supported is True
+    assert result.units[0].scope == "book"
     assert result.units[1].unit_id == "u2"
     assert result.units[1].supported is False
 
@@ -211,7 +212,7 @@ async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() ->
     class _Answer:
         async def ainvoke(self, messages: Any) -> str:
             _ = messages
-            return "Понимаю. Поддержка рядом помогает."
+            return "Поддержка рядом помогает. Ещё одна мысль."
 
     outcome = await run_v2_answer_turn(
         user_message="что делать?",
@@ -222,11 +223,45 @@ async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() ->
         verifier_model=_PartiallyUnavailableVerifier(),
         initial_query_count=1,
     )
-    assert outcome["text"] == "Понимаю."
+    assert outcome["text"] == "Поддержка рядом помогает."
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["verifier_outcome"] == "partial-unavailable"
     assert outcome["telemetry"]["verifier_unavailable_units"] == 1
     assert outcome["telemetry"]["repair_rounds"] == 0
+
+
+async def test_partial_verifier_failure_does_not_serve_glue_only_for_substantive_turn() -> None:
+    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
+
+    class _Answer:
+        async def ainvoke(self, messages: Any) -> str:
+            _ = messages
+            return "Понимаю. Содержательная мысль."
+
+    class _GlueOnlyVerifier:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (system, schema, retry_count)
+            if "Понимаю." in prompt:
+                return {
+                    "requires_book_evidence": False,
+                    "supported": True,
+                    "evidence_passage_ids": [],
+                }
+            raise RuntimeError("fixture verifier transport failure")
+
+    outcome = await run_v2_answer_turn(
+        user_message="что делать?",
+        summary="",
+        recent=[],
+        evidence_pack=[_pack_entry()],
+        answer_model=_Answer(),
+        verifier_model=_GlueOnlyVerifier(),
+        initial_query_count=1,
+    )
+    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
+    assert outcome["telemetry"]["verifier_outcome"] == "partial-unavailable"
 
 
 async def test_provider_429_propagates_with_bounded_round() -> None:
