@@ -63,6 +63,8 @@ class GroundingResult(BaseModel):
 
     units: list[UnitVerdict] = Field(min_length=1)
     all_required_supported: bool
+    # Deterministic AA transport metadata; never emitted by the model.
+    unavailable_unit_ids: list[str] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -140,9 +142,20 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
             raise VerifierValidationError(
                 f"verifier verdict for {unit_id!r} is missing or duplicated"
             )
+    expected = set(expected_unit_ids)
     for unit_id in seen:
-        if unit_id not in set(expected_unit_ids):
+        if unit_id not in expected:
             raise VerifierValidationError(f"verifier returned unknown unit {unit_id!r}")
+    for unit_id in result.unavailable_unit_ids:
+        if unit_id not in expected:
+            raise VerifierValidationError(
+                f"verifier unavailable metadata contains unknown unit {unit_id!r}"
+            )
+        verdict = next((item for item in result.units if item.unit_id == unit_id), None)
+        if verdict is None or verdict.supported:
+            raise VerifierValidationError(
+                f"unavailable verifier unit {unit_id!r} must fail closed"
+            )
     return result
 
 
