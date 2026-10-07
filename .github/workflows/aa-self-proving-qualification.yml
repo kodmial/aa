@@ -724,6 +724,7 @@ jobs:
             let productFailures = [];
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
+            let modelPathLine = 'Served models: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
@@ -773,6 +774,14 @@ jobs:
               if (rendered.length) {
                 stageTimingLine = 'Stage timings: ' + rendered.join('; ') +
                   `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+              }
+              const served = metrics.served_models_by_agent || {};
+              const servedEntries = Object.keys(served)
+                .sort()
+                .map(name => `${name}=${(served[name] || []).join(',')}`);
+              if (servedEntries.length) {
+                modelPathLine = 'Served models: ' + servedEntries.join('; ') +
+                  `; clarifications=${Number(metrics.clarification_count || 0)}.`;
               }
             } catch (error) {
               core.info('No per-stage live timing evidence yet: ' + error.message);
@@ -827,6 +836,7 @@ jobs:
               `Repair recurrence: \`${recurrence}\``,
               timingLine,
               stageTimingLine,
+              modelPathLine,
               '',
               '### Required repair behavior',
               '',
