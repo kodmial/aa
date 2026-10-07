@@ -30,6 +30,7 @@ on:
       - "qualification/**"
       - "scripts/run_self_proving_qualification.py"
       - "scripts/verify_product_contract_qualification.py"
+      - "tests/**"
       - ".github/workflows/aa-product-contract-qualification-dispatch.yml"
       - ".github/workflows/aa-self-proving-qualification.yml"
   workflow_dispatch:
