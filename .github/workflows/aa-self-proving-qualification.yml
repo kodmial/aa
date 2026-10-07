@@ -39,7 +39,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
   issues: write
 
 concurrency:
@@ -706,22 +706,33 @@ jobs:
             if (existing) {
               await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body, labels: ['priority:p0', 'automation:ready'] });
               core.info(`Refreshed existing self-proving repair issue #${existing.number}.`);
-              return;
+            } else {
+              // Exactly one P0 repair issue per failing component series: reuse
+              // any open marker issue before creating a new one.
+              const anyExisting = openIssues.find(
+                issue => !issue.pull_request && String(issue.body || '').includes(marker)
+              );
+              if (anyExisting) {
+                await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
+                core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
+                });
+                core.info(`Created self-proving repair issue #${created.data.number}.`);
+              }
             }
-            // Exactly one P0 repair issue per failing component series: reuse
-            // any open marker issue before creating a new one.
-            const anyExisting = openIssues.find(
-              issue => !issue.pull_request && String(issue.body || '').includes(marker)
-            );
-            if (anyExisting) {
-              await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
-              core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
-              return;
-            }
-            const created = await github.rest.issues.create({
-              owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
+            // Convergence repair (kodmial/aa#192): explicitly wake the issue
+            // scheduler once via workflow_dispatch. Events emitted by
+            // GITHUB_TOKEN (issue create/update above) do not reliably trigger
+            // downstream workflows, and scheduled cron alone left a P0 repair
+            // issue undispatched for roughly an hour. This is the supported
+            // recursion-safe wake-up; never use a PAT merely to manufacture
+            // event fan-out.
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
             });
-            core.info(`Created self-proving repair issue #${created.data.number}.`);
+            core.info('Dispatched continuum-issue-scheduler.yml once for the P0 repair issue.');
 
       - name: Publish authoritative Product Contract result
         if: ${{ always() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}

@@ -436,14 +436,25 @@ def test_verifier_system_prompt_is_english_authority() -> None:
 
 
 def test_verifier_uses_native_json_schema_no_bespoke_parser() -> None:
-    for name in ("verifier.py", "verifier_schema.py", "planner_node.py"):
+    # Native structured output stays the primary verifier channel; planner
+    # and schema modules never parse JSON text. The verifier owns exactly
+    # one bounded capability-compatible text-JSON fallback (kodmial/aa#192)
+    # for provider paths where native json_schema is unavailable; it is
+    # strictly Pydantic-validated and 429-safe, never an unconstrained
+    # bespoke parser.
+    for name in ("verifier_schema.py", "planner_node.py"):
         source = (CONVERSATION_PKG / name).read_text(encoding="utf-8")
         assert "json.loads" not in source, name
         assert "PydanticOutputParser" not in source, name
         assert "get_format_instructions" not in source, name
     source = (CONVERSATION_PKG / "verifier.py").read_text(encoding="utf-8")
+    assert "PydanticOutputParser" not in source
+    assert "get_format_instructions" not in source
     assert "ainvoke_structured" in source
     assert "retry_count" in source
+    assert "parse_text_json_decision" in source
+    assert "OpenCodeRateLimitError" in source
+    assert source.count("json.loads") == 1
 
 
 # ---------------------------------------------------------------------------
