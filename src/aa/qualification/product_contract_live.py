@@ -1880,6 +1880,17 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             1 for snapshot in stage_snapshots if bool(snapshot.get("repair_budget_exceeded", False))
         ),
     }
+    verifier_unavailable_units = [
+        int(snapshot.get("verifier_unavailable_units", 0) or 0)
+        for snapshot in stage_snapshots
+        if isinstance(snapshot.get("verifier_unavailable_units", 0), (int, float))
+    ]
+    verifier_metrics = {
+        "turns_with_unavailable_units": sum(
+            1 for value in verifier_unavailable_units if value > 0
+        ),
+        "unavailable_units_total": sum(verifier_unavailable_units),
+    }
 
     metrics = {
         "scenarios_executed": 8,
@@ -1897,6 +1908,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "stage_outcome_counts": _count_stage_outcomes(stage_snapshots),
         "stage_latency_ms": stage_latency_ms,
         "repair_metrics": repair_metrics,
+        "verifier_metrics": verifier_metrics,
         "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
