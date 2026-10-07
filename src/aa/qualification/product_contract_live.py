@@ -1892,6 +1892,31 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "unavailable_units_total": sum(verifier_unavailable_units),
     }
 
+    request_latency_ms: dict[str, dict[str, float | int]] = {}
+    request_audit = getattr(app.opencode_runtime.client, "request_latency_audit", ())
+    for operation in (
+        "session-create",
+        "message-text",
+        "message-structured",
+        "session-delete",
+        "health",
+        "other",
+    ):
+        values = [
+            float(item.get("latency_ms", 0.0))
+            for item in request_audit
+            if isinstance(item, dict)
+            and item.get("operation") == operation
+            and isinstance(item.get("latency_ms"), (int, float))
+        ]
+        if values:
+            request_latency_ms[operation] = {
+                "count": len(values),
+                "p50": round(_percentile(values, 50), 1),
+                "p95": round(_percentile(values, 95), 1),
+                "max": round(max(values), 1),
+            }
+
     metrics = {
         "scenarios_executed": 8,
         "turns_executed": len(latencies),
@@ -1909,6 +1934,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "stage_latency_ms": stage_latency_ms,
         "repair_metrics": repair_metrics,
         "verifier_metrics": verifier_metrics,
+        "opencode_request_latency_ms": request_latency_ms,
         "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
