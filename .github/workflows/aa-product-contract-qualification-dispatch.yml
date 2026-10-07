@@ -120,28 +120,30 @@ jobs:
             }
           fi
 
-      - name: Dispatch authoritative exact-main qualification #7
-        if: steps.readiness.outputs.status == 'ready'
+      - name: Dispatch authoritative repository-owned qualification (manual relay only)
+        if: steps.readiness.outputs.status == 'ready' && github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           REQUIRED_SHA: ${{ steps.sha.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run continuum-opencode.yml \
+          # Product-affecting pushes already trigger aa-self-proving-qualification.yml
+          # directly. Only a manual dispatch of this relay needs to fan out.
+          # Never dispatch generic Continuum/OpenCode qualification for AA:
+          # it does not own the Telegram/book/provider secrets and therefore
+          # cannot produce authoritative Product Contract evidence.
+          gh workflow run aa-self-proving-qualification.yml \
             --ref main \
-            -f mode=qualification \
-            -f capability_number=6 \
-            -f qualification_number=7 \
             -f required_sha="$REQUIRED_SHA"
-          echo "dispatched Product Contract qualification #7 at $REQUIRED_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "dispatched repository-owned AA self-proving qualification at $REQUIRED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record dispatch on qualification tracker
-        if: steps.readiness.outputs.status == 'ready'
+      - name: Record manual relay on qualification tracker
+        if: steps.readiness.outputs.status == 'ready' && github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           REQUIRED_SHA: ${{ steps.sha.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh issue comment 7 --body "Product Contract qualification dispatched automatically for exact current main \`$REQUIRED_SHA\` (capability #6, qualification #7). The qualification tracker remains validation-only; PASS is valid only for this exact SHA."
+          gh issue comment 7 --body "Repository-owned AA self-proving qualification dispatched for exact current main \`$REQUIRED_SHA\`. Generic no-secret qualification workers are non-authoritative for AA."
