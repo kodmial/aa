@@ -1,23 +1,24 @@
-"""P0 kodmial/aa#198 regression: repair Gate C live-path-failed.
+"""P0 kodmial/aa#200 regression: repair Gate C live-path-failed.
 
-Live evidence on exact main 8f9ed2a (run 37598043365) showed the
+Live evidence on exact main d615df5 (run 37602056194) showed the
 live-telegram-evidence lane failing with the concrete component signature:
 
-- live-answer-no-generic-collapse (14 generic clarifications of 14 turns),
+- live-delivery-unsupported-out-of-book-timeout (one held-out turn never
+  delivered within the per-turn wait),
+- live-answer-no-generic-collapse (11 generic clarifications),
 - live-answer-diversity (distinct replies below the diversity floor),
-- live-text-max-over-budget (max 54.8s over the 30s hard budget),
+- live-delivery-sendmessage-observed (delivered count below 16 scenarios),
 
-with stage outcomes planner ``ok`` 13/14, retrieval ``evidence-ready``
-13/14, answer ``clarification`` 14/14, and verifier ``unavailable`` 13/14
-while every agent served the configured fallback on the same path. The
-verifier still attempted native structured output first on the fallback
-path (a slow doomed round-trip per unit) and a single weak-model
-non-compliant text reply collapsed the turn without a second bounded
-attempt. The verifier therefore goes directly to the bounded text path
-when the shared primary circuit is already open, and retries the text
-path at most once on strict-validation failure. Grounding stays strict
-(every attempt is Pydantic-validated); provider 429 never retries.
-Product Contract #110 stays immutable; no exact-question special cases.
+with stage outcomes planner ``ok`` 8, retrieval ``evidence-ready`` 8,
+answer ``clarification`` 9 vs ``narrowed-supported`` 1, and verifier
+``unavailable`` 9 vs ``unsupported`` 1 while every agent served the
+configured fallback on the same path. A single text validation retry
+(#198, two bounded attempts) still left most fallback turns unavailable:
+the weak fallback path needs a second bounded text retry (three attempts
+total) before failing closed. Grounding stays strict (every attempt is
+Pydantic-validated); provider errors including 429 never retry and
+propagate for runner retire/restart. Product Contract #110 stays
+immutable; no exact-question special cases.
 """
 
 from __future__ import annotations
@@ -116,39 +117,15 @@ class _AdapterScriptedClient:
         return outcome
 
 
-async def test_fallback_path_skips_structured_proactively() -> None:
-    """An open primary circuit sends the verifier directly to text."""
+async def test_two_invalid_then_valid_serves_on_third_attempt() -> None:
+    """Two non-compliant replies get a third bounded attempt and serve."""
     pack = [_pack_entry()]
     units = split_response_units("Поддержка рядом помогает.")
     assert len(units) == 1
     client = _AdapterScriptedClient(
-        structured_outcomes=[
-            {"requires_book_evidence": True, "supported": True, "evidence_passage_ids": ["p1"]}
-        ],
-        text_outcomes=[_decision_json(pack[0]["passage_id"])],
-    )
-    model = OpenCodeChatModel(
-        client,  # type: ignore[arg-type]
-        agent="aa-verifier-v2",
-        primary_model=PRIMARY,
-        fallback_model=FALLBACK,
-    )
-    # Simulate a rejected primary already serving via fallback: later
-    # verifier units must not burn a doomed structured round-trip.
-    model._record_primary_rejection()
-    result = await run_verifier(units, pack, model=model)
-    assert result.all_required_supported is True
-    assert client.structured_calls == 0
-    assert client.text_calls == 1
-
-
-async def test_text_validation_failure_retries_once_and_serves() -> None:
-    """One non-compliant text reply retries once before failing closed."""
-    pack = [_pack_entry()]
-    units = split_response_units("Поддержка рядом помогает.")
-    client = _AdapterScriptedClient(
         text_outcomes=[
             "Конечно, постараюсь помочь.",
+            "просто текст без json",
             _decision_json(pack[0]["passage_id"]),
         ],
     )
@@ -163,18 +140,11 @@ async def test_text_validation_failure_retries_once_and_serves() -> None:
     verifier_module.mark_structured_unavailable(model)
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
-    assert client.text_calls == 2
+    assert client.text_calls == 3
 
 
-async def test_double_invalid_text_still_fails_closed() -> None:
-    """Three non-compliant text replies fail closed without a fourth attempt.
-
-    Bound updated by Gate C live repair kodmial/aa#200 (run 37602056194:
-    verifier ``unavailable`` 9/10 on the weak fallback with a single
-    retry still collapsing turns): the text path now retries at most
-    twice (three bounded attempts); grounding stays strict because every
-    attempt is Pydantic-validated and provider errors never retry.
-    """
+async def test_three_invalid_text_fails_closed_bounded() -> None:
+    """Three non-compliant replies fail closed with exactly three calls."""
     pack = [_pack_entry()]
     units = split_response_units("Поддержка рядом помогает.")
     client = _AdapterScriptedClient(
@@ -212,16 +182,18 @@ async def test_double_invalid_text_still_fails_closed() -> None:
     assert model.text_calls == 3
 
 
-async def test_text_429_never_retries() -> None:
-    """Provider 429 on the text path propagates without a retry."""
+async def test_text_429_on_retry_never_retries_further() -> None:
+    """Provider 429 on a retry attempt propagates without further retries."""
     pack = [_pack_entry()]
     units = split_response_units("Поддержка рядом помогает.")
 
-    class _RatelimitedTextModel:
+    class _ValidationThenRatelimitModel:
         agent = "aa-verifier-v2"
         primary_model = PRIMARY
         fallback_model = FALLBACK
-        text_calls = 0
+
+        def __init__(self) -> None:
+            self.text_calls = 0
 
         async def ainvoke_structured(  # pragma: no cover - never used
             self,
@@ -234,13 +206,15 @@ async def test_text_429_never_retries() -> None:
             raise AssertionError("unreachable")
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
-            type(self).text_calls += 1
+            self.text_calls += 1
+            if self.text_calls == 1:
+                return "просто текст без json"
             raise OpenCodeRateLimitError("opencode request rate-limited: http=429")
 
-    model = _RatelimitedTextModel()
+    model = _ValidationThenRatelimitModel()
     from aa.conversation import verifier as verifier_module
 
     verifier_module.mark_structured_unavailable(model)
     with pytest.raises(OpenCodeRateLimitError):
         await run_verifier(units, pack, model=model)
-    assert _RatelimitedTextModel.text_calls == 1
+    assert model.text_calls == 2

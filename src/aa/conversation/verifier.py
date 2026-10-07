@@ -766,41 +766,41 @@ async def _verify_single_unit(
     pathology). When the shared primary circuit is already open (live
     fallback path serving after a primary rejection) the structured
     attempt is skipped proactively for the same reason. The text path
-    itself retries at most once on strict-validation failure so one
-    weak-model non-compliant reply does not collapse the turn to
-    verifier-unavailable without a second bounded attempt; grounding
-    stays strict because every attempt is fully Pydantic-validated.
-    This stays inside the one concurrent per-unit round (no
-    extra verifier round, no planner/retrieval/answer rerun). Provider 429
-    always propagates immediately for runner retire/restart.
+    itself retries at most twice on strict-validation failure so two
+    weak-model non-compliant replies do not collapse the turn to
+    verifier-unavailable without a third bounded attempt (Gate C live
+    repair kodmial/aa#200: run 37602056194 served the weak fallback on
+    every agent with verifier ``unavailable`` 9/10, answer
+    ``clarification`` 9/10, generic collapse, diversity failure and one
+    delivery timeout; a single retry still left most turns unavailable);
+    grounding stays strict because every attempt is fully
+    Pydantic-validated. This stays inside the one concurrent per-unit
+    round (no extra verifier round, no planner/retrieval/answer rerun).
+    Provider 429 always propagates immediately for runner retire/restart.
     """
 
     async def _text_decision() -> UnitVerdict:
-        try:
-            text_reply = await _ainvoke_verifier_text(
-                model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
-            )
-            data = parse_text_json_decision(text_reply)
-            return coerce_single_verdict(
-                data, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
-            )
-        except VerifierValidationError:
-            # One weak-model non-compliant text reply (prose instead of
-            # JSON, wrong keys/types, unknown passage ids): retry once
-            # with the same bounded prompt before failing closed. Only
-            # validation failures retry here; provider errors (including
-            # 429) propagate immediately and never retry.
-            logger.info("verifier text validation retry used")
-            text_retry = await _ainvoke_verifier_text(
-                model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
-            )
-            retry_data = parse_text_json_decision(text_retry)
-            return coerce_single_verdict(
-                retry_data,
-                unit_id=unit.unit_id,
-                short_to_full=short_to_full,
-                full_ids=full_ids,
-            )
+        for attempt in range(3):
+            try:
+                text_reply = await _ainvoke_verifier_text(
+                    model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
+                )
+                data = parse_text_json_decision(text_reply)
+                return coerce_single_verdict(
+                    data, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
+                )
+            except VerifierValidationError:
+                # Weak-model non-compliant text replies (prose instead of
+                # JSON, wrong keys/types, unknown passage ids): retry at
+                # most twice with the same bounded prompt before failing
+                # closed. Only validation failures retry here; provider
+                # errors (including 429) propagate immediately and never
+                # retry.
+                if attempt < 2:
+                    logger.info("verifier text validation retry used")
+                    continue
+                raise
+        raise VerifierValidationError("verifier text output is not valid JSON")
 
     system_text = load_verifier_system_v2()
     user_text = build_single_unit_text(unit=unit, passages=passages)
