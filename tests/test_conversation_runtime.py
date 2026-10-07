@@ -737,8 +737,14 @@ def test_product_contract_dispatch_targets_exact_main_issue7() -> None:
     assert "branches" in workflow and "main" in workflow
     assert "Verify exact current main identity" in workflow
     assert "refs/remotes/origin/main" in workflow
-    assert "capability_number=6" in workflow
-    assert "qualification_number=7" in workflow
+    # Repository-owned qualification (issue #146): the dispatch relays only
+    # to aa-self-proving-qualification.yml with the exact main SHA. The
+    # generic continuum-opencode.yml capability/qualification inputs are
+    # intentionally absent.
+    assert "aa-self-proving-qualification.yml" in workflow
+    assert "continuum-opencode.yml" not in workflow
+    assert "capability_number=6" not in workflow
+    assert "qualification_number=7" not in workflow
     assert "required_sha" in workflow
     assert "verify_product_contract_qualification.py" in workflow
     assert "not-activated" in workflow
