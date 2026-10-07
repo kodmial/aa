@@ -912,23 +912,72 @@ async def _verify_per_unit_concurrent(
 
     Exactly one concurrent round. Deterministic cite/quote/checksum gates
     run on the assembled result, so grounding strictness is unchanged.
-    Errors propagate fail-closed; provider 429 always propagates for
-    runner retire/restart.
+    A non-429 failure in one unit fails only that unit closed and preserves
+    independently verified units for deterministic narrowing. Provider 429
+    always propagates for runner retire/restart.
     """
     import asyncio as _asyncio
 
     prefer_text_snapshot = _verifier_prefers_text(model)
-    verdicts = await _asyncio.gather(
+    raw_results = await _asyncio.gather(
         *(
             _verify_single_unit(
                 unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
             )
             for unit in units
-        )
+        ),
+        return_exceptions=True,
     )
+
+    # A single provider/format failure must not discard independently
+    # verified units from the same draft. Failed units are represented as
+    # deterministic unsupported book claims, so they can never cross the
+    # product boundary; successfully verified units remain eligible for
+    # deterministic narrowing. Provider 429 is different: the whole runner
+    # must retire/restart and therefore always propagates.
+    for item in raw_results:
+        if isinstance(item, OpenCodeRateLimitError):
+            raise item
+
+    verdicts: list[UnitVerdict] = []
+    unavailable_unit_ids: list[str] = []
+    first_unavailable: BaseException | None = None
+    for unit, item in zip(units, raw_results, strict=True):
+        if isinstance(item, BaseException):
+            if first_unavailable is None:
+                first_unavailable = item
+            unavailable_unit_ids.append(unit.unit_id)
+            verdicts.append(
+                UnitVerdict(
+                    unit_id=unit.unit_id,
+                    scope="book",
+                    supported=False,
+                    evidence_passage_ids=[],
+                )
+            )
+            logger.info(
+                "verifier unit unavailable; failing only that unit closed",
+                extra={"category": type(item).__name__},
+            )
+        else:
+            verdicts.append(item)
+
+    # If every unit failed at the provider/format boundary there is no
+    # verified material to salvage. Preserve the historical unavailable
+    # signal so Gate C can attribute a total verifier outage correctly.
+    if unavailable_unit_ids and len(unavailable_unit_ids) == len(units):
+        assert first_unavailable is not None
+        raise first_unavailable
+
     ordered = sorted(verdicts, key=lambda verdict: verdict.unit_id)
-    all_supported = all(verdict.supported for verdict in ordered)
-    assembled = GroundingResult(units=list(ordered), all_required_supported=all_supported)
+    all_supported = (
+        not unavailable_unit_ids and all(verdict.supported for verdict in ordered)
+    )
+    assembled = GroundingResult(
+        units=list(ordered),
+        all_required_supported=all_supported,
+        unavailable_unit_ids=unavailable_unit_ids,
+    )
     result = validate_grounding_result(
         assembled, expected_unit_ids=[unit.unit_id for unit in units]
     )
