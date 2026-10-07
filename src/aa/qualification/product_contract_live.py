@@ -252,12 +252,30 @@ def working_tree_clean(repo_root: Path | None = None) -> bool:
     return all(path in ignored for path in untracked_real)
 
 
+def _subtree_holds_text(value: Any) -> bool:
+    """Whether a value subtree holds any string (fail-closed text signal).
+
+    Structural metric maps use stage names such as ``answer`` as keys with
+    numeric-only values (for example ``stage_latency_ms["answer"]``). Such
+    numeric-only subtrees carry no user/corpus text and must not trip the
+    privacy guard. Any string anywhere under a forbidden key stays a leak.
+    """
+    if isinstance(value, (str, bytes)):
+        return True
+    if isinstance(value, dict):
+        return any(_subtree_holds_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_subtree_holds_text(item) for item in value)
+    return False
+
+
 def assert_no_text_leak(payload: Any, owner: str = "live-summary") -> None:
     """Reject forbidden text-carrying keys in public summaries."""
     if isinstance(payload, dict):
         for key, value in payload.items():
             if str(key).lower() in FORBIDDEN_SUMMARY_KEYS:
-                raise ProductContractLiveError(f"{owner}: forbidden key {key!r}")
+                if _subtree_holds_text(value):
+                    raise ProductContractLiveError(f"{owner}: forbidden key {key!r}")
             assert_no_text_leak(value, f"{owner}.{key}")
     elif isinstance(payload, list):
         for index, item in enumerate(payload):

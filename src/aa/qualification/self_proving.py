@@ -276,12 +276,30 @@ def validate_hex64(value: str) -> str:
     return normalized
 
 
+def _subtree_holds_text(value: Any) -> bool:
+    """Whether a value subtree holds any string (fail-closed text signal).
+
+    Structural metric maps use stage names such as ``answer`` as keys with
+    numeric-only values. Such numeric-only subtrees carry no user/corpus text
+    and must not trip the privacy guard. Any string under a forbidden key
+    stays a leak.
+    """
+    if isinstance(value, (str, bytes)):
+        return True
+    if isinstance(value, dict):
+        return any(_subtree_holds_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_subtree_holds_text(item) for item in value)
+    return False
+
+
 def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
     """Reject user/corpus-text-carrying keys in public evidence."""
     if isinstance(payload, dict):
         for key, value in payload.items():
             if str(key).lower() in FORBIDDEN_EVIDENCE_KEYS:
-                raise SelfProvingError(f"{owner}: forbidden key {key!r}")
+                if _subtree_holds_text(value):
+                    raise SelfProvingError(f"{owner}: forbidden key {key!r}")
             assert_no_text_leak(value, f"{owner}.{key}")
     elif isinstance(payload, list):
         for index, item in enumerate(payload):
