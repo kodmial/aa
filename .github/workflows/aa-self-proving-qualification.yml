@@ -703,6 +703,21 @@ jobs:
             const sha = process.env.FAILED_SHA || context.sha;
             const runId = String(context.runId);
             const transientBlocked = fs.existsSync('self-proving-out/transient-blocked.json');
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
             let component = 'unknown';
@@ -806,22 +821,26 @@ jobs:
               'This issue is generated and refreshed automatically; the same stable failure series reopens this issue instead of creating another one.',
             ].join('\n');
             if (existing) {
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: existing.number,
-                state: 'open',
-                title,
-                body,
-                labels: ['priority:p0', 'automation:ready'],
-              });
+              await apiRetry('refresh self-proving repair issue', () =>
+                github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: existing.number,
+                  state: 'open',
+                  title,
+                  body,
+                  labels: ['priority:p0', 'automation:ready'],
+                })
+              );
               core.warning(
                 `Reopened self-proving repair issue #${existing.number}; recurrence=${recurrence} fingerprint=${fingerprint}.`
               );
             } else {
-              const created = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
-              });
+              const created = await apiRetry('create self-proving repair issue', () =>
+                github.rest.issues.create({
+                  owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
+                })
+              );
               core.info(
                 `Created self-proving repair issue #${created.data.number}; fingerprint=${fingerprint}.`
               );
@@ -833,9 +852,11 @@ jobs:
             // issue undispatched for roughly an hour. This is the supported
             // recursion-safe wake-up; never use a PAT merely to manufacture
             // event fan-out.
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
-            });
+            await apiRetry('wake issue scheduler', () =>
+              github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+              })
+            );
             core.info('Dispatched continuum-issue-scheduler.yml once for the P0 repair issue.');
 
       - name: Publish authoritative Product Contract result
