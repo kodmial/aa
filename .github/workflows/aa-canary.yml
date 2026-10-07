@@ -392,7 +392,7 @@ jobs:
           {
             echo "## AA canary"
             echo
-            echo "- final activation gate: capability #6 and exact-main qualification #7 completed"
+            echo "- activation: bounded current-main canary runs regardless of qualification state"
             echo "- repository verification: executed"
             echo "- real local OpenCode server lifecycle: executed"
             echo "- Gate C smoke (exact production path, scenario families, diversity): executed"
