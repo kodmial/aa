@@ -398,3 +398,32 @@ def test_live_voice_fixture_failure_has_concrete_component() -> None:
     assert "live-voice-raw-transport-accepted" in source
     assert "live-voice-file-fetch-seam" in source
     assert "live-voice-asr-answer-sendvoice" in source
+
+
+def test_privacy_guard_allows_numeric_answer_stage_metrics() -> None:
+    # Gate C repair (run 37691536129): the live lane records per-stage
+    # latency as stage_latency_ms with structural keys planner/retrieval/
+    # answer/verifier/total. The bare "answer" key tripped the text-leak
+    # guard even though its value holds only numbers, so evaluate_live
+    # raised live-summary.lanes[4].metrics.stage_latency_ms: forbidden key
+    # 'answer' and Gate C degraded to BLOCKED live-evidence-required with
+    # no live artifact. Numeric-only subtrees must pass; text must fail.
+    from aa.qualification import self_proving as self_proving_mod
+
+    numeric_stage_metrics = {
+        "stage_latency_ms": {
+            "planner": {"p50": 100.0, "p95": 200.0, "max": 300.0},
+            "retrieval": {"p50": 10.0, "p95": 20.0, "max": 30.0},
+            "answer": {"p50": 50.0, "p95": 60.0, "max": 70.0},
+            "verifier": {"p50": 5.0, "p95": 6.0, "max": 7.0},
+            "total": {"p50": 165.0, "p95": 200.0, "max": 250.0},
+        }
+    }
+    assert_no_text_leak({"metrics": numeric_stage_metrics})
+    self_proving_mod.assert_no_text_leak({"metrics": numeric_stage_metrics})
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak({"answer": "secret reply text"})
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak(numeric_stage_metrics | {"answer": "secret reply text"})
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak({"stage_latency_ms": {"answer": {"p50": 1.0, "note": "leaked text"}}})
