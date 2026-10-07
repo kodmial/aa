@@ -87,6 +87,68 @@ def _escape(value: str) -> str:
     return _xml_escape(value, {"'": "&apos;", '"': "&quot;"})
 
 
+def display_id_map_for_window(window: Sequence[dict[str, Any]]) -> dict[str, str]:
+    """Map short ordinal display ids (``p1``..``pN``) to full passage ids.
+
+    Gate C live repair, run 37556798996: 13/14 ordinary turns collapsed
+    to generic clarification with ``verifier_outcome=unavailable``,
+    diversity fail, and max 50.7s over the 30s budget while every model
+    call served the weak fallback. Stored passage ids are long
+    provenance strings (``section#exp0001``/``section#atom-...``) that a
+    weak model must copy exactly; flaked citations fail
+    ``check_cited_passage_ids`` deterministically (no per-unit retry),
+    so the turn clarifies and the batch + per-unit double slow round
+    burns the latency budget. Short ordinal ids are trivially copyable;
+    the deterministic cite/quote/checksum gates below still validate the
+    resolved full ids against the full stored pack, so grounding
+    strictness is unchanged. Turn-independent, never an exact-question
+    special case. Positions with a missing/empty full id or empty text
+    are skipped here exactly as in the prompt builders below, keeping the
+    display order and the map consistent.
+    """
+    mapping: dict[str, str] = {}
+    position = 0
+    for passage in window:
+        if not isinstance(passage, dict):
+            continue
+        full_id = passage.get("passage_id", "")
+        text = passage.get("text", "")
+        if not isinstance(full_id, str) or not full_id:
+            continue
+        if not isinstance(text, str) or not text:
+            continue
+        position += 1
+        mapping[f"p{position}"] = full_id
+    return mapping
+
+
+def resolve_cited_passage_ids(
+    cited: Sequence[object],
+    *,
+    short_to_full: dict[str, str],
+    full_ids: set[str],
+) -> list[str]:
+    """Resolve model-cited ids to full stored passage ids (fail-closed).
+
+    Short display ids (``p1``..``pN``, surrounding whitespace tolerated)
+    resolve through ``short_to_full``; full stored ids pass through
+    unchanged for back-compat; anything else passes through untouched so
+    the strict cite gate below still rejects it. Never invents ids.
+    """
+    resolved: list[str] = []
+    for item in cited:
+        text = item.strip() if isinstance(item, str) else item
+        if isinstance(text, str) and text in short_to_full:
+            resolved.append(short_to_full[text])
+        elif isinstance(text, str) and text in full_ids:
+            resolved.append(text)
+        elif isinstance(item, str):
+            resolved.append(item.strip())
+        else:
+            resolved.append(str(item))
+    return resolved
+
+
 def build_verifier_user_text(
     *,
     units: Sequence[ResponseUnitDraft],
@@ -108,7 +170,8 @@ def build_verifier_user_text(
     lines: list[str] = [
         "Return one verdict per <unit> in order, copying each id attribute exactly;",
         'scope must be exactly one of "book", "product_meta", "conversation_glue".',
-        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids.",
+        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
+        "passages are numbered p1..pN, cite those short ids.",
         "Set all_required_supported true only when every unit is supported.",
         "<response_units>",
     ]
@@ -118,19 +181,30 @@ def build_verifier_user_text(
     lines.append("<book_evidence>")
     window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
     if window:
+        position = 0
         for passage in window:
-            passage_id = str(passage.get("passage_id", ""))
-            source_id = str(passage.get("source_id", passage.get("source", "")))
-            section_id = str(passage.get("section_id", passage.get("section", "")))
-            text = str(passage.get("text", ""))
-            if not passage_id or not text:
+            if not isinstance(passage, dict):
                 continue
+            raw_id = passage.get("passage_id", "")
+            raw_text = passage.get("text", "")
+            if not isinstance(raw_id, str) or not raw_id:
+                continue
+            if not isinstance(raw_text, str) or not raw_text:
+                continue
+            raw_source = passage.get("source_id", passage.get("source", ""))
+            raw_section = passage.get("section_id", passage.get("section", ""))
+            source_id = raw_source if isinstance(raw_source, str) else ""
+            section_id = raw_section if isinstance(raw_section, str) else ""
+            text = raw_text
+            position += 1
             lines.append(
-                f"<passage id={_xml_quoteattr(passage_id)} "
+                f"<passage id={_xml_quoteattr(f'p{position}')} "
                 f"source={_xml_quoteattr(source_id)} "
                 f"section={_xml_quoteattr(section_id)}>"
                 f"{_escape(_display_passage_text(text))}</passage>"
             )
+        if position == 0:
+            lines.append("(no book evidence supplied for this turn)")
     else:
         lines.append("(no book evidence supplied for this turn)")
     lines.append("</book_evidence>")
@@ -387,7 +461,28 @@ def coerce_grounding_result(
             logger.info("verifier ids remapped by order", extra={"units": len(expected)})
     else:
         raise VerifierValidationError("verifier output is not a structured object")
+    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    short_to_full = display_id_map_for_window(window)
     pack_ids = set(_pack_index(passages).keys())
+    if short_to_full:
+        translated_units: list[UnitVerdict] = []
+        for verdict in result.units:
+            translated_units.append(
+                UnitVerdict(
+                    unit_id=verdict.unit_id,
+                    scope=verdict.scope,
+                    supported=verdict.supported,
+                    evidence_passage_ids=resolve_cited_passage_ids(
+                        list(verdict.evidence_passage_ids),
+                        short_to_full=short_to_full,
+                        full_ids=pack_ids,
+                    ),
+                )
+            )
+        result = GroundingResult(
+            units=translated_units,
+            all_required_supported=result.all_required_supported,
+        )
     check_passage_checksums(passages)
     check_cited_passage_ids(result, pack_ids=pack_ids)
     check_exact_quotes(units=units, result=result, passages=passages)
@@ -417,7 +512,8 @@ def build_single_unit_text(
     lines: list[str] = [
         "Judge exactly one response unit below.",
         'scope must be exactly one of "book", "product_meta", "conversation_glue".',
-        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids.",
+        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
+        "passages are numbered p1..pN, cite those short ids.",
         "A book unit that cites no evidence passage is unsupported.",
         "<response_unit>",
         _escape(unit.text),
@@ -426,27 +522,49 @@ def build_single_unit_text(
     ]
     window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
     if window:
+        position = 0
         for passage in window:
-            passage_id = str(passage.get("passage_id", ""))
-            source_id = str(passage.get("source_id", passage.get("source", "")))
-            section_id = str(passage.get("section_id", passage.get("section", "")))
-            text = str(passage.get("text", ""))
-            if not passage_id or not text:
+            if not isinstance(passage, dict):
                 continue
+            raw_id = passage.get("passage_id", "")
+            raw_text = passage.get("text", "")
+            if not isinstance(raw_id, str) or not raw_id:
+                continue
+            if not isinstance(raw_text, str) or not raw_text:
+                continue
+            raw_source = passage.get("source_id", passage.get("source", ""))
+            raw_section = passage.get("section_id", passage.get("section", ""))
+            source_id = raw_source if isinstance(raw_source, str) else ""
+            section_id = raw_section if isinstance(raw_section, str) else ""
+            text = raw_text
+            position += 1
             lines.append(
-                f"<passage id={_xml_quoteattr(passage_id)} "
+                f"<passage id={_xml_quoteattr(f'p{position}')} "
                 f"source={_xml_quoteattr(source_id)} "
                 f"section={_xml_quoteattr(section_id)}>"
                 f"{_escape(_display_passage_text(text))}</passage>"
             )
+        if position == 0:
+            lines.append("(no book evidence supplied for this turn)")
     else:
         lines.append("(no book evidence supplied for this turn)")
     lines.append("</book_evidence>")
     return "\n".join(lines)
 
 
-def coerce_single_verdict(data: object, *, unit_id: str) -> UnitVerdict:
-    """Validate one single-unit verdict and bind it to ``unit_id``."""
+def coerce_single_verdict(
+    data: object,
+    *,
+    unit_id: str,
+    short_to_full: dict[str, str] | None = None,
+    full_ids: set[str] | None = None,
+) -> UnitVerdict:
+    """Validate one single-unit verdict and bind it to ``unit_id``.
+
+    Short display ids (``p1``..``pN``) resolve to full stored passage ids
+    before validation so the strict cite gate below sees full ids; full
+    stored ids pass through unchanged and unknown ids still fail closed.
+    """
     from pydantic import ValidationError as PydanticValidationError
 
     if not isinstance(data, dict):
@@ -457,9 +575,15 @@ def coerce_single_verdict(data: object, *, unit_id: str) -> UnitVerdict:
         payload["scope"] = scope.strip().lower().replace("-", "_")
     evidence_ids = payload.get("evidence_passage_ids")
     if isinstance(evidence_ids, list):
-        payload["evidence_passage_ids"] = [
-            item.strip() if isinstance(item, str) else item for item in evidence_ids
-        ]
+        stripped = [item.strip() if isinstance(item, str) else item for item in evidence_ids]
+        if short_to_full:
+            payload["evidence_passage_ids"] = resolve_cited_passage_ids(
+                stripped,
+                short_to_full=short_to_full,
+                full_ids=full_ids or set(),
+            )
+        else:
+            payload["evidence_passage_ids"] = stripped
     payload["unit_id"] = unit_id
     try:
         return UnitVerdict.model_validate(payload)
@@ -476,6 +600,9 @@ async def _verify_single_unit(
     """Verify exactly one unit with the minimal single-verdict schema."""
     system_text = load_verifier_system_v2()
     user_text = build_single_unit_text(unit=unit, passages=passages)
+    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    short_to_full = display_id_map_for_window(window)
+    full_ids = set(_pack_index(passages).keys())
     structured_invoke = getattr(model, "ainvoke_structured", None)
     if callable(structured_invoke):
         raw = await structured_invoke(
@@ -486,14 +613,18 @@ async def _verify_single_unit(
         )
         if not isinstance(raw, dict):
             raise VerifierValidationError("verifier output is not a structured object")
-        return coerce_single_verdict(raw, unit_id=unit.unit_id)
+        return coerce_single_verdict(
+            raw, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
+        )
     reply = await model.ainvoke(
         [SystemMessage(content=system_text), HumanMessage(content=user_text)]
     )
     content = _reply_structured_content(reply)
     if isinstance(content, str):
         raise VerifierValidationError("verifier output is not a structured object")
-    return coerce_single_verdict(content, unit_id=unit.unit_id)
+    return coerce_single_verdict(
+        content, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
+    )
 
 
 async def _verify_per_unit_concurrent(
@@ -614,5 +745,7 @@ __all__ = [
     "check_passage_checksums",
     "coerce_grounding_result",
     "coerce_single_verdict",
+    "display_id_map_for_window",
+    "resolve_cited_passage_ids",
     "run_verifier",
 ]

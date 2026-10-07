@@ -1477,7 +1477,12 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
         for i in range(12)
     ]
     user_text = build_verifier_user_text(units=units, passages=passages)
-    assert "chapter-3#exp0007" in user_text
+    # Short ordinal display ids keep the window bounded and copyable; long
+    # provenance ids never enter the prompt (Gate C run 37556798996).
+    assert 'id="p1"' in user_text
+    assert 'id="p8"' in user_text
+    assert 'id="p9"' not in user_text
+    assert "chapter-3#exp0007" not in user_text
     assert "chapter-3#exp0008" not in user_text
     assert "chapter-3#exp0011" not in user_text
     assert len(passages) == 12
@@ -1824,6 +1829,129 @@ def test_verifier_display_truncates_long_passages_but_checks_full_pack() -> None
     units = split_response_units("Понимаю. Тяга проходит.")
     user_text = build_verifier_user_text(units=units, passages=pack)
     assert long_text not in user_text
-    assert pack[0]["passage_id"] in user_text
+    # Short display ids enter the prompt; the long provenance id resolves
+    # only in AA-side validation against the full stored pack.
+    assert 'id="p1"' in user_text
+    assert pack[0]["passage_id"] not in user_text
     # Full-pack checks still see the untruncated stored text.
     assert pack[0]["text"] == long_text
+
+
+def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
+    """Gate C repair (run 37556798996): short ids are copyable and strict.
+
+    Stored passage ids are long provenance strings that a weak fallback
+    model flakes copying, so citing them fails the strict cite gate and
+    the turn clarifies (13/14 clarifications, diversity fail, max 50.7s
+    over budget). The prompt carries short ``p1``..``pN`` ids; AA code
+    resolves them to full ids before the unchanged strict cite/quote/
+    checksum gates. Turn-independent, never an exact-question special
+    case.
+    """
+    from aa.conversation.verifier import display_id_map_for_window
+
+    pack = [
+        _pack_entry(passage_id="chapter-3#exp0000"),
+        _pack_entry(passage_id="chapter-7#atom-abc123"),
+    ]
+    units = split_response_units("Поддержка рядом помогает разбирать тягу.")
+    assert len(units) == 1
+    user_text = build_verifier_user_text(units=units, passages=pack)
+    assert 'id="p1"' in user_text
+    assert 'id="p2"' in user_text
+    assert "chapter-3#exp0000" not in user_text
+    assert "chapter-7#atom-abc123" not in user_text
+
+    window_map = display_id_map_for_window(pack[:8])
+    assert window_map == {"p1": "chapter-3#exp0000", "p2": "chapter-7#atom-abc123"}
+
+    # A weak-model verdict citing short ids validates to full stored ids.
+    result = coerce_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": ["p1"],
+                }
+            ],
+            "all_required_supported": True,
+        },
+        units=units,
+        passages=pack,
+    )
+    assert result.units[0].evidence_passage_ids == ["chapter-3#exp0000"]
+
+    # Full stored ids stay accepted (back-compat with exact copiers).
+    back_compat = coerce_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": ["chapter-7#atom-abc123"],
+                }
+            ],
+            "all_required_supported": True,
+        },
+        units=units,
+        passages=pack,
+    )
+    assert back_compat.units[0].evidence_passage_ids == ["chapter-7#atom-abc123"]
+
+    # Unknown short ids still fail closed (never invented).
+    with pytest.raises(VerifierValidationError):
+        coerce_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "u1",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": ["p9"],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            units=units,
+            passages=pack,
+        )
+
+
+def test_verifier_single_unit_short_ids_resolve() -> None:
+    """Single-unit fallback resolves short ids with the same strictness."""
+    from aa.conversation.verifier import build_single_unit_text, coerce_single_verdict
+
+    pack = [_pack_entry(passage_id="chapter-3#exp0000")]
+    units = split_response_units("Поддержка рядом помогает.")
+    text = build_single_unit_text(unit=units[0], passages=pack)
+    assert 'id="p1"' in text
+    assert "chapter-3#exp0000" not in text
+
+    verdict = coerce_single_verdict(
+        {"scope": "book", "supported": True, "evidence_passage_ids": ["p1"]},
+        unit_id="u1",
+        short_to_full={"p1": "chapter-3#exp0000"},
+        full_ids={"chapter-3#exp0000"},
+    )
+    assert verdict.unit_id == "u1"
+    assert verdict.evidence_passage_ids == ["chapter-3#exp0000"]
+
+    with pytest.raises(VerifierValidationError):
+        coerce_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "u1",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": ["p2"],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            units=units,
+            passages=pack,
+        )
