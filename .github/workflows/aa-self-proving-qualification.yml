@@ -28,11 +28,11 @@ on:
       - "opencode.json"
       - "corpus/**"
       - "qualification/**"
-      - "scripts/run_self_proving_qualification.py"
-      - "scripts/verify_product_contract_qualification.py"
+      - "scripts/**"
       - "tests/**"
-      - ".github/workflows/aa-product-contract-qualification-dispatch.yml"
-      - ".github/workflows/aa-self-proving-qualification.yml"
+      - "pyproject.toml"
+      - ".github/workflows/aa-*.yml"
+      - ".github/workflows/continuum-*.yml"
   workflow_dispatch:
     inputs:
       required_sha:
