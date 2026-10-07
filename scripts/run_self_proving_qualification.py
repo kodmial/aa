@@ -1247,98 +1247,26 @@ def _gate_c_live_evidence(
                 latencies,
                 None,
             )
-        # Product-contract lane evidence: the exact production conversation
-        # path (synthetic Updates at the production adapter boundary) must
-        # have no failed lane. Lanes may additionally carry INCOMPLETE live-
-        # network sublanes (real Telegram dialing deferred to Gate D); those
-        # are accepted only as the exact deferred markers below, every lane
-        # must carry multiple explicit production checks, and nothing may
-        # have failed. A single trivial passed check never yields PASS.
-        status = str(payload.get("status", ""))
+        # LiveSummary evidence: Gate C owns only the exact live production
+        # conversation lane. The aggregate summary also contains deterministic
+        # transport, runtime-control and voice/resource lanes whose failures
+        # belong to B/D/E. Never let a foreign lane poison Gate C and start
+        # another misclassified repair loop.
         lanes = payload.get("lanes", [])
-        if isinstance(lanes, list) and lanes and status in ("PASS", "INCOMPLETE"):
-            lane_failures = [
+        real_latencies = _live_real_latencies_from_product_summary(payload) or []
+        aggregate = _live_aggregate_slo_from_product_summary(payload)
+        if not isinstance(lanes, list):
+            lanes = []
+        live_lane = next(
+            (
                 lane
                 for lane in lanes
-                if not isinstance(lane, dict) or lane.get("status") not in ("PASS", "INCOMPLETE")
-            ]
-            aggregate = _live_aggregate_slo_from_product_summary(payload)
-            real_latencies = _live_real_latencies_from_product_summary(payload) or []
-            if lane_failures:
-                return (
-                    GateEvidence(
-                        gate="C",
-                        status="FAIL",
-                        sha=expected_sha,
-                        product_fingerprint=product,
-                        runtime_fingerprint=runtime,
-                        failure_category="live-path-failed",
-                        component="live-production-path",
-                        run_id=run_id,
-                        live_trusted=True,
-                        mocked_only=False,
-                        detail="live-lane-failed"[:160],
-                    ),
-                    real_latencies,
-                    aggregate,
-                )
-            complete = True
-            for lane in lanes:
-                assert isinstance(lane, dict)
-                passed = lane.get("passed", [])
-                incomplete = lane.get("incomplete", [])
-                if not _lane_has_production_checks(passed):
-                    complete = False
-                    break
-                if isinstance(incomplete, list):
-                    for item in incomplete:
-                        if not isinstance(item, str) or item not in _ALLOWED_GATE_C_DEFERRED:
-                            complete = False
-                            break
-                    if not complete:
-                        break
-                else:
-                    complete = False
-                    break
-            # The union of passed checks must prove the production pipeline
-            # stages (planner/retrieval/answer-verifier/delivery) with
-            # distinct evidence per stage; otherwise an INCOMPLETE summary
-            # with trivial passes could be promoted. Groups are disjoint
-            # (see _STAGE_GROUPS) and each group must be satisfied by a
-            # distinct passed check name, so one token (e.g. ``rrf``)
-            # cannot satisfy two stages.
-            if complete:
-                names = [
-                    str(item).lower()
-                    for lane in lanes
-                    if isinstance(lane, dict)
-                    for item in (lane.get("passed", []) or [])
-                    if isinstance(item, str) and str(item).strip()
-                ]
-                if not _union_has_distinct_stage_cover(names):
-                    complete = False
-                # Trusted Gate C PASS additionally requires explicit proof
-                # that at least one live lane entered through raw Bot API
-                # Update JSON at the production PollingTelegramTransport
-                # boundary. Direct Application.respond() evidence is invalid.
-                if "live-raw-telegram-transport-boundary" not in names:
-                    complete = False
-            if complete:
-                return (
-                    GateEvidence(
-                        gate="C",
-                        status="PASS",
-                        sha=expected_sha,
-                        product_fingerprint=product,
-                        runtime_fingerprint=runtime,
-                        component="live-production-path",
-                        run_id=run_id,
-                        live_trusted=True,
-                        mocked_only=False,
-                    ),
-                    real_latencies,
-                    aggregate,
-                )
+                if isinstance(lane, dict)
+                and str(lane.get("lane", "")) == "live-telegram-evidence"
+            ),
+            None,
+        )
+        if live_lane is None:
             return (
                 GateEvidence(
                     gate="C",
@@ -1350,14 +1278,54 @@ def _gate_c_live_evidence(
                     component="live-production-path",
                     run_id=run_id,
                     mocked_only=False,
-                    detail="live-lane-incomplete"[:64],
+                    detail="missing-live-telegram-evidence-lane",
                 ),
                 real_latencies,
                 aggregate,
             )
-        if status in ("FAIL",):
-            real_latencies = _live_real_latencies_from_product_summary(payload) or []
-            aggregate = _live_aggregate_slo_from_product_summary(payload)
+
+        lane_status = str(live_lane.get("status", "")).upper()
+        passed = [
+            str(item)
+            for item in (live_lane.get("passed", []) or [])
+            if isinstance(item, str)
+        ]
+        failed = [
+            str(item)
+            for item in (live_lane.get("failed", []) or [])
+            if isinstance(item, str)
+        ]
+        incomplete = [
+            str(item)
+            for item in (live_lane.get("incomplete", []) or [])
+            if isinstance(item, str)
+        ]
+        required_checks = {
+            "live-raw-telegram-transport-boundary",
+            "live-answer-no-generic-collapse",
+            "live-answer-diversity",
+            "live-actual-served-model-identity",
+            "live-planner-retrieval-answer-verifier-telemetry",
+        }
+
+        if lane_status == "PASS" and required_checks.issubset(set(passed)):
+            return (
+                GateEvidence(
+                    gate="C",
+                    status="PASS",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    component="live-production-path",
+                    run_id=run_id,
+                    live_trusted=True,
+                    mocked_only=False,
+                ),
+                real_latencies,
+                aggregate,
+            )
+        if lane_status == "FAIL":
+            category = failed[0] if failed else "live-path-failed"
             return (
                 GateEvidence(
                     gate="C",
@@ -1365,16 +1333,33 @@ def _gate_c_live_evidence(
                     sha=expected_sha,
                     product_fingerprint=product,
                     runtime_fingerprint=runtime,
-                    failure_category="live-path-failed",
+                    failure_category=category[:96],
                     component="live-production-path",
                     run_id=run_id,
                     live_trusted=True,
                     mocked_only=False,
-                    detail="live-lane-failed"[:160],
+                    detail="live-telegram-evidence-failed",
                 ),
                 real_latencies,
                 aggregate,
             )
+        detail = incomplete[0] if incomplete else "live-evidence-incomplete"
+        return (
+            GateEvidence(
+                gate="C",
+                status="BLOCKED",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category="live-evidence-incomplete",
+                component="live-production-path",
+                run_id=run_id,
+                mocked_only=False,
+                detail=detail[:160],
+            ),
+            real_latencies,
+            aggregate,
+        )
     return None
 
 
