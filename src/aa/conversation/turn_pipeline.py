@@ -169,6 +169,16 @@ def keep_supported_text(units: Sequence[ResponseUnitDraft], result: GroundingRes
     return " ".join(kept).strip()
 
 
+def has_supported_book_unit(result: GroundingResult | None) -> bool:
+    """Whether a failed/partial draft retains substantive grounded material."""
+    if result is None:
+        return False
+    return any(
+        verdict.scope == "book" and bool(verdict.supported)
+        for verdict in result.units
+    )
+
+
 def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
     """Serialize a verifier outcome into graph state (no prompt text)."""
     if result is None:
@@ -671,8 +681,14 @@ async def run_v2_answer_turn(
 
     # Repair budget exhausted: narrow to supported material or clarify.
     narrowed = keep_supported_text(units, result) if units else ""
+    substantive_narrowing_ok = (
+        initial_query_count is None
+        or initial_query_count == 0
+        or has_supported_book_unit(result)
+    )
     if (
         narrowed
+        and substantive_narrowing_ok
         and contains_cyrillic(narrowed)
         and not leaks_internal_terms(narrowed)
         and envelope_passes(narrowed)
@@ -843,6 +859,7 @@ __all__ = [
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",
+    "has_supported_book_unit",
     "keep_supported_text",
     "leaks_internal_terms",
     "merge_pack_dicts",
