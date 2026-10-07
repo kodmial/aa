@@ -735,6 +735,7 @@ jobs:
             let stageTimingLine = 'Stage timings: unavailable.';
             let verifierLine = 'Verifier availability: unavailable.';
             let transportTimingLine = 'OpenCode request timings: unavailable.';
+            let tokenUsageLine = 'Model token usage: unavailable.';
             let modelPathLine = 'Served models: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
@@ -801,6 +802,16 @@ jobs:
               if (requestRendered.length) {
                 transportTimingLine = 'OpenCode request timings: ' + requestRendered.join('; ') + '.';
               }
+              const tokenUsage = metrics.opencode_token_usage_by_agent || {};
+              const tokenRendered = Object.keys(tokenUsage)
+                .sort()
+                .map(name => {
+                  const item = tokenUsage[name] || {};
+                  return `${name}=requests:${Number(item.requests || 0)}/in:${Number(item.input_total || 0)}/out:${Number(item.output_total || 0)}/reasoning:${Number(item.reasoning_total || 0)}`;
+                });
+              if (tokenRendered.length) {
+                tokenUsageLine = 'Model token usage: ' + tokenRendered.join('; ') + '.';
+              }
               const served = metrics.served_models_by_agent || {};
               const servedEntries = Object.keys(served)
                 .sort()
@@ -864,6 +875,7 @@ jobs:
               stageTimingLine,
               verifierLine,
               transportTimingLine,
+              tokenUsageLine,
               modelPathLine,
               '',
               '### Required repair behavior',
