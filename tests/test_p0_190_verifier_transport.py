@@ -34,6 +34,7 @@ from aa.conversation.verifier_schema import (
     validate_unit_decision,
     verifier_single_json_schema,
 )
+from aa.opencode.errors import OpenCodeTransientError
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONVERSATION_PKG = ROOT / "src" / "aa" / "conversation"
@@ -187,7 +188,7 @@ class _PartiallyUnavailableVerifier:
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
             }
-        raise RuntimeError("fixture verifier transport failure")
+        raise OpenCodeTransientError("fixture verifier transport failure")
 
 
 async def test_partial_verifier_failure_preserves_verified_units() -> None:
@@ -249,7 +250,7 @@ async def test_partial_verifier_failure_does_not_serve_glue_only_for_substantive
                     "supported": True,
                     "evidence_passage_ids": [],
                 }
-            raise RuntimeError("fixture verifier transport failure")
+            raise OpenCodeTransientError("fixture verifier transport failure")
 
     outcome = await run_v2_answer_turn(
         user_message="что делать?",
