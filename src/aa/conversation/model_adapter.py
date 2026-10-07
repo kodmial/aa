@@ -465,8 +465,13 @@ class OpenCodeChatModel(BaseChatModel):
         # strong primary serves with the selector omitted (verifier probe),
         # try the omitted primary first so later turns stay strong instead
         # of sticking to the weak fallback and collapsing to generic
-        # clarification. Only access/transient/timeout fall through to the
-        # weak fallback; 429 and deterministic failures propagate.
+        # clarification. Any omitted failure except 429 falls through to the
+        # weak fallback (kodmial/aa#206): a deterministic omitted failure
+        # (for example structured-output-missing or served-model-mismatch)
+        # must never strand the configured fallback and collapse the graph
+        # to natural retry replies with no telemetry. 429 always propagates
+        # for runner retire/restart; deterministic primary failures still
+        # propagate without fallback.
         if self._fast_fallback_available():
             if self.wire_agent:
                 try:
@@ -475,11 +480,7 @@ class OpenCodeChatModel(BaseChatModel):
                     return omitted
                 except OpenCodeRateLimitError:
                     raise
-                except (
-                    OpenCodeProviderAccessError,
-                    OpenCodeTransientError,
-                    OpenCodeTimeoutError,
-                ):
+                except OpenCodeError:
                     pass
             logger.info("opencode primary circuit open, fast fallback used")
             try:
@@ -539,11 +540,7 @@ class OpenCodeChatModel(BaseChatModel):
                         return omitted
                     except OpenCodeRateLimitError:
                         raise
-                    except (
-                        OpenCodeProviderAccessError,
-                        OpenCodeTransientError,
-                        OpenCodeTimeoutError,
-                    ):
+                    except OpenCodeError:
                         pass
             logger.info("opencode model fallback used")
             try:
@@ -593,11 +590,7 @@ class OpenCodeChatModel(BaseChatModel):
                     return omitted
                 except OpenCodeRateLimitError:
                     raise
-                except (
-                    OpenCodeProviderAccessError,
-                    OpenCodeTransientError,
-                    OpenCodeTimeoutError,
-                ):
+                except OpenCodeError:
                     pass
             logger.info("opencode primary circuit open, fast fallback used")
             try:
@@ -669,11 +662,7 @@ class OpenCodeChatModel(BaseChatModel):
                         return omitted
                     except OpenCodeRateLimitError:
                         raise
-                    except (
-                        OpenCodeProviderAccessError,
-                        OpenCodeTransientError,
-                        OpenCodeTimeoutError,
-                    ):
+                    except OpenCodeError:
                         pass
             logger.info("opencode model fallback used")
             try:
