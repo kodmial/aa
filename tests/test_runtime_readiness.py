@@ -104,6 +104,29 @@ def test_in_progress_alone_is_starting_never_ready() -> None:
     )
 
 
+def test_gate_d_probe_parses_ready_marker_instead_of_substring() -> None:
+    """Gate D regression: the authoritative READY marker kind is lowercase.
+
+    The self-proving and canary Gate D probes formerly asserted
+    ``"READY" in app.readiness_marker``. The marker produced by
+    :func:`format_ready_marker` carries the lowercase kind
+    ``aa-runtime-ready``, so that case-sensitive substring check failed
+    every healthy run with ``running app readiness is not READY`` and Gate
+    D reported ``FAIL/runtime-not-ready`` for ``telegram-readiness`` even
+    though OpenCode health, getMe identity, bootstrap, polling and clean
+    stop all succeeded. Probes must validate the marker structurally with
+    :func:`parse_ready_marker` instead.
+    """
+    marker = format_ready_marker(run_id=37686216421, sha=SHA, ready_at=1700000000, ordinal=1)
+    # The trap: the uppercase substring never matches the lowercase kind.
+    assert "READY" not in marker
+    assert parse_ready_marker(marker) is not None
+    for name in ("aa-self-proving-qualification.yml", "aa-canary.yml"):
+        text = _read(name)
+        assert "parse_ready_marker" in text
+        assert '"READY" in app.readiness_marker' not in text
+
+
 def test_ready_lookup_is_per_exact_run() -> None:
     first = format_ready_marker(run_id=201, sha=SHA, ready_at=1700000000, ordinal=1)
     bodies = ["hello", first]
