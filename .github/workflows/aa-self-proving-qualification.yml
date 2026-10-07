@@ -46,7 +46,9 @@ permissions:
 
 concurrency:
   group: aa-self-proving-qualification
-  cancel-in-progress: false
+  # Exact-main evidence becomes invalid as soon as main advances. Cancel stale
+  # qualification immediately so the newest main SHA owns the single slot.
+  cancel-in-progress: true
 
 jobs:
   qualify:
