@@ -680,7 +680,7 @@ jobs:
         # not product-code repair issues.
         # A workflow_run recovery controller reruns failed jobs on a fresh VM
         # from the persisted gate checkpoints.
-        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' && hashFiles('self-proving-out/transient-blocked.json') == '' }}
+        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
