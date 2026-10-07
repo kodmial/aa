@@ -1,4 +1,4 @@
-name: AA self-proving 429 recovery
+name: AA self-proving recovery
 
 on:
   workflow_run:
@@ -38,8 +38,10 @@ jobs:
 
             const restartName = `aa-self-proving-restart-${attempt}`;
             const staleName = `aa-self-proving-stale-${attempt}`;
+            const transientName = `aa-self-proving-transient-${attempt}`;
             let restartFound = false;
             let staleFound = false;
+            let transientFound = false;
             for (let check = 1; check <= 5; check++) {
               const artifacts = await github.paginate(
                 github.rest.actions.listWorkflowRunArtifacts,
@@ -47,7 +49,8 @@ jobs:
               );
               restartFound = artifacts.some(a => a.name === restartName && !a.expired);
               staleFound = artifacts.some(a => a.name === staleName && !a.expired);
-              if (restartFound || staleFound) break;
+              transientFound = artifacts.some(a => a.name === transientName && !a.expired);
+              if (restartFound || staleFound || transientFound) break;
               if (check < 5) await new Promise(resolve => setTimeout(resolve, 5000));
             }
 
@@ -74,9 +77,41 @@ jobs:
               return;
             }
 
+            if (transientFound) {
+              const delaySeconds = Math.min(
+                300, 15 * (2 ** Math.min(Math.max(attempt - 1, 0), 4))
+              );
+              core.info(
+                `External/transient qualification blocker: waiting ${delaySeconds}s before ownerless retry.`
+              );
+              await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+              if (failedSha && currentMain !== failedSha) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: 'aa-self-proving-qualification.yml',
+                  ref: 'main',
+                  inputs: { required_sha: currentMain },
+                });
+                return;
+              }
+              if (attempt < 10) {
+                await github.rest.actions.reRunWorkflowFailedJobs({
+                  owner, repo, run_id: runId,
+                });
+                return;
+              }
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo,
+                workflow_id: 'aa-self-proving-qualification.yml',
+                ref: 'main',
+                inputs: { required_sha: currentMain },
+              });
+              return;
+            }
+
             if (!restartFound) {
               core.info(
-                `No ${restartName} or ${staleName}; product/other failure stays with the repair loop.`
+                `No ${restartName}, ${staleName}, or ${transientName}; product failure stays with the repair loop.`
               );
               return;
             }
