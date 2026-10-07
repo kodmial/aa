@@ -543,9 +543,19 @@ jobs:
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
           # Gate E consumes the trusted live measurements independently of
           # Gate C's functional verdict and Gate D's network-readiness result.
+          # The runner computes the whole A-E summary and therefore returns
+          # non-zero when Gate C is already known FAIL. Gate E must not inherit
+          # that functional verdict: consume the same trusted latency evidence
+          # and exit strictly from Gate E below. Preserve runner lifecycle
+          # exits that require VM restart/resume.
+          runner_rc=0
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" || runner_rc=$?
+          if [[ "$runner_rc" -eq 75 || -f self-proving-out/restart-required.json ]]; then
+            echo "::error::Gate E interrupted by provider 429; runner restart required."
+            exit 75
+          fi
           # Hard guard: no ordinary qualification turn may take >= 30s; p95
           # target materially below that. Typing heartbeat continuity is
           # verified independently. Pathological latency fails the gate.
