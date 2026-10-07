@@ -381,6 +381,79 @@ class OpenCodeChatModel(BaseChatModel):
             except OpenCodeError:
                 logger.warning("ephemeral session cleanup failed")
 
+    async def _invoke_omitted_primary_text(self, prompt: str, *, system: str = "") -> str:
+        """Invoke the pinned primary with the transport selector omitted.
+
+        Gate C live repair (run 37608207212 on exact main 8c57bba): the
+        live lane served planner/answer/summarizer through the weak
+        fallback while the decoupled verifier (omitted selector) served
+        Muse Spark, with 13 generic clarifications, diversity collapse and
+        max latency over budget while verifier stayed ``unavailable``. The
+        verifier probe already isolates this as an agent-selector
+        rejection (custom selector 403, omitted serves). Retrying the same
+        strong primary with the selector omitted before falling back to
+        the weak model keeps grounding strong without any exact-question
+        special case. Provider 429 always propagates and never triggers
+        this path. The logical audit identity stays ``self.agent`` while
+        the wire omits the selector.
+        """
+        if not self.wire_agent:
+            raise ValueError("omitted retry is only for custom wire agents")
+        client = self._client
+        session = await client.create_session(title="")
+        try:
+            return await client.send_message(
+                session.id,
+                prompt,
+                timeout=self.request_timeout,
+                agent="",
+                model=self.primary_model,
+                system=system,
+                audit_agent=self.agent,
+            )
+        finally:
+            try:
+                await client.delete_session(session.id)
+            except OpenCodeError:
+                logger.warning("ephemeral session cleanup failed")
+
+    async def _invoke_omitted_primary_structured(
+        self,
+        prompt: str,
+        *,
+        system: str,
+        schema: dict[str, object],
+        retry_count: int = STRUCTURED_RETRY_COUNT,
+    ) -> dict[str, object]:
+        """Invoke pinned primary structured output with selector omitted.
+
+        Same Gate C agent-selector repair as
+        :meth:`_invoke_omitted_primary_text` for the native ``json_schema``
+        path (planner). Only provider-access (403) callers use this; 429
+        propagates and deterministic failures stay fail-closed.
+        """
+        if not self.wire_agent:
+            raise ValueError("omitted retry is only for custom wire agents")
+        client = self._client
+        session = await client.create_session(title="")
+        try:
+            return await client.send_structured_message(
+                session.id,
+                prompt,
+                timeout=self.request_timeout,
+                agent="",
+                model=self.primary_model,
+                system=system,
+                schema=schema,
+                retry_count=retry_count,
+                audit_agent=self.agent,
+            )
+        finally:
+            try:
+                await client.delete_session(session.id)
+            except OpenCodeError:
+                logger.warning("ephemeral session cleanup failed")
+
     async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
@@ -388,7 +461,26 @@ class OpenCodeChatModel(BaseChatModel):
         # already performed the required >=5s retry. Later calls in the same
         # process go directly to the configured fallback instead of burning
         # another 5s sleep plus two slow primary attempts per call.
+        # Gate C repair: when the custom selector is rejected but the same
+        # strong primary serves with the selector omitted (verifier probe),
+        # try the omitted primary first so later turns stay strong instead
+        # of sticking to the weak fallback and collapsing to generic
+        # clarification. Only access/transient/timeout fall through to the
+        # weak fallback; 429 and deterministic failures propagate.
         if self._fast_fallback_available():
+            if self.wire_agent:
+                try:
+                    omitted = await self._invoke_omitted_primary_text(prompt, system=system)
+                    logger.info("opencode omitted primary served while circuit open")
+                    return omitted
+                except OpenCodeRateLimitError:
+                    raise
+                except (
+                    OpenCodeProviderAccessError,
+                    OpenCodeTransientError,
+                    OpenCodeTimeoutError,
+                ):
+                    pass
             logger.info("opencode primary circuit open, fast fallback used")
             try:
                 reply = await self._invoke_ephemeral(
@@ -440,6 +532,19 @@ class OpenCodeChatModel(BaseChatModel):
             primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
             if primary_access_rejected:
                 self._record_primary_rejection()
+                if self.wire_agent:
+                    try:
+                        omitted = await self._invoke_omitted_primary_text(prompt, system=system)
+                        logger.info("opencode omitted primary served after custom 403")
+                        return omitted
+                    except OpenCodeRateLimitError:
+                        raise
+                    except (
+                        OpenCodeProviderAccessError,
+                        OpenCodeTransientError,
+                        OpenCodeTimeoutError,
+                    ):
+                        pass
             logger.info("opencode model fallback used")
             try:
                 return await self._invoke_ephemeral(
@@ -476,6 +581,24 @@ class OpenCodeChatModel(BaseChatModel):
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
         if self._fast_fallback_available():
+            if self.wire_agent:
+                try:
+                    omitted = await self._invoke_omitted_primary_structured(
+                        prompt,
+                        system=system,
+                        schema=schema,
+                        retry_count=retry_count,
+                    )
+                    logger.info("opencode omitted primary served while circuit open")
+                    return omitted
+                except OpenCodeRateLimitError:
+                    raise
+                except (
+                    OpenCodeProviderAccessError,
+                    OpenCodeTransientError,
+                    OpenCodeTimeoutError,
+                ):
+                    pass
             logger.info("opencode primary circuit open, fast fallback used")
             try:
                 return await self._invoke_ephemeral_structured(
@@ -534,6 +657,24 @@ class OpenCodeChatModel(BaseChatModel):
             primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
             if primary_access_rejected:
                 self._record_primary_rejection()
+                if self.wire_agent:
+                    try:
+                        omitted = await self._invoke_omitted_primary_structured(
+                            prompt,
+                            system=system,
+                            schema=schema,
+                            retry_count=retry_count,
+                        )
+                        logger.info("opencode omitted primary served after custom 403")
+                        return omitted
+                    except OpenCodeRateLimitError:
+                        raise
+                    except (
+                        OpenCodeProviderAccessError,
+                        OpenCodeTransientError,
+                        OpenCodeTimeoutError,
+                    ):
+                        pass
             logger.info("opencode model fallback used")
             try:
                 return await self._invoke_ephemeral_structured(

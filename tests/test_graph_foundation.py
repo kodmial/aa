@@ -735,6 +735,8 @@ def test_adapter_carries_no_semantic_policy() -> None:
         "_fast_fallback_available",
         "_invoke_ephemeral",
         "_invoke_ephemeral_structured",
+        "_invoke_omitted_primary_text",
+        "_invoke_omitted_primary_structured",
         "_ainvoke_text",
         "ainvoke_structured",
         "_generate",
