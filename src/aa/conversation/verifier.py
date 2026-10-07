@@ -24,10 +24,13 @@ the ID-completeness gate (exactly one verdict per response unit).
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
@@ -283,32 +286,103 @@ VERIFIER_TEXT_JSON_SUFFIX = (
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
-# Process-wide native-structured capability cache (Gate C live repair):
-# the first structured-channel failure proves the provider path does not
-# serve native verifier structured output. Later units/turns in the same
-# process then go directly to the bounded text JSON path instead of burning
-# a second slow provider round-trip per unit (the max-latency pathology:
-# structured attempt + text fallback per unit makes every verifier call pay
-# twice). Turn-independent, never question-specific. Tests reset it via
+# Bounded native-structured capability cache (Gate C live repair):
+# a deterministic structured-channel failure proves the provider path does
+# not serve native verifier structured output. Later units/turns on the
+# same model path then go directly to the bounded text JSON path instead
+# of burning a second slow provider round-trip per unit (the max-latency
+# pathology: structured attempt + text fallback per unit makes every
+# verifier call pay twice). The cache is per model path with a TTL so a
+# recovered provider is retried and one transient timeout or one bad
+# decision never permanently disables structured calls process-wide.
+# Turn-independent, never question-specific. Tests reset it via
 # clear_verifier_capability_cache().
-_PREFER_TEXT_JSON = False
+VERIFIER_CAPABILITY_TTL_S = 300.0
+
+_TEXT_JSON_PREFERRED_AT: dict[str, float] = {}
+_CAPABILITY_LOCK = threading.Lock()
 
 
-def structured_text_fallback_preferred() -> bool:
-    """Whether the process should skip native structured verifier calls."""
-    return _PREFER_TEXT_JSON
+def _verifier_capability_key(model: Any | None) -> str:
+    """Return the capability-cache key for one verifier model path."""
+    try:
+        primary = getattr(model, "primary_model", "")
+        fallback = getattr(model, "fallback_model", "")
+        agent = getattr(model, "agent", "")
+        if (
+            (isinstance(primary, str) and primary.strip())
+            or (isinstance(fallback, str) and fallback.strip())
+            or (isinstance(agent, str) and agent.strip())
+        ):
+            return (
+                f"{primary.strip() if isinstance(primary, str) else ''}"
+                f"|{fallback.strip() if isinstance(fallback, str) else ''}"
+                f"|{agent.strip() if isinstance(agent, str) else ''}"
+            )
+    except Exception:
+        pass
+    if model is None:
+        return ""
+    return "default"
 
 
-def mark_structured_unavailable() -> None:
-    """Remember that native structured verifier output is unavailable."""
-    global _PREFER_TEXT_JSON
-    _PREFER_TEXT_JSON = True
+def _capability_entry_fresh(recorded_at: float) -> bool:
+    try:
+        return (time.monotonic() - float(recorded_at)) < VERIFIER_CAPABILITY_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
+def structured_text_fallback_preferred(model: Any | None = None) -> bool:
+    """Whether the process should skip native structured verifier calls.
+
+    With no model, reports whether any cached model path is currently
+    preferred (backward-compatible probe used by tests). With a model,
+    reports only that model path so a different path still tries native
+    structured output first.
+    """
+    with _CAPABILITY_LOCK:
+        if model is None:
+            fresh: list[str] = []
+            for key, recorded_at in _TEXT_JSON_PREFERRED_AT.items():
+                if _capability_entry_fresh(recorded_at):
+                    fresh.append(key)
+            # Drop expired entries so a recovered provider is retried.
+            for key in list(_TEXT_JSON_PREFERRED_AT):
+                if key not in fresh:
+                    _TEXT_JSON_PREFERRED_AT.pop(key, None)
+            return bool(fresh)
+        key = _verifier_capability_key(model)
+        if key == "":
+            return any(_capability_entry_fresh(stamp) for stamp in _TEXT_JSON_PREFERRED_AT.values())
+        cached_at: float | None = _TEXT_JSON_PREFERRED_AT.get(key)
+        if cached_at is None:
+            return False
+        if not _capability_entry_fresh(cached_at):
+            _TEXT_JSON_PREFERRED_AT.pop(key, None)
+            return False
+        return True
+
+
+def mark_structured_unavailable(model: Any | None = None) -> None:
+    """Remember that native structured verifier output is unavailable.
+
+    Only deterministic capability failures call this (schema rejected,
+    missing structured payload). Transient/timeout and content validation
+    failures fall back once without poisoning the cache. Entries expire
+    via ``VERIFIER_CAPABILITY_TTL_S`` and are keyed per model path.
+    """
+    key = _verifier_capability_key(model)
+    if not key:
+        key = "default"
+    with _CAPABILITY_LOCK:
+        _TEXT_JSON_PREFERRED_AT[key] = time.monotonic()
 
 
 def clear_verifier_capability_cache() -> None:
     """Reset the structured-capability cache (tests only)."""
-    global _PREFER_TEXT_JSON
-    _PREFER_TEXT_JSON = False
+    with _CAPABILITY_LOCK:
+        _TEXT_JSON_PREFERRED_AT.clear()
 
 
 def _strip_text_json_fences(text: str) -> str:
@@ -319,45 +393,112 @@ def _strip_text_json_fences(text: str) -> str:
     return text.strip()
 
 
+def _scan_double_quoted(text: str) -> list[bool]:
+    """Mark characters inside double-quoted JSON strings (escape-aware)."""
+    inside = [False] * len(text)
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            inside[i] = True
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+                inside[i] = True
+    return inside
+
+
+def _strip_trailing_commas_safe(text: str) -> str:
+    """Strip trailing commas only outside double-quoted strings."""
+    inside = _scan_double_quoted(text)
+    out: list[str] = []
+    for i, ch in enumerate(text):
+        if ch == "," and not inside[i]:
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j < len(text) and text[j] in ("}", "]"):
+                continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _replace_python_literals_safe(text: str) -> str:
+    """Replace ``True``/``False``/``None`` only outside string values.
+
+    Blind ``str.replace`` rewrites substrings inside quoted
+    ``evidence_passage_ids`` values (for example ``"True"`` becomes
+    ``"true"``), corrupting cited ids before validation. This scanner
+    replaces whole-word Python literals only when they appear outside
+    double-quoted strings, leaving quoted values byte-identical.
+    """
+    inside = _scan_double_quoted(text)
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if inside[i]:
+            out.append(text[i])
+            i += 1
+            continue
+        rest = text[i:]
+        replaced = False
+        for word, json_word in (("True", "true"), ("False", "false"), ("None", "null")):
+            if rest.startswith(word):
+                before = text[i - 1] if i > 0 else ""
+                after = text[i + len(word)] if i + len(word) < len(text) else ""
+                if (not before.isalnum() and before != "_") and (
+                    not after.isalnum() and after != "_"
+                ):
+                    out.append(json_word)
+                    i += len(word)
+                    replaced = True
+                    break
+        if not replaced:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def _tolerant_json_candidates(candidate: str) -> list[str]:
     """Build bounded normalized candidates for one text JSON payload.
 
-    Order: strict, trailing-comma stripped, single-quote recovered (only
-    when the payload looks single-quoted to avoid corrupting apostrophes),
-    single-quote plus Python literals, Python literals, Python literals
-    plus trailing commas. Deduplicated, at most six entries.
+    Order: strict, trailing-comma stripped, Python literals, Python
+    literals plus trailing commas. All rewrites apply only outside
+    double-quoted string values so quoted ``evidence_passage_ids`` are
+    never corrupted. Single-quoted payloads are handled via
+    ``ast.literal_eval`` in :func:`_tolerant_json_loads`, never via blind
+    quote replacement that would corrupt apostrophes. Deduplicated, at
+    most four entries.
     """
     out: list[str] = [candidate]
-    stripped = re.sub(r",\s*([}\]])", r"\1", candidate)
+    stripped = _strip_trailing_commas_safe(candidate)
     if stripped != candidate:
         out.append(stripped)
-    if "'" in candidate and '"' not in candidate.replace('{"', "").replace('"}', ""):
-        single_fixed = re.sub(r",\s*([}\]])", r"\1", candidate.replace("'", '"'))
-        if single_fixed not in out:
-            out.append(single_fixed)
-        single_python = (
-            single_fixed.replace("True", "true").replace("False", "false").replace("None", "null")
-        )
-        if single_python not in out:
-            out.append(single_python)
-    python_fixed = (
-        candidate.replace("True", "true").replace("False", "false").replace("None", "null")
-    )
+    python_fixed = _replace_python_literals_safe(candidate)
     if python_fixed not in out:
         out.append(python_fixed)
-    normalized_python = re.sub(r",\s*([}\]])", r"\1", python_fixed)
+    normalized_python = _strip_trailing_commas_safe(python_fixed)
     if normalized_python not in out:
         out.append(normalized_python)
-    return out[:6]
+    return out[:4]
 
 
 def _tolerant_json_loads(candidate: str) -> object:
     """Parse one JSON object tolerating common small-model deviations.
 
-    Strict JSON is tried first, then the bounded normalized candidates
-    above (trailing commas, single quotes, Python literals). Key/type
-    strictness is enforced later by Pydantic (extra keys still rejected),
-    so grounding is unchanged.
+    Strict JSON is tried first, then the bounded string-safe normalized
+    candidates above (trailing commas, Python literals outside strings).
+    Single-quoted Python-dict payloads are parsed with
+    ``ast.literal_eval`` (which preserves quoted values exactly) instead
+    of blind quote/literal replacement. Key/type strictness is enforced
+    later by Pydantic (extra keys still rejected), so grounding is
+    unchanged.
     """
     last_error: Exception | None = None
     for text in _tolerant_json_candidates(candidate):
@@ -365,6 +506,17 @@ def _tolerant_json_loads(candidate: str) -> object:
             return json.loads(text)
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = exc
+    # Single-quoted or Python-literal payloads: literal_eval preserves
+    # quoted string values exactly (no blind True/None/apostrophe rewrite).
+    for text in _tolerant_json_candidates(candidate):
+        try:
+            value = ast.literal_eval(text)
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError) as exc:
+            last_error = exc
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+        return value
     assert last_error is not None
     raise last_error
 
@@ -392,7 +544,7 @@ def parse_text_json_decision(text: str) -> dict[str, Any]:
         candidate = candidate[start : end + 1]
     try:
         data = _tolerant_json_loads(candidate)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError, SyntaxError, TypeError) as exc:
         raise VerifierValidationError(f"verifier text output is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise VerifierValidationError("verifier text output is not a JSON object")
@@ -404,12 +556,20 @@ def parse_text_json_decision(text: str) -> dict[str, Any]:
 
 
 # Errors that mean the native structured channel itself is unavailable on
-# this provider path (schema rejected, structured payload missing,
-# transient/timeout after model fallback). Provider 429 is deliberately
-# absent: it must propagate for runner retire/restart, never fall back.
+# this provider path (deterministic schema rejection, provider access
+# rejection). Only these poison the bounded per-model capability cache.
+# Transient/timeout failures still fall back once to text but never mark
+# the cache, so one slow timeout cannot permanently disable structured
+# calls after the provider recovers. Provider 429 is deliberately absent:
+# it must propagate for runner retire/restart, never fall back.
 _STRUCTURED_CAPABILITY_ERRORS: tuple[type[BaseException], ...] = (
     OpenCodeDeterministicError,
     OpenCodeProviderAccessError,
+)
+
+# Transient/timeout after model fallback: retry once via the text path
+# without marking the capability cache (recovery-friendly).
+_STRUCTURED_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     OpenCodeTransientError,
     OpenCodeTimeoutError,
 )
@@ -560,16 +720,18 @@ async def _verify_single_unit(
     Provider-native ``json_schema`` structured output is an optional
     capability (kodmial/aa#192, Gate C live repair): when the structured
     channel itself is unavailable on this provider path (deterministic
-    schema rejection, missing structured payload, structured validation
-    failure, transient/timeout after model fallback), the same single-unit
+    schema rejection, missing structured payload), the same single-unit
     decision is retried once as bounded plain-text JSON through the
-    ordinary text path and strictly validated. After the first
-    structured-channel failure the process prefers the text path directly
-    so later units/turns do not burn two slow provider round-trips per
-    unit (the live max-latency pathology). This stays inside the one
-    concurrent per-unit round (no extra verifier round, no
-    planner/retrieval/answer rerun). Provider 429 always propagates
-    immediately for runner retire/restart.
+    ordinary text path and strictly validated. Transient/timeout and
+    structured content-validation failures also retry once via text but
+    never poison the capability cache, so one slow call or one bad
+    decision cannot permanently disable structured calls. After a
+    deterministic capability failure the model path prefers the text path
+    directly (bounded by TTL, per model path) so later units/turns do not
+    burn two slow provider round-trips per unit (the live max-latency
+    pathology). This stays inside the one concurrent per-unit round (no
+    extra verifier round, no planner/retrieval/answer rerun). Provider 429
+    always propagates immediately for runner retire/restart.
     """
 
     async def _text_decision() -> UnitVerdict:
@@ -589,11 +751,11 @@ async def _verify_single_unit(
     structured_invoke = getattr(model, "ainvoke_structured", None)
     # Snapshot the capability at round start so concurrent units in one
     # turn behave consistently (all try structured or all use text).
-    # The global is still marked on failure for future turns.
+    # The cache is still marked on deterministic failure for future turns.
     prefer_text = (
         _prefer_text_snapshot
         if _prefer_text_snapshot is not None
-        else structured_text_fallback_preferred()
+        else structured_text_fallback_preferred(model)
     )
     if callable(structured_invoke) and not prefer_text:
         try:
@@ -610,13 +772,22 @@ async def _verify_single_unit(
                 "verifier structured channel unavailable; text fallback used",
                 extra={"category": type(exc).__name__},
             )
-            mark_structured_unavailable()
+            mark_structured_unavailable(model)
+            return await _text_decision()
+        except _STRUCTURED_TRANSIENT_ERRORS as exc:
+            # One transient/timeout: retry once via text without poisoning
+            # the per-model capability cache, so later turns still probe
+            # native structured output after recovery.
+            logger.info(
+                "verifier structured transient; text fallback used",
+                extra={"category": type(exc).__name__},
+            )
             return await _text_decision()
         if not isinstance(raw, dict):
             logger.info(
                 "verifier structured payload missing; text fallback used",
             )
-            mark_structured_unavailable()
+            mark_structured_unavailable(model)
             return await _text_decision()
         try:
             return coerce_single_verdict(
@@ -625,15 +796,17 @@ async def _verify_single_unit(
         except VerifierValidationError as exc:
             # The provider returned a structured object that fails the
             # transport decision schema (for example loose enforcement on a
-            # fallback route emitting extra keys). The text path with its
+            # fallback route emitting extra keys, or a content grounding
+            # failure like bad passage ids). The text path with its
             # explicit single-object instruction may still serve; try it
-            # once before failing closed. Grounding stays strict: the text
-            # decision is still fully Pydantic-validated.
+            # once before failing closed without poisoning the
+            # process-wide capability cache on one bad decision.
+            # Grounding stays strict: the text decision is still fully
+            # Pydantic-validated.
             logger.info(
                 "verifier structured decision invalid; text fallback used",
                 extra={"category": type(exc).__name__},
             )
-            mark_structured_unavailable()
             return await _text_decision()
     elif callable(structured_invoke) and prefer_text:
         return await _text_decision()
@@ -666,7 +839,7 @@ async def _verify_per_unit_concurrent(
     """
     import asyncio as _asyncio
 
-    prefer_text_snapshot = structured_text_fallback_preferred()
+    prefer_text_snapshot = structured_text_fallback_preferred(model)
     verdicts = await _asyncio.gather(
         *(
             _verify_single_unit(
@@ -713,6 +886,7 @@ async def run_verifier(
 
 __all__ = [
     "VERIFIER_AGENT_V2",
+    "VERIFIER_CAPABILITY_TTL_S",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
     "VERIFIER_MAX_PASSAGE_CHARS",
     "VERIFIER_TEXT_JSON_SUFFIX",
