@@ -54,6 +54,23 @@ logger = logging.getLogger("aa.conversation.turn_pipeline")
 MAX_TARGETED_REPAIR_ROUNDS = 2
 MAX_PACK_PASSAGES = 12
 
+# Bounded answer-generation evidence window (Gate C+E live repair, run
+# 37664757721 on exact main 0202b0b: p50 29.6s / p95 42.0s / max 45.5s
+# over the 30s budget with planner p50 5.7s / p95 12.1s and a
+# live-answer-no-generic-collapse, repair_turns=0). The initial
+# draft+verify chain already exceeds budget before any repair: the
+# answer prompt carries the full 16k-token Evidence Pack while the
+# verifier display window is already bounded to 6 passages, so every
+# ordinary turn pays the largest provider input on the answer call,
+# generates long multi-unit drafts on the weak fallback path, and then
+# pays one verifier round-trip per unit. The window below keeps the top
+# RRF-ranked passages for generation only; verification, checksum,
+# quote and cite gates still use the full stored pack, so grounding
+# strictness is unchanged: the model may only use listed authoritative
+# evidence and every claim is still validated against the full pack.
+# Turn-independent, never an exact-question special case.
+ANSWER_GENERATION_MAX_PASSAGES = 6
+
 # Live SLO guard (Gate C live repair, run 37615447071 on exact main
 # e92385f): ordinary turns reached p50 34s / p95 59s / max 64s over the
 # 30s hard budget while the repair loop burned up to two full
@@ -332,6 +349,7 @@ async def run_v2_answer_turn(
         "repair_budget_exceeded": False,
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
+        "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
     }
 
     def _finish_telemetry() -> None:
@@ -343,8 +361,20 @@ async def run_v2_answer_turn(
 
     rounds = 0
 
+    def _generation_window(active_pack: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return the bounded top-ranked window for answer generation only.
+
+        The stored pack order is already fused-rank priority, so the
+        leading slice keeps the most relevant authoritative passages.
+        Verification always uses the full pack; only generation input
+        tokens are bounded here.
+        """
+        if len(active_pack) <= ANSWER_GENERATION_MAX_PASSAGES:
+            return active_pack
+        return active_pack[:ANSWER_GENERATION_MAX_PASSAGES]
+
     async def _draft_with_pack(active_pack: list[dict[str, Any]], prompt_text: str) -> str | None:
-        passages = state_passages_to_prompt(active_pack)
+        passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
             return await generate_draft(
@@ -789,6 +819,7 @@ async def answer_pipeline_node(
 
 
 __all__ = [
+    "ANSWER_GENERATION_MAX_PASSAGES",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
     "NATURAL_CLARIFICATION_REPLY",
