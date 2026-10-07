@@ -336,7 +336,9 @@ jobs:
           # without the live Application is forbidden and fails this gate.
           if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
             echo "::error::Gate D BLOCKED: TELEGRAM_BOT_TOKEN is not configured."
-            exit 2
+            mkdir -p self-proving-out
+            printf '{"reason_code":"EXTERNAL_TELEGRAM_TOKEN_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
+            exit 78
           fi
           # HTTP 403 uses bounded exponential retry with >= 5s base.
           delay=5
@@ -353,7 +355,9 @@ jobs:
               continue
             fi
             echo "::error::Gate D BLOCKED: Telegram getMe failed (http=$code)."
-            exit 2
+            mkdir -p self-proving-out
+            printf '{"reason_code":"EXTERNAL_TELEGRAM_GETME","gate":"D","http":"%s"}\n' "$code" > self-proving-out/transient-blocked.json
+            exit 78
           done
           python - <<'PY'
           import json
@@ -374,7 +378,7 @@ jobs:
           from aa.config import Settings
           from aa.control.runtime_status import RuntimeMarker, write_marker
           from aa.opencode.errors import OpenCodeRateLimitError
-          from aa.telegram.transport import PollingTelegramTransport
+          from aa.telegram.transport import PollingTelegramTransport, TelegramApiError
 
           async def _active_telegram_poller_running() -> bool:
               """Return True when another Telegram poller holds getUpdates (409)."""
@@ -415,7 +419,17 @@ jobs:
               )
               try:
                   active = await _active_telegram_poller_running()
-                  assert not active, "Gate D BLOCKED: owner runtime poller active; retry when idle to avoid getUpdates conflict"
+                  if active:
+                      transient = Path("self-proving-out/transient-blocked.json")
+                      transient.parent.mkdir(parents=True, exist_ok=True)
+                      transient.write_text(
+                          json.dumps(
+                              {"reason_code": "EXTERNAL_TELEGRAM_POLLER_CONFLICT", "gate": "D"},
+                              sort_keys=True,
+                          ) + "\n",
+                          encoding="utf-8",
+                      )
+                      raise SystemExit(78)
                   await app.start()
               except OpenCodeRateLimitError:
                   failed = RuntimeMarker(
@@ -442,6 +456,17 @@ jobs:
                       encoding="utf-8",
                   )
                   raise SystemExit(75)
+              except TelegramApiError:
+                  transient = Path("self-proving-out/transient-blocked.json")
+                  transient.parent.mkdir(parents=True, exist_ok=True)
+                  transient.write_text(
+                      json.dumps(
+                          {"reason_code": "EXTERNAL_TELEGRAM_API", "gate": "D"},
+                          sort_keys=True,
+                      ) + "\n",
+                      encoding="utf-8",
+                  )
+                  raise SystemExit(78)
               except Exception as exc:
                   failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
                   write_marker(out, failed)
