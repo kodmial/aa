@@ -476,14 +476,7 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
 def test_gate_c_preserves_live_failure_without_live_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gate F re-evaluation (issue #153) must not mask a real Gate C failure.
-
-    When the repository-owned live artifact already carries a matching
-    SHA/run FAIL, ``_gate_c`` must return ``live-path-failed`` even if the
-    current process lacks ``SELF_PROVING_LIVE``/secrets (Gate E/F context).
-    Only with no usable live evidence may it report
-    ``live-execution-not-enabled``.
-    """
+    """Gate F re-evaluation must preserve the Gate-C-owned live lane only."""
     import scripts.run_self_proving_qualification as runner
 
     monkeypatch.delenv("SELF_PROVING_LIVE", raising=False)
@@ -493,12 +486,84 @@ def test_gate_c_preserves_live_failure_without_live_env(
     live_dir = tmp_path / "live-out"
     live_dir.mkdir(parents=True, exist_ok=True)
     (live_dir / "product-contract-live-summary.json").write_text(
-        json.dumps({"main_sha": SHA, "run_id": "run-1", "status": "FAIL", "lanes": []}),
+        json.dumps(
+            {
+                "main_sha": SHA,
+                "run_id": "run-1",
+                "status": "FAIL",
+                "lanes": [
+                    {
+                        "lane": "live-telegram-evidence",
+                        "status": "FAIL",
+                        "passed": [],
+                        "failed": ["live-answer-no-generic-collapse"],
+                        "incomplete": [],
+                        "metrics": {},
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
     assert evidence.status == "FAIL"
-    assert evidence.failure_category == "live-path-failed"
+    assert evidence.failure_category == "live-answer-no-generic-collapse"
+
+
+def test_gate_c_ignores_foreign_lane_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-C lane must never be reclassified as a Gate C repair."""
+    import scripts.run_self_proving_qualification as runner
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    live_dir = tmp_path / "live-out"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / "product-contract-live-summary.json").write_text(
+        json.dumps(
+            {
+                "main_sha": SHA,
+                "run_id": "run-1",
+                "status": "FAIL",
+                "lanes": [
+                    {
+                        "lane": "runtime-control-33-41",
+                        "status": "FAIL",
+                        "failed": ["runtime-control-failure"],
+                        "passed": [],
+                        "incomplete": [],
+                        "metrics": {},
+                    },
+                    {
+                        "lane": "live-telegram-evidence",
+                        "status": "PASS",
+                        "passed": [
+                            "live-raw-telegram-transport-boundary",
+                            "live-answer-no-generic-collapse",
+                            "live-answer-diversity",
+                            "live-actual-served-model-identity",
+                            "live-planner-retrieval-answer-verifier-telemetry",
+                        ],
+                        "failed": [],
+                        "incomplete": [],
+                        "metrics": {
+                            "turns_executed": 4,
+                            "latency_p50_s": 20.0,
+                            "latency_p95_s": 25.0,
+                            "latency_max_s": 29.0,
+                            "turn_latencies_ms": [18000.0, 20000.0, 24000.0, 29000.0],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence, latencies, aggregate = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
+    assert evidence.status == "PASS"
+    assert evidence.live_trusted is True
+    assert latencies
+    assert aggregate is not None
 
 
 def test_gate_c_still_blocked_without_evidence_or_env(
