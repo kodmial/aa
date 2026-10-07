@@ -451,6 +451,8 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "transient-blocked.json" in workflow
     assert "Stage timings:" in workflow
     assert "Repair recurrence:" in workflow
+    assert "async function apiRetry" in workflow
+    assert "retrying in" in workflow
     assert "const fingerprint = `${blocking}:${category}:${component}`" in workflow
     recovery = (REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml").read_text(
         encoding="utf-8"
@@ -590,6 +592,14 @@ def test_gate_c_still_blocked_without_evidence_or_env(
     evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
     assert evidence.status == "BLOCKED"
     assert evidence.failure_category == "live-execution-not-enabled"
+
+
+def test_gate_e_uses_trusted_live_latency_even_when_gate_c_functionally_fails() -> None:
+    runner = (REPO_ROOT / "scripts" / "run_self_proving_qualification.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gate_c_live=gate_c.live_trusted" in runner
+    assert 'gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted)' not in runner
 
 
 def test_gate_e_f_preserve_live_execution_context() -> None:
