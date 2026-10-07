@@ -853,6 +853,12 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
         client = HttpOpenCodeClient(f"http://127.0.0.1:{port}", request_timeout=5.0)
         await client.send_message("ses_qual01", "hello", agent="aa", model="zen/spark")
         await client.send_message("ses_qual01", "hello again")
+        timing_audit = client.request_latency_audit
+        assert len(timing_audit) == 2
+        assert all(item["operation"] == "message-text" for item in timing_audit)
+        assert all(float(item["latency_ms"]) >= 0.0 for item in timing_audit)
+        assert all(item["success"] is True for item in timing_audit)
+        assert "hello" not in json.dumps(timing_audit)
     finally:
         server.shutdown()
         thread.join(timeout=5.0)
