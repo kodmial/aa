@@ -16,7 +16,7 @@ def test_canary_runs_every_four_hours_during_convergence() -> None:
     assert "workflow_dispatch:" in text
     assert "group: aa-self-proving-qualification" in text
     assert "Activate bounded current-main canary" in text
-    assert 'active=true' in text
+    assert "active=true" in text
     assert "needs: activation" in text
     assert "needs.activation.outputs.active == 'true'" in text
     assert "Gate C smoke" in text
