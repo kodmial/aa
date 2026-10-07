@@ -753,6 +753,10 @@ jobs:
             } catch (error) {
               core.info('No per-stage live timing evidence yet: ' + error.message);
             }
+            if (transientBlocked && category === 'unknown-gate-failure') {
+              core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
+              return;
+            }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
             // Stable defect identity deliberately excludes main SHA. A new
             // merge must not disguise the same failing component as a new
