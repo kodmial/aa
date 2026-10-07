@@ -425,6 +425,10 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "Gate C smoke" in canary
     assert "Gate D readiness" in canary
     assert "Gate E latency guard" in canary
+    assert "group: aa-self-proving-qualification" in canary
+    assert "Activate bounded current-main canary" in canary
+    assert "Re-enter authoritative convergence after canary failure" in canary
+    assert "aa-self-proving-qualification.yml" in canary
     assert CONTROL_ISSUE_NUMBER == 31
     assert ISSUE_NUMBER == 146
 
@@ -433,12 +437,17 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # pause semantics or fewer than the required three implementation slots.
     assert "automation:ready" in workflow
     assert "aa-self-proving-restart" in workflow
+    assert "aa-self-proving-transient" in workflow
+    assert "transient-blocked.json" in workflow
+    assert "Stage timings:" in workflow
     recovery = (REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml").read_text(
         encoding="utf-8"
     )
     assert "workflow_run" in recovery
     assert "AA self-proving qualification" in recovery
     assert "aa-self-proving-restart" in recovery
+    assert "aa-self-proving-transient" in recovery
+    assert "External/transient qualification blocker" in recovery
     assert "reRunWorkflowFailedJobs" in recovery
     assert "createWorkflowDispatch" in recovery
     scheduler = (REPO_ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml").read_text(
