@@ -336,7 +336,8 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         answer = planner.with_agent(ANSWER_AGENT_V2)
         # Product invariant: the grounding verifier uses Muse Spark only.
         # Space Bunny is deliberately excluded from this critical gate.
-        # Other agents retain the configured primary/fallback policy.
+        # A regression test locks this routing; other agents retain the
+        # configured primary/fallback policy.
         from aa.config import DEFAULT_PRIMARY_MODEL
 
         verifier = OpenCodeChatModel(
