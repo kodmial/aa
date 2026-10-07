@@ -335,9 +335,9 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         )
         summarizer = planner.with_agent(SUMMARIZER_AGENT_V2)
         answer = planner.with_agent(ANSWER_AGENT_V2)
-        # P0: the grounding verifier uses Muse Spark only. Space Bunny is
-        # intentionally excluded from this critical gate; other agents keep
-        # the configured primary/fallback policy unchanged.
+        # P0: the grounding verifier is pinned to Muse Spark only, with no
+        # Space Bunny technical fallback. Other agents keep the configured
+        # primary/fallback policy unchanged.
         verifier = OpenCodeChatModel(
             self._client,
             agent=VERIFIER_AGENT_V2,
