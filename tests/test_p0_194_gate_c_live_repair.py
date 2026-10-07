@@ -239,3 +239,59 @@ def test_verifier_suffix_has_explicit_example() -> None:
     assert "Example:" in VERIFIER_TEXT_JSON_SUFFIX
     assert "p1" in VERIFIER_TEXT_JSON_SUFFIX
     assert "No other text" in VERIFIER_TEXT_JSON_SUFFIX
+
+
+def test_production_verifier_is_muse_spark_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifier never falls through to Space Bunny; other agents keep fallback."""
+    from types import SimpleNamespace
+
+    import aa.conversation.graph as graph_module
+    import aa.conversation.model_adapter as adapter_module
+    from aa.config import DEFAULT_PRIMARY_MODEL
+    from aa.conversation.graph_runtime import _ProductionGraphRuntime
+
+    class _DummyModel:
+        def __init__(
+            self,
+            client: object,
+            *,
+            agent: str,
+            primary_model: str,
+            fallback_model: str = "",
+            request_timeout: float = 120.0,
+        ) -> None:
+            self.client = client
+            self.agent = agent
+            self.primary_model = primary_model
+            self.fallback_model = fallback_model
+            self.request_timeout = request_timeout
+
+        def with_agent(self, agent: str) -> "_DummyModel":
+            return _DummyModel(
+                self.client,
+                agent=agent,
+                primary_model=self.primary_model,
+                fallback_model=self.fallback_model,
+                request_timeout=self.request_timeout,
+            )
+
+    monkeypatch.setattr(adapter_module, "OpenCodeChatModel", _DummyModel)
+    monkeypatch.setattr(graph_module, "build_turn_graph", lambda **kwargs: kwargs)
+
+    runtime = _ProductionGraphRuntime(
+        client=object(),
+        settings=SimpleNamespace(
+            opencode_model="opencode/muse-spark-1.3-contributor-free",
+            opencode_fallback_model="opencode/space-bunny-free",
+        ),
+        index=None,
+    )
+    wired = runtime._build_graph(object())
+    planner = wired["planner_model"]
+    verifier = wired["verifier_model"]
+
+    assert planner.fallback_model == "opencode/space-bunny-free"
+    assert verifier.agent == "aa-verifier-v2"
+    assert verifier.primary_model == DEFAULT_PRIMARY_MODEL
+    assert verifier.primary_model == "opencode/muse-spark-1.3-contributor-free"
+    assert verifier.fallback_model == ""
