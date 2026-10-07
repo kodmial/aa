@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -212,6 +213,11 @@ class HttpOpenCodeClient(OpenCodeClient):
             raise ValueError("request_timeout must be > 0")
         self._request_timeout = request_timeout
         self._served_model_audit: list[dict[str, str]] = []
+        # Privacy-safe local transport timings: operation category, duration,
+        # and success only. Never records prompts, responses, session ids, or
+        # provider error text. Gate E uses this to distinguish model latency
+        # from local session lifecycle overhead.
+        self._request_latency_audit: list[dict[str, object]] = []
 
     @property
     def base_url(self) -> str:
@@ -239,13 +245,51 @@ class HttpOpenCodeClient(OpenCodeClient):
             return None
         return json.loads(raw.decode("utf-8"))
 
+    @staticmethod
+    def _request_operation(
+        method: str, path: str, body: dict[str, object] | None
+    ) -> str:
+        if method == "GET" and path == "/global/health":
+            return "health"
+        if method == "POST" and path == "/session":
+            return "session-create"
+        if path.startswith("/session/") and path.endswith("/message") and method == "POST":
+            fmt = body.get("format") if isinstance(body, dict) else None
+            return "message-structured" if isinstance(fmt, dict) else "message-text"
+        if path.startswith("/session/") and method == "DELETE":
+            return "session-delete"
+        return "other"
+
+    def _record_request_latency(
+        self, *, operation: str, elapsed_ms: float, success: bool
+    ) -> None:
+        self._request_latency_audit.append(
+            {
+                "operation": operation,
+                "latency_ms": round(max(0.0, elapsed_ms), 1),
+                "success": bool(success),
+            }
+        )
+        if len(self._request_latency_audit) > 2048:
+            del self._request_latency_audit[:-2048]
+
+    @property
+    def request_latency_audit(self) -> tuple[dict[str, object], ...]:
+        """Return privacy-safe local OpenCode HTTP timing evidence."""
+        return tuple(dict(item) for item in self._request_latency_audit)
+
     async def _call(self, method: str, path: str, body: dict[str, object] | None = None) -> object:
         timeout = self._request_timeout
+        operation = self._request_operation(method, path, body)
+        started = time.perf_counter()
+        success = False
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 asyncio.to_thread(self._sync_request, method, path, body, timeout),
                 timeout,
             )
+            success = True
+            return result
         except TimeoutError as exc:
             raise OpenCodeTimeoutError("opencode request timed out") from exc
         except OpenCodeError:
@@ -254,6 +298,12 @@ class HttpOpenCodeClient(OpenCodeClient):
             # Connection refused/reset against the loopback server: the
             # runtime is down or unreachable; retryable once it is back.
             raise OpenCodeTransientError("opencode runtime is unreachable") from exc
+        finally:
+            self._record_request_latency(
+                operation=operation,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                success=success,
+            )
 
     async def health(self) -> HealthInfo:
         payload = await self._call("GET", "/global/health")
