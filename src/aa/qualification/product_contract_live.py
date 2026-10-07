@@ -782,6 +782,36 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
     else:
         failed.append("25b-heartbeat-cancel-clean")
 
+    token_usage_by_agent: dict[str, dict[str, int | float]] = {}
+    token_audit = getattr(app.opencode_runtime.client, "token_usage_audit", ())
+    for item in token_audit:
+        if not isinstance(item, dict):
+            continue
+        agent = str(item.get("agent", "") or "unknown")
+        bucket = token_usage_by_agent.setdefault(
+            agent,
+            {
+                "requests": 0,
+                "input_total": 0,
+                "output_total": 0,
+                "reasoning_total": 0,
+                "cache_read_total": 0,
+                "cache_write_total": 0,
+            },
+        )
+        bucket["requests"] = int(bucket["requests"]) + 1
+        for key in (
+            "input",
+            "output",
+            "reasoning",
+            "cache_read",
+            "cache_write",
+        ):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and float(value) >= 0:
+                target = f"{key}_total"
+                bucket[target] = int(bucket[target]) + int(value)
+
     metrics = {
         "scenarios_executed": 8,
         "heartbeat_sends": heartbeat_sends,
@@ -1935,6 +1965,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "repair_metrics": repair_metrics,
         "verifier_metrics": verifier_metrics,
         "opencode_request_latency_ms": request_latency_ms,
+        "opencode_token_usage_by_agent": token_usage_by_agent,
         "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (
             round(voice_elapsed * 1000.0, 1) if "voice_elapsed" in locals() else 0.0
