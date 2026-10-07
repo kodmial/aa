@@ -336,7 +336,9 @@ jobs:
           # without the live Application is forbidden and fails this gate.
           if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
             echo "::error::Gate D BLOCKED: TELEGRAM_BOT_TOKEN is not configured."
-            exit 2
+            mkdir -p self-proving-out
+            printf '{"reason_code":"EXTERNAL_TELEGRAM_TOKEN_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
+            exit 78
           fi
           # HTTP 403 uses bounded exponential retry with >= 5s base.
           delay=5
@@ -353,7 +355,9 @@ jobs:
               continue
             fi
             echo "::error::Gate D BLOCKED: Telegram getMe failed (http=$code)."
-            exit 2
+            mkdir -p self-proving-out
+            printf '{"reason_code":"EXTERNAL_TELEGRAM_GETME","gate":"D","http":"%s"}\n' "$code" > self-proving-out/transient-blocked.json
+            exit 78
           done
           python - <<'PY'
           import json
@@ -374,7 +378,7 @@ jobs:
           from aa.config import Settings
           from aa.control.runtime_status import RuntimeMarker, write_marker
           from aa.opencode.errors import OpenCodeRateLimitError
-          from aa.telegram.transport import PollingTelegramTransport
+          from aa.telegram.transport import PollingTelegramTransport, TelegramApiError
 
           async def _active_telegram_poller_running() -> bool:
               """Return True when another Telegram poller holds getUpdates (409)."""
@@ -415,7 +419,17 @@ jobs:
               )
               try:
                   active = await _active_telegram_poller_running()
-                  assert not active, "Gate D BLOCKED: owner runtime poller active; retry when idle to avoid getUpdates conflict"
+                  if active:
+                      transient = Path("self-proving-out/transient-blocked.json")
+                      transient.parent.mkdir(parents=True, exist_ok=True)
+                      transient.write_text(
+                          json.dumps(
+                              {"reason_code": "EXTERNAL_TELEGRAM_POLLER_CONFLICT", "gate": "D"},
+                              sort_keys=True,
+                          ) + "\n",
+                          encoding="utf-8",
+                      )
+                      raise SystemExit(78)
                   await app.start()
               except OpenCodeRateLimitError:
                   failed = RuntimeMarker(
@@ -442,6 +456,17 @@ jobs:
                       encoding="utf-8",
                   )
                   raise SystemExit(75)
+              except TelegramApiError:
+                  transient = Path("self-proving-out/transient-blocked.json")
+                  transient.parent.mkdir(parents=True, exist_ok=True)
+                  transient.write_text(
+                      json.dumps(
+                          {"reason_code": "EXTERNAL_TELEGRAM_API", "gate": "D"},
+                          sort_keys=True,
+                      ) + "\n",
+                      encoding="utf-8",
+                  )
+                  raise SystemExit(78)
               except Exception as exc:
                   failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
                   write_marker(out, failed)
@@ -640,8 +665,19 @@ jobs:
           retention-days: 1
           if-no-files-found: error
           overwrite: true
+      - name: Upload external/transient blocker marker
+        if: ${{ failure() && hashFiles('self-proving-out/transient-blocked.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-transient-${{ github.run_attempt }}
+          path: self-proving-out/transient-blocked.json
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
       - name: Publish machine-readable failure and repair marker
-        # Provider 429 is infrastructure recovery, not a product repair issue.
+        # Provider 429 and external/transient blockers are recovery states,
+        # not product-code repair issues.
         # A workflow_run recovery controller reruns failed jobs on a fresh VM
         # from the persisted gate checkpoints.
         if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
@@ -666,24 +702,55 @@ jobs:
             const repo = context.repo.repo;
             const sha = process.env.FAILED_SHA || context.sha;
             const runId = String(context.runId);
+            const transientBlocked = fs.existsSync('self-proving-out/transient-blocked.json');
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
+            let component = 'unknown';
+            let productFailures = [];
             let timingLine = 'Timings: unavailable in self-proving summary.';
+            let stageTimingLine = 'Stage timings: unavailable.';
+            let modelPathLine = 'Served models: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
-              blocking = summary.blocking_gate || blocking;
-              const failed = (summary.gates || []).find(g => g.status !== 'PASS');
+              const gates = summary.gates || [];
+              productFailures = gates.filter(g => g && g.status === 'FAIL');
+              const failed = productFailures[0] || (
+                transientBlocked ? null : gates.find(g => g.status !== 'PASS')
+              );
+              blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
               if (failed) {
                 category = `${failed.gate}:${failed.failure_category || failed.status}`;
-                const p50 = Number(failed.latency_p50_ms || 0);
-                const p95 = Number(failed.latency_p95_ms || 0);
-                const max = Number(failed.max_turn_ms || 0);
+                component = String(failed.component || 'unknown');
+              }
+              const latencyFailure = productFailures.find(g => g.gate === 'E') || failed;
+              if (latencyFailure) {
+                const p50 = Number(latencyFailure.latency_p50_ms || 0);
+                const p95 = Number(latencyFailure.latency_p95_ms || 0);
+                const max = Number(latencyFailure.max_turn_ms || 0);
                 if (p50 > 0 || p95 > 0 || max > 0) {
                   timingLine = `Timings: p50=${Math.round(p50)}ms, p95=${Math.round(p95)}ms, max=${Math.round(max)}ms.`;
                 }
               }
-              if (blocking === 'E') {
+              const failGates = new Set(productFailures.map(g => String(g.gate || '')));
+              if (failGates.has('C') && failGates.has('E')) {
+                repairFocus = '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.';
+              } else if (blocking === 'E') {
                 repairFocus = '- Gate E is the sole live-text SLO owner: fix product latency to p95 <= 15000ms and max < 30000ms. Do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.';
               } else if (blocking === 'C') {
                 repairFocus = '- Gate C owns functional production-path correctness only. Diagnose the concrete broken stage/fallback/diversity/grounding component; latency-only defects belong to Gate E.';
@@ -691,9 +758,69 @@ jobs:
             } catch (error) {
               core.warning('No self-proving summary; using generic failure category: ' + error.message);
             }
+            try {
+              const live = JSON.parse(fs.readFileSync('live-out/product-contract-live-summary.json', 'utf8'));
+              const lane = (live.lanes || []).find(item => item && item.lane === 'live-telegram-evidence');
+              const metrics = (lane && lane.metrics) || {};
+              const stages = metrics.stage_latency_ms || {};
+              const names = ['planner', 'retrieval', 'answer', 'verifier', 'total'];
+              const rendered = names
+                .filter(name => stages[name])
+                .map(name => {
+                  const item = stages[name] || {};
+                  return `${name}=p50:${Math.round(Number(item.p50 || 0))}/p95:${Math.round(Number(item.p95 || 0))}/max:${Math.round(Number(item.max || 0))}ms`;
+                });
+              const repair = metrics.repair_metrics || {};
+              if (rendered.length) {
+                stageTimingLine = 'Stage timings: ' + rendered.join('; ') +
+                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+              }
+              const served = metrics.served_models_by_agent || {};
+              const servedEntries = Object.keys(served)
+                .sort()
+                .map(name => `${name}=${(served[name] || []).join(',')}`);
+              if (servedEntries.length) {
+                modelPathLine = 'Served models: ' + servedEntries.join('; ') +
+                  `; clarifications=${Number(metrics.clarification_count || 0)}.`;
+              }
+            } catch (error) {
+              core.info('No per-stage live timing evidence yet: ' + error.message);
+            }
+            if (transientBlocked && category === 'unknown-gate-failure') {
+              core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
+              return;
+            }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
-            const fingerprint = `${blocking}:${category}:${sha.slice(0, 12)}`;
-            const title = `P0: Repair self-proving qualification failure (Gate ${blocking})`;
+            // Stable defect identity deliberately excludes main SHA. When
+            // several product gates fail in one trusted run, keep one combined
+            // repair series so C/E can converge in the same implementation
+            // cycle rather than serializing known defects across runs.
+            const stableFailures = productFailures.length
+              ? productFailures
+                  .map(g => `${g.gate}:${g.failure_category || g.status}:${g.component || 'unknown'}`)
+                  .sort()
+              : [`${blocking}:${category}:${component}`];
+            const fingerprint = stableFailures.join('|');
+            const gateLabel = productFailures.length > 1
+              ? productFailures.map(g => g.gate).join('+')
+              : blocking;
+            const title = `P0: Repair self-proving qualification failure (Gate ${gateLabel})`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100,
+            });
+            const existing = issues
+              .filter(issue => !issue.pull_request && String(issue.body || '').includes(marker))
+              .find(issue =>
+                String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
+              );
+            let recurrence = 1;
+            if (existing) {
+              const match = String(existing.body || '').match(/Repair recurrence: \`(\d+)\`/);
+              recurrence = match ? Number(match[1]) + 1 : 2;
+            }
+            const recurrenceFocus = recurrence > 1
+              ? '- RECURRENCE: the previous repair for this same stable failure set did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
+              : '- First occurrence for this stable product-failure fingerprint.';
             const body = [
               marker,
               '',
@@ -701,46 +828,51 @@ jobs:
               '',
               `Failure category: \`${category}\``,
               `Blocking gate: \`${blocking}\``,
+              `Component: \`${component}\``,
+              `All proven product failures: \`${stableFailures.join(', ')}\``,
               `Main SHA: \`${sha}\``,
               `Run id: \`${runId}\``,
               `Repair fingerprint: \`${fingerprint}\``,
+              `Repair recurrence: \`${recurrence}\``,
               timingLine,
+              stageTimingLine,
+              modelPathLine,
               '',
               '### Required repair behavior',
               '',
               repairFocus,
+              recurrenceFocus,
               '- Fix without exact-question special cases; Product Contract #110 stays immutable.',
               '- Rerun the failed gate first, then downstream gates, then the exact-main final gate.',
               '- Repeat boundedly until PASS; no owner comments, manual labels, or manual merge required.',
               '- Provider 429: retire/restart the runner and resume from the last completed gate checkpoint.',
               '',
-              'This issue is generated and refreshed automatically; duplicate failures must reuse it.',
+              'This issue is generated and refreshed automatically; the same stable failure series reopens this issue instead of creating another one.',
             ].join('\n');
-            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', per_page: 100,
-            });
-            const existing = openIssues.find(
-              issue => !issue.pull_request && String(issue.body || '').includes(marker) &&
-                String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
-            );
             if (existing) {
-              await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body, labels: ['priority:p0', 'automation:ready'] });
-              core.info(`Refreshed existing self-proving repair issue #${existing.number}.`);
-            } else {
-              // Exactly one P0 repair issue per failing component series: reuse
-              // any open marker issue before creating a new one.
-              const anyExisting = openIssues.find(
-                issue => !issue.pull_request && String(issue.body || '').includes(marker)
+              await apiRetry('refresh self-proving repair issue', () =>
+                github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: existing.number,
+                  state: 'open',
+                  title,
+                  body,
+                  labels: ['priority:p0', 'automation:ready'],
+                })
               );
-              if (anyExisting) {
-                await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
-                core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
-              } else {
-                const created = await github.rest.issues.create({
+              core.warning(
+                `Reopened self-proving repair issue #${existing.number}; recurrence=${recurrence} fingerprint=${fingerprint}.`
+              );
+            } else {
+              const created = await apiRetry('create self-proving repair issue', () =>
+                github.rest.issues.create({
                   owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
-                });
-                core.info(`Created self-proving repair issue #${created.data.number}.`);
-              }
+                })
+              );
+              core.info(
+                `Created self-proving repair issue #${created.data.number}; fingerprint=${fingerprint}.`
+              );
             }
             // Convergence repair (kodmial/aa#192): explicitly wake the issue
             // scheduler once via workflow_dispatch. Events emitted by
@@ -749,9 +881,11 @@ jobs:
             // issue undispatched for roughly an hour. This is the supported
             // recursion-safe wake-up; never use a PAT merely to manufacture
             // event fan-out.
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
-            });
+            await apiRetry('wake issue scheduler', () =>
+              github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+              })
+            );
             core.info('Dispatched continuum-issue-scheduler.yml once for the P0 repair issue.');
 
       - name: Publish authoritative Product Contract result
@@ -767,6 +901,21 @@ jobs:
             // Product Contract #110. Generic OpenCode qualification must not
             // manufacture failures from a no-secret/minimal runner.
             const fs = require('fs');
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
             const path = 'self-proving-out/self-proving-summary.json';
             if (!fs.existsSync(path)) {
               core.warning('No self-proving summary; no authoritative #7 result is published.');
@@ -780,11 +929,13 @@ jobs:
               return;
             }
 
-            const { data: main } = await github.rest.repos.getBranch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              branch: 'main',
-            });
+            const { data: main } = await apiRetry('resolve current main', () =>
+              github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: 'main',
+              })
+            );
             const currentMain = String(main.commit.sha || '').toLowerCase();
             if (sha !== currentMain) {
               core.notice(
@@ -815,85 +966,103 @@ jobs:
               'Evidence was produced by the repository-owned qualification workflow with the configured Telegram token, encrypted canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. Generic no-secret qualification workers are not authoritative for AA.',
             ].join('\n');
 
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: 7,
-              per_page: 100,
-            });
-            if (!comments.some(c => String(c.body || '').includes(marker))) {
-              await github.rest.issues.createComment({
+            const comments = await apiRetry('list qualification comments', () =>
+              github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: 7,
-                body,
-              });
+                per_page: 100,
+              })
+            );
+            if (!comments.some(c => String(c.body || '').includes(marker))) {
+              await apiRetry('publish qualification result comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  body,
+                })
+              );
             }
 
             if (result === 'pass') {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 7,
-                state: 'closed',
-                state_reason: 'completed',
-                labels: [],
-              });
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                body: [
-                  '⚡ **AA self-proving qualification**',
-                  '<!-- continuum-origin role=project component=aa-self-proving-qualification -->',
-                  `Product Contract qualified on exact current main \`${sha}\`; capability #6 is complete.`,
-                ].join('\n'),
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                state: 'closed',
-                state_reason: 'completed',
-                labels: ['priority:p1'],
-              });
+              await apiRetry('close qualification tracker', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  state: 'closed',
+                  state_reason: 'completed',
+                  labels: [],
+                })
+              );
+              await apiRetry('publish capability completion comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  body: [
+                    '⚡ **AA self-proving qualification**',
+                    '<!-- continuum-origin role=project component=aa-self-proving-qualification -->',
+                    `Product Contract qualified on exact current main \`${sha}\`; capability #6 is complete.`,
+                  ].join('\n'),
+                })
+              );
+              await apiRetry('close capability issue', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  state: 'closed',
+                  state_reason: 'completed',
+                  labels: ['priority:p1'],
+                })
+              );
 
-              const openIssues = await github.paginate(github.rest.issues.listForRepo, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                per_page: 100,
-              });
+              const openIssues = await apiRetry('list open repair issues', () =>
+                github.paginate(github.rest.issues.listForRepo, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  per_page: 100,
+                })
+              );
               for (const issue of openIssues) {
                 if (
                   !issue.pull_request &&
                   String(issue.body || '').includes('<!-- aa-self-proving-repair:v1 -->')
                 ) {
-                  await github.rest.issues.update({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: issue.number,
-                    state: 'closed',
-                    state_reason: 'completed',
-                  });
+                  await apiRetry('close completed repair issue', () =>
+                    github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      state: 'closed',
+                      state_reason: 'completed',
+                    })
+                  );
                 }
               }
               core.notice(`Product Contract PASS accepted for exact main ${sha}; #7 and #6 completed.`);
             } else {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 7,
-                state: 'open',
-                labels: ['automation:in-progress'],
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                state: 'open',
-                labels: ['priority:p1', 'automation:qualifying', 'automation:blocked'],
-              });
+              await apiRetry('mark qualification tracker unqualified', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  state: 'open',
+                  labels: ['automation:in-progress'],
+                })
+              );
+              await apiRetry('mark capability blocked', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  state: 'open',
+                  labels: ['priority:p1', 'automation:qualifying', 'automation:blocked'],
+                })
+              );
               core.warning(
                 `Product Contract remains unqualified at exact main ${sha}; self-proving repair loop continues from Gate ${blocking}.`
               );

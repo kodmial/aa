@@ -8,11 +8,13 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: read
   issues: read
 
 concurrency:
-  group: aa-canary
+  # Serialize live Telegram polling with authoritative self-proving.
+  group: aa-self-proving-qualification
   cancel-in-progress: false
 
 jobs:
@@ -22,58 +24,12 @@ jobs:
     outputs:
       active: ${{ steps.gate.outputs.active }}
     steps:
-      - name: Gate canary on final AA qualification
+      - name: Activate bounded current-main canary
         id: gate
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            // The recurring canary is post-qualification only. #6 is the
-            // capability and #7 is the exact-main final qualification tracker.
-            // Require both terminal-success states; legacy #80 is superseded
-            // and must never activate the canary.
-            let active = false;
-            let detail = 'final Product Contract qualification is not complete';
-            try {
-              const [{ data: capability }, { data: qualification }] = await Promise.all([
-                github.rest.issues.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: 6,
-                }),
-                github.rest.issues.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: 7,
-                }),
-              ]);
-              const capabilityDone =
-                capability.state === 'closed' && capability.state_reason === 'completed';
-              const qualificationDone =
-                qualification.state === 'closed' && qualification.state_reason === 'completed';
-              active = capabilityDone && qualificationDone;
-              detail = active
-                ? 'capability #6 and exact-main qualification #7 are complete'
-                : `#6 state=${capability.state}/${capability.state_reason || 'none'}; #7 state=${qualification.state}/${qualification.state_reason || 'none'}`;
-            } catch (error) {
-              core.warning(
-                `Unable to verify #6/#7 final qualification; canary stays inactive: ${error.message}`
-              );
-              detail = 'final qualification could not be verified';
-            }
-
-            core.setOutput('active', active ? 'true' : 'false');
-            core.notice(
-              active
-                ? 'AA canary activated by completed #6/#7 final qualification.'
-                : `AA canary cleanly skipped: ${detail}.`
-            );
-            await core.summary
-              .addHeading('AA canary activation')
-              .addRaw(active ? 'ACTIVE' : 'NOT READY')
-              .addEOL()
-              .addRaw(detail)
-              .write();
+        shell: bash
+        run: |
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          echo "AA canary ACTIVE: current-main C/D/E runs every four hours regardless of qualification state." >> "$GITHUB_STEP_SUMMARY"
 
   canary:
     needs: activation
@@ -406,6 +362,29 @@ jobs:
           )
           PY
 
+      - name: Re-enter authoritative convergence after canary failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const { data: main } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main',
+            });
+            const currentMain = String((main.commit && main.commit.sha) || '');
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'aa-self-proving-qualification.yml',
+              ref: 'main',
+              inputs: { required_sha: currentMain },
+            });
+            core.notice(
+              `Canary failed; authoritative exact-main self-proving dispatched for ${currentMain.slice(0, 12)}.`
+            );
+
       - name: Record canary summary
         if: always()
         shell: bash
@@ -413,7 +392,7 @@ jobs:
           {
             echo "## AA canary"
             echo
-            echo "- final activation gate: capability #6 and exact-main qualification #7 completed"
+            echo "- activation: bounded current-main canary runs regardless of qualification state"
             echo "- repository verification: executed"
             echo "- real local OpenCode server lifecycle: executed"
             echo "- Gate C smoke (exact production path, scenario families, diversity): executed"

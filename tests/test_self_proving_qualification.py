@@ -326,6 +326,17 @@ def test_repair_loop_single_issue_and_rerun_order() -> None:
     assert report.category == "fallback-collapse"
     fingerprint = repair_fingerprint(report)
     assert len(fingerprint) == 16
+    same_defect_new_sha = failure_report_for_gate(
+        GateEvidence(
+            gate="C",
+            status="FAIL",
+            sha=OTHER_SHA,
+            failure_category="fallback-collapse",
+            component="answer",
+            run_id="run-10",
+        )
+    )
+    assert repair_fingerprint(same_defect_new_sha) == fingerprint
     assert find_reusable_repair([(12, fingerprint), (13, "other")], fingerprint=fingerprint) == 12
     assert find_reusable_repair([(12, "other")], fingerprint=fingerprint) is None
     assert rerun_plan("C") == ["C", "D", "E", "F"]
@@ -425,6 +436,9 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "Gate C smoke" in canary
     assert "Gate D readiness" in canary
     assert "Gate E latency guard" in canary
+    assert "group: aa-self-proving-qualification" in canary
+    assert "Activate bounded current-main canary" in canary
+    assert "Re-enter authoritative convergence after canary failure" in canary
     assert CONTROL_ISSUE_NUMBER == 31
     assert ISSUE_NUMBER == 146
 
@@ -433,12 +447,22 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # pause semantics or fewer than the required three implementation slots.
     assert "automation:ready" in workflow
     assert "aa-self-proving-restart" in workflow
+    assert "aa-self-proving-transient" in workflow
+    assert "transient-blocked.json" in workflow
+    assert "Stage timings:" in workflow
+    assert "Repair recurrence:" in workflow
+    assert "async function apiRetry" in workflow
+    assert "retrying in" in workflow
+    assert "const stableFailures = productFailures.length" in workflow
+    assert "const fingerprint = stableFailures.join('|')" in workflow
     recovery = (REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml").read_text(
         encoding="utf-8"
     )
     assert "workflow_run" in recovery
     assert "AA self-proving qualification" in recovery
     assert "aa-self-proving-restart" in recovery
+    assert "aa-self-proving-transient" in recovery
+    assert "External/transient qualification blocker" in recovery
     assert "reRunWorkflowFailedJobs" in recovery
     assert "createWorkflowDispatch" in recovery
     scheduler = (REPO_ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml").read_text(
@@ -466,14 +490,7 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
 def test_gate_c_preserves_live_failure_without_live_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gate F re-evaluation (issue #153) must not mask a real Gate C failure.
-
-    When the repository-owned live artifact already carries a matching
-    SHA/run FAIL, ``_gate_c`` must return ``live-path-failed`` even if the
-    current process lacks ``SELF_PROVING_LIVE``/secrets (Gate E/F context).
-    Only with no usable live evidence may it report
-    ``live-execution-not-enabled``.
-    """
+    """Gate F re-evaluation must preserve the Gate-C-owned live lane only."""
     import scripts.run_self_proving_qualification as runner
 
     monkeypatch.delenv("SELF_PROVING_LIVE", raising=False)
@@ -483,12 +500,84 @@ def test_gate_c_preserves_live_failure_without_live_env(
     live_dir = tmp_path / "live-out"
     live_dir.mkdir(parents=True, exist_ok=True)
     (live_dir / "product-contract-live-summary.json").write_text(
-        json.dumps({"main_sha": SHA, "run_id": "run-1", "status": "FAIL", "lanes": []}),
+        json.dumps(
+            {
+                "main_sha": SHA,
+                "run_id": "run-1",
+                "status": "FAIL",
+                "lanes": [
+                    {
+                        "lane": "live-telegram-evidence",
+                        "status": "FAIL",
+                        "passed": [],
+                        "failed": ["live-answer-no-generic-collapse"],
+                        "incomplete": [],
+                        "metrics": {},
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
     assert evidence.status == "FAIL"
-    assert evidence.failure_category == "live-path-failed"
+    assert evidence.failure_category == "live-answer-no-generic-collapse"
+
+
+def test_gate_c_ignores_foreign_lane_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-C lane must never be reclassified as a Gate C repair."""
+    import scripts.run_self_proving_qualification as runner
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    live_dir = tmp_path / "live-out"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / "product-contract-live-summary.json").write_text(
+        json.dumps(
+            {
+                "main_sha": SHA,
+                "run_id": "run-1",
+                "status": "FAIL",
+                "lanes": [
+                    {
+                        "lane": "runtime-control-33-41",
+                        "status": "FAIL",
+                        "failed": ["runtime-control-failure"],
+                        "passed": [],
+                        "incomplete": [],
+                        "metrics": {},
+                    },
+                    {
+                        "lane": "live-telegram-evidence",
+                        "status": "PASS",
+                        "passed": [
+                            "live-raw-telegram-transport-boundary",
+                            "live-answer-no-generic-collapse",
+                            "live-answer-diversity",
+                            "live-actual-served-model-identity",
+                            "live-planner-retrieval-answer-verifier-telemetry",
+                        ],
+                        "failed": [],
+                        "incomplete": [],
+                        "metrics": {
+                            "turns_executed": 4,
+                            "latency_p50_s": 20.0,
+                            "latency_p95_s": 25.0,
+                            "latency_max_s": 29.0,
+                            "turn_latencies_ms": [18000.0, 20000.0, 24000.0, 29000.0],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence, latencies, aggregate = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
+    assert evidence.status == "PASS"
+    assert evidence.live_trusted is True
+    assert latencies
+    assert aggregate is not None
 
 
 def test_gate_c_still_blocked_without_evidence_or_env(
@@ -504,6 +593,14 @@ def test_gate_c_still_blocked_without_evidence_or_env(
     evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
     assert evidence.status == "BLOCKED"
     assert evidence.failure_category == "live-execution-not-enabled"
+
+
+def test_gate_e_uses_trusted_live_latency_even_when_gate_c_functionally_fails() -> None:
+    runner = (REPO_ROOT / "scripts" / "run_self_proving_qualification.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gate_c_live=gate_c.live_trusted" in runner
+    assert 'gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted)' not in runner
 
 
 def test_gate_e_f_preserve_live_execution_context() -> None:

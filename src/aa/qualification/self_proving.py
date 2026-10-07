@@ -549,7 +549,6 @@ def repair_fingerprint(report: FailureReport) -> str:
             report.gate.strip(),
             report.category.strip(),
             report.component.strip(),
-            report.sha.strip(),
         )
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
