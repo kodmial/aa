@@ -91,7 +91,9 @@ async def test_over_budget_envelope_overflow_skips_regeneration(
 ) -> None:
     """A slow overflowing turn compacts deterministically without a 2nd round."""
     pack = [_pack_entry()]
-    sentence = "Поддержка рядом помогает пережить тягу спокойно"
+    # Long sentences so the capped leading window (kodmial/aa#217, max 3
+    # units) still overflows the envelope and exercises the budget path.
+    sentence = "Поддержка рядом помогает пережить тягу спокойно " + "x" * 350
     long_draft = " ".join(f"{sentence}." for _ in range(60))
     assert not envelope_passes(long_draft)
     long_units = split_response_units(long_draft)
@@ -134,9 +136,11 @@ async def test_over_budget_envelope_overflow_skips_regeneration(
 async def test_fast_envelope_overflow_still_regenerates() -> None:
     """A fast overflowing turn still uses the single compact regeneration."""
     pack = [_pack_entry()]
-    sentence = "Поддержка рядом помогает пережить тягу спокойно"
+    # Long sentences so the capped leading window (kodmial/aa#217, max 3
+    # units) still overflows the envelope and exercises regeneration.
+    sentence = "Поддержка рядом помогает пережить тягу спокойно " + "x" * 350
     long_draft = " ".join(f"{sentence}." for _ in range(60))
-    short_draft = f"{sentence}."
+    short_draft = "Поддержка рядом помогает пережить тягу спокойно."
     assert not envelope_passes(long_draft)
     assert envelope_passes(short_draft)
     long_units = split_response_units(long_draft)

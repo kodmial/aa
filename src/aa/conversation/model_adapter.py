@@ -56,6 +56,18 @@ RUNTIME_AGENT_V2 = "aa-runtime-v2"
 # pinned to Muse Spark. An empty transport agent means no ``agent`` key is
 # sent on the wire.
 VERIFIER_TRANSPORT_AGENT_V2 = ""
+# Planner transport selector (kodmial/aa#217): the logical audit identity
+# stays ``aa-planner-v2`` while the OpenCode transport agent selector is
+# omitted (server default applies). Live evidence on exact main a7d76f1
+# (run 37670332968) showed the planner serving the weak fallback while
+# answer/verifier/summarizer served the strong primary, with p50 25.2s /
+# p95 33.6s over budget and 3 generic clarifications. The custom-selector
+# structured path burns a 5s retry plus omitted attempt plus fallback per
+# turn before reaching the weak model, and weak queries yield irrelevant
+# packs that verify unsupported. Omitting the selector serves the strong
+# primary in one call like the decoupled verifier, cutting planner tail
+# and improving pack relevance. Fallback stays configured for resilience.
+PLANNER_TRANSPORT_AGENT_V2 = ""
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 # Live SLO guard (Gate C/E): a persistent provider-access (403) rejection
@@ -848,10 +860,43 @@ def build_verifier_model(
     )
 
 
+def build_planner_model(
+    client: OpenCodeClient,
+    *,
+    primary_model: str,
+    fallback_model: str,
+    request_timeout: float = 120.0,
+) -> OpenCodeChatModel:
+    """Build the decoupled query planner (kodmial/aa#217).
+
+    The logical audit identity stays ``aa-planner-v2`` while the
+    transport agent selector is omitted so a custom-selector structured
+    rejection can never strand the planner on the weak fallback. The
+    configured fallback stays for resilience (unlike the fallback-free
+    verifier). The planner system prompt still travels through the native
+    ``system`` field. Derived answer/summarizer agents are built via
+    ``with_agent`` (custom wire, proven for text) and share the
+    process-wide primary circuit.
+    """
+    from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+
+    pinned_primary = (primary_model or "").strip() or DEFAULT_PRIMARY_MODEL
+    pinned_fallback = (fallback_model or "").strip() or DEFAULT_FALLBACK_MODEL
+    return OpenCodeChatModel(
+        client,
+        agent=PLANNER_AGENT_V2,
+        primary_model=pinned_primary,
+        fallback_model=pinned_fallback,
+        request_timeout=request_timeout,
+        transport_agent=PLANNER_TRANSPORT_AGENT_V2,
+    )
+
+
 __all__ = [
     "ANSWER_AGENT_V2",
     "OMITTED_STRUCTURED_CAPABILITY_TTL_S",
     "PLANNER_AGENT_V2",
+    "PLANNER_TRANSPORT_AGENT_V2",
     "PRIMARY_ACCESS_CIRCUIT_TTL_S",
     "RUNTIME_AGENT_V2",
     "STRUCTURED_RETRY_COUNT",
@@ -859,6 +904,7 @@ __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
+    "build_planner_model",
     "build_verifier_model",
     "clear_omitted_structured_cache",
     "clear_primary_circuit",

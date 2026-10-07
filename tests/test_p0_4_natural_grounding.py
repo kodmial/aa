@@ -998,10 +998,12 @@ async def test_ordinary_output_stays_within_envelope() -> None:
 
 async def test_overlong_first_generation_compactly_regenerates_once() -> None:
     pack = [_pack_entry()]
-    sentence = "Поддержка рядом помогает пережить тягу спокойно"
+    # Long sentences so the capped leading window (kodmial/aa#217, max 3
+    # units) still overflows the envelope and exercises regeneration.
+    sentence = "Поддержка рядом помогает пережить тягу спокойно " + "x" * 350
     long_draft = " ".join(f"{sentence}." for _ in range(60))
     assert not envelope_passes(long_draft)
-    short_draft = f"{sentence}."
+    short_draft = "Поддержка рядом помогает пережить тягу спокойно."
     long_units = split_response_units(long_draft)
     short_units = split_response_units(short_draft)
     answer = _AnswerModel([long_draft, short_draft])

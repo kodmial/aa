@@ -85,6 +85,25 @@ ANSWER_GENERATION_MAX_PASSAGES = 6
 # healthy provider) still use both rounds.
 TURN_REPAIR_TIME_BUDGET_S = 15.0
 
+# Bounded verifier fan-out (Gate C+E live repair, kodmial/aa#217 recurrence
+# on exact main a7d76f1 run 37670332968: p50 25.2s / p95 33.6s / max 44.7s
+# with planner p50 3.6s / p95 9.2s, retrieval p50 0.4s, repair_turns=0 and
+# 3 generic clarifications). The prior input-window repair (answer window 6
+# + planner 500 chars on 0202b0b) saved only ~4s p50: planner improved
+# 5.7s to 3.6s but total stayed 10s over the p95 SLO because the dominant
+# persistent cost is the sequential provider chain (answer text on strong
+# primary + one concurrent verifier call per draft unit). Long drafts fan
+# out to 4-5 concurrent Muse calls that contend on the free tier, and long
+# drafts carry more unsupported claims that collapse to generic
+# clarification. The cap below bounds the answer-to-verifier handoff
+# (output boundary, not another input window): only the leading units are
+# verified and served, the tail is deterministically discarded before any
+# provider call. Grounding stays strict (only validated supported units
+# are served, otherwise clarification); the 2-5 sentence generation budget
+# still holds because the cap allows 3 sentences. Turn-independent, never
+# an exact-question special case.
+MAX_VERIFIED_UNITS = 3
+
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."
@@ -258,6 +277,25 @@ def strip_adjacent_quotes(
     return " ".join(filtered.split()).strip()
 
 
+def cap_draft_to_verified_window(draft: str) -> str:
+    """Truncate one draft to the leading verified-unit window (no semantics).
+
+    Only the leading ``MAX_VERIFIED_UNITS`` razdel units are kept for
+    verification and serving; the tail is deterministically discarded
+    before any verifier provider call. Grounding stays strict because the
+    served text is exactly the verified prefix (never the unverified tail).
+    Split failures pass through untouched so ``_verify_draft`` still fails
+    closed. Turn-independent, never an exact-question special case.
+    """
+    try:
+        units = split_response_units(draft)
+    except (ResponseUnitError, ValueError):
+        return draft
+    if len(units) <= MAX_VERIFIED_UNITS:
+        return draft
+    return " ".join(unit.text for unit in units[:MAX_VERIFIED_UNITS])
+
+
 async def _verify_draft(
     draft: str,
     pack_dicts: list[dict[str, Any]],
@@ -350,6 +388,7 @@ async def run_v2_answer_turn(
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
         "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
+        "verifier_units_cap": MAX_VERIFIED_UNITS,
     }
 
     def _finish_telemetry() -> None:
@@ -377,13 +416,17 @@ async def run_v2_answer_turn(
         passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
-            return await generate_draft(
+            raw = await generate_draft(
                 model=answer_model,
                 recent=recent,
                 summary=summary,
                 passages=passages,
                 user_message=prompt_text,
             )
+            capped = cap_draft_to_verified_window(raw)
+            if capped != raw:
+                logger.info("v2 draft capped to verified window")
+            return capped
         except Exception as exc:
             logger.info("v2 answer generation failed", extra={"category": type(exc).__name__})
             telemetry["answer_outcome"] = "failed"
@@ -822,10 +865,12 @@ __all__ = [
     "ANSWER_GENERATION_MAX_PASSAGES",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
+    "MAX_VERIFIED_UNITS",
     "NATURAL_CLARIFICATION_REPLY",
     "NATURAL_RETRY_REPLY",
     "TURN_REPAIR_TIME_BUDGET_S",
     "answer_pipeline_node",
+    "cap_draft_to_verified_window",
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",

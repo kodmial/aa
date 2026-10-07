@@ -317,17 +317,21 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         from aa.conversation.memory import default_memory_config
         from aa.conversation.model_adapter import (
             ANSWER_AGENT_V2,
-            PLANNER_AGENT_V2,
             SUMMARIZER_AGENT_V2,
-            OpenCodeChatModel,
+            build_planner_model,
         )
         from aa.retrieval.evidence import RetrievalConfig
 
         primary = str(getattr(self._settings, "opencode_model", ""))
         fallback = str(getattr(self._settings, "opencode_fallback_model", ""))
-        planner = OpenCodeChatModel(
+        # Gate C+E repair (kodmial/aa#217): the planner uses the decoupled
+        # omitted transport (logical aa-planner-v2, wire omitted) so the
+        # structured planner serves the strong primary in one call instead
+        # of custom-selector 403 + 5s sleep + omitted attempt + weak
+        # fallback. Derived text agents keep the custom wire (proven for
+        # text) and share the process-wide primary circuit.
+        planner = build_planner_model(
             self._client,
-            agent=PLANNER_AGENT_V2,
             primary_model=primary,
             fallback_model=fallback,
         )
