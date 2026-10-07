@@ -440,6 +440,10 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "aa-self-proving-transient" in workflow
     assert "transient-blocked.json" in workflow
     assert "Stage timings:" in workflow
+    assert "Repair recurrence:" in workflow
+    assert "const fingerprint = `${blocking}:${category}:${component}`" in workflow
+    assert "state: 'all'" in workflow
+    assert "state: 'open'" in workflow
     recovery = (REPO_ROOT / ".github" / "workflows" / "aa-self-proving-429-recovery.yml").read_text(
         encoding="utf-8"
     )
