@@ -368,6 +368,44 @@ def _count_stage_outcomes(snapshots: list[dict[str, Any]]) -> dict[str, dict[str
     return counts
 
 
+def _token_usage_by_agent(client: Any) -> dict[str, dict[str, int]]:
+    """Aggregate privacy-safe model token usage by logical agent.
+
+    Only numeric counters travel here (request counts plus input/output/
+    reasoning/cache totals); no prompts, responses, or session ids.
+    """
+    usage: dict[str, dict[str, int]] = {}
+    audit = getattr(client, "token_usage_audit", ())
+    for item in audit:
+        if not isinstance(item, dict):
+            continue
+        agent = str(item.get("agent", "") or "unknown")
+        bucket = usage.setdefault(
+            agent,
+            {
+                "requests": 0,
+                "input_total": 0,
+                "output_total": 0,
+                "reasoning_total": 0,
+                "cache_read_total": 0,
+                "cache_write_total": 0,
+            },
+        )
+        bucket["requests"] = int(bucket["requests"]) + 1
+        for key in (
+            "input",
+            "output",
+            "reasoning",
+            "cache_read",
+            "cache_write",
+        ):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and float(value) >= 0:
+                target = f"{key}_total"
+                bucket[target] = int(bucket[target]) + int(value)
+    return usage
+
+
 # ---------------------------------------------------------------------------
 # Lane 1: deterministic production-message lane (scenarios 1-24)
 # ---------------------------------------------------------------------------
@@ -782,35 +820,7 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
     else:
         failed.append("25b-heartbeat-cancel-clean")
 
-    token_usage_by_agent: dict[str, dict[str, int | float]] = {}
-    token_audit = getattr(app.opencode_runtime.client, "token_usage_audit", ())
-    for item in token_audit:
-        if not isinstance(item, dict):
-            continue
-        agent = str(item.get("agent", "") or "unknown")
-        bucket = token_usage_by_agent.setdefault(
-            agent,
-            {
-                "requests": 0,
-                "input_total": 0,
-                "output_total": 0,
-                "reasoning_total": 0,
-                "cache_read_total": 0,
-                "cache_write_total": 0,
-            },
-        )
-        bucket["requests"] = int(bucket["requests"]) + 1
-        for key in (
-            "input",
-            "output",
-            "reasoning",
-            "cache_read",
-            "cache_write",
-        ):
-            value = item.get(key)
-            if isinstance(value, (int, float)) and float(value) >= 0:
-                target = f"{key}_total"
-                bucket[target] = int(bucket[target]) + int(value)
+    token_usage_by_agent = _token_usage_by_agent(app.opencode_runtime.client)
 
     metrics = {
         "scenarios_executed": 8,
@@ -819,6 +829,7 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
         "real_telegram_token_configured": bool(
             (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
         ),
+        "opencode_token_usage_by_agent": token_usage_by_agent,
     }
     if failed:
         status = "FAIL"
@@ -1921,9 +1932,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         if isinstance(snapshot.get("response_units", 0), (int, float))
     ]
     verifier_metrics = {
-        "turns_with_unavailable_units": sum(
-            1 for value in verifier_unavailable_units if value > 0
-        ),
+        "turns_with_unavailable_units": sum(1 for value in verifier_unavailable_units if value > 0),
         "unavailable_units_total": sum(verifier_unavailable_units),
         "response_units_total": sum(response_unit_counts),
         "response_units_max": max(response_unit_counts) if response_unit_counts else 0,
@@ -1953,6 +1962,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 "p95": round(_percentile(values, 95), 1),
                 "max": round(max(values), 1),
             }
+
+    token_usage_by_agent = _token_usage_by_agent(app.opencode_runtime.client)
 
     metrics = {
         "scenarios_executed": 8,

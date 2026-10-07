@@ -151,11 +151,9 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
             raise VerifierValidationError(
                 f"verifier unavailable metadata contains unknown unit {unit_id!r}"
             )
-        verdict = next((item for item in result.units if item.unit_id == unit_id), None)
-        if verdict is None or verdict.supported:
-            raise VerifierValidationError(
-                f"unavailable verifier unit {unit_id!r} must fail closed"
-            )
+        match = next((item for item in result.units if item.unit_id == unit_id), None)
+        if match is None or match.supported:
+            raise VerifierValidationError(f"unavailable verifier unit {unit_id!r} must fail closed")
     return result
 
 

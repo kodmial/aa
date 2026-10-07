@@ -173,10 +173,7 @@ def has_supported_book_unit(result: GroundingResult | None) -> bool:
     """Whether a failed/partial draft retains substantive grounded material."""
     if result is None:
         return False
-    return any(
-        verdict.scope == "book" and bool(verdict.supported)
-        for verdict in result.units
-    )
+    return any(verdict.scope == "book" and bool(verdict.supported) for verdict in result.units)
 
 
 def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
@@ -682,9 +679,7 @@ async def run_v2_answer_turn(
     # Repair budget exhausted: narrow to supported material or clarify.
     narrowed = keep_supported_text(units, result) if units else ""
     substantive_narrowing_ok = (
-        initial_query_count is None
-        or initial_query_count == 0
-        or has_supported_book_unit(result)
+        initial_query_count is None or initial_query_count == 0 or has_supported_book_unit(result)
     )
     if (
         narrowed

@@ -18,6 +18,7 @@ from aa.qualification.product_contract_live import (
     EXIT_BY_STATUS,
     ProductContractLiveError,
     _count_stage_outcomes,
+    _token_usage_by_agent,
     assert_no_text_leak,
     build_result_marker,
     collect_static_gates,
@@ -357,6 +358,32 @@ def test_count_stage_outcomes_ignores_malformed_snapshots() -> None:
     assert counts["retrieval_outcome"] == {}
     assert counts["answer_outcome"] == {}
     assert counts["verifier_outcome"] == {}
+
+
+def test_token_usage_by_agent_aggregates_counters_only() -> None:
+    # Gate C+E repair diagnostics (kodmial/aa#217 recurrence 3): the live
+    # lane must attribute token/output work per logical agent from the
+    # privacy-safe client audit so the next latency conclusion uses
+    # measured round trips, not prompt-size assumptions.
+    class _Client:
+        token_usage_audit = (
+            {"agent": "aa-v2", "input": 120, "output": 40, "reasoning": 5},
+            {"agent": "aa-v2", "input": 80, "output": 20},
+            {"agent": "aa-verifier-v2", "input": 200, "output": 3},
+            {"agent": "", "input": 10, "output": 1},
+            "not-an-entry",
+            {"agent": "aa-v2", "input": -1, "output": "many"},
+        )
+
+    usage = _token_usage_by_agent(_Client())
+    assert usage["aa-v2"]["requests"] == 3
+    assert usage["aa-v2"]["input_total"] == 200
+    assert usage["aa-v2"]["output_total"] == 60
+    assert usage["aa-v2"]["reasoning_total"] == 5
+    assert usage["aa-verifier-v2"]["requests"] == 1
+    assert usage["aa-verifier-v2"]["input_total"] == 200
+    assert usage["unknown"]["requests"] == 1
+    assert_no_text_leak(usage)
 
 
 def test_live_voice_fixture_failure_has_concrete_component() -> None:

@@ -225,14 +225,10 @@ class GraphTurnRuntime:
                 "answer_rounds": int(embedded_d.get("answer_rounds", 0)),
                 "verifier_outcome": str(embedded_d.get("verifier_outcome", "unknown")),
                 "verifier_latency_ms": float(embedded_d.get("verifier_latency_ms", 0.0)),
-                "verifier_unavailable_units": int(
-                    embedded_d.get("verifier_unavailable_units", 0)
-                ),
+                "verifier_unavailable_units": int(embedded_d.get("verifier_unavailable_units", 0)),
                 "response_units": int(response_units),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
-                "repair_budget_exceeded": bool(
-                    embedded_d.get("repair_budget_exceeded", False)
-                ),
+                "repair_budget_exceeded": bool(embedded_d.get("repair_budget_exceeded", False)),
                 "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),

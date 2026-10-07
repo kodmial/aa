@@ -37,7 +37,6 @@ from aa.conversation.model_adapter import (
     PLANNER_TRANSPORT_AGENT_V2,
     VERIFIER_AGENT_V2,
     VERIFIER_TRANSPORT_AGENT_V2,
-    OpenCodeChatModel,
     build_planner_model,
     build_verifier_model,
     clear_primary_circuit,

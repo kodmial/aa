@@ -859,7 +859,10 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
         timing_audit = client.request_latency_audit
         assert len(timing_audit) == 2
         assert all(item["operation"] == "message-text" for item in timing_audit)
-        assert all(float(item["latency_ms"]) >= 0.0 for item in timing_audit)
+        assert all(
+            isinstance(item["latency_ms"], (int, float)) and float(item["latency_ms"]) >= 0.0
+            for item in timing_audit
+        )
         assert all(item["success"] is True for item in timing_audit)
         assert "hello" not in json.dumps(timing_audit)
         token_audit = client.token_usage_audit

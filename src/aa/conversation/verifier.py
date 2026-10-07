@@ -939,9 +939,7 @@ async def _verify_per_unit_concurrent(
     for item in raw_results:
         if isinstance(item, OpenCodeRateLimitError):
             raise item
-        if isinstance(item, BaseException) and not isinstance(
-            item, expected_unavailable_errors
-        ):
+        if isinstance(item, BaseException) and not isinstance(item, expected_unavailable_errors):
             # Cancellation/system exceptions and programming defects are not
             # transport unavailability. Do not silently turn them into a
             # partial user answer.
@@ -979,9 +977,7 @@ async def _verify_per_unit_concurrent(
         raise first_unavailable
 
     ordered = sorted(verdicts, key=lambda verdict: verdict.unit_id)
-    all_supported = (
-        not unavailable_unit_ids and all(verdict.supported for verdict in ordered)
-    )
+    all_supported = not unavailable_unit_ids and all(verdict.supported for verdict in ordered)
     assembled = GroundingResult(
         units=list(ordered),
         all_required_supported=all_supported,

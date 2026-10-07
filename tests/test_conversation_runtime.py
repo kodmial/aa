@@ -88,7 +88,6 @@ def test_graph_runtime_preserves_stage_latency_and_outage_telemetry() -> None:
     assert snapshot["repair_budget_exceeded"] is False
 
 
-
 RU_FIXTURES: dict[str, str] = {
     "doctors-opinion": (
         "Фиктивное мнение доктора о тяге и навязчивом желании выпить. "

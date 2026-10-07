@@ -247,9 +247,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         return json.loads(raw.decode("utf-8"))
 
     @staticmethod
-    def _request_operation(
-        method: str, path: str, body: dict[str, object] | None
-    ) -> str:
+    def _request_operation(method: str, path: str, body: dict[str, object] | None) -> str:
         if method == "GET" and path == "/global/health":
             return "health"
         if method == "POST" and path == "/session":
@@ -261,9 +259,7 @@ class HttpOpenCodeClient(OpenCodeClient):
             return "session-delete"
         return "other"
 
-    def _record_request_latency(
-        self, *, operation: str, elapsed_ms: float, success: bool
-    ) -> None:
+    def _record_request_latency(self, *, operation: str, elapsed_ms: float, success: bool) -> None:
         self._request_latency_audit.append(
             {
                 "operation": operation,
@@ -378,9 +374,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         """Return privacy-safe model token usage keyed by logical agent."""
         return tuple(dict(item) for item in self._token_usage_audit)
 
-    def _record_token_usage(
-        self, info: object, *, agent: str, audit_agent: str = ""
-    ) -> None:
+    def _record_token_usage(self, info: object, *, agent: str, audit_agent: str = "") -> None:
         if not isinstance(info, dict):
             return
         tokens = info.get("tokens")
