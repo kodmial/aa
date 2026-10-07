@@ -791,7 +791,9 @@ jobs:
               verifierLine =
                 'Verifier availability: ' +
                 `turns_with_unavailable_units=${Number(verifier.turns_with_unavailable_units || 0)}, ` +
-                `unavailable_units_total=${Number(verifier.unavailable_units_total || 0)}.`;
+                `unavailable_units_total=${Number(verifier.unavailable_units_total || 0)}, ` +
+                `response_units_total=${Number(verifier.response_units_total || 0)}, ` +
+                `response_units_max=${Number(verifier.response_units_max || 0)}.`;
               const requestTimings = metrics.opencode_request_latency_ms || {};
               const requestRendered = Object.keys(requestTimings)
                 .sort()
