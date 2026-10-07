@@ -704,6 +704,7 @@ jobs:
             const runId = String(context.runId);
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
+            let component = 'unknown';
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
@@ -713,6 +714,7 @@ jobs:
               const failed = (summary.gates || []).find(g => g.status !== 'PASS');
               if (failed) {
                 category = `${failed.gate}:${failed.failure_category || failed.status}`;
+                component = String(failed.component || 'unknown');
                 const p50 = Number(failed.latency_p50_ms || 0);
                 const p95 = Number(failed.latency_p95_ms || 0);
                 const max = Number(failed.max_turn_ms || 0);
@@ -749,8 +751,27 @@ jobs:
               core.info('No per-stage live timing evidence yet: ' + error.message);
             }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
-            const fingerprint = `${blocking}:${category}:${sha.slice(0, 12)}`;
+            // Stable defect identity deliberately excludes main SHA. A new
+            // merge must not disguise the same failing component as a new
+            // failure series; repeated non-convergence reopens the same P0.
+            const fingerprint = `${blocking}:${category}:${component}`;
             const title = `P0: Repair self-proving qualification failure (Gate ${blocking})`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100,
+            });
+            const existing = issues
+              .filter(issue => !issue.pull_request && String(issue.body || '').includes(marker))
+              .find(issue =>
+                String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
+              );
+            let recurrence = 1;
+            if (existing) {
+              const match = String(existing.body || '').match(/Repair recurrence: \`(\d+)\`/);
+              recurrence = match ? Number(match[1]) + 1 : 2;
+            }
+            const recurrenceFocus = recurrence > 1
+              ? '- RECURRENCE: the previous repair for this same gate/category/component did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
+              : '- First occurrence for this stable gate/category/component fingerprint.';
             const body = [
               marker,
               '',
@@ -758,47 +779,45 @@ jobs:
               '',
               `Failure category: \`${category}\``,
               `Blocking gate: \`${blocking}\``,
+              `Component: \`${component}\``,
               `Main SHA: \`${sha}\``,
               `Run id: \`${runId}\``,
               `Repair fingerprint: \`${fingerprint}\``,
+              `Repair recurrence: \`${recurrence}\``,
               timingLine,
               stageTimingLine,
               '',
               '### Required repair behavior',
               '',
               repairFocus,
+              recurrenceFocus,
               '- Fix without exact-question special cases; Product Contract #110 stays immutable.',
               '- Rerun the failed gate first, then downstream gates, then the exact-main final gate.',
               '- Repeat boundedly until PASS; no owner comments, manual labels, or manual merge required.',
               '- Provider 429: retire/restart the runner and resume from the last completed gate checkpoint.',
               '',
-              'This issue is generated and refreshed automatically; duplicate failures must reuse it.',
+              'This issue is generated and refreshed automatically; the same stable failure series reopens this issue instead of creating another one.',
             ].join('\n');
-            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', per_page: 100,
-            });
-            const existing = openIssues.find(
-              issue => !issue.pull_request && String(issue.body || '').includes(marker) &&
-                String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
-            );
             if (existing) {
-              await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body, labels: ['priority:p0', 'automation:ready'] });
-              core.info(`Refreshed existing self-proving repair issue #${existing.number}.`);
-            } else {
-              // Exactly one P0 repair issue per failing component series: reuse
-              // any open marker issue before creating a new one.
-              const anyExisting = openIssues.find(
-                issue => !issue.pull_request && String(issue.body || '').includes(marker)
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                state: 'open',
+                title,
+                body,
+                labels: ['priority:p0', 'automation:ready'],
+              });
+              core.warning(
+                `Reopened self-proving repair issue #${existing.number}; recurrence=${recurrence} fingerprint=${fingerprint}.`
               );
-              if (anyExisting) {
-                await github.rest.issues.update({ owner, repo, issue_number: anyExisting.number, title, body, labels: ['priority:p0', 'automation:ready'] });
-                core.info(`Reused existing self-proving repair issue #${anyExisting.number}.`);
-              } else {
-                const created = await github.rest.issues.create({
-                  owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
-                });
-                core.info(`Created self-proving repair issue #${created.data.number}.`);
-              }
+            } else {
+              const created = await github.rest.issues.create({
+                owner, repo, title, body, labels: ['priority:p0', 'automation:ready'],
+              });
+              core.info(
+                `Created self-proving repair issue #${created.data.number}; fingerprint=${fingerprint}.`
+              );
             }
             // Convergence repair (kodmial/aa#192): explicitly wake the issue
             // scheduler once via workflow_dispatch. Events emitted by
