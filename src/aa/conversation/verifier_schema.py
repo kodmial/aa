@@ -6,6 +6,14 @@ lists, or source-ID presence checks decide semantic support. OpenCode
 native ``format=json_schema`` plus bounded native retry delivers the
 object; AA code performs exactly one Pydantic validation and the
 deterministic completeness checks below.
+
+Transport contract (Gate C repair kodmial/aa#190): per-unit only. The
+model emits one small boolean decision per response unit and never emits
+a free-form scope string, a unit id, or an aggregate flag. AA code binds
+``unit_id`` from the input unit, derives the internal scope
+deterministically (``book`` when ``requires_book_evidence`` is true,
+otherwise a non-book glue-compatible scope), and computes
+``all_required_supported`` as the conjunction of per-unit support.
 """
 
 from __future__ import annotations
@@ -16,19 +24,33 @@ from pydantic import BaseModel, Field
 
 ScopeName = Literal["book", "product_meta", "conversation_glue"]
 
+# Internal non-book scope derived when the model reports
+# ``requires_book_evidence=false``. Both pure conversation glue and
+# truthful assistant identity/capability statements map here; neither
+# needs book evidence and both are handled identically downstream.
+NON_BOOK_SCOPE: ScopeName = "conversation_glue"
+
 # Bounded native retry for one verifier call (Gate C live repair, run
 # 37538518277: p50 16.4s/p95 34.4s/max 42.7s over the 30s hard budget with
 # the verifier never served and all ordinary turns collapsed to generic
-# clarification). OpenCode owns this retry; AA code adds at most one more
-# id-completeness retry in turn_pipeline. Two server retries plus the
-# AA-side retry burned up to six slow fallback model calls per flaky turn.
-# One server retry halves the worst-case verifier latency while the
-# AA-side strict Pydantic + completeness gate stays unchanged.
+# clarification). OpenCode owns this retry. One server retry halves the
+# worst-case verifier latency while the AA-side strict Pydantic +
+# completeness gate stays unchanged.
 VERIFIER_MAX_ATTEMPTS = 1
 
 
+class UnitDecision(BaseModel):
+    """Provider-native per-unit verifier decision (transport only)."""
+
+    requires_book_evidence: bool
+    supported: bool
+    evidence_passage_ids: list[str] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
 class UnitVerdict(BaseModel):
-    """One verifier verdict for one ordered response unit."""
+    """One verifier verdict for one ordered response unit (internal)."""
 
     unit_id: str = Field(min_length=1)
     scope: ScopeName
@@ -37,7 +59,7 @@ class UnitVerdict(BaseModel):
 
 
 class GroundingResult(BaseModel):
-    """Claim-level grounding outcome for one draft."""
+    """Claim-level grounding outcome for one draft (internal)."""
 
     units: list[UnitVerdict] = Field(min_length=1)
     all_required_supported: bool
@@ -49,96 +71,45 @@ class VerifierValidationError(ValueError):
     """Structured verifier output failed completeness validation."""
 
 
-def verifier_json_schema() -> dict[str, object]:
-    """Build the native OpenCode JSON Schema for the verifier.
-
-    The schema is flattened and ``$ref``-free on purpose (Gate C live
-    repair): the raw Pydantic ``model_json_schema()`` emits ``$defs`` plus
-    ``$ref`` for the nested ``UnitVerdict`` model, and weak fallback
-    providers reject or flake on ``$ref`` (verifier never served, all
-    ordinary turns collapsing to generic clarification with slow internal
-    retries). The planner already uses a flat ``$ref``-free native schema
-    for the same reason. AA-side validation stays strict Pydantic
-    (``validate_grounding_result`` with ``extra=forbid`` and ID
-    completeness); this native schema is only the OpenCode transport hint.
-
-    The transport hint is additionally minimal on purpose (Gate C run
-    37538518277): ``minLength``/``minItems`` are omitted because weak
-    fallback providers reject or flake on length constraints while the
-    same constraints stay enforced in AA code (Pydantic ``min_length`` /
-    ``min_length`` plus the exactly-one-verdict-per-unit completeness
-    gate). ``required`` stays because it is the essential guidance a weak
-    model needs to emit a schema-valid verdict on the first try instead
-    of burning retry cycles.
-
-    The closed scope vocabulary is conveyed as a plain-text ``description``
-    hint only, never as a JSON Schema ``enum`` (Gate C live repair, run
-    37564172746: 13/14 ordinary turns collapsed to generic clarification
-    with the verifier never served in the served-model audit while the
-    enum-free planner structured output served on the same weak fallback
-    and answer text served; enum-constrained decoding is the remaining
-    structural difference, so the transport drops ``enum`` while AA-side
-    Pydantic ``Literal`` plus normalization stays strict). Turn-independent,
-    never an exact-question special case.
-    """
-    return {
-        "type": "object",
-        "properties": {
-            "units": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "unit_id": {"type": "string"},
-                        "scope": {
-                            "type": "string",
-                            "description": ("one of book, product_meta, conversation_glue"),
-                        },
-                        "supported": {"type": "boolean"},
-                        "evidence_passage_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["unit_id", "scope", "supported"],
-                },
-            },
-            "all_required_supported": {"type": "boolean"},
-        },
-        "required": ["units", "all_required_supported"],
-    }
-
-
 def verifier_single_json_schema() -> dict[str, object]:
-    """Build the minimal single-unit transport schema for weak providers.
+    """Build the minimal per-unit transport schema for providers.
 
-    Turn-independent hardening: a single verdict object (no array, no
-    ``unit_id`` copy) is strictly easier for a weak fallback model than
-    the batch array with exact ``u1``..``uN`` id copying. The native hint
-    stays ``$ref``-free and omits length constraints (enforced in AA
-    code); ``required`` stays as essential guidance. The scope vocabulary
-    is a plain-text description hint, never ``enum`` (Gate C run
-    37564172746, same enum-free rationale as the batch schema above).
+    The native hint contains only booleans plus the citation list: no
+    free-form scope string, no ``unit_id`` copy, and no model-computed
+    aggregate. The schema stays ``$ref``-free and omits length
+    constraints (enforced in AA code); ``required`` stays as essential
+    guidance. Turn-independent, never an exact-question special case.
     """
     return {
         "type": "object",
         "properties": {
-            "scope": {
-                "type": "string",
-                "description": "one of book, product_meta, conversation_glue",
-            },
+            "requires_book_evidence": {"type": "boolean"},
             "supported": {"type": "boolean"},
             "evidence_passage_ids": {
                 "type": "array",
                 "items": {"type": "string"},
             },
         },
-        "required": ["scope", "supported"],
+        "required": ["requires_book_evidence", "supported", "evidence_passage_ids"],
     }
 
 
+def validate_unit_decision(data: object) -> UnitDecision:
+    """Pydantic-validate one native per-unit verifier decision."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    if isinstance(data, UnitDecision):
+        return data
+    if isinstance(data, dict):
+        try:
+            return UnitDecision.model_validate(data)
+        except PydanticValidationError as exc:
+            raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
+    raise VerifierValidationError("verifier output is not a structured object")
+
+
 def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> GroundingResult:
-    """Pydantic-validate one native verifier object plus ID completeness.
+    """Pydantic-validate one internal grounding result plus ID completeness.
 
     Every supplied ``unit_id`` must receive exactly one verdict: missing,
     duplicate, or unknown IDs invalidate the verification.
@@ -177,11 +148,13 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
 
 __all__ = [
     "GroundingResult",
+    "NON_BOOK_SCOPE",
     "ScopeName",
+    "UnitDecision",
     "UnitVerdict",
     "VERIFIER_MAX_ATTEMPTS",
     "VerifierValidationError",
     "validate_grounding_result",
-    "verifier_json_schema",
+    "validate_unit_decision",
     "verifier_single_json_schema",
 ]

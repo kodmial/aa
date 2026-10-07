@@ -112,17 +112,11 @@ async def test_glue_turn_skips_repair_and_reports_telemetry() -> None:
     verifier = _VerifierModel(
         [
             {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": False,
-                        "evidence_passage_ids": [],
-                    }
-                    for unit in units
-                ],
-                "all_required_supported": False,
+                "requires_book_evidence": True,
+                "supported": False,
+                "evidence_passage_ids": [],
             }
+            for _ in units
         ]
     )
     planner = _PlannerModel()
@@ -139,7 +133,7 @@ async def test_glue_turn_skips_repair_and_reports_telemetry() -> None:
     assert outcome["rounds"] == 0
     assert planner.calls == 0
     assert answer.calls == 1
-    assert verifier.calls == 1
+    assert verifier.calls == len(units)
     telemetry = outcome["telemetry"]
     assert telemetry["initial_pack_empty"] is True
     assert telemetry["planner_outcome"] == "skipped-glue"
@@ -171,34 +165,23 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
     verifier = _VerifierModel(
         [
             {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [first_pack[0]["passage_id"]],
-                    },
-                    {
-                        "unit_id": "u2",
-                        "scope": "book",
-                        "supported": False,
-                        "evidence_passage_ids": [first_pack[0]["passage_id"]],
-                    },
-                ],
-                "all_required_supported": False,
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [first_pack[0]["passage_id"]],
             },
             {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": ["chapter-3#exp0001"],
-                    }
-                    for unit in repaired_units
-                ],
-                "all_required_supported": True,
+                "requires_book_evidence": True,
+                "supported": False,
+                "evidence_passage_ids": [first_pack[0]["passage_id"]],
             },
+            *(
+                {
+                    "requires_book_evidence": True,
+                    "supported": True,
+                    "evidence_passage_ids": ["chapter-3#exp0001"],
+                }
+                for _ in repaired_units
+            ),
         ]
     )
     planner = _TwelvePlanner()
@@ -252,13 +235,12 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     """Verifier-unavailable turns (issue #153) must not burn repair rounds.
 
     When the verifier produces no verdict at all (provider/transient/timeout
-    after fallback, or validation failure), re-planning cannot help and each
-    repair round burns another full planner+retrieval+answer+verifier sequence
-    of slow provider calls (the live 40-80s pathology). The turn must clarify
-    directly with explicit telemetry instead. Gate C repair (run 37564172746):
-    one bounded per-unit round is allowed for batch provider flake (smaller
-    prompts may serve where the batch timed out), so a 2-unit draft costs
-    batch (1) + per-unit (2) calls and still clarifies without repair.
+    or validation failure), re-planning cannot help and each repair round
+    burns another full planner+retrieval+answer+verifier sequence of slow
+    provider calls. The turn must clarify directly with explicit telemetry
+    instead. Per-unit only verifier (kodmial/aa#190): exactly one
+    concurrent per-unit round runs, so a 2-unit draft costs 2 calls and
+    still clarifies without repair.
     """
     from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
 
@@ -292,7 +274,7 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     assert outcome["rounds"] == 0
     assert planner.calls == 0
     assert answer.calls == 1
-    assert verifier.calls == 3
+    assert verifier.calls == 2
     assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
     telemetry = outcome["telemetry"]
     # Gate C repair: verifier outage still skips futile repair, but the

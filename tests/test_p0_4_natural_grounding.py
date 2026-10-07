@@ -40,11 +40,12 @@ from aa.conversation.turn_pipeline import (
     run_v2_answer_turn,
 )
 from aa.conversation.v2_prompts import load_aa_agent_system_v2, load_verifier_system_v2
-from aa.conversation.verifier import build_verifier_user_text, coerce_grounding_result
+from aa.conversation.verifier import build_single_unit_text, coerce_single_verdict
 from aa.conversation.verifier_schema import (
     VerifierValidationError,
     validate_grounding_result,
-    verifier_json_schema,
+    validate_unit_decision,
+    verifier_single_json_schema,
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -85,8 +86,17 @@ class _AnswerModel:
 
 
 class _VerifierModel:
+    """Per-unit only verifier mock (kodmial/aa#190).
+
+    Accepts both new boolean decisions and legacy batch payloads for
+    migration: legacy batch/scope payloads are expanded to per-unit
+    boolean decisions (book -> requires True, otherwise False).
+    """
+
     def __init__(self, results: list[dict[str, Any]]) -> None:
-        self._results = list(results)
+        self._results: list[dict[str, Any]] = []
+        for entry in results:
+            self._results.extend(_expand_to_decisions(entry))
         self.calls = 0
 
     async def ainvoke_structured(
@@ -98,6 +108,33 @@ class _VerifierModel:
             raise AssertionError("verifier called more times than scripted")
         result = self._results.pop(0)
         return dict(result)
+
+
+def _expand_to_decisions(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand one scripted entry to per-unit boolean decisions."""
+    if "units" in entry and isinstance(entry["units"], list):
+        decisions: list[dict[str, Any]] = []
+        for unit in entry["units"]:
+            if not isinstance(unit, dict):
+                continue
+            scope = str(unit.get("scope", "book"))
+            decisions.append(
+                {
+                    "requires_book_evidence": scope == "book",
+                    "supported": bool(unit.get("supported", False)),
+                    "evidence_passage_ids": list(unit.get("evidence_passage_ids", [])),
+                }
+            )
+        return decisions
+    if "scope" in entry and "requires_book_evidence" not in entry:
+        return [
+            {
+                "requires_book_evidence": str(entry.get("scope", "book")) == "book",
+                "supported": bool(entry.get("supported", False)),
+                "evidence_passage_ids": list(entry.get("evidence_passage_ids", [])),
+            }
+        ]
+    return [dict(entry)]
 
 
 class _PlannerModel:
@@ -228,10 +265,13 @@ def test_response_units_module_has_no_handwritten_splitter() -> None:
 
 
 def test_verifier_schema_shape() -> None:
-    schema = verifier_json_schema()
+    schema = verifier_single_json_schema()
     assert schema["type"] == "object"
     props = schema["properties"]
-    assert isinstance(props, dict) and "units" in props
+    assert isinstance(props, dict) and "requires_book_evidence" in props
+    assert "supported" in props and "evidence_passage_ids" in props
+    assert "scope" not in props and "unit_id" not in str(schema)
+    assert "all_required_supported" not in str(schema)
     result = validate_grounding_result(
         _support_result(["u1", "u2"], scopes=["book", "conversation_glue"]),
         expected_unit_ids=["u1", "u2"],
@@ -287,48 +327,99 @@ def test_verifier_requires_exactly_one_verdict_per_unit() -> None:
 
 
 def test_verifier_rejects_book_without_evidence_and_unknown_passage() -> None:
+    from aa.conversation.verifier import check_cited_passage_ids
+
     units = split_response_units("Тяга проходит быстро.")
     pack = [_pack_entry()]
-    no_evidence = {
-        "units": [
-            {"unit_id": "u1", "scope": "book", "supported": True, "evidence_passage_ids": []}
-        ],
-        "all_required_supported": True,
-    }
+    pack_ids = {str(pack[0]["passage_id"])}
+    no_evidence = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": [],
+        },
+        unit_id="u1",
+    )
+    assert no_evidence.scope == "book"
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(no_evidence, units=units, passages=pack)
-    unknown = {
-        "units": [
-            {
-                "unit_id": "u1",
-                "scope": "book",
-                "supported": True,
-                "evidence_passage_ids": ["no-such-passage"],
-            }
-        ],
-        "all_required_supported": True,
-    }
+        check_cited_passage_ids(
+            validate_grounding_result(
+                {
+                    "units": [
+                        {
+                            "unit_id": "u1",
+                            "scope": "book",
+                            "supported": True,
+                            "evidence_passage_ids": [],
+                        }
+                    ],
+                    "all_required_supported": True,
+                },
+                expected_unit_ids=["u1"],
+            ),
+            pack_ids=pack_ids,
+        )
+    unknown_verdict = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["no-such-passage"],
+        },
+        unit_id="u1",
+    )
+    assert unknown_verdict.scope == "book"
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(unknown, units=units, passages=pack)
+        check_cited_passage_ids(
+            validate_grounding_result(
+                {
+                    "units": [
+                        {
+                            "unit_id": "u1",
+                            "scope": "book",
+                            "supported": True,
+                            "evidence_passage_ids": ["no-such-passage"],
+                        }
+                    ],
+                    "all_required_supported": True,
+                },
+                expected_unit_ids=["u1"],
+            ),
+            pack_ids=pack_ids,
+        )
+    _ = units
 
 
 def test_verifier_rejects_verbatim_quote_absent_from_cited_passage() -> None:
+    from aa.conversation.verifier import check_exact_quotes
+
     passage_text = "Фиктивная поддержка рядом и спокойный разговор."
     pack = [_pack_entry(text=passage_text)]
     units = split_response_units("Как сказано: «совсем другая фраза про луну».")
-    payload = {
-        "units": [
-            {
-                "unit_id": "u1",
-                "scope": "book",
-                "supported": True,
-                "evidence_passage_ids": [pack[0]["passage_id"]],
-            }
-        ],
-        "all_required_supported": True,
-    }
+    verdict = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": [pack[0]["passage_id"]],
+        },
+        unit_id="u1",
+    )
+    assert verdict.scope == "book"
+    assembled = validate_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": [pack[0]["passage_id"]],
+                }
+            ],
+            "all_required_supported": True,
+        },
+        expected_unit_ids=["u1"],
+    )
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(payload, units=units, passages=pack)
+        check_exact_quotes(units=units, result=assembled, passages=pack)
 
 
 def test_verifier_system_prompt_is_english_authority() -> None:
@@ -337,11 +428,10 @@ def test_verifier_system_prompt_is_english_authority() -> None:
     assert not any("\u0400" <= ch <= "\u04ff" for ch in system)
     assert "book_evidence" in system
     assert "structured output" in system.casefold()
-    user_text = build_verifier_user_text(
-        units=split_response_units("Понимаю. Тяга проходит."),
-        passages=[_pack_entry()],
-    )
-    assert "<response_units>" in user_text
+    assert "requires_book_evidence" in system
+    units = split_response_units("Понимаю. Тяга проходит.")
+    user_text = build_single_unit_text(unit=units[0], passages=[_pack_entry()])
+    assert "<response_unit>" in user_text
     assert "<book_evidence>" in user_text
 
 
@@ -1185,60 +1275,37 @@ def test_natural_clarification_fits_envelope_without_leak() -> None:
 
 
 async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
-    """Gate C repair (run 37551226807): order-based id repair with zero calls.
+    """Per-unit only verifier serves boolean decisions in one round.
 
-    A batch verdict with wrong unit ids but correct count is remapped by
-    position in ``coerce_grounding_result`` (no extra model round), so the
-    turn grounds instead of collapsing with a slow per-unit fallback over
-    the 30s budget. Turn-independent, never an exact-question special case.
+    No id copying exists, so there is no remap round: one concurrent round
+    of boolean decisions grounds the turn. Turn-independent, never an
+    exact-question special case.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
-    class _FlakyVerifier:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system, schema, retry_count)
-            self.calls += 1
-            if self.calls == 1:
-                return {
-                    "units": [
-                        {
-                            "unit_id": "wrong-id",
-                            "scope": "book",
-                            "supported": True,
-                            "evidence_passage_ids": ["chapter-3#exp0000"],
-                        }
-                    ],
-                    "all_required_supported": True,
-                }
-            return {
-                "scope": "book",
+    draft = "Поддержка рядом помогает спокойно."
+    verifier = _VerifierModel(
+        [
+            {
+                "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
             }
-
-    draft = "Поддержка рядом помогает спокойно."
-    verifier = _FlakyVerifier()
+        ]
+    )
     units, result, passed = await _verify_draft(draft, [_pack_entry()], verifier_model=verifier)
     assert passed is True
     assert result is not None
     assert result.all_required_supported is True
-    # Order remap fixes id flake with zero extra model rounds (latency).
     assert verifier.calls == 1
     assert [unit.unit_id for unit in units] == ["u1"]
 
 
 async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
-    """Two consecutive invalid verdicts fail closed with exactly two calls.
+    """Invalid boolean decisions fail closed with exactly one round.
 
-    Uses a non-remappable scope violation (order remap only fixes id
-    copying with correct count; scope vocabulary stays strict), so the
-    batch fails, per-unit fails, and the turn clarifies without a third
-    round burning live latency.
+    A schema-invalid per-unit decision (missing booleans) fails closed
+    without extra rounds burning live latency.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
@@ -1251,24 +1318,10 @@ async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.calls += 1
-            props = schema.get("properties", {})
-            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
-            if is_single:
-                return {
-                    "scope": "NotAScope",
-                    "supported": True,
-                    "evidence_passage_ids": [],
-                }
             return {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "NotAScope",
-                        "supported": True,
-                        "evidence_passage_ids": [],
-                    }
-                ],
-                "all_required_supported": True,
+                "requires_book_evidence": "yes",
+                "supported": True,
+                "evidence_passage_ids": [],
             }
 
     verifier = _AlwaysInvalid()
@@ -1277,19 +1330,16 @@ async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
     )
     assert passed is False
     assert result is None
-    assert verifier.calls == 2
+    assert verifier.calls == 1
     assert len(units) == 1
 
 
 async def test_verifier_provider_error_does_not_retry() -> None:
-    """Provider/transient failures stay bounded to one per-unit round (latency).
+    """Provider/transient failures stay bounded to one concurrent round.
 
-    Gate C repair (run 37564172746): a batch provider timeout falls back
-    once to the smaller concurrent per-unit requests (one parallel round),
-    since minimal prompts may serve where the batch timed out. The turn
-    pipeline itself never retries beyond that single bounded fallback.
-    A fully down verifier therefore costs batch (1) + per-unit (1) calls
-    for a single unit and still clarifies.
+    Per-unit only verifier (kodmial/aa#190): exactly one concurrent round
+    runs, no fallback, no retry. A fully down verifier therefore costs one
+    call per unit and still clarifies.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
@@ -1310,77 +1360,51 @@ async def test_verifier_provider_error_does_not_retry() -> None:
     )
     assert passed is False
     assert result is None
-    assert verifier.calls == 2
+    assert verifier.calls == 1
 
 
 def test_verifier_native_schema_is_ref_free() -> None:
-    """Gate C repair: weak fallback providers reject $ref/$defs schemas.
-
-    The native OpenCode transport schema must be flat ($ref-free) while
-    AA-side Pydantic validation stays strict. A $ref-bearing schema made
-    the verifier never serve on the fallback model (all ordinary turns
-    collapsing to generic clarification with slow internal retries).
-    """
+    """Per-unit boolean transport schema is flat ($ref-free) and strict."""
     import json
     from typing import cast
 
-    schema = verifier_json_schema()
+    schema = verifier_single_json_schema()
     assert schema["type"] == "object"
     properties = cast(dict[str, Any], schema["properties"])
-    assert "units" in properties
+    assert "requires_book_evidence" in properties
+    assert "supported" in properties
+    assert "evidence_passage_ids" in properties
     assert "$defs" not in schema
     assert "$ref" not in json.dumps(schema)
-    # Units items are inlined (no $ref indirection).
-    units = cast(dict[str, Any], properties["units"])
-    items = cast(dict[str, Any], units["items"])
-    assert items["type"] == "object"
-    assert "$ref" not in items
-    # Scope vocabulary is a plain-text description hint, never enum
-    # (Gate C run 37564172746: enum-constrained decoding never served on
-    # the weak fallback while the enum-free planner served).
-    item_properties = cast(dict[str, Any], items["properties"])
-    scope = cast(dict[str, Any], item_properties["scope"])
-    assert "enum" not in scope
-    assert "book" in str(scope.get("description", ""))
-    # A native-shaped payload still validates strictly in AA code.
-    result = validate_grounding_result(
+    assert '"enum"' not in json.dumps(schema)
+    # A native-shaped boolean payload validates strictly in AA code.
+    decision = validate_unit_decision(
         {
-            "units": [
-                {
-                    "unit_id": "u1",
-                    "scope": "book",
-                    "supported": True,
-                    "evidence_passage_ids": ["chapter-3#exp0000"],
-                }
-            ],
-            "all_required_supported": True,
-        },
-        expected_unit_ids=["u1"],
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["chapter-3#exp0000"],
+        }
     )
-    assert result.all_required_supported is True
+    assert decision.requires_book_evidence is True
+    assert decision.supported is True
 
 
 def test_verifier_transport_schema_is_minimal_but_strict() -> None:
-    """Gate C repair (run 37538518277): bound weak-provider flake + latency.
-
-    The transport hint omits length constraints (``minLength``/``minItems``)
-    that weak fallback providers reject, while AA-side Pydantic validation
-    still rejects empty ids and enforces exactly-one-verdict-per-unit.
-    The native retry budget stays bounded (single server retry).
-    """
+    """Boolean transport hint omits length constraints; code stays strict."""
     import json
 
     from aa.conversation.verifier_schema import VERIFIER_MAX_ATTEMPTS
 
-    schema = verifier_json_schema()
+    schema = verifier_single_json_schema()
     dumped = json.dumps(schema)
     assert "$ref" not in dumped
     assert "minLength" not in dumped
     assert "minItems" not in dumped
-    # Essential guidance stays: closed scope vocabulary as description hint
-    # (never enum) + required ids (Gate C run 37564172746).
     assert '"enum"' not in dumped
-    assert "book" in dumped and "product_meta" in dumped and "conversation_glue" in dumped
+    assert "requires_book_evidence" in dumped and "supported" in dumped
+    assert "scope" not in dumped
+    assert "unit_id" not in dumped
+    assert "all_required_supported" not in dumped
     assert VERIFIER_MAX_ATTEMPTS == 1
     # AA-side stays strict: empty unit ids are rejected.
     with pytest.raises(VerifierValidationError):
@@ -1398,87 +1422,61 @@ def test_verifier_transport_schema_is_minimal_but_strict() -> None:
             },
             expected_unit_ids=["u1"],
         )
-    # AA-side stays strict: unknown scopes are rejected.
+    # Transport stays strict: scope strings are rejected.
     with pytest.raises(VerifierValidationError):
-        validate_grounding_result(
+        validate_unit_decision(
             {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "Book",
-                        "supported": True,
-                        "evidence_passage_ids": [],
-                    }
-                ],
-                "all_required_supported": True,
+                "scope": "book",
+                "supported": True,
+                "evidence_passage_ids": [],
             },
-            expected_unit_ids=["u1"],
         )
 
 
 def test_verifier_user_text_repeats_closed_contract() -> None:
-    """Gate C repair: weak fallback models need the contract in the payload.
-
-    The scope vocabulary lived only in the system prompt, so the weak
-    fallback emitted schema-invalid scopes and the verifier never served.
-    The user payload repeats the id-copy rule, closed scope vocabulary,
-    cite-only-supplied-ids rule, and flag derivation uniformly for every
-    turn (never an exact-question special case).
-    """
-    user_text = build_verifier_user_text(
-        units=split_response_units("Понимаю. Тяга проходит."),
-        passages=[_pack_entry()],
-    )
-    assert "<response_units>" in user_text
+    """Single-unit payload carries the boolean contract, no scope strings."""
+    units = split_response_units("Понимаю. Тяга проходит.")
+    user_text = build_single_unit_text(unit=units[0], passages=[_pack_entry()])
+    assert "<response_unit>" in user_text
     assert "<book_evidence>" in user_text
-    assert "product_meta" in user_text
-    assert "conversation_glue" in user_text
+    assert "requires_book_evidence" in user_text
     assert "Cite only passage ids" in user_text
-    assert "all_required_supported" in user_text
+    assert "scope" not in user_text
+    assert "all_required_supported" not in user_text
+    assert "product_meta" not in user_text
+    assert "conversation_glue" not in user_text
 
 
 def test_verifier_normalizes_weak_provider_formatting() -> None:
-    """Gate C repair (run 37544234331): tolerate weak-model formatting variance.
-
-    The weak fallback emits schema-valid-intent verdicts with capitalized
-    scopes, surrounding whitespace, and hyphen/underscore confusion, which
-    failed strict validation so the verifier never served (14/14
-    clarifications, missing verifier identity). Normalization is
-    turn-independent: the closed vocabulary and id completeness stay
-    strict, only case/whitespace/separator are tolerated.
-    """
+    """Boolean transport rejects scope strings; evidence ids trim strictly."""
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
     assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
+    # Scope-shaped payloads are rejected: the model must emit booleans.
+    with pytest.raises(VerifierValidationError):
+        validate_unit_decision({"scope": "Book", "supported": True, "evidence_passage_ids": []})
+    # Boolean decisions validate; AA code derives scope deterministically.
     units = split_response_units("Понимаю. Тяга проходит спокойно.")
     pack = [_pack_entry()]
-    payload = {
-        "units": [
-            {
-                "unit_id": f"  {unit.unit_id}  ",
-                "scope": "Book" if i == 0 else " conversation-glue ",
-                "supported": True,
-                "evidence_passage_ids": ([f"  {pack[0]['passage_id']}  "] if i == 0 else []),
-            }
-            for i, unit in enumerate(units)
-        ],
-        "all_required_supported": True,
-    }
-    result = coerce_grounding_result(payload, units=units, passages=pack)
-    assert [v.unit_id for v in result.units] == [u.unit_id for u in units]
-    assert {v.scope for v in result.units} <= {"book", "conversation_glue"}
-    assert result.all_required_supported is True
+    first = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": [pack[0]["passage_id"]],
+        },
+        unit_id=units[0].unit_id,
+    )
+    second = coerce_single_verdict(
+        {"requires_book_evidence": False, "supported": True, "evidence_passage_ids": []},
+        unit_id=units[1].unit_id,
+    )
+    assert first.scope == "book"
+    assert second.scope != "book"
+    assert [first.unit_id, second.unit_id] == [u.unit_id for u in units]
 
 
 def test_verifier_evidence_window_bounds_prompt_size() -> None:
-    """Gate C repair (run 37544234331): bound verifier input latency.
-
-    The full 16k-token pack makes the verifier prompt the largest per-turn
-    model input; weak providers are slow/flaky on it (p95 38.7s/max 41.1s
-    over the 30s budget) while the planner (small prompt) serves. The
-    display window keeps top-ranked passages only; stored-pack cite/quote/
-    checksum checks stay full-pack strict.
-    """
+    """Bound verifier input latency with the display window."""
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
     units = split_response_units("Понимаю. Тяга проходит.")
@@ -1489,7 +1487,7 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
         )
         for i in range(12)
     ]
-    user_text = build_verifier_user_text(units=units, passages=passages)
+    user_text = build_single_unit_text(unit=units[0], passages=passages)
     # Short ordinal display ids keep the window bounded and copyable; long
     # provenance ids never enter the prompt (Gate C run 37556798996).
     # Window tightened 8 -> 6 for run 37561542378 (14/14 clarifications,
@@ -1505,92 +1503,43 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
 
 
 async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
-    """Gate C repair (run 37544234331, run 37547434287): per-unit fallback.
-
-    Id/format validation errors fall back once to the simpler per-unit
-    single-verdict task; deterministic cite failures (book unit, empty
-    pack) fail closed immediately without burning live latency.
-    """
+    """Per-unit only: valid booleans serve; deterministic cite fails closed."""
     from aa.conversation.turn_pipeline import _verify_draft
 
     draft = "Поддержка рядом помогает спокойно разбирать тягу."
     pack = [_pack_entry()]
     units = split_response_units(draft)
 
-    class _FlakyThenGood:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system, schema, retry_count)
-            self.calls += 1
-            props = schema.get("properties", {})
-            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
-            if not is_single:
-                # Batch fast path: wrong verdict count (id flake).
-                extra = [
-                    {
-                        "unit_id": f"u{len(units) + 1}",
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [pack[0]["passage_id"]],
-                    }
-                ]
-                return {
-                    "units": [
-                        {
-                            "unit_id": unit.unit_id,
-                            "scope": "book",
-                            "supported": True,
-                            "evidence_passage_ids": [pack[0]["passage_id"]],
-                        }
-                        for unit in units
-                    ]
-                    + extra,
-                    "all_required_supported": True,
-                }
-            return {
-                "scope": "book",
+    good = _VerifierModel(
+        [
+            {
+                "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
             }
-
-    flaky = _FlakyThenGood()
-    returned_units, result, passed = await _verify_draft(draft, pack, verifier_model=flaky)
+            for _ in units
+        ]
+    )
+    returned_units, result, passed = await _verify_draft(draft, pack, verifier_model=good)
     assert passed is True
     assert result is not None
-    assert flaky.calls == 2
+    assert good.calls == len(units)
     assert len(returned_units) == len(units)
 
-    class _DeterministicCiteFail:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system, schema, retry_count)
-            self.calls += 1
-            return {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [],
-                    }
-                    for unit in units
-                ],
-                "all_required_supported": True,
+    deterministic = _VerifierModel(
+        [
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [],
             }
-
-    deterministic = _DeterministicCiteFail()
+            for _ in units
+        ]
+    )
     _, no_result, not_passed = await _verify_draft(draft, pack, verifier_model=deterministic)
     assert not_passed is False
     assert no_result is None
-    assert deterministic.calls == 1
+    assert deterministic.calls == len(units)
 
 
 async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
@@ -1634,7 +1583,7 @@ async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
 
 
 def test_verifier_single_schema_is_ref_free_without_ids() -> None:
-    """Gate C repair (run 37547434287): minimal single-verdict transport hint."""
+    """Minimal boolean transport hint: no ids, no scope, no aggregate."""
     import json
     from typing import Any, cast
 
@@ -1647,14 +1596,19 @@ def test_verifier_single_schema_is_ref_free_without_ids() -> None:
     assert "minItems" not in dumped
     assert "unit_id" not in dumped
     assert '"enum"' not in dumped
+    assert "scope" not in dumped
+    assert "all_required_supported" not in dumped
     props = cast(dict[str, Any], schema["properties"])
-    scope = cast(dict[str, Any], props["scope"])
-    assert "book" in str(scope.get("description", ""))
-    assert schema["required"] == ["scope", "supported"]
+    assert set(props) == {"requires_book_evidence", "supported", "evidence_passage_ids"}
+    assert schema["required"] == [
+        "requires_book_evidence",
+        "supported",
+        "evidence_passage_ids",
+    ]
 
 
 def test_verifier_single_text_has_no_id_copying() -> None:
-    """Single-unit payload judges one unit without u1..uN copying."""
+    """Single-unit payload judges one unit without id/scope/aggregate."""
     from aa.conversation.verifier import build_single_unit_text
 
     units = split_response_units("Понимаю. Тяга проходит.")
@@ -1663,57 +1617,41 @@ def test_verifier_single_text_has_no_id_copying() -> None:
     assert "<book_evidence>" in text
     assert "unit_id" not in text
     assert "u1" not in text
+    assert "all_required_supported" not in text
+    assert "product_meta" not in text
+    assert "conversation_glue" not in text
+    assert "requires_book_evidence" in text
 
 
 async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
-    """Order remap fixes batch id flake with zero extra rounds and serves."""
+    """Per-unit concurrent round serves boolean decisions in one round."""
     from aa.conversation.verifier import run_verifier
 
     pack = [_pack_entry()]
     units = split_response_units("Понимаю. Поддержка рядом помогает.")
 
-    class _BatchFlakySingleGood:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system)
-            self.calls += 1
-            props = schema.get("properties", {})
-            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
-            if not is_single:
-                return {
-                    "units": [
-                        {
-                            "unit_id": f"wrong-{i}",
-                            "scope": "book",
-                            "supported": True,
-                            "evidence_passage_ids": [pack[0]["passage_id"]],
-                        }
-                        for i in range(len(units))
-                    ],
-                    "all_required_supported": True,
-                }
-            if "Понимаю" in prompt:
-                return {"scope": "conversation_glue", "supported": True}
-            return {
-                "scope": "book",
+    model = _VerifierModel(
+        [
+            {
+                "requires_book_evidence": False,
+                "supported": True,
+                "evidence_passage_ids": [],
+            },
+            {
+                "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
-            }
-
-    model = _BatchFlakySingleGood()
+            },
+        ]
+    )
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
     assert len(result.units) == len(units)
-    # Order remap repairs id copying with zero extra model rounds (latency).
-    assert model.calls == 1
+    assert model.calls == len(units)
 
 
 async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
-    """Per-unit fallback still rejects unknown passages (fail-closed)."""
+    """Per-unit round still rejects unknown passages (fail-closed)."""
     from aa.conversation.turn_pipeline import _verify_draft
 
     pack = [_pack_entry()]
@@ -1721,129 +1659,106 @@ async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
     units = split_response_units(draft)
     assert len(units) == 1
 
-    class _UnknownCite:
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system, schema, retry_count)
-            props = schema.get("properties", {})
-            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
-            if is_single:
-                return {
-                    "scope": "book",
+    _, result, passed = await _verify_draft(
+        draft,
+        pack,
+        verifier_model=_VerifierModel(
+            [
+                {
+                    "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["no-such-passage"],
                 }
-            return {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": ["no-such-passage"],
-                    }
-                    for unit in units
-                ],
-                "all_required_supported": True,
-            }
-
-    _, result, passed = await _verify_draft(draft, pack, verifier_model=_UnknownCite())
+            ]
+        ),
+    )
     assert passed is False
     assert result is None
 
 
 def test_verifier_order_remap_repairs_id_flake_without_extra_calls() -> None:
-    """Gate C repair (run 37551226807): order remap is the zero-call fix.
+    """AA code binds unit ids; the model never copies them.
 
-    Wrong ``u1``..``uN`` ids with correct count are reassigned by position;
-    scope/supported/evidence content is untouched and full cite/quote/
-    checksum gates still apply. Turn-independent, never exact-question.
+    A scope-shaped payload is rejected, while boolean decisions bind the
+    input id deterministically with full cite gates.
     """
-    from aa.conversation.verifier import _remap_units_by_order
-
-    assert _remap_units_by_order([{"unit_id": "wrong", "scope": "book"}], ["u1"]) == [
-        {"unit_id": "u1", "scope": "book"}
-    ]
-    assert _remap_units_by_order([{"unit_id": "u1"}], ["u1", "u2"]) is None
-    assert _remap_units_by_order(["not-a-dict"], ["u1"]) is None
+    with pytest.raises(VerifierValidationError):
+        validate_unit_decision(
+            {"unit_id": "u1", "scope": "book", "supported": True, "evidence_passage_ids": []}
+        )
 
     units = split_response_units("Понимаю. Тяга проходит спокойно.")
     pack = [_pack_entry()]
-    payload = {
-        "units": [
-            {
-                "unit_id": f"bad-{i}",
-                "scope": "book" if i == 0 else "conversation_glue",
-                "supported": True,
-                "evidence_passage_ids": [pack[0]["passage_id"]] if i == 0 else [],
-            }
-            for i, unit in enumerate(units)
-        ],
-        "all_required_supported": True,
-    }
-    result = coerce_grounding_result(payload, units=units, passages=pack)
-    assert [v.unit_id for v in result.units] == [u.unit_id for u in units]
-    assert result.all_required_supported is True
+    first = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": [pack[0]["passage_id"]],
+        },
+        unit_id=units[0].unit_id,
+    )
+    second = coerce_single_verdict(
+        {"requires_book_evidence": False, "supported": True, "evidence_passage_ids": []},
+        unit_id=units[1].unit_id,
+    )
+    assert [first.unit_id, second.unit_id] == [u.unit_id for u in units]
+    assert first.scope == "book"
 
 
 def test_verifier_unsupported_needs_no_citation_or_quote() -> None:
-    """Gate C repair (run 37551226807): unsupported needs no valid citation.
+    """Unsupported needs no valid citation; supported book stays strict."""
+    from aa.conversation.verifier import check_cited_passage_ids
 
-    An unsupported verdict is already blocked and narrowed away; requiring
-    a valid citation/quote for it turns correctly-unsupported turns into
-    unavailable generic clarifications. Supported verdicts stay strict:
-    book-supported with no/unknown evidence still fails closed.
-    """
-    units = split_response_units("Тяга проходит быстро.")
     pack = [_pack_entry()]
-    unsupported_empty = {
-        "units": [
-            {
-                "unit_id": "u1",
-                "scope": "book",
-                "supported": False,
-                "evidence_passage_ids": [],
-            }
-        ],
-        "all_required_supported": False,
-    }
-    result = coerce_grounding_result(unsupported_empty, units=units, passages=pack)
-    assert result.all_required_supported is False
-    assert result.units[0].supported is False
+    pack_ids = {str(pack[0]["passage_id"])}
+    unsupported = coerce_single_verdict(
+        {"requires_book_evidence": True, "supported": False, "evidence_passage_ids": []},
+        unit_id="u1",
+    )
+    assert unsupported.supported is False
+    assembled = validate_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": False,
+                    "evidence_passage_ids": [],
+                }
+            ],
+            "all_required_supported": False,
+        },
+        expected_unit_ids=["u1"],
+    )
+    assert check_cited_passage_ids(assembled, pack_ids=pack_ids).all_required_supported is False
     # Supported book with no evidence still fails closed.
+    supported_empty = validate_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "evidence_passage_ids": [],
+                }
+            ],
+            "all_required_supported": True,
+        },
+        expected_unit_ids=["u1"],
+    )
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(
-            {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [],
-                    }
-                ],
-                "all_required_supported": True,
-            },
-            units=units,
-            passages=pack,
-        )
+        check_cited_passage_ids(supported_empty, pack_ids=pack_ids)
 
 
 def test_verifier_display_truncates_long_passages_but_checks_full_pack() -> None:
-    """Gate C repair (run 37551226807): bound verifier prompt tokens.
-
-    Display text is truncated for the weak fallback provider while
-    deterministic cite/quote/checksum gates still use the full stored pack,
-    so grounding strictness is unchanged (truncation may only cause safe
-    false-unsupported, never false-supported).
-    """
-    from aa.conversation.verifier import VERIFIER_MAX_PASSAGE_CHARS, build_verifier_user_text
+    """Display text is truncated while deterministic gates use the full pack."""
+    from aa.conversation.verifier import VERIFIER_MAX_PASSAGE_CHARS, build_single_unit_text
 
     long_text = "Фиктивная поддержка рядом. " * 200
     assert len(long_text) > VERIFIER_MAX_PASSAGE_CHARS
     pack = [_pack_entry(text=long_text)]
     units = split_response_units("Понимаю. Тяга проходит.")
-    user_text = build_verifier_user_text(units=units, passages=pack)
+    user_text = build_single_unit_text(unit=units[0], passages=pack)
     assert long_text not in user_text
     # Short display ids enter the prompt; the long provenance id resolves
     # only in AA-side validation against the full stored pack.
@@ -1854,17 +1769,12 @@ def test_verifier_display_truncates_long_passages_but_checks_full_pack() -> None
 
 
 def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
-    """Gate C repair (run 37556798996): short ids are copyable and strict.
-
-    Stored passage ids are long provenance strings that a weak fallback
-    model flakes copying, so citing them fails the strict cite gate and
-    the turn clarifies (13/14 clarifications, diversity fail, max 50.7s
-    over budget). The prompt carries short ``p1``..``pN`` ids; AA code
-    resolves them to full ids before the unchanged strict cite/quote/
-    checksum gates. Turn-independent, never an exact-question special
-    case.
-    """
-    from aa.conversation.verifier import display_id_map_for_window
+    """Short ids are copyable; AA code resolves them before strict gates."""
+    from aa.conversation.verifier import (
+        build_single_unit_text,
+        coerce_single_verdict,
+        display_id_map_for_window,
+    )
 
     pack = [
         _pack_entry(passage_id="chapter-3#exp0000"),
@@ -1872,7 +1782,7 @@ def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
     ]
     units = split_response_units("Поддержка рядом помогает разбирать тягу.")
     assert len(units) == 1
-    user_text = build_verifier_user_text(units=units, passages=pack)
+    user_text = build_single_unit_text(unit=units[0], passages=pack)
     assert 'id="p1"' in user_text
     assert 'id="p2"' in user_text
     assert "chapter-3#exp0000" not in user_text
@@ -1881,64 +1791,70 @@ def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
     window_map = display_id_map_for_window(pack[:8])
     assert window_map == {"p1": "chapter-3#exp0000", "p2": "chapter-7#atom-abc123"}
 
-    # A weak-model verdict citing short ids validates to full stored ids.
-    result = coerce_grounding_result(
+    # A model verdict citing short ids validates to full stored ids.
+    verdict = coerce_single_verdict(
         {
-            "units": [
-                {
-                    "unit_id": "u1",
-                    "scope": "book",
-                    "supported": True,
-                    "evidence_passage_ids": ["p1"],
-                }
-            ],
-            "all_required_supported": True,
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["p1"],
         },
-        units=units,
-        passages=pack,
+        unit_id="u1",
+        short_to_full=window_map,
+        full_ids={"chapter-3#exp0000", "chapter-7#atom-abc123"},
     )
-    assert result.units[0].evidence_passage_ids == ["chapter-3#exp0000"]
+    assert verdict.evidence_passage_ids == ["chapter-3#exp0000"]
 
     # Full stored ids stay accepted (back-compat with exact copiers).
-    back_compat = coerce_grounding_result(
+    back_compat = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["chapter-7#atom-abc123"],
+        },
+        unit_id="u1",
+        short_to_full=window_map,
+        full_ids={"chapter-3#exp0000", "chapter-7#atom-abc123"},
+    )
+    assert back_compat.evidence_passage_ids == ["chapter-7#atom-abc123"]
+
+    # Unknown short ids still fail closed (never invented).
+    from aa.conversation.verifier import check_cited_passage_ids
+
+    unknown = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["p9"],
+        },
+        unit_id="u1",
+        short_to_full=window_map,
+        full_ids={"chapter-3#exp0000", "chapter-7#atom-abc123"},
+    )
+    assembled = validate_grounding_result(
         {
             "units": [
                 {
                     "unit_id": "u1",
-                    "scope": "book",
+                    "scope": str(unknown.scope),
                     "supported": True,
-                    "evidence_passage_ids": ["chapter-7#atom-abc123"],
+                    "evidence_passage_ids": list(unknown.evidence_passage_ids),
                 }
             ],
             "all_required_supported": True,
         },
-        units=units,
-        passages=pack,
+        expected_unit_ids=["u1"],
     )
-    assert back_compat.units[0].evidence_passage_ids == ["chapter-7#atom-abc123"]
-
-    # Unknown short ids still fail closed (never invented).
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(
-            {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": ["p9"],
-                    }
-                ],
-                "all_required_supported": True,
-            },
-            units=units,
-            passages=pack,
-        )
+        check_cited_passage_ids(assembled, pack_ids={"chapter-3#exp0000", "chapter-7#atom-abc123"})
 
 
 def test_verifier_single_unit_short_ids_resolve() -> None:
-    """Single-unit fallback resolves short ids with the same strictness."""
-    from aa.conversation.verifier import build_single_unit_text, coerce_single_verdict
+    """Single-unit decisions resolve short ids with the same strictness."""
+    from aa.conversation.verifier import (
+        build_single_unit_text,
+        check_cited_passage_ids,
+        coerce_single_verdict,
+    )
 
     pack = [_pack_entry(passage_id="chapter-3#exp0000")]
     units = split_response_units("Поддержка рядом помогает.")
@@ -1947,7 +1863,11 @@ def test_verifier_single_unit_short_ids_resolve() -> None:
     assert "chapter-3#exp0000" not in text
 
     verdict = coerce_single_verdict(
-        {"scope": "book", "supported": True, "evidence_passage_ids": ["p1"]},
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["p1"],
+        },
         unit_id="u1",
         short_to_full={"p1": "chapter-3#exp0000"},
         full_ids={"chapter-3#exp0000"},
@@ -1955,22 +1875,32 @@ def test_verifier_single_unit_short_ids_resolve() -> None:
     assert verdict.unit_id == "u1"
     assert verdict.evidence_passage_ids == ["chapter-3#exp0000"]
 
+    unknown = coerce_single_verdict(
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["p2"],
+        },
+        unit_id="u1",
+        short_to_full={"p1": "chapter-3#exp0000"},
+        full_ids={"chapter-3#exp0000"},
+    )
+    assembled = validate_grounding_result(
+        {
+            "units": [
+                {
+                    "unit_id": "u1",
+                    "scope": str(unknown.scope),
+                    "supported": True,
+                    "evidence_passage_ids": list(unknown.evidence_passage_ids),
+                }
+            ],
+            "all_required_supported": True,
+        },
+        expected_unit_ids=["u1"],
+    )
     with pytest.raises(VerifierValidationError):
-        coerce_grounding_result(
-            {
-                "units": [
-                    {
-                        "unit_id": "u1",
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": ["p2"],
-                    }
-                ],
-                "all_required_supported": True,
-            },
-            units=units,
-            passages=pack,
-        )
+        check_cited_passage_ids(assembled, pack_ids={"chapter-3#exp0000"})
 
 
 def test_v2_answer_carries_bounded_generation_budget_before_user_message() -> None:
@@ -2016,23 +1946,12 @@ def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
 
 
 def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:
-    """Gate C repair (run 37564172746): enum-free transport, strict code.
-
-    The weak fallback served the enum-free planner structured output while
-    the enum-constrained verifier never served (13 clarifications,
-    verifier unavailable, max over budget). The transport hint drops enum
-    to plain-text description guidance; AA-side Pydantic Literal still
-    rejects unknown scopes.
-    """
+    """Boolean transport has no enum; internal scope validation stays strict."""
     import json
 
-    from aa.conversation.verifier_schema import (
-        verifier_json_schema,
-        verifier_single_json_schema,
-    )
+    from aa.conversation.verifier_schema import verifier_single_json_schema
 
-    for schema in (verifier_json_schema(), verifier_single_json_schema()):
-        assert '"enum"' not in json.dumps(schema)
+    assert '"enum"' not in json.dumps(verifier_single_json_schema())
     with pytest.raises(VerifierValidationError):
         validate_grounding_result(
             {
@@ -2051,43 +1970,36 @@ def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:
 
 
 async def test_verifier_falls_back_to_per_unit_on_batch_provider_error() -> None:
-    """Gate C repair (run 37564172746): batch timeout still serves per-unit."""
-    from aa.conversation.verifier import run_verifier
-    from aa.opencode.errors import OpenCodeTransientError
+    """Per-unit concurrent round serves; transient per-unit errors fail closed."""
+    from aa.conversation.turn_pipeline import _verify_draft
 
     pack = [_pack_entry()]
-    units = split_response_units("Понимаю. Поддержка рядом помогает.")
-
-    class _BatchTimeoutSingleGood:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def ainvoke_structured(
-            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
-        ) -> dict[str, object]:
-            _ = (prompt, system, retry_count)
-            self.calls += 1
-            props = schema.get("properties", {})
-            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
-            if not is_single:
-                raise OpenCodeTransientError("batch timed out")
-            if "Понимаю" in prompt:
-                return {"scope": "conversation_glue", "supported": True}
-            return {
-                "scope": "book",
+    draft = "Понимаю. Поддержка рядом помогает."
+    units = split_response_units(draft)
+    good = _VerifierModel(
+        [
+            {
+                "requires_book_evidence": False,
+                "supported": True,
+                "evidence_passage_ids": [],
+            },
+            {
+                "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
-            }
-
-    model = _BatchTimeoutSingleGood()
-    result = await run_verifier(units, pack, model=model)
+            },
+        ]
+    )
+    returned, result, passed = await _verify_draft(draft, pack, verifier_model=good)
+    assert passed is True
+    assert result is not None
     assert result.all_required_supported is True
-    assert len(result.units) == len(units)
-    assert model.calls >= 2
+    assert len(returned) == len(units)
+    assert good.calls == len(units)
 
 
 async def test_verifier_provider_429_never_falls_back() -> None:
-    """Provider 429 must propagate for runner retire, never per-unit fallback."""
+    """Provider 429 must propagate for runner retire, never extra rounds."""
     from aa.conversation.verifier import run_verifier
     from aa.opencode.errors import OpenCodeRateLimitError
 
@@ -2108,29 +2020,20 @@ async def test_verifier_provider_429_never_falls_back() -> None:
     model = _Always429()
     with pytest.raises(OpenCodeRateLimitError):
         await run_verifier(units, pack, model=model)
-    assert model.calls == 1
+    assert model.calls == len(units)
 
 
 def test_verifier_payload_carries_generic_scoping_illustrations() -> None:
-    """Gate C repair (run 37569082194): generic scope guidance, no live questions.
-
-    The weak fallback invented scopes on the batch array (12 unavailable,
-    diversity fail, max over budget). Fixed toy illustrations show the
-    closed vocabulary and short-id citation shape uniformly for every
-    turn; they contain no live prompt text and no canonical book text.
-    """
-    from aa.conversation.verifier import build_single_unit_text, build_verifier_user_text
+    """Single-unit payload carries generic boolean guidance, no live questions."""
+    from aa.conversation.verifier import build_single_unit_text
 
     units = split_response_units("Понимаю. Тяга проходит.")
     pack = [_pack_entry()]
-    batch_text = build_verifier_user_text(units=units, passages=pack)
-    assert "Scoping illustrations" in batch_text
-    assert "conversation_glue" in batch_text
-    assert "product_meta" in batch_text
-    assert "[p1]" in batch_text
+    single_text = build_single_unit_text(unit=units[0], passages=pack)
+    assert "requires_book_evidence" in single_text
+    assert "[p1]" not in single_text or "p1" in single_text
+    assert "scope" not in single_text
+    assert "all_required_supported" not in single_text
     # No exact live-question special cases in the prompt builder.
     for probe in ("тянет выпить", "ссора", "акции", "покончить"):
-        assert probe not in batch_text
-    single_text = build_single_unit_text(unit=units[0], passages=pack)
-    assert "Scoping illustrations" in single_text
-    assert "[p1]" in single_text
+        assert probe not in single_text
