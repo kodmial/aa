@@ -259,12 +259,20 @@ def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> No
             primary_model: str,
             fallback_model: str = "",
             request_timeout: float = 120.0,
+            transport_agent: str | None = None,
         ) -> None:
             self.client = client
             self.agent = agent
             self.primary_model = primary_model
             self.fallback_model = fallback_model
             self.request_timeout = request_timeout
+            self.transport_agent = transport_agent
+
+        @property
+        def wire_agent(self) -> str:
+            if self.transport_agent is None:
+                return self.agent
+            return self.transport_agent
 
         def with_agent(self, agent: str) -> _DummyModel:
             return _DummyModel(
@@ -295,3 +303,6 @@ def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> No
     assert verifier.primary_model == DEFAULT_PRIMARY_MODEL
     assert verifier.primary_model == "opencode/muse-spark-1.3-contributor-free"
     assert verifier.fallback_model == ""
+    # kodmial/aa#202: the logical audit identity stays aa-verifier-v2
+    # while the transport selector is omitted on the wire.
+    assert verifier.wire_agent == ""

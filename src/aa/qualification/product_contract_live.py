@@ -1701,6 +1701,18 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     for model in models
                 ),
             )
+            # Exact verifier pin (kodmial/aa#202): requested verifier
+            # model == served verifier model == Muse Spark. Space Bunny
+            # must never be recorded as serving aa-verifier-v2. An absent
+            # served verifier is the specific Muse-access failure, never
+            # a generic Gate C failure.
+            from aa.qualification.verifier_muse_probe import check_verifier_served_exact
+
+            verifier_passed, verifier_failed = check_verifier_served_exact(audit)
+            for name in verifier_passed:
+                _check(name, True)
+            for name in verifier_failed:
+                failed.append(name)
             _check(
                 "live-planner-retrieval-answer-verifier-telemetry",
                 len(stage_snapshots) >= 5

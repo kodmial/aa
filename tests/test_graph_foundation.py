@@ -532,8 +532,9 @@ class _RecordingClient(FakeOpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
-        self.agents.append(agent)
+        self.agents.append(audit_agent or agent)
         self.models.append(model)
         self.systems.append(system)
         self.formats.append(format)
@@ -545,6 +546,7 @@ class _RecordingClient(FakeOpenCodeClient):
             model=model,
             system=system,
             format=format,
+            audit_agent=audit_agent,
         )
 
     async def send_structured_message(
@@ -558,8 +560,9 @@ class _RecordingClient(FakeOpenCodeClient):
         system: str = "",
         schema: dict[str, object],
         retry_count: int = 2,
+        audit_agent: str = "",
     ) -> dict[str, object]:
-        self.agents.append(agent)
+        self.agents.append(audit_agent or agent)
         self.models.append(model)
         self.systems.append(system)
         self.formats.append({"type": "json_schema", "schema": schema, "retryCount": retry_count})
@@ -572,6 +575,7 @@ class _RecordingClient(FakeOpenCodeClient):
             system=system,
             schema=schema,
             retry_count=retry_count,
+            audit_agent=audit_agent,
         )
 
 
@@ -662,6 +666,7 @@ class _FlakyClient(FakeOpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         self.calls += 1
         if self.calls == 1:
@@ -715,12 +720,14 @@ def test_adapter_carries_no_semantic_policy() -> None:
     }
     assert defined <= {
         "OpenCodeChatModel",
+        "build_verifier_model",
         "render_messages_text",
         "split_system_and_user",
         "__init__",
         "_message_text",
         "_run_coro_sync",
         "opencode_client",
+        "wire_agent",
         "with_agent",
         "_primary_circuit_open",
         "_record_primary_rejection",
@@ -888,6 +895,7 @@ async def test_timeouts_fall_back_without_user_content_leak() -> None:
             model: str = "",
             system: str = "",
             format: dict[str, object] | None = None,
+            audit_agent: str = "",
         ) -> str:
             if model == "opencode/space-bunny-free":
                 raise OpenCodeTimeoutError("slow")

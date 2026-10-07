@@ -407,6 +407,7 @@ class _SlowMarkerClient(FakeOpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         if "slow-marker" in text:
             await asyncio.sleep(0.4)
@@ -418,6 +419,7 @@ class _SlowMarkerClient(FakeOpenCodeClient):
             model=model,
             system=system,
             format=format,
+            audit_agent=audit_agent,
         )
 
 
@@ -548,6 +550,7 @@ class _AlwaysFailingClient(FakeOpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         raise OpenCodeTransientError("provider down")
 

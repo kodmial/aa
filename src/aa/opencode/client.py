@@ -152,13 +152,18 @@ class OpenCodeClient(ABC):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         """Send one user message and return the assistant text reply.
 
         ``system`` is delivered through OpenCode's native system layer,
         never flattened into ``parts`` text. ``format`` carries an
         optional native output-format object (for example a
-        ``json_schema`` request).
+        ``json_schema`` request). ``agent`` is the transport agent
+        selector sent on the wire; ``audit_agent`` optionally records a
+        distinct logical audit identity (for example the decoupled
+        ``aa-verifier-v2`` verifier) while the wire omits the custom
+        selector. When empty, the audit identity equals ``agent``.
         """
         raise NotImplementedError
 
@@ -174,12 +179,16 @@ class OpenCodeClient(ABC):
         system: str = "",
         schema: dict[str, object],
         retry_count: int = 2,
+        audit_agent: str = "",
     ) -> dict[str, object]:
         """Send one message with native ``json_schema`` output and return it.
 
         The returned value is the structured-output object produced by
         OpenCode (``info.structured_output``/``info.structured``); callers
         Pydantic-validate it. No JSON text parsing happens here.
+        ``audit_agent`` records a distinct logical audit identity while
+        ``agent`` stays the wire transport selector (see
+        :meth:`send_message`).
         """
         raise NotImplementedError
 
@@ -313,7 +322,9 @@ class HttpOpenCodeClient(OpenCodeClient):
                 return f"{provider}/{model}"
         return ""
 
-    def _validate_served_model(self, info: object, *, requested: str, agent: str) -> None:
+    def _validate_served_model(
+        self, info: object, *, requested: str, agent: str, audit_agent: str = ""
+    ) -> None:
         """Fail closed when OpenCode served a model other than the pinned request."""
         expected = (requested or "").strip()
         if not expected:
@@ -325,9 +336,10 @@ class HttpOpenCodeClient(OpenCodeClient):
             raise OpenCodeDeterministicError(
                 f"opencode served model mismatch: expected {expected}, got {served}"
             )
+        logical_agent = (audit_agent or agent or "").strip()[:128]
         self._served_model_audit.append(
             {
-                "agent": (agent or "").strip()[:128],
+                "agent": logical_agent,
                 "requested": expected[:128],
                 "served": served[:128],
             }
@@ -345,6 +357,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
@@ -373,7 +386,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
-        self._validate_served_model(info, requested=model, agent=agent)
+        self._validate_served_model(info, requested=model, agent=agent, audit_agent=audit_agent)
         reply = _extract_text(payload.get("parts"))
         # Never log the prompt or the reply; only the fact of completion.
         logger.info("opencode message completed")
@@ -390,6 +403,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         system: str = "",
         schema: dict[str, object],
         retry_count: int = 2,
+        audit_agent: str = "",
     ) -> dict[str, object]:
         """Send one native ``json_schema`` request and return its object."""
         if not text or not text.strip():
@@ -422,7 +436,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
-        self._validate_served_model(info, requested=model, agent=agent)
+        self._validate_served_model(info, requested=model, agent=agent, audit_agent=audit_agent)
         structured = _extract_structured(payload)
         if structured is None:
             raise OpenCodeDeterministicError("opencode structured output missing")
@@ -516,12 +530,13 @@ class FakeOpenCodeClient(OpenCodeClient):
         model: str = "",
         system: str = "",
         format: dict[str, object] | None = None,
+        audit_agent: str = "",
     ) -> str:
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         # Validate the model hint exactly like the real client.
         model_payload(model)
-        _ = (system, format)
+        _ = (system, format, audit_agent)
         await self._settle(timeout)
         record = self._sessions.get(session_id)
         if record is None:
@@ -544,12 +559,13 @@ class FakeOpenCodeClient(OpenCodeClient):
         system: str = "",
         schema: dict[str, object],
         retry_count: int = 2,
+        audit_agent: str = "",
     ) -> dict[str, object]:
         """Fake native structured output: returns the queued object or empty plan."""
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         model_payload(model)
-        _ = (system, schema, retry_count)
+        _ = (system, schema, retry_count, audit_agent)
         await self._settle(timeout)
         record = self._sessions.get(session_id)
         if record is None:
