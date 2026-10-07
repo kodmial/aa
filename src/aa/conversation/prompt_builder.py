@@ -9,7 +9,8 @@ order:
 3. one application-built current-turn context payload in the final
    user-role input, with explicit XML boundaries:
    ``<conversation_memory>``, ``<book_evidence>`` (exact ``<passage>``
-   elements) and ``<user_message>`` last.
+   elements), ``<response_budget>`` (bounded efficiency guard) and
+   ``<user_message>`` last.
 
 Backend retrieval data travels as structured context in that payload. It
 is never fabricated as a native tool message when the model issued no
@@ -54,6 +55,11 @@ def render_turn_context(
     ``<user_message>`` is always last so the real request stays
     structurally unambiguous.
     """
+    from aa.conversation.output_limits import (
+        DEFAULT_GENERATION_BUDGET_TOKENS,
+        generation_budget_instruction,
+    )
+
     lines: list[str] = ["<conversation_memory>"]
     stripped = summary.strip()
     lines.append(_escape_text(stripped) if stripped else "(no prior conversation)")
@@ -70,6 +76,19 @@ def render_turn_context(
     else:
         lines.append("(no book evidence supplied for this turn)")
     lines.append("</book_evidence>")
+    # Bounded generation budget (Gate C live repair, run 37561542378:
+    # 14/14 ordinary turns collapsed to generic clarification with the
+    # verifier never served and max 51.4s over the 30s budget. The v2
+    # answer path omitted the #83 efficiency guard that the legacy path
+    # carries, so weak fallback drafts ran long (many razdel units per
+    # draft), making the verifier batch large, slow and flaky on
+    # structured output while planner/answer served. The budget hint keeps
+    # drafts to 2-5 short sentences, so verifier batches stay small and
+    # fast. Turn-independent, never an exact-question special case; the
+    # hard character/word/quote envelope stays authoritative).
+    lines.append("<response_budget>")
+    lines.append(generation_budget_instruction(DEFAULT_GENERATION_BUDGET_TOKENS))
+    lines.append("</response_budget>")
     lines.append("<user_message>")
     lines.append(_escape_text(user_message))
     lines.append("</user_message>")
