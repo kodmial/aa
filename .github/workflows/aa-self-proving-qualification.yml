@@ -872,6 +872,21 @@ jobs:
             // Product Contract #110. Generic OpenCode qualification must not
             // manufacture failures from a no-secret/minimal runner.
             const fs = require('fs');
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
             const path = 'self-proving-out/self-proving-summary.json';
             if (!fs.existsSync(path)) {
               core.warning('No self-proving summary; no authoritative #7 result is published.');
@@ -885,11 +900,13 @@ jobs:
               return;
             }
 
-            const { data: main } = await github.rest.repos.getBranch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              branch: 'main',
-            });
+            const { data: main } = await apiRetry('resolve current main', () =>
+              github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: 'main',
+              })
+            );
             const currentMain = String(main.commit.sha || '').toLowerCase();
             if (sha !== currentMain) {
               core.notice(
@@ -920,19 +937,23 @@ jobs:
               'Evidence was produced by the repository-owned qualification workflow with the configured Telegram token, encrypted canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. Generic no-secret qualification workers are not authoritative for AA.',
             ].join('\n');
 
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: 7,
-              per_page: 100,
-            });
-            if (!comments.some(c => String(c.body || '').includes(marker))) {
-              await github.rest.issues.createComment({
+            const comments = await apiRetry('list qualification comments', () =>
+              github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: 7,
-                body,
-              });
+                per_page: 100,
+              })
+            );
+            if (!comments.some(c => String(c.body || '').includes(marker))) {
+              await apiRetry('publish qualification result comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  body,
+                })
+              );
             }
 
             if (result === 'pass') {
