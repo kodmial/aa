@@ -686,6 +686,29 @@ class OpenCodeChatModel(BaseChatModel):
         """
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
+
+        # A selector-omitted planner may discover that the pinned primary
+        # serves text but not native json_schema for this schema/provider.
+        # Cache that deterministic capability result and use the configured
+        # fallback directly on subsequent planner turns.
+        if (
+            not self.wire_agent
+            and self.fallback_model.strip()
+            and self.fallback_model != self.primary_model
+            and omitted_structured_unavailable(self)
+        ):
+            logger.info(
+                "opencode omitted structured capability cached unavailable; fallback used"
+            )
+            return await self._invoke_ephemeral_structured(
+                prompt,
+                system=system,
+                schema=schema,
+                model=self.fallback_model,
+                agent=self.agent,
+                retry_count=retry_count,
+            )
+
         if self._fast_fallback_available():
             if self.wire_agent and not omitted_structured_unavailable(self):
                 try:
@@ -747,6 +770,16 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
             except OpenCodeRateLimitError:
+                raise
+            except OpenCodeDeterministicError as exc:
+                if (
+                    not self.wire_agent
+                    and self.fallback_model.strip()
+                    and self.fallback_model != self.primary_model
+                ):
+                    mark_omitted_structured_unavailable(self)
+                    last_transient = exc
+                    break
                 raise
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
