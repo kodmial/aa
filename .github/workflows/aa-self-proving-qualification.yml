@@ -723,6 +723,151 @@ jobs:
             });
             core.info(`Created self-proving repair issue #${created.data.number}.`);
 
+      - name: Publish authoritative Product Contract result
+        if: ${{ always() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        uses: actions/github-script@v7
+        env:
+          QUAL_SHA: ${{ steps.sha.outputs.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // AA owns qualification in this repository because only this
+            // workflow has the real Telegram/book/model assets required by
+            // Product Contract #110. Generic OpenCode qualification must not
+            // manufacture failures from a no-secret/minimal runner.
+            const fs = require('fs');
+            const path = 'self-proving-out/self-proving-summary.json';
+            if (!fs.existsSync(path)) {
+              core.warning('No self-proving summary; no authoritative #7 result is published.');
+              return;
+            }
+
+            const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const sha = String(summary.sha || process.env.QUAL_SHA || '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(sha)) {
+              core.setFailed('Authoritative qualification summary has no valid exact SHA.');
+              return;
+            }
+
+            const { data: main } = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: 'main',
+            });
+            const currentMain = String(main.commit.sha || '').toLowerCase();
+            if (sha !== currentMain) {
+              core.notice(
+                `Qualification result is stale at publish time (tested=${sha}, current=${currentMain}); lifecycle unchanged.`
+              );
+              return;
+            }
+
+            const status = String(summary.status || '').toUpperCase();
+            const result = status === 'PASS' ? 'pass' : 'fail';
+            const marker =
+              `<!-- continuum-qualification-result issue=7 sha=${sha} result=${result} -->`;
+            const gates = Array.isArray(summary.gates)
+              ? summary.gates.map(g => `${g.gate}:${g.status}`).join(' ')
+              : '';
+            const blocking = String(summary.blocking_gate || 'none');
+            const body = [
+              marker,
+              '',
+              '## AA self-proving Product Contract qualification',
+              '',
+              `Exact current main: \`${sha}\``,
+              `Workflow run: \`${context.runId}\``,
+              `Verdict: **${result.toUpperCase()}**`,
+              `Gates: ${gates || 'unavailable'}`,
+              `Blocking gate: ${blocking}`,
+              '',
+              'Evidence was produced by the repository-owned qualification workflow with the configured Telegram token, encrypted canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. Generic no-secret qualification workers are not authoritative for AA.',
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 7,
+              per_page: 100,
+            });
+            if (!comments.some(c => String(c.body || '').includes(marker))) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 7,
+                body,
+              });
+            }
+
+            if (result === 'pass') {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 7,
+                state: 'closed',
+                state_reason: 'completed',
+                labels: [],
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 6,
+                body: [
+                  '⚡ **AA self-proving qualification**',
+                  '<!-- continuum-origin role=project component=aa-self-proving-qualification -->',
+                  `Product Contract qualified on exact current main \`${sha}\`; capability #6 is complete.`,
+                ].join('\n'),
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 6,
+                state: 'closed',
+                state_reason: 'completed',
+                labels: ['priority:p1'],
+              });
+
+              const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100,
+              });
+              for (const issue of openIssues) {
+                if (
+                  !issue.pull_request &&
+                  String(issue.body || '').includes('<!-- aa-self-proving-repair:v1 -->')
+                ) {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                    state_reason: 'completed',
+                  });
+                }
+              }
+              core.notice(`Product Contract PASS accepted for exact main ${sha}; #7 and #6 completed.`);
+            } else {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 7,
+                state: 'open',
+                labels: ['automation:in-progress'],
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 6,
+                state: 'open',
+                labels: ['priority:p1', 'automation:qualifying', 'automation:blocked'],
+              });
+              core.warning(
+                `Product Contract remains unqualified at exact main ${sha}; self-proving repair loop continues from Gate ${blocking}.`
+              );
+            }
+
       - name: Handle provider 429 runner retire
         if: failure()
         shell: bash
