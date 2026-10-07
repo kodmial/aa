@@ -163,19 +163,20 @@ def test_heartbeat_tolerance_allows_scheduling_jitter() -> None:
 
 
 def test_gate_c_records_latency_but_gate_e_owns_slo_verdict() -> None:
-    """Latency is evidence in Gate C; Product Contract SLO enforcement belongs to Gate E."""
+    """Gate C records latency evidence; Gate E owns the SLO verdict."""
     source = (
         REPO_ROOT / "src" / "aa" / "qualification" / "product_contract_live.py"
     ).read_text(encoding="utf-8")
-    self_proving = (REPO_ROOT / "scripts" / "run_self_proving_qualification.py").read_text(
-        encoding="utf-8"
-    )
+    self_proving = (
+        REPO_ROOT / "scripts" / "run_self_proving_qualification.py"
+    ).read_text(encoding="utf-8")
     assert 'failed.append("live-text-max-over-budget")' not in source
     assert 'passed.append("live-text-latency-measured")' in source
     assert "P95_TARGET_MS" in self_proving
     assert "ORDINARY_TURN_BUDGET_MS" in self_proving
     assert "p95 > float(P95_TARGET_MS)" in self_proving
     assert "maximum >= float(ORDINARY_TURN_BUDGET_MS)" in self_proving
+
 
 def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     # Regression for kodmial/aa#150: a missing third-party module
