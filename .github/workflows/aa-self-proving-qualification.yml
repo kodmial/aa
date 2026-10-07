@@ -702,6 +702,7 @@ jobs:
             const repo = context.repo.repo;
             const sha = process.env.FAILED_SHA || context.sha;
             const runId = String(context.runId);
+            const transientBlocked = fs.existsSync('self-proving-out/transient-blocked.json');
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
             let component = 'unknown';
