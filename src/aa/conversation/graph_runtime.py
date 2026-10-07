@@ -313,7 +313,6 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         self._index = index
 
     def _build_graph(self, saver: Any) -> Any:  # pragma: no cover - production wiring
-        from aa.config import DEFAULT_PRIMARY_MODEL
         from aa.conversation.graph import build_turn_graph
         from aa.conversation.memory import default_memory_config
         from aa.conversation.model_adapter import (
@@ -335,16 +334,13 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         )
         summarizer = planner.with_agent(SUMMARIZER_AGENT_V2)
         answer = planner.with_agent(ANSWER_AGENT_V2)
-        # P0: the grounding verifier is pinned to Muse Spark only, with no
-        # Space Bunny technical fallback. Other agents keep the configured
-        # primary/fallback policy unchanged.
-        verifier = OpenCodeChatModel(
-            self._client,
-            agent=VERIFIER_AGENT_V2,
-            primary_model=DEFAULT_PRIMARY_MODEL,
-            fallback_model="",
-            request_timeout=planner.request_timeout,
-        )
+        # P0 Gate C live repair (kodmial/aa#196): the grounding verifier keeps
+        # the configured primary/fallback policy like every other agent. Live
+        # evidence showed the pinned primary rejected with 403 while the
+        # configured fallback served planner/answer; stranding the verifier
+        # with no fallback guarantees verifier-unavailable, generic
+        # clarification collapse, and served-model-identity failure.
+        verifier = planner.with_agent(VERIFIER_AGENT_V2)
         return build_turn_graph(
             planner_model=planner,
             summary_model=summarizer,
