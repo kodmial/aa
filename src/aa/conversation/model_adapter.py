@@ -720,8 +720,9 @@ class OpenCodeChatModel(BaseChatModel):
                     return omitted
                 except OpenCodeRateLimitError:
                     raise
-                except OpenCodeDeterministicError:
-                    mark_omitted_structured_unavailable(self)
+                except OpenCodeDeterministicError as exc:
+                    if "structured output missing" in str(exc).lower():
+                        mark_omitted_structured_unavailable(self)
                 except OpenCodeError:
                     pass
             logger.info("opencode primary circuit open, fast fallback used")
@@ -774,6 +775,7 @@ class OpenCodeChatModel(BaseChatModel):
                     not self.wire_agent
                     and self.fallback_model.strip()
                     and self.fallback_model != self.primary_model
+                    and "structured output missing" in str(exc).lower()
                 ):
                     mark_omitted_structured_unavailable(self)
                     last_transient = exc
@@ -804,8 +806,9 @@ class OpenCodeChatModel(BaseChatModel):
                         return omitted
                     except OpenCodeRateLimitError:
                         raise
-                    except OpenCodeDeterministicError:
-                        mark_omitted_structured_unavailable(self)
+                    except OpenCodeDeterministicError as exc:
+                        if "structured output missing" in str(exc).lower():
+                            mark_omitted_structured_unavailable(self)
                     except OpenCodeError:
                         pass
             logger.info("opencode model fallback used")
