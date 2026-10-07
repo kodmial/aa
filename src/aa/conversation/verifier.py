@@ -183,12 +183,19 @@ def build_verifier_user_text(
     if window:
         position = 0
         for passage in window:
-            passage_id = str(passage.get("passage_id", ""))
-            source_id = str(passage.get("source_id", passage.get("source", "")))
-            section_id = str(passage.get("section_id", passage.get("section", "")))
-            text = str(passage.get("text", ""))
-            if not passage_id or not text:
+            if not isinstance(passage, dict):
                 continue
+            raw_id = passage.get("passage_id", "")
+            raw_text = passage.get("text", "")
+            if not isinstance(raw_id, str) or not raw_id:
+                continue
+            if not isinstance(raw_text, str) or not raw_text:
+                continue
+            raw_source = passage.get("source_id", passage.get("source", ""))
+            raw_section = passage.get("section_id", passage.get("section", ""))
+            source_id = raw_source if isinstance(raw_source, str) else ""
+            section_id = raw_section if isinstance(raw_section, str) else ""
+            text = raw_text
             position += 1
             lines.append(
                 f"<passage id={_xml_quoteattr(f'p{position}')} "
@@ -517,12 +524,19 @@ def build_single_unit_text(
     if window:
         position = 0
         for passage in window:
-            passage_id = str(passage.get("passage_id", ""))
-            source_id = str(passage.get("source_id", passage.get("source", "")))
-            section_id = str(passage.get("section_id", passage.get("section", "")))
-            text = str(passage.get("text", ""))
-            if not passage_id or not text:
+            if not isinstance(passage, dict):
                 continue
+            raw_id = passage.get("passage_id", "")
+            raw_text = passage.get("text", "")
+            if not isinstance(raw_id, str) or not raw_id:
+                continue
+            if not isinstance(raw_text, str) or not raw_text:
+                continue
+            raw_source = passage.get("source_id", passage.get("source", ""))
+            raw_section = passage.get("section_id", passage.get("section", ""))
+            source_id = raw_source if isinstance(raw_source, str) else ""
+            section_id = raw_section if isinstance(raw_section, str) else ""
+            text = raw_text
             position += 1
             lines.append(
                 f"<passage id={_xml_quoteattr(f'p{position}')} "
