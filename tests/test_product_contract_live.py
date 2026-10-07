@@ -162,7 +162,6 @@ def test_heartbeat_tolerance_allows_scheduling_jitter() -> None:
     assert max(1, int(1 * 0.8)) == 1
 
 
-
 def test_gate_c_records_latency_but_gate_e_owns_slo_verdict() -> None:
     """Latency is evidence in Gate C; Product Contract SLO enforcement belongs to Gate E."""
     source = (
