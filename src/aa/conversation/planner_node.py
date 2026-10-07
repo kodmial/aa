@@ -35,6 +35,34 @@ from aa.conversation.v2_prompts import load_planner_system_v2
 
 logger = logging.getLogger("aa.conversation.planner_node")
 
+# Bounded per-message display length for the planner prompt only (Gate
+# C+E live repair, run 37664757721 on exact main 0202b0b: p50 29.6s /
+# p95 42.0s / max 45.5s with planner p50 5.7s / p95 12.1s). The planner
+# consumes the full framework-managed history (no message-count slice;
+# long-conversation tails make the planner prompt the second-largest
+# per-turn model input after the answer pack). Truncating each message
+# display bounds input tokens and planner latency while context
+# resolution is unchanged for ordinary turns: short follow-ups,
+# pronouns and ellipsis resolve from recent truncated context plus the
+# running summary, and truncation is explicitly marked so the model
+# never judges on a silently cut prefix. All messages are still sent
+# (message count and order unchanged); only per-message characters are
+# bounded. Turn-independent, never an exact-question special case.
+PLANNER_MAX_MESSAGE_CHARS = 500
+
+PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
+
+
+def _display_message_text(value: object) -> str:
+    """Bound one history message display text for the planner prompt."""
+    text = value if isinstance(value, str) else ""
+    if len(text) <= PLANNER_MAX_MESSAGE_CHARS:
+        return text
+    omitted = len(text) - PLANNER_MAX_MESSAGE_CHARS
+    return text[:PLANNER_MAX_MESSAGE_CHARS] + PLANNER_TRUNCATION_SUFFIX_FORMAT.format(
+        omitted=omitted
+    )
+
 
 def query_plan_json_schema() -> dict[str, Any]:
     """Build the native schema, including the structural planner contract.
@@ -66,6 +94,19 @@ def _render_context_value(value: object) -> str:
     return ""
 
 
+def _render_recent_value(value: object) -> str:
+    """Bound one recent history message for the planner prompt display.
+
+    Message count and order are unchanged (full history still sent);
+    only per-message characters are bounded with an explicit marker.
+    The live current user message and the running summary travel
+    untruncated so follow-up resolution never loses the live request.
+    """
+    if not isinstance(value, str):
+        return ""
+    return _display_message_text(value)
+
+
 def build_planner_messages(
     *,
     user_message: str,
@@ -88,7 +129,7 @@ def build_planner_messages(
         lines.append("Recent messages:")
         for message in recent:
             role = "user" if message.type == "human" else "assistant"
-            lines.append(f"{role}: {_render_context_value(message.content)}")
+            lines.append(f"{role}: {_render_recent_value(message.content)}")
     lines.append("Current user message:")
     lines.append(user_message)
     return [
@@ -178,6 +219,7 @@ async def planner_node(
 
 
 __all__ = [
+    "PLANNER_MAX_MESSAGE_CHARS",
     "build_planner_messages",
     "planner_node",
     "query_plan_json_schema",
