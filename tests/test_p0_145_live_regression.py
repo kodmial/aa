@@ -255,7 +255,10 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     after fallback, or validation failure), re-planning cannot help and each
     repair round burns another full planner+retrieval+answer+verifier sequence
     of slow provider calls (the live 40-80s pathology). The turn must clarify
-    directly with explicit telemetry instead.
+    directly with explicit telemetry instead. Gate C repair (run 37564172746):
+    one bounded per-unit round is allowed for batch provider flake (smaller
+    prompts may serve where the batch timed out), so a 2-unit draft costs
+    batch (1) + per-unit (2) calls and still clarifies without repair.
     """
     from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
 
@@ -289,7 +292,7 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     assert outcome["rounds"] == 0
     assert planner.calls == 0
     assert answer.calls == 1
-    assert verifier.calls == 1
+    assert verifier.calls == 3
     assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
     telemetry = outcome["telemetry"]
     # Gate C repair: verifier outage still skips futile repair, but the

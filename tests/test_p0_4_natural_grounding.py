@@ -1282,7 +1282,15 @@ async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
 
 
 async def test_verifier_provider_error_does_not_retry() -> None:
-    """Provider/transient failures after fallback never retry here (latency)."""
+    """Provider/transient failures stay bounded to one per-unit round (latency).
+
+    Gate C repair (run 37564172746): a batch provider timeout falls back
+    once to the smaller concurrent per-unit requests (one parallel round),
+    since minimal prompts may serve where the batch timed out. The turn
+    pipeline itself never retries beyond that single bounded fallback.
+    A fully down verifier therefore costs batch (1) + per-unit (1) calls
+    for a single unit and still clarifies.
+    """
     from aa.conversation.turn_pipeline import _verify_draft
 
     class _DownVerifier:
@@ -1302,7 +1310,7 @@ async def test_verifier_provider_error_does_not_retry() -> None:
     )
     assert passed is False
     assert result is None
-    assert verifier.calls == 1
+    assert verifier.calls == 2
 
 
 def test_verifier_native_schema_is_ref_free() -> None:
@@ -1327,10 +1335,13 @@ def test_verifier_native_schema_is_ref_free() -> None:
     items = cast(dict[str, Any], units["items"])
     assert items["type"] == "object"
     assert "$ref" not in items
-    # Scopes still enumerate the closed vocabulary for the transport.
+    # Scope vocabulary is a plain-text description hint, never enum
+    # (Gate C run 37564172746: enum-constrained decoding never served on
+    # the weak fallback while the enum-free planner served).
     item_properties = cast(dict[str, Any], items["properties"])
     scope = cast(dict[str, Any], item_properties["scope"])
-    assert set(cast(list[str], scope["enum"])) == {"book", "product_meta", "conversation_glue"}
+    assert "enum" not in scope
+    assert "book" in str(scope.get("description", ""))
     # A native-shaped payload still validates strictly in AA code.
     result = validate_grounding_result(
         {
@@ -1366,7 +1377,9 @@ def test_verifier_transport_schema_is_minimal_but_strict() -> None:
     assert "$ref" not in dumped
     assert "minLength" not in dumped
     assert "minItems" not in dumped
-    # Essential guidance stays: closed scope enum + required ids.
+    # Essential guidance stays: closed scope vocabulary as description hint
+    # (never enum) + required ids (Gate C run 37564172746).
+    assert '"enum"' not in dumped
     assert "book" in dumped and "product_meta" in dumped and "conversation_glue" in dumped
     assert VERIFIER_MAX_ATTEMPTS == 1
     # AA-side stays strict: empty unit ids are rejected.
@@ -1633,9 +1646,10 @@ def test_verifier_single_schema_is_ref_free_without_ids() -> None:
     assert "minLength" not in dumped
     assert "minItems" not in dumped
     assert "unit_id" not in dumped
+    assert '"enum"' not in dumped
     props = cast(dict[str, Any], schema["properties"])
     scope = cast(dict[str, Any], props["scope"])
-    assert set(cast(list[str], scope["enum"])) == {"book", "product_meta", "conversation_glue"}
+    assert "book" in str(scope.get("description", ""))
     assert schema["required"] == ["scope", "supported"]
 
 
@@ -1999,3 +2013,99 @@ def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
 
     assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
     assert VERIFIER_MAX_PASSAGE_CHARS == 800
+
+
+def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:
+    """Gate C repair (run 37564172746): enum-free transport, strict code.
+
+    The weak fallback served the enum-free planner structured output while
+    the enum-constrained verifier never served (13 clarifications,
+    verifier unavailable, max over budget). The transport hint drops enum
+    to plain-text description guidance; AA-side Pydantic Literal still
+    rejects unknown scopes.
+    """
+    import json
+
+    from aa.conversation.verifier_schema import (
+        verifier_json_schema,
+        verifier_single_json_schema,
+    )
+
+    for schema in (verifier_json_schema(), verifier_single_json_schema()):
+        assert '"enum"' not in json.dumps(schema)
+    with pytest.raises(VerifierValidationError):
+        validate_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "u1",
+                        "scope": "unknown-scope",
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            expected_unit_ids=["u1"],
+        )
+
+
+async def test_verifier_falls_back_to_per_unit_on_batch_provider_error() -> None:
+    """Gate C repair (run 37564172746): batch timeout still serves per-unit."""
+    from aa.conversation.verifier import run_verifier
+    from aa.opencode.errors import OpenCodeTransientError
+
+    pack = [_pack_entry()]
+    units = split_response_units("Понимаю. Поддержка рядом помогает.")
+
+    class _BatchTimeoutSingleGood:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, retry_count)
+            self.calls += 1
+            props = schema.get("properties", {})
+            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
+            if not is_single:
+                raise OpenCodeTransientError("batch timed out")
+            if "Понимаю" in prompt:
+                return {"scope": "conversation_glue", "supported": True}
+            return {
+                "scope": "book",
+                "supported": True,
+                "evidence_passage_ids": [pack[0]["passage_id"]],
+            }
+
+    model = _BatchTimeoutSingleGood()
+    result = await run_verifier(units, pack, model=model)
+    assert result.all_required_supported is True
+    assert len(result.units) == len(units)
+    assert model.calls >= 2
+
+
+async def test_verifier_provider_429_never_falls_back() -> None:
+    """Provider 429 must propagate for runner retire, never per-unit fallback."""
+    from aa.conversation.verifier import run_verifier
+    from aa.opencode.errors import OpenCodeRateLimitError
+
+    pack = [_pack_entry()]
+    units = split_response_units("Понимаю. Поддержка рядом помогает.")
+
+    class _Always429:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            raise OpenCodeRateLimitError("opencode request rate-limited: http=429")
+
+    model = _Always429()
+    with pytest.raises(OpenCodeRateLimitError):
+        await run_verifier(units, pack, model=model)
+    assert model.calls == 1
