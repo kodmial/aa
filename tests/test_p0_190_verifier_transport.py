@@ -25,6 +25,7 @@ from aa.conversation.response_units import split_response_units
 from aa.conversation.v2_prompts import load_verifier_system_v2
 from aa.conversation.verifier import (
     build_single_unit_text,
+    clear_verifier_capability_cache,
     coerce_single_verdict,
     run_verifier,
 )
@@ -38,6 +39,13 @@ from aa.opencode.errors import OpenCodeTransientError
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONVERSATION_PKG = ROOT / "src" / "aa" / "conversation"
+
+
+@pytest.fixture(autouse=True)
+def _clear_verifier_cache_between_tests() -> Any:
+    clear_verifier_capability_cache()
+    yield
+    clear_verifier_capability_cache()
 
 
 def _pack_entry(
