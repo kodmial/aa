@@ -219,9 +219,14 @@ class GraphTurnRuntime:
                 ),
                 "retrieval_over_budget": bool(result.get("retrieval_over_budget", False)),
                 "answer_outcome": str(embedded_d.get("answer_outcome", "unknown")),
-                "answer_rounds": int(retry_d.get("answer_rounds", 0)),
+                "answer_latency_ms": float(embedded_d.get("answer_latency_ms", 0.0)),
+                "answer_rounds": int(embedded_d.get("answer_rounds", 0)),
                 "verifier_outcome": str(embedded_d.get("verifier_outcome", "unknown")),
+                "verifier_latency_ms": float(embedded_d.get("verifier_latency_ms", 0.0)),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
+                "repair_budget_exceeded": bool(
+                    embedded_d.get("repair_budget_exceeded", False)
+                ),
                 "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),
@@ -233,7 +238,10 @@ class GraphTurnRuntime:
                     "planner_outcome": snapshot["planner_outcome"],
                     "retrieval_outcome": snapshot["retrieval_outcome"],
                     "answer_outcome": snapshot["answer_outcome"],
+                    "answer_latency_ms": snapshot["answer_latency_ms"],
                     "verifier_outcome": snapshot["verifier_outcome"],
+                    "verifier_latency_ms": snapshot["verifier_latency_ms"],
+                    "repair_budget_exceeded": snapshot["repair_budget_exceeded"],
                     "latency_ms": snapshot["total_latency_ms"],
                 },
             )
