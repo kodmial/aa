@@ -1290,11 +1290,7 @@ def _gate_c_live_evidence(
             for item in (live_lane.get("passed", []) or [])
             if isinstance(item, str)
         ]
-        failed = [
-            str(item)
-            for item in (live_lane.get("failed", []) or [])
-            if isinstance(item, str)
-        ]
+        failed = [str(item) for item in (live_lane.get("failed", []) or []) if isinstance(item, str)]
         incomplete = [
             str(item)
             for item in (live_lane.get("incomplete", []) or [])
