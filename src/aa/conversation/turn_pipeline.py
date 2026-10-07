@@ -548,36 +548,61 @@ async def run_v2_answer_turn(
                     "telemetry": dict(telemetry),
                 }
         if not envelope_passes(final):
-            # At most one compact regeneration from the same pack.
-            compact_hint = compact_retry_instruction(
-                remaining_chars=HARD_CHARS,
-                remaining_words=HARD_WORDS,
-                quote_remaining=QUOTE_BUDGET_CHARS,
-            )
-            second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
-            if second is not None:
-                second_units, second_result, second_passed = await _verify_with_telemetry(
-                    second, pack
+            # Live SLO guard (Gate C live repair, run 37638264853 on exact
+            # main e2e42de): the live lane failed only on
+            # live-text-max-over-budget (max 50.6s over the 30s hard budget,
+            # p50 31.1s, p95 44.5s over 14 ordinary turns) with no generic
+            # collapse, diversity passing, and planner/answer/verifier model
+            # identities healthy. The tail is long overflowing drafts: a
+            # passed draft that misses the #83 envelope currently pays a
+            # full extra answer+verifier round via compact regeneration,
+            # pushing an already-slow turn further over budget. When the
+            # turn already exceeds the live-SLO repair budget, skip that
+            # extra provider round and compact deterministically to leading
+            # supported units instead. Grounding stays strict (only
+            # validated supported units, otherwise clarification); fast
+            # turns still use the single compact regeneration. Turn-
+            # independent, never an exact-question special case.
+            if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S:
+                telemetry["repair_budget_exceeded"] = True
+                logger.info(
+                    "v2 envelope regeneration skipped for live-SLO budget",
+                    extra={"rounds": rounds},
                 )
-                if second_passed and second_units and second_result is not None:
-                    if envelope_passes(second):
-                        final = second
-                        units, result = second_units, second_result
+                final = compact_supported_to_envelope(units, result, text=final)
+                if not envelope_passes(final):
+                    final = NATURAL_CLARIFICATION_REPLY
+            else:
+                # At most one compact regeneration from the same pack.
+                compact_hint = compact_retry_instruction(
+                    remaining_chars=HARD_CHARS,
+                    remaining_words=HARD_WORDS,
+                    quote_remaining=QUOTE_BUDGET_CHARS,
+                )
+                second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
+                if second is not None:
+                    second_units, second_result, second_passed = await _verify_with_telemetry(
+                        second, pack
+                    )
+                    if second_passed and second_units and second_result is not None:
+                        if envelope_passes(second):
+                            final = second
+                            units, result = second_units, second_result
+                        else:
+                            final = compact_supported_to_envelope(
+                                second_units, second_result, text=second
+                            )
+                            units, result = second_units, second_result
+                            if not envelope_passes(final) or not contains_cyrillic(final):
+                                final = NATURAL_CLARIFICATION_REPLY
                     else:
-                        final = compact_supported_to_envelope(
-                            second_units, second_result, text=second
-                        )
-                        units, result = second_units, second_result
-                        if not envelope_passes(final) or not contains_cyrillic(final):
+                        final = compact_supported_to_envelope(units, result, text=final)
+                        if not envelope_passes(final):
                             final = NATURAL_CLARIFICATION_REPLY
                 else:
                     final = compact_supported_to_envelope(units, result, text=final)
                     if not envelope_passes(final):
                         final = NATURAL_CLARIFICATION_REPLY
-            else:
-                final = compact_supported_to_envelope(units, result, text=final)
-                if not envelope_passes(final):
-                    final = NATURAL_CLARIFICATION_REPLY
         # Quote-budget deterministic guard.
         if aggregate_quote_chars(final) > QUOTE_BUDGET_CHARS:
             compacted = compact_text_to_envelope(final)
