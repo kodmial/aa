@@ -43,9 +43,13 @@ FALLBACK = "opencode/space-bunny-free"
 
 @pytest.fixture(autouse=True)
 def _clear_circuit() -> Any:
+    from aa.conversation.verifier import clear_verifier_capability_cache
+
     clear_primary_circuit()
+    clear_verifier_capability_cache()
     yield
     clear_primary_circuit()
+    clear_verifier_capability_cache()
 
 
 def _pack_entry(
