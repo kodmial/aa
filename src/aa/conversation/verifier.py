@@ -27,9 +27,11 @@ from aa.conversation.v2_prompts import load_verifier_system_v2
 from aa.conversation.verifier_schema import (
     VERIFIER_MAX_ATTEMPTS,
     GroundingResult,
+    UnitVerdict,
     VerifierValidationError,
     validate_grounding_result,
     verifier_json_schema,
+    verifier_single_json_schema,
 )
 
 logger = logging.getLogger("aa.conversation.verifier")
@@ -265,6 +267,135 @@ def _reply_structured_content(reply: object) -> object:
     return getattr(reply, "content", reply)
 
 
+def build_single_unit_text(
+    *,
+    unit: ResponseUnitDraft,
+    passages: Sequence[dict[str, Any]],
+) -> str:
+    """Render the minimal single-unit verifier payload (no id copying).
+
+    Turn-independent hardening for weak fallback models: the model judges
+    exactly one unit and returns one verdict object without copying
+    ``u1``..``uN`` ids, which removes the systematic id-completeness flake
+    seen live (14/14 clarifications with the verifier never served). The
+    closed scope vocabulary and cite-only-supplied-ids rules are repeated
+    verbatim; AA-side strict checks stay unchanged.
+    """
+    lines: list[str] = [
+        "Judge exactly one response unit below.",
+        'scope must be exactly one of "book", "product_meta", "conversation_glue".',
+        "Cite only passage ids listed in <book_evidence> in evidence_passage_ids.",
+        "A book unit that cites no evidence passage is unsupported.",
+        "<response_unit>",
+        _escape(unit.text),
+        "</response_unit>",
+        "<book_evidence>",
+    ]
+    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    if window:
+        for passage in window:
+            passage_id = str(passage.get("passage_id", ""))
+            source_id = str(passage.get("source_id", passage.get("source", "")))
+            section_id = str(passage.get("section_id", passage.get("section", "")))
+            text = str(passage.get("text", ""))
+            if not passage_id or not text:
+                continue
+            lines.append(
+                f"<passage id={_xml_quoteattr(passage_id)} "
+                f"source={_xml_quoteattr(source_id)} "
+                f"section={_xml_quoteattr(section_id)}>"
+                f"{_escape(text)}</passage>"
+            )
+    else:
+        lines.append("(no book evidence supplied for this turn)")
+    lines.append("</book_evidence>")
+    return "\n".join(lines)
+
+
+def coerce_single_verdict(data: object, *, unit_id: str) -> UnitVerdict:
+    """Validate one single-unit verdict and bind it to ``unit_id``."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    if not isinstance(data, dict):
+        raise VerifierValidationError("verifier output is not a structured object")
+    payload = dict(data)
+    scope = payload.get("scope")
+    if isinstance(scope, str):
+        payload["scope"] = scope.strip().lower().replace("-", "_")
+    evidence_ids = payload.get("evidence_passage_ids")
+    if isinstance(evidence_ids, list):
+        payload["evidence_passage_ids"] = [
+            item.strip() if isinstance(item, str) else item for item in evidence_ids
+        ]
+    payload["unit_id"] = unit_id
+    try:
+        return UnitVerdict.model_validate(payload)
+    except PydanticValidationError as exc:
+        raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
+
+
+async def _verify_single_unit(
+    unit: ResponseUnitDraft,
+    passages: Sequence[dict[str, Any]],
+    *,
+    model: Any,
+) -> UnitVerdict:
+    """Verify exactly one unit with the minimal single-verdict schema."""
+    system_text = load_verifier_system_v2()
+    user_text = build_single_unit_text(unit=unit, passages=passages)
+    structured_invoke = getattr(model, "ainvoke_structured", None)
+    if callable(structured_invoke):
+        raw = await structured_invoke(
+            user_text,
+            system=system_text,
+            schema=verifier_single_json_schema(),
+            retry_count=VERIFIER_MAX_ATTEMPTS,
+        )
+        if not isinstance(raw, dict):
+            raise VerifierValidationError("verifier output is not a structured object")
+        return coerce_single_verdict(raw, unit_id=unit.unit_id)
+    reply = await model.ainvoke(
+        [SystemMessage(content=system_text), HumanMessage(content=user_text)]
+    )
+    content = _reply_structured_content(reply)
+    if isinstance(content, str):
+        raise VerifierValidationError("verifier output is not a structured object")
+    return coerce_single_verdict(content, unit_id=unit.unit_id)
+
+
+async def _verify_per_unit_concurrent(
+    units: Sequence[ResponseUnitDraft],
+    passages: Sequence[dict[str, Any]],
+    *,
+    model: Any,
+) -> GroundingResult:
+    """Verify each unit concurrently with the single-verdict schema.
+
+    Concurrency keeps the fallback within one slow-model round instead of
+    N sequential rounds (live SLO). Deterministic cite/quote/checksum
+    gates run on the assembled result exactly as in the batch path, so
+    grounding strictness is unchanged. Provider/transient errors
+    propagate (fail-closed); only validation-shaped failures are raised
+    as ``VerifierValidationError`` by the callers.
+    """
+    import asyncio as _asyncio
+
+    verdicts = await _asyncio.gather(
+        *(_verify_single_unit(unit, passages, model=model) for unit in units)
+    )
+    ordered = sorted(verdicts, key=lambda verdict: verdict.unit_id)
+    all_supported = all(verdict.supported for verdict in ordered)
+    assembled = GroundingResult(units=list(ordered), all_required_supported=all_supported)
+    result = validate_grounding_result(
+        assembled, expected_unit_ids=[unit.unit_id for unit in units]
+    )
+    pack_ids = set(_pack_index(passages).keys())
+    check_passage_checksums(passages)
+    check_cited_passage_ids(result, pack_ids=pack_ids)
+    check_exact_quotes(units=units, result=result, passages=passages)
+    return result
+
+
 async def run_verifier(
     units: Sequence[ResponseUnitDraft],
     passages: Sequence[dict[str, Any]],
@@ -273,44 +404,81 @@ async def run_verifier(
 ) -> GroundingResult:
     """Invoke the hidden verifier and validate its structured verdict.
 
-    A single OpenCode ``json_schema`` request is issued; OpenCode owns the
-    bounded validation retry (``retryCount``). AA code performs exactly one
-    Pydantic validation plus the deterministic completeness and
-    exact-quote/provenance checks, and never reparses text or retries.
+    Fast path first: a single OpenCode ``json_schema`` batch request with
+    OpenCode-owned bounded validation retry (``retryCount``). On a
+    validation-shaped failure (weak fallback models systematically flake
+    on exact ``u1``..``uN`` id copying even for trivial glue/meta drafts,
+    collapsing every ordinary turn to generic clarification with the
+    verifier never served), fall back once to concurrent per-unit
+    single-verdict verification with the minimal schema (no id copying).
+    AA code performs strict Pydantic validation plus the deterministic
+    completeness and exact-quote/provenance checks on both paths, and
+    never reparses text. Provider/transient/timeout errors propagate
+    immediately without fallback (the model adapter already exhausted
+    primary/fallback).
     """
     if not units:
         raise VerifierValidationError("verifier needs at least one response unit")
     system_text = load_verifier_system_v2()
     user_text = build_verifier_user_text(units=units, passages=passages)
     structured_invoke = getattr(model, "ainvoke_structured", None)
-    if callable(structured_invoke):
-        raw = await structured_invoke(
-            user_text,
-            system=system_text,
-            schema=verifier_json_schema(),
-            retry_count=VERIFIER_MAX_ATTEMPTS,
+    try:
+        if callable(structured_invoke):
+            raw = await structured_invoke(
+                user_text,
+                system=system_text,
+                schema=verifier_json_schema(),
+                retry_count=VERIFIER_MAX_ATTEMPTS,
+            )
+            result = coerce_grounding_result(raw, units=units, passages=passages)
+            logger.info("verifier output accepted", extra={"units": len(units)})
+            return result
+        reply = await model.ainvoke(
+            [SystemMessage(content=system_text), HumanMessage(content=user_text)]
         )
-        result = coerce_grounding_result(raw, units=units, passages=passages)
+        content = _reply_structured_content(reply)
+        if isinstance(content, str):
+            raise VerifierValidationError("verifier output is not a structured object")
+        result = coerce_grounding_result(content, units=units, passages=passages)
         logger.info("verifier output accepted", extra={"units": len(units)})
         return result
-    reply = await model.ainvoke(
-        [SystemMessage(content=system_text), HumanMessage(content=user_text)]
-    )
-    content = _reply_structured_content(reply)
-    if isinstance(content, str):
-        raise VerifierValidationError("verifier output is not a structured object")
-    result = coerce_grounding_result(content, units=units, passages=passages)
-    logger.info("verifier output accepted", extra={"units": len(units)})
-    return result
+    except (VerifierValidationError, ValueError) as exc:
+        # Bounded single fallback to the simpler per-unit task for
+        # id/format flake only; deterministic grounding rejections for the
+        # same draft/pack (unknown passage, missing evidence, bad quote,
+        # checksum) would repeat per unit and only burn live latency, so
+        # they fail closed immediately. Provider/transient errors are not
+        # VerifierValidationError and propagate above without fallback.
+        message = str(exc).lower()
+        deterministic = (
+            "cites no evidence" in message
+            or "cites unknown passage" in message
+            or "quotes text" in message
+            or "without cited exact passages" in message
+            or "absent from cited passages" in message
+            or "checksum mismatch" in message
+            or "needs at least one response unit" in message
+        )
+        if deterministic:
+            raise
+        logger.info(
+            "verifier batch invalid, per-unit fallback scheduled",
+            extra={"category": "verifier-invalid"},
+        )
+        result = await _verify_per_unit_concurrent(units, passages, model=model)
+        logger.info("verifier per-unit output accepted", extra={"units": len(units)})
+        return result
 
 
 __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
+    "build_single_unit_text",
     "build_verifier_user_text",
     "check_cited_passage_ids",
     "check_exact_quotes",
     "check_passage_checksums",
     "coerce_grounding_result",
+    "coerce_single_verdict",
     "run_verifier",
 ]
