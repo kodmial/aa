@@ -15,6 +15,7 @@ from aa.conversation.model_adapter import (
 )
 from aa.opencode.client import SessionInfo
 from aa.opencode.errors import (
+    OpenCodeDeterministicError,
     OpenCodeProviderAccessError,
     OpenCodeRateLimitError,
     OpenCodeTransientError,
@@ -139,6 +140,40 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
     assert sleeps[0] >= 5.0
+
+
+async def test_omitted_structured_capability_failure_fast_falls_back_and_caches() -> None:
+    """Direct omitted planner avoids repeated deterministic structured failures."""
+    client = _ScriptedClient(
+        structured_outcomes=[
+            OpenCodeDeterministicError("opencode structured output missing"),
+            {"queries": ["fallback-first"]},
+            {"queries": ["fallback-cached"]},
+        ]
+    )
+    model = OpenCodeChatModel(
+        client,  # type: ignore[arg-type]
+        agent="aa-planner-v2",
+        primary_model=PRIMARY,
+        fallback_model=FALLBACK,
+        transport_agent="",
+    )
+
+    first = await model.ainvoke_structured(
+        "hello",
+        system="planner",
+        schema={"type": "object"},
+    )
+    assert first == {"queries": ["fallback-first"]}
+    assert client.models == [PRIMARY, FALLBACK]
+
+    second = await model.ainvoke_structured(
+        "hello again",
+        system="planner",
+        schema={"type": "object"},
+    )
+    assert second == {"queries": ["fallback-cached"]}
+    assert client.models == [PRIMARY, FALLBACK, FALLBACK]
 
 
 async def test_structured_429_escalates_immediately_for_fresh_runner_recovery(
