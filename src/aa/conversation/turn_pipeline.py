@@ -345,6 +345,7 @@ async def run_v2_answer_turn(
         "answer_rounds": 0,
         "verifier_outcome": "unknown",
         "verifier_latency_ms": 0.0,
+        "verifier_unavailable_units": 0,
         "repair_rounds": 0,
         "repair_budget_exceeded": False,
         "total_latency_ms": 0.0,
@@ -421,10 +422,14 @@ async def run_v2_answer_turn(
 
     telemetry["answer_outcome"] = "draft-ok"
     units, result, passed = await _verify_with_telemetry(draft, pack)
+    if result is not None:
+        telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
     if passed:
         telemetry["verifier_outcome"] = "passed"
     elif result is None:
         telemetry["verifier_outcome"] = "unavailable"
+    elif result.unavailable_unit_ids:
+        telemetry["verifier_outcome"] = "partial-unavailable"
     else:
         telemetry["verifier_outcome"] = "unsupported"
     current_draft: str = draft
@@ -451,8 +456,13 @@ async def run_v2_answer_turn(
     # be proven grounded, so it clarifies directly instead of burning
     # latency on futile repair.
     is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
-    repair_allowed = result is not None and (
-        (not initial_pack_empty) or (initial_query_count is not None and initial_query_count > 0)
+    repair_allowed = (
+        result is not None
+        and not result.unavailable_unit_ids
+        and (
+            (not initial_pack_empty)
+            or (initial_query_count is not None and initial_query_count > 0)
+        )
     )
     if not passed and is_glue:
         logger.info(
@@ -546,10 +556,14 @@ async def run_v2_answer_turn(
             break
         current_draft = next_draft
         units, result, passed = await _verify_with_telemetry(current_draft, pack)
+        if result is not None:
+            telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
         if passed:
             telemetry["verifier_outcome"] = "passed-after-repair"
         elif result is None:
             telemetry["verifier_outcome"] = "unavailable"
+        elif result.unavailable_unit_ids:
+            telemetry["verifier_outcome"] = "partial-unavailable"
         else:
             telemetry["verifier_outcome"] = "unsupported"
 
