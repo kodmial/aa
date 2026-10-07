@@ -2109,3 +2109,28 @@ async def test_verifier_provider_429_never_falls_back() -> None:
     with pytest.raises(OpenCodeRateLimitError):
         await run_verifier(units, pack, model=model)
     assert model.calls == 1
+
+
+def test_verifier_payload_carries_generic_scoping_illustrations() -> None:
+    """Gate C repair (run 37569082194): generic scope guidance, no live questions.
+
+    The weak fallback invented scopes on the batch array (12 unavailable,
+    diversity fail, max over budget). Fixed toy illustrations show the
+    closed vocabulary and short-id citation shape uniformly for every
+    turn; they contain no live prompt text and no canonical book text.
+    """
+    from aa.conversation.verifier import build_single_unit_text, build_verifier_user_text
+
+    units = split_response_units("Понимаю. Тяга проходит.")
+    pack = [_pack_entry()]
+    batch_text = build_verifier_user_text(units=units, passages=pack)
+    assert "Scoping illustrations" in batch_text
+    assert "conversation_glue" in batch_text
+    assert "product_meta" in batch_text
+    assert "[p1]" in batch_text
+    # No exact live-question special cases in the prompt builder.
+    for probe in ("тянет выпить", "ссора", "акции", "покончить"):
+        assert probe not in batch_text
+    single_text = build_single_unit_text(unit=units[0], passages=pack)
+    assert "Scoping illustrations" in single_text
+    assert "[p1]" in single_text
