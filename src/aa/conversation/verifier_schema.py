@@ -99,6 +99,32 @@ def verifier_json_schema() -> dict[str, object]:
     }
 
 
+def verifier_single_json_schema() -> dict[str, object]:
+    """Build the minimal single-unit transport schema for weak providers.
+
+    Turn-independent hardening: a single verdict object (no array, no
+    ``unit_id`` copy) is strictly easier for a weak fallback model than
+    the batch array with exact ``u1``..``uN`` id copying. The native hint
+    stays ``$ref``-free and omits length constraints (enforced in AA
+    code); ``enum`` + ``required`` stay as essential guidance.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "enum": ["book", "product_meta", "conversation_glue"],
+            },
+            "supported": {"type": "boolean"},
+            "evidence_passage_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["scope", "supported"],
+    }
+
+
 def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> GroundingResult:
     """Pydantic-validate one native verifier object plus ID completeness.
 
@@ -145,4 +171,5 @@ __all__ = [
     "VerifierValidationError",
     "validate_grounding_result",
     "verifier_json_schema",
+    "verifier_single_json_schema",
 ]

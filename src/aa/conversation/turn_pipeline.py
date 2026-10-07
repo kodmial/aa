@@ -248,48 +248,20 @@ async def _verify_draft(
     try:
         result = await run_verifier(units, pack_dicts, model=verifier_model)
     except (VerifierValidationError, ValueError) as exc:
-        # Gate C live repair (run 37530425848, 14 clarifications with
-        # verifier never served; run 37544234331, 14 clarifications with
-        # verifier never served on the weak fallback): a weaker fallback
-        # model can emit a verdict with wrong unit ids/count or
-        # schema-invalid formatting (capitalized scopes, whitespace) on the
-        # first attempt while succeeding on a bounded second attempt
-        # (sampling variance). Retry exactly once for id-completeness and
-        # weak-formatting mismatches; citation/quote/checksum failures are
-        # deterministic for the same draft/pack (a book unit with no
-        # evidence, e.g. glue with empty pack, always fails) so an
-        # immediate fail-closed avoids burning live latency. Provider or
-        # transport failures below never retry here (the model adapter
-        # already exhausted primary/fallback). Grounding is preserved: only
-        # a model verdict passing full Pydantic + completeness checks is
-        # accepted.
-        message = str(exc).lower()
-        deterministic = (
-            "cites no evidence" in message
-            or "cites unknown passage" in message
-            or "quotes text" in message
-            or "without cited exact passages" in message
-            or "absent from cited passages" in message
-            or "checksum mismatch" in message
-            or "needs at least one response unit" in message
-        )
-        if deterministic:
-            logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
-            return units, None, False
-        logger.info(
-            "v2 verification invalid, bounded retry scheduled",
-            extra={"category": "verifier-invalid"},
-        )
+        # Gate C live repair (run 37547434287, 14/14 clarifications with
+        # the verifier never served and max 35s over the 30s budget):
+        # run_verifier already performs its own bounded per-unit fallback
+        # (simpler single-verdict task, concurrent, no id copying) on a
+        # validation-shaped failure. Repeating the same batch prompt here
+        # only burns a second slow-model round and pushes ordinary turns
+        # over budget without fixing systematic id-copy flake. Fail closed
+        # immediately: only a verdict passing full Pydantic + completeness
+        # + cite/quote/checksum gates is accepted. Provider or transport
+        # failures below never retry here (the model adapter already
+        # exhausted primary/fallback).
+        logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
         _ = exc
-        try:
-            result = await run_verifier(units, pack_dicts, model=verifier_model)
-        except (VerifierValidationError, ValueError) as retry_exc:
-            logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
-            _ = retry_exc
-            return units, None, False
-        except Exception as retry_exc:  # provider/transient/timeout after fallback
-            logger.info("v2 verifier unavailable", extra={"category": type(retry_exc).__name__})
-            return units, None, False
+        return units, None, False
     except Exception as exc:  # provider/transient/timeout after fallback
         logger.info("v2 verifier unavailable", extra={"category": type(exc).__name__})
         return units, None, False
