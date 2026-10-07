@@ -1261,8 +1261,7 @@ def _gate_c_live_evidence(
             (
                 lane
                 for lane in lanes
-                if isinstance(lane, dict)
-                and str(lane.get("lane", "")) == "live-telegram-evidence"
+                if isinstance(lane, dict) and str(lane.get("lane", "")) == "live-telegram-evidence"
             ),
             None,
         )
@@ -1286,19 +1285,13 @@ def _gate_c_live_evidence(
 
         lane_status = str(live_lane.get("status", "")).upper()
         passed = [
-            str(item)
-            for item in (live_lane.get("passed", []) or [])
-            if isinstance(item, str)
+            str(item) for item in (live_lane.get("passed", []) or []) if isinstance(item, str)
         ]
         failed = [
-            str(item)
-            for item in (live_lane.get("failed", []) or [])
-            if isinstance(item, str)
+            str(item) for item in (live_lane.get("failed", []) or []) if isinstance(item, str)
         ]
         incomplete = [
-            str(item)
-            for item in (live_lane.get("incomplete", []) or [])
-            if isinstance(item, str)
+            str(item) for item in (live_lane.get("incomplete", []) or []) if isinstance(item, str)
         ]
         required_checks = {
             "live-raw-telegram-transport-boundary",
