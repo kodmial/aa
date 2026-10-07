@@ -492,6 +492,9 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
         assert "steps.gate-c.outcome == 'success'" in independent
         assert "steps.gate-c.outcome == 'failure'" in independent
         assert "restart-required.json" in independent
+    assert "runner_rc=0" in gate_e
+    assert "|| runner_rc=$?" in gate_e
+    assert '"$runner_rc" -eq 75' in gate_e
     for block in (gate_e, gate_f):
         assert 'SELF_PROVING_LIVE: "1"' in block
         assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block
