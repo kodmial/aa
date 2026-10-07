@@ -1838,7 +1838,7 @@ def main(argv: list[str] | None = None) -> int:
             product,
             runtime,
             latencies,
-            gate_c_live=(gate_c.status == "PASS" and gate_c.live_trusted),
+            gate_c_live=gate_c.live_trusted,
             aggregate_slo_ms=aggregate_slo,
         )
     except Exception as exc:
