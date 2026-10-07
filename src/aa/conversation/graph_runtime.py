@@ -203,6 +203,8 @@ class GraphTurnRuntime:
             pack_count = len(pack) if isinstance(pack, list) else 0
             grounding = result.get("grounding_result", {})
             grounding_d = dict(grounding) if isinstance(grounding, dict) else {}
+            grounding_units = grounding_d.get("units", [])
+            response_units = len(grounding_units) if isinstance(grounding_units, list) else 0
             snapshot: dict[str, Any] = {
                 "planner_query_count": int(embedded_d.get("planner_query_count", query_count)),
                 "planner_outcome": str(
@@ -226,6 +228,7 @@ class GraphTurnRuntime:
                 "verifier_unavailable_units": int(
                     embedded_d.get("verifier_unavailable_units", 0)
                 ),
+                "response_units": int(response_units),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
                 "repair_budget_exceeded": bool(
                     embedded_d.get("repair_budget_exceeded", False)
@@ -245,6 +248,7 @@ class GraphTurnRuntime:
                     "verifier_outcome": snapshot["verifier_outcome"],
                     "verifier_latency_ms": snapshot["verifier_latency_ms"],
                     "verifier_unavailable_units": snapshot["verifier_unavailable_units"],
+                    "response_units": snapshot["response_units"],
                     "repair_budget_exceeded": snapshot["repair_budget_exceeded"],
                     "latency_ms": snapshot["total_latency_ms"],
                 },
