@@ -733,6 +733,8 @@ jobs:
             let productFailures = [];
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
+            let verifierLine = 'Verifier availability: unavailable.';
+            let transportTimingLine = 'OpenCode request timings: unavailable.';
             let modelPathLine = 'Served models: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
@@ -782,7 +784,22 @@ jobs:
               const repair = metrics.repair_metrics || {};
               if (rendered.length) {
                 stageTimingLine = 'Stage timings: ' + rendered.join('; ') +
-                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, answer_rounds=${Number(repair.answer_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+              }
+              const verifier = metrics.verifier_metrics || {};
+              verifierLine =
+                'Verifier availability: ' +
+                `turns_with_unavailable_units=${Number(verifier.turns_with_unavailable_units || 0)}, ` +
+                `unavailable_units_total=${Number(verifier.unavailable_units_total || 0)}.`;
+              const requestTimings = metrics.opencode_request_latency_ms || {};
+              const requestRendered = Object.keys(requestTimings)
+                .sort()
+                .map(name => {
+                  const item = requestTimings[name] || {};
+                  return `${name}=n:${Number(item.count || 0)}/p50:${Math.round(Number(item.p50 || 0))}/p95:${Math.round(Number(item.p95 || 0))}/max:${Math.round(Number(item.max || 0))}ms`;
+                });
+              if (requestRendered.length) {
+                transportTimingLine = 'OpenCode request timings: ' + requestRendered.join('; ') + '.';
               }
               const served = metrics.served_models_by_agent || {};
               const servedEntries = Object.keys(served)
@@ -845,6 +862,8 @@ jobs:
               `Repair recurrence: \`${recurrence}\``,
               timingLine,
               stageTimingLine,
+              verifierLine,
+              transportTimingLine,
               modelPathLine,
               '',
               '### Required repair behavior',
