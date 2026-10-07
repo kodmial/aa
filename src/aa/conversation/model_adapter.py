@@ -363,9 +363,11 @@ class OpenCodeChatModel(BaseChatModel):
 
         The process-wide primary circuit is shared: a new agent bound after
         the primary was rejected fast-fallbacks immediately instead of
-        burning its own primary retry per turn. Derived agents always use
-        the wire-equals-logical policy; the decoupled verifier is built
-        via :func:`build_verifier_model`, never via ``with_agent``.
+        burning its own primary retry per turn. Derived agents preserve
+        this model's transport-agent policy, so hidden planner/answer/
+        summarizer stages can omit a provider-rejected selector while
+        retaining distinct logical audit identities. The verifier is built
+        separately via :func:`build_verifier_model` because it has no fallback.
         """
         nxt = OpenCodeChatModel(
             self._client,
