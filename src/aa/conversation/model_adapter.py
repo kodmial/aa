@@ -48,6 +48,13 @@ SUMMARIZER_AGENT_V2 = "aa-summarizer-v2"
 ANSWER_AGENT_V2 = "aa-v2"
 VERIFIER_AGENT_V2 = "aa-verifier-v2"
 RUNTIME_AGENT_V2 = "aa-runtime-v2"
+# Verifier transport selector (kodmial/aa#202): the logical audit identity
+# stays ``aa-verifier-v2`` while the OpenCode transport agent selector is
+# omitted (server default applies). The verifier system prompt still
+# travels through the native ``system`` field and the requested model stays
+# pinned to Muse Spark. An empty transport agent means no ``agent`` key is
+# sent on the wire.
+VERIFIER_TRANSPORT_AGENT_V2 = ""
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 # Live SLO guard (Gate C/E): a persistent provider-access (403) rejection
@@ -191,9 +198,12 @@ class OpenCodeChatModel(BaseChatModel):
     """LangChain chat model backed by ephemeral OpenCode sessions.
 
     Each invocation creates a fresh session, sends one rendered prompt and
-    deletes the session in ``finally``. ``agent`` selects the named OpenCode
-    agent (planner/summarizer/answer); ``primary_model``/``fallback_model``
-    reuse the configured AA runtime model policy.
+    deletes the session in ``finally``. ``agent`` is the logical audit
+    identity (planner/summarizer/answer/verifier); ``transport_agent``
+    optionally overrides the OpenCode transport agent selector sent on the
+    wire (``None`` means the wire uses ``agent``; an empty string omits the
+    selector and lets the server default apply). ``primary_model``/
+    ``fallback_model`` reuse the configured AA runtime model policy.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
@@ -202,6 +212,7 @@ class OpenCodeChatModel(BaseChatModel):
     primary_model: str
     fallback_model: str = ""
     request_timeout: float = 120.0
+    transport_agent: str | None = None
 
     _client: OpenCodeClient = PrivateAttr()
     _primary_access_rejected_at: float | None = PrivateAttr(default=None)
@@ -214,14 +225,23 @@ class OpenCodeChatModel(BaseChatModel):
         primary_model: str,
         fallback_model: str = "",
         request_timeout: float = 120.0,
+        transport_agent: str | None = None,
     ) -> None:
         super().__init__(  # type: ignore[call-arg]
             agent=agent,
             primary_model=primary_model,
             fallback_model=fallback_model,
             request_timeout=request_timeout,
+            transport_agent=transport_agent,
         )
         self._client = client
+
+    @property
+    def wire_agent(self) -> str:
+        """The transport agent selector actually sent on the wire."""
+        if self.transport_agent is None:
+            return self.agent
+        return self.transport_agent
 
     @property
     def _llm_type(self) -> str:
@@ -237,7 +257,9 @@ class OpenCodeChatModel(BaseChatModel):
 
         The process-wide primary circuit is shared: a new agent bound after
         the primary was rejected fast-fallbacks immediately instead of
-        burning its own primary retry per turn.
+        burning its own primary retry per turn. Derived agents always use
+        the wire-equals-logical policy; the decoupled verifier is built
+        via :func:`build_verifier_model`, never via ``with_agent``.
         """
         nxt = OpenCodeChatModel(
             self._client,
@@ -306,15 +328,20 @@ class OpenCodeChatModel(BaseChatModel):
     ) -> str:
         client = self._client
         session = await client.create_session(title="")
+        # Decoupled verifier (kodmial/aa#202): the wire carries the
+        # transport selector while the audit keeps the logical identity.
+        wire_agent = self.wire_agent if agent == self.agent else agent
+        audit_agent = agent if wire_agent != agent else ""
         try:
             return await client.send_message(
                 session.id,
                 prompt,
                 timeout=self.request_timeout,
-                agent=agent,
+                agent=wire_agent,
                 model=model,
                 system=system,
                 format=format,
+                audit_agent=audit_agent,
             )
         finally:
             try:
@@ -334,16 +361,19 @@ class OpenCodeChatModel(BaseChatModel):
     ) -> dict[str, object]:
         client = self._client
         session = await client.create_session(title="")
+        wire_agent = self.wire_agent if agent == self.agent else agent
+        audit_agent = agent if wire_agent != agent else ""
         try:
             return await client.send_structured_message(
                 session.id,
                 prompt,
                 timeout=self.request_timeout,
-                agent=agent,
+                agent=wire_agent,
                 model=model,
                 system=system,
                 schema=schema,
                 retry_count=retry_count,
+                audit_agent=audit_agent,
             )
         finally:
             try:
@@ -557,6 +587,34 @@ class OpenCodeChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=str(reply)))])
 
 
+def build_verifier_model(
+    client: OpenCodeClient,
+    *,
+    primary_model: str,
+    request_timeout: float = 120.0,
+) -> OpenCodeChatModel:
+    """Build the Muse-only grounding verifier (kodmial/aa#202).
+
+    The logical audit identity stays ``aa-verifier-v2`` while the
+    transport agent selector is omitted so a custom-agent rejection can
+    never strand the Muse verifier. The fallback stays empty: Space Bunny
+    must never serve the verifier. The verifier system prompt still
+    travels through the native ``system`` field and the requested model
+    stays pinned to Muse Spark.
+    """
+    from aa.config import DEFAULT_PRIMARY_MODEL
+
+    pinned = (primary_model or "").strip() or DEFAULT_PRIMARY_MODEL
+    return OpenCodeChatModel(
+        client,
+        agent=VERIFIER_AGENT_V2,
+        primary_model=pinned,
+        fallback_model="",
+        request_timeout=request_timeout,
+        transport_agent=VERIFIER_TRANSPORT_AGENT_V2,
+    )
+
+
 __all__ = [
     "ANSWER_AGENT_V2",
     "PLANNER_AGENT_V2",
@@ -565,7 +623,9 @@ __all__ = [
     "STRUCTURED_RETRY_COUNT",
     "SUMMARIZER_AGENT_V2",
     "VERIFIER_AGENT_V2",
+    "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
+    "build_verifier_model",
     "clear_primary_circuit",
     "render_messages_text",
     "split_system_and_user",

@@ -319,7 +319,6 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
             ANSWER_AGENT_V2,
             PLANNER_AGENT_V2,
             SUMMARIZER_AGENT_V2,
-            VERIFIER_AGENT_V2,
             OpenCodeChatModel,
         )
         from aa.retrieval.evidence import RetrievalConfig
@@ -334,17 +333,22 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         )
         summarizer = planner.with_agent(SUMMARIZER_AGENT_V2)
         answer = planner.with_agent(ANSWER_AGENT_V2)
-        # Product invariant: the grounding verifier uses Muse Spark only.
-        # Space Bunny is deliberately excluded from this critical gate.
-        # A regression test locks this routing; other agents retain the
-        # configured primary/fallback policy.
+        # Product invariant (kodmial/aa#202): the grounding verifier uses
+        # Muse Spark only with no fallback. Space Bunny is deliberately
+        # excluded from this critical gate. The logical audit identity
+        # stays ``aa-verifier-v2`` while the transport agent selector is
+        # omitted (server default applies) so a custom-agent rejection can
+        # never strand the Muse verifier; the verifier system prompt still
+        # travels through the native ``system`` field. A regression test
+        # locks this routing; other agents retain the configured
+        # primary/fallback policy. Never rebuild the verifier via
+        # ``planner.with_agent(...)``: that would inherit the fallback.
         from aa.config import DEFAULT_PRIMARY_MODEL
+        from aa.conversation.model_adapter import build_verifier_model
 
-        verifier = OpenCodeChatModel(
+        verifier = build_verifier_model(
             self._client,
-            agent=VERIFIER_AGENT_V2,
             primary_model=DEFAULT_PRIMARY_MODEL,
-            fallback_model="",
             request_timeout=planner.request_timeout,
         )
         return build_turn_graph(
