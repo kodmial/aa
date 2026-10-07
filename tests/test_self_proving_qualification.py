@@ -326,6 +326,17 @@ def test_repair_loop_single_issue_and_rerun_order() -> None:
     assert report.category == "fallback-collapse"
     fingerprint = repair_fingerprint(report)
     assert len(fingerprint) == 16
+    same_defect_new_sha = failure_report_for_gate(
+        GateEvidence(
+            gate="C",
+            status="FAIL",
+            sha=OTHER_SHA,
+            failure_category="fallback-collapse",
+            component="answer",
+            run_id="run-10",
+        )
+    )
+    assert repair_fingerprint(same_defect_new_sha) == fingerprint
     assert find_reusable_repair([(12, fingerprint), (13, "other")], fingerprint=fingerprint) == 12
     assert find_reusable_repair([(12, "other")], fingerprint=fingerprint) is None
     assert rerun_plan("C") == ["C", "D", "E", "F"]
