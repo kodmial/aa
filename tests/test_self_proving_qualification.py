@@ -452,6 +452,8 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "Stage timings:" in workflow
     assert "Verifier availability:" in workflow
     assert "OpenCode request timings:" in workflow
+    assert "Model token usage:" in workflow
+    assert "response_units_total=" in workflow
     assert "Repair recurrence:" in workflow
     assert "async function apiRetry" in workflow
     assert "retrying in" in workflow
