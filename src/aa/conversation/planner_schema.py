@@ -17,7 +17,26 @@ from pydantic import BaseModel, Field
 
 MIN_NONEMPTY_QUERIES = 10
 MAX_QUERIES = 16
-PLANNER_MAX_ATTEMPTS = 2
+# Bounded native structured retry budget (Gate C+E live repair,
+# kodmial/aa#217 recurrence 4 on exact main 7a9c907 run 37697730282:
+# C:live-answer-no-generic-collapse plus E:latency-budget-exceeded
+# p50 20.4s / p95 33.3s / max 34.3s with planner p50 7.0s / p95 16.4s /
+# max 28.7s, retrieval p50 0.5s, repair_turns=0). Prior repairs bounded
+# per-message/per-passage display tokens at the planner/answer/verifier
+# boundaries and saved ~9s p50 across runs, but the persistent planner
+# tail is server-side structured retries, not display tokens: each
+# planner call pays up to 3 sequential model invocations inside OpenCode
+# (initial + 2 validation retries) before the AA-level text fallback,
+# so one weak-model invalid plan costs ~8-16s before serving anything.
+# The verifier precedent (run 37538518277) already halved its worst case
+# to a single server retry with unchanged strict Pydantic validation.
+# This changes strategy at the responsible OpenCode-request boundary
+# (retry budget, not another token-display patch): one server retry
+# bounds the planner tail while grounding stays strict (only a fully
+# validated 0 or 10-16 distinct-query plan is accepted; anything else
+# fails closed to the bounded text fallback or raises). Turn-
+# independent, never an exact-question special case.
+PLANNER_MAX_ATTEMPTS = 1
 
 
 class QueryPlan(BaseModel):
