@@ -213,6 +213,7 @@ class HttpOpenCodeClient(OpenCodeClient):
             raise ValueError("request_timeout must be > 0")
         self._request_timeout = request_timeout
         self._served_model_audit: list[dict[str, str]] = []
+        self._token_usage_audit: list[dict[str, object]] = []
         # Privacy-safe local transport timings: operation category, duration,
         # and success only. Never records prompts, responses, session ids, or
         # provider error text. Gate E uses this to distinguish model latency
@@ -372,6 +373,44 @@ class HttpOpenCodeClient(OpenCodeClient):
                 return f"{provider}/{model}"
         return ""
 
+    @property
+    def token_usage_audit(self) -> tuple[dict[str, object], ...]:
+        """Return privacy-safe model token usage keyed by logical agent."""
+        return tuple(dict(item) for item in self._token_usage_audit)
+
+    def _record_token_usage(
+        self, info: object, *, agent: str, audit_agent: str = ""
+    ) -> None:
+        if not isinstance(info, dict):
+            return
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict):
+            return
+        logical_agent = (audit_agent or agent or "").strip()[:128]
+        entry: dict[str, object] = {"agent": logical_agent}
+        found = False
+        for source_key, target_key in (
+            ("input", "input"),
+            ("output", "output"),
+            ("reasoning", "reasoning"),
+        ):
+            value = tokens.get(source_key)
+            if isinstance(value, (int, float)) and float(value) >= 0:
+                entry[target_key] = int(value)
+                found = True
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            for source_key, target_key in (("read", "cache_read"), ("write", "cache_write")):
+                value = cache.get(source_key)
+                if isinstance(value, (int, float)) and float(value) >= 0:
+                    entry[target_key] = int(value)
+                    found = True
+        if not found:
+            return
+        self._token_usage_audit.append(entry)
+        if len(self._token_usage_audit) > 1024:
+            del self._token_usage_audit[:-1024]
+
     def _validate_served_model(
         self, info: object, *, requested: str, agent: str, audit_agent: str = ""
     ) -> None:
@@ -437,6 +476,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
         self._validate_served_model(info, requested=model, agent=agent, audit_agent=audit_agent)
+        self._record_token_usage(info, agent=agent, audit_agent=audit_agent)
         reply = _extract_text(payload.get("parts"))
         # Never log the prompt or the reply; only the fact of completion.
         logger.info("opencode message completed")
@@ -487,6 +527,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
         self._validate_served_model(info, requested=model, agent=agent, audit_agent=audit_agent)
+        self._record_token_usage(info, agent=agent, audit_agent=audit_agent)
         structured = _extract_structured(payload)
         if structured is None:
             raise OpenCodeDeterministicError("opencode structured output missing")
