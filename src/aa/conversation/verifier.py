@@ -386,6 +386,39 @@ def clear_verifier_capability_cache() -> None:
         _TEXT_JSON_PREFERRED_AT.clear()
 
 
+def _model_on_fallback_path(model: Any | None) -> bool:
+    """Whether ``model`` is currently serving via its configured fallback.
+
+    Gate C live repair (run 37598043365 on exact main 8f9ed2a): every live
+    turn served the fallback while the verifier still attempted native
+    structured output first, paying a slow structured round-trip per unit
+    before the text fallback (the max-latency pathology, max 54s over the
+    30s budget) and collapsing to verifier-unavailable when the weak
+    fallback path rejected structured output. When the shared primary
+    circuit is already open the structured attempt on the fallback path is
+    doomed, so later units/turns go directly to the bounded text path.
+    Turn-independent, never an exact-question special case; provider 429
+    still propagates and never triggers this path.
+    """
+    try:
+        fast = getattr(model, "_fast_fallback_available", None)
+        if callable(fast) and bool(fast()):
+            return True
+        circuit = getattr(model, "_primary_circuit_open", None)
+        if callable(circuit) and bool(circuit()):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _verifier_prefers_text(model: Any | None) -> bool:
+    """Whether one verifier model path should use the text path directly."""
+    if structured_text_fallback_preferred(model):
+        return True
+    return _model_on_fallback_path(model)
+
+
 def _strip_text_json_fences(text: str) -> str:
     """Remove one markdown code fence wrapper from a text JSON reply."""
     match = _FENCE_RE.search(text)
@@ -730,19 +763,44 @@ async def _verify_single_unit(
     deterministic capability failure the model path prefers the text path
     directly (bounded by TTL, per model path) so later units/turns do not
     burn two slow provider round-trips per unit (the live max-latency
-    pathology). This stays inside the one concurrent per-unit round (no
+    pathology). When the shared primary circuit is already open (live
+    fallback path serving after a primary rejection) the structured
+    attempt is skipped proactively for the same reason. The text path
+    itself retries at most once on strict-validation failure so one
+    weak-model non-compliant reply does not collapse the turn to
+    verifier-unavailable without a second bounded attempt; grounding
+    stays strict because every attempt is fully Pydantic-validated.
+    This stays inside the one concurrent per-unit round (no
     extra verifier round, no planner/retrieval/answer rerun). Provider 429
     always propagates immediately for runner retire/restart.
     """
 
     async def _text_decision() -> UnitVerdict:
-        text_reply = await _ainvoke_verifier_text(
-            model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
-        )
-        data = parse_text_json_decision(text_reply)
-        return coerce_single_verdict(
-            data, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
-        )
+        try:
+            text_reply = await _ainvoke_verifier_text(
+                model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
+            )
+            data = parse_text_json_decision(text_reply)
+            return coerce_single_verdict(
+                data, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
+            )
+        except VerifierValidationError:
+            # One weak-model non-compliant text reply (prose instead of
+            # JSON, wrong keys/types, unknown passage ids): retry once
+            # with the same bounded prompt before failing closed. Only
+            # validation failures retry here; provider errors (including
+            # 429) propagate immediately and never retry.
+            logger.info("verifier text validation retry used")
+            text_retry = await _ainvoke_verifier_text(
+                model, user_text + VERIFIER_TEXT_JSON_SUFFIX, system_text
+            )
+            retry_data = parse_text_json_decision(text_retry)
+            return coerce_single_verdict(
+                retry_data,
+                unit_id=unit.unit_id,
+                short_to_full=short_to_full,
+                full_ids=full_ids,
+            )
 
     system_text = load_verifier_system_v2()
     user_text = build_single_unit_text(unit=unit, passages=passages)
@@ -753,10 +811,13 @@ async def _verify_single_unit(
     # Snapshot the capability at round start so concurrent units in one
     # turn behave consistently (all try structured or all use text).
     # The cache is still marked on deterministic failure for future turns.
+    # An already-open primary circuit (fallback path serving) also prefers
+    # text proactively so the fallback path never burns a doomed
+    # structured round-trip per unit.
     prefer_text = (
         _prefer_text_snapshot
         if _prefer_text_snapshot is not None
-        else structured_text_fallback_preferred(model)
+        else _verifier_prefers_text(model)
     )
     if callable(structured_invoke) and not prefer_text:
         try:
@@ -856,7 +917,7 @@ async def _verify_per_unit_concurrent(
     """
     import asyncio as _asyncio
 
-    prefer_text_snapshot = structured_text_fallback_preferred(model)
+    prefer_text_snapshot = _verifier_prefers_text(model)
     verdicts = await _asyncio.gather(
         *(
             _verify_single_unit(
