@@ -167,6 +167,18 @@ def build_verifier_user_text(
     all_required_supported derivation rule here is turn-independent
     hardening, never an exact-question special case: AA-side Pydantic +
     completeness + checksum + quote checks stay strict.
+
+    Gate C live repair, run 37569082194: 12/14 ordinary turns clarified
+    with ``verifier_outcome=unavailable`` (structured batch plus per-unit
+    fallback both failing on the weak fallback), diversity fail, and max
+    55.2s over the 30s budget. The remaining systematic flake is scope
+    selection (invented scopes such as "general"/"advice" instead of the
+    closed vocabulary) on the complex batch array. Generic scoping
+    illustrations below (fixed toy sentences, never live questions) show
+    the three scopes and the short-id citation shape so the weak model
+    emits a schema-valid verdict on the first try; AA-side Literal plus
+    cite/quote/checksum gates stay strict. Turn-independent, never an
+    exact-question special case.
     """
     lines: list[str] = [
         "Return one verdict per <unit> in order, copying each id attribute exactly;",
@@ -174,6 +186,11 @@ def build_verifier_user_text(
         "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
         "passages are numbered p1..pN, cite those short ids.",
         "Set all_required_supported true only when every unit is supported.",
+        "Scoping illustrations (format only, never copy these texts or ids): "
+        "a brief acknowledgement is conversation_glue with supported true and "
+        "no evidence; a general offer to help discuss common topics is "
+        "product_meta with supported true and no evidence; a substantive "
+        "claim needs book with supported true and evidence such as [p1].",
         "<response_units>",
     ]
     for unit in units:
@@ -509,6 +526,13 @@ def build_single_unit_text(
     seen live (14/14 clarifications with the verifier never served). The
     closed scope vocabulary and cite-only-supplied-ids rules are repeated
     verbatim; AA-side strict checks stay unchanged.
+
+    Gate C live repair, run 37569082194: the per-unit fallback also failed
+    on the weak fallback (12 unavailable), so the single-unit payload
+    carries the same generic scoping illustrations as the batch payload
+    (fixed toy sentences, never live questions) to emit a schema-valid
+    verdict on the first try. Turn-independent, never an exact-question
+    special case.
     """
     lines: list[str] = [
         "Judge exactly one response unit below.",
@@ -516,6 +540,9 @@ def build_single_unit_text(
         "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
         "passages are numbered p1..pN, cite those short ids.",
         "A book unit that cites no evidence passage is unsupported.",
+        "Scoping illustrations (format only): conversation_glue needs no "
+        "evidence; product_meta needs no evidence; a substantive claim needs "
+        "book with evidence such as [p1].",
         "<response_unit>",
         _escape(unit.text),
         "</response_unit>",
