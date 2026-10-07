@@ -721,26 +721,35 @@ jobs:
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
             let component = 'unknown';
+            let productFailures = [];
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
-              const failed = transientBlocked
-                ? (summary.gates || []).find(g => g.status === 'FAIL')
-                : (summary.gates || []).find(g => g.status !== 'PASS');
+              const gates = summary.gates || [];
+              productFailures = gates.filter(g => g && g.status === 'FAIL');
+              const failed = productFailures[0] || (
+                transientBlocked ? null : gates.find(g => g.status !== 'PASS')
+              );
               blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
               if (failed) {
                 category = `${failed.gate}:${failed.failure_category || failed.status}`;
                 component = String(failed.component || 'unknown');
-                const p50 = Number(failed.latency_p50_ms || 0);
-                const p95 = Number(failed.latency_p95_ms || 0);
-                const max = Number(failed.max_turn_ms || 0);
+              }
+              const latencyFailure = productFailures.find(g => g.gate === 'E') || failed;
+              if (latencyFailure) {
+                const p50 = Number(latencyFailure.latency_p50_ms || 0);
+                const p95 = Number(latencyFailure.latency_p95_ms || 0);
+                const max = Number(latencyFailure.max_turn_ms || 0);
                 if (p50 > 0 || p95 > 0 || max > 0) {
                   timingLine = `Timings: p50=${Math.round(p50)}ms, p95=${Math.round(p95)}ms, max=${Math.round(max)}ms.`;
                 }
               }
-              if (blocking === 'E') {
+              const failGates = new Set(productFailures.map(g => String(g.gate || '')));
+              if (failGates.has('C') && failGates.has('E')) {
+                repairFocus = '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.';
+              } else if (blocking === 'E') {
                 repairFocus = '- Gate E is the sole live-text SLO owner: fix product latency to p95 <= 15000ms and max < 30000ms. Do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.';
               } else if (blocking === 'C') {
                 repairFocus = '- Gate C owns functional production-path correctness only. Diagnose the concrete broken stage/fallback/diversity/grounding component; latency-only defects belong to Gate E.';
