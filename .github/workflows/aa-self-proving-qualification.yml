@@ -711,8 +711,10 @@ jobs:
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
-              blocking = summary.blocking_gate || blocking;
-              const failed = (summary.gates || []).find(g => g.status !== 'PASS');
+              const failed = transientBlocked
+                ? (summary.gates || []).find(g => g.status === 'FAIL')
+                : (summary.gates || []).find(g => g.status !== 'PASS');
+              blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
               if (failed) {
                 category = `${failed.gate}:${failed.failure_category || failed.status}`;
                 component = String(failed.component || 'unknown');
