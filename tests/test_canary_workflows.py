@@ -36,6 +36,7 @@ def test_canary_monitor_routes_failure_to_authoritative_self_proving_only() -> N
     text = _read("aa-canary-monitor.yml")
     assert 'workflows: ["AA canary"]' in text
     assert "Re-enter authoritative self-proving convergence" in text
+    assert "actions: write" in text
     assert "aa-self-proving-qualification.yml" in text
     assert "listWorkflowRuns" in text
     assert "createWorkflowDispatch" in text
