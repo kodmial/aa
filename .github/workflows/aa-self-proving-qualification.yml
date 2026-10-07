@@ -381,6 +381,7 @@ jobs:
           sys.path.insert(0, "src")
           from aa.app import create_application
           from aa.config import Settings
+          from aa.control.readiness import parse_ready_marker
           from aa.control.runtime_status import RuntimeMarker, write_marker
           from aa.opencode.errors import OpenCodeRateLimitError
           from aa.telegram.transport import PollingTelegramTransport, TelegramApiError
@@ -493,9 +494,18 @@ jobs:
                       assert isinstance(bot_info, dict) and bot_info.get("is_bot") is True, "getMe identity not live"
                       handlers = getattr(transport, "_command_handlers", {})
                       assert "start" in handlers and "new" in handlers, "webhook/commands bootstrap incomplete"
-                      # READY is published only from the running app.
+                      # READY is published only from the running app. The
+                      # authoritative marker kind is lowercase
+                      # ``aa-runtime-ready`` (see
+                      # ``aa.control.readiness.format_ready_marker``), so a
+                      # case-sensitive ``"READY" in marker`` substring check
+                      # never matches and fails every healthy run. Validate
+                      # the marker structurally instead: it must parse as a
+                      # READY marker for the exact run (run id, exact main
+                      # SHA, timestamp, ordinal).
                       assert app.readiness_marker, "READY was not published from the running app"
-                      assert "READY" in app.readiness_marker, "running app readiness is not READY"
+                      parsed_ready = parse_ready_marker(app.readiness_marker)
+                      assert parsed_ready is not None, "running app readiness is not READY"
                       ready = RuntimeMarker(run_id=run_id, sha=sha, phase="READY", timestamp_s=time.time())
                       write_marker(out, ready)
                       print(f"runtime marker READY published from live app run={run_id} sha={sha[:12]}")
