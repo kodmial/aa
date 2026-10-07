@@ -302,6 +302,11 @@ jobs:
 
       - name: Gate D - real Telegram network/runtime readiness
         id: gate-d
+        # Gate D is independent of Gate C functional correctness. Run it after
+        # any completed Gate C attempt so one functional failure cannot hide a
+        # second runtime-readiness defect. A provider-429 restart marker still
+        # retires this VM immediately.
+        if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -516,6 +521,10 @@ jobs:
           echo "D" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-D.done"
 
       - name: Gate E - live performance/SLO
+        # Gate E owns latency independently of Gate C functional correctness.
+        # Evaluate the trusted Gate C measurements even when C itself fails so
+        # the repair loop can attack C and E in the same cycle.
+        if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -532,8 +541,8 @@ jobs:
             exit 0
           fi
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
-          # Gate D has now produced trusted runtime evidence, so this is the
-          # first point where a full A-E evaluation is valid.
+          # Gate E consumes the trusted live measurements independently of
+          # Gate C's functional verdict and Gate D's network-readiness result.
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}"
