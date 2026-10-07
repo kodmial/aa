@@ -67,9 +67,19 @@ def verifier_json_schema() -> dict[str, object]:
     fallback providers reject or flake on length constraints while the
     same constraints stay enforced in AA code (Pydantic ``min_length`` /
     ``min_length`` plus the exactly-one-verdict-per-unit completeness
-    gate). ``enum`` and ``required`` stay because they are the essential
-    guidance a weak model needs to emit a schema-valid verdict on the
-    first try instead of burning retry cycles.
+    gate). ``required`` stays because it is the essential guidance a weak
+    model needs to emit a schema-valid verdict on the first try instead
+    of burning retry cycles.
+
+    The closed scope vocabulary is conveyed as a plain-text ``description``
+    hint only, never as a JSON Schema ``enum`` (Gate C live repair, run
+    37564172746: 13/14 ordinary turns collapsed to generic clarification
+    with the verifier never served in the served-model audit while the
+    enum-free planner structured output served on the same weak fallback
+    and answer text served; enum-constrained decoding is the remaining
+    structural difference, so the transport drops ``enum`` while AA-side
+    Pydantic ``Literal`` plus normalization stays strict). Turn-independent,
+    never an exact-question special case.
     """
     return {
         "type": "object",
@@ -82,7 +92,7 @@ def verifier_json_schema() -> dict[str, object]:
                         "unit_id": {"type": "string"},
                         "scope": {
                             "type": "string",
-                            "enum": ["book", "product_meta", "conversation_glue"],
+                            "description": ("one of book, product_meta, conversation_glue"),
                         },
                         "supported": {"type": "boolean"},
                         "evidence_passage_ids": {
@@ -106,14 +116,16 @@ def verifier_single_json_schema() -> dict[str, object]:
     ``unit_id`` copy) is strictly easier for a weak fallback model than
     the batch array with exact ``u1``..``uN`` id copying. The native hint
     stays ``$ref``-free and omits length constraints (enforced in AA
-    code); ``enum`` + ``required`` stay as essential guidance.
+    code); ``required`` stays as essential guidance. The scope vocabulary
+    is a plain-text description hint, never ``enum`` (Gate C run
+    37564172746, same enum-free rationale as the batch schema above).
     """
     return {
         "type": "object",
         "properties": {
             "scope": {
                 "type": "string",
-                "enum": ["book", "product_meta", "conversation_glue"],
+                "description": "one of book, product_meta, conversation_glue",
             },
             "supported": {"type": "boolean"},
             "evidence_passage_ids": {

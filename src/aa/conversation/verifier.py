@@ -678,9 +678,19 @@ async def run_verifier(
     single-verdict verification with the minimal schema (no id copying).
     AA code performs strict Pydantic validation plus the deterministic
     completeness and exact-quote/provenance checks on both paths, and
-    never reparses text. Provider/transient/timeout errors propagate
-    immediately without fallback (the model adapter already exhausted
-    primary/fallback).
+    never reparses text.
+
+    Gate C live repair, run 37564172746: the batch structured call never
+    served on the weak fallback (no ``aa-verifier-v2`` entry in the
+    served-model audit while the enum-free planner served and answer text
+    served), so every ordinary turn clarified with verifier ``unavailable``
+    and max latency over budget. A batch provider/transient/timeout
+    failure now also falls back once to the smaller concurrent per-unit
+    requests (one parallel round, same strict gates), since a large batch
+    prompt may time out where minimal single-unit prompts serve. Provider
+    429 always propagates immediately for runner retire/restart and never
+    triggers fallback. Turn-independent, never an exact-question special
+    case.
     """
     if not units:
         raise VerifierValidationError("verifier needs at least one response unit")
@@ -707,29 +717,42 @@ async def run_verifier(
         result = coerce_grounding_result(content, units=units, passages=passages)
         logger.info("verifier output accepted", extra={"units": len(units)})
         return result
-    except (VerifierValidationError, ValueError) as exc:
-        # Bounded single fallback to the simpler per-unit task for
-        # id/format flake only; deterministic grounding rejections for the
-        # same draft/pack (unknown passage, missing evidence, bad quote,
-        # checksum) would repeat per unit and only burn live latency, so
-        # they fail closed immediately. Provider/transient errors are not
-        # VerifierValidationError and propagate above without fallback.
-        message = str(exc).lower()
-        deterministic = (
-            "cites no evidence" in message
-            or "cites unknown passage" in message
-            or "quotes text" in message
-            or "without cited exact passages" in message
-            or "absent from cited passages" in message
-            or "checksum mismatch" in message
-            or "needs at least one response unit" in message
-        )
-        if deterministic:
+    except Exception as exc:
+        # Provider 429 is runner lifecycle, never verifier fallback.
+        from aa.opencode.errors import OpenCodeRateLimitError
+
+        if isinstance(exc, OpenCodeRateLimitError):
             raise
-        logger.info(
-            "verifier batch invalid, per-unit fallback scheduled",
-            extra={"category": "verifier-invalid"},
-        )
+        # Bounded single fallback to the simpler per-unit task for
+        # id/format flake and for batch provider/transient/timeout flake
+        # (smaller prompts may serve where the batch timed out); the
+        # concurrent per-unit round keeps the live SLO to one extra round.
+        # Deterministic grounding rejections for the same draft/pack
+        # (unknown passage, missing evidence, bad quote, checksum) would
+        # repeat per unit and only burn live latency, so they fail closed
+        # immediately.
+        if isinstance(exc, (VerifierValidationError, ValueError)):
+            message = str(exc).lower()
+            deterministic = (
+                "cites no evidence" in message
+                or "cites unknown passage" in message
+                or "quotes text" in message
+                or "without cited exact passages" in message
+                or "absent from cited passages" in message
+                or "checksum mismatch" in message
+                or "needs at least one response unit" in message
+            )
+            if deterministic:
+                raise
+            logger.info(
+                "verifier batch invalid, per-unit fallback scheduled",
+                extra={"category": "verifier-invalid"},
+            )
+        else:
+            logger.info(
+                "verifier batch unavailable, per-unit fallback scheduled",
+                extra={"category": type(exc).__name__},
+            )
         result = await _verify_per_unit_concurrent(units, passages, model=model)
         logger.info("verifier per-unit output accepted", extra={"units": len(units)})
         return result
