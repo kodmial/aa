@@ -33,9 +33,11 @@ from typing import Any
 import pytest
 
 from aa.conversation.model_adapter import (
+    PLANNER_AGENT_V2,
+    PLANNER_TRANSPORT_AGENT_V2,
     VERIFIER_AGENT_V2,
     VERIFIER_TRANSPORT_AGENT_V2,
-    OpenCodeChatModel,
+    build_planner_model,
     build_verifier_model,
     clear_primary_circuit,
 )
@@ -155,18 +157,25 @@ async def test_verifier_structured_wire_omits_selector_but_keeps_logical_audit()
     assert client.models == [MUSE]
 
 
-async def test_planner_wire_still_uses_logical_agent() -> None:
-    """Non-verifier agents keep the wire-equals-logical policy."""
+async def test_hidden_model_family_omits_selector_and_keeps_logical_audit() -> None:
+    """Planner plus derived answer/summarizer omit only the wire selector."""
     client = _DecouplingClient()
-    planner = OpenCodeChatModel(
+    planner = build_planner_model(
         client,  # type: ignore[arg-type]
-        agent="aa-planner-v2",
         primary_model=MUSE,
         fallback_model=SPACE_BUNNY,
     )
+    answer = planner.with_agent("aa-v2")
+    summarizer = planner.with_agent("aa-summarizer-v2")
     await planner._ainvoke_text("hello", system="planner-system")
-    assert client.wire_agents == ["aa-planner-v2"]
-    assert client.audit_agents == [""]
+    await answer._ainvoke_text("hello", system="answer-system")
+    await summarizer._ainvoke_text("hello", system="summary-system")
+    assert planner.agent == PLANNER_AGENT_V2
+    assert planner.wire_agent == PLANNER_TRANSPORT_AGENT_V2 == ""
+    assert answer.wire_agent == ""
+    assert summarizer.wire_agent == ""
+    assert client.wire_agents == ["", "", ""]
+    assert client.audit_agents == ["aa-planner-v2", "aa-v2", "aa-summarizer-v2"]
 
 
 async def test_verifier_403_retries_bounded_then_raises_without_fallback(
@@ -401,6 +410,7 @@ def test_production_verifier_uses_decoupled_helper_without_fallback(
                 primary_model=self.primary_model,
                 fallback_model=self.fallback_model,
                 request_timeout=self.request_timeout,
+                transport_agent=self.transport_agent,
             )
 
         @property
@@ -408,6 +418,22 @@ def test_production_verifier_uses_decoupled_helper_without_fallback(
             if self.transport_agent is None:
                 return self.agent
             return self.transport_agent
+
+    def _fake_build_planner(
+        client: object,
+        *,
+        primary_model: str,
+        fallback_model: str,
+        request_timeout: float = 120.0,
+    ) -> _DummyModel:
+        return _DummyModel(
+            client,
+            agent="aa-planner-v2",
+            primary_model=primary_model,
+            fallback_model=fallback_model,
+            request_timeout=request_timeout,
+            transport_agent="",
+        )
 
     def _fake_build_verifier(
         client: object, *, primary_model: str, request_timeout: float = 120.0
@@ -422,6 +448,7 @@ def test_production_verifier_uses_decoupled_helper_without_fallback(
         )
 
     monkeypatch.setattr(adapter_module, "OpenCodeChatModel", _DummyModel)
+    monkeypatch.setattr(adapter_module, "build_planner_model", _fake_build_planner)
     monkeypatch.setattr(adapter_module, "build_verifier_model", _fake_build_verifier)
     monkeypatch.setattr(graph_module, "build_turn_graph", lambda **kwargs: kwargs)
 
@@ -438,6 +465,9 @@ def test_production_verifier_uses_decoupled_helper_without_fallback(
     verifier = wired["verifier_model"]
 
     assert planner.fallback_model == "opencode/space-bunny-free"
+    assert planner.wire_agent == ""
+    assert wired["answer_model"].wire_agent == ""
+    assert wired["summary_model"].wire_agent == ""
     assert verifier.agent == "aa-verifier-v2"
     assert verifier.primary_model == DEFAULT_PRIMARY_MODEL == MUSE
     assert verifier.fallback_model == ""

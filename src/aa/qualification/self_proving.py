@@ -112,7 +112,10 @@ GATE_C_STAGES: tuple[str, ...] = (
     "delivery",
 )
 
-# Automatic repair loop bound (Gate failure -> repair -> requalify cycles).
+# Legacy per-attempt diagnostic bound retained for compatibility only.
+# It MUST NOT cap the persistent convergence controller: #146 requires the
+# outer QUALIFY -> REPAIR -> MERGE -> REQUALIFY loop to continue until
+# exact-main PASS without a human-required terminal state.
 MAX_REPAIR_CYCLES = 3
 
 # Live performance SLO (Gate E): no ordinary qualification turn may take

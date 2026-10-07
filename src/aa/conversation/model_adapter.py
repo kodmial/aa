@@ -56,6 +56,13 @@ RUNTIME_AGENT_V2 = "aa-runtime-v2"
 # pinned to Muse Spark. An empty transport agent means no ``agent`` key is
 # sent on the wire.
 VERIFIER_TRANSPORT_AGENT_V2 = ""
+# All hidden conversation stages use their own system prompts and logical
+# audit identities. The custom OpenCode agent selector is not part of the
+# product contract and has repeatedly produced provider 403s while the same
+# pinned Muse model serves with the selector omitted. Omit it for the hidden
+# planner family too; derived answer/summarizer models preserve this wire
+# policy while retaining their distinct logical audit identities.
+PLANNER_TRANSPORT_AGENT_V2 = ""
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 # Live SLO guard (Gate C/E): a persistent provider-access (403) rejection
@@ -356,9 +363,11 @@ class OpenCodeChatModel(BaseChatModel):
 
         The process-wide primary circuit is shared: a new agent bound after
         the primary was rejected fast-fallbacks immediately instead of
-        burning its own primary retry per turn. Derived agents always use
-        the wire-equals-logical policy; the decoupled verifier is built
-        via :func:`build_verifier_model`, never via ``with_agent``.
+        burning its own primary retry per turn. Derived agents preserve
+        this model's transport-agent policy, so hidden planner/answer/
+        summarizer stages can omit a provider-rejected selector while
+        retaining distinct logical audit identities. The verifier is built
+        separately via :func:`build_verifier_model` because it has no fallback.
         """
         nxt = OpenCodeChatModel(
             self._client,
@@ -366,6 +375,7 @@ class OpenCodeChatModel(BaseChatModel):
             primary_model=self.primary_model,
             fallback_model=self.fallback_model,
             request_timeout=self.request_timeout,
+            transport_agent=self.transport_agent,
         )
         try:
             key = _circuit_key(self.primary_model)
@@ -676,6 +686,27 @@ class OpenCodeChatModel(BaseChatModel):
         """
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
+
+        # A selector-omitted planner may discover that the pinned primary
+        # serves text but not native json_schema for this schema/provider.
+        # Cache that deterministic capability result and use the configured
+        # fallback directly on subsequent planner turns.
+        if (
+            not self.wire_agent
+            and self.fallback_model.strip()
+            and self.fallback_model != self.primary_model
+            and omitted_structured_unavailable(self)
+        ):
+            logger.info("opencode omitted structured capability cached unavailable; fallback used")
+            return await self._invoke_ephemeral_structured(
+                prompt,
+                system=system,
+                schema=schema,
+                model=self.fallback_model,
+                agent=self.agent,
+                retry_count=retry_count,
+            )
+
         if self._fast_fallback_available():
             if self.wire_agent and not omitted_structured_unavailable(self):
                 try:
@@ -737,6 +768,16 @@ class OpenCodeChatModel(BaseChatModel):
                     continue
                 break
             except OpenCodeRateLimitError:
+                raise
+            except OpenCodeDeterministicError as exc:
+                if (
+                    not self.wire_agent
+                    and self.fallback_model.strip()
+                    and self.fallback_model != self.primary_model
+                ):
+                    mark_omitted_structured_unavailable(self)
+                    last_transient = exc
+                    break
                 raise
             except (OpenCodeTransientError, OpenCodeTimeoutError) as exc:
                 last_transient = exc
@@ -820,6 +861,33 @@ class OpenCodeChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=str(reply)))])
 
 
+def build_planner_model(
+    client: OpenCodeClient,
+    *,
+    primary_model: str,
+    fallback_model: str,
+    request_timeout: float = 120.0,
+) -> OpenCodeChatModel:
+    """Build the hidden planner family with an omitted transport selector.
+
+    Planner/answer/summarizer keep their configured primary/fallback model
+    policy. Only the provider-specific transport selector is omitted; the
+    logical agent identity and native system prompt remain intact.
+    """
+    from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+
+    pinned_primary = (primary_model or "").strip() or DEFAULT_PRIMARY_MODEL
+    pinned_fallback = (fallback_model or "").strip() or DEFAULT_FALLBACK_MODEL
+    return OpenCodeChatModel(
+        client,
+        agent=PLANNER_AGENT_V2,
+        primary_model=pinned_primary,
+        fallback_model=pinned_fallback,
+        request_timeout=request_timeout,
+        transport_agent=PLANNER_TRANSPORT_AGENT_V2,
+    )
+
+
 def build_verifier_model(
     client: OpenCodeClient,
     *,
@@ -852,6 +920,7 @@ __all__ = [
     "ANSWER_AGENT_V2",
     "OMITTED_STRUCTURED_CAPABILITY_TTL_S",
     "PLANNER_AGENT_V2",
+    "PLANNER_TRANSPORT_AGENT_V2",
     "PRIMARY_ACCESS_CIRCUIT_TTL_S",
     "RUNTIME_AGENT_V2",
     "STRUCTURED_RETRY_COUNT",
@@ -859,6 +928,7 @@ __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
+    "build_planner_model",
     "build_verifier_model",
     "clear_omitted_structured_cache",
     "clear_primary_circuit",
