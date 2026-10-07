@@ -782,11 +782,20 @@ jobs:
               return;
             }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
-            // Stable defect identity deliberately excludes main SHA. A new
-            // merge must not disguise the same failing component as a new
-            // failure series; repeated non-convergence reopens the same P0.
-            const fingerprint = `${blocking}:${category}:${component}`;
-            const title = `P0: Repair self-proving qualification failure (Gate ${blocking})`;
+            // Stable defect identity deliberately excludes main SHA. When
+            // several product gates fail in one trusted run, keep one combined
+            // repair series so C/E can converge in the same implementation
+            // cycle rather than serializing known defects across runs.
+            const stableFailures = productFailures.length
+              ? productFailures
+                  .map(g => `${g.gate}:${g.failure_category || g.status}:${g.component || 'unknown'}`)
+                  .sort()
+              : [`${blocking}:${category}:${component}`];
+            const fingerprint = stableFailures.join('|');
+            const gateLabel = productFailures.length > 1
+              ? productFailures.map(g => g.gate).join('+')
+              : blocking;
+            const title = `P0: Repair self-proving qualification failure (Gate ${gateLabel})`;
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner, repo, state: 'all', per_page: 100,
             });
@@ -801,8 +810,8 @@ jobs:
               recurrence = match ? Number(match[1]) + 1 : 2;
             }
             const recurrenceFocus = recurrence > 1
-              ? '- RECURRENCE: the previous repair for this same gate/category/component did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
-              : '- First occurrence for this stable gate/category/component fingerprint.';
+              ? '- RECURRENCE: the previous repair for this same stable failure set did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
+              : '- First occurrence for this stable product-failure fingerprint.';
             const body = [
               marker,
               '',
@@ -811,6 +820,7 @@ jobs:
               `Failure category: \`${category}\``,
               `Blocking gate: \`${blocking}\``,
               `Component: \`${component}\``,
+              `All proven product failures: \`${stableFailures.join(', ')}\``,
               `Main SHA: \`${sha}\``,
               `Run id: \`${runId}\``,
               `Repair fingerprint: \`${fingerprint}\``,
