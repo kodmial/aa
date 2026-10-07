@@ -16,49 +16,16 @@ concurrency:
 
 jobs:
   monitor:
+    if: ${{ github.event.workflow_run.conclusion != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Create or refresh one P0 repair issue on canary failure
+      - name: Re-enter authoritative self-proving convergence
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
           script: |
             const run = context.payload.workflow_run;
-
-            // Canary repair is post-qualification only. Ignore any stale,
-            // manual, or legacy canary failure while #6/#7 are not complete.
-            try {
-              const [{ data: capability }, { data: qualification }] = await Promise.all([
-                github.rest.issues.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: 6,
-                }),
-                github.rest.issues.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: 7,
-                }),
-              ]);
-              const qualified =
-                capability.state === 'closed' &&
-                capability.state_reason === 'completed' &&
-                qualification.state === 'closed' &&
-                qualification.state_reason === 'completed';
-              if (!qualified) {
-                core.info(
-                  `AA canary repair suppressed before final qualification: #6=${capability.state}/${capability.state_reason || 'none'}, #7=${qualification.state}/${qualification.state_reason || 'none'}.`
-                );
-                return;
-              }
-            } catch (error) {
-              core.warning(
-                `Unable to verify #6/#7; suppressing canary repair fail-closed: ${error.message}`
-              );
-              return;
-            }
-
             const actionable = new Set([
               'failure',
               'timed_out',
@@ -66,81 +33,41 @@ jobs:
               'startup_failure',
               'stale',
             ]);
-
             if (!actionable.has(String(run.conclusion || ''))) {
-              core.info(`AA canary conclusion is ${run.conclusion}; no repair issue required.`);
+              core.info(`AA canary conclusion is ${run.conclusion}; no convergence action required.`);
               return;
             }
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const marker = '<!-- aa-canary-repair:v1 -->';
-            const title = 'P0: Repair recurring AA canary failure';
-            const runUrl = run.html_url || `${context.serverUrl}/${owner}/${repo}/actions/runs/${run.id}`;
-            const body = [
-              marker,
-              '',
-              '## Automatic AA canary repair',
-              '',
-              'The recurring AA build/smoke canary failed and this issue is the single durable repair task for the current failure series.',
-              '',
-              `- latest failing run: ${runUrl}`,
-              `- run id: \`${run.id}\``,
-              `- conclusion: \`${run.conclusion}\``,
-              `- tested head SHA: \`${run.head_sha || 'unknown'}\``,
-              `- event: \`${run.event || 'unknown'}\``,
-              '',
-              '### Required repair behavior',
-              '',
-              '- Diagnose the actual failing step from the workflow run.',
-              '- If it is a deterministic repository defect, fix it without weakening tests or canary coverage.',
-              '- If it is transient infrastructure, do not make speculative product changes; rerun/prove the canary green.',
-              '- Preserve the 4-hour schedule, Gate C smoke, Gate D readiness, and Gate E latency guard.',
-              '- Owner `/run` manual testing stays available regardless of canary/qualification state; canary failure only labels current main UNQUALIFIED.',
-              '- Do not add release/publish behavior to this canary.',
-              '- Close this issue only after a current-main canary run is green.',
-              '',
-              'This issue is generated and refreshed automatically; duplicate canary failures must reuse it rather than creating issue storms.',
-            ].join('\n');
+            const { data: main } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main',
+            });
+            const currentMain = String((main.commit && main.commit.sha) || '');
 
-            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
-              state: 'open',
-              per_page: 100,
+              workflow_id: 'aa-self-proving-qualification.yml',
+              branch: 'main',
+              per_page: 30,
             });
-            const existing = openIssues.find(
-              issue => !issue.pull_request && String(issue.body || '').includes(marker)
+            const active = (runs.workflow_runs || []).some(item =>
+              String(item.head_sha || '') === currentMain &&
+              ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(String(item.status || ''))
             );
-
-            if (existing) {
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: existing.number,
-                title,
-                body,
-              });
-              const hasP0 = (existing.labels || []).some(label =>
-                (typeof label === 'string' ? label : label.name) === 'priority:p0'
-              );
-              if (!hasP0) {
-                await github.rest.issues.addLabels({
-                  owner,
-                  repo,
-                  issue_number: existing.number,
-                  labels: ['priority:p0'],
-                });
-              }
-              core.info(`Refreshed existing canary repair issue #${existing.number}.`);
+            if (active) {
+              core.notice('Canary failed; authoritative exact-main self-proving is already active.');
               return;
             }
 
-            const created = await github.rest.issues.create({
+            await github.rest.actions.createWorkflowDispatch({
               owner,
               repo,
-              title,
-              body,
-              labels: ['priority:p0'],
+              workflow_id: 'aa-self-proving-qualification.yml',
+              ref: 'main',
+              inputs: { required_sha: currentMain },
             });
-            core.info(`Created canary repair issue #${created.data.number}.`);
+            core.notice(
+              `Canary failed; dispatched authoritative exact-main self-proving for ${currentMain.slice(0, 12)}. No generic canary P0 is created; gate-specific repair ownership stays with self-proving.`
+            );
