@@ -783,7 +783,7 @@ def test_agent_prompt_contains_output_policy() -> None:
     assert "900" in prompt and "130" in prompt
     assert "500" in prompt and "80" in prompt
     assert "300" in prompt
-    assert "2-5" in prompt
+    assert "2-3" in prompt
     assert "chapter" in prompt
     assert "authoritative" in prompt and "ignore" in prompt
 
@@ -805,6 +805,7 @@ async def test_synthesis_prompt_carries_policy_and_no_planner_metadata(
 
 
 def test_generation_budget_defaults_and_validates() -> None:
+    assert DEFAULT_GENERATION_BUDGET_TOKENS == 160
     assert resolve_generation_budget(0) == DEFAULT_GENERATION_BUDGET_TOKENS
     assert resolve_generation_budget(200) == 200
     with pytest.raises(ValueError):
@@ -867,6 +868,9 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
 
 def test_fixed_operational_replies_fit_envelope() -> None:
     from aa.app import _NEW_REPLY, _START_REPLY, _TEMPORARY_ERROR_REPLY
+
+    assert "The answer" not in ENVELOPE_FALLBACK_REPLY
+    assert "Tell me" not in ENVELOPE_FALLBACK_REPLY
 
     for text in (
         FAIL_CLOSED_REPLY,
