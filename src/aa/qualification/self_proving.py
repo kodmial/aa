@@ -165,6 +165,28 @@ class SelfProvingError(ValueError):
     """Raised when self-proving qualification invariants fail (fail-closed)."""
 
 
+# Fixed-vocabulary statistic labels emitted as dict keys by numeric metric
+# maps (stage_latency_ms and siblings). These labels carry no user/corpus
+# text, so they are exempt from the text signal when they appear as dict
+# keys under a forbidden key. Every other string under a forbidden key
+# stays a leak.
+_STRUCTURAL_STAT_KEYS = frozenset({"p50", "p95", "max", "count"})
+
+
+def _dict_key_holds_text(key: Any) -> bool:
+    """Whether a dict key carries text (fixed-vocabulary labels exempt)."""
+    if isinstance(key, bytes):
+        try:
+            key = key.decode("utf-8")
+        except UnicodeDecodeError:
+            return True
+    if isinstance(key, str):
+        return key not in _STRUCTURAL_STAT_KEYS
+    if isinstance(key, (tuple, frozenset)):
+        return any(_dict_key_holds_text(part) for part in key)
+    return False
+
+
 @dataclass(frozen=True)
 class GateEvidence:
     """Privacy-safe evidence for one gate on one exact SHA."""
@@ -281,14 +303,18 @@ def _subtree_holds_text(value: Any) -> bool:
 
     Structural metric maps use stage names such as ``answer`` as keys with
     numeric-only values. Such numeric-only subtrees carry no user/corpus text
-    and must not trip the privacy guard. Any string under a forbidden key
-    stays a leak.
+    and must not trip the privacy guard. Fixed-vocabulary statistic labels
+    (``p50``/``p95``/``max``/``count``) used as dict keys likewise carry no
+    user text. Any other string under a forbidden key — values, dict keys,
+    or set members — stays a leak.
     """
     if isinstance(value, (str, bytes)):
         return True
     if isinstance(value, dict):
-        return any(_subtree_holds_text(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+        return any(
+            _dict_key_holds_text(key) or _subtree_holds_text(item) for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
         return any(_subtree_holds_text(item) for item in value)
     return False
 
@@ -301,7 +327,7 @@ def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
                 if _subtree_holds_text(value):
                     raise SelfProvingError(f"{owner}: forbidden key {key!r}")
             assert_no_text_leak(value, f"{owner}.{key}")
-    elif isinstance(payload, list):
+    elif isinstance(payload, (list, tuple, set, frozenset)):
         for index, item in enumerate(payload):
             assert_no_text_leak(item, f"{owner}[{index}]")
 
