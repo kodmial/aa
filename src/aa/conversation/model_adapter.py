@@ -34,6 +34,7 @@ from pydantic import ConfigDict, PrivateAttr
 
 from aa.opencode.client import OpenCodeClient
 from aa.opencode.errors import (
+    OpenCodeDeterministicError,
     OpenCodeError,
     OpenCodeProviderAccessError,
     OpenCodeRateLimitError,
@@ -87,6 +88,26 @@ PRIMARY_ACCESS_CIRCUIT_TTL_S = 300.0
 _PRIMARY_CIRCUIT: dict[str, float] = {}
 _CIRCUIT_LOCK = threading.Lock()
 
+# Omitted-structured capability cache (Gate C live repair, run 37615447071
+# on exact main e92385f): the live lane served the planner through the weak
+# fallback while answer/verifier served the strong primary, with p50 34s /
+# p95 59s / max 64s over the 30s budget and one generic clarification.
+# The planner pays a doomed omitted-structured round-trip per invocation
+# (custom 403 x2 + 5s sleep + omitted deterministic failure + fallback)
+# before reaching the weak fallback, and each repair re-plan repeats it.
+# A deterministic omitted-structured failure proves that provider path does
+# not serve native structured output with the selector omitted; later
+# planner turns then go directly to the configured fallback instead of
+# burning the slow omitted attempt per call. Entries expire via TTL so a
+# recovered provider is retried. Only deterministic capability failures
+# mark the cache; transient/timeout fall back once without poisoning it.
+# Provider 429 always propagates and never marks the cache. Turn-
+# independent, never an exact-question special case.
+OMITTED_STRUCTURED_CAPABILITY_TTL_S = 300.0
+
+_OMITTED_STRUCTURED_UNAVAILABLE: dict[str, float] = {}
+_OMITTED_STRUCTURED_LOCK = threading.Lock()
+
 
 def _circuit_key(primary_model: str) -> str:
     """Return the process-wide circuit key for one pinned primary model."""
@@ -128,6 +149,84 @@ def clear_primary_circuit() -> None:
     """Close all shared primary circuits (tests only)."""
     with _CIRCUIT_LOCK:
         _PRIMARY_CIRCUIT.clear()
+    # Test isolation: the omitted-structured capability cache is also
+    # process-wide per model path, so reset it here as well. Existing
+    # fixtures call this helper between tests; without this, a deterministic
+    # omitted failure cached in one test would skip the omitted attempt in
+    # the next test with the same model path and break its call-count
+    # assertions. Production never calls this helper.
+    with _OMITTED_STRUCTURED_LOCK:
+        _OMITTED_STRUCTURED_UNAVAILABLE.clear()
+
+
+def _omitted_structured_key(model: Any | None) -> str:
+    """Return the capability-cache key for one structured model path."""
+    try:
+        primary = getattr(model, "primary_model", "")
+        fallback = getattr(model, "fallback_model", "")
+        agent = getattr(model, "agent", "")
+        if (
+            (isinstance(primary, str) and primary.strip())
+            or (isinstance(fallback, str) and fallback.strip())
+            or (isinstance(agent, str) and agent.strip())
+        ):
+            return (
+                f"{primary.strip() if isinstance(primary, str) else ''}"
+                f"|{fallback.strip() if isinstance(fallback, str) else ''}"
+                f"|{agent.strip() if isinstance(agent, str) else ''}"
+            )
+    except Exception:
+        pass
+    return "default"
+
+
+def _omitted_structured_entry_fresh(recorded_at: float) -> bool:
+    try:
+        return (time.monotonic() - float(recorded_at)) < OMITTED_STRUCTURED_CAPABILITY_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
+def omitted_structured_unavailable(model: Any | None = None) -> bool:
+    """Whether omitted structured output is cached unavailable for this path."""
+    with _OMITTED_STRUCTURED_LOCK:
+        if model is None:
+            fresh: list[str] = []
+            for key, recorded_at in _OMITTED_STRUCTURED_UNAVAILABLE.items():
+                if _omitted_structured_entry_fresh(recorded_at):
+                    fresh.append(key)
+            for key in list(_OMITTED_STRUCTURED_UNAVAILABLE):
+                if key not in fresh:
+                    _OMITTED_STRUCTURED_UNAVAILABLE.pop(key, None)
+            return bool(fresh)
+        key = _omitted_structured_key(model)
+        if key == "":
+            return any(
+                _omitted_structured_entry_fresh(stamp)
+                for stamp in _OMITTED_STRUCTURED_UNAVAILABLE.values()
+            )
+        cached_at: float | None = _OMITTED_STRUCTURED_UNAVAILABLE.get(key)
+        if cached_at is None:
+            return False
+        if not _omitted_structured_entry_fresh(cached_at):
+            _OMITTED_STRUCTURED_UNAVAILABLE.pop(key, None)
+            return False
+        return True
+
+
+def mark_omitted_structured_unavailable(model: Any | None = None) -> None:
+    """Remember that omitted structured output is unavailable for this path."""
+    key = _omitted_structured_key(model)
+    if not key:
+        key = "default"
+    with _OMITTED_STRUCTURED_LOCK:
+        _OMITTED_STRUCTURED_UNAVAILABLE[key] = time.monotonic()
+
+
+def clear_omitted_structured_cache() -> None:
+    """Reset the omitted-structured capability cache (tests only)."""
+    with _OMITTED_STRUCTURED_LOCK:
+        _OMITTED_STRUCTURED_UNAVAILABLE.clear()
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -578,7 +677,7 @@ class OpenCodeChatModel(BaseChatModel):
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
         if self._fast_fallback_available():
-            if self.wire_agent:
+            if self.wire_agent and not omitted_structured_unavailable(self):
                 try:
                     omitted = await self._invoke_omitted_primary_structured(
                         prompt,
@@ -590,6 +689,8 @@ class OpenCodeChatModel(BaseChatModel):
                     return omitted
                 except OpenCodeRateLimitError:
                     raise
+                except OpenCodeDeterministicError:
+                    mark_omitted_structured_unavailable(self)
                 except OpenCodeError:
                     pass
             logger.info("opencode primary circuit open, fast fallback used")
@@ -650,7 +751,7 @@ class OpenCodeChatModel(BaseChatModel):
             primary_access_rejected = isinstance(last_transient, OpenCodeProviderAccessError)
             if primary_access_rejected:
                 self._record_primary_rejection()
-                if self.wire_agent:
+                if self.wire_agent and not omitted_structured_unavailable(self):
                     try:
                         omitted = await self._invoke_omitted_primary_structured(
                             prompt,
@@ -662,6 +763,8 @@ class OpenCodeChatModel(BaseChatModel):
                         return omitted
                     except OpenCodeRateLimitError:
                         raise
+                    except OpenCodeDeterministicError:
+                        mark_omitted_structured_unavailable(self)
                     except OpenCodeError:
                         pass
             logger.info("opencode model fallback used")
@@ -747,6 +850,7 @@ def build_verifier_model(
 
 __all__ = [
     "ANSWER_AGENT_V2",
+    "OMITTED_STRUCTURED_CAPABILITY_TTL_S",
     "PLANNER_AGENT_V2",
     "PRIMARY_ACCESS_CIRCUIT_TTL_S",
     "RUNTIME_AGENT_V2",
@@ -756,7 +860,10 @@ __all__ = [
     "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
     "build_verifier_model",
+    "clear_omitted_structured_cache",
     "clear_primary_circuit",
+    "mark_omitted_structured_unavailable",
+    "omitted_structured_unavailable",
     "render_messages_text",
     "split_system_and_user",
 ]

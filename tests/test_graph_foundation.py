@@ -748,6 +748,11 @@ def test_adapter_carries_no_semantic_policy() -> None:
         "_global_circuit_record",
         "_global_circuit_clear",
         "clear_primary_circuit",
+        "_omitted_structured_key",
+        "_omitted_structured_entry_fresh",
+        "omitted_structured_unavailable",
+        "mark_omitted_structured_unavailable",
+        "clear_omitted_structured_cache",
     }
 
 

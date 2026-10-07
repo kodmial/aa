@@ -54,6 +54,20 @@ logger = logging.getLogger("aa.conversation.turn_pipeline")
 MAX_TARGETED_REPAIR_ROUNDS = 2
 MAX_PACK_PASSAGES = 12
 
+# Live SLO guard (Gate C live repair, run 37615447071 on exact main
+# e92385f): ordinary turns reached p50 34s / p95 59s / max 64s over the
+# 30s hard budget while the repair loop burned up to two full
+# planner+retrieval+answer+verifier rounds per slow turn. Each repair round
+# costs several sequential provider calls on the free tier; when the
+# initial draft+verify already approaches the budget, further re-planning
+# cannot help grounding fast enough and only pushes the turn over budget.
+# Skip remaining repair rounds once the turn exceeds this budget and narrow
+# to supported material instead. Grounding stays strict (only validated
+# supported units are served, otherwise clarification); no exact-question
+# special case, Product Contract #110 unchanged. Fast turns (mocked tests,
+# healthy provider) still use both rounds.
+TURN_REPAIR_TIME_BUDGET_S = 15.0
+
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."
@@ -315,6 +329,7 @@ async def run_v2_answer_turn(
         "verifier_outcome": "unknown",
         "verifier_latency_ms": 0.0,
         "repair_rounds": 0,
+        "repair_budget_exceeded": False,
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
     }
@@ -434,6 +449,13 @@ async def run_v2_answer_turn(
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:
+        if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S:
+            telemetry["repair_budget_exceeded"] = True
+            logger.info(
+                "v2 repair skipped for live-SLO budget",
+                extra={"rounds": rounds},
+            )
+            break
         missing = unsupported_unit_texts(units, result) if units else [draft]
         missing = [text for text in missing if text.strip()]
         if planner_model is None or retrieval_index is None:
@@ -746,6 +768,7 @@ __all__ = [
     "MAX_TARGETED_REPAIR_ROUNDS",
     "NATURAL_CLARIFICATION_REPLY",
     "NATURAL_RETRY_REPLY",
+    "TURN_REPAIR_TIME_BUDGET_S",
     "answer_pipeline_node",
     "compact_supported_to_envelope",
     "contains_cyrillic",
