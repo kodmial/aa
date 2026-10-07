@@ -1185,12 +1185,12 @@ def test_natural_clarification_fits_envelope_without_leak() -> None:
 
 
 async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
-    """Gate C repair (run 37530425848, run 37547434287): weak id-copy flake.
+    """Gate C repair (run 37551226807): order-based id repair with zero calls.
 
-    A batch verdict with wrong unit ids falls back once to the simpler
-    concurrent per-unit single-verdict task (no id copying); a valid
-    single verdict grounds the turn instead of collapsing to generic
-    clarification.
+    A batch verdict with wrong unit ids but correct count is remapped by
+    position in ``coerce_grounding_result`` (no extra model round), so the
+    turn grounds instead of collapsing with a slow per-unit fallback over
+    the 30s budget. Turn-independent, never an exact-question special case.
     """
     from aa.conversation.turn_pipeline import _verify_draft
 
@@ -1227,12 +1227,19 @@ async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
     assert passed is True
     assert result is not None
     assert result.all_required_supported is True
-    assert verifier.calls == 2
+    # Order remap fixes id flake with zero extra model rounds (latency).
+    assert verifier.calls == 1
     assert [unit.unit_id for unit in units] == ["u1"]
 
 
 async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
-    """Two consecutive invalid verdicts fail closed with exactly two calls."""
+    """Two consecutive invalid verdicts fail closed with exactly two calls.
+
+    Uses a non-remappable scope violation (order remap only fixes id
+    copying with correct count; scope vocabulary stays strict), so the
+    batch fails, per-unit fails, and the turn clarifies without a third
+    round burning live latency.
+    """
     from aa.conversation.turn_pipeline import _verify_draft
 
     class _AlwaysInvalid:
@@ -1244,13 +1251,21 @@ async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.calls += 1
+            props = schema.get("properties", {})
+            is_single = isinstance(props, dict) and "scope" in props and "units" not in props
+            if is_single:
+                return {
+                    "scope": "NotAScope",
+                    "supported": True,
+                    "evidence_passage_ids": [],
+                }
             return {
                 "units": [
                     {
-                        "unit_id": "wrong-id",
-                        "scope": "book",
+                        "unit_id": "u1",
+                        "scope": "NotAScope",
                         "supported": True,
-                        "evidence_passage_ids": ["chapter-3#exp0000"],
+                        "evidence_passage_ids": [],
                     }
                 ],
                 "all_required_supported": True,
@@ -1630,7 +1645,7 @@ def test_verifier_single_text_has_no_id_copying() -> None:
 
 
 async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
-    """Batch id flake falls back to concurrent single verdicts and serves."""
+    """Order remap fixes batch id flake with zero extra rounds and serves."""
     from aa.conversation.verifier import run_verifier
 
     pack = [_pack_entry()]
@@ -1651,11 +1666,12 @@ async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
                 return {
                     "units": [
                         {
-                            "unit_id": "wrong-id",
+                            "unit_id": f"wrong-{i}",
                             "scope": "book",
                             "supported": True,
                             "evidence_passage_ids": [pack[0]["passage_id"]],
                         }
+                        for i in range(len(units))
                     ],
                     "all_required_supported": True,
                 }
@@ -1671,8 +1687,8 @@ async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
     assert len(result.units) == len(units)
-    # One batch attempt plus one concurrent single per unit.
-    assert model.calls == 1 + len(units)
+    # Order remap repairs id copying with zero extra model rounds (latency).
+    assert model.calls == 1
 
 
 async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
@@ -1713,3 +1729,101 @@ async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
     _, result, passed = await _verify_draft(draft, pack, verifier_model=_UnknownCite())
     assert passed is False
     assert result is None
+
+
+def test_verifier_order_remap_repairs_id_flake_without_extra_calls() -> None:
+    """Gate C repair (run 37551226807): order remap is the zero-call fix.
+
+    Wrong ``u1``..``uN`` ids with correct count are reassigned by position;
+    scope/supported/evidence content is untouched and full cite/quote/
+    checksum gates still apply. Turn-independent, never exact-question.
+    """
+    from aa.conversation.verifier import _remap_units_by_order
+
+    assert _remap_units_by_order([{"unit_id": "wrong", "scope": "book"}], ["u1"]) == [
+        {"unit_id": "u1", "scope": "book"}
+    ]
+    assert _remap_units_by_order([{"unit_id": "u1"}], ["u1", "u2"]) is None
+    assert _remap_units_by_order(["not-a-dict"], ["u1"]) is None
+
+    units = split_response_units("Понимаю. Тяга проходит спокойно.")
+    pack = [_pack_entry()]
+    payload = {
+        "units": [
+            {
+                "unit_id": f"bad-{i}",
+                "scope": "book" if i == 0 else "conversation_glue",
+                "supported": True,
+                "evidence_passage_ids": [pack[0]["passage_id"]] if i == 0 else [],
+            }
+            for i, unit in enumerate(units)
+        ],
+        "all_required_supported": True,
+    }
+    result = coerce_grounding_result(payload, units=units, passages=pack)
+    assert [v.unit_id for v in result.units] == [u.unit_id for u in units]
+    assert result.all_required_supported is True
+
+
+def test_verifier_unsupported_needs_no_citation_or_quote() -> None:
+    """Gate C repair (run 37551226807): unsupported needs no valid citation.
+
+    An unsupported verdict is already blocked and narrowed away; requiring
+    a valid citation/quote for it turns correctly-unsupported turns into
+    unavailable generic clarifications. Supported verdicts stay strict:
+    book-supported with no/unknown evidence still fails closed.
+    """
+    units = split_response_units("Тяга проходит быстро.")
+    pack = [_pack_entry()]
+    unsupported_empty = {
+        "units": [
+            {
+                "unit_id": "u1",
+                "scope": "book",
+                "supported": False,
+                "evidence_passage_ids": [],
+            }
+        ],
+        "all_required_supported": False,
+    }
+    result = coerce_grounding_result(unsupported_empty, units=units, passages=pack)
+    assert result.all_required_supported is False
+    assert result.units[0].supported is False
+    # Supported book with no evidence still fails closed.
+    with pytest.raises(VerifierValidationError):
+        coerce_grounding_result(
+            {
+                "units": [
+                    {
+                        "unit_id": "u1",
+                        "scope": "book",
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                    }
+                ],
+                "all_required_supported": True,
+            },
+            units=units,
+            passages=pack,
+        )
+
+
+def test_verifier_display_truncates_long_passages_but_checks_full_pack() -> None:
+    """Gate C repair (run 37551226807): bound verifier prompt tokens.
+
+    Display text is truncated for the weak fallback provider while
+    deterministic cite/quote/checksum gates still use the full stored pack,
+    so grounding strictness is unchanged (truncation may only cause safe
+    false-unsupported, never false-supported).
+    """
+    from aa.conversation.verifier import VERIFIER_MAX_PASSAGE_CHARS, build_verifier_user_text
+
+    long_text = "Фиктивная поддержка рядом. " * 200
+    assert len(long_text) > VERIFIER_MAX_PASSAGE_CHARS
+    pack = [_pack_entry(text=long_text)]
+    units = split_response_units("Понимаю. Тяга проходит.")
+    user_text = build_verifier_user_text(units=units, passages=pack)
+    assert long_text not in user_text
+    assert pack[0]["passage_id"] in user_text
+    # Full-pack checks still see the untruncated stored text.
+    assert pack[0]["text"] == long_text
