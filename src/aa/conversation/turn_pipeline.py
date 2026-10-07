@@ -252,7 +252,7 @@ async def _verify_draft(
         # the verifier never served and max 35s over the 30s budget):
         # run_verifier already performs its own bounded per-unit fallback
         # (simpler single-verdict task, concurrent, no id copying) on a
-        # validation-shaped failure. Repeating the same batch prompt here
+        # validation-shaped or batch provider-flake failure. Repeating the same batch prompt here
         # only burns a second slow-model round and pushes ordinary turns
         # over budget without fixing systematic id-copy flake. Fail closed
         # immediately: only a verdict passing full Pydantic + completeness
