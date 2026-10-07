@@ -1436,7 +1436,7 @@ def test_verifier_normalizes_weak_provider_formatting() -> None:
     """
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 8
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
     units = split_response_units("Понимаю. Тяга проходит спокойно.")
     pack = [_pack_entry()]
     payload = {
@@ -1479,14 +1479,16 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
     user_text = build_verifier_user_text(units=units, passages=passages)
     # Short ordinal display ids keep the window bounded and copyable; long
     # provenance ids never enter the prompt (Gate C run 37556798996).
+    # Window tightened 8 -> 6 for run 37561542378 (14/14 clarifications,
+    # verifier never served, max 51.4s over budget on the weak fallback).
     assert 'id="p1"' in user_text
-    assert 'id="p8"' in user_text
-    assert 'id="p9"' not in user_text
+    assert 'id="p6"' in user_text
+    assert 'id="p7"' not in user_text
+    assert "chapter-3#exp0006" not in user_text
     assert "chapter-3#exp0007" not in user_text
-    assert "chapter-3#exp0008" not in user_text
     assert "chapter-3#exp0011" not in user_text
     assert len(passages) == 12
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 8
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
 
 
 async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
@@ -1955,3 +1957,45 @@ def test_verifier_single_unit_short_ids_resolve() -> None:
             units=units,
             passages=pack,
         )
+
+
+def test_v2_answer_carries_bounded_generation_budget_before_user_message() -> None:
+    """Gate C repair (run 37561542378): bound v2 draft length turn-independently.
+
+    The v2 answer path omitted the #83 efficiency guard, so weak fallback
+    drafts ran long (many razdel units), making the verifier batch large,
+    slow and flaky on structured output (14/14 clarifications, verifier
+    never served, max 51.4s over budget). The budget hint keeps drafts to
+    2-5 short sentences so verifier batches stay small and fast. The hard
+    envelope stays authoritative; this is only an efficiency guard, never
+    an exact-question special case.
+    """
+    messages = build_answer_messages(
+        recent=[HumanMessage(content="тяжело вечером")],
+        summary="",
+        passages=[EvidencePassage(passage_id="p", source="s", section="c", text="текст")],
+        user_message="почему?",
+    )
+    final = str(messages[-1].content)
+    assert "<response_budget>" in final
+    assert "2-5 short sentences" in final
+    assert final.index("<book_evidence>") < final.index("<response_budget>")
+    assert final.index("<response_budget>") < final.index("<user_message>")
+    assert final.rstrip().endswith("</user_message>")
+
+
+def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
+    """Gate C repair (run 37561542378): verifier input fits the live SLO.
+
+    Six top-ranked passages of 800 display chars keep the structured
+    verifier prompt small enough for the weak fallback to serve within
+    budget, while deterministic cite/quote/checksum gates still validate
+    against the full stored pack.
+    """
+    from aa.conversation.verifier import (
+        VERIFIER_MAX_EVIDENCE_PASSAGES,
+        VERIFIER_MAX_PASSAGE_CHARS,
+    )
+
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
+    assert VERIFIER_MAX_PASSAGE_CHARS == 800

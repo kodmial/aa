@@ -38,37 +38,38 @@ logger = logging.getLogger("aa.conversation.verifier")
 
 VERIFIER_AGENT_V2 = "aa-verifier-v2"
 
-# Bounded verifier evidence window (Gate C live repair, run 37544234331:
-# 14/14 ordinary turns collapsed to generic clarification with the verifier
-# never served (missing aa-verifier-v2 identity) and p50 18.8s/p95 38.7s/
-# max 41.1s over the 30s hard budget on the weak fallback model. The full
-# 16k-token Evidence Pack (up to 12 passages) makes the verifier prompt the
-# largest per-turn model input; weak providers are slow and flaky on large
-# structured prompts while the planner (small prompt) serves. The display
-# window keeps the top-ranked passages only, cutting verifier input tokens
-# and latency while the stored-pack deterministic checks below still use
-# the full pack, so grounding strictness is unchanged: the model may only
-# cite listed ids, and every cited id is still validated against the full
-# pack plus checksum/quote gates. Turn-independent, never an
-# exact-question special case.
-VERIFIER_MAX_EVIDENCE_PASSAGES = 8
+# Bounded verifier evidence window (Gate C live repair, run 37544234331
+# and run 37561542378: 14/14 ordinary turns collapsed to generic
+# clarification with the verifier never served (missing aa-verifier-v2
+# identity) and p50 27.0s/p95 50.1s/max 51.4s over the 30s hard budget on
+# the weak fallback model. The full 16k-token Evidence Pack (up to 12
+# passages) makes the verifier prompt the largest per-turn structured
+# model input; weak providers are slow and flaky on large structured
+# prompts while the small-prompt planner serves and the text-output answer
+# serves. The display window keeps the top-ranked passages only, cutting
+# verifier input tokens and latency while the stored-pack deterministic
+# checks below still use the full pack, so grounding strictness is
+# unchanged: the model may only cite listed ids, and every cited id is
+# still validated against the full pack plus checksum/quote gates.
+# Turn-independent, never an exact-question special case.
+VERIFIER_MAX_EVIDENCE_PASSAGES = 6
 
 # Bounded per-passage display length for the verifier prompt only (Gate C
-# live repair, run 37551226807: 14/14 clarifications with the verifier
-# never served in the served-model audit, answer collapse, diversity fail,
-# and max 57.9s over the 30s budget on the weak fallback). The verifier
-# prompt is the largest per-turn model input; weak fallback providers
-# reject or time out large structured requests (no served audit) while the
-# small-prompt planner serves. Truncating display text bounds input tokens
-# and latency while deterministic cite/quote/checksum gates still use the
-# full stored pack. Display truncation is explicitly marked with
-# ``... [truncated ...]`` so the model can see the passage is incomplete
-# and withhold support instead of judging on a silently cut prefix
-# (a qualifier or contradiction after the cut is invisible to the model,
-# so silent truncation could cause false-supported, not only safe
-# false-unsupported). Turn-independent, never an exact-question
-# special case.
-VERIFIER_MAX_PASSAGE_CHARS = 1200
+# live repair, run 37551226807 and run 37561542378: 14/14 clarifications
+# with the verifier never served in the served-model audit, answer
+# collapse, diversity fail, and max 51.4s over the 30s budget on the weak
+# fallback). The verifier prompt is the largest per-turn structured model
+# input; weak fallback providers reject or time out large structured
+# requests (no served audit) while the small-prompt planner serves.
+# Truncating display text bounds input tokens and latency while
+# deterministic cite/quote/checksum gates still use the full stored pack.
+# Display truncation is explicitly marked with ``... [truncated ...]`` so
+# the model can see the passage is incomplete and withhold support instead
+# of judging on a silently cut prefix (a qualifier or contradiction after
+# the cut is invisible to the model, so silent truncation could cause
+# false-supported, not only safe false-unsupported). Turn-independent,
+# never an exact-question special case.
+VERIFIER_MAX_PASSAGE_CHARS = 800
 
 VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
