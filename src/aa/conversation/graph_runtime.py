@@ -223,6 +223,9 @@ class GraphTurnRuntime:
                 "answer_rounds": int(embedded_d.get("answer_rounds", 0)),
                 "verifier_outcome": str(embedded_d.get("verifier_outcome", "unknown")),
                 "verifier_latency_ms": float(embedded_d.get("verifier_latency_ms", 0.0)),
+                "verifier_unavailable_units": int(
+                    embedded_d.get("verifier_unavailable_units", 0)
+                ),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
                 "repair_budget_exceeded": bool(
                     embedded_d.get("repair_budget_exceeded", False)
@@ -241,6 +244,7 @@ class GraphTurnRuntime:
                     "answer_latency_ms": snapshot["answer_latency_ms"],
                     "verifier_outcome": snapshot["verifier_outcome"],
                     "verifier_latency_ms": snapshot["verifier_latency_ms"],
+                    "verifier_unavailable_units": snapshot["verifier_unavailable_units"],
                     "repair_budget_exceeded": snapshot["repair_budget_exceeded"],
                     "latency_ms": snapshot["total_latency_ms"],
                 },
