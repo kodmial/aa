@@ -825,7 +825,10 @@ class _CaptureServeHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
         _CaptureServeHandler.captured.append({"path": self.path, "body": body})
-        info: dict[str, Any] = {"role": "assistant"}
+        info: dict[str, Any] = {
+            "role": "assistant",
+            "tokens": {"input": 11, "output": 7, "reasoning": 3, "cache": {"read": 2, "write": 1}},
+        }
         if isinstance(body, dict) and isinstance(body.get("model"), dict):
             model = body["model"]
             provider = model.get("providerID")
@@ -859,6 +862,12 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
         assert all(float(item["latency_ms"]) >= 0.0 for item in timing_audit)
         assert all(item["success"] is True for item in timing_audit)
         assert "hello" not in json.dumps(timing_audit)
+        token_audit = client.token_usage_audit
+        assert len(token_audit) == 2
+        assert all(item["input"] == 11 for item in token_audit)
+        assert all(item["output"] == 7 for item in token_audit)
+        assert all(item["reasoning"] == 3 for item in token_audit)
+        assert "hello" not in json.dumps(token_audit)
     finally:
         server.shutdown()
         thread.join(timeout=5.0)
