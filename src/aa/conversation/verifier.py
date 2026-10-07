@@ -639,9 +639,8 @@ async def _verify_per_unit_concurrent(
     Concurrency keeps the fallback within one slow-model round instead of
     N sequential rounds (live SLO). Deterministic cite/quote/checksum
     gates run on the assembled result exactly as in the batch path, so
-    grounding strictness is unchanged. Provider/transient errors
-    propagate (fail-closed); only validation-shaped failures are raised
-    as ``VerifierValidationError`` by the callers.
+    grounding strictness is unchanged. Errors propagate fail-closed;
+    provider 429 always propagates for runner retire/restart.
     """
     import asyncio as _asyncio
 
