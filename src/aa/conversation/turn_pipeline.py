@@ -169,6 +169,13 @@ def keep_supported_text(units: Sequence[ResponseUnitDraft], result: GroundingRes
     return " ".join(kept).strip()
 
 
+def has_supported_book_unit(result: GroundingResult | None) -> bool:
+    """Whether a failed/partial draft retains substantive grounded material."""
+    if result is None:
+        return False
+    return any(verdict.scope == "book" and bool(verdict.supported) for verdict in result.units)
+
+
 def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
     """Serialize a verifier outcome into graph state (no prompt text)."""
     if result is None:
@@ -345,6 +352,7 @@ async def run_v2_answer_turn(
         "answer_rounds": 0,
         "verifier_outcome": "unknown",
         "verifier_latency_ms": 0.0,
+        "verifier_unavailable_units": 0,
         "repair_rounds": 0,
         "repair_budget_exceeded": False,
         "total_latency_ms": 0.0,
@@ -421,10 +429,14 @@ async def run_v2_answer_turn(
 
     telemetry["answer_outcome"] = "draft-ok"
     units, result, passed = await _verify_with_telemetry(draft, pack)
+    if result is not None:
+        telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
     if passed:
         telemetry["verifier_outcome"] = "passed"
     elif result is None:
         telemetry["verifier_outcome"] = "unavailable"
+    elif result.unavailable_unit_ids:
+        telemetry["verifier_outcome"] = "partial-unavailable"
     else:
         telemetry["verifier_outcome"] = "unsupported"
     current_draft: str = draft
@@ -451,8 +463,13 @@ async def run_v2_answer_turn(
     # be proven grounded, so it clarifies directly instead of burning
     # latency on futile repair.
     is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
-    repair_allowed = result is not None and (
-        (not initial_pack_empty) or (initial_query_count is not None and initial_query_count > 0)
+    repair_allowed = (
+        result is not None
+        and not result.unavailable_unit_ids
+        and (
+            (not initial_pack_empty)
+            or (initial_query_count is not None and initial_query_count > 0)
+        )
     )
     if not passed and is_glue:
         logger.info(
@@ -546,10 +563,14 @@ async def run_v2_answer_turn(
             break
         current_draft = next_draft
         units, result, passed = await _verify_with_telemetry(current_draft, pack)
+        if result is not None:
+            telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
         if passed:
             telemetry["verifier_outcome"] = "passed-after-repair"
         elif result is None:
             telemetry["verifier_outcome"] = "unavailable"
+        elif result.unavailable_unit_ids:
+            telemetry["verifier_outcome"] = "partial-unavailable"
         else:
             telemetry["verifier_outcome"] = "unsupported"
 
@@ -657,8 +678,12 @@ async def run_v2_answer_turn(
 
     # Repair budget exhausted: narrow to supported material or clarify.
     narrowed = keep_supported_text(units, result) if units else ""
+    substantive_narrowing_ok = (
+        initial_query_count is None or initial_query_count == 0 or has_supported_book_unit(result)
+    )
     if (
         narrowed
+        and substantive_narrowing_ok
         and contains_cyrillic(narrowed)
         and not leaks_internal_terms(narrowed)
         and envelope_passes(narrowed)
@@ -829,6 +854,7 @@ __all__ = [
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",
+    "has_supported_book_unit",
     "keep_supported_text",
     "leaks_internal_terms",
     "merge_pack_dicts",

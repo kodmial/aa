@@ -783,7 +783,7 @@ def test_agent_prompt_contains_output_policy() -> None:
     assert "900" in prompt and "130" in prompt
     assert "500" in prompt and "80" in prompt
     assert "300" in prompt
-    assert "2-5" in prompt
+    assert "2-3" in prompt
     assert "chapter" in prompt
     assert "authoritative" in prompt and "ignore" in prompt
 
@@ -805,6 +805,7 @@ async def test_synthesis_prompt_carries_policy_and_no_planner_metadata(
 
 
 def test_generation_budget_defaults_and_validates() -> None:
+    assert DEFAULT_GENERATION_BUDGET_TOKENS == 160
     assert resolve_generation_budget(0) == DEFAULT_GENERATION_BUDGET_TOKENS
     assert resolve_generation_budget(200) == 200
     with pytest.raises(ValueError):
@@ -824,7 +825,10 @@ class _CaptureServeHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
         _CaptureServeHandler.captured.append({"path": self.path, "body": body})
-        info: dict[str, Any] = {"role": "assistant"}
+        info: dict[str, Any] = {
+            "role": "assistant",
+            "tokens": {"input": 11, "output": 7, "reasoning": 3, "cache": {"read": 2, "write": 1}},
+        }
         if isinstance(body, dict) and isinstance(body.get("model"), dict):
             model = body["model"]
             provider = model.get("providerID")
@@ -852,6 +856,21 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
         client = HttpOpenCodeClient(f"http://127.0.0.1:{port}", request_timeout=5.0)
         await client.send_message("ses_qual01", "hello", agent="aa", model="zen/spark")
         await client.send_message("ses_qual01", "hello again")
+        timing_audit = client.request_latency_audit
+        assert len(timing_audit) == 2
+        assert all(item["operation"] == "message-text" for item in timing_audit)
+        assert all(
+            isinstance(item["latency_ms"], (int, float)) and float(item["latency_ms"]) >= 0.0
+            for item in timing_audit
+        )
+        assert all(item["success"] is True for item in timing_audit)
+        assert "hello" not in json.dumps(timing_audit)
+        token_audit = client.token_usage_audit
+        assert len(token_audit) == 2
+        assert all(item["input"] == 11 for item in token_audit)
+        assert all(item["output"] == 7 for item in token_audit)
+        assert all(item["reasoning"] == 3 for item in token_audit)
+        assert "hello" not in json.dumps(token_audit)
     finally:
         server.shutdown()
         thread.join(timeout=5.0)
@@ -867,6 +886,9 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
 
 def test_fixed_operational_replies_fit_envelope() -> None:
     from aa.app import _NEW_REPLY, _START_REPLY, _TEMPORARY_ERROR_REPLY
+
+    assert "The answer" not in ENVELOPE_FALLBACK_REPLY
+    assert "Tell me" not in ENVELOPE_FALLBACK_REPLY
 
     for text in (
         FAIL_CLOSED_REPLY,

@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from aa.conversation.graph_runtime import GraphTurnRuntime
 from aa.conversation.orchestrator import (
     AGENT_NAME,
     FAIL_CLOSED_REPLY,
@@ -49,6 +50,43 @@ from aa.retrieval.planner import aspect_search_queries, validate_plan
 
 PRIMARY = "opencode/muse-spark-1.3-contributor-free"
 FALLBACK = "opencode/space-bunny-free"
+
+
+def test_graph_runtime_preserves_stage_latency_and_outage_telemetry() -> None:
+    runtime = GraphTurnRuntime()
+    result = {
+        "retry_state": {
+            "turn_telemetry": {
+                "planner_outcome": "ok",
+                "planner_latency_ms": 1200.0,
+                "retrieval_outcome": "evidence-ready",
+                "retrieval_latency_ms": 250.0,
+                "answer_outcome": "narrowed-supported",
+                "answer_latency_ms": 6400.0,
+                "answer_rounds": 1,
+                "verifier_outcome": "partial-unavailable",
+                "verifier_latency_ms": 3100.0,
+                "verifier_unavailable_units": 1,
+                "repair_rounds": 0,
+                "repair_budget_exceeded": False,
+            }
+        },
+        "search_queries": ["q"] * 10,
+        "evidence_pack": [{"passage_id": "p1"}],
+        "grounding_result": {
+            "all_required_supported": False,
+            "units": [{"unit_id": "u1"}, {"unit_id": "u2"}],
+        },
+    }
+    runtime._record_stage_telemetry("thread", result, 11000.0, 42)
+    snapshot = runtime.last_telemetry_for_thread("thread")
+    assert snapshot["answer_latency_ms"] == 6400.0
+    assert snapshot["verifier_latency_ms"] == 3100.0
+    assert snapshot["answer_rounds"] == 1
+    assert snapshot["verifier_unavailable_units"] == 1
+    assert snapshot["response_units"] == 2
+    assert snapshot["repair_budget_exceeded"] is False
+
 
 RU_FIXTURES: dict[str, str] = {
     "doctors-opinion": (

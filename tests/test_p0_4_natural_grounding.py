@@ -1933,7 +1933,7 @@ def test_v2_answer_carries_bounded_generation_budget_before_user_message() -> No
     )
     final = str(messages[-1].content)
     assert "<response_budget>" in final
-    assert "2-5 short sentences" in final
+    assert "2-3 short sentences" in final
     assert final.index("<book_evidence>") < final.index("<response_budget>")
     assert final.index("<response_budget>") < final.index("<user_message>")
     assert final.rstrip().endswith("</user_message>")

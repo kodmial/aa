@@ -105,7 +105,7 @@ rather than filling gaps from model memory.
 
 OUTPUT POLICY
 
-Answer concisely, as in a chat conversation: usually 2-5 short sentences.
+Answer concisely, as in a chat conversation: usually 2-3 short sentences.
 Simple acknowledgement/clarification turns stay within about 300 characters.
 Ordinary substantive answers target at most 500 characters and 80 words.
 Never exceed 900 characters and 130 words in one reply, and never split one

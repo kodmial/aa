@@ -302,6 +302,11 @@ jobs:
 
       - name: Gate D - real Telegram network/runtime readiness
         id: gate-d
+        # Gate D is independent of Gate C functional correctness. Run it after
+        # any completed Gate C attempt so one functional failure cannot hide a
+        # second runtime-readiness defect. A provider-429 restart marker still
+        # retires this VM immediately.
+        if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -516,6 +521,10 @@ jobs:
           echo "D" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-D.done"
 
       - name: Gate E - live performance/SLO
+        # Gate E owns latency independently of Gate C functional correctness.
+        # Evaluate the trusted Gate C measurements even when C itself fails so
+        # the repair loop can attack C and E in the same cycle.
+        if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -532,11 +541,21 @@ jobs:
             exit 0
           fi
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
-          # Gate D has now produced trusted runtime evidence, so this is the
-          # first point where a full A-E evaluation is valid.
+          # Gate E consumes the trusted live measurements independently of
+          # Gate C's functional verdict and Gate D's network-readiness result.
+          # The runner computes the whole A-E summary and therefore returns
+          # non-zero when Gate C is already known FAIL. Gate E must not inherit
+          # that functional verdict: consume the same trusted latency evidence
+          # and exit strictly from Gate E below. Preserve runner lifecycle
+          # exits that require VM restart/resume.
+          runner_rc=0
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" || runner_rc=$?
+          if [[ "$runner_rc" -eq 75 || -f self-proving-out/restart-required.json ]]; then
+            echo "::error::Gate E interrupted by provider 429; runner restart required."
+            exit 75
+          fi
           # Hard guard: no ordinary qualification turn may take >= 30s; p95
           # target materially below that. Typing heartbeat continuity is
           # verified independently. Pathological latency fails the gate.
@@ -724,6 +743,9 @@ jobs:
             let productFailures = [];
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
+            let verifierLine = 'Verifier availability: unavailable.';
+            let transportTimingLine = 'OpenCode request timings: unavailable.';
+            let tokenUsageLine = 'Model token usage: unavailable.';
             let modelPathLine = 'Served models: unavailable.';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
@@ -773,7 +795,34 @@ jobs:
               const repair = metrics.repair_metrics || {};
               if (rendered.length) {
                 stageTimingLine = 'Stage timings: ' + rendered.join('; ') +
-                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+                  `; repair_turns=${Number(repair.turns_with_repair || 0)}, repair_rounds=${Number(repair.repair_rounds_total || 0)}, answer_rounds=${Number(repair.answer_rounds_total || 0)}, budget_exceeded=${Number(repair.repair_budget_exceeded_turns || 0)}.`;
+              }
+              const verifier = metrics.verifier_metrics || {};
+              verifierLine =
+                'Verifier availability: ' +
+                `turns_with_unavailable_units=${Number(verifier.turns_with_unavailable_units || 0)}, ` +
+                `unavailable_units_total=${Number(verifier.unavailable_units_total || 0)}, ` +
+                `response_units_total=${Number(verifier.response_units_total || 0)}, ` +
+                `response_units_max=${Number(verifier.response_units_max || 0)}.`;
+              const requestTimings = metrics.opencode_request_latency_ms || {};
+              const requestRendered = Object.keys(requestTimings)
+                .sort()
+                .map(name => {
+                  const item = requestTimings[name] || {};
+                  return `${name}=n:${Number(item.count || 0)}/p50:${Math.round(Number(item.p50 || 0))}/p95:${Math.round(Number(item.p95 || 0))}/max:${Math.round(Number(item.max || 0))}ms`;
+                });
+              if (requestRendered.length) {
+                transportTimingLine = 'OpenCode request timings: ' + requestRendered.join('; ') + '.';
+              }
+              const tokenUsage = metrics.opencode_token_usage_by_agent || {};
+              const tokenRendered = Object.keys(tokenUsage)
+                .sort()
+                .map(name => {
+                  const item = tokenUsage[name] || {};
+                  return `${name}=requests:${Number(item.requests || 0)}/in:${Number(item.input_total || 0)}/out:${Number(item.output_total || 0)}/reasoning:${Number(item.reasoning_total || 0)}`;
+                });
+              if (tokenRendered.length) {
+                tokenUsageLine = 'Model token usage: ' + tokenRendered.join('; ') + '.';
               }
               const served = metrics.served_models_by_agent || {};
               const servedEntries = Object.keys(served)
@@ -836,6 +885,9 @@ jobs:
               `Repair recurrence: \`${recurrence}\``,
               timingLine,
               stageTimingLine,
+              verifierLine,
+              transportTimingLine,
+              tokenUsageLine,
               modelPathLine,
               '',
               '### Required repair behavior',

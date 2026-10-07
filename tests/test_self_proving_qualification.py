@@ -450,6 +450,10 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "aa-self-proving-transient" in workflow
     assert "transient-blocked.json" in workflow
     assert "Stage timings:" in workflow
+    assert "Verifier availability:" in workflow
+    assert "OpenCode request timings:" in workflow
+    assert "Model token usage:" in workflow
+    assert "response_units_total=" in workflow
     assert "Repair recurrence:" in workflow
     assert "async function apiRetry" in workflow
     assert "retrying in" in workflow
@@ -475,12 +479,22 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # Gate E and terminal Gate F must preserve the same live prerequisites as
     # Gate C. Otherwise the final verdict can falsely downgrade valid live
     # evidence to C:live-execution-not-enabled.
+    gate_d = workflow.split("Gate D - real Telegram network/runtime readiness", 1)[1].split(
+        "Gate E - live performance/SLO", 1
+    )[0]
     gate_e = workflow.split("Gate E - live performance/SLO", 1)[1].split(
         "Gate F - exact-main final verdict", 1
     )[0]
     gate_f = workflow.split("Gate F - exact-main final verdict", 1)[1].split(
         "Stage gate checkpoints for resume", 1
     )[0]
+    for independent in (gate_d, gate_e):
+        assert "steps.gate-c.outcome == 'success'" in independent
+        assert "steps.gate-c.outcome == 'failure'" in independent
+        assert "restart-required.json" in independent
+    assert "runner_rc=0" in gate_e
+    assert "|| runner_rc=$?" in gate_e
+    assert '"$runner_rc" -eq 75' in gate_e
     for block in (gate_e, gate_f):
         assert 'SELF_PROVING_LIVE: "1"' in block
         assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block

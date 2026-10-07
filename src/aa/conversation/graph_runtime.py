@@ -203,6 +203,8 @@ class GraphTurnRuntime:
             pack_count = len(pack) if isinstance(pack, list) else 0
             grounding = result.get("grounding_result", {})
             grounding_d = dict(grounding) if isinstance(grounding, dict) else {}
+            grounding_units = grounding_d.get("units", [])
+            response_units = len(grounding_units) if isinstance(grounding_units, list) else 0
             snapshot: dict[str, Any] = {
                 "planner_query_count": int(embedded_d.get("planner_query_count", query_count)),
                 "planner_outcome": str(
@@ -219,9 +221,14 @@ class GraphTurnRuntime:
                 ),
                 "retrieval_over_budget": bool(result.get("retrieval_over_budget", False)),
                 "answer_outcome": str(embedded_d.get("answer_outcome", "unknown")),
-                "answer_rounds": int(retry_d.get("answer_rounds", 0)),
+                "answer_latency_ms": float(embedded_d.get("answer_latency_ms", 0.0)),
+                "answer_rounds": int(embedded_d.get("answer_rounds", 0)),
                 "verifier_outcome": str(embedded_d.get("verifier_outcome", "unknown")),
+                "verifier_latency_ms": float(embedded_d.get("verifier_latency_ms", 0.0)),
+                "verifier_unavailable_units": int(embedded_d.get("verifier_unavailable_units", 0)),
+                "response_units": int(response_units),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
+                "repair_budget_exceeded": bool(embedded_d.get("repair_budget_exceeded", False)),
                 "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),
@@ -233,7 +240,12 @@ class GraphTurnRuntime:
                     "planner_outcome": snapshot["planner_outcome"],
                     "retrieval_outcome": snapshot["retrieval_outcome"],
                     "answer_outcome": snapshot["answer_outcome"],
+                    "answer_latency_ms": snapshot["answer_latency_ms"],
                     "verifier_outcome": snapshot["verifier_outcome"],
+                    "verifier_latency_ms": snapshot["verifier_latency_ms"],
+                    "verifier_unavailable_units": snapshot["verifier_unavailable_units"],
+                    "response_units": snapshot["response_units"],
+                    "repair_budget_exceeded": snapshot["repair_budget_exceeded"],
                     "latency_ms": snapshot["total_latency_ms"],
                 },
             )
@@ -317,17 +329,15 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         from aa.conversation.memory import default_memory_config
         from aa.conversation.model_adapter import (
             ANSWER_AGENT_V2,
-            PLANNER_AGENT_V2,
             SUMMARIZER_AGENT_V2,
-            OpenCodeChatModel,
+            build_planner_model,
         )
         from aa.retrieval.evidence import RetrievalConfig
 
         primary = str(getattr(self._settings, "opencode_model", ""))
         fallback = str(getattr(self._settings, "opencode_fallback_model", ""))
-        planner = OpenCodeChatModel(
+        planner = build_planner_model(
             self._client,
-            agent=PLANNER_AGENT_V2,
             primary_model=primary,
             fallback_model=fallback,
         )
