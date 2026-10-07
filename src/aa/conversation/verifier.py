@@ -53,6 +53,35 @@ VERIFIER_AGENT_V2 = "aa-verifier-v2"
 # exact-question special case.
 VERIFIER_MAX_EVIDENCE_PASSAGES = 8
 
+# Bounded per-passage display length for the verifier prompt only (Gate C
+# live repair, run 37551226807: 14/14 clarifications with the verifier
+# never served in the served-model audit, answer collapse, diversity fail,
+# and max 57.9s over the 30s budget on the weak fallback). The verifier
+# prompt is the largest per-turn model input; weak fallback providers
+# reject or time out large structured requests (no served audit) while the
+# small-prompt planner serves. Truncating display text bounds input tokens
+# and latency while deterministic cite/quote/checksum gates still use the
+# full stored pack. Display truncation is explicitly marked with
+# ``... [truncated ...]`` so the model can see the passage is incomplete
+# and withhold support instead of judging on a silently cut prefix
+# (a qualifier or contradiction after the cut is invisible to the model,
+# so silent truncation could cause false-supported, not only safe
+# false-unsupported). Turn-independent, never an exact-question
+# special case.
+VERIFIER_MAX_PASSAGE_CHARS = 1200
+
+VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
+
+
+def _display_passage_text(text: str) -> str:
+    """Bound one passage display text for the verifier prompt (no semantics)."""
+    if len(text) <= VERIFIER_MAX_PASSAGE_CHARS:
+        return text
+    omitted = len(text) - VERIFIER_MAX_PASSAGE_CHARS
+    return text[:VERIFIER_MAX_PASSAGE_CHARS] + VERIFIER_TRUNCATION_SUFFIX_FORMAT.format(
+        omitted=omitted
+    )
+
 
 def _escape(value: str) -> str:
     return _xml_escape(value, {"'": "&apos;", '"': "&quot;"})
@@ -100,7 +129,7 @@ def build_verifier_user_text(
                 f"<passage id={_xml_quoteattr(passage_id)} "
                 f"source={_xml_quoteattr(source_id)} "
                 f"section={_xml_quoteattr(section_id)}>"
-                f"{_escape(text)}</passage>"
+                f"{_escape(_display_passage_text(text))}</passage>"
             )
     else:
         lines.append("(no book evidence supplied for this turn)")
@@ -119,8 +148,18 @@ def _pack_index(passages: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]
 
 
 def check_cited_passage_ids(result: GroundingResult, *, pack_ids: set[str]) -> GroundingResult:
-    """Fail closed when a verdict cites unknown or missing book evidence."""
+    """Fail closed when a supported verdict cites unknown or missing evidence.
+
+    Gate C live repair, run 37551226807: 14/14 clarifications with the
+    verifier never served. An unsupported verdict (supported False) is
+    already blocked and narrowed away from the user; its citation list is
+    irrelevant to grounding, so only supported verdicts must cite valid
+    evidence. A supported book unit with no/unknown citation still fails
+    closed. Turn-independent, never an exact-question special case.
+    """
     for verdict in result.units:
+        if not verdict.supported:
+            continue
         if verdict.scope == "book":
             if not verdict.evidence_passage_ids:
                 raise VerifierValidationError(f"book unit {verdict.unit_id!r} cites no evidence")
@@ -158,11 +197,16 @@ def check_exact_quotes(
     result: GroundingResult,
     passages: Sequence[dict[str, Any]],
 ) -> GroundingResult:
-    """Fail closed when a verbatim quote is not in its cited passage(s).
+    """Fail closed when a supported verdict quotes text not in cited passages.
 
     Quoted spans use the deterministic quote-span detector. A non-empty
-    quoted span must appear verbatim in at least one cited exact passage
-    for its unit; otherwise the draft cannot cross the product boundary.
+    quoted span in a supported unit must appear verbatim in at least one
+    cited exact passage for its unit; otherwise the draft cannot cross the
+    product boundary. Unsupported units are already blocked and narrowed
+    away, so their quotes are irrelevant (Gate C live repair, run
+    37551226807: turning correctly-unsupported verdicts into unavailable
+    generic clarifications). Turn-independent, never an exact-question
+    special case.
     """
     from aa.conversation.output_limits import extract_quoted_spans
 
@@ -172,6 +216,8 @@ def check_exact_quotes(
         verdict = verdict_by_id.get(unit.unit_id)
         if verdict is None:
             raise VerifierValidationError(f"missing verdict for {unit.unit_id!r}")
+        if not verdict.supported:
+            continue
         spans = [span for span in extract_quoted_spans(unit.text) if span.strip()]
         if not spans:
             continue
@@ -236,6 +282,47 @@ def _normalize_verifier_payload(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _remap_units_by_order(
+    raw_units: list[Any], expected_ids: list[str]
+) -> list[dict[str, Any]] | None:
+    """Reassign verdict ids by position when counts match (0 extra calls).
+
+    Gate C live repair, run 37551226807: the weak fallback systematically
+    flakes exact ``u1``..``uN`` id copying (wrong ids, off-by-one,
+    ``1``/``unit1`` variants) while preserving order and verdict content,
+    so the batch verifier never serves and every ordinary turn clarifies
+    with per-unit fallback burning a second slow-model round over the 30s
+    budget. When the model returns the correct number of verdicts in order,
+    reassigning ``expected_ids`` by position preserves grounding without
+    extra latency: scope/supported/evidence content is untouched, and the
+    full cite/quote/checksum gates below still validate against the full
+    stored pack. Turn-independent, never an exact-question special case.
+    Returns ``None`` when counts mismatch, entries are not dicts, or the
+    returned id set already matches expected (count equality does not
+    prove order preservation: remapping a shuffled but id-correct list
+    would silently misattribute supported status and evidence to the
+    wrong unit). Remap applies only when ids are systematically wrong;
+    any overlap with expected ids fails closed instead of clobbering a
+    correct binding by position.
+    """
+    if len(raw_units) != len(expected_ids) or not expected_ids:
+        return None
+    raw_ids = [entry.get("unit_id") if isinstance(entry, dict) else None for entry in raw_units]
+    if set(raw_ids) == set(expected_ids):
+        return None
+    expected_set = set(expected_ids)
+    if any(raw_id in expected_set for raw_id in raw_ids):
+        return None
+    remapped: list[dict[str, Any]] = []
+    for entry, expected_id in zip(raw_units, expected_ids, strict=True):
+        if not isinstance(entry, dict):
+            return None
+        fixed = dict(entry)
+        fixed["unit_id"] = expected_id
+        remapped.append(fixed)
+    return remapped
+
+
 def coerce_grounding_result(
     data: object,
     *,
@@ -245,13 +332,59 @@ def coerce_grounding_result(
     """Validate one verifier object end to end (schema + deterministic)."""
     expected = [unit.unit_id for unit in units]
     if isinstance(data, GroundingResult):
-        result = validate_grounding_result(data, expected_unit_ids=expected)
+        try:
+            result = validate_grounding_result(data, expected_unit_ids=expected)
+        except VerifierValidationError:
+            remapped_units = _remap_units_by_order(
+                [
+                    {
+                        "unit_id": verdict.unit_id,
+                        "scope": verdict.scope,
+                        "supported": verdict.supported,
+                        "evidence_passage_ids": list(verdict.evidence_passage_ids),
+                    }
+                    for verdict in data.units
+                ],
+                expected,
+            )
+            if remapped_units is None:
+                raise
+            try:
+                remapped = GroundingResult.model_validate(
+                    {
+                        "units": remapped_units,
+                        "all_required_supported": bool(data.all_required_supported),
+                    }
+                )
+            except PydanticValidationError as exc:
+                raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
+            result = validate_grounding_result(remapped, expected_unit_ids=expected)
+            logger.info("verifier ids remapped by order", extra={"units": len(expected)})
     elif isinstance(data, dict):
         try:
             parsed = GroundingResult.model_validate(_normalize_verifier_payload(data))
         except PydanticValidationError as exc:
             raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
-        result = validate_grounding_result(parsed, expected_unit_ids=expected)
+        try:
+            result = validate_grounding_result(parsed, expected_unit_ids=expected)
+        except VerifierValidationError:
+            raw_units = _normalize_verifier_payload(data).get("units")
+            remapped_units = (
+                _remap_units_by_order(raw_units, expected) if isinstance(raw_units, list) else None
+            )
+            if remapped_units is None:
+                raise
+            try:
+                remapped = GroundingResult.model_validate(
+                    {
+                        "units": remapped_units,
+                        "all_required_supported": bool(data.get("all_required_supported", False)),
+                    }
+                )
+            except PydanticValidationError as exc:
+                raise VerifierValidationError(f"verifier output invalid: {exc}") from exc
+            result = validate_grounding_result(remapped, expected_unit_ids=expected)
+            logger.info("verifier ids remapped by order", extra={"units": len(expected)})
     else:
         raise VerifierValidationError("verifier output is not a structured object")
     pack_ids = set(_pack_index(passages).keys())
@@ -304,7 +437,7 @@ def build_single_unit_text(
                 f"<passage id={_xml_quoteattr(passage_id)} "
                 f"source={_xml_quoteattr(source_id)} "
                 f"section={_xml_quoteattr(section_id)}>"
-                f"{_escape(text)}</passage>"
+                f"{_escape(_display_passage_text(text))}</passage>"
             )
     else:
         lines.append("(no book evidence supplied for this turn)")
@@ -473,6 +606,7 @@ async def run_verifier(
 __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
+    "VERIFIER_MAX_PASSAGE_CHARS",
     "build_single_unit_text",
     "build_verifier_user_text",
     "check_cited_passage_ids",
