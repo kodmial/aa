@@ -313,6 +313,7 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         self._index = index
 
     def _build_graph(self, saver: Any) -> Any:  # pragma: no cover - production wiring
+        from aa.config import DEFAULT_PRIMARY_MODEL
         from aa.conversation.graph import build_turn_graph
         from aa.conversation.memory import default_memory_config
         from aa.conversation.model_adapter import (
@@ -334,7 +335,17 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         )
         summarizer = planner.with_agent(SUMMARIZER_AGENT_V2)
         answer = planner.with_agent(ANSWER_AGENT_V2)
-        verifier = planner.with_agent(VERIFIER_AGENT_V2)
+        # P0: the grounding verifier must use Muse Spark only. Space Bunny
+        # proved unreliable for the strict verifier contract in live Gate C,
+        # so the verifier is deliberately isolated from the shared runtime
+        # fallback policy. Other agents retain the configured primary/fallback.
+        verifier = OpenCodeChatModel(
+            self._client,
+            agent=VERIFIER_AGENT_V2,
+            primary_model=DEFAULT_PRIMARY_MODEL,
+            fallback_model="",
+            request_timeout=planner.request_timeout,
+        )
         return build_turn_graph(
             planner_model=planner,
             summary_model=summarizer,
