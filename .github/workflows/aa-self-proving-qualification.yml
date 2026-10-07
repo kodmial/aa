@@ -957,69 +957,83 @@ jobs:
             }
 
             if (result === 'pass') {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 7,
-                state: 'closed',
-                state_reason: 'completed',
-                labels: [],
-              });
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                body: [
-                  '⚡ **AA self-proving qualification**',
-                  '<!-- continuum-origin role=project component=aa-self-proving-qualification -->',
-                  `Product Contract qualified on exact current main \`${sha}\`; capability #6 is complete.`,
-                ].join('\n'),
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                state: 'closed',
-                state_reason: 'completed',
-                labels: ['priority:p1'],
-              });
+              await apiRetry('close qualification tracker', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  state: 'closed',
+                  state_reason: 'completed',
+                  labels: [],
+                })
+              );
+              await apiRetry('publish capability completion comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  body: [
+                    '⚡ **AA self-proving qualification**',
+                    '<!-- continuum-origin role=project component=aa-self-proving-qualification -->',
+                    `Product Contract qualified on exact current main \`${sha}\`; capability #6 is complete.`,
+                  ].join('\n'),
+                })
+              );
+              await apiRetry('close capability issue', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  state: 'closed',
+                  state_reason: 'completed',
+                  labels: ['priority:p1'],
+                })
+              );
 
-              const openIssues = await github.paginate(github.rest.issues.listForRepo, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                per_page: 100,
-              });
+              const openIssues = await apiRetry('list open repair issues', () =>
+                github.paginate(github.rest.issues.listForRepo, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  per_page: 100,
+                })
+              );
               for (const issue of openIssues) {
                 if (
                   !issue.pull_request &&
                   String(issue.body || '').includes('<!-- aa-self-proving-repair:v1 -->')
                 ) {
-                  await github.rest.issues.update({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: issue.number,
-                    state: 'closed',
-                    state_reason: 'completed',
-                  });
+                  await apiRetry('close completed repair issue', () =>
+                    github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      state: 'closed',
+                      state_reason: 'completed',
+                    })
+                  );
                 }
               }
               core.notice(`Product Contract PASS accepted for exact main ${sha}; #7 and #6 completed.`);
             } else {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 7,
-                state: 'open',
-                labels: ['automation:in-progress'],
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: 6,
-                state: 'open',
-                labels: ['priority:p1', 'automation:qualifying', 'automation:blocked'],
-              });
+              await apiRetry('mark qualification tracker unqualified', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  state: 'open',
+                  labels: ['automation:in-progress'],
+                })
+              );
+              await apiRetry('mark capability blocked', () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 6,
+                  state: 'open',
+                  labels: ['priority:p1', 'automation:qualifying', 'automation:blocked'],
+                })
+              );
               core.warning(
                 `Product Contract remains unqualified at exact main ${sha}; self-proving repair loop continues from Gate ${blocking}.`
               );
