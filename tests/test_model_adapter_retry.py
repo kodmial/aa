@@ -110,8 +110,13 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     # Live SLO guard: a persistent 403 for the pinned primary must fail over
     # fast (single bounded >=5s retry, then fallback) instead of burning 35s
     # of sleep per provider call (Gate C run 37498373507: p50 50s/p95 86s).
+    # Gate C repair (run 37608207212): custom-selector 403 first retries the
+    # same strong primary with the selector omitted before the weak
+    # fallback, so the scripted primary exhausts custom (2x) + omitted (1x)
+    # before fallback.
     client = _ScriptedClient(
         text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             "fallback-ok",
@@ -131,7 +136,7 @@ async def test_text_403_retries_with_exponential_backoff_then_uses_fallback(
     )
 
     assert await model._ainvoke_text("hello") == "fallback-ok"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
     assert sleeps[0] >= 5.0
 
@@ -171,13 +176,18 @@ async def test_persistent_403_skips_redundant_primary_retry(
     The first call performs the required >=5s retry then fallback. Later
     calls in the same process go directly to fallback without burning
     another 5s sleep plus slow primary attempts per call (15s overhead
-    per ordinary turn).
+    per ordinary turn). Gate C repair (37608207212) tries the omitted
+    primary before the weak fallback on both slow and fast paths, so each
+    exhausted primary costs custom (2x) + omitted (1x) before fallback on
+    the slow path and omitted (1x) before fallback on the fast path.
     """
     client = _ScriptedClient(
         text_outcomes=[
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
             "fallback-ok-1",
+            OpenCodeProviderAccessError("http=403"),
             "fallback-ok-2",
         ]
     )
@@ -195,11 +205,11 @@ async def test_persistent_403_skips_redundant_primary_retry(
     )
 
     assert await model._ainvoke_text("hello") == "fallback-ok-1"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
 
     assert await model._ainvoke_text("hello again") == "fallback-ok-2"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
 
 
@@ -209,6 +219,7 @@ async def test_primary_recovery_closes_circuit(
     """A recovered primary must be retried after the circuit TTL."""
     client = _ScriptedClient(
         text_outcomes=[
+            OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
             "fallback-ok",
@@ -229,7 +240,7 @@ async def test_primary_recovery_closes_circuit(
     )
 
     assert await model._ainvoke_text("hello") == "fallback-ok"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     # Force circuit expiry without waiting for the TTL. Setting the stamp to
     # 0.0 is not sufficient: time.monotonic() on a freshly booted runner can
     # be below the TTL, leaving the circuit open. Expire relative to now.
@@ -242,7 +253,7 @@ async def test_primary_recovery_closes_circuit(
     model._primary_access_rejected_at = _expired
     _ma._PRIMARY_CIRCUIT[_ma._circuit_key(PRIMARY)] = _expired
     assert await model._ainvoke_text("hello again") == "primary-ok"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK, PRIMARY]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK, PRIMARY]
     assert model._primary_access_rejected_at is None
 
 
@@ -284,6 +295,7 @@ async def test_fallback_403_clears_primary_circuit(
         text_outcomes=[
             OpenCodeProviderAccessError("primary-403"),
             OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("omitted-403"),
             OpenCodeProviderAccessError("fallback-403"),
             "primary-recovered",
         ]
@@ -315,6 +327,7 @@ async def test_structured_fallback_403_clears_primary_circuit(
         structured_outcomes=[
             OpenCodeProviderAccessError("primary-403"),
             OpenCodeProviderAccessError("primary-403"),
+            OpenCodeProviderAccessError("omitted-403"),
             OpenCodeProviderAccessError("fallback-403"),
             {"ok": True},
         ]
@@ -356,12 +369,16 @@ async def test_cross_agent_shares_primary_403_circuit(
     served and 14 generic clarifications: each agent burned its own primary
     retry per turn. A planner rejection must open the process-wide circuit
     so answer/verifier bound via with_agent go directly to fallback.
+    Gate C repair (37608207212) tries omitted primary before weak fallback
+    on both paths, so exhausted primaries cost an extra omitted PRIMARY.
     """
     client = _ScriptedClient(
         text_outcomes=[
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
             "planner-fallback-ok",
+            OpenCodeProviderAccessError("http=403"),
             "answer-fallback-ok",
         ]
     )
@@ -379,12 +396,12 @@ async def test_cross_agent_shares_primary_403_circuit(
     )
 
     assert await planner._ainvoke_text("planner hello") == "planner-fallback-ok"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
 
     answer = planner.with_agent("aa-v2")
     assert await answer._ainvoke_text("answer hello") == "answer-fallback-ok"
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
 
 
@@ -396,7 +413,9 @@ async def test_with_agent_created_after_rejection_fast_fallbacks_structured(
         structured_outcomes=[
             OpenCodeProviderAccessError("http=403"),
             OpenCodeProviderAccessError("http=403"),
+            OpenCodeProviderAccessError("http=403"),
             {"queries": ["q0"] * 12},
+            OpenCodeProviderAccessError("http=403"),
             {"units": [], "all_required_supported": True},
         ]
     )
@@ -422,5 +441,5 @@ async def test_with_agent_created_after_rejection_fast_fallbacks_structured(
         "units": [],
         "all_required_supported": True,
     }
-    assert client.models == [PRIMARY, PRIMARY, FALLBACK, FALLBACK]
+    assert client.models == [PRIMARY, PRIMARY, PRIMARY, FALLBACK, PRIMARY, FALLBACK]
     assert sleeps == [5.0]
