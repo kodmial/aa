@@ -70,6 +70,28 @@ ANSWER_MAX_PASSAGE_CHARS = 600
 
 ANSWER_MAX_MESSAGE_CHARS = 500
 
+# Bounded answer history count (Gate C+E live repair, kodmial/aa#217
+# recurrence 8 on exact main 46cf046 run 37717319855:
+# C:live-answer-no-generic-collapse plus E:latency-budget-exceeded p50
+# 18.0s / p95 30.1s / max 43.7s with planner p50 5.5s / p95 8.2s,
+# retrieval p50 0.4s, answer p50 7.3s / p95 11.8s / max 25.3s
+# (matching the message-text max 25.3s) and verifier p50 5.0s / p95
+# 12.0s, repair_turns=0, 74 text calls at p50 4.5s). Comparison with
+# recurrence 7 (58f943c run 37709271567: planner 8.4/9.9s, verifier
+# 10.1/12.0s, answer ~8.9s) shows recurrences 6/7 bounded the planner
+# and verifier attempt times, leaving the single answer draft as the
+# only unbounded model call on the base chain: one provider tail
+# directly breaches the 30s max and starves the downstream verifier
+# (2 unavailable units -> generic clarification). Repeating the same
+# per-passage/per-message char trim cannot converge (6->5 already
+# done twice on both windows). This bounds a different dimension at
+# the answer-assembly boundary: message COUNT. Only the last N
+# messages travel; older continuity stays via the running summary and
+# the live user message travels untruncated. Verification, checksum,
+# quote and cite gates still use the full stored pack. Turn-
+# independent, never an exact-question special case.
+ANSWER_MAX_HISTORY_MESSAGES = 6
+
 ANSWER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
 
@@ -156,7 +178,15 @@ def build_answer_messages(
     """
     system_text = system_prompt or load_aa_agent_system_v2()
     assembled: list[BaseMessage] = [SystemMessage(content=system_text)]
-    for message in recent:
+    # History-count bound (recurrence 8): keep order, keep the most
+    # recent window only. Older turns stay reachable via the running
+    # summary carried in the structured payload.
+    windowed = list(
+        recent[-ANSWER_MAX_HISTORY_MESSAGES:]
+        if len(recent) > ANSWER_MAX_HISTORY_MESSAGES
+        else recent
+    )
+    for message in windowed:
         if message.type == "human":
             content = message.content
             text = content if isinstance(content, str) else str(content)
@@ -180,6 +210,7 @@ def build_answer_messages(
 
 
 __all__ = [
+    "ANSWER_MAX_HISTORY_MESSAGES",
     "ANSWER_MAX_MESSAGE_CHARS",
     "ANSWER_MAX_PASSAGE_CHARS",
     "ANSWER_TRUNCATION_SUFFIX_FORMAT",

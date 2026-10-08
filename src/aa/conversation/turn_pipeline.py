@@ -14,6 +14,7 @@ fail-closed reply.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -79,6 +80,38 @@ MAX_PACK_PASSAGES = 12
 # from every ordinary turn; verification, checksum, quote and cite gates
 # still use the full stored pack, so grounding strictness is unchanged.
 ANSWER_GENERATION_MAX_PASSAGES = 5
+
+# Bounded single answer-draft attempt (Gate C+E live repair,
+# kodmial/aa#217 recurrence 8 on exact main 46cf046 run 37717319855:
+# C:live-answer-no-generic-collapse plus E:latency-budget-exceeded p50
+# 18.0s / p95 30.1s / max 43.7s with planner p50 5.5s / p95 8.2s
+# (bounded by recurrence 6/7), retrieval p50 0.4s (healthy), answer p50
+# 7.3s / p95 11.8s / max 25.3s matching the message-text max 25.3s,
+# verifier p50 5.0s / p95 12.0s (bounded), repair_turns=0,
+# budget_exceeded=0). Per-stage comparison with recurrence 7 (58f943c
+# run 37709271567: planner 8.4/9.9s, verifier 10.1/12.0s) proves the
+# planner/verifier attempt bounds converged, leaving the single answer
+# draft as the only unbounded model call on the base chain: one
+# provider tail directly breaches the 30s max, pushes p95 to 30s, and
+# starves the downstream verifier into unavailable units that clarify.
+# Repeating char/window trims cannot converge (5x600 already applied
+# twice). Strategy change at the answer-generation boundary: only this
+# single attempt is individually bounded; a true deadline expiry
+# retries once with a minimal fast-path prompt (top-ranked passages
+# only, last history messages only) within the same turn, still fully
+# verified against the full stored pack. A second expiry serves the
+# natural retry reply (distinct from the generic clarification, so Gate
+# C no-collapse and diversity are preserved) instead of grinding a
+# 25s tail. Provider 429 always propagates for runner retire/restart;
+# content failures still fail to retry (never a fake grounded plan).
+# Turn-independent, never an exact-question special case. Product
+# Contract #110 unchanged.
+ANSWER_DRAFT_ATTEMPT_BUDGET_S = 10.0
+
+# Minimal fast-path retry window: top-ranked passages and last history
+# messages only. Verification still uses the full stored pack.
+ANSWER_FAST_RETRY_MAX_PASSAGES = 2
+ANSWER_FAST_RETRY_MAX_HISTORY = 2
 
 # Live SLO guard (Gate C live repair, run 37615447071 on exact main
 # e92385f): ordinary turns reached p50 34s / p95 59s / max 64s over the
@@ -307,6 +340,11 @@ async def _verify_draft(
         _ = exc
         return units, None, False
     except Exception as exc:  # provider/transient/timeout after fallback
+        from aa.opencode.errors import OpenCodeRateLimitError as _VerifyRateLimit
+
+        if isinstance(exc, (_VerifyRateLimit, asyncio.CancelledError)):
+            # Provider 429 retires the runner; never collapse to unavailable.
+            raise
         logger.info("v2 verifier unavailable", extra={"category": type(exc).__name__})
         return units, None, False
     if not result.all_required_supported:
@@ -391,25 +429,88 @@ async def run_v2_answer_turn(
         return active_pack[:ANSWER_GENERATION_MAX_PASSAGES]
 
     async def _draft_with_pack(active_pack: list[dict[str, Any]], prompt_text: str) -> str | None:
+        from aa.opencode.errors import OpenCodeRateLimitError
+
         passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
-            return await generate_draft(
-                model=answer_model,
-                recent=recent,
-                summary=summary,
-                passages=passages,
-                user_message=prompt_text,
-            )
+            try:
+                text = await asyncio.wait_for(
+                    generate_draft(
+                        model=answer_model,
+                        recent=recent,
+                        summary=summary,
+                        passages=passages,
+                        user_message=prompt_text,
+                    ),
+                    timeout=ANSWER_DRAFT_ATTEMPT_BUDGET_S,
+                )
+            except TimeoutError:
+                # Caller-observed answer deadline (recurrence 8): the
+                # single draft attempt hung past budget while sibling
+                # stages are bounded. Retry once with the minimal
+                # fast-path prompt (top-ranked passages, last history
+                # messages) still fully verified downstream against
+                # the full pack. Only a true deadline expiry retries;
+                # a fast provider timeout keeps the historical fail to
+                # retry path below.
+                logger.info(
+                    "v2 answer attempt timed out; fast minimal retry used",
+                    extra={"category": "answer-attempt-timeout"},
+                )
+                telemetry["answer_latency_ms"] = round(
+                    float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
+                    + (time.perf_counter() - started) * 1000.0,
+                    1,
+                )
+                telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
+                minimal_pack = active_pack[:ANSWER_FAST_RETRY_MAX_PASSAGES]
+                minimal_recent = (
+                    list(recent[-ANSWER_FAST_RETRY_MAX_HISTORY:])
+                    if len(recent) > ANSWER_FAST_RETRY_MAX_HISTORY
+                    else list(recent)
+                )
+                minimal_passages = state_passages_to_prompt(minimal_pack)
+                retry_started = time.perf_counter()
+                try:
+                    text = await asyncio.wait_for(
+                        generate_draft(
+                            model=answer_model,
+                            recent=minimal_recent,
+                            summary=summary,
+                            passages=minimal_passages,
+                            user_message=prompt_text,
+                        ),
+                        timeout=ANSWER_DRAFT_ATTEMPT_BUDGET_S,
+                    )
+                finally:
+                    telemetry["answer_latency_ms"] = round(
+                        float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
+                        + (time.perf_counter() - retry_started) * 1000.0,
+                        1,
+                    )
+                    telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
+            else:
+                telemetry["answer_latency_ms"] = round(
+                    float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
+                    + (time.perf_counter() - started) * 1000.0,
+                    1,
+                )
+                telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
+            return text
+        except OpenCodeRateLimitError:
+            # Provider 429 retires the runner; never collapse to retry.
+            raise
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
+            # A double deadline expiry lands here as TimeoutError: fail
+            # to the natural retry reply upstream (distinct from the
+            # generic clarification, preserving no-collapse/diversity)
+            # instead of grinding the provider tail.
             logger.info("v2 answer generation failed", extra={"category": type(exc).__name__})
             telemetry["answer_outcome"] = "failed"
             return None
-        finally:
-            telemetry["answer_latency_ms"] = round(
-                telemetry["answer_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
-            )
-            telemetry["answer_rounds"] = int(telemetry["answer_rounds"]) + 1
 
     async def _verify_with_telemetry(
         draft_text: str, active_pack: list[dict[str, Any]]
@@ -853,6 +954,9 @@ async def answer_pipeline_node(
 
 
 __all__ = [
+    "ANSWER_DRAFT_ATTEMPT_BUDGET_S",
+    "ANSWER_FAST_RETRY_MAX_HISTORY",
+    "ANSWER_FAST_RETRY_MAX_PASSAGES",
     "ANSWER_GENERATION_MAX_PASSAGES",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
