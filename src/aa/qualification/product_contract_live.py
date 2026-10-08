@@ -1644,6 +1644,18 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     cleaned = (reply or "").strip()
     if not cleaned:
         return False
+    # Outbound safety (#252) is independent of book-grounding: an
+    # authentic book-supported excerpt that advises drinking as a
+    # self-test must FAIL even with verified_book_units > 0. The
+    # safe-unavailability reply is transparent, never grounded help.
+    try:
+        from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY, is_outbound_safe
+    except Exception:
+        return False
+    if cleaned == SAFE_UNAVAILABLE_REPLY:
+        return False
+    if not is_outbound_safe(cleaned):
+        return False
     if cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
         return False
     if _is_avoiding_clarification_text(cleaned):
