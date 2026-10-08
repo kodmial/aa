@@ -416,7 +416,7 @@ def assess_turn_adequacy(
             verified_book_units=verified_count,
             evidence_passages=len(pack),
         )
-    if not all_supported:
+    if not all_supported or verified_count == 0 or not pack:
         return AdequacyAssessment(
             substantive_request=substantive,
             technically_grounded=False,

@@ -1725,18 +1725,25 @@ def assess_reply_relevance_with_rubric(
 
     Primary signal is the production semantic verifier verdict carried in
     ``telemetry`` (groundedness + answer relevance from the same
-    invocation). When telemetry is present, it is authoritative: a turn
-    whose adequacy gate passed and whose verifier marks the answer
-    relevant counts as relevant, anything else does not. No step-number
-    extraction, domain-stem matching or token-prefix overlap is applied.
+    invocation). When telemetry is present without an independent
+    ``judge``, it decides: a turn whose adequacy gate passed and whose
+    verifier marks the answer relevant counts as relevant, anything else
+    does not. No step-number extraction, domain-stem matching or
+    token-prefix overlap is applied.
 
-    When telemetry is absent, an optional injected ``judge`` model/rubric
-    callable ``judge(prompt, reply, context) -> bool`` decides. Without
-    either signal this fails closed to False: string heuristics never
-    prove relevance.
+    When both telemetry and an injected ``judge`` model/rubric callable
+    ``judge(prompt, reply, context) -> bool`` are present, both must
+    agree: a dissenting independent judge fails closed to False so a
+    verifier false-positive (irrelevant-but-grounded text marked
+    pass/relevant) cannot pass on telemetry alone. When telemetry is
+    absent, the ``judge`` alone decides. Without either signal this
+    fails closed to False: string heuristics never prove relevance.
     """
-    _ = context
-    if isinstance(telemetry, dict) and telemetry:
+    has_telemetry = isinstance(telemetry, dict) and bool(telemetry)
+    has_judge = callable(judge)
+
+    def _telemetry_verdict() -> bool:
+        assert isinstance(telemetry, dict)
         adequacy = str(telemetry.get("adequacy_verdict", "") or "").strip()
         answers = telemetry.get("answers_request", None)
         grounded = telemetry.get("technically_grounded", None)
@@ -1750,21 +1757,57 @@ def assess_reply_relevance_with_rubric(
         if isinstance(explicit, bool):
             return explicit
         return False
-    if callable(judge):
+
+    def _judge_verdict() -> bool:
         try:
-            return bool(judge(prompt, reply, context))
+            return bool(judge(str(prompt), str(reply), str(context or "")))
         except Exception:
             return False
+
+    if has_telemetry and has_judge:
+        return bool(_telemetry_verdict() and _judge_verdict())
+    if has_telemetry:
+        return bool(_telemetry_verdict())
+    if has_judge:
+        return bool(_judge_verdict())
     return False
 
 
-def _assess_live_relevance(snapshot: dict[str, Any], reply: str) -> bool:
-    """Judge one live reply from model verdicts plus syntactic guards only."""
+def _assess_live_relevance(
+    prompt: str,
+    snapshot: dict[str, Any],
+    reply: str,
+    *,
+    context: str = "",
+    judge: Any = None,
+) -> bool:
+    """Judge one live reply against its own prompt plus model verdicts.
+
+    The prompt is compared independently of the production adequacy
+    verdict: an empty prompt fails closed, and the prompt/reply/context
+    triple is always forwarded to
+    :func:`assess_reply_relevance_with_rubric` (never an empty prompt
+    with telemetry only). When an independent ``judge`` is supplied,
+    telemetry and judge must both agree, so the live negative controls
+    can catch a verifier false-positive where irrelevant-but-grounded
+    text is marked pass/relevant. Only syntactic guards (empty reply)
+    live here; no domain tables or token heuristics are applied.
+    """
     if not isinstance(snapshot, dict) or not snapshot:
         return False
-    if not str(reply or "").strip():
+    cleaned_prompt = str(prompt or "").strip()
+    cleaned_reply = str(reply or "").strip()
+    if not cleaned_prompt or not cleaned_reply:
         return False
-    return bool(assess_reply_relevance_with_rubric("", str(reply), telemetry=dict(snapshot)))
+    return bool(
+        assess_reply_relevance_with_rubric(
+            cleaned_prompt,
+            cleaned_reply,
+            context=str(context or ""),
+            telemetry=dict(snapshot),
+            judge=judge,
+        )
+    )
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
@@ -2166,7 +2209,15 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # verifier already resolved follow-ups, ellipsis
                         # and topic shifts against conversation state.
                         # No keyword context-rescue is applied here.
-                        relevant = _assess_live_relevance(snapshot, reply)
+                        # The live prompt itself is forwarded so relevance
+                        # compares reply to prompt instead of mirroring
+                        # the adequacy verdict alone.
+                        relevant = _assess_live_relevance(
+                            prompt,
+                            snapshot,
+                            reply,
+                            context="\n".join(prior_prompts[-2:]),
+                        )
                         _check(f"live-book-grounding-{family}-{position}", bool(grounded))
                         _check(
                             f"live-answer-relevance-{family}-{position}",
@@ -2185,7 +2236,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # mechanical anti-fallback/output guards in the
                         # qualification layer; do not infer semantics from
                         # phrases, punctuation, or sentence length.
-                        continuation_semantic = _assess_live_relevance(snapshot, reply)
+                        continuation_semantic = _assess_live_relevance(
+                            prompt,
+                            snapshot,
+                            reply,
+                            context="\n".join(prior_prompts[-2:]),
+                        )
                         continuation_output_ok = (
                             reply.strip()
                             and reply.strip()
@@ -2251,7 +2307,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 except Exception:
                     pass
                 step_grounded = _is_grounded_substantive_reply(step_snapshot, step_reply_2)
-                step_relevant = _assess_live_relevance(step_snapshot, step_reply_2)
+                step_relevant = _assess_live_relevance(
+                    step_followup, step_snapshot, step_reply_2, context=step_first
+                )
                 step_ok = bool(step_reply_2.strip()) and step_reply_2.strip() not in {
                     NATURAL_CLARIFICATION_REPLY,
                     *NATURAL_RETRY_VARIANTS,
@@ -2293,7 +2351,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 )
                 _check(
                     "live-short-admission-second-relevant",
-                    bool(_assess_live_relevance(short_snapshot, short_reply_2)),
+                    bool(
+                        _assess_live_relevance(
+                            short_second, short_snapshot, short_reply_2, context=short_first
+                        )
+                    ),
                 )
                 _check(
                     "live-short-admission-no-fallback",
@@ -2344,16 +2406,28 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     pass
                 _check(
                     "live-context-switch-helpful",
-                    bool(_assess_live_relevance(switch_snapshot, switch_reply))
+                    bool(
+                        _assess_live_relevance(
+                            "А теперь другое: ночью не могу уснуть",
+                            switch_snapshot,
+                            switch_reply,
+                        )
+                    )
                     and switch_reply.strip()
                     not in {
                         NATURAL_CLARIFICATION_REPLY,
                         *NATURAL_RETRY_VARIANTS,
                     },
                 )
+            # Negative controls compare each irrelevant reply against its
+            # own prompt instead of mirroring the adequacy verdict alone.
+            # The fail-telemetry cases must fail, and a verifier
+            # false-positive (passing telemetry for irrelevant text) must
+            # still fail once the independent judge dissents.
             _check(
                 "live-negative-control-unrelated-citation-fails",
                 not _assess_live_relevance(
+                    "Расскажи про Первый шаг программы выздоровления",
                     {
                         "adequacy_verdict": "fail",
                         "answers_request": False,
@@ -2365,12 +2439,41 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             _check(
                 "live-negative-control-wrong-step-fails",
                 not _assess_live_relevance(
+                    "Расскажи про Первый шаг программы выздоровления",
                     {
                         "adequacy_verdict": "fail",
                         "answers_request": False,
                         "technically_grounded": True,
                     },
                     "Третий шаг говорит о решениях и воле.",
+                ),
+            )
+            _check(
+                "live-negative-control-false-positive-citation-fails",
+                not assess_reply_relevance_with_rubric(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    "Ведите финансовый бюджет спокойно.",
+                    telemetry={
+                        "adequacy_verdict": "pass",
+                        "answers_request": True,
+                        "technically_grounded": True,
+                        "answer_relevant": True,
+                    },
+                    judge=lambda prompt, reply, context: False,
+                ),
+            )
+            _check(
+                "live-negative-control-false-positive-step-fails",
+                not assess_reply_relevance_with_rubric(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    "Третий шаг говорит о решениях и воле.",
+                    telemetry={
+                        "adequacy_verdict": "pass",
+                        "answers_request": True,
+                        "technically_grounded": True,
+                        "answer_relevant": True,
+                    },
+                    judge=lambda prompt, reply, context: False,
                 ),
             )
 
