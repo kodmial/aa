@@ -257,10 +257,7 @@ def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
         if (
             _REFUSAL_RE.search(clause) is not None
             or _NEGATION_RE.search(clause) is not None
-            or (
-                _CAUTION_RE.search(clause) is not None
-                and _STRONG_ADVICE_RE.search(clause) is None
-            )
+            or (_CAUTION_RE.search(clause) is not None and _STRONG_ADVICE_RE.search(clause) is None)
         ):
             continue
         clause_drink = _DRINK_RE.search(clause) is not None
@@ -290,10 +287,7 @@ def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
     # non-exempt drinking action in another (coordination with comma or
     # words such as "a/potom", or a purpose link). Drinking mentioned as
     # craving context or as an avoided outcome never counts as advised.
-    if (
-        _ADVICE_RE.search(sentence) is not None
-        and _DRINK_RE.search(sentence) is not None
-    ):
+    if _ADVICE_RE.search(sentence) is not None and _DRINK_RE.search(sentence) is not None:
         candidate = False
         for clause in clauses:
             if _DRINK_RE.search(clause) is None:
