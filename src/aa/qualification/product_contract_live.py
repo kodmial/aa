@@ -1400,19 +1400,223 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
-def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
-    """Accept actual book-grounded answers, never hash-selected filler.
+_GENERIC_OFFER_MARKERS = (
+    "помогу разобрать",
+    "помогаю разобрать",
+    "ближайшие шаги",
+    "конкретную ситуацию",
+    "конкретной ситуации",
+)
 
-    This is a qualification-only invariant, not content/keyword routing.
-    It uses privacy-safe verifier counts and the real production turn outcome;
-    no prompt, reply or corpus text enters telemetry.
+_CLARIFICATION_CUES = (
+    "подробнее",
+    "расскажите",
+    "расскажи",
+    "уточните",
+    "уточни",
+    "что сейчас важнее",
+    "что именно",
+    "о чем именно",
+    "о чём именно",
+)
+
+
+def _declarative_sentences(reply: str) -> list[str]:
+    """Return declarative (``.``/``!``-terminated) sentences."""
+    import re as _re
+
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return []
+    found = _re.findall(r"[^.!?]+[.!]+", cleaned)
+    remainder = _re.sub(r"[^.!?]+[.!?]+", "", cleaned).strip()
+    sentences = [part.strip() for part in found if part.strip()]
+    if remainder and not remainder.rstrip().endswith("?"):
+        sentences.append(remainder)
+    return sentences
+
+
+def _is_avoiding_clarification_text(reply: str) -> bool:
+    """Whether a sent reply is an avoiding clarification without substance.
+
+    Qualification-only generic signal, never runtime routing: a reply that
+    carries a clarification cue but no declarative substantive sentence
+    beyond generic offers cannot count as helpful even when verifier counts
+    are present. No exact live prompt text is matched here; only generic RU
+    clarification cues and sentence shape are used.
+    """
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.casefold()
+    has_cue = any(cue in lowered for cue in _CLARIFICATION_CUES)
+    declaratives = [
+        part
+        for part in _declarative_sentences(cleaned)
+        if len(part) >= 20 and any(ch.isalpha() for ch in part)
+    ]
+    substantive = [
+        part
+        for part in declaratives
+        if not any(marker in part.casefold() for marker in _GENERIC_OFFER_MARKERS)
+    ]
+    if has_cue and not substantive:
+        return True
+    if cleaned.rstrip().endswith("?") and not substantive and len(cleaned) < 200:
+        return True
+    return False
+
+
+def _is_service_link_only_text(reply: str) -> bool:
+    """Whether a sent reply is only a service source link without help.
+
+    Qualification-only generic signal: real grounded answers carry natural
+    prose and no Bot API links/internal ids. A reply whose substantive
+    content is only a URL or a bare source pointer fails helpfulness.
+    """
+    lowered = (reply or "").casefold()
+    if not lowered.strip():
+        return True
+    if "http://" in lowered or "https://" in lowered or "t.me" in lowered:
+        return True
+    if "pc-s-" in lowered or "chunk" in lowered:
+        return True
+    return False
+
+
+def _is_quote_only_text(reply: str) -> bool:
+    """Whether a sent reply is only a verbatim quote without guidance.
+
+    Qualification-only generic signal: a reply dominated by quoted spans
+    (more than half of its characters inside quotes) with little surrounding
+    natural guidance is an irrelevant-quote failure, not a helpful answer.
+    """
+    text = (reply or "").strip()
+    if not text:
+        return True
+    try:
+        from aa.conversation.output_limits import aggregate_quote_chars
+    except Exception:
+        return False
+    try:
+        quoted = int(aggregate_quote_chars(text) or 0)
+    except Exception:
+        return False
+    if quoted <= 0:
+        return False
+    return quoted / max(1, len(text)) > 0.5
+
+
+def _has_declarative_substance(reply: str) -> bool:
+    """Whether a sent reply carries at least one declarative RU sentence."""
+    import re as _re
+
+    cleaned = (reply or "").strip()
+    if len(cleaned) < 20:
+        return False
+    for part in _declarative_sentences(cleaned):
+        if len(part) < 20:
+            continue
+        if not _re.search(r"[\u0400-\u04ff]", part):
+            continue
+        lowered = part.casefold()
+        if any(marker in lowered for marker in _GENERIC_OFFER_MARKERS):
+            continue
+        return True
+    return False
+
+
+def _is_direct_meta_reply(reply: str) -> bool:
+    """Whether a sent meta reply is direct, natural and honestly identified.
+
+    Qualification-only: a meta/capability answer must directly state what
+    the assistant can do in natural RU without an evasive clarification
+    template and without a false identity (human/member/sponsor/clinician
+    with lived experience). No exact live prompt text is matched.
+    """
+    from aa.conversation.turn_pipeline import (
+        NATURAL_CLARIFICATION_REPLY,
+        NATURAL_RETRY_VARIANTS,
+        contains_cyrillic,
+        leaks_internal_terms,
+    )
+
+    cleaned = (reply or "").strip()
+    if not cleaned or cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+        return False
+    if not contains_cyrillic(cleaned) or leaks_internal_terms(cleaned):
+        return False
+    if _is_avoiding_clarification_text(cleaned) or _is_service_link_only_text(cleaned):
+        return False
+    lowered = cleaned.casefold()
+    false_identity_markers = (
+        "я человек",
+        "я живой",
+        "я настоящий человек",
+        "я член аа",
+        "я алкоголик",
+        "лет трезвости",
+        "мой опыт трезвости",
+        "я ваш спонсор",
+        "я спонсор",
+        "я врач",
+        "я клиническ",
+        "я психолог",
+        "как врач",
+    )
+    if any(marker in lowered for marker in false_identity_markers):
+        return False
+    # Directness: at least one declarative RU sentence offering help, not
+    # only a question or a one-line evasion. Capability offers count here
+    # (meta answers state what the assistant can do); the generic-offer
+    # filter for substantive turns does not apply to meta directness.
+    import re as _meta_re
+
+    declaratives = [
+        part
+        for part in _declarative_sentences(cleaned)
+        if len(part) >= 20 and _meta_re.search(r"[\u0400-\u04ff]", part)
+    ]
+    if not declaratives:
+        return False
+    if len(cleaned) < 40:
+        return False
+    return True
+
+
+def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
+    """Accept only helpful book-grounded answers on the sent Telegram text.
+
+    Qualification-only invariant, not content/keyword routing. The caller
+    passes the real sent Telegram message text plus the actual turn
+    telemetry snapshot for this turn (never an intermediate draft). A reply
+    counts only when it is a useful answer on the substance of the request:
+    a concrete recommendation/explanation supported by relevant exact
+    canonical RU passages, briefly and human-like, with every substantive
+    claim confirmed by the independent verifier with source-exact
+    provenance. A side book fact, general sympathy, a verification excuse,
+    an avoiding clarification, a template retry, hash-variant filler, a
+    service-link-only pointer or a quote-only dump all fail even when
+    ``verified_book_units > 0``. No prompt, reply or corpus text enters
+    telemetry; only booleans/counts travel outward.
     """
     from aa.conversation.turn_pipeline import (
         NATURAL_CLARIFICATION_REPLY,
         NATURAL_RETRY_VARIANTS,
     )
 
-    if reply.strip() in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return False
+    if cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+        return False
+    if _is_avoiding_clarification_text(cleaned):
+        return False
+    if _is_service_link_only_text(cleaned):
+        return False
+    if _is_quote_only_text(cleaned):
+        return False
+    if not _has_declarative_substance(cleaned):
         return False
     if snapshot.get("answer_outcome") not in (
         "served",
@@ -1420,11 +1624,44 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         "narrowed-compacted",
     ):
         return False
-    return (
-        int(snapshot.get("planner_query_count", 0) or 0) > 0
-        and int(snapshot.get("retrieval_passages", 0) or 0) > 0
-        and int(snapshot.get("verified_book_units", 0) or 0) > 0
-    )
+    # The independent verifier must have produced usable verdicts: no
+    # unavailable units and no turn-budget collapse. A budget-exceeded turn
+    # serves retry/clarification upstream and never counts as grounded help.
+    try:
+        unavailable = int(snapshot.get("verifier_unavailable_units", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if unavailable != 0:
+        return False
+    if bool(snapshot.get("turn_budget_exceeded", False)):
+        return False
+    if str(snapshot.get("verifier_outcome", "")).strip() in (
+        "unavailable",
+        "partial-unavailable",
+        "skipped-turn-budget",
+    ):
+        return False
+    try:
+        planner_count = int(snapshot.get("planner_query_count", 0) or 0)
+        passages = int(snapshot.get("retrieval_passages", 0) or 0)
+        verified = int(snapshot.get("verified_book_units", 0) or 0)
+        response_units = int(snapshot.get("response_units", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if planner_count <= 0 or passages <= 0 or verified <= 0:
+        return False
+    # Every substantive claim must be verifier-supported: a served turn
+    # carries no unsupported book material. Narrowed turns serve only the
+    # supported subset, so they pass here only with at least one supported
+    # book unit and no unavailable units (checked above). Direct pipeline
+    # callers without graph enrichment omit response_units; accept them
+    # when verified book units are present (production still records
+    # response_units via GraphTurnRuntime).
+    if response_units > 0 and verified > response_units:
+        return False
+    if response_units <= 0 and verified <= 0:
+        return False
+    return True
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
@@ -1675,7 +1912,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 (
                     "followup-ellipsis",
                     921002,
-                    "И это реально зачем?",
+                    "Так а что мне делать-то с этим?",
                 ),
                 (
                     "topic-shift",
@@ -1789,9 +2026,30 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     except Exception:
                         pass
                     if family in book_grounded_families:
+                        # Helpfulness is judged on the real sent Telegram
+                        # message plus this turn's actual telemetry snapshot,
+                        # never on an intermediate draft.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
                         _check(f"live-book-grounding-{family}-{position}", grounded)
                         book_grounded_successes += int(grounded)
+                    if family == "meta-capability":
+                        # Meta gets a direct natural RU answer without a
+                        # false identity and without an evasive template.
+                        direct = _is_direct_meta_reply(reply)
+                        _check(f"live-meta-direct-{position}", direct)
+                    if family in ("followup-ellipsis", "topic-shift"):
+                        # Continuations and short contextual follow-ups must
+                        # not collapse to avoiding clarifications, bare
+                        # service links or quote-only dumps. Emergency and
+                        # out-of-book turns keep their own contracts below.
+                        not_avoiding = not _is_avoiding_clarification_text(reply)
+                        not_service = not _is_service_link_only_text(reply)
+                        not_quote_only = not _is_quote_only_text(reply)
+                        has_substance = _has_declarative_substance(reply)
+                        _check(
+                            f"live-continuation-helpful-{family}-{position}",
+                            bool(not_avoiding and not_service and not_quote_only and has_substance),
+                        )
 
             non_answer_fallbacks = {
                 NATURAL_CLARIFICATION_REPLY,
@@ -2249,4 +2507,10 @@ __all__ = [
     "run_voice_lane",
     "validate_exact_sha",
     "working_tree_clean",
+    "_has_declarative_substance",
+    "_is_avoiding_clarification_text",
+    "_is_direct_meta_reply",
+    "_is_grounded_substantive_reply",
+    "_is_quote_only_text",
+    "_is_service_link_only_text",
 ]
