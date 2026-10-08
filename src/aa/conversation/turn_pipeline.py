@@ -113,7 +113,7 @@ ANSWER_GENERATION_MAX_PASSAGES = 5
 # always propagates for runner retire/restart; content failures still
 # fail to retry (never a fake grounded plan). Turn-independent, never
 # an exact-question special case. Product Contract #110 unchanged.
-ANSWER_DRAFT_ATTEMPT_BUDGET_S = 10.0
+ANSWER_DRAFT_ATTEMPT_BUDGET_S = 35.0
 
 # Deprecated recurrence-8 fast-path retry window (kept for import
 # compatibility; recurrence 9 no longer issues a second in-turn answer
@@ -133,7 +133,7 @@ ANSWER_FAST_RETRY_MAX_HISTORY = 2
 # supported units are served, otherwise clarification); no exact-question
 # special case, Product Contract #110 unchanged. Fast turns (mocked tests,
 # healthy provider) still use both rounds.
-TURN_REPAIR_TIME_BUDGET_S = 15.0
+TURN_REPAIR_TIME_BUDGET_S = 90.0
 
 # End-to-end turn guard (Gate C+E live repair, kodmial/aa#217 recurrence
 # 10 on exact main 94fd5b5 run 37722464604, corrected by kodmial/aa#240
@@ -158,7 +158,7 @@ TURN_REPAIR_TIME_BUDGET_S = 15.0
 # content failures still fail closed (never a fake grounded plan).
 # Turn-independent, never an exact-question special case. Product
 # Contract #110 unchanged.
-TURN_END_TO_END_BUDGET_S = 27.0
+TURN_END_TO_END_BUDGET_S = 105.0
 
 # Minimum useful slices of the remaining end-to-end budget. Below the
 # answer slice no answer call is started; below the verifier slice no

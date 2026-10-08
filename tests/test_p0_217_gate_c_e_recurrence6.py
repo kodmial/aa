@@ -98,9 +98,9 @@ def _clear_shared_caches() -> Any:
 
 def test_stage_budgets_are_bounded() -> None:
     """Planner wall, structured attempt and verifier turn each have a hard bound."""
-    assert PLANNER_TIME_BUDGET_S == 10.0
-    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
-    assert VERIFIER_TURN_BUDGET_S == 12.0
+    assert PLANNER_TIME_BUDGET_S == 25.0
+    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
+    assert VERIFIER_TURN_BUDGET_S == 40.0
     assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S < PLANNER_TIME_BUDGET_S
 
 

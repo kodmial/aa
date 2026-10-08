@@ -1143,7 +1143,7 @@ async def _verify_single_unit(
 # become unavailable-unit verdicts, still fail-closed per unit) so those
 # turns narrow to verified supported material instead of clarifying;
 # only a round with no verified unit at all still fails fully closed.
-VERIFIER_TURN_BUDGET_S = 12.0
+VERIFIER_TURN_BUDGET_S = 40.0
 
 
 # Per-unit bound for one native structured verifier attempt (Gate C+E
@@ -1168,7 +1168,7 @@ VERIFIER_TURN_BUDGET_S = 12.0
 # into validated text verdicts. Strict validation of both paths is
 # unchanged; 429 propagates and never triggers the text path.
 # Turn-independent, never an exact-question special case.
-VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
+VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
 
 
 def _diagnostic_no_turn_limits() -> bool:

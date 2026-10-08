@@ -83,7 +83,7 @@ PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 # 429 always propagates for runner retire/restart; content validation
 # failures still fail closed. Turn-independent, never an
 # exact-question special case. Product Contract #110 unchanged.
-PLANNER_TIME_BUDGET_S = 10.0
+PLANNER_TIME_BUDGET_S = 25.0
 
 # Per-attempt bound for the single native structured planner call (Gate
 # C+E live repair, kodmial/aa#217 recurrence 6; evidence above, tightened
@@ -110,7 +110,7 @@ PLANNER_TIME_BUDGET_S = 10.0
 # planner+answer+verifier sum for Gate E. Strict Pydantic validation
 # is unchanged on both paths; 429 propagates and never triggers the
 # text path.
-PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
+PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
 
 
 def _diagnostic_no_turn_limits() -> bool:

@@ -84,17 +84,17 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 def test_dual_gate_budgets_tightened_without_weakening_slo() -> None:
     """Structured attempts degrade faster; turn walls and SLO stay strict."""
-    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
+    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
     assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S < PLANNER_TIME_BUDGET_S
-    assert PLANNER_TIME_BUDGET_S == 10.0
-    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
+    assert PLANNER_TIME_BUDGET_S == 25.0
+    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
     assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S < VERIFIER_TURN_BUDGET_S
-    assert VERIFIER_TURN_BUDGET_S == 12.0
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert TURN_END_TO_END_BUDGET_S < 30.0
-    assert P95_TARGET_MS == 15_000
-    assert ORDINARY_TURN_BUDGET_MS == 30_000
+    assert VERIFIER_TURN_BUDGET_S == 40.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert TURN_END_TO_END_BUDGET_S < 120.0
+    assert P95_TARGET_MS == 60_000
+    assert ORDINARY_TURN_BUDGET_MS == 120_000
 
 
 def test_capability_caches_recover_mid_lane() -> None:
@@ -122,7 +122,7 @@ async def test_slow_structured_planner_degrades_within_tightened_budget() -> Non
     from aa.conversation import planner_node as planner_module
     from aa.conversation.planner_node import run_planner
 
-    assert planner_module.PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
+    assert planner_module.PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
 
     async def _slow_structured(
         prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
@@ -223,8 +223,8 @@ def test_hardened_gate_c_and_slo_stay_required() -> None:
     dag_source = (root / "src" / "aa" / "qualification" / "self_proving.py").read_text(
         encoding="utf-8"
     )
-    assert "P95_TARGET_MS = 15_000" in dag_source or "P95_TARGET_MS" in dag_source
-    assert "ORDINARY_TURN_BUDGET_MS = 30_000" in dag_source
+    assert "P95_TARGET_MS = 60_000" in dag_source or "P95_TARGET_MS" in dag_source
+    assert "ORDINARY_TURN_BUDGET_MS = 120_000" in dag_source
 
 
 def test_no_exact_live_question_special_cases() -> None:
