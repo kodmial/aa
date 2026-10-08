@@ -193,15 +193,32 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
         except QueryPlanValidationError as exc:
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.warning("v2 planner failed closed", extra={"category": "planner-invalid"})
+            # Invalid semantic output is never conversational glue. Use the
+            # generic retrieval fallback from the raw turn plus bounded
+            # managed context, just as for provider/timeout failures.
+            try:
+                _summary = str(state.get("conversation_summary", "") or "")
+                _recent_raw: list[str] = []
+                for _msg in list(state.get("messages", []) or [])[-4:]:
+                    _content = getattr(_msg, "content", "")
+                    if isinstance(_content, str) and _content.strip():
+                        _recent_raw.append(_content.strip()[:200])
+                _fallback = build_generic_fallback_queries(
+                    str(state.get("current_user_message", "")),
+                    summary=_summary,
+                    recent=_recent_raw,
+                )
+            except Exception:
+                _fallback = []
             return {
-                "search_queries": [],
+                "search_queries": list(_fallback),
                 "planner_invoked": True,
                 "planner_mode": "retrieval",
                 "resolved_intent": str(state.get("current_user_message", "")),
                 "retry_state": {
                     "planner_error": str(exc)[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
-                    "planner_query_count": 0,
+                    "planner_query_count": len(_fallback),
                     "planner_outcome": "invalid",
                     "planner_reason": "invalid",
                     "planner_mode": "retrieval",
