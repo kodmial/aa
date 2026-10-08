@@ -591,6 +591,28 @@ class OpenCodeChatModel(BaseChatModel):
                     raise
                 except OpenCodeError:
                     pass
+            else:
+                # Omitted-wire path (planner/answer/summarizer with an empty
+                # transport selector, Gate C run 37725833818): the circuit
+                # would otherwise pin every later turn to the weak fallback
+                # for the full TTL even after the pinned primary recovers,
+                # serving weak drafts that fail the language/leak guard and
+                # collapse to generic clarification with the verifier never
+                # served. Re-probe the already-omitted primary once with no
+                # sleep before falling back; a recovered primary clears the
+                # circuit and restores strong serves, a still-rejected
+                # primary falls through fast to the fallback.
+                try:
+                    reply = await self._invoke_ephemeral(
+                        prompt, model=self.primary_model, agent=self.agent, system=system
+                    )
+                    self._clear_primary_rejection()
+                    logger.info("opencode omitted-wire primary re-probed while circuit open")
+                    return reply
+                except OpenCodeRateLimitError:
+                    raise
+                except OpenCodeError:
+                    pass
             logger.info("opencode primary circuit open, fast fallback used")
             try:
                 reply = await self._invoke_ephemeral(
@@ -718,6 +740,33 @@ class OpenCodeChatModel(BaseChatModel):
                     )
                     logger.info("opencode omitted primary served while circuit open")
                     return omitted
+                except OpenCodeRateLimitError:
+                    raise
+                except OpenCodeDeterministicError as exc:
+                    if "structured output missing" in str(exc).lower():
+                        mark_omitted_structured_unavailable(self)
+                except OpenCodeError:
+                    pass
+            elif not self.wire_agent and not omitted_structured_unavailable(self):
+                # Omitted-wire structured path (same Gate C recovery as the
+                # text path above): re-probe the already-omitted primary
+                # once with no sleep when the capability is not known to be
+                # missing. A recovered primary clears the circuit and
+                # restores strong structured plans; a still-rejected primary
+                # falls through fast to the fallback. A cached deterministic
+                # capability failure keeps the direct fallback above.
+                try:
+                    result = await self._invoke_ephemeral_structured(
+                        prompt,
+                        system=system,
+                        schema=schema,
+                        model=self.primary_model,
+                        agent=self.agent,
+                        retry_count=retry_count,
+                    )
+                    self._clear_primary_rejection()
+                    logger.info("opencode omitted-wire primary re-probed while circuit open")
+                    return result
                 except OpenCodeRateLimitError:
                     raise
                 except OpenCodeDeterministicError as exc:
