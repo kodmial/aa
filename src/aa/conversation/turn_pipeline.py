@@ -791,13 +791,16 @@ async def run_v2_answer_turn(
                 _recovery_queries = []
             if _recovery_queries:
                 try:
-                    from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
+                    from aa.retrieval.evidence import (
+                        RetrievalConfig,
+                        retrieve_evidence_for_recovery,
+                    )
 
                     _active_cfg = (
                         retrieval_config if retrieval_config is not None else RetrievalConfig()
                     )
                     _rec_started = time.perf_counter()
-                    _rec_pack = retrieve_evidence(
+                    _rec_pack = retrieve_evidence_for_recovery(
                         retrieval_index, _recovery_queries, config=_active_cfg
                     )
                     from aa.conversation.retrieval_node import pack_to_state as _pack_state

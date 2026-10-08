@@ -725,7 +725,12 @@ def assess_turn_adequacy(
         # generic/terse current turn that carries little standalone
         # topical content; otherwise a prior craving turn would rescue a
         # craving-only reply to a current finance-budget question.
-        _current_allows_context_rescue = len(request_tokens) <= 2
+        # Bound at four substantive tokens so a generic continuation
+        # with demonstratives and adverbs (four generic tokens, no
+        # recovery-domain vocabulary of its own) still resolves against
+        # the immediately preceding turns, while a six-token explicit
+        # pivot with distinct topic content stays on its own merits.
+        _current_allows_context_rescue = len(request_tokens) <= 4
         if not _direct_overlap and context_prefixes and _current_allows_context_rescue:
             # Contextual follow-up resolution (generic, turn-independent):
             # a terse follow-up in an ongoing conversation is relevant
