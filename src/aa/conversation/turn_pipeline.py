@@ -15,7 +15,6 @@ fail-closed reply.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 import time
@@ -190,86 +189,22 @@ NATURAL_CLARIFICATION_REPLY = (
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."
 )
 
-NATURAL_RETRY_REPLY = "Давайте продолжим спокойно. Расскажите, что сейчас беспокоит сильнее всего?"
-
-# Bounded natural retry variants (Gate C live repair, kodmial/aa#236
-# recurrence 2 on exact main d4cb46f run 37732467481: the SAME stable
-# failure set recurred
-# (C:live-answer-diversity:live-production-path) after the recurrence-1
-# repair. Per-stage comparison of the new evidence against the prior
-# failure (ef7970f run 37728213619) proves the recurrence-1 local patch
-# cannot converge, so this repair changes strategy at the responsible
-# fallback/diversity boundary instead of repeating it:
-#
-# - Prior failure: every retry path served one byte-identical
-#   NATURAL_RETRY_REPLY, so slow/transient turns collapsed to one
-#   string and the ``len(set(replies)) >= 8`` floor failed.
-# - Recurrence-1 patch: 4 variants keyed by stripped message-length
-#   parity (``len % 4``).
-# - New failure: answer_rounds=13 with budget_exceeded=6, verifier p50
-#   0ms, and 3 graph natural fallbacks, i.e. slow-tail turns still
-#   funnel into the retry pool while planner (p50 5.7s) and retrieval
-#   (p50 0.6s) stay healthy and grounding/model identity hold. The
-#   dominant persistent cause is therefore the retry pool itself: it
-#   caps within-run distinctness at 4 < 8 floor by construction, and
-#   length parity collides heavily for unrelated prompts (the 16 live
-#   prompts occupy exactly 4 length buckets with skew, so fallback
-#   turns for differently-worded same-length questions stay
-#   byte-identical). No per-stage timeout/token retune can converge
-#   this: each stage already respects its bound, and latency-only
-#   tuning belongs to Gate E, not Gate C.
-#
-# Strategy change at the fallback/diversity boundary (not another pool
-# resize under the same key): selection now uses a uniform stable hash
-# (SHA-256) of the normalized message modulo the pool size, and the
-# bounded pool is sized ABOVE the diversity floor (10 >= 8) so even an
-# all-fallback worst case can satisfy it. Differently-worded
-# same-length prompts spread uniformly instead of colliding; the mapping
-# stays deterministic per message (same input yields the same variant),
-# turn-independent, and free of question-content, family, keyword, or
-# exact-text matching: no exact-question special case, Product Contract
-# #110 unchanged. Every variant keeps the same grounding-safe contract
-# (natural Russian, no substantive claim, no mechanics leak, inside the
-# #83 envelope, distinct from the generic clarification). The first
-# variant stays byte-identical to the historical retry so healthy
-# single-retry turns behave exactly as before.
-NATURAL_RETRY_VARIANTS: tuple[str, ...] = (
-    NATURAL_RETRY_REPLY,
-    "Хорошо, давайте разберём это спокойно. Что для вас сейчас важнее всего?",
-    "Понял вас. Давайте продолжим спокойно. Расскажите чуть подробнее о текущей ситуации?",
-    "Спасибо, что делитесь. Давайте разберём это вместе. Что сейчас тревожит сильнее всего?",
-    "Принято, давайте обсудим это не спеша. Что сейчас выходит на первый план?",
-    "Хорошо, что вы написали. Давайте разберёмся по порядку. С чего начнём?",
-    "Понимаю вас. Давайте посмотрим на это внимательнее. Что беспокоит прямо сейчас?",
-    "Спасибо, что рассказали. Давайте продолжим разбираться. Что кажется самым важным?",
-    "Давайте разберём это шаг за шагом. Расскажите, что происходит сейчас?",
-    "Я вас слушаю. Давайте обсудим это спокойно. Что волнует сильнее всего?",
+NATURAL_RETRY_REPLY = (
+    "Сейчас не удалось надёжно проверить ответ по книге "
+    "«Анонимные алкоголики». Пожалуйста, попробуйте ещё раз позже."
 )
+
+# A technical/non-grounded fallback is never a successful AA response.
+# Earlier hash-selected variants existed solely to pass the diversity
+# floor despite returning no supported book content. Do not vary or
+# count an unverified service message as an answered user request.
+NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
 
 
 def select_retry_reply(user_message: str) -> str:
-    """Select one grounding-safe retry continuation without content matching.
-
-    Selection uses only a stable uniform hash (SHA-256) of the stripped
-    lowercased message modulo the variant count: deterministic per
-    message, generic, and independent of wording, family, or keywords.
-    Unlike length parity, unrelated same-length prompts spread across
-    the pool, so degraded turns stay distinct for the Gate C diversity
-    floor. An empty/unusable message keeps the historical first variant.
-    """
-    variants = NATURAL_RETRY_VARIANTS
-    try:
-        normalized = (user_message or "").strip().lower()
-    except Exception:
-        return variants[0]
-    if not normalized:
-        return variants[0]
-    try:
-        digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-    except Exception:
-        return variants[0]
-    return variants[int.from_bytes(digest[:8], "big") % len(variants)]
-
+    """Return a truthful brief unqualified status, never synthetic support."""
+    del user_message
+    return NATURAL_RETRY_REPLY
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 
