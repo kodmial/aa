@@ -569,7 +569,19 @@ async def run_v2_answer_turn(
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
             )
-        except Exception:
+        except Exception as exc:
+            # Fail closed: an assessment error on a substantive turn must
+            # never fall through as unknown and serve as success.
+            logger.info(
+                "v2 adequacy assessment failed closed",
+                extra={"category": type(exc).__name__},
+            )
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
             return
         telemetry["adequacy_verdict"] = assessment.verdict
         # Preserve a concrete earlier failure category (for example a
@@ -582,6 +594,79 @@ async def run_v2_answer_turn(
         telemetry["qualified"] = bool(
             assessment.verdict == _ADEQ_PASS and assessment.answers_request
         )
+
+    def _safe_assess_adequacy(
+        *,
+        reply_text: str,
+        verification_state: dict[str, Any] | None,
+        verifier_outcome: str | None = None,
+    ) -> Any:
+        """Assess adequacy without ever falling through on unknown.
+
+        Direct adequacy reads (repair gate) must fail closed like
+        ``_record_adequacy``: an assessment error on a substantive turn
+        returns an explicit failure instead of raising or serving the
+        candidate as success. Pure glue keeps its pass.
+        """
+        try:
+            return _assess_adequacy(
+                user_message=user_message,
+                reply=reply_text,
+                evidence_pack=pack,
+                grounding_result=verification_state,
+                planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+                verifier_outcome=str(
+                    verifier_outcome
+                    if verifier_outcome is not None
+                    else telemetry.get("verifier_outcome", "unknown")
+                ),
+                unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
+                turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+            )
+        except Exception as exc:
+            logger.info(
+                "v2 adequacy assessment failed closed",
+                extra={"category": type(exc).__name__},
+            )
+            from aa.conversation.answer_adequacy import AdequacyAssessment as _AdequacyCls
+
+            if _proven_glue:
+                return _AdequacyCls(
+                    substantive_request=False,
+                    technically_grounded=False,
+                    answers_request=True,
+                    verdict=_ADEQ_PASS,
+                    failure_category="",
+                    verified_book_units=0,
+                    evidence_passages=len(pack),
+                )
+
+            try:
+                verified = len(
+                    [
+                        item
+                        for item in (
+                            (verification_state or {}).get("units", [])
+                            if isinstance(verification_state, dict)
+                            else []
+                        )
+                        if isinstance(item, dict)
+                        and item.get("scope") == "book"
+                        and item.get("supported") is True
+                        and item.get("evidence_passage_ids")
+                    ]
+                )
+            except Exception:
+                verified = 0
+            return _AdequacyCls(
+                substantive_request=True,
+                technically_grounded=False,
+                answers_request=False,
+                verdict=_ADEQ_FAIL,
+                failure_category=_FAIL_REPAIR,
+                verified_book_units=verified,
+                evidence_passages=len(pack),
+            )
 
     def _end_to_end_elapsed_s() -> float:
         """Already-spent graph-turn time: upstream plus this phase."""
@@ -1028,15 +1113,9 @@ async def run_v2_answer_turn(
         # from the existing precise passages, then re-verify and reassess;
         # otherwise fail explicitly with a repair failure, never a helpful
         # success claim. Bounded by the remaining end-to-end budget.
-        _adequacy_now = _assess_adequacy(
-            user_message=user_message,
-            reply=current_draft,
-            evidence_pack=pack,
-            grounding_result=grounding_result_to_state(result),
-            planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
-            verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
-            unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
-            turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+        _adequacy_now = _safe_assess_adequacy(
+            reply_text=current_draft,
+            verification_state=grounding_result_to_state(result),
         )
         if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL and pack:
             _regen_prompt = (
@@ -1059,15 +1138,10 @@ async def run_v2_answer_turn(
                         )
                     if _regen_passed and _regen_units and _regen_result is not None:
                         _regen_state = grounding_result_to_state(_regen_result)
-                        _regen_adequacy = _assess_adequacy(
-                            user_message=user_message,
-                            reply=_regen_draft,
-                            evidence_pack=pack,
-                            grounding_result=_regen_state,
-                            planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+                        _regen_adequacy = _safe_assess_adequacy(
+                            reply_text=_regen_draft,
+                            verification_state=_regen_state,
                             verifier_outcome="passed",
-                            unavailable_units=0,
-                            turn_budget_exceeded=False,
                         )
                         if _regen_adequacy.verdict == _ADEQ_PASS:
                             current_draft = _regen_draft
@@ -1087,15 +1161,9 @@ async def run_v2_answer_turn(
                     telemetry["failure_category"] = _FAIL_BUDGET
             else:
                 telemetry["failure_category"] = _FAIL_REPAIR
-            _adequacy_now = _assess_adequacy(
-                user_message=user_message,
-                reply=current_draft,
-                evidence_pack=pack,
-                grounding_result=grounding_result_to_state(result),
-                planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
-                verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
-                unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
-                turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+            _adequacy_now = _safe_assess_adequacy(
+                reply_text=current_draft,
+                verification_state=grounding_result_to_state(result),
             )
             if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL:
                 telemetry["answer_outcome"] = "adequacy-repair-failed"

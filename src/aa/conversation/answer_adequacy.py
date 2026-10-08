@@ -193,11 +193,61 @@ _GENERIC_META_MARKERS = (
 
 
 def is_meta_request(user_message: str) -> bool:
-    """Whether a turn asks about assistant identity or capability."""
-    lowered = " ".join((user_message or "").split()).casefold()
-    if not lowered:
+    """Whether a turn is a pure identity/capability probe.
+
+    Fail-closed to substantive: a combined request (capability prefix
+    plus a substantive help request) is never meta, even when it
+    contains a meta marker substring. Only a short single-segment probe
+    with no recovery-domain vocabulary and no substantive remainder
+    counts as meta.
+    """
+    cleaned = " ".join((user_message or "").split()).strip()
+    if not cleaned:
         return False
-    return any(marker in lowered for marker in _GENERIC_META_MARKERS)
+    lowered = cleaned.casefold()
+    if not any(marker in lowered for marker in _GENERIC_META_MARKERS):
+        return False
+    # Any recovery-domain vocabulary makes the turn substantive, never
+    # pure meta (for example a capability prefix plus an evening-craving
+    # request).
+    if _has_recovery_domain(lowered):
+        return False
+    # A combined greeting/meta prefix plus continuation is substantive.
+    segments = [part.strip() for part in re.split(r"[.!?…?]+", cleaned) if part.strip()]
+    if len(segments) > 1:
+        return False
+    if len(cleaned) > 60:
+        return False
+    # Strip meta markers; if a meaningful remainder remains, the turn is
+    # combined rather than a pure probe.
+    remainder = lowered
+    for marker in _GENERIC_META_MARKERS:
+        if marker in remainder:
+            remainder = remainder.replace(marker, " ")
+    remainder = " ".join(remainder.split())
+    if not remainder:
+        return True
+    if any(marker in remainder for marker in ("что делать", "как быть")):
+        return False
+    if _has_recovery_domain(remainder):
+        return False
+    # Generic interrogative/request verbs alone (for example asking
+    # about capabilities) stay meta; any other substantive token in the
+    # remainder proves a combined request. Tokens that only restate the
+    # meta probe itself (overlapping marker inflections) are ignored.
+    interrogative_words: set[str] = set()
+    for marker in _GENERIC_INTERROGATIVE_MARKERS:
+        interrogative_words.update(_WORD_RE.findall(marker.casefold()))
+    meta_words: set[str] = set()
+    for marker in _GENERIC_META_MARKERS:
+        meta_words.update(_WORD_RE.findall(marker.casefold()))
+    remainder_tokens = _content_tokens(remainder) - interrogative_words - meta_words
+    # "помочь"/"подсказать" inflections are request verbs, not proof of a
+    # substantive topic on their own; require another topic token.
+    remainder_tokens -= {"помочь", "подсказать", "подскажите", "помогите"}
+    if remainder_tokens:
+        return False
+    return True
 
 
 # Generic alcohol-recovery domain stems for topical relevance (never an
