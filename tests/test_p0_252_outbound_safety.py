@@ -276,6 +276,12 @@ def _strong_snapshot() -> dict[str, Any]:
         "retrieval_passages": 5,
         "verified_book_units": 2,
         "response_units": 2,
+        # Production semantic flags (kodmial/aa#281): Gate C fails
+        # closed without an explicit model-driven PASS verdict.
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "qualified": True,
     }
 
 
