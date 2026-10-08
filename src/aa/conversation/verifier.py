@@ -816,20 +816,19 @@ async def _verify_single_unit(
     schema rejection, missing structured payload), the same single-unit
     decision is retried once as bounded plain-text JSON through the
     ordinary text path and strictly validated. A caller-observed
-    structured deadline expiry, a transient/timeout, a generic provider
-    error, or a structured content-validation failure is latency/content,
-    not capability evidence (kodmial/aa#244 recurrence 2): it falls back
-    once without marking so later units/turns re-probe the fast
-    structured path instead of pinning the lane to slow text. Marks are
-    TTL-bounded per model path (later rounds re-snapshot the mark instead
-    of re-burning the budget, and a recovered provider is re-probed).
-    When the shared primary circuit is already open (live fallback path
-    serving after a primary rejection) the structured attempt is skipped
-    proactively for the same reason. The text path itself retries at most
-    once on strict-validation failure so one weak-model non-compliant
-    reply does not collapse the turn to verifier-unavailable without a
-    second bounded attempt; grounding stays strict because every attempt
-    is fully Pydantic-validated.
+    structured deadline expiry (``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``,
+    kodmial/aa#217 recurrence 7) marks the capability the same way: a
+    channel that cannot serve one unit within budget will not serve the
+    next one either. Marks are TTL-bounded per model path (later rounds
+    re-snapshot the mark instead of re-burning the budget, and a
+    recovered provider is re-probed). When the shared primary
+    circuit is already open (live fallback path serving after a primary
+    rejection) the structured attempt is skipped proactively for the
+    same reason. The text path itself retries at most once on
+    strict-validation failure so one weak-model non-compliant reply does
+    not collapse the turn to verifier-unavailable without a second
+    bounded attempt; grounding stays strict because every attempt is
+    fully Pydantic-validated.
     This stays inside the one concurrent per-unit round (no
     extra verifier round, no planner/retrieval/answer rerun). Provider 429
     always propagates immediately for runner retire/restart.
@@ -887,6 +886,7 @@ async def _verify_single_unit(
     )
     if callable(structured_invoke) and not prefer_text:
         attempt_budget = VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S
+        attempt_started = time.monotonic()
         try:
             raw = await asyncio.wait_for(
                 structured_invoke(
@@ -898,29 +898,25 @@ async def _verify_single_unit(
                 timeout=attempt_budget,
             )
         except TimeoutError:
-            # Gate C+E live repair, kodmial/aa#244 recurrence 2 on exact
-            # main 6f8d4e1 run 37764195857 (C:live-book-grounding-
-            # substantive-drinking-2 plus E p50 18.3s / p95 26.6s with
-            # verifier p50 4.7s / p95 12.0s at its turn wall over 31
-            # per-unit calls with 2 unavailable units, message-structured
-            # p50 0.40s / p95 0.68s over 28 fast calls vs message-text
-            # p50 5.1s / p95 10.0s over 73 slow calls): compared with run
-            # 37757356193 (verifier p50 6.1s with 5 unavailable units,
-            # structured over only 5 calls), the 60s TTL re-probed more
-            # structured but the timeout-marking still pins the healthy
-            # fast path to slow text for a full minute after one tail.
-            # A caller-observed deadline is latency, not capability
-            # evidence, so this falls back once without marking; every
-            # later unit/turn re-probes fast structured first and pays
-            # 2s+text only on a genuinely slow turn. Only deterministic
-            # capability failures mark (below). Provider 429 is raised by
-            # the adapter (never a TimeoutError) and still propagates.
-            # Turn-independent, never an exact-question special case.
-            logger.info(
-                "verifier structured attempt timed out; text fallback used",
-                extra={"category": "structured-attempt-timeout"},
-            )
-            return await _text_decision()
+            # Caller-observed structured deadline (same deadline-aware
+            # capability inference as the planner in kodmial/aa#217
+            # recurrence 7): a structured channel that cannot serve one
+            # unit within budget will not serve the next one either, so
+            # mark it and fall back to text for this unit; later rounds
+            # re-snapshot the mark instead of re-burning the budget.
+            # Only a true deadline expiry
+            # marks: a fast callee-raised timeout is a provider error,
+            # not a capability signal, and keeps the historical
+            # fail-closed path below. Provider 429 is raised by the
+            # adapter (never a TimeoutError) and still propagates.
+            if time.monotonic() - attempt_started >= attempt_budget:
+                logger.info(
+                    "verifier structured attempt timed out; text fallback used",
+                    extra={"category": "structured-attempt-timeout"},
+                )
+                mark_structured_unavailable(model)
+                return await _text_decision()
+            raise
         except OpenCodeRateLimitError:
             raise
         except _STRUCTURED_CAPABILITY_ERRORS as exc:
@@ -931,26 +927,28 @@ async def _verify_single_unit(
             mark_structured_unavailable(model)
             return await _text_decision()
         except _STRUCTURED_TRANSIENT_ERRORS as exc:
-            # One transient/timeout: retry once via text without marking
-            # (recurrence-2 change above: a slow tail must not pin the
-            # fast structured path lane-wide). The next unit re-probes
-            # structured; a recovered provider serves fast immediately.
+            # One transient/timeout: retry once via text and prefer the text
+            # path for subsequent turns (TTL-bounded) so every later turn
+            # does not burn two slow provider round-trips per unit (the live
+            # max-latency pathology). The TTL expiry re-probes structured
+            # output after recovery.
             logger.info(
                 "verifier structured transient; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            mark_structured_unavailable(model)
             return await _text_decision()
         except OpenCodeError as exc:
             # Any other provider-side structured failure (for example a
             # startup/not-ready/session error from the OpenCode boundary)
-            # retries once via the bounded text path without marking:
-            # provider blips are latency, not proof the schema channel
-            # is gone. Provider 429 is already re-raised above and never
-            # falls back.
+            # retries once via the bounded text path instead of collapsing
+            # the turn to verifier-unavailable without a text attempt.
+            # Provider 429 is already re-raised above and never falls back.
             logger.info(
                 "verifier structured provider error; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            mark_structured_unavailable(model)
             return await _text_decision()
         if not isinstance(raw, dict):
             logger.info(
@@ -968,15 +966,15 @@ async def _verify_single_unit(
             # fallback route emitting extra keys, or a content grounding
             # failure like bad passage ids). The text path with its
             # explicit single-object instruction may still serve; try it
-            # once before failing closed without marking: a content
-            # validation failure is not capability evidence, and pinning
-            # the lane to text would repeat the recurrence-2 pathology.
-            # Grounding stays strict: the text decision is still fully
-            # Pydantic-validated.
+            # once before failing closed and prefer text subsequently
+            # (TTL-bounded) so later turns do not pay two provider
+            # round-trips per unit. Grounding stays strict: the text
+            # decision is still fully Pydantic-validated.
             logger.info(
                 "verifier structured decision invalid; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            mark_structured_unavailable(model)
             return await _text_decision()
     elif callable(structured_invoke) and prefer_text:
         return await _text_decision()
