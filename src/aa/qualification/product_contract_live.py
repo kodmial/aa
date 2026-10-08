@@ -1740,11 +1740,13 @@ def assess_reply_relevance_with_rubric(
         adequacy = str(telemetry.get("adequacy_verdict", "") or "").strip()
         answers = telemetry.get("answers_request", None)
         grounded = telemetry.get("technically_grounded", None)
+        explicit = telemetry.get("answer_relevant", None)
+        if explicit is False:
+            return False
         if adequacy == "pass" and answers is True and grounded is True:
             return True
         if adequacy == "fail" or answers is False:
             return False
-        explicit = telemetry.get("answer_relevant", None)
         if isinstance(explicit, bool):
             return explicit
         return False

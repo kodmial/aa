@@ -55,6 +55,7 @@ class UnitVerdict(BaseModel):
 class GroundingResult(BaseModel):
     """Claim-level grounding outcome for one draft (internal)."""
 
+    verified: bool = Field(default=True)
     units: list[UnitVerdict] = Field(min_length=1)
     all_required_supported: bool
     # Deterministic AA transport metadata; never emitted by the model.
@@ -181,6 +182,7 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
             raise VerifierValidationError(f"unavailable verifier unit {unit_id!r} must fail closed")
     relevant, category = _derive_turn_relevance(list(result.units))
     return GroundingResult(
+        verified=bool(result.verified),
         units=list(result.units),
         all_required_supported=bool(result.all_required_supported),
         unavailable_unit_ids=list(result.unavailable_unit_ids),

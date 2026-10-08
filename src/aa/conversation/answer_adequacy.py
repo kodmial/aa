@@ -237,7 +237,7 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
         return explicit
     units = grounding_result.get("units", [])
     if not isinstance(units, list) or not units:
-        return False
+        return True
     needs_book = any(isinstance(item, dict) and item.get("scope") == "book" for item in units)
     if not needs_book:
         return True
@@ -264,7 +264,7 @@ def assess_turn_adequacy(
     verifier_outcome: str = "unknown",
     unavailable_units: int = 0,
     turn_budget_exceeded: bool = False,
-    planner_mode: str = "retrieval",
+    planner_mode: str = "",
     resolved_intent: str = "",
     summary: str = "",
     recent: Sequence[str] | None = None,
@@ -314,9 +314,14 @@ def assess_turn_adequacy(
     # When the caller supplies only a legacy planner reason without an
     # explicit mode, treat legitimate-glue as conversational and every
     # other reason as substantive. Provider errors therefore never count
-    # as glue.
+    # as glue. A stale non-empty evidence pack with zero stored queries
+    # still fails closed to substantive: true glue never retrieves.
     if not planner_mode:
-        substantive = planner_reason != PLANNER_REASON_LEGITIMATE_GLUE
+        substantive = (
+            planner_reason != PLANNER_REASON_LEGITIMATE_GLUE
+            or stored_query_count != 0
+            or bool(pack)
+        )
     if turn_budget_exceeded:
         return AdequacyAssessment(
             substantive_request=substantive,
@@ -416,7 +421,7 @@ def assess_turn_adequacy(
     # perfectly grounded answer fails here.
     if not _turn_is_relevant(grounding_result):
         return AdequacyAssessment(
-            substantive_request=True,
+            substantive_request=substantive,
             technically_grounded=True,
             answers_request=False,
             verdict=ADEQUACY_FAIL,
