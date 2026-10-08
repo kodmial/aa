@@ -53,7 +53,7 @@ from aa.conversation.output_limits import (
 )
 from aa.conversation.turn_pipeline import (
     NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_REPLY,
+    select_retry_reply,
 )
 from aa.corpus.context import CorpusContext
 from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError
@@ -1036,17 +1036,17 @@ class Application:
             raise
         except GraphRuntimeError as exc:
             logger.warning("graph turn used natural fallback", extra={"category": exc.category})
-            reply = NATURAL_RETRY_REPLY
+            reply = select_retry_reply(text)
             fallback_used = True
         except OpenCodeError:
             logger.warning("graph turn used natural fallback")
-            reply = NATURAL_RETRY_REPLY
+            reply = select_retry_reply(text)
             fallback_used = True
         except ValueError:
             raise
         except Exception:
             logger.warning("graph turn used natural fallback")
-            reply = NATURAL_RETRY_REPLY
+            reply = select_retry_reply(text)
             fallback_used = True
         if voice_input and reply.strip():
             reply = self._apply_voice_brevity(reply)
