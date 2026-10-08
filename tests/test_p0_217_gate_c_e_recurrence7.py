@@ -143,9 +143,9 @@ def _clear_shared_caches() -> Any:
 def test_stage_budgets_and_windows_are_bounded() -> None:
     """Recurrence-7 bounds: per-attempt deadlines plus tighter display windows."""
     assert PLANNER_TIME_BUDGET_S == 10.0
-    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 3.0
+    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
     assert VERIFIER_TURN_BUDGET_S == 12.0
-    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 3.0
+    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
     assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S < VERIFIER_TURN_BUDGET_S
     assert ANSWER_GENERATION_MAX_PASSAGES == 5
     assert ANSWER_MAX_PASSAGE_CHARS == 500

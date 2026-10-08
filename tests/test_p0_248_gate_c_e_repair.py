@@ -1,33 +1,37 @@
-"""P0 kodmial/aa#244: dual-gate repair for Gate C+E on exact main a0d377a.
+"""P0 kodmial/aa#248: dual-gate repair for Gate C+E on exact main e57dea5.
 
-Proven product failures (run 37753553708):
+Proven product failures (run 37757356193):
 
-- C:live-book-grounding-substantive-drinking-2 on live-production-path
-  (the core substantive drinking turn produced zero verified book units:
-  planner timeouts yield empty query plans and empty packs, so the answer
-  phase serves an ungrounded retry that the hardened Gate C counts as
-  failure, never completion);
-- E:latency-budget-exceeded on slo (p50 18930ms / p95 24290ms /
-  max 24732ms with planner p50 4625ms / p95 10007ms pinned at its 10s
-  wall, answer p50 6553ms / p95 10006ms pinned at its 10s wall, verifier
-  p50 4655ms / p95 9410ms, message-text p50 4542ms / p95 9997ms over 73
-  text calls).
+- C:live-book-grounding-substantive-drinking-10 on live-production-path
+  (the held-out substantive drinking paraphrase produced no verified
+  book units: slow structured attempts time out to empty plans and
+  unavailable verifier units, so the turn serves an ungrounded retry
+  that the hardened Gate C counts as failure, never completion);
+- E:latency-budget-exceeded on slo (p50 19996ms / p95 27033ms /
+  max 27052ms with planner p50 5289ms / p95 8557ms / max 10007ms,
+  retrieval p50 498ms, answer p50 6556ms / p95 10007ms pinned at its
+  10s wall, verifier p50 6101ms / p95 12009ms at its 12s turn wall,
+  message-text p50 5390ms / p95 11985ms over 69 text calls vs
+  message-structured p50 466ms over only 5 calls, 4 turns with
+  unavailable units over 33 units).
 
 Repair (turn-independent, Product Contract #110 unchanged, no
 exact-question special cases, no SLO/threshold weakening):
 
-- slow native structured channels degrade one second faster to the
+- slow native structured channels degrade another second faster to the
   proven plain-text path (planner and verifier structured-attempt
-  budgets 4.0s -> 3.0s, strict Pydantic validation unchanged on both
-  paths, 429 still propagates): tail turns convert wall timeouts
+  budgets 3.0s -> 2.0s; healthy structured serves in ~0.5s so 2s still
+  allows fast structured while tail turns convert wall timeouts
   (empty plan / unavailable units -> C failure) into tailored text
   successes while cutting the sequential planner+answer+verifier sum
-  for Gate E;
-- answer/verifier display windows narrow 600 -> 500 chars per passage
-  (explicit truncation markers preserved; stored pack plus
-  checksum/quote/cite gates still use full exact text): every ordinary
-  turn pays fewer text-path input tokens, cutting the message-text tail
-  that pins all three stages at their walls.
+  for Gate E; strict Pydantic validation unchanged on both paths, 429
+  still propagates);
+- structured-capability caches recover mid-lane instead of pinning the
+  whole 16-turn lane to the slow text path (omitted-structured and
+  verifier TTLs 300s -> 60s; 5 structured fast vs 69 text slow proves
+  the fast path exists but was pinned for the full lane after one slow
+  attempt; 60s still skips the doomed attempt within a slow burst
+  while re-probing fast structured mid-lane for Gate E).
 
 The hardened Gate C checks (live-substantive-grounded-book-answer,
 verified_book_units, held-out variants) and the Gate E SLO (p95 <= 15s,
@@ -43,6 +47,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from aa.conversation.model_adapter import OMITTED_STRUCTURED_CAPABILITY_TTL_S
 from aa.conversation.planner_node import (
     PLANNER_STRUCTURED_ATTEMPT_BUDGET_S,
     PLANNER_TIME_BUDGET_S,
@@ -56,6 +61,7 @@ from aa.conversation.turn_pipeline import (
     run_v2_answer_turn,
 )
 from aa.conversation.verifier import (
+    VERIFIER_CAPABILITY_TTL_S,
     VERIFIER_MAX_PASSAGE_CHARS,
     VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S,
     VERIFIER_TURN_BUDGET_S,
@@ -91,8 +97,14 @@ def test_dual_gate_budgets_tightened_without_weakening_slo() -> None:
     assert ORDINARY_TURN_BUDGET_MS == 30_000
 
 
-def test_display_windows_narrowed_but_gates_use_full_pack() -> None:
-    """Display trims cut input tokens; deterministic gates keep full text."""
+def test_capability_caches_recover_mid_lane() -> None:
+    """A 60s TTL re-probes fast structured instead of pinning slow text."""
+    assert VERIFIER_CAPABILITY_TTL_S == 60.0
+    assert OMITTED_STRUCTURED_CAPABILITY_TTL_S == 60.0
+
+
+def test_display_windows_preserved_for_grounding() -> None:
+    """Evidence windows stay at 5/500 so held-out paraphrases keep context."""
     assert ANSWER_MAX_PASSAGE_CHARS == 500
     assert VERIFIER_MAX_PASSAGE_CHARS == 500
     from aa.conversation.prompt_builder import _display_answer_text
@@ -141,8 +153,8 @@ async def test_slow_structured_planner_degrades_within_tightened_budget() -> Non
     assert 10 <= len(plan.queries) <= 16
 
 
-async def test_grounded_turn_still_serves_with_narrowed_window() -> None:
-    """A verified draft serves (not retry) with the 500-char display window."""
+async def test_grounded_turn_still_serves_with_repair() -> None:
+    """A verified draft serves (not retry) under the tightened budgets."""
 
     class _InstantAnswer:
         async def ainvoke(self, messages: Any) -> AIMessage:
@@ -195,7 +207,7 @@ async def test_grounded_turn_still_serves_with_narrowed_window() -> None:
 
 
 def test_hardened_gate_c_and_slo_stay_required() -> None:
-    """The #244 repair must never weaken Gate C grounding or Gate E SLO."""
+    """The #248 repair must never weaken Gate C grounding or Gate E SLO."""
     root = pathlib.Path(__file__).resolve().parents[1]
     live_source = (root / "src" / "aa" / "qualification" / "product_contract_live.py").read_text(
         encoding="utf-8"

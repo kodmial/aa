@@ -110,7 +110,16 @@ _CIRCUIT_LOCK = threading.Lock()
 # mark the cache; transient/timeout fall back once without poisoning it.
 # Provider 429 always propagates and never marks the cache. Turn-
 # independent, never an exact-question special case.
-OMITTED_STRUCTURED_CAPABILITY_TTL_S = 300.0
+#
+# Gate C+E live repair, kodmial/aa#248 on exact main e57dea5 run
+# 37757356193 (C:live-book-grounding-substantive-drinking-10 plus E
+# p50 20.0s / p95 27.0s with message-structured p50 0.47s over 5 calls
+# vs message-text p50 5.4s over 69 calls, all Muse Spark): the 300s TTL
+# pins the whole lane to the slow path after one slow structured
+# attempt. A 60s TTL still skips the doomed attempt within a slow burst
+# while re-probing the fast structured path mid-lane for Gate E.
+# Turn-independent, 429 never marks.
+OMITTED_STRUCTURED_CAPABILITY_TTL_S = 60.0
 
 _OMITTED_STRUCTURED_UNAVAILABLE: dict[str, float] = {}
 _OMITTED_STRUCTURED_LOCK = threading.Lock()
