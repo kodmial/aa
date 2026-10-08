@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -446,7 +445,6 @@ async def _run_planner_provider(
                 # fail-closed on content).
                 pass
         try:
-            attempt_started = time.monotonic()
             raw = await asyncio.wait_for(
                 structured_invoke(
                     user_text,
@@ -461,38 +459,37 @@ async def _run_planner_provider(
                 "planner structured attempt timed out; tailored text fallback used",
                 extra={"category": "structured-attempt-timeout"},
             )
-            # Deadline-aware capability inference (Gate C+E live repair,
-            # kodmial/aa#217 recurrence 7 on exact main 58f943c run
-            # 37709271567: planner p50 8.4s / p95 9.9s with exactly one
-            # audited text request per turn. The recurrence-6 bound works
-            # (no more 10s-wall pinning, tailored plans served), but every
-            # turn still burns the full structured-attempt budget before
-            # the text fallback because a caller-side timeout never
-            # reaches the callee-observed capability cache in
-            # model_adapter (only "structured output missing" marks it).
-            # A true caller-observed deadline expiry is the same evidence:
-            # this path does not serve native structured output within
-            # budget, so later turns go text-direct instead of re-burning
-            # the budget per turn. Only a true deadline expiry marks: a
-            # fast callee-raised timeout keeps the historical path (text
-            # fallback without marking). TTL-bounded (recovery re-probes),
-            # 429 never marks, content validation still fails closed
-            # downstream. Turn-independent, never an exact-question
-            # special case.
-            if time.monotonic() - attempt_started >= structured_attempt_budget:
-                try:
-                    from aa.conversation.model_adapter import (
-                        mark_omitted_structured_unavailable,
-                    )
-                except Exception:
-                    mark_omitted_structured_unavailable = None  # type: ignore[assignment]
-                if mark_omitted_structured_unavailable is not None:
-                    try:
-                        is_omitted_wire = getattr(model, "wire_agent", None) == ""
-                        if is_omitted_wire:
-                            mark_omitted_structured_unavailable(model)
-                    except Exception:
-                        pass
+            # Gate C+E live repair, kodmial/aa#244 recurrence 2 on exact
+            # main 6f8d4e1 run 37764195857 (C:live-book-grounding-
+            # substantive-drinking-2 plus E p50 18.3s / p95 26.6s with
+            # planner p50 5.7s / p95 10.0s pinned at its wall, answer p50
+            # 6.0s / p95 10.0s pinned, verifier p50 4.7s / p95 12.0s at
+            # its wall, message-structured p50 0.40s / p95 0.68s over 28
+            # fast calls vs message-text p50 5.1s / p95 10.0s over 73
+            # slow calls, 2 turns with unavailable units, answer_rounds
+            # 14): compared with run 37757356193 (structured p50 0.47s
+            # over only 5 calls, planner 5.3s, verifier 6.1s, total p50
+            # 20.0s / p95 27.0s), the 3s->2s attempt cut plus 300s->60s
+            # TTL did not converge (p50 -1.7s, p95 -0.4s; planner p50
+            # even rose 5.3s->5.7s with p95 pinned at the wall). The
+            # dominant persistent cause is now the timeout-marking
+            # itself: one slow structured tail marks the whole lane to
+            # the slow text path for 60s, so healthy turns that would
+            # serve in ~0.4s structured instead pay ~5s text, and the
+            # sequential planner+answer+verifier sum stays at ~18s p50.
+            # Strategy change at this capability-cache boundary (not
+            # another duration retune): a caller-observed deadline is
+            # latency, not capability evidence, so it falls back once
+            # without marking. Only a deterministic capability failure
+            # (recorded in model_adapter as "structured output missing")
+            # marks. Every turn therefore re-probes the fast structured
+            # path first (0.4s when healthy) and pays 2s+text only on a
+            # genuinely slow turn, cutting the sequential median for
+            # Gate E while slow turns still serve model-generated
+            # queries (never an empty plan, fixing the drinking-2 C
+            # mechanism). 429 never marks; strict Pydantic validation
+            # unchanged on both paths. Turn-independent, never an
+            # exact-question special case.
             text_reply = await _invoke_planner_text(
                 model, user_text=user_text, system_text=system_text
             )
