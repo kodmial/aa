@@ -424,6 +424,18 @@ class _SlowMarkerClient(FakeOpenCodeClient):
 
 
 async def test_slow_chat_does_not_head_of_line_block_other_chat() -> None:
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+
+    async def _delegate(_thread_id: str, message: str) -> str:
+        # Deterministic per-chat latency at the conversation boundary:
+        # only the marked slow chat sleeps. This keeps the test hermetic
+        # (no production retrieval/model timing) so it proves dispatcher
+        # cross-chat concurrency instead of E5/planner latency variance.
+        if "slow-marker" in message:
+            await asyncio.sleep(0.4)
+            return "Медленный ответ готов."
+        return "Быстрый ответ готов."
+
     api = _FakeApi(
         [
             [
@@ -436,7 +448,8 @@ async def test_slow_chat_does_not_head_of_line_block_other_chat() -> None:
     app = Application(
         _settings(),
         transport=transport,
-        opencode_runtime=_stub_runtime(_SlowMarkerClient()),
+        opencode_runtime=_stub_runtime(),
+        graph_runtime=GraphTurnRuntime(delegate=_delegate),
     )
     await app.start()
     try:
