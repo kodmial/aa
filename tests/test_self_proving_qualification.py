@@ -433,12 +433,11 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "READY" in runtime
     canary = (REPO_ROOT / ".github" / "workflows" / "aa-canary.yml").read_text(encoding="utf-8")
     assert 'cron: "17 */4 * * *"' in canary
-    assert "Gate C smoke" in canary
-    assert "Gate D readiness" in canary
-    assert "Gate E latency guard" in canary
-    assert "group: aa-self-proving-qualification" in canary
-    assert "Activate bounded current-main canary" in canary
-    assert "Re-enter authoritative convergence after canary failure" in canary
+    assert "group: aa-production-canary" in canary
+    assert "run_aa_production_canary.py" in canary
+    assert "SKIPPED / not activated" in canary
+    assert "aa-production-canary-repair:v1" in canary
+    assert "continuum-issue-scheduler.yml" in canary
     assert CONTROL_ISSUE_NUMBER == 31
     assert ISSUE_NUMBER == 146
 
