@@ -999,8 +999,8 @@ def assess_turn_adequacy(
         # on words such as step or decision. Evidence that paraphrases
         # the requested step without literally naming a step number
         # must not fail here; topical relevance below still applies.
+        cited_steps: set[int] = set()
         if request_steps:
-            cited_steps: set[int] = set()
             for passage_text in cited_texts:
                 cited_steps |= extract_step_numbers(passage_text)
             cited_steps |= extract_step_numbers(unit_text)
@@ -1040,13 +1040,16 @@ def assess_turn_adequacy(
                 overlap_count = max(overlap_count, 1)
         if overlap_count >= 2:
             pass
-        elif overlap_count == 1 and (request_steps or _direct_overlap):
-            # Single content overlap proves topical relevance once the
-            # numbered-step referent already aligns above or when a direct
-            # lexical tie exists; a wrong step fails on step alignment
-            # even when generic vocabulary such as decisions overlaps.
-            # Paraphrases without an explicit step number also reach here
-            # when the request names a step.
+        elif (
+            overlap_count == 1
+            and request_steps
+            and cited_steps
+            and bool(request_steps & cited_steps)
+        ):
+            # One lexical overlap is only enough when the answer/evidence
+            # also explicitly carries the same numbered-step identity.
+            # Otherwise a generic word such as "решения" cannot make an
+            # unrelated or wrong-step paraphrase look relevant.
             pass
         else:
             # Same stale-context guard for the domain fallback: context
