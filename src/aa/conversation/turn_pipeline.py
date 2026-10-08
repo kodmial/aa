@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections.abc import Sequence
@@ -166,6 +167,19 @@ TURN_END_TO_END_BUDGET_S = 27.0
 # unavailable). Values stay small so only truly doomed rounds skip.
 TURN_ANSWER_MIN_SLICE_S = 1.0
 TURN_VERIFIER_MIN_SLICE_S = 3.0
+
+
+def _diagnostic_no_turn_limits() -> bool:
+    """Manual Telegram-only mode: let all AA stages finish without SLO cutoff."""
+    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+
+
+def _effective_turn_budget_s() -> float:
+    return float("inf") if _diagnostic_no_turn_limits() else TURN_END_TO_END_BUDGET_S
+
+
+def _effective_repair_budget_s() -> float:
+    return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
 
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
@@ -536,7 +550,7 @@ async def run_v2_answer_turn(
 
     def _remaining_budget_s() -> float:
         """Remaining end-to-end budget for further model calls."""
-        return TURN_END_TO_END_BUDGET_S - _end_to_end_elapsed_s()
+        return _effective_turn_budget_s() - _end_to_end_elapsed_s()
 
     def _mark_turn_budget_exceeded() -> None:
         telemetry["turn_budget_exceeded"] = True
@@ -584,15 +598,17 @@ async def run_v2_answer_turn(
         passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
-            text = await asyncio.wait_for(
-                generate_draft(
-                    model=answer_model,
-                    recent=recent,
-                    summary=summary,
-                    passages=passages,
-                    user_message=prompt_text,
-                ),
-                timeout=attempt_budget,
+            draft_call = generate_draft(
+                model=answer_model,
+                recent=recent,
+                summary=summary,
+                passages=passages,
+                user_message=prompt_text,
+            )
+            text = (
+                await draft_call
+                if _diagnostic_no_turn_limits()
+                else await asyncio.wait_for(draft_call, timeout=attempt_budget)
             )
             telemetry["answer_latency_ms"] = round(
                 float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
@@ -779,14 +795,14 @@ async def run_v2_answer_turn(
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:
-        if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S:
+        if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
             telemetry["repair_budget_exceeded"] = True
             logger.info(
                 "v2 repair skipped for live-SLO budget",
                 extra={"rounds": rounds},
             )
             break
-        if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+        if _end_to_end_elapsed_s() > _effective_turn_budget_s():
             # End-to-end guard (recurrence 10): the upstream plus this
             # phase already spent the whole turn. Another re-plan round
             # would breach the E SLO and clarify anyway; narrow/retry
@@ -918,11 +934,11 @@ async def run_v2_answer_turn(
             # validated supported units, otherwise clarification); fast
             # turns still use the single compact regeneration. Turn-
             # independent, never an exact-question special case.
-            if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S or (
-                _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S
+            if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
+                _end_to_end_elapsed_s() > _effective_turn_budget_s()
             ):
                 telemetry["repair_budget_exceeded"] = True
-                if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
                     _mark_turn_budget_exceeded()
                 logger.info(
                     "v2 envelope regeneration skipped for live-SLO budget",
@@ -1007,7 +1023,7 @@ async def run_v2_answer_turn(
             recovered: dict[str, Any] | None = None
             active_pack = list(pack)
             for _ in range(OUTBOUND_SAFETY_MAX_REPAIRS):
-                if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
                     _mark_turn_budget_exceeded()
                     break
                 if planner_model is None or retrieval_index is None:
@@ -1177,7 +1193,7 @@ async def run_v2_answer_turn(
                 "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
                 "telemetry": dict(telemetry),
             }
-    if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
         # End-to-end guard (recurrence 10): no verified supported
         # material exists, but the turn already spent its whole budget.
         # Clarifying here would add the recurrence-10 generic collapse

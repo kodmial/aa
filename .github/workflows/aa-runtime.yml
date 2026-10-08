@@ -468,6 +468,9 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           AA_CAMPAIGN_SEQ: ${{ inputs.seq }}
           AA_ENABLE_READY_PUBLISH: "1"
+          # Manual product diagnosis: no application-owned 2/10/12/15/27s cutoffs.
+          # Real provider/network watchdogs, safety gates, and the 5h job lifetime remain.
+          AA_DIAGNOSTIC_NO_TURN_LIMITS: "1"
           LOG_LEVEL: INFO
         shell: bash
         run: |
