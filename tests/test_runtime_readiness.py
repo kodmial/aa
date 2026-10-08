@@ -121,10 +121,17 @@ def test_gate_d_probe_parses_ready_marker_instead_of_substring() -> None:
     # The trap: the uppercase substring never matches the lowercase kind.
     assert "READY" not in marker
     assert parse_ready_marker(marker) is not None
-    for name in ("aa-self-proving-qualification.yml", "aa-canary.yml"):
-        text = _read(name)
-        assert "parse_ready_marker" in text
-        assert '"READY" in app.readiness_marker' not in text
+    text = _read("aa-self-proving-qualification.yml")
+    assert "parse_ready_marker" in text
+    assert '"READY" in app.readiness_marker' not in text
+    # The gated production canary (#82) probes readiness through the same
+    # production Application boundary inside the repository-owned runner;
+    # its structural check lives in the runner, not inline in the workflow.
+    runner = (ROOT / "scripts" / "run_aa_production_canary.py").read_text(encoding="utf-8")
+    assert "parse_ready_marker" in runner
+    assert '"READY" in app.readiness_marker' not in runner
+    canary = _read("aa-canary.yml")
+    assert '"READY" in app.readiness_marker' not in canary
 
 
 def test_ready_lookup_is_per_exact_run() -> None:
