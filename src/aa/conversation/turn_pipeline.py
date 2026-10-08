@@ -213,6 +213,28 @@ NATURAL_RETRY_REPLY = (
 # count an unverified service message as an answered user request.
 NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
 
+# Deterministic claim-free conversational fallback (kodmial/aa#284).
+#
+# Architecture-level delivery contract for planner-certified
+# conversational turns only (model-resolved ``mode == "conversational"``
+# with zero queries and an empty Evidence Pack): when the single
+# draft/verify attempt for such a turn cannot produce a verifier verdict
+# (transient verifier outage, validation failure, or unsupported glue
+# draft), the turn is served with this static claim-free reply instead
+# of collapsing to the generic clarification/retry templates.
+#
+# The text carries no substantive external claim by construction (a
+# truthful assistant-capability statement plus an invitation to
+# continue), so no book passage is required and per-claim grounding
+# holds vacuously. It is served only on this boundary, never for
+# substantive turns, and it still passes the envelope, language, leak,
+# quote-budget and outbound-safety gates. Turn-independent, never an
+# exact-question special case.
+CONVERSATIONAL_FALLBACK_REPLY = (
+    "Я помощник и готов поддержать разговор: "
+    "расскажите, что сейчас происходит, и разберём это вместе."
+)
+
 # Outbound-safety recovery uses the same generic semantic fallback as any
 # other retrieval need: the raw current turn plus bounded conversation
 # context. No canned query-expansion tables are maintained here.
@@ -1956,6 +1978,45 @@ async def run_v2_answer_turn(
             "telemetry": dict(telemetry),
         }
 
+    # Conversational delivery contract (kodmial/aa#284): a
+    # planner-certified conversational turn (model-resolved conversational
+    # mode with zero queries, legitimate-glue reason and an empty Evidence
+    # Pack) whose single draft/verify attempt produced no verifier verdict
+    # is served with the deterministic claim-free conversational fallback
+    # instead of collapsing to clarification/retry. The fallback carries
+    # no substantive claim by construction, so per-claim grounding holds
+    # vacuously; it still passes the envelope, language, leak,
+    # quote-budget and outbound-safety gates. Substantive turns never
+    # enter this boundary and keep the existing fail-closed collapse.
+    # No extra model call is issued here, so the live SLO is preserved.
+    # Turn-independent, never an exact-question special case.
+    if (
+        _proven_glue
+        and not pack
+        and not passed
+        and _effective_reason == "legitimate-glue"
+        and contains_cyrillic(CONVERSATIONAL_FALLBACK_REPLY)
+        and not leaks_internal_terms(CONVERSATIONAL_FALLBACK_REPLY)
+        and envelope_passes(CONVERSATIONAL_FALLBACK_REPLY)
+        and aggregate_quote_chars(CONVERSATIONAL_FALLBACK_REPLY) <= QUOTE_BUDGET_CHARS
+        and certify_outbound_safety(CONVERSATIONAL_FALLBACK_REPLY)
+    ):
+        telemetry["outbound_safety"] = "pass"
+        telemetry["answer_outcome"] = "conversational-fallback"
+        telemetry["adequacy_verdict"] = _ADEQ_PASS
+        telemetry["answers_request"] = True
+        telemetry["technically_grounded"] = False
+        telemetry["qualified"] = True
+        _finish_telemetry()
+        return {
+            "text": CONVERSATIONAL_FALLBACK_REPLY,
+            "units": [],
+            "verification": grounding_result_to_state(None),
+            "rounds": rounds,
+            "recent_quote_ranges": list(recent_ranges),
+            "telemetry": dict(telemetry),
+        }
+
     # Repair budget exhausted: narrow to supported material, serve honest
     # unavailability for a substantive request without book evidence, and
     # keep clarification only for positively proven glue (kodmial/aa#251).
@@ -2336,6 +2397,7 @@ __all__ = [
     "ANSWER_GENERATION_MAX_PASSAGES",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
+    "CONVERSATIONAL_FALLBACK_REPLY",
     "NATURAL_CLARIFICATION_REPLY",
     "NATURAL_RETRY_REPLY",
     "NATURAL_RETRY_VARIANTS",
