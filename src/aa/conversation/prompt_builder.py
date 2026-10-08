@@ -66,7 +66,17 @@ class EvidencePassage:
 # decisive context per passage with the explicit marker while cutting
 # ~25% of display tokens per passage; the stored pack and all gates
 # still use full exact text.
-ANSWER_MAX_PASSAGE_CHARS = 600
+#
+# kodmial/aa#244 on exact main a0d377a run 37753553708
+# (C:live-book-grounding-substantive-drinking-2 plus E p50 18.9s / p95
+# 24.3s, answer p50 6.6s / p95 10.0s pinned at its 10s wall over
+# message-text p50 4.5s / p95 10.0s): 500 chars keeps several sentences
+# of decisive context per passage with the explicit marker while cutting
+# a further ~17% of display tokens per answer call. The stored pack,
+# checksum/quote/cite gates and verifier verdicts still use full exact
+# text, so grounding strictness is unchanged. Turn-independent, never an
+# exact-question special case.
+ANSWER_MAX_PASSAGE_CHARS = 500
 
 ANSWER_MAX_MESSAGE_CHARS = 500
 
