@@ -206,6 +206,7 @@ def select_retry_reply(user_message: str) -> str:
     del user_message
     return NATURAL_RETRY_REPLY
 
+
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 
 _INTERNAL_TERMS = (
