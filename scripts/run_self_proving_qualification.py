@@ -1296,6 +1296,7 @@ def _gate_c_live_evidence(
         required_checks = {
             "live-raw-telegram-transport-boundary",
             "live-answer-no-generic-collapse",
+            "live-substantive-grounded-book-answer",
             "live-answer-diversity",
             "live-actual-served-model-identity",
             "live-planner-retrieval-answer-verifier-telemetry",
