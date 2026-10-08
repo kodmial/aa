@@ -409,6 +409,62 @@ def keep_supported_units(
     return kept
 
 
+def keep_relevant_supported_units(
+    units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> list[ResponseUnitDraft]:
+    """Narrow units to the supported subset that also addresses the intent.
+
+    Architecture-level granularity repair (kodmial/aa#284 systemic
+    recurrence 2): the verifier derives turn relevance from per-unit
+    model verdicts and requires every served supported book unit to
+    carry ``addresses_intent == True`` (padding or an off-topic
+    digression alongside one relevant sentence fails the whole turn).
+    The historical support-only narrowing therefore cannot rescue a
+    mixed draft: it keeps the irrelevant padding, the narrowed subset
+    still fails adequacy as ``irrelevant-citation``, and the turn
+    collapses to a generic retry while a clean sibling passes, moving
+    the fingerprint across SHAs and paraphrases. This helper keeps
+    only model-certified relevant material -- supported book units
+    with an explicit ``addresses_intent`` true verdict plus supported
+    non-book glue, which needs no book passage -- so the served subset
+    is relevant by construction. Model verdicts only: no keyword,
+    stem, step-number, token-overlap, or exact-question heuristics.
+    """
+    if result is None:
+        return []
+    by_id = verdict_by_id(result)
+    kept: list[ResponseUnitDraft] = []
+    for unit in units:
+        verdict = by_id.get(unit.unit_id)
+        if verdict is None or not bool(getattr(verdict, "supported", False)):
+            continue
+        if str(getattr(verdict, "scope", "")) == "book" and not bool(
+            getattr(verdict, "addresses_intent", False)
+        ):
+            continue
+        kept.append(unit)
+    return kept
+
+
+def keep_relevant_supported_text(
+    units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> str:
+    """Join the relevant supported subset matching ``keep_relevant_supported_units``."""
+    return " ".join(unit.text for unit in keep_relevant_supported_units(units, result)).strip()
+
+
+def has_relevant_supported_book_unit(result: GroundingResult | None) -> bool:
+    """Whether any supported book unit explicitly addresses the intent."""
+    if result is None:
+        return False
+    return any(
+        verdict.scope == "book"
+        and bool(verdict.supported)
+        and bool(getattr(verdict, "addresses_intent", False))
+        for verdict in result.units
+    )
+
+
 def narrowed_grounding_state(
     kept_units: Sequence[ResponseUnitDraft], result: GroundingResult | None
 ) -> dict[str, Any]:
@@ -1473,6 +1529,64 @@ async def run_v2_answer_turn(
         else:
             telemetry["verifier_outcome"] = "unsupported"
 
+    # Relevance-padding rescue (kodmial/aa#284 systemic recurrence 2).
+    #
+    # Architecture-level granularity repair at the delivery boundary:
+    # the verifier requires every served supported book unit to carry
+    # an explicit model ``addresses_intent`` verdict, so a draft that
+    # mixes one relevant supported book unit with irrelevant padding
+    # fails the whole turn (``answer_relevant`` false, adequacy
+    # ``irrelevant-citation``) while a clean sibling passes, moving
+    # the Gate C fingerprint across SHAs and paraphrases. Repair
+    # replanning cannot converge this: the pack is adequate and only
+    # the draft composition varies. Before collapsing to a generic
+    # retry, deterministically narrow to the relevant supported
+    # subset (model verdicts only, never keyword/stem/step-number/
+    # token-overlap heuristics or exact-question branches) and serve
+    # it when the subset itself passes the envelope, quote-budget,
+    # outbound-safety and whole-turn adequacy gates. No extra model
+    # call, so the Gate E SLO is preserved; per-claim grounding holds
+    # for exactly what is delivered. Turns with no relevant
+    # supported book unit fall through to the historical collapse.
+    if not passed and units and result is not None and not result.unavailable_unit_ids:
+        _pad_kept = keep_relevant_supported_units(units, result)
+        if _pad_kept and len(_pad_kept) < len(units) and has_relevant_supported_book_unit(result):
+            _pad_candidate = keep_relevant_supported_text(_pad_kept, result)
+            if (
+                _pad_candidate
+                and _pad_candidate != current_draft
+                and contains_cyrillic(_pad_candidate)
+                and not leaks_internal_terms(_pad_candidate)
+                and envelope_passes(_pad_candidate)
+                and aggregate_quote_chars(_pad_candidate) <= QUOTE_BUDGET_CHARS
+                and certify_outbound_safety(_pad_candidate)
+            ):
+                _pad_state = narrowed_grounding_state(_pad_kept, result)
+                _pad_adequacy = _safe_assess_adequacy(
+                    reply_text=_pad_candidate,
+                    verification_state=_pad_state,
+                    verifier_outcome="passed",
+                )
+                if _pad_adequacy.verdict == _ADEQ_PASS:
+                    telemetry["answer_outcome"] = "narrowed-adequacy"
+                    telemetry["outbound_safety"] = "pass"
+                    telemetry["verifier_unavailable_units"] = 0
+                    _record_adequacy(
+                        reply_text=_pad_candidate,
+                        verification_state=_pad_state,
+                    )
+                    _finish_telemetry()
+                    return {
+                        "text": _pad_candidate,
+                        "units": _pad_kept,
+                        "verification": _pad_state,
+                        "rounds": rounds,
+                        "recent_quote_ranges": merge_recent_ranges(
+                            recent_ranges, ranges_from_pack(pack)
+                        ),
+                        "telemetry": dict(telemetry),
+                    }
+
     if passed and units and result is not None:
         # kodmial/aa#286 item 4 double-misclassification guard: a
         # planner-certified glue turn with an empty pack whose verifier
@@ -1591,13 +1705,21 @@ async def run_v2_answer_turn(
                             # can be served narrowed (per-claim grounding
                             # holds for what is delivered) instead of
                             # discarding the progress to a generic retry.
+                            # Systemic recurrence 2 (kodmial/aa#284): keep
+                            # the relevant supported subset only, using the
+                            # per-unit model verdicts (supported plus an
+                            # explicit addresses_intent true for book
+                            # units). Support-only narrowing keeps
+                            # irrelevant padding, still fails adequacy as
+                            # irrelevant-citation, and collapses while a
+                            # clean sibling passes.
                             _regen_kept = (
-                                keep_supported_units(_regen_units, _regen_result)
+                                keep_relevant_supported_units(_regen_units, _regen_result)
                                 if _regen_units
                                 else []
                             )
                             _regen_narrowed = (
-                                keep_supported_text(_regen_kept, _regen_result)
+                                keep_relevant_supported_text(_regen_kept, _regen_result)
                                 if _regen_kept
                                 else ""
                             )
@@ -1649,14 +1771,16 @@ async def run_v2_answer_turn(
                         _part_units = list(_regen_units)
                         _part_result = _regen_result
                         _part_kept = (
-                            keep_supported_units(_part_units, _part_result)
+                            keep_relevant_supported_units(_part_units, _part_result)
                             if _part_units and _part_result is not None
                             else []
                         )
                         _part_narrowed = ""
                         try:
                             if _part_kept and _part_result is not None:
-                                _part_narrowed = keep_supported_text(_part_kept, _part_result)
+                                _part_narrowed = keep_relevant_supported_text(
+                                    _part_kept, _part_result
+                                )
                         except Exception:
                             _part_narrowed = ""
                         if _part_narrowed:
@@ -1711,14 +1835,16 @@ async def run_v2_answer_turn(
                 # (all-glue or irrelevant), and the historical path served
                 # the exact generic retry without trying the verified
                 # subset it already holds. Before collapsing, attempt one
-                # deterministic narrowing to the supported units: when the
+                # deterministic narrowing to the relevant supported units
+                # (model verdicts only: supported plus explicit
+                # addresses_intent for book units, glue kept): when the
                 # narrowed text itself passes envelope, safety and
                 # adequacy, serving it preserves a grounded answer instead
                 # of adding another generic collapse. Turn-independent,
                 # never an exact-question special case.
-                _narrow_kept = keep_supported_units(units, result) if units else []
+                _narrow_kept = keep_relevant_supported_units(units, result) if units else []
                 _narrowed_candidate = (
-                    keep_supported_text(_narrow_kept, result) if _narrow_kept else ""
+                    keep_relevant_supported_text(_narrow_kept, result) if _narrow_kept else ""
                 )
                 if _narrowed_candidate and _narrowed_candidate != current_draft:
                     from aa.conversation.output_limits import QUOTE_BUDGET_CHARS as _QB
@@ -2570,7 +2696,10 @@ __all__ = [
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",
+    "has_relevant_supported_book_unit",
     "has_supported_book_unit",
+    "keep_relevant_supported_text",
+    "keep_relevant_supported_units",
     "keep_supported_text",
     "keep_supported_units",
     "leaks_internal_terms",
