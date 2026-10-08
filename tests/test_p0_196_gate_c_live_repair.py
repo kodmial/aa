@@ -162,7 +162,13 @@ async def test_startup_error_falls_back_to_text_once() -> None:
 
 
 async def test_transient_marks_capability_to_bound_latency() -> None:
-    """After a transient fallback the next round uses text directly."""
+    """A transient fallback serves text once without pinning later rounds.
+
+    Recurrence-2 update for kodmial/aa#244 on exact main 6f8d4e1 run
+    37764195857 (structured p50 0.40s fast vs text p50 5.1s slow):
+    a transient is latency, not capability evidence, so the next round
+    re-probes fast structured instead of staying text-pinned for 60s.
+    """
     pack = [_pack_entry()]
     units = split_response_units("Поддержка рядом помогает.")
 
@@ -194,12 +200,12 @@ async def test_transient_marks_capability_to_bound_latency() -> None:
     model = _TransientThenTextModel()
     first = await run_verifier(units, pack, model=model)
     assert first.all_required_supported is True
-    assert structured_text_fallback_preferred(model) is True
+    assert structured_text_fallback_preferred(model) is False
     assert model.structured_calls == 1
     assert model.text_calls == 1
     second = await run_verifier(units, pack, model=model)
     assert second.all_required_supported is True
-    assert model.structured_calls == 1
+    assert model.structured_calls == 2
     assert model.text_calls == 2
 
 
@@ -225,7 +231,12 @@ async def test_structured_429_never_falls_back_to_text() -> None:
 
 
 async def test_invalid_structured_decision_prefers_text_afterwards() -> None:
-    """After a schema-invalid structured object the next round uses text directly."""
+    """A schema-invalid structured object falls back once without pinning.
+
+    Recurrence-2 update for kodmial/aa#244: content validation is not
+    capability evidence, so the next round re-probes structured instead
+    of staying text-pinned.
+    """
     pack = [_pack_entry()]
     units = split_response_units("Поддержка рядом помогает.")
 
@@ -262,10 +273,10 @@ async def test_invalid_structured_decision_prefers_text_afterwards() -> None:
     model = _InvalidThenTextModel()
     first = await run_verifier(units, pack, model=model)
     assert first.all_required_supported is True
-    assert structured_text_fallback_preferred(model) is True
+    assert structured_text_fallback_preferred(model) is False
     assert model.structured_calls == 1
     assert model.text_calls == 1
     second = await run_verifier(units, pack, model=model)
     assert second.all_required_supported is True
-    assert model.structured_calls == 1
+    assert model.structured_calls == 2
     assert model.text_calls == 2
