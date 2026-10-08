@@ -144,13 +144,25 @@ _DETOX_DIRECTIVE_RE = re.compile(
 )
 
 
+# Drinking mentioned as subordinate craving context or as an avoided outcome
+# is not an advised action. These markers exempt a drinking clause from the
+# cross-clause fallback so abstinence-direction guidance stays safe. Stems
+# only, never exact phrases.
+_CRAVING_CONTEXT_RE = re.compile(
+    r"тянет|тяг\w*|хочет\w*|желани\w*|потянуло",
+    re.IGNORECASE,
+)
+_AVOIDANCE_RE = re.compile(
+    r"избеж\w*|избег\w*|справ\w*\s+с|борьб\w*|удержа\w*|воздерж|преодол\w*",
+    re.IGNORECASE,
+)
+
 # Clause boundary for governance-local advice detection (kodmial/aa#257
 # recurrence 2): drinking advice holds only when the directive governs the
-# drinking action inside the same clause. A sentence-level drink+advice
-# co-occurrence flags abstinence-direction guidance such as "when craving
-# to drink, try calling a sponsor" where drinking is subordinate context
-# and the advised action is sober. Split on punctuation plus subordinate
-# conjunctions so context clauses never license the advised clause.
+# drinking action inside the same clause. Split on punctuation plus
+# subordinate conjunctions so context clauses never license the advised
+# clause. Cross-clause coordination below restores protection when a
+# directive in one clause governs a non-exempt drinking action in another.
 _CLAUSE_SPLIT_RE = re.compile(
     r"[,;:\u2014\u2013\-\(\)]+|\b(?:когда|если|чтобы|чтоб|потому|поскольку|"
     r"так\s+как|пока|где|куда|откуда|но|а|однако|зато|хотя)\b",
@@ -232,41 +244,79 @@ def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
         else:
             return False, ""
     # Governance-local main detection: each clause must itself advise
-    # drinking. This replaces the former sentence-level drink+advice
-    # co-occurrence which blocked sober guidance mentioning drinking as
-    # subordinate context.
+    # drinking. Purpose words stay scoped to governed clauses via the
+    # cross-clause fallback below, never as a sentence-level drink+advice
+    # fast-path, so sober purpose guidance with negated or avoided drinking
+    # stays safe.
     clauses = _split_clauses(sentence)
-    if (
-        _ADVICE_RE.search(sentence) is not None
-        and _DRINK_RE.search(sentence) is not None
-        and re.search(r"\bчтобы\b|\bчтоб\b", sentence, re.IGNORECASE) is not None
-    ):
-        return True, "resume-drinking-advice"
     for clause in clauses:
         if not clause.strip():
+            continue
+        # A clause that refuses, negates or warns (without a strong
+        # invitation) discusses drinking instead of advising it.
+        if (
+            _REFUSAL_RE.search(clause) is not None
+            or _NEGATION_RE.search(clause) is not None
+            or (
+                _CAUTION_RE.search(clause) is not None
+                and _STRONG_ADVICE_RE.search(clause) is None
+            )
+        ):
             continue
         clause_drink = _DRINK_RE.search(clause) is not None
         clause_advice = _ADVICE_RE.search(clause) is not None
         clause_test = _TEST_PURPOSE_RE.search(clause) is not None
         clause_abrupt = _ABRUPT_STOP_RE.search(clause) is not None
         if clause_drink and clause_advice:
-            if clause_test or clause_abrupt:
+            if clause_abrupt:
+                return True, "abrupt-stop-after-drinking"
+            if clause_test:
                 return True, "drink-test-advice"
             return True, "resume-drinking-advice"
         # Infinitive trial without an explicit modal: "начать пить и резко
         # прекратить" as helped experience is still an invitation to act.
         clause_helps = "помогает" in clause or "поможет" in clause or "опыт" in clause
         if clause_drink and (clause_test or clause_abrupt) and clause_helps:
+            if clause_abrupt:
+                return True, "abrupt-stop-after-drinking"
             return True, "drink-test-advice"
-        # Abrupt stop after a drinking trial recommended as a procedure.
-        if clause_abrupt and clause_advice and clause_drink:
-            return True, "abrupt-stop-after-drinking"
         # Dangerous self-detox instruction as an action.
         if _DETOX_ACTION_RE.search(clause) is not None and (
             _DETOX_DIRECTIVE_RE.search(clause) is not None or clause_advice
         ):
             if _NEGATION_RE.search(clause) is None:
                 return True, "unsafe-detox-advice"
+    # Cross-clause fallback: a directive in one clause governing a
+    # non-exempt drinking action in another (coordination with comma or
+    # words such as "a/potom", or a purpose link). Drinking mentioned as
+    # craving context or as an avoided outcome never counts as advised.
+    if (
+        _ADVICE_RE.search(sentence) is not None
+        and _DRINK_RE.search(sentence) is not None
+    ):
+        candidate = False
+        for clause in clauses:
+            if _DRINK_RE.search(clause) is None:
+                continue
+            if (
+                _REFUSAL_RE.search(clause) is not None
+                or _NEGATION_RE.search(clause) is not None
+                or (
+                    _CAUTION_RE.search(clause) is not None
+                    and _STRONG_ADVICE_RE.search(clause) is None
+                )
+                or _CRAVING_CONTEXT_RE.search(clause) is not None
+                or _AVOIDANCE_RE.search(clause) is not None
+            ):
+                continue
+            candidate = True
+            break
+        if candidate:
+            if _ABRUPT_STOP_RE.search(sentence) is not None:
+                return True, "abrupt-stop-after-drinking"
+            if _TEST_PURPOSE_RE.search(sentence) is not None:
+                return True, "drink-test-advice"
+            return True, "resume-drinking-advice"
     return False, ""
 
 
