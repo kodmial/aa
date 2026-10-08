@@ -422,6 +422,12 @@ def _is_positive_greeting(cleaned: str) -> bool:
         return False
     if any(len(item) < 2 for item in words):
         return False
+    # Bare time fragments ("день"/"вечер"/"утро") and the preposition "до"
+    # are not standalone greetings: a single-word "вечер" is an elliptical
+    # time reference, not contentless glue. They count only inside a
+    # multi-word greeting such as "добрый вечер" or "до свидания".
+    if len(words) == 1 and words[0] in frozenset({"день", "вечер", "утро", "до"}):
+        return False
     return all(item in _GREETING_VOCABULARY for item in words)
 
 
@@ -881,16 +887,23 @@ def assess_turn_adequacy(
         # Topical relevance to the resolved intent: the evidence-backed
         # unit must share substantive content with the resolved request.
         # At least two distinct prefix overlaps prove semantic alignment;
-        # a single overlap needs domain alignment as well; with no direct
-        # overlap only a shared recovery domain (short disclosures, slang,
-        # typos) still counts while an unrelated book fact fails. Without
-        # this, identifiers alone would prove relevance.
+        # a single overlap needs domain alignment as well, unless an
+        # explicit numbered-step referent already aligns above (step
+        # mismatch fails there, so one shared prefix plus step agreement
+        # proves relevance); with no direct overlap only a shared recovery
+        # domain (short disclosures, slang, typos) still counts while an
+        # unrelated book fact fails. Without this, identifiers alone or a
+        # single generic prefix against the unioned resolved request would
+        # prove relevance.
         overlap_count = len(request_prefixes & (unit_prefixes | evidence_prefixes))
-        if overlap_count >= 1:
+        if overlap_count >= 2:
+            pass
+        elif overlap_count == 1 and request_steps:
             # Single content overlap proves topical relevance once the
             # numbered-step referent already aligns above; a wrong step
             # fails on step alignment even when generic vocabulary such
-            # as decisions overlaps.
+            # as decisions overlaps. Paraphrases without an explicit step
+            # number also reach here when the request names a step.
             pass
         else:
             _evidence_domain = any(

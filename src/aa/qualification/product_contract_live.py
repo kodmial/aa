@@ -1807,6 +1807,12 @@ def _extract_step_numbers_for_relevance(text: str) -> set[int]:
             ("четверт", 4),
             ("пят", 5),
             ("шест", 6),
+            ("седьм", 7),
+            ("восьм", 8),
+            ("девят", 9),
+            ("десят", 10),
+            ("одиннадцат", 11),
+            ("двенадцат", 12),
         ):
             if stem in lowered:
                 found.add(number)
@@ -1833,13 +1839,15 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
     reply_tokens = _content_tokens_for_relevance(reply)
     if not prompt_tokens or not reply_tokens:
         return False
-    # Numbered-step fidelity: a prompt naming a step is relevant only to a
-    # reply naming the same step. Generic overlap on step vocabulary alone
-    # never proves that the answer addresses the asked step.
+    # Numbered-step fidelity: a prompt naming a step fails only on an
+    # explicit step mismatch. A reply paraphrasing the requested step
+    # without restating a step number must not fail here; topical
+    # relevance below still applies. Generic overlap on step vocabulary
+    # alone never proves that the answer addresses the asked step.
     prompt_steps = _extract_step_numbers_for_relevance(effective_prompt)
     if prompt_steps:
         reply_steps = _extract_step_numbers_for_relevance(reply)
-        if not (prompt_steps & reply_steps):
+        if reply_steps and not (prompt_steps & reply_steps):
             return False
     prompt_prefixes = {token[:4] for token in prompt_tokens if len(token) >= 4}
     reply_prefixes = {token[:4] for token in reply_tokens if len(token) >= 4}
@@ -1854,15 +1862,17 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
         return True
     _stems = (
         "тяг",
-        "вып",
         "выпи",
         "выпь",
         "буха",
         "бухл",
         "пить",
         "пью",
-        "пье",
-        "пил",
+        "пьет",
+        "пьешь",
+        "пьем",
+        "пьете",
+        "пьют",
         "пьян",
         "пья",
         "трезв",
@@ -1873,11 +1883,25 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
         "пив",
         "похмел",
     )
-    lowered_prompt = (effective_prompt or "").casefold()
-    lowered_reply = (reply or "").casefold()
-    prompt_domain = any(stem in lowered_prompt for stem in _stems)
-    reply_domain = any(stem in lowered_reply for stem in _stems)
-    return bool(prompt_domain and reply_domain)
+    # Token-anchored matching only: bare-substring checks let "вып" match
+    # "выполнить"/"выпуск", "пье" match "пьеса", and bare "пил" match
+    # "пилить"/"пилот". Bare "вып"/"пье" are removed above in favor of
+    # drinking-specific prefixes/inflections; "пил" forms match as exact
+    # tokens only. The rest match at token start so mid-word "пив"/"алко"
+    # in unrelated words cannot pass domain-domain relevance.
+    _exact = frozenset({"пил", "пила", "пило", "пили"})
+
+    def _has_domain(text: str) -> bool:
+        lowered = (text or "").casefold().replace("ё", "е")
+        for token in re.findall(r"[A-Za-z\u0400-\u04ff]+", lowered):
+            if token in _exact:
+                return True
+            for stem in _stems:
+                if token.startswith(stem):
+                    return True
+        return False
+
+    return bool(_has_domain(effective_prompt) and _has_domain(reply))
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
