@@ -233,7 +233,8 @@ class GraphTurnRuntime:
                 # Count only book-scoped, verifier-supported units with
                 # actual passage provenance. No user or corpus text leaks.
                 "verified_book_units": sum(
-                    1 for unit in grounding_units
+                    1
+                    for unit in grounding_units
                     if isinstance(unit, dict)
                     and unit.get("scope") == "book"
                     and unit.get("supported") is True
