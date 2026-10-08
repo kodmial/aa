@@ -1832,10 +1832,12 @@ def _prompt_allows_context_rescue(prompt: str) -> bool:
     An explicit new-topic prompt must be answered on its own merits; stale
     prior-turn context must not rescue a reply that ignores the current
     request. Only a current turn carrying little standalone topical
-    content (at most two substantive tokens) may resolve relevance
-    against the immediately preceding turns in the same chat.
+    content (at most four substantive tokens) may resolve relevance
+    against the immediately preceding turns in the same chat, so a
+    generic four-token continuation still resolves while a six-token
+    explicit pivot stays on its own merits.
     """
-    return len(_content_tokens_for_relevance(prompt)) <= 2
+    return len(_content_tokens_for_relevance(prompt)) <= 4
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
