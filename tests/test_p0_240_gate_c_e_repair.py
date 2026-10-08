@@ -177,7 +177,10 @@ async def test_budget_breach_retry_is_explicit_failure_for_gate_c() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=125000.0,
+        # Temporary quality-first SLO: end-to-end budget is 105s (< 120s
+        # hard SLO), so a breach needs upstream past 105s (was 35s under
+        # the old 27s budget).
+        upstream_latency_ms=110000.0,
     )
     assert outcome["text"] == NATURAL_RETRY_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
