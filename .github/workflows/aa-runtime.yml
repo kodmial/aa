@@ -223,6 +223,28 @@ jobs:
             exit 1
           fi
 
+      - name: Install and smoke-test Telegram voice codec
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | sed -n '1p'
+          # Exercise the actual OGG/Opus encoder and Telegram ASR PCM decoder.
+          # This is a codec smoke test; it never uses or stores user audio.
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          ffmpeg -nostdin -hide_banner -loglevel error -y \
+            -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=0.5' \
+            -ac 1 -c:a libopus -b:a 32k "$tmpdir/test.ogg"
+          ffmpeg -nostdin -hide_banner -loglevel error -y \
+            -i "$tmpdir/test.ogg" -ac 1 -ar 16000 -f f32le "$tmpdir/test.pcm"
+          test -s "$tmpdir/test.ogg"
+          test -s "$tmpdir/test.pcm"
+          echo "AA voice codec smoke: OGG/Opus encode/decode PASS"
+
       - name: Install worker
         run: |
           python -m pip install --upgrade pip
