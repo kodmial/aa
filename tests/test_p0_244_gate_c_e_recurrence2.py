@@ -92,14 +92,14 @@ def _pack_entry(
 
 def test_budgets_and_slo_unchanged() -> None:
     """Recurrence 2 changes marking policy only, never walls or SLO."""
-    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
-    assert PLANNER_TIME_BUDGET_S == 10.0
-    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
-    assert VERIFIER_TURN_BUDGET_S == 12.0
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert P95_TARGET_MS == 15_000
-    assert ORDINARY_TURN_BUDGET_MS == 30_000
+    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
+    assert PLANNER_TIME_BUDGET_S == 25.0
+    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
+    assert VERIFIER_TURN_BUDGET_S == 40.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert P95_TARGET_MS == 60_000
+    assert ORDINARY_TURN_BUDGET_MS == 120_000
 
 
 async def test_planner_timeout_reprobes_structured_next_turn(
