@@ -166,6 +166,9 @@ class GraphTurnRuntime:
         graph = self._graph
         if graph is None:
             raise GraphRuntimeError("not-started", "graph runtime has no compiled graph")
+        # Never attribute a previous turn's grounding telemetry to a later
+        # turn that crashes or is converted to an application fallback.
+        self._last_telemetry.pop(thread, None)
         started = _time.perf_counter()
         try:
             result = await self._invoke_graph(graph, thread, cleaned)
@@ -227,6 +230,15 @@ class GraphTurnRuntime:
                 "verifier_latency_ms": float(embedded_d.get("verifier_latency_ms", 0.0)),
                 "verifier_unavailable_units": int(embedded_d.get("verifier_unavailable_units", 0)),
                 "response_units": int(response_units),
+                # Count only book-scoped, verifier-supported units with
+                # actual passage provenance. No user or corpus text leaks.
+                "verified_book_units": sum(
+                    1 for unit in grounding_units
+                    if isinstance(unit, dict)
+                    and unit.get("scope") == "book"
+                    and unit.get("supported") is True
+                    and bool(unit.get("evidence_passage_ids"))
+                ),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
                 "repair_budget_exceeded": bool(embedded_d.get("repair_budget_exceeded", False)),
                 "turn_budget_exceeded": bool(embedded_d.get("turn_budget_exceeded", False)),
