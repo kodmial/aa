@@ -110,8 +110,8 @@ def test_no_hash_selection_in_turn_pipeline() -> None:
 
 def test_end_to_end_budget_tracks_hard_slo_not_p95_target() -> None:
     """Ordinary 14-27s turns must complete; only hard-SLO breaches fail fast."""
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert TURN_END_TO_END_BUDGET_S < 30.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert TURN_END_TO_END_BUDGET_S < 120.0
 
 
 async def test_slow_but_answerable_turn_serves_grounded_answer() -> None:

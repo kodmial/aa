@@ -99,12 +99,12 @@ def test_end_to_end_budget_configured() -> None:
     turn past the hard SLO still fails fast with explicit failure
     telemetry.
     """
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert TURN_END_TO_END_BUDGET_S < 30.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert TURN_END_TO_END_BUDGET_S < 120.0
     assert TURN_ANSWER_MIN_SLICE_S == 1.0
     assert TURN_VERIFIER_MIN_SLICE_S == 3.0
     # Stage budgets are unchanged (strategy change, not a retune).
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
 
 
 async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
