@@ -126,19 +126,27 @@ def _derive_turn_relevance(units: list[UnitVerdict]) -> tuple[bool, str]:
     """Derive turn relevance deterministically from per-unit model verdicts.
 
     No lexical heuristics: the model already judged each unit. The turn
-    is relevant when at least one supported book unit addresses the
-    resolved intent, or when no unit requires book evidence at all
-    (pure conversational turn).
+    is relevant when every supported book unit addresses the resolved
+    intent, or when no unit requires book evidence at all (pure
+    conversational turn). Requiring every supported book unit (not just
+    one) rejects padding, repetition and off-topic digressions served
+    alongside one relevant sentence (kodmial/aa#286): a single relevant
+    sentence no longer passes the entire response. Pure empathy/glue
+    units carry no substantive claim and are not required to address
+    the intent individually.
     """
     if not units:
         return False, "no-units"
     needs_book = any(verdict.scope == "book" for verdict in units)
     if not needs_book:
         return True, "glue-no-book-required"
-    for verdict in units:
-        if verdict.scope == "book" and verdict.supported and verdict.addresses_intent:
-            return True, ""
-    return False, "irrelevant-citation"
+    supported_book = [verdict for verdict in units if verdict.scope == "book" and verdict.supported]
+    if not supported_book:
+        return False, "irrelevant-citation"
+    for verdict in supported_book:
+        if not verdict.addresses_intent:
+            return False, "irrelevant-citation"
+    return True, ""
 
 
 def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> GroundingResult:

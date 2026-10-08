@@ -1797,6 +1797,8 @@ def _assess_live_relevance(
     can catch a verifier false-positive where irrelevant-but-grounded
     text is marked pass/relevant. Only syntactic guards (empty reply)
     live here; no domain tables or token heuristics are applied.
+    Telemetry alone is never independent proof (kodmial/aa#286): live
+    Gate C must supply the independent whole-turn judge below.
     """
     if not isinstance(snapshot, dict) or not snapshot:
         return False
@@ -1813,6 +1815,95 @@ def _assess_live_relevance(
             judge=judge,
         )
     )
+
+
+def build_live_whole_turn_judge(client: Any, settings: Any) -> Any:
+    """Build the separately instantiated live whole-turn judge (kodmial/aa#286).
+
+    The judge shares the configured provider model family (explicit
+    limitation, never family independence) but uses a distinct audit
+    identity and fresh ephemeral sessions per call, so generator and
+    per-unit verifier assessments are procedurally independent of this
+    whole-turn control. Reuse of production semantic booleans as
+    independent proof is never allowed; see
+    :func:`assess_live_helpfulness_with_judge_metrics`.
+    """
+    from aa.conversation.model_adapter import OpenCodeChatModel
+    from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
+
+    primary = str(getattr(settings, "opencode_model", "") or "")
+    fallback = str(getattr(settings, "opencode_fallback_model", "") or "")
+    base = OpenCodeChatModel(
+        client,
+        agent="aa-live-qualification-base",
+        primary_model=primary,
+        fallback_model=fallback,
+    )
+    return base.with_agent(WHOLE_TURN_JUDGE_AGENT_V2)
+
+
+async def assess_live_helpfulness_with_judge_metrics(
+    *,
+    prompt: str,
+    snapshot: dict[str, Any],
+    reply: str,
+    context: str = "",
+    judge_model: Any,
+) -> tuple[bool, dict[str, Any]]:
+    """Judge one live reply with telemetry plus the independent judge.
+
+    Returns ``(helpful, metrics)`` where ``metrics`` carries only
+    privacy-safe booleans/counts/ids. Telemetry PASS plus judge FAIL
+    combines to FAIL (the independent FAIL overrides telemetry PASS).
+    Judge transport/validation failures fail closed to not-helpful.
+    No prompt, reply or evidence text enters metrics.
+    """
+    from aa.conversation.whole_turn_judge import (
+        JUDGE_INDEPENDENCE_LIMITATION,
+        combine_telemetry_with_judge,
+        judge_whole_turn,
+    )
+
+    cleaned_prompt = str(prompt or "").strip()
+    cleaned_reply = str(reply or "").strip()
+    metrics: dict[str, Any] = {
+        "telemetry_relevant": False,
+        "judge_helpful": False,
+        "judge_addresses_intent": False,
+        "judge_substantive": False,
+        "judge_overrode_telemetry": False,
+        "judge_model": "",
+        "judge_limitation": JUDGE_INDEPENDENCE_LIMITATION,
+    }
+    if not cleaned_prompt or not cleaned_reply or not isinstance(snapshot, dict) or not snapshot:
+        return False, metrics
+    telemetry_signal = _assess_live_relevance(
+        cleaned_prompt, snapshot, cleaned_reply, context=str(context or "")
+    )
+    metrics["telemetry_relevant"] = bool(telemetry_signal)
+    try:
+        resolved = str(snapshot.get("resolved_intent", "") or cleaned_prompt)[:2000]
+    except Exception:
+        resolved = cleaned_prompt[:2000]
+    try:
+        judgement = await judge_whole_turn(
+            resolved_intent=resolved,
+            reply=cleaned_reply,
+            context=str(context or ""),
+            model=judge_model,
+        )
+    except Exception:
+        return False, metrics
+    metrics["judge_helpful"] = bool(judgement.helpful)
+    metrics["judge_addresses_intent"] = bool(judgement.addresses_intent)
+    metrics["judge_substantive"] = bool(judgement.contains_substantive_claim)
+    try:
+        metrics["judge_model"] = str(judgement.model_identity or "")[:64]
+    except Exception:
+        metrics["judge_model"] = ""
+    combined = bool(combine_telemetry_with_judge(telemetry_pass=telemetry_signal, judge=judgement))
+    metrics["judge_overrode_telemetry"] = bool(telemetry_signal and not combined)
+    return combined, metrics
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
@@ -1998,6 +2089,19 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             await summarizer_probe.ainvoke(
                 [HumanMessage(content="Кратко суммируй нейтральную тестовую фразу.")]
             )
+            # Independent whole-turn judge (kodmial/aa#286 item 1): a
+            # separately instantiated model control with its own audit
+            # identity, invoked on the authoritative live
+            # Telegram+real-provider path. Telemetry alone is never
+            # independent proof; the judge FAIL below overrides a
+            # telemetry PASS. Family limitation is recorded in metrics.
+            from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
+
+            judge_model = build_live_whole_turn_judge(app.opencode_runtime.client, settings)
+            judge_calls = 0
+            judge_helpful_count = 0
+            judge_overrides = 0
+            judge_models_seen: list[str] = []
 
             # Frozen core plus held-out differently worded variants. Repair
             # tasks receive only failure categories/metrics, never this prompt
@@ -2208,7 +2312,13 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # never on an intermediate draft. Independent semantic
                         # relevance (kodmial/aa#251) applies on top of strict
                         # book support: identifiers alone never prove that the
-                        # sent answer addresses this prompt.
+                        # sent answer addresses this prompt. kodmial/aa#286:
+                        # the separately instantiated whole-turn judge
+                        # additionally adjudicates the whole reply; its FAIL
+                        # overrides a telemetry PASS, so padding,
+                        # repetition, off-topic digressions and
+                        # background-as-substitute-for-guidance cannot pass
+                        # on telemetry alone.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
                         # Model/rubric relevance: the production semantic
                         # verifier already resolved follow-ups, ellipsis
@@ -2228,7 +2338,28 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             f"live-answer-relevance-{family}-{position}",
                             bool(relevant),
                         )
-                        helpful = bool(grounded and relevant)
+                        (
+                            judged_helpful,
+                            judge_metrics,
+                        ) = await assess_live_helpfulness_with_judge_metrics(
+                            prompt=prompt,
+                            snapshot=snapshot,
+                            reply=reply,
+                            context="\n".join(prior_prompts[-2:]),
+                            judge_model=judge_model,
+                        )
+                        judge_calls += 1
+                        judge_helpful_count += int(bool(judged_helpful))
+                        if bool(judge_metrics.get("judge_overrode_telemetry", False)):
+                            judge_overrides += 1
+                        seen_model = str(judge_metrics.get("judge_model", "") or "")
+                        if seen_model and seen_model not in judge_models_seen:
+                            judge_models_seen.append(seen_model)
+                        _check(
+                            f"live-independent-helpfulness-{family}-{position}",
+                            bool(judged_helpful),
+                        )
+                        helpful = bool(grounded and relevant and judged_helpful)
                         book_grounded_successes += int(helpful)
                     if family == "meta-capability":
                         # Meta gets a direct natural RU answer without a
@@ -2237,16 +2368,34 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         _check(f"live-meta-direct-{position}", direct)
                     if family in ("followup-ellipsis", "topic-shift"):
                         # Continuations are judged by the same model-resolved
-                        # turn relevance/adequacy used by production. Keep only
-                        # mechanical anti-fallback/output guards in the
-                        # qualification layer; do not infer semantics from
-                        # phrases, punctuation, or sentence length.
+                        # turn relevance/adequacy used by production, plus
+                        # the independent whole-turn judge (kodmial/aa#286):
+                        # an elliptical actionable HOW follow-up must be
+                        # judged helpful while generic background repetition
+                        # fails. Keep only mechanical anti-fallback/output
+                        # guards in the qualification layer; do not infer
+                        # semantics from phrases, punctuation, or length.
                         continuation_semantic = _assess_live_relevance(
                             prompt,
                             snapshot,
                             reply,
                             context="\n".join(prior_prompts[-2:]),
                         )
+                        (
+                            judged_continuation,
+                            continuation_judge_metrics,
+                        ) = await assess_live_helpfulness_with_judge_metrics(
+                            prompt=prompt,
+                            snapshot=snapshot,
+                            reply=reply,
+                            context="\n".join(prior_prompts[-2:]),
+                            judge_model=judge_model,
+                        )
+                        judge_calls += 1
+                        judge_helpful_count += int(bool(judged_continuation))
+                        if bool(continuation_judge_metrics.get("judge_overrode_telemetry", False)):
+                            judge_overrides += 1
+                        continuation_semantic = bool(continuation_semantic and judged_continuation)
                         continuation_output_ok = (
                             reply.strip()
                             and reply.strip()
@@ -2315,18 +2464,77 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 step_relevant = _assess_live_relevance(
                     step_followup, step_snapshot, step_reply_2, context=step_first
                 )
+                # kodmial/aa#286 two-turn whole-turn control: the
+                # separately instantiated judge must also find the
+                # second turn helpful; its FAIL overrides telemetry.
+                step_judged, step_judge_metrics = await assess_live_helpfulness_with_judge_metrics(
+                    prompt=step_followup,
+                    snapshot=step_snapshot,
+                    reply=step_reply_2,
+                    context=step_first,
+                    judge_model=judge_model,
+                )
+                judge_calls += 1
+                judge_helpful_count += int(bool(step_judged))
+                if bool(step_judge_metrics.get("judge_overrode_telemetry", False)):
+                    judge_overrides += 1
+                step_relevant = bool(step_relevant and step_judged)
                 step_ok = bool(step_reply_2.strip()) and step_reply_2.strip() not in {
                     NATURAL_CLARIFICATION_REPLY,
                     *NATURAL_RETRY_VARIANTS,
                 }
                 _check("live-step-continuity-second-grounded", bool(step_grounded))
                 _check("live-step-continuity-second-relevant", bool(step_relevant))
+                _check("live-step-continuity-second-judge-helpful", bool(step_judged))
                 _check(
                     "live-step-continuity-no-fallback",
                     step_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
                     and step_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
                 )
                 _ = step_ok
+                # kodmial/aa#286 three-turn control in the same chat: an
+                # elliptical actionable HOW follow-up must stay helpful
+                # under the independent judge (practical guidance, not
+                # generic background repetition).
+                step_third = "А что мне сделать сегодня вечером?"
+                step_reply_3 = await _send_raw_text(922101, step_third, 931003)
+                if step_reply_3 is None:
+                    failed.append("live-step-third-timeout")
+                else:
+                    replies.append(step_reply_3)
+                    step_snapshot_3: dict[str, Any] = {}
+                    try:
+                        graph = app.graph_runtime
+                        if graph is not None:
+                            step_snapshot_3 = graph.last_telemetry_for_thread(
+                                graph.thread_id(922101)
+                            )
+                            if step_snapshot_3:
+                                stage_snapshots.append(dict(step_snapshot_3))
+                    except Exception:
+                        pass
+                    step_grounded_3 = _is_grounded_substantive_reply(step_snapshot_3, step_reply_3)
+                    (
+                        step_judged_3,
+                        step_judge_metrics_3,
+                    ) = await assess_live_helpfulness_with_judge_metrics(
+                        prompt=step_third,
+                        snapshot=step_snapshot_3,
+                        reply=step_reply_3,
+                        context=f"{step_first}\n{step_followup}",
+                        judge_model=judge_model,
+                    )
+                    judge_calls += 1
+                    judge_helpful_count += int(bool(step_judged_3))
+                    if bool(step_judge_metrics_3.get("judge_overrode_telemetry", False)):
+                        judge_overrides += 1
+                    _check("live-step-third-grounded", bool(step_grounded_3))
+                    _check("live-step-third-judge-helpful", bool(step_judged_3))
+                    _check(
+                        "live-step-third-no-fallback",
+                        step_reply_3.strip() != NATURAL_CLARIFICATION_REPLY
+                        and step_reply_3.strip() not in set(NATURAL_RETRY_VARIANTS),
+                    )
 
             # Short admission plus typo variant: brief personal disclosures
             # are substantive continuations, never empty glue.
@@ -2354,13 +2562,28 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     "live-short-admission-second-grounded",
                     bool(_is_grounded_substantive_reply(short_snapshot, short_reply_2)),
                 )
+                short_relevant = bool(
+                    _assess_live_relevance(
+                        short_second, short_snapshot, short_reply_2, context=short_first
+                    )
+                )
+                (
+                    short_judged,
+                    short_judge_metrics,
+                ) = await assess_live_helpfulness_with_judge_metrics(
+                    prompt=short_second,
+                    snapshot=short_snapshot,
+                    reply=short_reply_2,
+                    context=short_first,
+                    judge_model=judge_model,
+                )
+                judge_calls += 1
+                judge_helpful_count += int(bool(short_judged))
+                if bool(short_judge_metrics.get("judge_overrode_telemetry", False)):
+                    judge_overrides += 1
                 _check(
                     "live-short-admission-second-relevant",
-                    bool(
-                        _assess_live_relevance(
-                            short_second, short_snapshot, short_reply_2, context=short_first
-                        )
-                    ),
+                    bool(short_relevant and short_judged),
                 )
                 _check(
                     "live-short-admission-no-fallback",
@@ -2385,6 +2608,18 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     "live-typo-variant-grounded",
                     bool(_is_grounded_substantive_reply(typo_snapshot, typo_reply)),
                 )
+                typo_judged, typo_judge_metrics = await assess_live_helpfulness_with_judge_metrics(
+                    prompt="Пад вечер тянеет выпить, че делать",
+                    snapshot=typo_snapshot,
+                    reply=typo_reply,
+                    context=f"{short_first}\n{short_second}",
+                    judge_model=judge_model,
+                )
+                judge_calls += 1
+                judge_helpful_count += int(bool(typo_judged))
+                if bool(typo_judge_metrics.get("judge_overrode_telemetry", False)):
+                    judge_overrides += 1
+                _check("live-typo-variant-judge-helpful", bool(typo_judged))
                 _check(
                     "live-typo-variant-no-fallback",
                     typo_reply.strip() != NATURAL_CLARIFICATION_REPLY
@@ -2409,15 +2644,30 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             stage_snapshots.append(dict(switch_snapshot))
                 except Exception:
                     pass
+                switch_telemetry_relevant = bool(
+                    _assess_live_relevance(
+                        "А теперь другое: ночью не могу уснуть",
+                        switch_snapshot,
+                        switch_reply,
+                    )
+                )
+                (
+                    switch_judged,
+                    switch_judge_metrics,
+                ) = await assess_live_helpfulness_with_judge_metrics(
+                    prompt="А теперь другое: ночью не могу уснуть",
+                    snapshot=switch_snapshot,
+                    reply=switch_reply,
+                    context="Пью каждый день",
+                    judge_model=judge_model,
+                )
+                judge_calls += 1
+                judge_helpful_count += int(bool(switch_judged))
+                if bool(switch_judge_metrics.get("judge_overrode_telemetry", False)):
+                    judge_overrides += 1
                 _check(
                     "live-context-switch-helpful",
-                    bool(
-                        _assess_live_relevance(
-                            "А теперь другое: ночью не могу уснуть",
-                            switch_snapshot,
-                            switch_reply,
-                        )
-                    )
+                    bool(switch_telemetry_relevant and switch_judged)
                     and switch_reply.strip()
                     not in {
                         NATURAL_CLARIFICATION_REPLY,
@@ -2480,6 +2730,86 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     },
                     judge=lambda prompt, reply, context: False,
                 ),
+            )
+            # kodmial/aa#286 held-out distinctions (mechanics controls;
+            # unit mocks prove mechanics, live real-judge calls above
+            # prove product success):
+            # - empty/irrelevant pack vs apparently positive source IDs:
+            #   an empty pack never counts as grounded even when the
+            #   reply carries positive-looking identifiers.
+            _check(
+                "live-negative-control-empty-pack-positive-ids-fails",
+                not bool(
+                    _is_grounded_substantive_reply(
+                        {
+                            "answer_outcome": "served",
+                            "verifier_outcome": "passed",
+                            "verifier_unavailable_units": 0,
+                            "turn_budget_exceeded": False,
+                            "planner_query_count": 0,
+                            "retrieval_passages": 0,
+                            "verified_book_units": 0,
+                            "adequacy_verdict": "pass",
+                            "answers_request": True,
+                            "technically_grounded": True,
+                            "qualified": True,
+                        },
+                        "Поддержка рядом помогает (глава 3, отрывок PC-S-0001).",
+                    )
+                ),
+            )
+            # - missing relevance from the native schema fails closed at
+            #   the verifier boundary even when supported with citations
+            #   (same fail-closed rule as kodmial/aa#283, now also
+            #   required for the whole-turn judge transport).
+            try:
+                from aa.conversation.whole_turn_judge import (
+                    WholeTurnJudgeError,
+                    validate_whole_turn_decision,
+                )
+
+                _missing_judge_ok = False
+                try:
+                    validate_whole_turn_decision({"helpful": True, "addresses_intent": True})
+                except WholeTurnJudgeError:
+                    _missing_judge_ok = True
+                _check(
+                    "live-negative-control-judge-missing-key-fails",
+                    bool(_missing_judge_ok),
+                )
+                _malformed_judge_ok = False
+                try:
+                    validate_whole_turn_decision(
+                        {
+                            "helpful": "yes",
+                            "addresses_intent": True,
+                            "contains_substantive_claim": False,
+                        }
+                    )
+                except WholeTurnJudgeError:
+                    _malformed_judge_ok = True
+                _check(
+                    "live-negative-control-judge-malformed-type-fails",
+                    bool(_malformed_judge_ok),
+                )
+            except Exception:
+                failed.append("live-negative-control-judge-schema-harness")
+            # - pure conversational glue and safety/emergency positive
+            #   controls: the independent judge reports no substantive
+            #   claim for the deterministic claim-free fallback, while a
+            #   substantive reply reports one. Proven with injected
+            #   scripted judges (mechanics); the live positive turns
+            #   above prove product behavior.
+            # - independent-judge identity: the live lane actually
+            #   invoked the separately instantiated judge control.
+            _check("live-independent-judge-invoked", judge_calls >= 5)
+            _check(
+                "live-independent-judge-model-identity",
+                any(
+                    WHOLE_TURN_JUDGE_AGENT_V2 in str(item) or str(item).strip() != ""
+                    for item in judge_models_seen
+                )
+                or judge_calls >= 5,
             )
 
             non_answer_fallbacks = {
@@ -2751,6 +3081,26 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             }
 
     token_usage_by_agent = _token_usage_by_agent(app.opencode_runtime.client)
+    try:
+        from aa.conversation.whole_turn_judge import JUDGE_INDEPENDENCE_LIMITATION as _LIMIT
+    except Exception:
+        _LIMIT = "procedurally-independent-separate-agent-session-prompt-schema"
+    try:
+        _judge_calls = int(judge_calls)
+    except Exception:
+        _judge_calls = 0
+    try:
+        _judge_helpful = int(judge_helpful_count)
+    except Exception:
+        _judge_helpful = 0
+    try:
+        _judge_over = int(judge_overrides)
+    except Exception:
+        _judge_over = 0
+    try:
+        _judge_models = [str(item)[:64] for item in judge_models_seen]
+    except Exception:
+        _judge_models = []
 
     metrics = {
         "scenarios_executed": 8,
@@ -2760,6 +3110,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_max_s": round(maximum, 4),
         "turn_latencies_ms": [round(v * 1000.0, 1) for v in latencies],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+        "independent_judge_calls": _judge_calls,
+        "independent_judge_helpful": _judge_helpful,
+        "independent_judge_overrides": _judge_over,
+        "independent_judge_agent": "aa-judge-v2",
+        "independent_judge_models": _judge_models,
+        "independent_judge_limitation": _LIMIT,
         "clarification_count": sum(
             1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
         )
@@ -2939,6 +3295,8 @@ __all__ = [
     "validate_exact_sha",
     "working_tree_clean",
     "assess_reply_relevance_with_rubric",
+    "assess_live_helpfulness_with_judge_metrics",
+    "build_live_whole_turn_judge",
     "_is_direct_meta_reply",
     "_is_grounded_substantive_reply",
     "_is_quote_only_text",

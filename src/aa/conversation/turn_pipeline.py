@@ -429,9 +429,11 @@ def narrowed_grounding_state(
     ]
     if not filtered:
         return {"verified": False, "units": [], "all_required_supported": False}
-    relevant = any(
-        item.get("scope") == "book" and bool(item.get("addresses_intent", False))
-        for item in filtered
+    # kodmial/aa#286: every supported book unit in the served subset must
+    # address the intent; one relevant sentence no longer passes padding.
+    supported_book = [item for item in filtered if item.get("scope") == "book"]
+    relevant = bool(supported_book) and all(
+        bool(item.get("addresses_intent", False)) for item in supported_book
     )
     needs_book = any(item.get("scope") == "book" for item in filtered)
     return {
@@ -639,6 +641,7 @@ async def run_v2_answer_turn(
     turn_trace_id: str | None = None,
     planner_mode: str | None = None,
     resolved_intent: str | None = None,
+    whole_turn_judge_model: Any | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -770,6 +773,10 @@ async def run_v2_answer_turn(
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
         "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
+        "evidence_window_omitted_generation": max(
+            0, initial_pack_passages - ANSWER_GENERATION_MAX_PASSAGES
+        ),
+        "evidence_window_omitted_verifier": max(0, initial_pack_passages - 5),
         "adequacy_verdict": "unknown",
         "failure_category": "",
         "answers_request": False,
@@ -919,6 +926,14 @@ async def run_v2_answer_turn(
             telemetry["repair_rounds"] = rounds
         except NameError:
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
+        try:
+            telemetry["evidence_window_omitted_generation"] = max(
+                0, len(pack) - ANSWER_GENERATION_MAX_PASSAGES
+            )
+            telemetry["evidence_window_omitted_verifier"] = max(0, len(pack) - 5)
+            telemetry["retrieval_passages"] = len(pack)
+        except Exception:
+            pass
 
     rounds = 0
 
@@ -989,19 +1004,30 @@ async def run_v2_answer_turn(
                     )
                     telemetry["retrieval_outcome"] = "recovery-failed"
 
-    def _generation_window(active_pack: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _generation_window(
+        active_pack: list[dict[str, Any]], *, wider: bool = False
+    ) -> list[dict[str, Any]]:
         """Return the bounded top-ranked window for answer generation only.
 
         The stored pack order is already fused-rank priority, so the
         leading slice keeps the most relevant authoritative passages.
         Verification always uses the full pack; only generation input
-        tokens are bounded here.
+        tokens are bounded here. The initial draft uses the top-5
+        window; bounded repair attempts may use the wider top-8 window
+        (kodmial/aa#286 item 3) so decisive evidence at ranks 6-8 is not
+        permanently invisible, without blindly enlarging every turn.
+        Provenance, source-exactness and latency bounds are unchanged.
         """
-        if len(active_pack) <= ANSWER_GENERATION_MAX_PASSAGES:
-            return active_pack
-        return active_pack[:ANSWER_GENERATION_MAX_PASSAGES]
+        from aa.conversation.whole_turn_judge import REPAIR_GENERATION_MAX_PASSAGES
 
-    async def _draft_with_pack(active_pack: list[dict[str, Any]], prompt_text: str) -> str | None:
+        limit = REPAIR_GENERATION_MAX_PASSAGES if wider else ANSWER_GENERATION_MAX_PASSAGES
+        if len(active_pack) <= limit:
+            return active_pack
+        return active_pack[:limit]
+
+    async def _draft_with_pack(
+        active_pack: list[dict[str, Any]], prompt_text: str, *, wider: bool = False
+    ) -> str | None:
         from aa.opencode.errors import OpenCodeRateLimitError
 
         # End-to-end guard (recurrence 10): bound this attempt by the
@@ -1019,7 +1045,7 @@ async def run_v2_answer_turn(
             telemetry["answer_outcome"] = "failed"
             return None
         attempt_budget = min(ANSWER_DRAFT_ATTEMPT_BUDGET_S, remaining)
-        passages = state_passages_to_prompt(_generation_window(active_pack))
+        passages = state_passages_to_prompt(_generation_window(active_pack, wider=wider))
         started = time.perf_counter()
         try:
             draft_call = generate_draft(
@@ -1208,6 +1234,19 @@ async def run_v2_answer_turn(
     # error/timeout/invalid outcome is never legitimate glue, even with
     # zero queries. Only a positively proven contentless turn with an
     # explicit legitimate-glue reason skips repair.
+    # kodmial/aa#286 item 4 signal (model-driven, never a keyword
+    # table): whether the verifier reported any book-required unit. Used
+    # below to guard the qualified fallback boundary when a judge is
+    # present; the historical glue skip-repair contract (kodmial/aa#145)
+    # is preserved when no separately instantiated judge is supplied.
+    _verifier_claims_book = False
+    try:
+        if result is not None:
+            _verifier_claims_book = any(
+                str(getattr(item, "scope", "")) == "book" for item in result.units
+            )
+    except Exception:
+        _verifier_claims_book = False
     is_glue = bool(
         _proven_glue
         and _effective_reason == "legitimate-glue"
@@ -1342,7 +1381,7 @@ async def run_v2_answer_turn(
                     )
                 except Exception:
                     pass
-                _fallback_draft = await _draft_with_pack(pack, _fallback_focus)
+                _fallback_draft = await _draft_with_pack(pack, _fallback_focus, wider=True)
                 if _fallback_draft is not None:
                     _fallback_slice = _verifier_round_budget()
                     _fallback_ok = not (
@@ -1383,7 +1422,7 @@ async def run_v2_answer_turn(
                     )
                 except Exception:
                     pass
-                _dup_draft = await _draft_with_pack(pack, _dup_focus)
+                _dup_draft = await _draft_with_pack(pack, _dup_focus, wider=True)
                 if _dup_draft is not None:
                     _dup_slice = _verifier_round_budget()
                     _dup_ok = not (
@@ -1408,7 +1447,7 @@ async def run_v2_answer_turn(
             break
         pack = merged
         rounds += 1
-        next_draft = await _draft_with_pack(pack, user_message)
+        next_draft = await _draft_with_pack(pack, user_message, wider=True)
         if next_draft is None:
             break
         current_draft = next_draft
@@ -1435,6 +1474,69 @@ async def run_v2_answer_turn(
             telemetry["verifier_outcome"] = "unsupported"
 
     if passed and units and result is not None:
+        # kodmial/aa#286 item 4 double-misclassification guard: a
+        # planner-certified glue turn with an empty pack whose verifier
+        # also reports pure glue may still carry substantive advice when
+        # both model judgements err. When a separately instantiated
+        # whole-turn judge is supplied, it adjudicates the served draft:
+        # a substantive-claim verdict overturns the glue pass so the
+        # turn can never serve unverified substantive advice as a
+        # qualified glue success. Without a judge the historical path is
+        # preserved (live Gate C always supplies the judge). Bounded by
+        # the remaining end-to-end budget; no keyword tables consulted.
+        if _proven_glue and initial_pack_empty and not pack and whole_turn_judge_model is not None:
+            try:
+                from aa.conversation.whole_turn_judge import (
+                    JUDGE_INDEPENDENCE_LIMITATION as _JUDGE_LIMIT,
+                )
+                from aa.conversation.whole_turn_judge import judge_whole_turn as _judge_turn
+
+                telemetry["judge_independence_limitation"] = _JUDGE_LIMIT
+                _judge_slice = _remaining_budget_s()
+                if _judge_slice >= TURN_VERIFIER_MIN_SLICE_S:
+                    _judgement = await _judge_turn(
+                        resolved_intent=_resolved_request,
+                        reply=current_draft,
+                        context=_conversation_context,
+                        model=whole_turn_judge_model,
+                    )
+                    telemetry["independent_judge_helpful"] = bool(_judgement.helpful)
+                    telemetry["independent_judge_addresses_intent"] = bool(
+                        _judgement.addresses_intent
+                    )
+                    telemetry["independent_judge_substantive"] = bool(
+                        _judgement.contains_substantive_claim
+                    )
+                    if bool(_judgement.contains_substantive_claim):
+                        logger.info(
+                            "v2 glue turn overturned by whole-turn judge",
+                            extra={"category": "glue-substantive-overturn"},
+                        )
+                        # A misclassified substantive request must never
+                        # count as a qualified glue success: record an
+                        # explicit failure (the shared glue adequacy path
+                        # would otherwise PASS a claim-free retry as glue).
+                        telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                        telemetry["failure_category"] = _FAIL_REPAIR
+                        telemetry["answers_request"] = False
+                        telemetry["technically_grounded"] = False
+                        telemetry["qualified"] = False
+                        _finish_telemetry()
+                        return {
+                            "text": select_retry_reply(user_message),
+                            "units": units,
+                            "verification": grounding_result_to_state(result),
+                            "rounds": rounds,
+                            "recent_quote_ranges": recent_ranges,
+                            "telemetry": dict(telemetry),
+                        }
+                else:
+                    _mark_turn_budget_exceeded()
+            except Exception as exc:
+                logger.info(
+                    "v2 whole-turn glue judge failed closed",
+                    extra={"category": type(exc).__name__},
+                )
         # Whole-turn answer adequacy gate (kodmial/aa#251): per-unit
         # success alone never serves an all-glue or irrelevant answer for
         # a substantive request. With evidence available regenerate once
@@ -1450,7 +1552,7 @@ async def run_v2_answer_turn(
             _regen_units: list[ResponseUnitDraft] = []
             _regen_result: GroundingResult | None = None
             _regen_passed = False
-            _regen_draft = await _draft_with_pack(pack, _regen_prompt)
+            _regen_draft = await _draft_with_pack(pack, _regen_prompt, wider=True)
             if _regen_draft is not None:
                 _regen_slice = _verifier_round_budget()
                 _regen_ok = not (
@@ -1978,22 +2080,30 @@ async def run_v2_answer_turn(
             "telemetry": dict(telemetry),
         }
 
-    # Conversational delivery contract (kodmial/aa#284): a
-    # planner-certified conversational turn (model-resolved conversational
-    # mode with zero queries, legitimate-glue reason and an empty Evidence
-    # Pack) whose single draft/verify attempt produced no verifier verdict
-    # is served with the deterministic claim-free conversational fallback
-    # instead of collapsing to clarification/retry. The fallback carries
-    # no substantive claim by construction, so per-claim grounding holds
+    # Conversational delivery contract (kodmial/aa#284, hardened
+    # kodmial/aa#286 item 5): a planner-certified conversational turn
+    # (model-resolved conversational mode with zero queries,
+    # legitimate-glue reason and an empty Evidence Pack) whose single
+    # draft/verify attempt produced no verifier verdict is served with
+    # the deterministic claim-free conversational fallback instead of
+    # collapsing to clarification/retry. The fallback carries no
+    # substantive claim by construction, so per-claim grounding holds
     # vacuously; it still passes the envelope, language, leak,
     # quote-budget and outbound-safety gates. Substantive turns never
     # enter this boundary and keep the existing fail-closed collapse.
-    # No extra model call is issued here, so the live SLO is preserved.
+    # A verifier that reports any book-required unit proves the planner
+    # misclassified a book-dependent request: such a turn must not be
+    # marked successful via this fallback even when the pack is empty.
+    # When a separately instantiated whole-turn judge is supplied, it
+    # additionally guards the result-None boundary (validation failure
+    # or outage carries no scope signal): a substantive-claim verdict
+    # serves honest retry as failure instead of qualified fallback.
     # Turn-independent, never an exact-question special case.
     if (
         _proven_glue
         and not pack
         and not passed
+        and not _verifier_claims_book
         and _effective_reason == "legitimate-glue"
         and contains_cyrillic(CONVERSATIONAL_FALLBACK_REPLY)
         and not leaks_internal_terms(CONVERSATIONAL_FALLBACK_REPLY)
@@ -2001,6 +2111,51 @@ async def run_v2_answer_turn(
         and aggregate_quote_chars(CONVERSATIONAL_FALLBACK_REPLY) <= QUOTE_BUDGET_CHARS
         and certify_outbound_safety(CONVERSATIONAL_FALLBACK_REPLY)
     ):
+        if whole_turn_judge_model is not None:
+            try:
+                from aa.conversation.whole_turn_judge import judge_whole_turn as _fb_judge
+
+                _fb_slice = _remaining_budget_s()
+                if _fb_slice >= TURN_VERIFIER_MIN_SLICE_S:
+                    _fb_probe = (
+                        current_draft
+                        if isinstance(current_draft, str) and current_draft.strip()
+                        else user_message
+                    )
+                    _fb_verdict = await _fb_judge(
+                        resolved_intent=_resolved_request,
+                        reply=_fb_probe,
+                        context=_conversation_context,
+                        model=whole_turn_judge_model,
+                    )
+                    telemetry["independent_judge_substantive"] = bool(
+                        _fb_verdict.contains_substantive_claim
+                    )
+                    if bool(_fb_verdict.contains_substantive_claim):
+                        logger.info(
+                            "v2 fallback withheld by whole-turn judge",
+                            extra={"category": "fallback-substantive-overturn"},
+                        )
+                        telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                        if not str(telemetry.get("failure_category", "") or "").strip():
+                            telemetry["failure_category"] = _FAIL_REPAIR
+                        telemetry["answers_request"] = False
+                        telemetry["technically_grounded"] = False
+                        telemetry["qualified"] = False
+                        _finish_telemetry()
+                        return {
+                            "text": select_retry_reply(user_message),
+                            "units": units,
+                            "verification": grounding_result_to_state(result),
+                            "rounds": rounds,
+                            "recent_quote_ranges": recent_ranges,
+                            "telemetry": dict(telemetry),
+                        }
+            except Exception as exc:
+                logger.info(
+                    "v2 fallback judge failed closed",
+                    extra={"category": type(exc).__name__},
+                )
         telemetry["outbound_safety"] = "pass"
         telemetry["answer_outcome"] = "conversational-fallback"
         telemetry["adequacy_verdict"] = _ADEQ_PASS
@@ -2199,6 +2354,7 @@ async def answer_pipeline_node(
     planner_model: Any | None = None,
     retrieval_index: Any | None = None,
     retrieval_config: Any | None = None,
+    whole_turn_judge_model: Any | None = None,
 ) -> dict[str, Any]:
     """LangGraph answer node: state in, grounded Russian reply out."""
     from aa.conversation.graph_state import NORMAL_ROUTE
@@ -2275,6 +2431,7 @@ async def answer_pipeline_node(
         turn_trace_id=_prior_trace or None,
         planner_mode=_prior_mode or None,
         resolved_intent=_prior_intent or None,
+        whole_turn_judge_model=whole_turn_judge_model,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot
