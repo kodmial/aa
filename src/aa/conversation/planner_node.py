@@ -383,7 +383,8 @@ async def run_planner(
             system_text=system_text,
             messages=messages,
             structured_attempt_budget=(
-                float("inf") if _diagnostic_no_turn_limits()
+                float("inf")
+                if _diagnostic_no_turn_limits()
                 else min(PLANNER_STRUCTURED_ATTEMPT_BUDGET_S, budget)
             ),
         )
