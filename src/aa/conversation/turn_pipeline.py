@@ -328,6 +328,47 @@ def keep_supported_text(units: Sequence[ResponseUnitDraft], result: GroundingRes
     return " ".join(kept).strip()
 
 
+def keep_supported_units(
+    units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> list[ResponseUnitDraft]:
+    """Narrow units to the verifier-supported subset matching ``keep_supported_text``."""
+    if result is None:
+        return []
+    by_id = verdict_by_id(result)
+    kept: list[ResponseUnitDraft] = []
+    for unit in units:
+        verdict = by_id.get(unit.unit_id)
+        if verdict is not None and bool(getattr(verdict, "supported", False)):
+            kept.append(unit)
+    return kept
+
+
+def narrowed_grounding_state(
+    kept_units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> dict[str, Any]:
+    """Build verification state for exactly the served narrowed subset."""
+    if result is None or not kept_units:
+        return {"verified": False, "units": [], "all_required_supported": False}
+    kept_ids = {unit.unit_id for unit in kept_units}
+    filtered = [
+        {
+            "unit_id": verdict.unit_id,
+            "scope": str(verdict.scope),
+            "supported": bool(verdict.supported),
+            "evidence_passage_ids": list(verdict.evidence_passage_ids),
+        }
+        for verdict in result.units
+        if verdict.unit_id in kept_ids and bool(verdict.supported)
+    ]
+    if not filtered:
+        return {"verified": False, "units": [], "all_required_supported": False}
+    return {
+        "verified": True,
+        "all_required_supported": True,
+        "units": filtered,
+    }
+
+
 def has_supported_book_unit(result: GroundingResult | None) -> bool:
     """Whether a failed/partial draft retains substantive grounded material."""
     if result is None:
@@ -1180,9 +1221,101 @@ async def run_v2_answer_turn(
             telemetry["retrieval_outcome"] = "failed"
             break
         if not new_dicts:
+            # Gate C live repair, kodmial/aa#234 recurrence 2 on exact
+            # main c34dd9e run 37805421560: the prior recurrence fixed
+            # the omitted-wire circuit (verifier now healthy: 0
+            # unavailable units over 49 response units), yet the gate
+            # still fails live-answer-no-generic-collapse with
+            # repair_turns=0, repair_rounds=0, answer_rounds=17 and no
+            # budget breach. Per-stage comparison proves the collapse no
+            # longer comes from the circuit: planner p50 6.5s / p95
+            # 15.6s, answer p50 7.5s / p95 14.1s and verifier p50 7.0s
+            # / p95 13.0s are all slow but within budget, while the
+            # targeted repair never fires because retrieval returns no
+            # new passages and the loop breaks with zero generations.
+            # Repeating the circuit patch cannot converge. Strategy
+            # change at this retrieval/repair boundary (not a retune):
+            # when repair retrieval adds nothing, attempt one bounded
+            # focused regeneration from the current pack before
+            # collapsing, so a duplicate retrieval cannot force a
+            # zero-round generic fallback. Turn-independent, never an
+            # exact-question special case.
+            if pack and rounds == 0:
+                _fallback_focus = user_message
+                try:
+                    _missing_now = (
+                        unsupported_unit_texts(units, result) if units else [current_draft]
+                    )
+                    _missing_now = [text for text in _missing_now if text.strip()]
+                    if _missing_now:
+                        _joined_now = " | ".join(_missing_now)[:800]
+                        _fallback_focus = f"{user_message}\nНедостающая поддержка: {_joined_now}"
+                except Exception:
+                    pass
+                _fallback_draft = await _draft_with_pack(pack, _fallback_focus)
+                if _fallback_draft is not None:
+                    _fallback_slice = _verifier_round_budget()
+                    _fallback_ok = not (
+                        _fallback_slice is not None and _fallback_slice < TURN_VERIFIER_MIN_SLICE_S
+                    )
+                    if _fallback_ok:
+                        _fb_units, _fb_result, _fb_passed = await _verify_with_telemetry(
+                            _fallback_draft, pack, turn_budget_s=_fallback_slice
+                        )
+                        if _fb_result is not None:
+                            telemetry["verifier_unavailable_units"] = len(
+                                _fb_result.unavailable_unit_ids
+                            )
+                        if _fb_passed and _fb_units and _fb_result is not None:
+                            current_draft = _fallback_draft
+                            units, result, passed = _fb_units, _fb_result, True
+                            telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
+                            rounds += 1
+                            break
+                    else:
+                        _mark_turn_budget_exceeded()
             break
         merged = merge_pack_dicts(pack, new_dicts)
         if len(merged) == len(pack):
+            # Same duplicate-retrieval collapse as above: the pack already
+            # holds the only passages retrieval can find, so merging adds
+            # nothing and the historical break left zero repair rounds.
+            # Regenerate once from the existing pack with the same
+            # missing-support focus instead of collapsing immediately.
+            if rounds == 0:
+                _dup_focus = user_message
+                try:
+                    _missing_dup = (
+                        unsupported_unit_texts(units, result) if units else [current_draft]
+                    )
+                    _missing_dup = [text for text in _missing_dup if text.strip()]
+                    if _missing_dup:
+                        _joined_dup = " | ".join(_missing_dup)[:800]
+                        _dup_focus = f"{user_message}\nНедостающая поддержка: {_joined_dup}"
+                except Exception:
+                    pass
+                _dup_draft = await _draft_with_pack(pack, _dup_focus)
+                if _dup_draft is not None:
+                    _dup_slice = _verifier_round_budget()
+                    _dup_ok = not (
+                        _dup_slice is not None and _dup_slice < TURN_VERIFIER_MIN_SLICE_S
+                    )
+                    if _dup_ok:
+                        _dup_units, _dup_result, _dup_passed = await _verify_with_telemetry(
+                            _dup_draft, pack, turn_budget_s=_dup_slice
+                        )
+                        if _dup_result is not None:
+                            telemetry["verifier_unavailable_units"] = len(
+                                _dup_result.unavailable_unit_ids
+                            )
+                        if _dup_passed and _dup_units and _dup_result is not None:
+                            current_draft = _dup_draft
+                            units, result, passed = _dup_units, _dup_result, True
+                            telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
+                            rounds += 1
+                            break
+                    else:
+                        _mark_turn_budget_exceeded()
             break
         pack = merged
         rounds += 1
@@ -1229,6 +1362,9 @@ async def run_v2_answer_turn(
                 "конкретное объяснение и ближайший шаг только из приведённых отрывков, "
                 "сохраняя тот же предмет и шаг, о котором спрашивает пользователь."
             )
+            _regen_units: list[ResponseUnitDraft] = []
+            _regen_result: GroundingResult | None = None
+            _regen_passed = False
             _regen_draft = await _draft_with_pack(pack, _regen_prompt)
             if _regen_draft is not None:
                 _regen_slice = _verifier_round_budget()
@@ -1261,8 +1397,118 @@ async def run_v2_answer_turn(
                                 "v2 adequacy repair failed; explicit failure served",
                                 extra={"category": "adequacy-repair-failed"},
                             )
+                            # Recurrence-2 partial-progress rescue: the
+                            # focused regen may hold one relevant supported
+                            # unit alongside unsupported filler. The full
+                            # regen still fails, but its verified subset
+                            # can be served narrowed (per-claim grounding
+                            # holds for what is delivered) instead of
+                            # discarding the progress to a generic retry.
+                            _regen_kept = (
+                                keep_supported_units(_regen_units, _regen_result)
+                                if _regen_units
+                                else []
+                            )
+                            _regen_narrowed = (
+                                keep_supported_text(_regen_kept, _regen_result)
+                                if _regen_kept
+                                else ""
+                            )
+                            if _regen_narrowed:
+                                from aa.conversation.output_limits import (
+                                    QUOTE_BUDGET_CHARS as _RQB,
+                                )
+
+                                if (
+                                    contains_cyrillic(_regen_narrowed)
+                                    and not leaks_internal_terms(_regen_narrowed)
+                                    and envelope_passes(_regen_narrowed)
+                                    and aggregate_quote_chars(_regen_narrowed) <= _RQB
+                                    and certify_outbound_safety(_regen_narrowed)
+                                ):
+                                    _rn_state = narrowed_grounding_state(_regen_kept, _regen_result)
+                                    _rn_adequacy = _safe_assess_adequacy(
+                                        reply_text=_regen_narrowed,
+                                        verification_state=_rn_state,
+                                        verifier_outcome="passed",
+                                    )
+                                    if _rn_adequacy.verdict == _ADEQ_PASS:
+                                        telemetry["answer_outcome"] = "narrowed-adequacy-regen"
+                                        telemetry["outbound_safety"] = "pass"
+                                        telemetry["verifier_unavailable_units"] = 0
+                                        _record_adequacy(
+                                            reply_text=_regen_narrowed,
+                                            verification_state=_rn_state,
+                                        )
+                                        _finish_telemetry()
+                                        return {
+                                            "text": _regen_narrowed,
+                                            "units": _regen_kept,
+                                            "verification": _rn_state,
+                                            "rounds": rounds,
+                                            "recent_quote_ranges": merge_recent_ranges(
+                                                recent_ranges, ranges_from_pack(pack)
+                                            ),
+                                            "telemetry": dict(telemetry),
+                                        }
                     else:
                         telemetry["failure_category"] = _FAIL_REPAIR
+                        # Same partial-progress rescue when the regen never
+                        # fully verified: serve its supported relevant
+                        # subset when it exists and itself passes adequacy.
+                        # ``_regen_units``/``_regen_result`` are pre-initialized
+                        # above, so this branch always sees current-round
+                        # evidence and never stale prior-round state.
+                        _part_units = list(_regen_units)
+                        _part_result = _regen_result
+                        _part_kept = (
+                            keep_supported_units(_part_units, _part_result)
+                            if _part_units and _part_result is not None
+                            else []
+                        )
+                        _part_narrowed = ""
+                        try:
+                            if _part_kept and _part_result is not None:
+                                _part_narrowed = keep_supported_text(_part_kept, _part_result)
+                        except Exception:
+                            _part_narrowed = ""
+                        if _part_narrowed:
+                            from aa.conversation.output_limits import (
+                                QUOTE_BUDGET_CHARS as _PQB,
+                            )
+
+                            if (
+                                contains_cyrillic(_part_narrowed)
+                                and not leaks_internal_terms(_part_narrowed)
+                                and envelope_passes(_part_narrowed)
+                                and aggregate_quote_chars(_part_narrowed) <= _PQB
+                                and certify_outbound_safety(_part_narrowed)
+                            ):
+                                _pn_state = narrowed_grounding_state(_part_kept, _part_result)
+                                _pn_adequacy = _safe_assess_adequacy(
+                                    reply_text=_part_narrowed,
+                                    verification_state=_pn_state,
+                                    verifier_outcome="passed",
+                                )
+                                if _pn_adequacy.verdict == _ADEQ_PASS:
+                                    telemetry["answer_outcome"] = "narrowed-adequacy-regen"
+                                    telemetry["outbound_safety"] = "pass"
+                                    telemetry["verifier_unavailable_units"] = 0
+                                    _record_adequacy(
+                                        reply_text=_part_narrowed,
+                                        verification_state=_pn_state,
+                                    )
+                                    _finish_telemetry()
+                                    return {
+                                        "text": _part_narrowed,
+                                        "units": _part_kept,
+                                        "verification": _pn_state,
+                                        "rounds": rounds,
+                                        "recent_quote_ranges": merge_recent_ranges(
+                                            recent_ranges, ranges_from_pack(pack)
+                                        ),
+                                        "telemetry": dict(telemetry),
+                                    }
                 else:
                     _mark_turn_budget_exceeded()
                     telemetry["failure_category"] = _FAIL_BUDGET
@@ -1273,6 +1519,55 @@ async def run_v2_answer_turn(
                 verification_state=grounding_result_to_state(result),
             )
             if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL:
+                # Same recurrence-2 collapse: the draft is verifier-passing
+                # (supported book units exist) but whole-turn inadequate
+                # (all-glue or irrelevant), and the historical path served
+                # the exact generic retry without trying the verified
+                # subset it already holds. Before collapsing, attempt one
+                # deterministic narrowing to the supported units: when the
+                # narrowed text itself passes envelope, safety and
+                # adequacy, serving it preserves a grounded answer instead
+                # of adding another generic collapse. Turn-independent,
+                # never an exact-question special case.
+                _narrow_kept = keep_supported_units(units, result) if units else []
+                _narrowed_candidate = (
+                    keep_supported_text(_narrow_kept, result) if _narrow_kept else ""
+                )
+                if _narrowed_candidate and _narrowed_candidate != current_draft:
+                    from aa.conversation.output_limits import QUOTE_BUDGET_CHARS as _QB
+
+                    _narrow_ok = (
+                        contains_cyrillic(_narrowed_candidate)
+                        and not leaks_internal_terms(_narrowed_candidate)
+                        and envelope_passes(_narrowed_candidate)
+                        and aggregate_quote_chars(_narrowed_candidate) <= _QB
+                        and certify_outbound_safety(_narrowed_candidate)
+                    )
+                    if _narrow_ok:
+                        _narrow_state = narrowed_grounding_state(_narrow_kept, result)
+                        _narrow_adequacy = _safe_assess_adequacy(
+                            reply_text=_narrowed_candidate,
+                            verification_state=_narrow_state,
+                            verifier_outcome="passed",
+                        )
+                        if _narrow_adequacy.verdict == _ADEQ_PASS:
+                            telemetry["answer_outcome"] = "narrowed-adequacy"
+                            telemetry["outbound_safety"] = "pass"
+                            _record_adequacy(
+                                reply_text=_narrowed_candidate,
+                                verification_state=_narrow_state,
+                            )
+                            _finish_telemetry()
+                            return {
+                                "text": _narrowed_candidate,
+                                "units": _narrow_kept,
+                                "verification": _narrow_state,
+                                "rounds": rounds,
+                                "recent_quote_ranges": merge_recent_ranges(
+                                    recent_ranges, ranges_from_pack(pack)
+                                ),
+                                "telemetry": dict(telemetry),
+                            }
                 telemetry["answer_outcome"] = "adequacy-repair-failed"
                 _record_adequacy(
                     reply_text=select_retry_reply(user_message),
@@ -1901,8 +2196,10 @@ __all__ = [
     "grounding_result_to_state",
     "has_supported_book_unit",
     "keep_supported_text",
+    "keep_supported_units",
     "leaks_internal_terms",
     "merge_pack_dicts",
+    "narrowed_grounding_state",
     "outbound_safety_category",
     "run_v2_answer_turn",
     "select_retry_reply",
