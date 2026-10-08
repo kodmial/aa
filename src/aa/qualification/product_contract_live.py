@@ -1826,6 +1826,18 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str) -> bool:
     return bool(prompt_domain and reply_domain)
 
 
+def _prompt_allows_context_rescue(prompt: str) -> bool:
+    """Whether the current prompt is generic/terse enough for context rescue.
+
+    An explicit new-topic prompt must be answered on its own merits; stale
+    prior-turn context must not rescue a reply that ignores the current
+    request. Only a current turn carrying little standalone topical
+    content (at most two substantive tokens) may resolve relevance
+    against the immediately preceding turns in the same chat.
+    """
+    return len(_content_tokens_for_relevance(prompt)) <= 2
+
+
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
@@ -2135,7 +2147,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 family in book_grounded_families for family, _, _ in scenarios
             )
             loop = asyncio.get_running_loop()
+            # Prior prompts per Telegram chat for contextual follow-up
+            # relevance (generic, turn-independent): a terse follow-up in
+            # an ongoing conversation carries little topical content on
+            # its own, so relevance also resolves against the immediately
+            # preceding user turns in the same chat instead of failing a
+            # continuous grounded answer for not echoing a generic
+            # follow-up. The direct prompt check stays primary.
+            prior_by_chat: dict[int, list[str]] = {}
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
+                prior_prompts = list(prior_by_chat.get(chat_id, []))
                 before = len(api.sent_texts)
                 before_typing = api.chat_actions
                 before_received = len(transport.received)
@@ -2155,6 +2176,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
                     failed.append(f"live-delivery-{family}-timeout")
+                    prior_by_chat.setdefault(chat_id, []).append(prompt)
                     continue
                 _check(
                     f"live-transport-{family}-accepted",
@@ -2210,6 +2232,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # sent answer addresses this prompt.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
                         relevant = _assess_prompt_reply_relevance(prompt, reply)
+                        # Stale-context guard: prior-turn context rescues only
+                        # a generic/terse current prompt. An explicit pivot
+                        # must match the reply on its own merits.
+                        if not relevant and prior_prompts and _prompt_allows_context_rescue(prompt):
+                            combined = " ".join([*prior_prompts[-2:], prompt])
+                            relevant = _assess_prompt_reply_relevance(combined, reply)
                         _check(f"live-book-grounding-{family}-{position}", bool(grounded))
                         _check(
                             f"live-answer-relevance-{family}-{position}",
@@ -2235,6 +2263,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             f"live-continuation-helpful-{family}-{position}",
                             bool(not_avoiding and not_service and not_quote_only and has_substance),
                         )
+                    prior_by_chat.setdefault(chat_id, []).append(prompt)
 
             non_answer_fallbacks = {
                 NATURAL_CLARIFICATION_REPLY,
