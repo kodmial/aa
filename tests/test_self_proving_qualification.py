@@ -234,8 +234,8 @@ def test_gate_e_slo_guard_rejects_pathological_latency() -> None:
         slow, heartbeat_sends=40, heartbeat_interval_ms=4000.0
     )
     assert ok is False
-    assert "120000" in detail or "budget" in detail
-    assert metrics["max_ms"] >= 120000.0
+    assert "30000" in detail or "budget" in detail
+    assert metrics["max_ms"] >= 30000.0
     fast = [
         _telemetry(f"family-{i}", reply_signature(f"reply {i}"), total_ms=1200.0) for i in range(4)
     ]
@@ -243,7 +243,17 @@ def test_gate_e_slo_guard_rejects_pathological_latency() -> None:
         fast, heartbeat_sends=4, heartbeat_interval_ms=4000.0
     )
     assert ok is True
-    assert metrics["p95_ms"] < 60000.0
+    assert metrics["p95_ms"] <= 15000.0
+
+
+def test_gate_e_strict_thresholds_are_machine_enforced() -> None:
+    # A single 30-second ordinary turn is an immediate FAIL even if p95
+    # otherwise looks fast. A p95 above 15 seconds must also FAIL.
+    assert slo_guards([14999.0] * 19 + [30000.0])[0] is False
+    assert slo_guards([16000.0] * 20)[0] is False
+    assert slo_guards([15000.0] * 20)[0] is True
+    assert slo_guards([29999.0] * 20)[0] is False  # p95 breach
+    assert slo_guards([120000.0])[0] is False
 
 
 def test_gate_e_slo_helpers() -> None:
