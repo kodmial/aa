@@ -1400,6 +1400,33 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
+def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
+    """Accept actual book-grounded answers, never hash-selected filler.
+
+    This is a qualification-only invariant, not content/keyword routing.
+    It uses privacy-safe verifier counts and the real production turn outcome;
+    no prompt, reply or corpus text enters telemetry.
+    """
+    from aa.conversation.turn_pipeline import (
+        NATURAL_CLARIFICATION_REPLY,
+        NATURAL_RETRY_VARIANTS,
+    )
+
+    if reply.strip() in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+        return False
+    if snapshot.get("answer_outcome") not in (
+        "served",
+        "narrowed-supported",
+        "narrowed-compacted",
+    ):
+        return False
+    return (
+        int(snapshot.get("planner_query_count", 0) or 0) > 0
+        and int(snapshot.get("retrieval_passages", 0) or 0) > 0
+        and int(snapshot.get("verified_book_units", 0) or 0) > 0
+    )
+
+
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
@@ -1420,6 +1447,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     incomplete: list[str] = []
     latencies: list[float] = []
     collapsed_count = 0
+    book_grounded_successes = 0
+    book_grounded_expected = 0
     typing_sends = 0
     heartbeat_continuity_failures = 0
     stage_snapshots: list[dict[str, Any]] = []
@@ -1475,6 +1504,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         from aa.conversation.output_limits import envelope_passes
         from aa.conversation.turn_pipeline import (
             NATURAL_CLARIFICATION_REPLY,
+            NATURAL_RETRY_VARIANTS,
             contains_cyrillic,
             leaks_internal_terms,
         )
@@ -1680,6 +1710,17 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 "unsupported-out-of-book",
                 "long-conversation",
             }
+            # The two scenario variants in each AA-substantive family
+            # MUST actually deliver verifier-supported book material.
+            # Meta and out-of-book requests have different contracts.
+            book_grounded_families = {
+                "substantive-drinking",
+                "family-relationship",
+                "long-conversation",
+            }
+            book_grounded_expected = sum(
+                family in book_grounded_families for family, _, _ in scenarios
+            )
             loop = asyncio.get_running_loop()
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 before = len(api.sent_texts)
@@ -1738,6 +1779,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     _check(f"live-typing-heartbeat-{family}", heartbeat_ok)
                     if not heartbeat_ok:
                         heartbeat_continuity_failures += 1
+                    snapshot: dict[str, Any] = {}
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
@@ -1746,11 +1788,25 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                                 stage_snapshots.append(dict(snapshot))
                     except Exception:
                         pass
+                    if family in book_grounded_families:
+                        grounded = _is_grounded_substantive_reply(snapshot, reply)
+                        _check(f"live-book-grounding-{family}-{position}", grounded)
+                        book_grounded_successes += int(grounded)
 
+            non_answer_fallbacks = {
+                NATURAL_CLARIFICATION_REPLY,
+                *NATURAL_RETRY_VARIANTS,
+            }
             collapsed_count = sum(
-                1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
+                1 for item in replies if item.strip() in non_answer_fallbacks
             )
+            # Hash-based answer variety is never evidence of helpfulness.
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
+            _check(
+                "live-substantive-grounded-book-answer",
+                book_grounded_expected >= 2
+                and book_grounded_successes == book_grounded_expected,
+            )
             _check("live-answer-diversity", len(set(replies)) >= 8)
             _check(
                 "live-typing-heartbeat-continuous",
@@ -2018,7 +2074,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_max_s": round(maximum, 4),
         "turn_latencies_ms": [round(v * 1000.0, 1) for v in latencies],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-        "clarification_count": collapsed_count,
+        "clarification_count": sum(
+            1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
+        ) if "replies" in locals() else 0,
+        "non_answer_fallback_count": collapsed_count,
+        "book_grounded_expected": book_grounded_expected,
+        "book_grounded_successes": book_grounded_successes,
         "typing_heartbeat_sends": typing_sends,
         "heartbeat_continuity_failures": heartbeat_continuity_failures,
         "served_models_by_agent": served_models_by_agent,
