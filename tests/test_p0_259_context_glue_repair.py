@@ -109,6 +109,44 @@ def test_step_followup_resolves_through_context() -> None:
     assert extract_step_numbers("Третий шаг о решениях") == {3}
 
 
+def test_short_explicit_topic_pivot_does_not_inherit_stale_context() -> None:
+    from aa.conversation.answer_adequacy import resolve_effective_request
+
+    resolved = resolve_effective_request(
+        "А теперь про работу",
+        summary="До этого обсуждали вечернюю тягу и выпивку",
+        recent=["К вечеру очень тянет выпить"],
+    )
+    assert resolved == "А теперь про работу"
+
+
+def test_short_explicit_topic_pivot_cannot_be_rescued_by_prior_recovery_context() -> None:
+    from aa.conversation.answer_adequacy import assess_turn_adequacy
+
+    text = "Поддержка рядом помогает пережить тягу сегодня без выпивки."
+    pack = [_pack_entry(passage_id="chapter-3#exp0002", text=text)]
+    verdict = assess_turn_adequacy(
+        user_message="А теперь про работу",
+        reply=text,
+        evidence_pack=pack,
+        grounding_result=_grounding(passage_id="chapter-3#exp0002", text=text),
+        planner_reason="substantive-with-queries",
+        summary="До этого обсуждали вечернюю тягу и выпивку",
+        recent=["К вечеру очень тянет выпить"],
+        prior_user_messages=["К вечеру очень тянет выпить"],
+    )
+    assert verdict.verdict == "fail"
+    assert verdict.failure_category == "irrelevant-citation"
+
+
+def test_step_number_extraction_requires_one_step_phrase() -> None:
+    from aa.conversation.answer_adequacy import extract_step_numbers
+
+    assert extract_step_numbers("В пятницу обсуждали шаг программы") == set()
+    assert extract_step_numbers("Пятый шаг программы") == {5}
+    assert extract_step_numbers("Шаг пятый") == {5}
+
+
 def test_step_mismatch_fails_despite_generic_overlap() -> None:
     from aa.conversation.answer_adequacy import assess_turn_adequacy
 
@@ -274,6 +312,8 @@ def test_live_lane_covers_multiturn_step_and_admission_families() -> None:
     assert "_extract_step_numbers_for_relevance" in live_source
     assert "api.sent_texts[-1]" in live_source
     assert "last_telemetry_for_thread" in live_source
+    assert "scenario_deliveries == len(scenarios)" in live_source
+    assert "len(api.sent_texts) >= len(scenarios)" not in live_source
 
 
 def test_no_exact_question_whitelist_in_product() -> None:
