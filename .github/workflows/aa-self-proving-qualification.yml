@@ -713,6 +713,11 @@ jobs:
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
+          GATE_A_OUTCOME: ${{ steps.gate-a.outcome }}
+          GATE_B_OUTCOME: ${{ steps.gate-b.outcome }}
+          GATE_C_OUTCOME: ${{ steps.gate-c.outcome }}
+          GATE_D_OUTCOME: ${{ steps.gate-d.outcome }}
+          GATE_E_OUTCOME: ${{ steps.gate-e.outcome }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -761,13 +766,68 @@ jobs:
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
               const gates = summary.gates || [];
-              productFailures = gates.filter(g => g && g.status === 'FAIL');
+              const workflowOutcomes = {
+                A: String(process.env.GATE_A_OUTCOME || ''),
+                B: String(process.env.GATE_B_OUTCOME || ''),
+                C: String(process.env.GATE_C_OUTCOME || ''),
+                D: String(process.env.GATE_D_OUTCOME || ''),
+                E: String(process.env.GATE_E_OUTCOME || ''),
+              };
+              const failedWorkflowGates = ['A', 'B', 'C', 'D', 'E']
+                .filter(gate => workflowOutcomes[gate] === 'failure');
+              const normalizedFailureCategory = (gate, value) => {
+                let text = String(value || 'workflow-step-failed').trim();
+                const prefix = gate + ':';
+                if (text.startsWith(prefix)) text = text.slice(prefix.length);
+                return text || 'workflow-step-failed';
+              };
+
+              // Workflow step outcomes are authoritative for gate ownership.
+              // A downstream skipped gate must never be reconstructed by Gate F
+              // as the blocker when an earlier workflow gate actually failed.
+              if (failedWorkflowGates.length) {
+                productFailures = failedWorkflowGates.map(gate => {
+                  const fromSummary = gates.find(
+                    item => item && String(item.gate || '') === gate && item.status === 'FAIL'
+                  );
+                  return {
+                    gate,
+                    status: 'FAIL',
+                    failure_category: normalizedFailureCategory(
+                      gate,
+                      fromSummary && fromSummary.failure_category
+                    ),
+                    component: String(
+                      (fromSummary && fromSummary.component) ||
+                      (gate === 'B' ? 'deterministic-integration' : 'workflow-step')
+                    ),
+                    latency_p50_ms: Number((fromSummary && fromSummary.latency_p50_ms) || 0),
+                    latency_p95_ms: Number((fromSummary && fromSummary.latency_p95_ms) || 0),
+                    max_turn_ms: Number((fromSummary && fromSummary.max_turn_ms) || 0),
+                  };
+                });
+              } else {
+                productFailures = gates
+                  .filter(g => g && g.status === 'FAIL')
+                  .map(g => ({
+                    ...g,
+                    failure_category: normalizedFailureCategory(
+                      String(g.gate || ''),
+                      g.failure_category
+                    ),
+                  }));
+              }
+
               const failed = productFailures[0] || (
                 transientBlocked ? null : gates.find(g => g.status !== 'PASS')
               );
               blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
               if (failed) {
-                category = `${failed.gate}:${failed.failure_category || failed.status}`;
+                const normalized = normalizedFailureCategory(
+                  String(failed.gate || ''),
+                  failed.failure_category || failed.status
+                );
+                category = `${failed.gate}:${normalized}`;
                 component = String(failed.component || 'unknown');
               }
               const latencyFailure = productFailures.find(g => g.gate === 'E') || failed;
@@ -854,11 +914,19 @@ jobs:
             // several product gates fail in one trusted run, keep one combined
             // repair series so C/E can converge in the same implementation
             // cycle rather than serializing known defects across runs.
+            const stripGatePrefix = (gate, value) => {
+              let text = String(value || 'FAIL').trim();
+              const prefix = String(gate || '') + ':';
+              if (prefix !== ':' && text.startsWith(prefix)) text = text.slice(prefix.length);
+              return text || 'FAIL';
+            };
             const stableFailures = productFailures.length
               ? productFailures
-                  .map(g => `${g.gate}:${g.failure_category || g.status}:${g.component || 'unknown'}`)
+                  .map(g =>
+                    `${g.gate}:${stripGatePrefix(g.gate, g.failure_category || g.status)}:${g.component || 'unknown'}`
+                  )
                   .sort()
-              : [`${blocking}:${category}:${component}`];
+              : [`${blocking}:${stripGatePrefix(blocking, category)}:${component}`];
             const fingerprint = stableFailures.join('|');
             const gateLabel = productFailures.length > 1
               ? productFailures.map(g => g.gate).join('+')
