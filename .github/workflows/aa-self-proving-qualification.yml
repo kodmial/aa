@@ -877,9 +877,115 @@ jobs:
               const match = String(existing.body || '').match(/Repair recurrence: \`(\d+)\`/);
               recurrence = match ? Number(match[1]) + 1 : 2;
             }
+            const MAX_LOCAL_REPAIR_RECURRENCE = 2;
             const recurrenceFocus = recurrence > 1
               ? '- RECURRENCE: the previous repair for this same stable failure set did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
               : '- First occurrence for this stable product-failure fingerprint.';
+
+            // Hard convergence breaker: the old controller only *said*
+            // "bounded" while reopening/dispatching the same repair issue
+            // forever. That allowed recurrence to reach 10 and repeatedly
+            // moved main under qualification. Two local attempts are enough
+            // to prove a stable fingerprint is not a local one-off. From the
+            // third occurrence onward, retire the narrow repair series and
+            // automatically escalate to one systemic/root-cause task instead.
+            if (recurrence > MAX_LOCAL_REPAIR_RECURRENCE) {
+              if (existing) {
+                await apiRetry('retire recurrent narrow repair issue', () =>
+                  github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: existing.number,
+                    state: 'closed',
+                    state_reason: 'not_planned',
+                    labels: ['priority:p0', 'automation:blocked'],
+                  })
+                );
+              }
+
+              const systemicMarker = '<!-- aa-self-proving-systemic-escalation:v1 -->';
+              const systemicTitle = `P0 SYSTEMIC: break recurrent Product Contract failure (Gate ${gateLabel})`;
+              const systemicExisting = issues
+                .filter(issue => !issue.pull_request && String(issue.body || '').includes(systemicMarker))
+                .find(issue =>
+                  String(issue.body || '').includes(`Failure fingerprint: \`${fingerprint}\``)
+                );
+              let systemicRecurrence = 1;
+              if (systemicExisting) {
+                const match = String(systemicExisting.body || '').match(/Systemic recurrence: \`(\\d+)\`/);
+                systemicRecurrence = match ? Number(match[1]) + 1 : 2;
+              }
+              const systemicBody = [
+                systemicMarker,
+                '',
+                '## Automatic convergence escalation',
+                '',
+                `Failure fingerprint: \`${fingerprint}\``,
+                `Latest failure category: \`${category}\``,
+                `Blocking gate: \`${blocking}\``,
+                `Component: \`${component}\``,
+                `Main SHA: \`${sha}\``,
+                `Qualification run: \`${runId}\``,
+                `Local repair recurrence: \`${recurrence}\``,
+                `Systemic recurrence: \`${systemicRecurrence}\``,
+                timingLine,
+                stageTimingLine,
+                verifierLine,
+                transportTimingLine,
+                tokenUsageLine,
+                modelPathLine,
+                '',
+                '### Required systemic behavior',
+                '',
+                '- STOP local symptom patching for this fingerprint. Audit the complete planner -> retrieval -> evidence -> answer -> verifier -> qualification path and identify the invariant/root cause that explains the recurrence.',
+                '- Do not add exact-question branches, domain keyword/stem tables, numbered-step parsing, token-overlap relevance, or handcrafted semantic qualification predicates.',
+                '- Do not weaken Product Contract #110, Gate C semantics, grounding, relevance, safety, or the current Gate E SLO.',
+                '- Any implementation must include a generic regression test for the failure class, not the literal qualification prompt.',
+                '- Produce one architecture-level repair from current main, then rerun exact-main qualification. Do not create or merge another narrow repair for the retired fingerprint.',
+                '- If the same fingerprint survives this systemic repair, update this same systemic task with the new evidence; do not resurrect the retired narrow repair series.',
+                '',
+                'This escalation exists specifically to prevent an unbounded qualification -> symptom patch -> merge -> qualification loop.',
+              ].join('\n');
+
+              if (systemicExisting) {
+                await apiRetry('refresh systemic convergence issue', () =>
+                  github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: systemicExisting.number,
+                    state: 'open',
+                    title: systemicTitle,
+                    body: systemicBody,
+                    labels: ['priority:p0', 'automation:ready'],
+                  })
+                );
+                core.warning(
+                  `Escalated recurrent fingerprint to systemic issue #${systemicExisting.number}; systemic recurrence=${systemicRecurrence}.`
+                );
+              } else {
+                const created = await apiRetry('create systemic convergence issue', () =>
+                  github.rest.issues.create({
+                    owner,
+                    repo,
+                    title: systemicTitle,
+                    body: systemicBody,
+                    labels: ['priority:p0', 'automation:ready'],
+                  })
+                );
+                core.warning(
+                  `Created systemic convergence issue #${created.data.number}; local recurrence=${recurrence}.`
+                );
+              }
+
+              await apiRetry('wake issue scheduler for systemic convergence', () =>
+                github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+                })
+              );
+              core.info('Dispatched systemic convergence task; narrow repair series is retired.');
+              return;
+            }
+
             const body = [
               marker,
               '',
