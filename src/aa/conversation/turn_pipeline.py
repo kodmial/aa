@@ -328,6 +328,47 @@ def keep_supported_text(units: Sequence[ResponseUnitDraft], result: GroundingRes
     return " ".join(kept).strip()
 
 
+def keep_supported_units(
+    units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> list[ResponseUnitDraft]:
+    """Narrow units to the verifier-supported subset matching ``keep_supported_text``."""
+    if result is None:
+        return []
+    by_id = verdict_by_id(result)
+    kept: list[ResponseUnitDraft] = []
+    for unit in units:
+        verdict = by_id.get(unit.unit_id)
+        if verdict is not None and bool(getattr(verdict, "supported", False)):
+            kept.append(unit)
+    return kept
+
+
+def narrowed_grounding_state(
+    kept_units: Sequence[ResponseUnitDraft], result: GroundingResult | None
+) -> dict[str, Any]:
+    """Build verification state for exactly the served narrowed subset."""
+    if result is None or not kept_units:
+        return {"verified": False, "units": [], "all_required_supported": False}
+    kept_ids = {unit.unit_id for unit in kept_units}
+    filtered = [
+        {
+            "unit_id": verdict.unit_id,
+            "scope": str(verdict.scope),
+            "supported": bool(verdict.supported),
+            "evidence_passage_ids": list(verdict.evidence_passage_ids),
+        }
+        for verdict in result.units
+        if verdict.unit_id in kept_ids and bool(verdict.supported)
+    ]
+    if not filtered:
+        return {"verified": False, "units": [], "all_required_supported": False}
+    return {
+        "verified": True,
+        "all_required_supported": True,
+        "units": filtered,
+    }
+
+
 def has_supported_book_unit(result: GroundingResult | None) -> bool:
     """Whether a failed/partial draft retains substantive grounded material."""
     if result is None:
@@ -1321,6 +1362,9 @@ async def run_v2_answer_turn(
                 "конкретное объяснение и ближайший шаг только из приведённых отрывков, "
                 "сохраняя тот же предмет и шаг, о котором спрашивает пользователь."
             )
+            _regen_units: list[ResponseUnitDraft] = []
+            _regen_result: GroundingResult | None = None
+            _regen_passed = False
             _regen_draft = await _draft_with_pack(pack, _regen_prompt)
             if _regen_draft is not None:
                 _regen_slice = _verifier_round_budget()
@@ -1360,9 +1404,14 @@ async def run_v2_answer_turn(
                             # can be served narrowed (per-claim grounding
                             # holds for what is delivered) instead of
                             # discarding the progress to a generic retry.
-                            _regen_narrowed = (
-                                keep_supported_text(_regen_units, _regen_result)
+                            _regen_kept = (
+                                keep_supported_units(_regen_units, _regen_result)
                                 if _regen_units
+                                else []
+                            )
+                            _regen_narrowed = (
+                                keep_supported_text(_regen_kept, _regen_result)
+                                if _regen_kept
                                 else ""
                             )
                             if _regen_narrowed:
@@ -1377,7 +1426,7 @@ async def run_v2_answer_turn(
                                     and aggregate_quote_chars(_regen_narrowed) <= _RQB
                                     and certify_outbound_safety(_regen_narrowed)
                                 ):
-                                    _rn_state = grounding_result_to_state(_regen_result)
+                                    _rn_state = narrowed_grounding_state(_regen_kept, _regen_result)
                                     _rn_adequacy = _safe_assess_adequacy(
                                         reply_text=_regen_narrowed,
                                         verification_state=_rn_state,
@@ -1386,6 +1435,7 @@ async def run_v2_answer_turn(
                                     if _rn_adequacy.verdict == _ADEQ_PASS:
                                         telemetry["answer_outcome"] = "narrowed-adequacy-regen"
                                         telemetry["outbound_safety"] = "pass"
+                                        telemetry["verifier_unavailable_units"] = 0
                                         _record_adequacy(
                                             reply_text=_regen_narrowed,
                                             verification_state=_rn_state,
@@ -1393,7 +1443,7 @@ async def run_v2_answer_turn(
                                         _finish_telemetry()
                                         return {
                                             "text": _regen_narrowed,
-                                            "units": _regen_units,
+                                            "units": _regen_kept,
                                             "verification": _rn_state,
                                             "rounds": rounds,
                                             "recent_quote_ranges": merge_recent_ranges(
@@ -1406,16 +1456,20 @@ async def run_v2_answer_turn(
                         # Same partial-progress rescue when the regen never
                         # fully verified: serve its supported relevant
                         # subset when it exists and itself passes adequacy.
-                        try:
-                            _part_units = _regen_units
-                            _part_result = _regen_result
-                        except NameError:
-                            _part_units = []
-                            _part_result = None
+                        # ``_regen_units``/``_regen_result`` are pre-initialized
+                        # above, so this branch always sees current-round
+                        # evidence and never stale prior-round state.
+                        _part_units = list(_regen_units)
+                        _part_result = _regen_result
+                        _part_kept = (
+                            keep_supported_units(_part_units, _part_result)
+                            if _part_units and _part_result is not None
+                            else []
+                        )
                         _part_narrowed = ""
                         try:
-                            if _part_units and _part_result is not None:
-                                _part_narrowed = keep_supported_text(_part_units, _part_result)
+                            if _part_kept and _part_result is not None:
+                                _part_narrowed = keep_supported_text(_part_kept, _part_result)
                         except Exception:
                             _part_narrowed = ""
                         if _part_narrowed:
@@ -1430,7 +1484,7 @@ async def run_v2_answer_turn(
                                 and aggregate_quote_chars(_part_narrowed) <= _PQB
                                 and certify_outbound_safety(_part_narrowed)
                             ):
-                                _pn_state = grounding_result_to_state(_part_result)
+                                _pn_state = narrowed_grounding_state(_part_kept, _part_result)
                                 _pn_adequacy = _safe_assess_adequacy(
                                     reply_text=_part_narrowed,
                                     verification_state=_pn_state,
@@ -1439,6 +1493,7 @@ async def run_v2_answer_turn(
                                 if _pn_adequacy.verdict == _ADEQ_PASS:
                                     telemetry["answer_outcome"] = "narrowed-adequacy-regen"
                                     telemetry["outbound_safety"] = "pass"
+                                    telemetry["verifier_unavailable_units"] = 0
                                     _record_adequacy(
                                         reply_text=_part_narrowed,
                                         verification_state=_pn_state,
@@ -1446,7 +1501,7 @@ async def run_v2_answer_turn(
                                     _finish_telemetry()
                                     return {
                                         "text": _part_narrowed,
-                                        "units": _part_units,
+                                        "units": _part_kept,
                                         "verification": _pn_state,
                                         "rounds": rounds,
                                         "recent_quote_ranges": merge_recent_ranges(
@@ -1474,7 +1529,10 @@ async def run_v2_answer_turn(
                 # adequacy, serving it preserves a grounded answer instead
                 # of adding another generic collapse. Turn-independent,
                 # never an exact-question special case.
-                _narrowed_candidate = keep_supported_text(units, result) if units else ""
+                _narrow_kept = keep_supported_units(units, result) if units else []
+                _narrowed_candidate = (
+                    keep_supported_text(_narrow_kept, result) if _narrow_kept else ""
+                )
                 if _narrowed_candidate and _narrowed_candidate != current_draft:
                     from aa.conversation.output_limits import QUOTE_BUDGET_CHARS as _QB
 
@@ -1486,7 +1544,7 @@ async def run_v2_answer_turn(
                         and certify_outbound_safety(_narrowed_candidate)
                     )
                     if _narrow_ok:
-                        _narrow_state = grounding_result_to_state(result)
+                        _narrow_state = narrowed_grounding_state(_narrow_kept, result)
                         _narrow_adequacy = _safe_assess_adequacy(
                             reply_text=_narrowed_candidate,
                             verification_state=_narrow_state,
@@ -1502,7 +1560,7 @@ async def run_v2_answer_turn(
                             _finish_telemetry()
                             return {
                                 "text": _narrowed_candidate,
-                                "units": units,
+                                "units": _narrow_kept,
                                 "verification": _narrow_state,
                                 "rounds": rounds,
                                 "recent_quote_ranges": merge_recent_ranges(
@@ -2138,8 +2196,10 @@ __all__ = [
     "grounding_result_to_state",
     "has_supported_book_unit",
     "keep_supported_text",
+    "keep_supported_units",
     "leaks_internal_terms",
     "merge_pack_dicts",
+    "narrowed_grounding_state",
     "outbound_safety_category",
     "run_v2_answer_turn",
     "select_retry_reply",
