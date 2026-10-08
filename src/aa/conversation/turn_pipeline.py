@@ -1273,10 +1273,33 @@ async def run_v2_answer_turn(
         # but the narrowed supported subset is still served rather than
         # collapsing to retry: unavailable units are excluded from the
         # served text, so per-claim grounding holds for what is delivered.
+        # A narrowed subset that is irrelevant or all-glue must not be
+        # served as success: fall back to honest failure when the
+        # whole-turn relevance invariant fails. Other failures (for
+        # example partial verifier unavailability, where excluded units
+        # preserve per-claim grounding) keep the narrowing contract.
         _record_adequacy(
             reply_text=narrowed,
             verification_state=grounding_result_to_state(result),
         )
+        if (
+            not _proven_glue
+            and telemetry.get("adequacy_verdict") == _ADEQ_FAIL
+            and str(telemetry.get("failure_category", "") or "").strip()
+            in ("irrelevant-citation", "all-glue-for-substantive")
+        ):
+            telemetry["answer_outcome"] = "adequacy-failed"
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            _finish_telemetry()
+            return {
+                "text": select_retry_reply(user_message),
+                "units": units,
+                "verification": grounding_result_to_state(result),
+                "rounds": rounds,
+                "recent_quote_ranges": recent_ranges,
+                "telemetry": dict(telemetry),
+            }
         _finish_telemetry()
         return {
             "text": narrowed,

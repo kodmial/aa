@@ -307,6 +307,8 @@ def is_proven_glue_message(user_message: str, *, summary: str = "", recent_count
     segments = [part.strip() for part in re.split(r"[.!?…]+", cleaned) if part.strip()]
     if len(segments) > 1:
         return False
+    if _has_recovery_domain(lowered):
+        return False
     return True
 
 
@@ -633,12 +635,21 @@ def check_substantive_delivery_invariant(snapshot: dict[str, Any]) -> tuple[bool
     reason = str(snapshot.get("planner_reason", "") or "").strip()
     adequacy = str(snapshot.get("adequacy_verdict", "") or "").strip()
     failure = str(snapshot.get("failure_category", "") or "").strip()
+    answer_outcome = str(snapshot.get("answer_outcome", "") or "").strip()
+    outcome_hint = (
+        answer_outcome
+        in (
+            "served",
+            "narrowed-supported",
+            "narrowed-compacted",
+        )
+        and reason != PLANNER_REASON_LEGITIMATE_GLUE
+    )
     substantive_hint = (
         query_count > 0
         or passages > 0
         or reason == PLANNER_REASON_SUBSTANTIVE_WITH_QUERIES
-        or str(snapshot.get("answer_outcome", "")).strip()
-        in ("served", "narrowed-supported", "narrowed-compacted")
+        or outcome_hint
     )
     if not substantive_hint:
         return True, ""
