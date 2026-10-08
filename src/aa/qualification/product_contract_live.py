@@ -1815,8 +1815,8 @@ def _extract_step_numbers_for_relevance(text: str) -> set[int]:
             ("двенадцат", 12),
         ):
             if (
-                re.search(rf"\\b{stem}\\w*\\s+шаг\\w*\\b", lowered) is not None
-                or re.search(rf"\\bшаг\\w*\\s+{stem}\\w*\\b", lowered) is not None
+                _re.search(rf"\b{stem}\w*\s+шаг\w*\b", lowered) is not None
+                or _re.search(rf"\bшаг\w*\s+{stem}\w*\b", lowered) is not None
             ):
                 found.add(number)
     return found
