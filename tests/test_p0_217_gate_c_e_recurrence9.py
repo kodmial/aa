@@ -75,7 +75,7 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 def test_answer_budget_still_configured() -> None:
     """Recurrence-9 keeps the single-attempt budget (no retune)."""
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
 
 
 async def test_answer_timeout_fails_fast_with_single_call(
