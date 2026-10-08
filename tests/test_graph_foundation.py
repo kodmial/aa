@@ -109,8 +109,22 @@ def _script_model(
 # ---------------------------------------------------------------------------
 
 
-def test_planner_accepts_empty_plan() -> None:
-    assert validate_query_plan(QueryPlan(queries=[])).queries == []
+def test_planner_accepts_explicit_conversational_plan() -> None:
+    plan = validate_query_plan(
+        QueryPlan(mode="conversational", resolved_intent="", queries=[])
+    )
+    assert plan.mode == "conversational"
+    assert plan.queries == []
+
+
+def test_planner_rejects_empty_retrieval_plan() -> None:
+    with pytest.raises(QueryPlanValidationError):
+        validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="нужен поиск", queries=[]))
+
+
+def test_planner_rejects_retrieval_without_resolved_intent() -> None:
+    with pytest.raises(QueryPlanValidationError):
+        validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="", queries=_twelve_queries()))
 
 
 def test_planner_accepts_ten_and_sixteen() -> None:
@@ -146,7 +160,9 @@ def test_planner_schema_has_only_queries_field() -> None:
 def test_validate_structured_plan_uses_native_object() -> None:
     plan = validate_structured_plan(_plan_obj(_twelve_queries()))
     assert len(plan.queries) == 12
-    assert validate_structured_plan(QueryPlan(queries=[])).queries == []
+    assert validate_structured_plan(
+        QueryPlan(mode="conversational", resolved_intent="", queries=[])
+    ).queries == []
     with pytest.raises(QueryPlanValidationError):
         validate_structured_plan(_plan_obj(["один"]))
     with pytest.raises(QueryPlanValidationError):
@@ -237,7 +253,9 @@ async def test_planner_fails_closed_without_retry() -> None:
     graph = build_turn_graph(planner_model=model)
     result = await graph.ainvoke(turn_input("тяга"))
     assert result["planner_invoked"] is True
-    assert result["search_queries"] == []
+    assert result["planner_mode"] == "retrieval"
+    assert result["search_queries"] == ["тяга"]
+    assert result["retry_state"]["planner_outcome"] == "invalid"
     assert "planner_error" in result["retry_state"]
 
 
