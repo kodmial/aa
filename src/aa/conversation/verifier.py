@@ -902,32 +902,73 @@ async def _verify_single_unit(
     )
 
 
+# Turn-level verifier budget (Gate C+E live repair, kodmial/aa#217
+# recurrence 6 on exact main 4a32481 run 37705584457:
+# E:latency-budget-exceeded p50 14.8s / p95 36.3s / max 64.6s with the
+# verifier sequence as the dominant tail (verifier p50 3ms / p95 25.4s /
+# max 39.9s; text-path p95 15s / max 39.9s) while planner is pinned at
+# its 10s wall, retrieval is healthy (p50 9ms / p95 486ms) and answer is
+# stable (p50 3.5s / p95 8.1s, max 15.0s). The per-unit sequence (one
+# structured attempt plus up to two sequential text attempts per unit)
+# is unbounded per turn: tail turns grind 25-40s and then still collapse
+# to generic clarification, failing both the E SLO and the C collapse
+# check. Strategy change at the turn-orchestration boundary (not
+# tokens/retries): the single concurrent per-unit round below runs under
+# one turn-level deadline; on expiry the turn fails closed as verifier-
+# unavailable (partial narrowing of independently verified units is
+# preserved where already complete, otherwise fast clarification)
+# instead of waiting out the 25-40s grind. Per-unit topology is
+# unchanged (exactly one concurrent round, no batch round, minimal
+# boolean schema, strict cite/quote/checksum gates); provider 429 always
+# propagates for runner retire/restart. Turn-independent, never an
+# exact-question special case. Product Contract #110 unchanged.
+VERIFIER_TURN_BUDGET_S = 12.0
+
+
 async def _verify_per_unit_concurrent(
     units: Sequence[ResponseUnitDraft],
     passages: Sequence[dict[str, Any]],
     *,
     model: Any,
+    turn_budget_s: float | None = None,
 ) -> GroundingResult:
     """Verify each unit concurrently with the boolean decision schema.
 
-    Exactly one concurrent round. Deterministic cite/quote/checksum gates
-    run on the assembled result, so grounding strictness is unchanged.
-    A non-429 failure in one unit fails only that unit closed and preserves
-    independently verified units for deterministic narrowing. Provider 429
-    always propagates for runner retire/restart.
+    Exactly one concurrent round under one turn-level deadline.
+    Deterministic cite/quote/checksum gates run on the assembled
+    result, so grounding strictness is unchanged. A non-429 failure in
+    one unit fails only that unit closed and preserves independently
+    verified units for deterministic narrowing. A turn-budget expiry
+    fails the whole turn closed as verifier-unavailable (fast
+    narrow/clarify downstream) instead of grinding through a 25-40s
+    provider tail. Provider 429 always propagates for runner
+    retire/restart.
     """
     import asyncio as _asyncio
 
+    budget = VERIFIER_TURN_BUDGET_S if turn_budget_s is None else float(turn_budget_s)
+    if not budget > 0:
+        raise VerifierValidationError("verifier turn budget must be > 0")
     prefer_text_snapshot = _verifier_prefers_text(model)
-    raw_results = await _asyncio.gather(
-        *(
-            _verify_single_unit(
-                unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
-            )
-            for unit in units
-        ),
-        return_exceptions=True,
-    )
+    try:
+        raw_results = await _asyncio.wait_for(
+            _asyncio.gather(
+                *(
+                    _verify_single_unit(
+                        unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
+                    )
+                    for unit in units
+                ),
+                return_exceptions=True,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError as exc:
+        logger.info(
+            "verifier turn budget exceeded; failing closed without slow grind",
+            extra={"category": "verifier-turn-timeout", "units": len(units)},
+        )
+        raise OpenCodeTimeoutError("verifier turn budget exceeded") from exc
 
     # A single provider/format failure must not discard independently
     # verified units from the same draft. Failed units are represented as
@@ -998,20 +1039,27 @@ async def run_verifier(
     passages: Sequence[dict[str, Any]],
     *,
     model: Any,
+    turn_budget_s: float | None = None,
 ) -> GroundingResult:
     """Invoke the hidden verifier once per unit, concurrently.
 
     Per-unit only production path (kodmial/aa#190): no batch-first round,
     no fallback round, no transport-format retry. One concurrent round of
-    minimal boolean decisions keeps the live SLO to a single round.
-    Validation-shaped failures fail closed immediately without re-running
-    planner/retrieval/answer. Provider 429 always propagates immediately
-    for runner retire/restart and never triggers extra calls.
-    Turn-independent, never an exact-question special case.
+    minimal boolean decisions keeps the live SLO to a single round, now
+    additionally bounded by ``VERIFIER_TURN_BUDGET_S`` (kodmial/aa#217
+    recurrence 6): a turn-level expiry raises
+    :class:`OpenCodeTimeoutError` fail-closed instead of grinding through
+    a 25-40s provider tail. Validation-shaped failures fail closed
+    immediately without re-running planner/retrieval/answer. Provider 429
+    always propagates immediately for runner retire/restart and never
+    triggers extra calls. Turn-independent, never an exact-question
+    special case.
     """
     if not units:
         raise VerifierValidationError("verifier needs at least one response unit")
-    result = await _verify_per_unit_concurrent(units, passages, model=model)
+    result = await _verify_per_unit_concurrent(
+        units, passages, model=model, turn_budget_s=turn_budget_s
+    )
     logger.info("verifier output accepted", extra={"units": len(units)})
     return result
 
@@ -1019,6 +1067,7 @@ async def run_verifier(
 __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_CAPABILITY_TTL_S",
+    "VERIFIER_TURN_BUDGET_S",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
     "VERIFIER_MAX_PASSAGE_CHARS",
     "VERIFIER_TEXT_JSON_SUFFIX",

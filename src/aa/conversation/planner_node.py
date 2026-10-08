@@ -55,64 +55,47 @@ PLANNER_MAX_MESSAGE_CHARS = 500
 PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
 # Hard per-turn planner time budget (Gate C+E live repair,
-# kodmial/aa#217 recurrence 5 on exact main a9c5d3e run 37701489048:
-# C:live-answer-no-generic-collapse (11 clarifications) plus
-# E:latency-budget-exceeded p50 23.6s / p95 45.8s / max 67.6s with
-# planner p50 11.1s / p95 42.8s / max 63.4s, retrieval p50 0.6s healthy,
-# answer p50 3.8s / p95 6.4s, repair_turns=0, structured p50 6.3s /
-# p95 42.8s vs text p50 4.5s / p95 15.4s). Comparison with recurrence 4
-# (exact main 7a9c907 run 37697730282: planner p50 7.0s / p95 16.4s /
-# max 28.7s, total p50 20.4s / p95 33.3s) shows the tail worsened by
-# +57% p50 / +161% p95 / +121% max despite the retry-budget (2->1) and
-# cached-direct-text repair: the dominant persistent cause is
-# server-side provider tail on the OpenCode-request boundary
-# (structured p95 42.8s), not display tokens or retry count. Repeating
-# another token/retry patch cannot converge. This changes strategy at
-# the responsible turn-orchestration boundary: the whole planner
-# provider sequence (structured-first plus one bounded text fallback,
-# cached-direct-text included) runs under one hard deadline; on expiry
-# the turn serves a deterministic broad-coverage plan instead of
-# waiting 40-60s and then serving weak-model queries that retrieve a
-# poor pack the verifier rejects into generic clarification. The
-# fallback carries only generic program/support vocabulary (same 12
-# queries for any turn, never user-text derived), so it is
-# turn-independent and never an exact-question special case; grounding
-# stays strict (the fallback is Pydantic-validated 12 distinct
-# queries, retrieval still loads exact RU passages, the answer is still
-# model-generated and the verifier still validates every claim).
-# Provider 429 always propagates for runner retire/restart and never
-# triggers the fallback; content validation failures still fail closed
-# (no masking of invalid model content with a deterministic plan).
-# Product Contract #110 unchanged.
+# kodmial/aa#217 recurrence 6 on exact main 4a32481 run 37705584457:
+# C:live-answer-no-generic-collapse (8 clarifications over 14 answer
+# rounds) plus E:latency-budget-exceeded p50 14.8s / p95 36.3s / max
+# 64.6s. Per-stage comparison with recurrence 5 (exact main a9c5d3e run
+# 37701489048: planner p50 11.1s / p95 42.8s / max 63.4s) shows the
+# recurrence-5 wall-clock timeout did not converge: planner is now
+# pinned at exactly the 10s budget on every turn (p50 10006ms / p95
+# 10008ms / max 10024ms), so every substantive turn serves the same 12
+# identical generic queries, retrieves a generic pack the verifier
+# rejects as unsupported (unavailable_units_total=0 proves transport is
+# healthy), and collapses to the exact generic clarification, while the
+# 10s floor is anchored into every turn (total p50 14.8s). Retrieval
+# stays healthy (p50 9ms / p95 486ms), answer is stable (p50 3.5s / p95
+# 8.1s), and the remaining E tail concentrates in the unbounded
+# verifier sequence (p50 3ms / p95 25.4s / max 39.9s; text-path p95 15s
+# / max 39.9s). The dominant persistent cause is therefore the timeout
+# fallback itself: repeating or retuning it cannot converge. Strategy
+# change at the turn-orchestration boundary: the generic fallback is
+# removed; only the single structured attempt is individually bounded
+# (see PLANNER_STRUCTURED_ATTEMPT_BUDGET_S) and a slow structured
+# channel degrades to the single tailored text fallback (model-generated
+# queries for this turn, strictly validated), never to identical
+# generic queries. Only a wall-clock expiry of the tailored sequence
+# fails closed as a provider timeout (never a generic plan). Provider
+# 429 always propagates for runner retire/restart; content validation
+# failures still fail closed. Turn-independent, never an
+# exact-question special case. Product Contract #110 unchanged.
 PLANNER_TIME_BUDGET_S = 10.0
 
-# Deterministic broad-coverage fallback queries for planner timeouts.
-# Generic program/support vocabulary only: no factual strengthening, no
-# diagnosis, no loss-of-control/divorce/medical assumptions. Identical
-# for every timeout turn so the repair is turn-independent and never an
-# exact-question special case. Twelve distinct queries satisfy the
-# 0-or-10..16 structural contract and sample distinct book regions so
-# a timed-out substantive turn still retrieves a usable pack instead of
-# collapsing to empty-pack clarification.
-PLANNER_TIMEOUT_FALLBACK_QUERIES: tuple[str, ...] = (
-    "программа трезвость шаги",
-    "трезвость программа выздоровление",
-    "сообщество поддержка помощь",
-    "помощь сообщества трезвость",
-    "трезвость сегодня поддержка",
-    "выздоровление программа помощь",
-    "шаги программа трезвость поддержка",
-    "сообщество трезвость выздоровление",
-    "помощь трезвость шаги программа",
-    "поддержка трезвость сообщество",
-    "выздоровление трезвость шаги",
-    "программа поддержка сообщество трезвость",
-)
-
-
-def deterministic_timeout_fallback_plan() -> QueryPlan:
-    """Return the validated broad-coverage plan for planner timeouts."""
-    return validate_query_plan(QueryPlan(queries=list(PLANNER_TIMEOUT_FALLBACK_QUERIES)))
+# Per-attempt bound for the single native structured planner call (Gate
+# C+E live repair, kodmial/aa#217 recurrence 6; evidence above). The
+# structured channel serves fast when healthy (p50 ~0.4s) and tails
+# badly when not (p95 ~10s, capped previously only by the whole-turn
+# wall that then discarded the turn's tailored work for generic
+# queries). Bounding just this attempt lets a slow structured channel
+# degrade quickly to the tailored text path within the same overall
+# wall: typical turns pay one fast call, tail turns still serve
+# model-generated queries for this turn's request instead of identical
+# generic vocabulary. Strict Pydantic validation is unchanged on both
+# paths; 429 propagates and never triggers the text path.
+PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 4.0
 
 
 def _display_message_text(value: object) -> str:
@@ -347,15 +330,17 @@ async def run_planner(
     never triggers the text path. Turn-independent, never an
     exact-question special case.
 
-    Recurrence 5 (exact main a9c5d3e run 37701489048: planner p50 11.1s /
-    p95 42.8s / max 63.4s vs recurrence-4 p50 7.0s / p95 16.4s, retrieval
-    still healthy at p50 0.6s, structured p50 6.3s / p95 42.8s vs text
-    p50 4.5s / p95 15.4s) proves the tail is server-side provider latency
-    on the OpenCode-request boundary, not tokens or retry count. The
-    whole provider sequence below therefore runs under
-    ``PLANNER_TIME_BUDGET_S``; on expiry a deterministic broad-coverage
-    plan is served (see the constant above) instead of waiting out the
-    40-60s tail. Only timeout triggers the fallback: 429 and content
+    Recurrence 6 (exact main 4a32481 run 37705584457: planner pinned at
+    p50 10006ms / p95 10008ms / max 10024ms, i.e. the recurrence-5 wall
+    fires on ~100% of turns; 8 clarifications with
+    unavailable_units_total=0, so the collapse is verifier-unsupported
+    on generic packs, not transport) proves the wall-clock generic
+    fallback is the collapse mechanism, not the repair. The structured
+    attempt below is therefore individually bounded
+    (``PLANNER_STRUCTURED_ATTEMPT_BUDGET_S``) and a slow structured
+    channel degrades to the single tailored text fallback, never to
+    identical generic queries; only a wall-clock expiry of the tailored
+    sequence fails closed as a provider timeout. 429 and content
     validation failures still propagate fail-closed.
     """
     messages = build_planner_messages(
@@ -369,17 +354,28 @@ async def run_planner(
 
     async def _provider_plan() -> QueryPlan:
         return await _run_planner_provider(
-            model, user_text=user_text, system_text=system_text, messages=messages
+            model,
+            user_text=user_text,
+            system_text=system_text,
+            messages=messages,
+            structured_attempt_budget=min(PLANNER_STRUCTURED_ATTEMPT_BUDGET_S, budget),
         )
 
     try:
         return await asyncio.wait_for(_provider_plan(), timeout=budget)
-    except TimeoutError:
+    except TimeoutError as exc:
+        # Fail closed as a provider timeout: serving identical generic
+        # queries here reintroduces the recurrence-6 collapse (generic
+        # pack -> verifier-unsupported -> exact generic clarification on
+        # every slow turn). Upstream maps this to a natural retry reply,
+        # never to a fake grounded plan.
+        from aa.opencode.errors import OpenCodeTimeoutError as _PlannerTimeout
+
         logger.info(
-            "planner time budget exceeded; broad fallback served",
+            "planner time budget exceeded; failing closed without generic fallback",
             extra={"category": "planner-timeout"},
         )
-        return deterministic_timeout_fallback_plan()
+        raise _PlannerTimeout("planner time budget exceeded") from exc
 
 
 async def _run_planner_provider(
@@ -388,8 +384,15 @@ async def _run_planner_provider(
     user_text: str,
     system_text: str,
     messages: list[BaseMessage],
+    structured_attempt_budget: float = PLANNER_STRUCTURED_ATTEMPT_BUDGET_S,
 ) -> QueryPlan:
-    """Run the structured-first provider sequence without any time bound."""
+    """Run the structured-first provider sequence with a bounded structured attempt.
+
+    The single native structured call is individually bounded so a slow
+    structured channel degrades quickly to the tailored text fallback
+    instead of consuming the whole turn wall and then collapsing to a
+    generic plan. The overall wall is enforced by the caller.
+    """
     structured_invoke = getattr(model, "ainvoke_structured", None)
     if callable(structured_invoke):
         try:
@@ -428,12 +431,26 @@ async def _run_planner_provider(
                 # fail-closed on content).
                 pass
         try:
-            raw = await structured_invoke(
-                user_text,
-                system=system_text,
-                schema=query_plan_json_schema(),
-                retry_count=PLANNER_MAX_ATTEMPTS,
+            raw = await asyncio.wait_for(
+                structured_invoke(
+                    user_text,
+                    system=system_text,
+                    schema=query_plan_json_schema(),
+                    retry_count=PLANNER_MAX_ATTEMPTS,
+                ),
+                timeout=structured_attempt_budget,
             )
+        except TimeoutError:
+            logger.info(
+                "planner structured attempt timed out; tailored text fallback used",
+                extra={"category": "structured-attempt-timeout"},
+            )
+            text_reply = await _invoke_planner_text(
+                model, user_text=user_text, system_text=system_text
+            )
+            plan = validate_structured_plan(parse_planner_text_json(text_reply))
+            logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+            return plan
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError
 
@@ -490,11 +507,10 @@ async def planner_node(
 
 __all__ = [
     "PLANNER_MAX_MESSAGE_CHARS",
+    "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S",
     "PLANNER_TEXT_JSON_SUFFIX",
     "PLANNER_TIME_BUDGET_S",
-    "PLANNER_TIMEOUT_FALLBACK_QUERIES",
     "build_planner_messages",
-    "deterministic_timeout_fallback_plan",
     "parse_planner_text_json",
     "planner_node",
     "query_plan_json_schema",
