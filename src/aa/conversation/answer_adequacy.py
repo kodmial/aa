@@ -310,7 +310,7 @@ def assess_turn_adequacy(
             else "retrieval"
         ),
         query_count=stored_query_count,
-    )
+    ) or bool(pack)
     # When the caller supplies only a legacy planner reason without an
     # explicit mode, treat legitimate-glue as conversational and every
     # other reason as substantive. Provider errors therefore never count
@@ -406,9 +406,19 @@ def assess_turn_adequacy(
         )
     except Exception:
         all_supported = False
+    if not substantive:
+        return AdequacyAssessment(
+            substantive_request=False,
+            technically_grounded=True,
+            answers_request=True,
+            verdict=ADEQUACY_PASS,
+            failure_category="",
+            verified_book_units=verified_count,
+            evidence_passages=len(pack),
+        )
     if not all_supported:
         return AdequacyAssessment(
-            substantive_request=True,
+            substantive_request=substantive,
             technically_grounded=False,
             answers_request=False,
             verdict=ADEQUACY_FAIL,

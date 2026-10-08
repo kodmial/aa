@@ -407,7 +407,10 @@ def narrowed_grounding_state(
     ]
     if not filtered:
         return {"verified": False, "units": [], "all_required_supported": False}
-    relevant = any(bool(item.get("addresses_intent", False)) for item in filtered)
+    relevant = any(
+        item.get("scope") == "book" and bool(item.get("addresses_intent", False))
+        for item in filtered
+    )
     needs_book = any(item.get("scope") == "book" for item in filtered)
     return {
         "verified": True,
