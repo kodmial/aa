@@ -1797,15 +1797,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 NATURAL_CLARIFICATION_REPLY,
                 *NATURAL_RETRY_VARIANTS,
             }
-            collapsed_count = sum(
-                1 for item in replies if item.strip() in non_answer_fallbacks
-            )
+            collapsed_count = sum(1 for item in replies if item.strip() in non_answer_fallbacks)
             # Hash-based answer variety is never evidence of helpfulness.
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
             _check(
                 "live-substantive-grounded-book-answer",
-                book_grounded_expected >= 2
-                and book_grounded_successes == book_grounded_expected,
+                book_grounded_expected >= 2 and book_grounded_successes == book_grounded_expected,
             )
             _check("live-answer-diversity", len(set(replies)) >= 8)
             _check(
@@ -2076,7 +2073,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "clarification_count": sum(
             1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
-        ) if "replies" in locals() else 0,
+        )
+        if "replies" in locals()
+        else 0,
         "non_answer_fallback_count": collapsed_count,
         "book_grounded_expected": book_grounded_expected,
         "book_grounded_successes": book_grounded_successes,
