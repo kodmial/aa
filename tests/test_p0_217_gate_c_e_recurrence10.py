@@ -94,7 +94,7 @@ def test_end_to_end_budget_configured() -> None:
 
     The 14s guard converted ordinary answerable turns (sequential stage
     sum p50 ~10s / p95 ~21s) into bookless hash-selected filler. The
-    budget now tracks the Gate E hard SLO (max < 30s, delivery margin
+    budget now tracks the Gate E hard SLO (max < 120s, delivery margin
     kept) so ordinary slow turns complete as grounded answers; only a
     turn past the hard SLO still fails fast with explicit failure
     telemetry.
@@ -245,7 +245,7 @@ async def test_verifier_receives_reduced_remaining_budget(
     # propagates) but above the 3s skip floor (round still runs).
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
-    assert 2.0 < float(captured["turn_budget_s"]) < 40.0
+    assert 3.0 < float(captured["turn_budget_s"]) < 40.0
     assert outcome["text"] not in (NATURAL_RETRY_REPLY, NATURAL_CLARIFICATION_REPLY)
     assert outcome["telemetry"]["turn_budget_exceeded"] is False
 
