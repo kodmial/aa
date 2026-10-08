@@ -144,6 +144,25 @@ _DETOX_DIRECTIVE_RE = re.compile(
 )
 
 
+# Clause boundary for governance-local advice detection (kodmial/aa#257
+# recurrence 2): drinking advice holds only when the directive governs the
+# drinking action inside the same clause. A sentence-level drink+advice
+# co-occurrence flags abstinence-direction guidance such as "when craving
+# to drink, try calling a sponsor" where drinking is subordinate context
+# and the advised action is sober. Split on punctuation plus subordinate
+# conjunctions so context clauses never license the advised clause.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;:\u2014\u2013\-\(\)]+|\b(?:когда|если|чтобы|чтоб|потому|поскольку|"
+    r"так\s+как|пока|где|куда|откуда|но|а|однако|зато|хотя)\b",
+    re.IGNORECASE,
+)
+
+
+def _split_clauses(sentence: str) -> list[str]:
+    """Split one sentence into governance-local clauses (generic, no text)."""
+    return [part for part in _CLAUSE_SPLIT_RE.split(sentence or "") if part.strip()]
+
+
 @dataclass(frozen=True)
 class OutboundSafetyVerdict:
     """Outcome of certifying one outbound response."""
@@ -158,7 +177,14 @@ def _sentence_is_negated(sentence: str) -> bool:
 
 
 def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
-    """Judge one sentence; return (unsafe, category)."""
+    """Judge one sentence; return (unsafe, category).
+
+    Governance-local (kodmial/aa#257 recurrence 2): the directive must
+    govern the drinking action inside the same clause. Sentence-level
+    drink+advice co-occurrence falsely blocked abstinence-direction
+    guidance where drinking is subordinate context ("when it pulls to
+    drink, try calling ...") while the advised action stays sober.
+    """
     if not sentence.strip():
         return False, ""
     if (
@@ -205,28 +231,35 @@ def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
                 break
         else:
             return False, ""
-    has_drink = _DRINK_RE.search(sentence) is not None
-    has_advice = _ADVICE_RE.search(sentence) is not None
-    has_test = _TEST_PURPOSE_RE.search(sentence) is not None
-    has_abrupt = _ABRUPT_STOP_RE.search(sentence) is not None
-    if has_drink and has_advice:
-        if has_test or has_abrupt:
+    # Governance-local main detection: each clause must itself advise
+    # drinking. This replaces the former sentence-level drink+advice
+    # co-occurrence which blocked sober guidance mentioning drinking as
+    # subordinate context.
+    for clause in _split_clauses(sentence):
+        if not clause.strip():
+            continue
+        clause_drink = _DRINK_RE.search(clause) is not None
+        clause_advice = _ADVICE_RE.search(clause) is not None
+        clause_test = _TEST_PURPOSE_RE.search(clause) is not None
+        clause_abrupt = _ABRUPT_STOP_RE.search(clause) is not None
+        if clause_drink and clause_advice:
+            if clause_test or clause_abrupt:
+                return True, "drink-test-advice"
+            return True, "resume-drinking-advice"
+        # Infinitive trial without an explicit modal: "начать пить и резко
+        # прекратить" as helped experience is still an invitation to act.
+        clause_helps = "помогает" in clause or "поможет" in clause or "опыт" in clause
+        if clause_drink and (clause_test or clause_abrupt) and clause_helps:
             return True, "drink-test-advice"
-        return True, "resume-drinking-advice"
-    # Infinitive trial without an explicit modal: "начать пить и резко
-    # прекратить" as helped experience is still an invitation to act.
-    helps = "помогает" in sentence or "поможет" in sentence or "опыт" in sentence
-    if has_drink and (has_test or has_abrupt) and helps:
-        return True, "drink-test-advice"
-    # Abrupt stop after a drinking trial recommended as a procedure.
-    if has_abrupt and has_advice and has_drink:
-        return True, "abrupt-stop-after-drinking"
-    # Dangerous self-detox instruction as an action.
-    if _DETOX_ACTION_RE.search(sentence) is not None and (
-        _DETOX_DIRECTIVE_RE.search(sentence) is not None or has_advice
-    ):
-        if not _sentence_is_negated(sentence):
-            return True, "unsafe-detox-advice"
+        # Abrupt stop after a drinking trial recommended as a procedure.
+        if clause_abrupt and clause_advice and clause_drink:
+            return True, "abrupt-stop-after-drinking"
+        # Dangerous self-detox instruction as an action.
+        if _DETOX_ACTION_RE.search(clause) is not None and (
+            _DETOX_DIRECTIVE_RE.search(clause) is not None or clause_advice
+        ):
+            if _NEGATION_RE.search(clause) is None:
+                return True, "unsafe-detox-advice"
     return False, ""
 
 
