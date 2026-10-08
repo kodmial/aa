@@ -1,4 +1,4 @@
-"""Regression contracts for the recurring AA canary workflows."""
+"""Regression contracts for the gated AA production canary (issue #82)."""
 
 from pathlib import Path
 
@@ -10,36 +10,59 @@ def _read(name: str) -> str:
     return (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
-def test_canary_runs_every_four_hours_during_convergence() -> None:
+def test_canary_is_single_gated_workflow_every_four_hours() -> None:
+    assert not (WORKFLOWS / "aa-canary-monitor.yml").exists()
     text = _read("aa-canary.yml")
     assert 'cron: "17 */4 * * *"' in text
     assert "workflow_dispatch:" in text
-    assert "group: aa-self-proving-qualification" in text
-    assert "Activate bounded current-main canary" in text
-    assert "active=true" in text
-    assert "needs: activation" in text
-    assert "needs.activation.outputs.active == 'true'" in text
-    assert "Gate C smoke" in text
-    assert "Gate D readiness" in text
-    assert "Gate E latency guard" in text
-    assert "Re-enter authoritative convergence after canary failure" in text
-    assert "aa-self-proving-qualification.yml" in text
+    assert "github.repository_owner" in text
+    assert "group: aa-production-canary" in text
+    assert "cancel-in-progress: false" in text
+
+
+def test_canary_activation_enforces_blocker_before_any_runtime() -> None:
+    text = _read("aa-canary.yml")
+    assert "issues/6" in text or "issue_number: 6" in text
+    assert "continuum-qualification-result issue=7" in text
+    assert "verify_product_contract_qualification" in text
+    assert "SKIPPED / not activated" in text
+    assert "needs.activation.outputs.active" in text
+    assert "run_aa_production_canary.py" in text
+
+
+def test_canary_scope_uses_real_production_boundary() -> None:
+    text = _read("aa-canary.yml")
     assert "bash scripts/verify.sh" in text
-    assert "test_spawned_server_shuts_down_gracefully" in text
-    assert "test_attach_mode_never_kills_foreign_server" in text
-    assert "/getMe" in text
+    assert "restore_canonical.py" in text
+    assert "build_retrieval_index.py" in text
     assert "TELEGRAM_BOT_TOKEN" in text
-    assert "release" not in text.lower().replace("product release: not performed", "")
+    assert "AA_BOOK_AGE_IDENTITY" in text
 
 
-def test_canary_monitor_routes_failure_to_authoritative_self_proving_only() -> None:
-    text = _read("aa-canary-monitor.yml")
-    assert 'workflows: ["AA canary"]' in text
-    assert "Re-enter authoritative self-proving convergence" in text
-    assert "actions: write" in text
-    assert "aa-self-proving-qualification.yml" in text
-    assert "listWorkflowRuns" in text
-    assert "createWorkflowDispatch" in text
-    assert "issues.create" not in text
-    assert "priority:p0" not in text
-    assert "No generic canary P0 is created" in text
+def test_canary_stale_and_transient_never_create_repair_issues() -> None:
+    text = _read("aa-canary.yml")
+    assert "STALE" in text
+    assert "requalification pending" in text
+    assert "provider/infrastructure transient" in text
+    assert "no product repair issue is created" in text
+
+
+def test_canary_repair_is_single_p0_with_recovery() -> None:
+    text = _read("aa-canary.yml")
+    assert "aa-production-canary-repair:v1" in text
+    assert "Canary fingerprint:" in text
+    assert "priority:p0" in text
+    assert "continuum-issue-scheduler.yml" in text
+    assert "Close matching canary repair issues on recovery" in text
+    assert "No user text, secrets, corpus text, audio, transcripts" in text
+
+
+def test_canary_runner_exists_with_gated_entrypoint() -> None:
+    runner = ROOT / "scripts" / "run_aa_production_canary.py"
+    assert runner.is_file()
+    text = runner.read_text(encoding="utf-8")
+    assert "aa-production-canary/1" in text
+    assert "evaluate_activation" in text
+    assert "classify_failure" in text
+    assert "not-activated" in text
+    assert "stale-main" in text
