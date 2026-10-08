@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.planner_schema import (
+    MAX_QUERIES,
     MIN_NONEMPTY_QUERIES,
     PLANNER_MAX_ATTEMPTS,
     QueryPlan,
@@ -147,6 +148,10 @@ def query_plan_json_schema() -> dict[str, Any]:
     items["pattern"] = r"\S"
     queries["items"] = items
     queries["uniqueItems"] = True
+    queries["anyOf"] = [
+        {"maxItems": 0},
+        {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
+    ]
     properties["queries"] = queries
     schema["properties"] = properties
     schema["required"] = ["mode", "resolved_intent", "queries"]
@@ -188,8 +193,6 @@ def build_generic_fallback_queries(
         queries.append(candidate)
         if len(queries) >= max_queries:
             break
-    while len(queries) < MIN_NONEMPTY_QUERIES and len(queries) > 1:
-        queries.append(cleaned)
     return queries[:max_queries]
 
 
