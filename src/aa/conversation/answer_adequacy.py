@@ -338,6 +338,7 @@ def _has_structural_capability_shape(cleaned: str) -> bool:
 # short stems, never via memorized user sentences.
 _RECOVERY_DOMAIN_STEMS = (
     "тяг",
+    "тян",
     "выпи",
     "выпь",
     "буха",
