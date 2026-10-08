@@ -133,7 +133,21 @@ ANSWER_FAST_RETRY_MAX_HISTORY = 2
 # supported units are served, otherwise clarification); no exact-question
 # special case, Product Contract #110 unchanged. Fast turns (mocked tests,
 # healthy provider) still use both rounds.
-TURN_REPAIR_TIME_BUDGET_S = 90.0
+#
+# Gate C+E live repair, kodmial/aa#269 on exact main 90ff8b8 run
+# 37813016105 (C:live-answer-relevance-substantive-drinking-2 plus
+# E:latency-budget-exceeded p50 25027ms / p95 71451ms / max 81435ms with
+# planner p50 5926ms, answer p50 9162ms, verifier p50 9632ms, repair_turns=2,
+# answer_rounds=24, message-text p50 5310ms / p95 14271ms over 150 text
+# calls): the 90s budget never binds while the p95 tail breaches the 60s
+# Gate E target, so slow tail turns still burn a second full
+# planner+retrieval+answer+verifier sequence after an already-slow initial
+# chain. Tightening to 50s keeps one full repair reachable on ordinary
+# turns (initial draft+verify plus one repair round still fit) while slow
+# tail turns skip further re-planning and narrow to verified supported
+# material instead of grinding another ~20s sequence. Turn-independent,
+# never an exact-question special case.
+TURN_REPAIR_TIME_BUDGET_S = 50.0
 
 # End-to-end turn guard (Gate C+E live repair, kodmial/aa#217 recurrence
 # 10 on exact main 94fd5b5 run 37722464604, corrected by kodmial/aa#240
@@ -223,6 +237,50 @@ def select_retry_reply(user_message: str) -> str:
     """Return a truthful brief unqualified status, never synthetic support."""
     del user_message
     return NATURAL_RETRY_REPLY
+
+
+# Supplementary repair context label shared by all focused-regeneration
+# prompts below. Generic wording only, never an exact live prompt.
+MISSING_SUPPORT_PREFIX = "Недостающая поддержка"
+
+
+def anchored_repair_focus(user_message: str, missing_texts: Sequence[str]) -> str:
+    """Build a repair focus that keeps the live request topically primary.
+
+    Gate C+E live repair, kodmial/aa#269 on exact main 90ff8b8 run
+    37813016105 (C:live-answer-relevance-substantive-drinking-2): repair
+    and fallback regeneration prompts previously carried the live user
+    message first and appended model-generated unsupported unit texts
+    after it, so the model attended to trailing supplementary material
+    (which may itself be off-topic) instead of the actual request and
+    served verified-but-irrelevant replies. Supplementary context now
+    travels first and the live request travels last, matching the answer
+    prompt contract where ``<user_message>`` is always last. Generic
+    ordering only, never an exact-question special case.
+    """
+    cleaned = [text.strip() for text in missing_texts if text.strip()]
+    if not cleaned:
+        return user_message
+    joined = " | ".join(cleaned)[:800]
+    return f"{MISSING_SUPPORT_PREFIX}: {joined}\n{user_message}"
+
+
+def anchored_adequacy_regen_prompt(resolved_request: str) -> str:
+    """Build the adequacy-regeneration prompt with the request last.
+
+    Same kodmial/aa#269 relevance mechanism as
+    :func:`anchored_repair_focus`: the practical-answer instruction
+    travels first and the resolved live request travels last, so the
+    regeneration stays anchored to the user's actual topic instead of
+    drifting toward trailing instruction prose. Generic ordering only,
+    never an exact-question special case.
+    """
+    return (
+        "Дайте один практичный ответ по книге: "
+        "конкретное объяснение и ближайший шаг только из приведённых отрывков, "
+        "сохраняя тот же предмет и шаг, о котором спрашивает пользователь.\n"
+        f"{resolved_request}"
+    )
 
 
 def certify_outbound_safety(text: str) -> bool:
@@ -1177,10 +1235,7 @@ async def run_v2_answer_turn(
         if planner_model is None or retrieval_index is None:
             telemetry["planner_outcome"] = "skipped-no-planner"
             break
-        focus = user_message
-        if missing:
-            joined = " | ".join(missing)[:800]
-            focus = f"{user_message}\nНедостающая поддержка: {joined}"
+        focus = anchored_repair_focus(user_message, missing)
         try:
             from aa.conversation.planner_node import run_planner as _run_planner
 
@@ -1246,10 +1301,9 @@ async def run_v2_answer_turn(
                     _missing_now = (
                         unsupported_unit_texts(units, result) if units else [current_draft]
                     )
-                    _missing_now = [text for text in _missing_now if text.strip()]
-                    if _missing_now:
-                        _joined_now = " | ".join(_missing_now)[:800]
-                        _fallback_focus = f"{user_message}\nНедостающая поддержка: {_joined_now}"
+                    _fallback_focus = anchored_repair_focus(
+                        user_message, [text for text in _missing_now if text.strip()]
+                    )
                 except Exception:
                     pass
                 _fallback_draft = await _draft_with_pack(pack, _fallback_focus)
@@ -1288,10 +1342,9 @@ async def run_v2_answer_turn(
                     _missing_dup = (
                         unsupported_unit_texts(units, result) if units else [current_draft]
                     )
-                    _missing_dup = [text for text in _missing_dup if text.strip()]
-                    if _missing_dup:
-                        _joined_dup = " | ".join(_missing_dup)[:800]
-                        _dup_focus = f"{user_message}\nНедостающая поддержка: {_joined_dup}"
+                    _dup_focus = anchored_repair_focus(
+                        user_message, [text for text in _missing_dup if text.strip()]
+                    )
                 except Exception:
                     pass
                 _dup_draft = await _draft_with_pack(pack, _dup_focus)
@@ -1357,11 +1410,7 @@ async def run_v2_answer_turn(
             verification_state=grounding_result_to_state(result),
         )
         if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL and pack:
-            _regen_prompt = (
-                f"{_resolved_request}\nДайте один практичный ответ по книге: "
-                "конкретное объяснение и ближайший шаг только из приведённых отрывков, "
-                "сохраняя тот же предмет и шаг, о котором спрашивает пользователь."
-            )
+            _regen_prompt = anchored_adequacy_regen_prompt(_resolved_request)
             _regen_units: list[ResponseUnitDraft] = []
             _regen_result: GroundingResult | None = None
             _regen_passed = False
@@ -2189,6 +2238,8 @@ __all__ = [
     "TURN_END_TO_END_BUDGET_S",
     "TURN_REPAIR_TIME_BUDGET_S",
     "TURN_VERIFIER_MIN_SLICE_S",
+    "anchored_adequacy_regen_prompt",
+    "anchored_repair_focus",
     "answer_pipeline_node",
     "certify_outbound_safety",
     "compact_supported_to_envelope",
