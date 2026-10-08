@@ -94,7 +94,7 @@ def test_end_to_end_budget_configured() -> None:
 
     The 14s guard converted ordinary answerable turns (sequential stage
     sum p50 ~10s / p95 ~21s) into bookless hash-selected filler. The
-    budget now tracks the Gate E hard SLO (max < 30s, delivery margin
+    budget now tracks the Gate E hard SLO (max < 120s, delivery margin
     kept) so ordinary slow turns complete as grounded answers; only a
     turn past the hard SLO still fails fast with explicit failure
     telemetry.
@@ -126,7 +126,7 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=120000.0,
+        upstream_latency_ms=125000.0,
     )
     assert time.perf_counter() - started < 5.0
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -167,7 +167,7 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=103000.0,
+        upstream_latency_ms=103500.0,
     )
     assert answer.calls == 1
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -227,13 +227,13 @@ async def test_verifier_receives_reduced_remaining_budget(
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=80000.0,
+        upstream_latency_ms=75000.0,
     )
-    # Remaining is ~25s: below the 40s verifier default (reduced slice
+    # Remaining is ~30s: below the 40s verifier default (reduced slice
     # propagates) but above the 3s skip floor (round still runs).
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
-    assert 2.0 < float(captured["turn_budget_s"]) < 40.0
+    assert 3.0 < float(captured["turn_budget_s"]) < 40.0
     assert outcome["text"] not in (NATURAL_RETRY_REPLY, NATURAL_CLARIFICATION_REPLY)
     assert outcome["telemetry"]["turn_budget_exceeded"] is False
 
@@ -257,7 +257,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
-            clock["now"] += 120.0
+            clock["now"] += 115.0
             return {
                 "requires_book_evidence": True,
                 "supported": False,
