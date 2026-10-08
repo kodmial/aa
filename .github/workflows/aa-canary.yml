@@ -242,6 +242,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
           SELF_PROVING_LIVE: "1"
           OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
           OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
@@ -436,6 +438,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout recovered main history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.activation.outputs.sha }}
+          fetch-depth: 0
+
       - name: Close matching canary repair issues on recovery
         uses: actions/github-script@v7
         env:
@@ -461,19 +469,36 @@ jobs:
                 }
               }
             }
+            const { execSync } = require('child_process');
             const marker = '<!-- aa-production-canary-repair:v1 -->';
-            // Close only repairs recorded for the exact SHA that just
-            // passed: a PASS for one root cause must never close
-            // unrelated still-failing fingerprints (other SHAs or other
-            // failure sets stay open).
-            const shaLine = `Exact main SHA: \`${sha}\``;
+            // Newer-or-equal auto-recovery: a PASS on the recovered SHA
+            // closes repairs recorded for that SHA or any older (ancestor)
+            // SHA. Descendant or unrelated SHAs stay open so a PASS for one
+            // root cause never closes a still-failing newer regression.
+            const recovered = String(sha || '').toLowerCase();
+            const shaPattern = /^[0-9a-f]{40}$/;
+            function issueSha(body) {
+              const match = String(body || '').match(/Exact main SHA:\s*`([0-9a-f]{40})`/i);
+              return match ? String(match[1]).toLowerCase() : '';
+            }
+            function isRecoveredOrAncestor(candidate) {
+              if (!shaPattern.test(candidate) || !shaPattern.test(recovered)) return false;
+              if (candidate === recovered) return true;
+              try {
+                execSync(`git cat-file -e ${candidate} && git cat-file -e ${recovered}`, { stdio: 'ignore' });
+                execSync(`git merge-base --is-ancestor ${candidate} ${recovered}`, { stdio: 'ignore' });
+                return true;
+              } catch (error) {
+                return false;
+              }
+            }
             const issues = await apiRetry('list open issues', () =>
               github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 })
             );
             const matching = issues.filter(
               issue => !issue.pull_request
                 && String(issue.body || '').includes(marker)
-                && String(issue.body || '').includes(shaLine)
+                && isRecoveredOrAncestor(issueSha(issue.body))
             );
             for (const issue of matching) {
               await apiRetry(`close canary repair issue #${issue.number}`, () =>
