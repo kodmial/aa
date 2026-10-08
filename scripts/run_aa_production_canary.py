@@ -1205,20 +1205,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         checks, startup_ms = asyncio.run(_run_compact_checks())
     except Exception as exc:
-        failure = classify_failure(type(exc).__name__ + str(exc))
-        if failure in ("provider-transient", "github-infrastructure"):
-            summary = CanarySummary(
-                main_sha=expected_sha,
-                run_id=run_id,
-                status="FAIL",
-                activation=activation,
-                failure_class=failure,
-                startup_duration_ms=0.0,
-                peak_rss_mb=_peak_rss_mb(),
-            )
-            _write_evidence(out_dir, summary)
-            print(f"production canary infrastructure failure: {failure}", file=sys.stderr)
-            return 4
+        # Fail closed: a harness crash carries no external-I/O-only proof,
+        # so it is always a product regression. Classifying from the
+        # exception name/message alone (for example a product startup
+        # deadlock raising TimeoutError) would otherwise exit as
+        # github-infrastructure and mask a stable-main defect.
         summary = CanarySummary(
             main_sha=expected_sha,
             run_id=run_id,
@@ -1271,7 +1262,7 @@ def main(argv: list[str] | None = None) -> int:
     current_main = (args.current_main_sha or "").strip().lower()
     if not current_main:
         try:
-            subprocess.run(
+            fetch_proc = subprocess.run(
                 [
                     "git",
                     "fetch",
@@ -1284,6 +1275,24 @@ def main(argv: list[str] | None = None) -> int:
                 capture_output=True,
                 check=False,
             )
+            if fetch_proc.returncode != 0:
+                summary = CanarySummary(
+                    main_sha=expected_sha,
+                    run_id=run_id,
+                    status="FAIL",
+                    activation=activation,
+                    checks=tuple(checks),
+                    failure_class="github-infrastructure",
+                    startup_duration_ms=startup_ms,
+                    peak_rss_mb=_peak_rss_mb(),
+                )
+                _write_evidence(out_dir, summary)
+                print(
+                    "production canary infrastructure failure: "
+                    f"git fetch failed: {fetch_proc.returncode}",
+                    file=sys.stderr,
+                )
+                return 4
             current_main = current_main_sha(ROOT)
         except ValueError as exc:
             summary = CanarySummary(
@@ -1319,6 +1328,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Revalidate activation before failure publication: invalidated final
     # qualification means requalification is pending, never a repair issue.
+    # Fail closed on lookup errors: reusing the earlier active result would
+    # publish FAIL as product-regression (and drive P0 repair) when
+    # activation could not be re-proven after a transient GitHub API
+    # failure such as an issue #7 comments timeout.
     try:
         rechecked = resolve_activation(
             expected_sha,
@@ -1326,8 +1339,24 @@ def main(argv: list[str] | None = None) -> int:
             issue6_closed=_parse_flag(args.issue6_closed),
             qual_pass_for_sha=_parse_flag(args.qual_pass),
         )
-    except Exception:
-        rechecked = activation
+    except Exception as exc:
+        summary = CanarySummary(
+            main_sha=expected_sha,
+            run_id=run_id,
+            status="FAIL",
+            activation=activation,
+            checks=tuple(checks),
+            failure_class="github-infrastructure",
+            startup_duration_ms=startup_ms,
+            peak_rss_mb=_peak_rss_mb(),
+        )
+        _write_evidence(out_dir, summary)
+        print(
+            "production canary infrastructure failure: "
+            f"cannot revalidate activation: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 4
     if not rechecked.active:
         summary = CanarySummary(
             main_sha=expected_sha,
