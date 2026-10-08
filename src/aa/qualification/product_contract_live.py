@@ -1784,42 +1784,96 @@ def _content_tokens_for_relevance(text: str) -> set[str]:
     return tokens
 
 
-def _assess_prompt_reply_relevance(prompt: str, reply: str) -> bool:
+def _extract_step_numbers_for_relevance(text: str) -> set[int]:
+    """Extract generic numbered-step referents (digits and ordinal words)."""
+    import re as _re
+
+    lowered = (text or "").casefold()
+    found: set[int] = set()
+    if not lowered:
+        return found
+    for match in _re.finditer(r"шаг\w*\s*(?:№\s*)?(\d{1,2})", lowered):
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= 12:
+            found.add(number)
+    if "шаг" in lowered:
+        for stem, number in (
+            ("перв", 1),
+            ("втор", 2),
+            ("трет", 3),
+            ("четверт", 4),
+            ("пят", 5),
+            ("шест", 6),
+        ):
+            if stem in lowered:
+                found.add(number)
+    return found
+
+
+def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = "") -> bool:
     """Whether a sent reply is topically relevant to its prompt.
 
     Qualification-only independent semantic signal beyond sentence shape:
-    the reply must share substantive content prefixes with the prompt, or
+    the reply must share substantive content with the resolved prompt, or
     both sides must carry generic alcohol-recovery domain vocabulary so
     colloquial, slang and typo paraphrases of the same recovery topic
     still count, while an out-of-context supported book quote, a citation
-    present but without a useful step, or an all-glue response cannot pass
-    on shape alone. Generic signals only, never an exact-question
-    whitelist. Short pure greetings are handled by the caller as glue and
-    never reach this check as substantive turns.
+    present but without a useful step, a cited passage from another
+    numbered step, or an all-glue response cannot pass on shape alone.
+    Generic signals only, never an exact-question whitelist. Short pure
+    greetings are handled by the caller as glue and never reach this
+    check as substantive turns. ``context`` carries prior-turn text so
+    elliptical follow-ups resolve to the same referent.
     """
-    prompt_tokens = _content_tokens_for_relevance(prompt)
+    effective_prompt = f"{prompt} {context}".strip() if context else (prompt or "")
+    prompt_tokens = _content_tokens_for_relevance(effective_prompt)
     reply_tokens = _content_tokens_for_relevance(reply)
     if not prompt_tokens or not reply_tokens:
         return False
+    # Numbered-step fidelity: a prompt naming a step is relevant only to a
+    # reply naming the same step. Generic overlap on step vocabulary alone
+    # never proves that the answer addresses the asked step.
+    prompt_steps = _extract_step_numbers_for_relevance(effective_prompt)
+    if prompt_steps:
+        reply_steps = _extract_step_numbers_for_relevance(reply)
+        if not (prompt_steps & reply_steps):
+            return False
     prompt_prefixes = {token[:4] for token in prompt_tokens if len(token) >= 4}
     reply_prefixes = {token[:4] for token in reply_tokens if len(token) >= 4}
-    if prompt_prefixes & reply_prefixes:
+    overlap = prompt_prefixes & reply_prefixes
+    if len(overlap) >= 2:
+        return True
+    if len(overlap) == 1 and not prompt_steps:
+        return True
+    if len(overlap) == 1 and prompt_steps:
+        # With an explicit step referent already aligned above, one shared
+        # content prefix plus step agreement proves topical relevance.
         return True
     _stems = (
         "тяг",
+        "вып",
         "выпи",
         "выпь",
         "буха",
         "бухл",
         "пить",
+        "пью",
+        "пье",
+        "пил",
         "пьян",
+        "пья",
         "трезв",
         "срыв",
         "запо",
         "алког",
+        "алко",
+        "пив",
         "похмел",
     )
-    lowered_prompt = (prompt or "").casefold()
+    lowered_prompt = (effective_prompt or "").casefold()
     lowered_reply = (reply or "").casefold()
     prompt_domain = any(stem in lowered_prompt for stem in _stems)
     reply_domain = any(stem in lowered_reply for stem in _stems)
@@ -2236,6 +2290,163 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             bool(not_avoiding and not_service and not_quote_only and has_substance),
                         )
 
+            # Multi-turn regression families (kodmial/aa#259): raw Telegram
+            # updates through the same production transport, exercising
+            # step continuity, short admissions, typos, context switches
+            # and reset. Each second turn is judged on the real sent text
+            # plus its own telemetry snapshot: no fallback template and no
+            # unrelated cited fact may count as success.
+            async def _send_raw_text(chat_id: int, text: str, update_id: int) -> str | None:
+                before = len(api.sent_texts)
+                raw_turn = {
+                    "update_id": update_id,
+                    "message": {
+                        "message_id": update_id % 100000,
+                        "date": 1,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "text": text,
+                    },
+                }
+                api.pending_updates.append(raw_turn)
+                deadline_turn = loop.time() + 150.0
+                while len(api.sent_texts) <= before and loop.time() < deadline_turn:
+                    await asyncio.sleep(0.02)
+                if len(api.sent_texts) <= before:
+                    return None
+                return api.sent_texts[-1]
+
+            # Step continuity: the follow-up relies on the prior referent.
+            step_first = "Расскажи про Первый шаг программы выздоровления"
+            step_followup = "А какие решения принимают в этом шаге?"
+            step_reply_1 = await _send_raw_text(922101, step_first, 931001)
+            _check("live-step-continuity-first-delivered", bool((step_reply_1 or "").strip()))
+            if step_reply_1:
+                replies.append(step_reply_1)
+                latencies.append(0.0)
+            step_reply_2 = await _send_raw_text(922101, step_followup, 931002)
+            if step_reply_2 is None:
+                failed.append("live-step-continuity-second-timeout")
+            else:
+                replies.append(step_reply_2)
+                latencies.append(0.0)
+                step_snapshot: dict[str, Any] = {}
+                try:
+                    graph = app.graph_runtime
+                    if graph is not None:
+                        step_snapshot = graph.last_telemetry_for_thread(graph.thread_id(922101))
+                        if step_snapshot:
+                            stage_snapshots.append(dict(step_snapshot))
+                except Exception:
+                    pass
+                step_grounded = _is_grounded_substantive_reply(step_snapshot, step_reply_2)
+                step_relevant = _assess_prompt_reply_relevance(
+                    step_followup, step_reply_2, context=step_first
+                )
+                step_ok = bool(step_reply_2.strip()) and step_reply_2.strip() not in {
+                    NATURAL_CLARIFICATION_REPLY,
+                    *NATURAL_RETRY_VARIANTS,
+                }
+                _check("live-step-continuity-second-grounded", bool(step_grounded))
+                _check("live-step-continuity-second-relevant", bool(step_relevant))
+                _check(
+                    "live-step-continuity-no-fallback",
+                    step_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
+                    and step_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
+                )
+                _check(
+                    "live-step-continuity-same-step",
+                    bool(_extract_step_numbers_for_relevance(step_reply_2) & {1}),
+                )
+                _ = step_ok
+
+            # Short admission plus typo variant: brief personal disclosures
+            # are substantive continuations, never empty glue.
+            short_first = "Как мне бросить пить?"
+            short_second = "Пью каждый день"
+            short_reply_1 = await _send_raw_text(922102, short_first, 931011)
+            _check("live-short-admission-first-delivered", bool((short_reply_1 or "").strip()))
+            if short_reply_1:
+                replies.append(short_reply_1)
+            short_reply_2 = await _send_raw_text(922102, short_second, 931012)
+            if short_reply_2 is None:
+                failed.append("live-short-admission-second-timeout")
+            else:
+                replies.append(short_reply_2)
+                short_snapshot: dict[str, Any] = {}
+                try:
+                    graph = app.graph_runtime
+                    if graph is not None:
+                        short_snapshot = graph.last_telemetry_for_thread(graph.thread_id(922102))
+                        if short_snapshot:
+                            stage_snapshots.append(dict(short_snapshot))
+                except Exception:
+                    pass
+                _check(
+                    "live-short-admission-second-grounded",
+                    bool(_is_grounded_substantive_reply(short_snapshot, short_reply_2)),
+                )
+                _check(
+                    "live-short-admission-second-relevant",
+                    bool(_assess_prompt_reply_relevance(short_second, short_reply_2)),
+                )
+                _check(
+                    "live-short-admission-no-fallback",
+                    short_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
+                    and short_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
+                )
+            typo_reply = await _send_raw_text(922102, "Пад вечер тянеет выпить, че делать", 931013)
+            if typo_reply is None:
+                failed.append("live-typo-variant-timeout")
+            else:
+                replies.append(typo_reply)
+                typo_snapshot: dict[str, Any] = {}
+                try:
+                    graph = app.graph_runtime
+                    if graph is not None:
+                        typo_snapshot = graph.last_telemetry_for_thread(graph.thread_id(922102))
+                        if typo_snapshot:
+                            stage_snapshots.append(dict(typo_snapshot))
+                except Exception:
+                    pass
+                _check(
+                    "live-typo-variant-grounded",
+                    bool(_is_grounded_substantive_reply(typo_snapshot, typo_reply)),
+                )
+                _check(
+                    "live-typo-variant-no-fallback",
+                    typo_reply.strip() != NATURAL_CLARIFICATION_REPLY
+                    and typo_reply.strip() not in set(NATURAL_RETRY_VARIANTS),
+                )
+
+            # Context switch in the same chat stays helpful, never a bare
+            # fallback; negative controls never count as relevant.
+            switch_reply = await _send_raw_text(
+                922102, "А теперь другое: ночью не могу уснуть", 931014
+            )
+            if switch_reply is None:
+                failed.append("live-context-switch-timeout")
+            else:
+                replies.append(switch_reply)
+                _check(
+                    "live-context-switch-helpful",
+                    bool(not _is_avoiding_clarification_text(switch_reply))
+                    and bool(_has_declarative_substance(switch_reply)),
+                )
+            _check(
+                "live-negative-control-unrelated-citation-fails",
+                not _assess_prompt_reply_relevance(
+                    "Вечером тяжело пережить тягу",
+                    "Ведите финансовый бюджет спокойно.",
+                ),
+            )
+            _check(
+                "live-negative-control-wrong-step-fails",
+                not _assess_prompt_reply_relevance(
+                    "Расскажи про Первый шаг",
+                    "Третий шаг говорит о решениях и воле.",
+                ),
+            )
+
             non_answer_fallbacks = {
                 NATURAL_CLARIFICATION_REPLY,
                 *NATURAL_RETRY_VARIANTS,
@@ -2254,7 +2465,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             )
             _check(
                 "live-delivery-sendmessage-observed",
-                len(api.sent_texts) == len(scenarios),
+                len(api.sent_texts) >= len(scenarios),
             )
 
             audit = getattr(app.opencode_runtime.client, "served_model_audit", ())

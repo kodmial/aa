@@ -553,6 +553,9 @@ async def run_v2_answer_turn(
         planner_reason_for as _planner_reason_for,
     )
     from aa.conversation.answer_adequacy import (
+        resolve_effective_request as _resolve_request,
+    )
+    from aa.conversation.answer_adequacy import (
         runtime_sha as _runtime_sha,
     )
 
@@ -578,8 +581,25 @@ async def run_v2_answer_turn(
         )
     else:
         _effective_reason = _planner_reason_for(_query_hint, "ok" if _query_hint else "empty")
+    _recent_texts_for_adequacy: list[str] = []
+    for _msg in list(recent or []):
+        _content = getattr(_msg, "content", "")
+        if isinstance(_content, str) and _content.strip():
+            _recent_texts_for_adequacy.append(_content.strip()[:400])
+    try:
+        _resolved_request = _resolve_request(
+            user_message, summary=summary, recent=_recent_texts_for_adequacy
+        )
+    except Exception:
+        _resolved_request = user_message
     _proven_glue = bool(
-        _is_proven_glue(user_message, summary=summary) or _is_meta_request(user_message)
+        _is_proven_glue(
+            user_message,
+            summary=summary,
+            recent_count=len(_recent_texts_for_adequacy),
+            recent=_recent_texts_for_adequacy,
+        )
+        or _is_meta_request(user_message)
     )
     _trace_id = str(turn_trace_id or _new_trace_id())
 
@@ -629,6 +649,9 @@ async def run_v2_answer_turn(
                 verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+                summary=summary,
+                recent=_recent_texts_for_adequacy,
+                resolved_request=_resolved_request,
             )
         except Exception as exc:
             # Fail closed: an assessment error on a substantive turn must
@@ -683,6 +706,9 @@ async def run_v2_answer_turn(
                 ),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+                summary=summary,
+                recent=_recent_texts_for_adequacy,
+                resolved_request=_resolved_request,
             )
         except Exception as exc:
             logger.info(
@@ -1182,8 +1208,9 @@ async def run_v2_answer_turn(
         )
         if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL and pack:
             _regen_prompt = (
-                f"{user_message}\nДайте один практичный ответ по книге: "
-                "конкретное объяснение и ближайший шаг только из приведённых отрывков."
+                f"{_resolved_request}\nДайте один практичный ответ по книге: "
+                "конкретное объяснение и ближайший шаг только из приведённых отрывков, "
+                "сохраняя тот же предмет и шаг, о котором спрашивает пользователь."
             )
             _regen_draft = await _draft_with_pack(pack, _regen_prompt)
             if _regen_draft is not None:
