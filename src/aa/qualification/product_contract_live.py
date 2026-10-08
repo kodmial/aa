@@ -1414,73 +1414,6 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
-_GENERIC_OFFER_MARKERS = (
-    "помогу разобрать",
-    "помогаю разобрать",
-    "ближайшие шаги",
-    "конкретную ситуацию",
-    "конкретной ситуации",
-)
-
-_CLARIFICATION_CUES = (
-    "подробнее",
-    "расскажите",
-    "расскажи",
-    "уточните",
-    "уточни",
-    "что сейчас важнее",
-    "что именно",
-    "о чем именно",
-    "о чём именно",
-)
-
-
-def _declarative_sentences(reply: str) -> list[str]:
-    """Return declarative (``.``/``!``-terminated) sentences."""
-    import re as _re
-
-    cleaned = (reply or "").strip()
-    if not cleaned:
-        return []
-    found = _re.findall(r"[^.!?]+[.!]+", cleaned)
-    remainder = _re.sub(r"[^.!?]+[.!?]+", "", cleaned).strip()
-    sentences = [part.strip() for part in found if part.strip()]
-    if remainder and not remainder.rstrip().endswith("?"):
-        sentences.append(remainder)
-    return sentences
-
-
-def _is_avoiding_clarification_text(reply: str) -> bool:
-    """Whether a sent reply is an avoiding clarification without substance.
-
-    Qualification-only generic signal, never runtime routing: a reply that
-    carries a clarification cue but no declarative substantive sentence
-    beyond generic offers cannot count as helpful even when verifier counts
-    are present. No exact live prompt text is matched here; only generic RU
-    clarification cues and sentence shape are used.
-    """
-    cleaned = (reply or "").strip()
-    if not cleaned:
-        return True
-    lowered = cleaned.casefold()
-    has_cue = any(cue in lowered for cue in _CLARIFICATION_CUES)
-    declaratives = [
-        part
-        for part in _declarative_sentences(cleaned)
-        if len(part) >= 20 and any(ch.isalpha() for ch in part)
-    ]
-    substantive = [
-        part
-        for part in declaratives
-        if not any(marker in part.casefold() for marker in _GENERIC_OFFER_MARKERS)
-    ]
-    if has_cue and not substantive:
-        return True
-    if cleaned.rstrip().endswith("?") and not substantive and len(cleaned) < 200:
-        return True
-    return False
-
-
 def _is_service_link_only_text(reply: str) -> bool:
     """Whether a sent reply is only a service source link without help.
 
@@ -1505,33 +1438,16 @@ def _is_service_link_only_text(reply: str) -> bool:
     )
     if not has_link:
         return False
-    # Strip service link tokens; helpful prose survives without them.
+    # Strip only transport/source-pointer tokens. Whether the remaining
+    # prose is semantically helpful is judged by model telemetry elsewhere.
     stripped = _re.sub(r"https?://\S+", " ", text)
     stripped = _re.sub(r"t\.me\S*", " ", stripped, flags=_re.IGNORECASE)
     stripped = _re.sub(r"pc-s-[\w-]+", " ", stripped, flags=_re.IGNORECASE)
     stripped = _re.sub(r"chunk[\w-]*", " ", stripped, flags=_re.IGNORECASE)
-    if not _has_declarative_substance(stripped):
-        return True
-    # Bare-pointer cues alone are not substantive help.
-    depointed = stripped.casefold()
-    for _cue in (
-        "подробнее",
-        "подробней",
-        "смотрите",
-        "смотри",
-        "смотр",
-        "здесь",
-        "ссылк",
-        "читай",
-        "открой",
-        "перейди",
-        "переходи",
-        "нажми",
-    ):
-        depointed = depointed.replace(_cue, " ")
-    if not _has_declarative_substance(depointed):
-        return True
-    return False
+    # Mechanical link-only test: after pointer removal there must be some
+    # natural-language alphabetic payload. No keyword/intent interpretation.
+    alphabetic = "".join(ch for ch in stripped if ch.isalpha())
+    return len(alphabetic) < 8
 
 
 def _is_quote_only_text(reply: str) -> bool:
@@ -1555,25 +1471,6 @@ def _is_quote_only_text(reply: str) -> bool:
     if quoted <= 0:
         return False
     return quoted / max(1, len(text)) > 0.5
-
-
-def _has_declarative_substance(reply: str) -> bool:
-    """Whether a sent reply carries at least one declarative RU sentence."""
-    import re as _re
-
-    cleaned = (reply or "").strip()
-    if len(cleaned) < 20:
-        return False
-    for part in _declarative_sentences(cleaned):
-        if len(part) < 20:
-            continue
-        if not _re.search(r"[\u0400-\u04ff]", part):
-            continue
-        lowered = part.casefold()
-        if any(marker in lowered for marker in _GENERIC_OFFER_MARKERS):
-            continue
-        return True
-    return False
 
 
 def _is_direct_meta_reply(
