@@ -816,12 +816,15 @@ async def _verify_single_unit(
     schema rejection, missing structured payload), the same single-unit
     decision is retried once as bounded plain-text JSON through the
     ordinary text path and strictly validated. A caller-observed
-    structured deadline expiry (``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``,
-    kodmial/aa#217 recurrence 7) marks the capability the same way: a
-    channel that cannot serve one unit within budget will not serve the
-    next one either. Marks are TTL-bounded per model path (later rounds
-    re-snapshot the mark instead of re-burning the budget, and a
-    recovered provider is re-probed). When the shared primary
+    structured deadline expiry, a transient/timeout, a generic provider
+    error, or a structured content-validation failure is latency/content,
+    not capability evidence (kodmial/aa#244 recurrence 2): it falls back
+    once without marking so later units/turns re-probe the fast
+    structured path instead of pinning the lane to slow text. Marks are
+    TTL-bounded per model path (later rounds re-snapshot the mark instead
+    of re-burning the budget, and a recovered provider is re-probed).
+    Only deterministic capability failures (schema rejected, provider
+    access rejected, missing structured payload) mark. When the shared primary
     circuit is already open (live fallback path serving after a primary
     rejection) the structured attempt is skipped proactively for the
     same reason. The text path itself retries at most once on
@@ -901,11 +904,13 @@ async def _verify_single_unit(
             # Gate C+E live repair, kodmial/aa#244 recurrence 2 on exact
             # main 6f8d4e1 run 37764195857 (structured p50 0.40s over 28
             # fast calls vs text p50 5.1s over 73 slow calls; verifier p50
-            # 4.7s / p95 12.0s): a caller-observed deadline is latency,
-            # not capability evidence, so it falls back once without
-            # marking. Every round re-probes fast structured first.
-            # Provider 429 is raised by the adapter (never a
-            # TimeoutError) and still propagates.
+            # 4.7s / p95 12.0s): a true caller-observed deadline expiry is
+            # latency, not capability evidence, so it falls back once
+            # without marking. Every round re-probes fast structured
+            # first. A fast callee-raised timeout (elapsed below budget)
+            # is not a deadline expiry and propagates to preserve the
+            # fail-closed path. Provider 429 is raised by the adapter
+            # (never a TimeoutError) and still propagates.
             if time.monotonic() - attempt_started >= attempt_budget:
                 logger.info(
                     "verifier structured attempt timed out; text fallback used",
