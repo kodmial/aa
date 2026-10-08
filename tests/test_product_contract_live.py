@@ -427,3 +427,37 @@ def test_privacy_guard_allows_numeric_answer_stage_metrics() -> None:
         assert_no_text_leak(numeric_stage_metrics | {"answer": "secret reply text"})
     with pytest.raises(ProductContractLiveError):
         assert_no_text_leak({"stage_latency_ms": {"answer": {"p50": 1.0, "note": "leaked text"}}})
+
+
+def test_gate_c_rejects_bookless_retry_diversity() -> None:
+    """Different generic replies must never qualify as book-grounded help."""
+    from aa.conversation.turn_pipeline import (
+        NATURAL_CLARIFICATION_REPLY,
+        NATURAL_RETRY_VARIANTS,
+    )
+    from aa.qualification.product_contract_live import _is_grounded_substantive_reply
+
+    verified = {
+        "answer_outcome": "served",
+        "planner_query_count": 12,
+        "retrieval_passages": 5,
+        "verified_book_units": 1,
+    }
+    # Only the qualification predicate is under test here; this string
+    # is not claimed to be a source quotation or a real generated answer.
+    assert _is_grounded_substantive_reply(verified, "Проверенный ответ по книге.")
+    for retry in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+        assert not _is_grounded_substantive_reply(verified, retry)
+
+    assert not _is_grounded_substantive_reply(
+        {**verified, "verified_book_units": 0}, "Развёрнутый, но неподтверждённый ответ."
+    )
+    assert not _is_grounded_substantive_reply(
+        {**verified, "answer_outcome": "retry-turn-budget"}, "Любой непроверенный ответ."
+    )
+    assert not _is_grounded_substantive_reply(
+        {**verified, "retrieval_passages": 0}, "Ответ без найденной книги."
+    )
+    assert not _is_grounded_substantive_reply(
+        {**verified, "planner_query_count": 0}, "Ответ без поиска."
+    )
