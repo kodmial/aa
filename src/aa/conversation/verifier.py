@@ -339,6 +339,47 @@ VERIFIER_CAPABILITY_TTL_S = 60.0
 _TEXT_JSON_PREFERRED_AT: dict[str, float] = {}
 _CAPABILITY_LOCK = threading.Lock()
 
+# Persistent-rejection pinning (Gate C+E live repair, kodmial/aa#244
+# recurrence 3 on exact main 1d109a2 run 37771443722:
+# C:live-book-grounding-substantive-drinking-2 plus
+# E:latency-budget-exceeded p50 19.5s / p95 27.0s / max 27.0s with
+# planner p50 6.4s / p95 8.3s, retrieval p50 0.6s (healthy), answer p50
+# 6.9s / p95 8.9s, verifier p50 5.8s / p95 12.0s (still pinned at its
+# 12s turn wall), message-structured p50 0.45s / p95 0.70s / max 1.5s
+# over 33 fast calls vs message-text p50 4.9s / p95 10.1s / max 26.9s
+# over 79 slow calls, 2 turns with unavailable units (2 total) over 41
+# response units, answer_rounds=14, budget_exceeded=1).
+#
+# Compared with the recurrence-2 base (exact main 6f8d4e1 run
+# 37764195857: p50 18.3s / p95 26.6s, structured 28 calls / text 73
+# calls, same 2 unavailable turns), the recurrence-2 re-probe policy
+# did not converge: structured attempts rose (+5) while text attempts
+# rose in lockstep (+6), so re-probed structured attempts converted
+# zero turns back to the fast path and only added a second paid
+# interaction per invocation. No structured timeout fired in either
+# run (max 1.5s < 2s attempt budget), so the remaining waste is call
+# COUNT, not attempt duration: the provider persistently rejects
+# native json_schema (no fallback model ever recorded as serving;
+# ~40 of 112 HTTP interactions record no tokens at all), and every
+# TTL-window re-probe round burns a full concurrent fan-out
+# (structured-reject + text-fallback per unit) before re-marking.
+#
+# Strategy change at this capability-cache boundary (not another
+# duration retune, and not a return to blip-pinning): pin on
+# PERSISTENT rejection evidence. Two consecutive capability-suggestive
+# structured rejections (deterministic, or generic provider errors)
+# mark the path for the TTL; isolated blips still re-probe.
+# Caller-observed deadline expiries, transient/timeout failures,
+# content-validation failures and provider 429 never count (latency
+# or content, not capability evidence), any structured success
+# resets the streak, and TTL expiry still re-probes a recovered
+# provider. Turn-independent, never an exact-question special case.
+# Grounding strictness is unchanged (both paths stay fully
+# Pydantic-validated); 429 always propagates and never marks.
+VERIFIER_PERSISTENT_REJECTION_THRESHOLD = 2
+
+_STRUCTURED_CONSECUTIVE_REJECTIONS: dict[str, tuple[int, float]] = {}
+
 
 def _verifier_capability_key(model: Any | None) -> str:
     """Return the capability-cache key for one verifier model path."""
@@ -370,13 +411,21 @@ def _capability_entry_fresh(recorded_at: float) -> bool:
         return False
 
 
+def _persistent_rejection_fresh(recorded_at: float) -> bool:
+    try:
+        return (time.monotonic() - float(recorded_at)) < VERIFIER_CAPABILITY_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
 def structured_text_fallback_preferred(model: Any | None = None) -> bool:
     """Whether the process should skip native structured verifier calls.
 
     With no model, reports whether any cached model path is currently
     preferred (backward-compatible probe used by tests). With a model,
     reports only that model path so a different path still tries native
-    structured output first.
+    structured output first. A path with a fresh persistent-rejection
+    streak (recurrence 3) is preferred exactly like a marked path.
     """
     with _CAPABILITY_LOCK:
         if model is None:
@@ -388,17 +437,30 @@ def structured_text_fallback_preferred(model: Any | None = None) -> bool:
             for key in list(_TEXT_JSON_PREFERRED_AT):
                 if key not in fresh:
                     _TEXT_JSON_PREFERRED_AT.pop(key, None)
+            for key, (count, recorded_at) in list(_STRUCTURED_CONSECUTIVE_REJECTIONS.items()):
+                if _persistent_rejection_fresh(recorded_at):
+                    if int(count) >= VERIFIER_PERSISTENT_REJECTION_THRESHOLD and key not in fresh:
+                        fresh.append(key)
+                else:
+                    _STRUCTURED_CONSECUTIVE_REJECTIONS.pop(key, None)
             return bool(fresh)
         key = _verifier_capability_key(model)
         if key == "":
             return any(_capability_entry_fresh(stamp) for stamp in _TEXT_JSON_PREFERRED_AT.values())
         cached_at: float | None = _TEXT_JSON_PREFERRED_AT.get(key)
-        if cached_at is None:
-            return False
-        if not _capability_entry_fresh(cached_at):
-            _TEXT_JSON_PREFERRED_AT.pop(key, None)
-            return False
-        return True
+        if cached_at is not None:
+            if not _capability_entry_fresh(cached_at):
+                _TEXT_JSON_PREFERRED_AT.pop(key, None)
+            else:
+                return True
+        streak = _STRUCTURED_CONSECUTIVE_REJECTIONS.get(key)
+        if streak is not None:
+            count, recorded_at = streak
+            if not _persistent_rejection_fresh(recorded_at):
+                _STRUCTURED_CONSECUTIVE_REJECTIONS.pop(key, None)
+            elif int(count) >= VERIFIER_PERSISTENT_REJECTION_THRESHOLD:
+                return True
+        return False
 
 
 def mark_structured_unavailable(model: Any | None = None) -> None:
@@ -416,10 +478,61 @@ def mark_structured_unavailable(model: Any | None = None) -> None:
         _TEXT_JSON_PREFERRED_AT[key] = time.monotonic()
 
 
+def record_structured_capability_rejection(
+    model: Any | None = None, *, immediate: bool = False
+) -> None:
+    """Record one capability-suggestive structured rejection (recurrence 3).
+
+    Deterministic failures pass ``immediate=True`` and mark at once
+    (existing behavior). Generic provider errors pass ``immediate=False``:
+    the first isolated rejection only starts a streak, while
+    ``VERIFIER_PERSISTENT_REJECTION_THRESHOLD`` consecutive rejections
+    mark the path for the TTL. Caller-observed deadline expiries,
+    transient/timeout failures, content-validation failures and provider
+    429 must never call this (latency/content, not capability evidence).
+    Any structured success clears the streak via
+    :func:`record_structured_success`.
+    """
+    key = _verifier_capability_key(model)
+    if not key:
+        key = "default"
+    with _CAPABILITY_LOCK:
+        if immediate:
+            _TEXT_JSON_PREFERRED_AT[key] = time.monotonic()
+            _STRUCTURED_CONSECUTIVE_REJECTIONS[key] = (
+                VERIFIER_PERSISTENT_REJECTION_THRESHOLD,
+                time.monotonic(),
+            )
+            return
+        entry = _STRUCTURED_CONSECUTIVE_REJECTIONS.get(key)
+        if entry is not None:
+            count, recorded_at = entry
+            if _persistent_rejection_fresh(recorded_at):
+                count = int(count) + 1
+            else:
+                count = 1
+        else:
+            count = 1
+        now = time.monotonic()
+        _STRUCTURED_CONSECUTIVE_REJECTIONS[key] = (int(count), now)
+        if int(count) >= VERIFIER_PERSISTENT_REJECTION_THRESHOLD:
+            _TEXT_JSON_PREFERRED_AT[key] = now
+
+
+def record_structured_success(model: Any | None = None) -> None:
+    """Clear the consecutive-rejection streak after a structured success."""
+    key = _verifier_capability_key(model)
+    if not key:
+        key = "default"
+    with _CAPABILITY_LOCK:
+        _STRUCTURED_CONSECUTIVE_REJECTIONS.pop(key, None)
+
+
 def clear_verifier_capability_cache() -> None:
     """Reset the structured-capability cache (tests only)."""
     with _CAPABILITY_LOCK:
         _TEXT_JSON_PREFERRED_AT.clear()
+        _STRUCTURED_CONSECUTIVE_REJECTIONS.clear()
 
 
 def _model_on_fallback_path(model: Any | None) -> bool:
@@ -928,7 +1041,7 @@ async def _verify_single_unit(
                 "verifier structured channel unavailable; text fallback used",
                 extra={"category": type(exc).__name__},
             )
-            mark_structured_unavailable(model)
+            record_structured_capability_rejection(model, immediate=True)
             return await _text_decision()
         except _STRUCTURED_TRANSIENT_ERRORS as exc:
             # Recurrence 2 for kodmial/aa#244: a transient/timeout is
@@ -945,25 +1058,30 @@ async def _verify_single_unit(
             # startup/not-ready/session error from the OpenCode boundary)
             # retries once via the bounded text path instead of collapsing
             # the turn to verifier-unavailable without a text attempt.
-            # Recurrence 2 for kodmial/aa#244: a generic provider error
-            # is not capability evidence, so it falls back once without
-            # marking; only deterministic capability failures mark.
-            # Provider 429 is already re-raised above and never falls back.
+            # Recurrence 3 for kodmial/aa#244: one isolated generic error
+            # is still not capability evidence, but consecutive generic
+            # rejections are persistent provider evidence, so the streak
+            # is recorded and pins the path once it reaches the
+            # persistent-rejection threshold (provider 429 is already
+            # re-raised above and never records).
             logger.info(
                 "verifier structured provider error; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            record_structured_capability_rejection(model)
             return await _text_decision()
         if not isinstance(raw, dict):
             logger.info(
                 "verifier structured payload missing; text fallback used",
             )
-            mark_structured_unavailable(model)
+            record_structured_capability_rejection(model, immediate=True)
             return await _text_decision()
         try:
-            return coerce_single_verdict(
+            verdict = coerce_single_verdict(
                 raw, unit_id=unit.unit_id, short_to_full=short_to_full, full_ids=full_ids
             )
+            record_structured_success(model)
+            return verdict
         except VerifierValidationError as exc:
             # The provider returned a structured object that fails the
             # transport decision schema (for example loose enforcement on a
@@ -1261,6 +1379,7 @@ async def run_verifier(
 __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_CAPABILITY_TTL_S",
+    "VERIFIER_PERSISTENT_REJECTION_THRESHOLD",
     "VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S",
     "VERIFIER_TURN_BUDGET_S",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
@@ -1275,6 +1394,8 @@ __all__ = [
     "display_id_map_for_window",
     "mark_structured_unavailable",
     "parse_text_json_decision",
+    "record_structured_capability_rejection",
+    "record_structured_success",
     "resolve_cited_passage_ids",
     "run_verifier",
     "structured_text_fallback_preferred",
