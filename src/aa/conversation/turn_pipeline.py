@@ -147,8 +147,9 @@ TURN_REPAIR_TIME_BUDGET_S = 90.0
 # finished as hash-selected bookless filler with zero verified book
 # units (the #240 regression). Strategy change at the same
 # turn-orchestration boundary: the end-to-end budget is aligned with
-# the Gate E hard SLO (max < 30s, delivery margin kept) instead of the
-# 15s p95 target, so ordinary 14-27s turns complete as verified
+# the temporary Gate E hard SLO (max < 120s, delivery margin kept;
+# 105s < 120s) instead of the 60s p95 target, so ordinary slow turns
+# complete as verified
 # grounded answers and Gate E honestly measures their latency; only a
 # turn past the hard SLO still fails fast with explicit failure
 # telemetry (turn_budget_exceeded, retry-turn-budget outcome, zero
@@ -180,6 +181,7 @@ def _effective_turn_budget_s() -> float:
 
 def _effective_repair_budget_s() -> float:
     return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
+
 
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
