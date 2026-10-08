@@ -191,6 +191,62 @@ _GENERIC_META_MARKERS = (
     "ваша роль",
 )
 
+# Generic structural capability vocabulary (individual tokens only, never
+# an exact-question phrase): second-person references plus capability
+# words plus neutral filler scaffolding around a short capability probe.
+# Natural paraphrases split a capability request across non-contiguous
+# tokens, so token-level structure is required; contiguous marker
+# substrings alone under-recognize ordinary probes and misroute them to
+# the substantive book path.
+_SECOND_PERSON_TOKENS = frozenset(
+    {
+        "ты",
+        "вы",
+        "твой",
+        "твоя",
+        "твои",
+        "твоих",
+        "ваш",
+        "ваша",
+        "ваши",
+        "тебя",
+        "вас",
+        "тобой",
+    }
+)
+
+_CAPABILITY_TOKENS = frozenset(
+    {
+        "можешь",
+        "можете",
+        "умеешь",
+        "умеете",
+        "помочь",
+        "помогать",
+        "полезен",
+        "полезна",
+        "польза",
+        "возможности",
+        "роль",
+    }
+)
+
+_META_FILLER_TOKENS = frozenset(
+    {
+        "вообще",
+        "здесь",
+        "тут",
+        "просто",
+        "именно",
+        "пожалуйста",
+        "слушай",
+        "а",
+        "же",
+        "то",
+        "ли",
+    }
+)
+
 
 def is_meta_request(user_message: str) -> bool:
     """Whether a turn is a pure identity/capability probe.
@@ -205,7 +261,8 @@ def is_meta_request(user_message: str) -> bool:
     if not cleaned:
         return False
     lowered = cleaned.casefold()
-    if not any(marker in lowered for marker in _GENERIC_META_MARKERS):
+    has_marker = any(marker in lowered for marker in _GENERIC_META_MARKERS)
+    if not has_marker and not _has_structural_capability_shape(cleaned):
         return False
     # Any recovery-domain vocabulary makes the turn substantive, never
     # pure meta (for example a capability prefix plus an evening-craving
@@ -235,6 +292,9 @@ def is_meta_request(user_message: str) -> bool:
     # about capabilities) stay meta; any other substantive token in the
     # remainder proves a combined request. Tokens that only restate the
     # meta probe itself (overlapping marker inflections) are ignored.
+    # Neutral filler scaffolding around a short probe (general adverbs
+    # of place/manner and politeness particles) likewise stays meta:
+    # only a genuine topic remainder proves a combined request.
     interrogative_words: set[str] = set()
     for marker in _GENERIC_INTERROGATIVE_MARKERS:
         interrogative_words.update(_WORD_RE.findall(marker.casefold()))
@@ -245,9 +305,28 @@ def is_meta_request(user_message: str) -> bool:
     # "помочь"/"подсказать" inflections are request verbs, not proof of a
     # substantive topic on their own; require another topic token.
     remainder_tokens -= {"помочь", "подсказать", "подскажите", "помогите"}
+    remainder_tokens -= _CAPABILITY_TOKENS
+    remainder_tokens -= _META_FILLER_TOKENS
     if remainder_tokens:
         return False
     return True
+
+
+def _has_structural_capability_shape(cleaned: str) -> bool:
+    """Whether a short probe has generic capability-question structure.
+
+    Token-level only, never an exact-question phrase: a single short
+    interrogative segment addressing the assistant in the second person
+    with capability vocabulary. This recognizes ordinary paraphrases
+    whose capability words are split across non-contiguous tokens.
+    """
+    lowered = (cleaned or "").casefold()
+    if not lowered or "?" not in cleaned:
+        return False
+    words = set(_WORD_RE.findall(lowered))
+    if not (words & _SECOND_PERSON_TOKENS):
+        return False
+    return bool(words & _CAPABILITY_TOKENS)
 
 
 # Generic alcohol-recovery domain stems for topical relevance (never an
@@ -703,6 +782,7 @@ def assess_turn_adequacy(
     summary: str = "",
     recent: Sequence[str] | None = None,
     resolved_request: str = "",
+    prior_user_messages: Sequence[str] = (),
 ) -> AdequacyAssessment:
     """Judge the whole turn: task, context, candidate and relevant evidence.
 
@@ -716,6 +796,15 @@ def assess_turn_adequacy(
     book material fails even with token overlap. Pure greetings, honest
     self-identity and genuinely contentless turns keep a passing glue
     verdict without book evidence.
+
+    ``prior_user_messages`` carries the immediately preceding user turns
+    in the same conversation (oldest first, generic context only). A
+    terse contextual follow-up carries little topical content on its own;
+    the planner already resolves such follow-ups against history, so
+    relevance here also resolves against that history instead of failing
+    a continuous grounded answer for not echoing a generic follow-up.
+    The substantive/glue determination itself stays on the current turn
+    only, so context never turns a substantive request into glue.
     """
     _ = planner_reason
     cleaned_reply = (reply or "").strip()
@@ -828,6 +917,7 @@ def assess_turn_adequacy(
             pack_by_id[passage_id] = text
     request_tokens = _content_tokens(effective_request)
     request_prefixes = _token_prefixes(request_tokens)
+    raw_request_tokens = _content_tokens(user_message)
     # Step-switch fidelity: the live turn's explicit numbered step wins over
     # context. The resolved text unions history for elliptical follow-ups,
     # so extracting steps from it alone would yield {old, new} after a
@@ -839,6 +929,14 @@ def assess_turn_adequacy(
     else:
         request_steps = extract_step_numbers(effective_request)
     request_domain = _has_recovery_domain(effective_request) or _has_recovery_domain(user_message)
+    # Contextual follow-up resolution (generic, turn-independent): a terse
+    # follow-up carries little topical content on its own, so relevance
+    # also resolves against the immediately preceding user turns. The
+    # current-turn check stays primary; context only rescues continuity.
+    context_text = " ".join(
+        str(item).strip() for item in (prior_user_messages or []) if str(item).strip()
+    )
+    context_prefixes = _token_prefixes(_content_tokens(context_text)) if context_text else set()
     relevant_unit_found = False
     for unit in supported_units:
         cited = unit.get("evidence_passage_ids", [])
@@ -884,32 +982,60 @@ def assess_turn_adequacy(
             cited_steps |= extract_step_numbers(unit_text)
             if cited_steps and not (request_steps & cited_steps):
                 continue
-        # Topical relevance to the resolved intent: the evidence-backed
-        # unit must share substantive content with the resolved request.
-        # At least two distinct prefix overlaps prove semantic alignment;
-        # a single overlap needs domain alignment as well, unless an
-        # explicit numbered-step referent already aligns above (step
-        # mismatch fails there, so one shared prefix plus step agreement
-        # proves relevance); with no direct overlap only a shared recovery
-        # domain (short disclosures, slang, typos) still counts while an
-        # unrelated book fact fails. Without this, identifiers alone or a
-        # single generic prefix against the unioned resolved request would
-        # prove relevance.
+        # Topical relevance to the resolved intent, with same-conversation
+        # context rescue: the evidence-backed unit must share substantive
+        # content with the resolved request. At least two distinct prefix
+        # overlaps prove semantic alignment; a single overlap proves
+        # relevance once the numbered-step referent already aligns above
+        # or when a direct lexical tie exists. With no direct overlap only
+        # a shared recovery domain (short disclosures, slang, typos) still
+        # counts while an unrelated book fact fails. A terse contextual
+        # follow-up additionally resolves against the immediately
+        # preceding user turns instead of failing a continuous grounded
+        # answer for not echoing a generic follow-up. Stale-context guard:
+        # context rescues only a generic/terse current turn (at most two
+        # substantive tokens); an explicit new-topic pivot must match on
+        # its own merits, otherwise a prior craving turn would rescue a
+        # craving-only reply to a current finance question.
         overlap_count = len(request_prefixes & (unit_prefixes | evidence_prefixes))
+        _direct_overlap = bool(
+            request_prefixes and (request_prefixes & (unit_prefixes | evidence_prefixes))
+        )
+        # Stale-context guard uses the raw live turn (not the unioned
+        # resolved text) so elliptical follow-ups stay rescuable while
+        # explicit pivots do not inherit history.
+        _current_allows_context_rescue = len(raw_request_tokens) <= 2
+        if not _direct_overlap and context_prefixes and _current_allows_context_rescue:
+            # Contextual follow-up resolution (generic, turn-independent):
+            # a terse follow-up in an ongoing conversation is relevant
+            # when the evidence-backed unit shares content with the
+            # immediately preceding user turns. The current-turn check
+            # above stays primary; context only rescues continuity.
+            _direct_overlap = bool(context_prefixes & (unit_prefixes | evidence_prefixes))
+            if _direct_overlap:
+                overlap_count = max(overlap_count, 1)
         if overlap_count >= 2:
             pass
-        elif overlap_count == 1 and request_steps:
+        elif overlap_count == 1 and (request_steps or _direct_overlap):
             # Single content overlap proves topical relevance once the
-            # numbered-step referent already aligns above; a wrong step
-            # fails on step alignment even when generic vocabulary such
-            # as decisions overlaps. Paraphrases without an explicit step
-            # number also reach here when the request names a step.
+            # numbered-step referent already aligns above or when a direct
+            # lexical tie exists; a wrong step fails on step alignment
+            # even when generic vocabulary such as decisions overlaps.
+            # Paraphrases without an explicit step number also reach here
+            # when the request names a step.
             pass
         else:
+            # Same stale-context guard for the domain fallback: context
+            # domain supplements only a generic/terse current turn. An
+            # explicit current pivot must itself carry recovery-domain
+            # vocabulary to match recovery evidence.
+            _request_domain = bool(request_domain)
+            if not _request_domain and _current_allows_context_rescue and bool(context_text):
+                _request_domain = _has_recovery_domain(context_text)
             _evidence_domain = any(
                 _has_recovery_domain(passage_text) for passage_text in cited_texts
             ) or _has_recovery_domain(str(unit.get("text", "") or reply))
-            if not (request_domain and _evidence_domain):
+            if not (_request_domain and _evidence_domain):
                 continue
         # Actionable usefulness: the unit must carry declarative substance
         # beyond sympathy or a bare offer, tied to the cited evidence above.
