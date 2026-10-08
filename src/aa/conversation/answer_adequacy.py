@@ -259,15 +259,17 @@ def is_meta_request(user_message: str) -> bool:
 # short stems, never via memorized user sentences.
 _RECOVERY_DOMAIN_STEMS = (
     "тяг",
-    "вып",
     "выпи",
     "выпь",
     "буха",
     "бухл",
     "пить",
     "пью",
-    "пье",
-    "пил",
+    "пьет",
+    "пьешь",
+    "пьем",
+    "пьете",
+    "пьют",
     "пьян",
     "пья",
     "трезв",
@@ -279,13 +281,29 @@ _RECOVERY_DOMAIN_STEMS = (
     "похмел",
 )
 
+# Whole-word drinking past-tense forms: bare "пил" as a substring matches
+# "пилить"/"пилот", so these are matched as exact tokens only. "выпил" and
+# longer drinking forms are already covered by the "выпи"/"выпь" prefixes.
+_RECOVERY_EXACT_TOKENS = frozenset({"пил", "пила", "пило", "пили"})
+
 
 def _has_recovery_domain(text: str) -> bool:
     """Whether text contains generic alcohol-recovery domain vocabulary."""
-    lowered = (text or "").casefold()
+    lowered = (text or "").casefold().replace("ё", "е")
     if not lowered:
         return False
-    return any(stem in lowered for stem in _RECOVERY_DOMAIN_STEMS)
+    # Token-anchored matching only: bare-substring checks let "вып" match
+    # "выполнить"/"выпуск", "пье" match "пьеса", and mid-word "пив"/"алко"
+    # match unrelated words. Bare "вып"/"пье" are removed above in favor of
+    # drinking-specific prefixes/inflections; the rest match at token start.
+    tokens = _WORD_RE.findall(lowered)
+    for token in tokens:
+        if token in _RECOVERY_EXACT_TOKENS:
+            return True
+        for stem in _RECOVERY_DOMAIN_STEMS:
+            if token.startswith(stem):
+                return True
+    return False
 
 
 # Step-referent vocabulary for multi-turn topic fidelity (generic, never an
@@ -847,16 +865,18 @@ def assess_turn_adequacy(
         if unit_text.rstrip().endswith("?") and len(unit_text) < 60:
             continue
         # Numbered-step fidelity: when the resolved request names a step,
-        # the cited passages or the unit itself must name the same step.
-        # A verified passage from another step (for example Step Three
-        # decisions served for a Step One question) fails even when generic
-        # vocabulary overlaps on words such as step or decision.
+        # only an explicit step mismatch fails. A verified passage from
+        # another step (for example Step Three decisions served for a
+        # Step One question) fails even when generic vocabulary overlaps
+        # on words such as step or decision. Evidence that paraphrases
+        # the requested step without literally naming a step number
+        # must not fail here; topical relevance below still applies.
         if request_steps:
             cited_steps: set[int] = set()
             for passage_text in cited_texts:
                 cited_steps |= extract_step_numbers(passage_text)
             cited_steps |= extract_step_numbers(unit_text)
-            if not (request_steps & cited_steps):
+            if cited_steps and not (request_steps & cited_steps):
                 continue
         # Topical relevance to the resolved intent: the evidence-backed
         # unit must share substantive content with the resolved request.

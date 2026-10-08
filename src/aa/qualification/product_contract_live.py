@@ -2307,12 +2307,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         "text": text,
                     },
                 }
+                started_raw = time.perf_counter()
                 api.pending_updates.append(raw_turn)
                 deadline_turn = loop.time() + 150.0
                 while len(api.sent_texts) <= before and loop.time() < deadline_turn:
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
                     return None
+                latencies.append(time.perf_counter() - started_raw)
                 return api.sent_texts[-1]
 
             # Step continuity: the follow-up relies on the prior referent.
@@ -2322,13 +2324,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             _check("live-step-continuity-first-delivered", bool((step_reply_1 or "").strip()))
             if step_reply_1:
                 replies.append(step_reply_1)
-                latencies.append(0.0)
             step_reply_2 = await _send_raw_text(922101, step_followup, 931002)
             if step_reply_2 is None:
                 failed.append("live-step-continuity-second-timeout")
             else:
                 replies.append(step_reply_2)
-                latencies.append(0.0)
                 step_snapshot: dict[str, Any] = {}
                 try:
                     graph = app.graph_runtime
