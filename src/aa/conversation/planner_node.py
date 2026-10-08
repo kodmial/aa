@@ -87,22 +87,30 @@ PLANNER_TIME_BUDGET_S = 10.0
 
 # Per-attempt bound for the single native structured planner call (Gate
 # C+E live repair, kodmial/aa#217 recurrence 6; evidence above, tightened
-# for kodmial/aa#244 on exact main a0d377a run 37753553708:
-# C:live-book-grounding-substantive-drinking-2 plus E:latency-budget-
-# exceeded p50 18.9s / p95 24.3s with planner p50 4.6s / p95 10.0s
-# (pinned at the 10s wall), answer p50 6.6s / p95 10.0s (pinned at its
-# 10s wall), verifier p50 4.7s / p95 9.4s, message-text p50 4.5s / p95
-# 10.0s / max 30.0s over 73 text calls). The structured channel serves
-# fast when healthy (structured p50 ~0.5s) and tails badly when not;
-# bounding just this attempt lets a slow structured channel degrade one
-# second faster to the tailored text path within the same overall wall:
-# typical turns still pay one fast call, tail turns still serve
-# model-generated queries for this turn's request instead of timing out
-# to an empty plan (the #244 C mechanism: empty pack -> ungrounded
-# retry -> live-book-grounding failure) while cutting the sequential
-# sum for Gate E. Strict Pydantic validation is unchanged on both
-# paths; 429 propagates and never triggers the text path.
-PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 3.0
+# for kodmial/aa#244 on exact main a0d377a run 37753553708, tightened
+# again for kodmial/aa#248 on exact main e57dea5 run 37757356193:
+# C:live-book-grounding-substantive-drinking-10 plus
+# E:latency-budget-exceeded p50 20.0s / p95 27.0s / max 27.1s with
+# planner p50 5.3s / p95 8.6s / max 10.0s, retrieval p50 0.5s,
+# answer p50 6.6s / p95 10.0s (pinned at its 10s wall), verifier p50
+# 6.1s / p95 12.0s (at its 12s turn wall), message-text p50 5.4s / p95
+# 12.0s / max 18.5s over 69 text calls vs message-structured p50 0.5s /
+# p95 2.7s over only 5 calls, 4 turns with unavailable units (5 total)
+# over 33 units, answer_rounds=14, repair_turns=0. The #244 4s->3s cut
+# did not converge (p50 18.9s->20.0s, p95 24.3s->27.0s): the tail is
+# still one slow structured attempt plus one slow text call per stage.
+# The structured channel serves fast when healthy (structured p50
+# 0.47s) and tails badly when not; bounding just this attempt to 2s
+# lets a slow structured channel degrade another second faster to the
+# tailored text path within the same overall wall: typical turns still
+# pay one fast call, tail turns still serve model-generated queries
+# for this turn instead of timing out to an empty plan (the #248 C
+# mechanism on held-out drinking-10: empty pack -> ungrounded retry ->
+# live-book-grounding failure) while cutting the sequential
+# planner+answer+verifier sum for Gate E. Strict Pydantic validation
+# is unchanged on both paths; 429 propagates and never triggers the
+# text path.
+PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
 
 
 def _display_message_text(value: object) -> str:

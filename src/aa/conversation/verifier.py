@@ -322,7 +322,18 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # decision never permanently disables structured calls process-wide.
 # Turn-independent, never question-specific. Tests reset it via
 # clear_verifier_capability_cache().
-VERIFIER_CAPABILITY_TTL_S = 300.0
+#
+# Gate C+E live repair, kodmial/aa#248 on exact main e57dea5 run
+# 37757356193 (C:live-book-grounding-substantive-drinking-10 plus E
+# p50 20.0s / p95 27.0s with message-structured p50 0.47s over 5 calls
+# vs message-text p50 5.4s over 69 calls, all Muse Spark, no fallback):
+# the fast structured path exists but is almost never tried because one
+# slow structured attempt pins the whole 16-turn lane (about 320s) to
+# the slow text path under the 300s TTL. A 60s TTL still avoids the
+# per-turn re-burn within a slow burst while re-probing the fast path
+# mid-lane, cutting the sequential median for Gate E without changing
+# grounding strictness. Turn-independent, 429 never marks.
+VERIFIER_CAPABILITY_TTL_S = 60.0
 
 _TEXT_JSON_PREFERRED_AT: dict[str, float] = {}
 _CAPABILITY_LOCK = threading.Lock()
@@ -1017,21 +1028,25 @@ VERIFIER_TURN_BUDGET_S = 12.0
 # live repair, kodmial/aa#217 recurrence 7 on exact main 58f943c run
 # 37709271567: verifier p50 10.1s / p95 12.0s hugging the 12s turn
 # budget with zero unavailable units; tightened for kodmial/aa#244 on
-# exact main a0d377a run 37753553708: verifier p50 4.7s / p95 9.4s over
-# 38 per-unit calls with 1 unavailable unit, message-text p50 4.5s /
-# p95 10.0s). The turn budget from recurrence 6 caps the whole round
-# but a single hung structured attempt can burn most of it while
-# sibling units wait, and the caller-side expiry never reached the
-# capability cache, so every unit re-burned the wait. Only this single
-# attempt is bounded here; a slow structured channel degrades one second
-# faster to the tailored text path within the same unit while the
-# turn-level deadline below stays the backstop, cutting the sequential
-# sum for Gate E and converting verifier timeouts (unavailable units ->
-# ungrounded -> C failure) into validated text verdicts. Strict
-# validation of both paths is unchanged; 429 propagates and never
-# triggers the text path. Turn-independent, never an exact-question
-# special case.
-VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 3.0
+# exact main a0d377a run 37753553708, tightened again for
+# kodmial/aa#248 on exact main e57dea5 run 37757356193:
+# C:live-book-grounding-substantive-drinking-10 plus
+# E:latency-budget-exceeded p50 20.0s / p95 27.0s with verifier p50
+# 6.1s / p95 12.0s (at the 12s turn wall) over 31 per-unit calls with
+# 5 unavailable units over 4 turns (33 units total), message-text p50
+# 5.4s / p95 12.0s vs message-structured p50 0.5s / p95 2.7s. The
+# #244 4s->3s cut did not converge (verifier p50 4.7s->6.1s, p95
+# 9.4s->12.0s, unavailable 1->5): one hung structured attempt still
+# burns most of the turn while siblings wait. Only this single attempt
+# is bounded here to 2s; a slow structured channel degrades another
+# second faster to the tailored text path within the same unit while
+# the turn-level deadline below stays the backstop, cutting the
+# sequential sum for Gate E and converting verifier timeouts
+# (unavailable units -> ungrounded retry -> drinking-10 C failure)
+# into validated text verdicts. Strict validation of both paths is
+# unchanged; 429 propagates and never triggers the text path.
+# Turn-independent, never an exact-question special case.
+VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
 
 
 def _first_fatal_outcome(done: set[asyncio.Task[UnitVerdict]]) -> BaseException | None:
