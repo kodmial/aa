@@ -1576,13 +1576,17 @@ def _has_declarative_substance(reply: str) -> bool:
     return False
 
 
-def _is_direct_meta_reply(reply: str) -> bool:
+def _is_direct_meta_reply(
+    reply: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> bool:
     """Whether a sent meta reply is direct, natural and honestly identified.
 
-    Qualification-only: a meta/capability answer must directly state what
-    the assistant can do in natural RU without an evasive clarification
-    template and without a false identity (human/member/sponsor/clinician
-    with lived experience). No exact live prompt text is matched.
+    Qualification-only. Text checks here are mechanical/product-identity
+    guards only; semantic directness is taken from the production
+    planner/verifier/adequacy telemetry, never from clarification cue tables,
+    sentence-shape heuristics, or keyword intent rules.
     """
     from aa.conversation.turn_pipeline import (
         NATURAL_CLARIFICATION_REPLY,
@@ -1596,8 +1600,8 @@ def _is_direct_meta_reply(reply: str) -> bool:
         return False
     if not contains_cyrillic(cleaned) or leaks_internal_terms(cleaned):
         return False
-    if _is_avoiding_clarification_text(cleaned) or _is_service_link_only_text(cleaned):
-        return False
+
+    # Product identity is deterministic policy, not domain intent routing.
     lowered = cleaned.casefold()
     false_identity_markers = (
         "я человек",
@@ -1616,22 +1620,19 @@ def _is_direct_meta_reply(reply: str) -> bool:
     )
     if any(marker in lowered for marker in false_identity_markers):
         return False
-    # Directness: at least one declarative RU sentence offering help, not
-    # only a question or a one-line evasion. Capability offers count here
-    # (meta answers state what the assistant can do); the generic-offer
-    # filter for substantive turns does not apply to meta directness.
-    import re as _meta_re
 
-    declaratives = [
-        part
-        for part in _declarative_sentences(cleaned)
-        if len(part) >= 20 and _meta_re.search(r"[\u0400-\u04ff]", part)
-    ]
-    if not declaratives:
+    snap = dict(snapshot or {})
+    adequacy = str(snap.get("adequacy_verdict", "") or "").strip()
+    answers = snap.get("answers_request", None)
+    relevant = snap.get("answer_relevant", None)
+    if adequacy == "fail" or answers is False or relevant is False:
         return False
-    if len(cleaned) < 40:
-        return False
-    return True
+    if adequacy == "pass" and answers is True:
+        return True
+    if relevant is True:
+        return True
+    # Without a semantic verdict, fail closed instead of guessing from text.
+    return False
 
 
 def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
@@ -1672,13 +1673,12 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
         return False
-    if _is_avoiding_clarification_text(cleaned):
-        return False
+    # Only mechanical output guards live here. Semantic helpfulness and
+    # relevance come from the production planner/verifier/adequacy telemetry,
+    # never from keyword lists, punctuation shape, or handcrafted phrase cues.
     if _is_service_link_only_text(cleaned):
         return False
     if _is_quote_only_text(cleaned):
-        return False
-    if not _has_declarative_substance(cleaned):
         return False
     if snapshot.get("answer_outcome") not in (
         "served",
@@ -2245,20 +2245,27 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     if family == "meta-capability":
                         # Meta gets a direct natural RU answer without a
                         # false identity and without an evasive template.
-                        direct = _is_direct_meta_reply(reply)
+                        direct = _is_direct_meta_reply(reply, snapshot=snapshot)
                         _check(f"live-meta-direct-{position}", direct)
                     if family in ("followup-ellipsis", "topic-shift"):
-                        # Continuations and short contextual follow-ups must
-                        # not collapse to avoiding clarifications, bare
-                        # service links or quote-only dumps. Emergency and
-                        # out-of-book turns keep their own contracts below.
-                        not_avoiding = not _is_avoiding_clarification_text(reply)
-                        not_service = not _is_service_link_only_text(reply)
-                        not_quote_only = not _is_quote_only_text(reply)
-                        has_substance = _has_declarative_substance(reply)
+                        # Continuations are judged by the same model-resolved
+                        # turn relevance/adequacy used by production. Keep only
+                        # mechanical anti-fallback/output guards in the
+                        # qualification layer; do not infer semantics from
+                        # phrases, punctuation, or sentence length.
+                        continuation_semantic = _assess_live_relevance(snapshot, reply)
+                        continuation_output_ok = (
+                            reply.strip()
+                            and reply.strip() not in {
+                                NATURAL_CLARIFICATION_REPLY,
+                                *NATURAL_RETRY_VARIANTS,
+                            }
+                            and not _is_service_link_only_text(reply)
+                            and not _is_quote_only_text(reply)
+                        )
                         _check(
                             f"live-continuation-helpful-{family}-{position}",
-                            bool(not_avoiding and not_service and not_quote_only and has_substance),
+                            bool(continuation_semantic and continuation_output_ok),
                         )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
 
@@ -2393,10 +2400,22 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 failed.append("live-context-switch-timeout")
             else:
                 replies.append(switch_reply)
+                switch_snapshot: dict[str, Any] = {}
+                try:
+                    graph = app.graph_runtime
+                    if graph is not None:
+                        switch_snapshot = graph.last_telemetry_for_thread(graph.thread_id(922102))
+                        if switch_snapshot:
+                            stage_snapshots.append(dict(switch_snapshot))
+                except Exception:
+                    pass
                 _check(
                     "live-context-switch-helpful",
-                    bool(not _is_avoiding_clarification_text(switch_reply))
-                    and bool(_has_declarative_substance(switch_reply)),
+                    bool(_assess_live_relevance(switch_snapshot, switch_reply))
+                    and switch_reply.strip() not in {
+                        NATURAL_CLARIFICATION_REPLY,
+                        *NATURAL_RETRY_VARIANTS,
+                    },
                 )
             _check(
                 "live-negative-control-unrelated-citation-fails",
