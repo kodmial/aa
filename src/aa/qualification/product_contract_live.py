@@ -1698,17 +1698,34 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if planner_count <= 0 or passages <= 0 or verified <= 0:
         return False
-    # Every substantive claim must be verifier-supported: a served turn
-    # carries no unsupported book material. Narrowed turns serve only the
-    # supported subset, so they pass here only with at least one supported
-    # book unit and no unavailable units (checked above). Direct pipeline
-    # callers without graph enrichment omit response_units; accept them
-    # when verified book units are present (production still records
-    # response_units via GraphTurnRuntime).
+    # Every substantive claim must be verifier-supported, while natural
+    # conversational glue (brief empathy or acknowledgement alongside the
+    # book-supported guidance) needs no book passage: the verifier scopes
+    # such units as conversation_glue with supported=true, so a helpful
+    # mixed reply has verified_book_units < response_units. Requiring
+    # strict equality fails every natural multi-sentence answer while
+    # relevance still passes (kodmial/aa#257: 0/8 grounded with verifier
+    # passed 12/16 and all relevance checks passing). A served turn
+    # carries no unsupported material, so it must hold a passing verifier
+    # outcome. Narrowed turns serve only the supported subset, so they
+    # pass with at least one supported book unit and no unavailable units
+    # (checked above). Direct pipeline callers without graph enrichment
+    # omit response_units; accept them when verified book units are
+    # present (production still records response_units via
+    # GraphTurnRuntime).
     if verified <= 0:
         return False
-    if response_units > 0 and verified != response_units:
+    if response_units > 0 and verified > response_units:
         return False
+    _answer_outcome = str(snapshot.get("answer_outcome", "") or "").strip()
+    _verifier_outcome = str(snapshot.get("verifier_outcome", "") or "").strip()
+    if _answer_outcome == "served" and _verifier_outcome not in ("", "unknown"):
+        if _verifier_outcome not in (
+            "passed",
+            "passed-after-repair",
+            "passed-after-adequacy-repair",
+        ):
+            return False
     # Whole-turn adequacy (kodmial/aa#251): when the production adequacy
     # gate ran, its verdict is authoritative. Validated identifiers alone
     # never prove topical relevance, so an explicit adequacy failure, a
