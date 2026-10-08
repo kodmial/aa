@@ -328,7 +328,7 @@ async def test_live_evidence_lane_is_incomplete_offline(monkeypatch: Any) -> Non
     assert result.lane == "live-telegram-evidence"
     assert result.status == "INCOMPLETE"
     assert result.incomplete
-    assert result.metrics["latency_budget_s"] == 30.0
+    assert result.metrics["latency_budget_s"] == 120.0
     assert "latency_p50_s" in result.metrics
     assert "latency_p95_s" in result.metrics
 
