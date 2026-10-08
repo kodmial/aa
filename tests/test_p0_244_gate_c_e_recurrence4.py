@@ -1,4 +1,4 @@
-"""P0 kodmial/aa#244 recurrence 4: support-vocabulary relevance bridge.
+"""P0 kodmial/aa#244 recurrence 4: support-vocabulary relevance.
 
 Proven product failures on exact main
 5b3fd771ef2586ee2be6140f1040b4bafe2c3b52 (run 37819349221):
@@ -22,24 +22,20 @@ the verifier tail doubling. The waste is no longer attempt duration
 sequence burned after an already-slow initial chain. Prior strategies
 (safety predicate scope in #257, anchored repair focus plus repair
 budget in #269, capability-cache streak in recurrence 3) never
-touched this lexical gap, so repeating them cannot converge.
+touched this relevance gap, so repeating them cannot converge.
 
 Dominant persistent cause at the adequacy/relevance boundary: good
 abstinence-direction guidance uses support vocabulary (sponsor,
 meeting, fellowship, prayer, community, recovery) without repeating
-craving words, so it shares no prefix overlap and no recovery-domain
-token with the request. Both the adequacy domain fallback and the
-live relevance domain check therefore score it exactly like an
-unrelated finance fact: the turn fails C (reported first as grounding
-when both fail) and the adequacy-regeneration answer+verifier round
-fires, still fails on the same lexical gap, and breaches the E p95
-tail. Strategy change here (not another budget/TTL/capability
-retune): a generic support-domain bridge lets an evidence-backed
-support unit count as relevant to a recovery-domain request. Passing
-on the initial draft also skips the regen sequence, cutting the tail
-for Gate E with the same mechanism. Generic stems only, never an
-exact-question list; finance/all-glue/wrong-step negatives still
-fail. Turn-independent, Product Contract #110 unchanged, no
+craving words. Under the model-driven architecture (kodmial/aa#268)
+relevance comes from the unified structured verifier verdicts
+(answer_relevant / addresses_intent), never from domain-stem tables
+or token-prefix overlap: an evidence-backed support unit whose
+verifier marks it as addressing the resolved intent counts as
+relevant, while an unrelated finance fact whose verifier marks it as
+not addressing the intent still fails. Passing on the initial draft
+also skips the regen sequence, cutting the tail for Gate E with the
+same mechanism. Turn-independent, Product Contract #110 unchanged, no
 SLO/threshold weakening.
 """
 
@@ -95,40 +91,55 @@ def test_budgets_thresholds_and_slo_unchanged() -> None:
 
 
 def test_support_vocabulary_counts_as_relevant_to_recovery_request() -> None:
-    """A support-step reply with no drinking words is relevant (not finance)."""
-    from aa.qualification.product_contract_live import _assess_prompt_reply_relevance
+    """A support-step reply is relevant when the verifier says it addresses intent."""
+    from aa.qualification.product_contract_live import assess_reply_relevance_with_rubric
 
     prompt = "Вечером тяжело пережить тягу, как обходиться без спиртного?"
     support = (
         "Позвоните спонсору и сходите на собрание, поддержка рядом помогает пережить этот вечер."
     )
-    assert _assess_prompt_reply_relevance(prompt, support) is True
+    passing_telemetry = {
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "answer_relevant": True,
+    }
+    assert assess_reply_relevance_with_rubric(prompt, support, telemetry=passing_telemetry) is True
 
 
 def test_negative_controls_still_fail() -> None:
-    """Finance, wrong-step and all-glue negatives are preserved."""
-    from aa.qualification.product_contract_live import _assess_prompt_reply_relevance
+    """Finance, wrong-step and mismatched negatives are preserved via verifier verdicts."""
+    from aa.qualification.product_contract_live import assess_reply_relevance_with_rubric
 
+    failing_telemetry = {
+        "adequacy_verdict": "fail",
+        "answers_request": False,
+        "technically_grounded": True,
+        "answer_relevant": False,
+    }
     assert (
-        _assess_prompt_reply_relevance(
+        assess_reply_relevance_with_rubric(
             "Вечером тяжело пережить тягу",
             "Ведите финансовый бюджет спокойно.",
+            telemetry=dict(failing_telemetry),
         )
         is False
     )
     assert (
-        _assess_prompt_reply_relevance(
+        assess_reply_relevance_with_rubric(
             "Расскажи про Первый шаг",
             "Третий шаг говорит о решениях и воле.",
+            telemetry=dict(failing_telemetry),
         )
         is False
     )
-    # A support reply to a finance request stays irrelevant (bridge needs
-    # a recovery-domain request, so stale context cannot rescue a pivot).
+    # A support reply to a finance request stays irrelevant when the
+    # verifier marks it as not addressing the resolved intent.
     assert (
-        _assess_prompt_reply_relevance(
+        assess_reply_relevance_with_rubric(
             "Стоит ли мне сейчас покупать акции?",
             "Позвоните спонсору и сходите на собрание.",
+            telemetry=dict(failing_telemetry),
         )
         is False
     )
@@ -157,6 +168,7 @@ def test_adequacy_passes_evidence_backed_support_unit() -> None:
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
                 "text": "Позвоните спонсору и приходите на собрание.",
+                "addresses_intent": True,
             },
             {
                 "unit_id": "u2",
@@ -164,9 +176,11 @@ def test_adequacy_passes_evidence_backed_support_unit() -> None:
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
                 "text": "Поддержка сообщества помогает оставаться трезвым сегодня.",
+                "addresses_intent": True,
             },
         ],
         "all_required_supported": True,
+        "answer_relevant": True,
     }
     assessment = assess_turn_adequacy(
         user_message=prompt,
@@ -177,6 +191,8 @@ def test_adequacy_passes_evidence_backed_support_unit() -> None:
         verifier_outcome="passed",
         unavailable_units=0,
         turn_budget_exceeded=False,
+        planner_mode="retrieval",
+        resolved_intent=prompt,
         summary="",
         recent=[],
         resolved_request=prompt,
@@ -201,9 +217,11 @@ def test_adequacy_still_fails_unrelated_citation() -> None:
                 "supported": True,
                 "evidence_passage_ids": ["chapter-9#exp0000"],
                 "text": "Ведите финансовый бюджет спокойно.",
+                "addresses_intent": False,
             }
         ],
         "all_required_supported": True,
+        "answer_relevant": False,
     }
     assessment = assess_turn_adequacy(
         user_message=prompt,
@@ -214,6 +232,8 @@ def test_adequacy_still_fails_unrelated_citation() -> None:
         verifier_outcome="passed",
         unavailable_units=0,
         turn_budget_exceeded=False,
+        planner_mode="retrieval",
+        resolved_intent=prompt,
         summary="",
         recent=[],
         resolved_request=prompt,

@@ -1013,7 +1013,11 @@ async def test_graph_retrieval_node_wires_evidence_pack(tmp_path: pathlib.Path) 
 
     index = _build_index(tmp_path)
     try:
-        plan = {"queries": _twelve_queries("срыв и тяга")}
+        plan = {
+            "mode": "retrieval",
+            "resolved_intent": "standalone intent for test turn",
+            "queries": _twelve_queries("срыв и тяга"),
+        }
 
         async def _plan(_messages: Any) -> Any:
             return plan
@@ -1044,7 +1048,7 @@ async def test_graph_without_index_keeps_stub(tmp_path: pathlib.Path) -> None:
     from aa.conversation.graph import build_turn_graph, turn_input
 
     async def _plan(_messages: Any) -> Any:
-        return {"queries": []}
+        return {"mode": "conversational", "resolved_intent": "", "queries": []}
 
     graph = build_turn_graph(planner_model=RunnableLambda(_plan))
     result = await graph.ainvoke(turn_input("привет"))

@@ -137,7 +137,13 @@ def _decision_json() -> str:
 def _twelve_query_json() -> str:
     import json
 
-    return json.dumps({"queries": [f"tailored turn query variant {i}" for i in range(12)]})
+    return json.dumps(
+        {
+            "mode": "retrieval",
+            "resolved_intent": "standalone intent for test turn",
+            "queries": [f"tailored turn query variant {i}" for i in range(12)],
+        }
+    )
 
 
 def test_budgets_thresholds_and_slo_unchanged() -> None:
@@ -477,7 +483,11 @@ async def test_planner_success_resets_omitted_streak() -> None:
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
             if self.structured_calls == 2:
-                return {"queries": [f"tailored turn query variant {i}" for i in range(12)]}
+                return {
+                    "mode": "retrieval",
+                    "resolved_intent": "standalone intent for test turn",
+                    "queries": [f"tailored turn query variant {i}" for i in range(12)],
+                }
             raise OpenCodeNotReadyError("opencode runtime has not been started")
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:

@@ -160,7 +160,11 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.calls += 1
-            return {"queries": [f"запрос про поддержку {idx}" for idx in range(12)]}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": [f"запрос про поддержку {idx}" for idx in range(12)],
+            }
 
     verifier = _VerifierModel(
         [

@@ -281,7 +281,15 @@ async def test_repair_budget_exceeded_skips_repair_and_narrows(
             }
         ]
     )
-    planner = _PlannerModel([{"queries": _twelve_queries("вечер")}])
+    planner = _PlannerModel(
+        [
+            {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("вечер"),
+            }
+        ]
+    )
 
     from aa.retrieval import evidence as evidence_mod
 
@@ -345,7 +353,15 @@ async def test_fast_turn_still_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
             },
         ]
     )
-    planner = _PlannerModel([{"queries": _twelve_queries("вечер")}])
+    planner = _PlannerModel(
+        [
+            {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("вечер"),
+            }
+        ]
+    )
 
     from aa.retrieval import evidence as evidence_mod
     from aa.retrieval.evidence import EvidencePack, EvidencePassageData

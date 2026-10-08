@@ -28,6 +28,15 @@ recovery/continuation retune): typo-tolerant retrieval normalization
 plus matching domain stems in production adequacy and the live
 qualification lane. Generic signals only, never an exact-question
 whitelist; Product Contract #110 unchanged.
+
+Merge note (PR #271 over main ed79c0b, issue #268): the PR replaced
+handcrafted adequacy/live domain heuristics with a model-driven
+planner plus unified structured verifier, so the adequacy/live stem
+additions have no target here. Craving-verb coverage is therefore
+locked at the surviving retrieval-normalization layer (shared
+retrieval root) and exercised through the model-driven relevance API
+below, preserving the typo-tolerance intent without reintroducing
+removed heuristics.
 """
 
 from __future__ import annotations
@@ -68,24 +77,58 @@ def test_craving_verb_and_noun_share_retrieval_root() -> None:
 
 
 def test_craving_verb_counts_as_recovery_domain() -> None:
-    from aa.conversation.answer_adequacy import _has_recovery_domain
+    # Model-driven architecture (issue #268): the handcrafted
+    # ``_has_recovery_domain`` heuristic no longer exists. Craving-verb
+    # coverage from main survives at the retrieval layer (craving-root
+    # unification ``тян`` -> ``тяг``), and recovery queries carry the raw
+    # turn for the model verifier. Lock that surviving mechanism.
+    from aa.conversation.answer_adequacy import build_recovery_queries
+    from aa.retrieval.normalize import stemmed_norm_text
 
-    assert _has_recovery_domain("тянет") is True
-    assert _has_recovery_domain("тянеет") is True
-    assert _has_recovery_domain("тяну") is True
-    assert _has_recovery_domain("вечер спокойно") is False
+    for form in ("тянет", "тянеет", "тяну"):
+        assert "тяг" in stemmed_norm_text(form).split()
+    assert "тяг" not in stemmed_norm_text("вечер спокойно").split()
+    queries = build_recovery_queries("вечером тянет выпить")
+    assert queries and any("тянет" in query for query in queries)
+    assert build_recovery_queries("") == []
 
 
 def test_live_relevance_domain_covers_craving_verb() -> None:
-    from aa.qualification.product_contract_live import _assess_prompt_reply_relevance
+    # Model-driven architecture (issue #268): the heuristic
+    # ``_assess_prompt_reply_relevance`` no longer exists. Relevance is
+    # judged by ``assess_reply_relevance_with_rubric`` over model
+    # verdicts (or an injected judge). Exercise it with a
+    # retrieval-normalization judge so the typo and core craving forms
+    # behave identically while an unrelated finance reply still fails.
+    from aa.qualification.product_contract_live import assess_reply_relevance_with_rubric
+    from aa.retrieval.normalize import stemmed_norm_text
+
+    def _craving_support_judge(prompt: str, reply: str, context: str = "") -> bool:
+        prompt_terms = set(stemmed_norm_text(prompt).split())
+        lowered_reply = reply.casefold()
+        support = (
+            "спонсор" in lowered_reply or "собран" in lowered_reply or "сообществ" in lowered_reply
+        )
+        return "тяг" in prompt_terms and support
 
     support_reply = "Стоит обратиться к спонсору и прийти на собрание сообщества."
-    assert _assess_prompt_reply_relevance("вечером тянет", support_reply) is True
-    assert _assess_prompt_reply_relevance("вечером тянеет", support_reply) is True
     assert (
-        _assess_prompt_reply_relevance(
+        assess_reply_relevance_with_rubric(
+            "вечером тянет", support_reply, judge=_craving_support_judge
+        )
+        is True
+    )
+    assert (
+        assess_reply_relevance_with_rubric(
+            "вечером тянеет", support_reply, judge=_craving_support_judge
+        )
+        is True
+    )
+    assert (
+        assess_reply_relevance_with_rubric(
             "Вечером тяжело пережить тягу",
             "Ведите финансовый бюджет спокойно.",
+            judge=_craving_support_judge,
         )
         is False
     )

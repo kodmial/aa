@@ -249,13 +249,15 @@ async def test_safe_verified_draft_still_serves() -> None:
 
 
 def test_recovery_queries_are_bounded_and_valid() -> None:
+    from aa.conversation.answer_adequacy import build_generic_fallback_queries
     from aa.conversation.turn_pipeline import OUTBOUND_RECOVERY_QUERIES
-    from aa.retrieval.evidence import validate_planner_queries
+    from aa.retrieval.evidence import validate_recovery_queries
 
-    assert 10 <= len(OUTBOUND_RECOVERY_QUERIES) <= 16
-    assert validate_planner_queries(list(OUTBOUND_RECOVERY_QUERIES)) == list(
-        OUTBOUND_RECOVERY_QUERIES
-    )
+    # Canned recovery table retired by design; safety uses generic fallback.
+    assert OUTBOUND_RECOVERY_QUERIES == ()
+    fallback = build_generic_fallback_queries("вечером тяжело без выпивки, как обходиться?")
+    assert 1 <= len(fallback) <= 16
+    assert validate_recovery_queries(list(fallback)) == list(fallback)
     assert OUTBOUND_SAFETY_MAX_REPAIRS == 2
 
 

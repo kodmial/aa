@@ -77,22 +77,43 @@ class _TwoDraftAnswer:
 
 
 class _MarkerVerifier:
-    """Support every unit except the explicit off-topic filler."""
+    """Model-driven verdicts for the narrowing scenario.
+
+    The initial draft is pure conversation glue (no book claim), so the
+    verifier passes it while whole-turn adequacy fails for the
+    substantive request and triggers the adequacy regen. The regen mixes
+    one relevant supported book unit with explicit off-topic filler, so
+    only the supported subset is delivered as narrowed-adequacy-regen.
+    Per-unit routing uses the judged <response_unit> only.
+    """
 
     async def ainvoke_structured(
         self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
     ) -> dict[str, object]:
+        import re as _re
+
         _ = (system, schema, retry_count)
-        if "Купите акции" in prompt:
+        match = _re.search(r"<response_unit>(.*?)</response_unit>", prompt, _re.S)
+        unit = match.group(1).strip() if match else prompt
+        if "Купите акции" in unit:
             return {
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": False,
+            }
+        if _INITIAL_DRAFT in unit:
+            return {
+                "requires_book_evidence": False,
+                "supported": True,
+                "evidence_passage_ids": [],
+                "addresses_intent": False,
             }
         return {
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["chapter-3#exp0000"],
+            "addresses_intent": True,
         }
 
 
@@ -143,8 +164,8 @@ async def test_pipeline_serves_narrowed_subset_with_zero_repair_rounds() -> None
 async def test_grounding_accepts_pipeline_narrowed_delivery() -> None:
     from aa.conversation.turn_pipeline import run_v2_answer_turn
     from aa.qualification.product_contract_live import (
-        _assess_prompt_reply_relevance,
         _is_grounded_substantive_reply,
+        assess_reply_relevance_with_rubric,
     )
 
     outcome = await run_v2_answer_turn(
@@ -172,7 +193,7 @@ async def test_grounding_accepts_pipeline_narrowed_delivery() -> None:
         qualified=bool(telemetry.get("qualified", False)),
     )
     reply = str(outcome["text"])
-    assert _assess_prompt_reply_relevance(_REQUEST, reply) is True
+    assert assess_reply_relevance_with_rubric(_REQUEST, reply, telemetry=snapshot) is True
     assert _is_grounded_substantive_reply(snapshot, reply) is True
 
 

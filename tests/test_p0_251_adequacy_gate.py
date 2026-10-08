@@ -78,13 +78,22 @@ def test_planner_reason_never_conflates_error_with_glue() -> None:
 
 
 def test_mixed_greeting_plus_request_is_not_proven_glue() -> None:
-    from aa.conversation.answer_adequacy import is_proven_glue_message
+    # Model-driven turn understanding (#268): schema-only planner mode
+    # decides glue, and the planner-resolved intent carries the request.
+    from aa.conversation.answer_adequacy import effective_request, is_conversational_plan
 
-    assert is_proven_glue_message("Привет") is True
-    assert is_proven_glue_message("Здравствуйте!") is True
-    mixed = "Привет! Рад написать. Подскажи, как обходиться с тягой вечером?"
-    assert is_proven_glue_message(mixed) is False
-    assert is_proven_glue_message("А что мне делать-то с этим?") is False
+    assert is_conversational_plan(mode="conversational", query_count=0) is True
+    assert is_conversational_plan(mode="retrieval", query_count=12) is False
+    assert is_conversational_plan(mode="conversational", query_count=12) is False
+    assert is_conversational_plan(mode="retrieval", query_count=0) is False
+    resolved = "how to handle evening craving"
+    assert (
+        effective_request(resolved_intent=resolved, user_message="Привет! Что делать?") == resolved
+    )
+    assert (
+        effective_request(resolved_intent="", user_message="А что мне делать-то с этим?")
+        == "А что мне делать-то с этим?"
+    )
 
 
 def test_recovery_queries_use_actual_turn_not_canned_generic() -> None:
@@ -138,16 +147,20 @@ def test_irrelevant_citation_fails_adequacy_despite_verified_unit() -> None:
         grounding_result={
             "verified": True,
             "all_required_supported": True,
+            "answer_relevant": False,
             "units": [
                 {
                     "unit_id": "u1",
                     "scope": "book",
                     "supported": True,
                     "evidence_passage_ids": ["chapter-9#exp0001"],
+                    "addresses_intent": False,
                 }
             ],
         },
         planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent="Вечером тяжело пережить тягу, как обходиться?",
     )
     assert verdict.verdict == "fail"
     assert verdict.failure_category == "irrelevant-citation"
@@ -166,16 +179,20 @@ def test_relevant_grounded_answer_passes_adequacy() -> None:
         grounding_result={
             "verified": True,
             "all_required_supported": True,
+            "answer_relevant": True,
             "units": [
                 {
                     "unit_id": "u1",
                     "scope": "book",
                     "supported": True,
                     "evidence_passage_ids": ["chapter-3#exp0000"],
+                    "addresses_intent": True,
                 }
             ],
         },
         planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent="Вечером тяжело пережить тягу, как обходиться?",
     )
     assert verdict.verdict == "pass"
     assert verdict.answers_request is True
@@ -201,6 +218,8 @@ def test_pure_greeting_keeps_glue_without_book() -> None:
             ],
         },
         planner_reason="legitimate-glue",
+        planner_mode="conversational",
+        resolved_intent="",
     )
     assert verdict.verdict == "pass"
 
@@ -225,6 +244,8 @@ def test_meta_identity_keeps_glue_without_book() -> None:
             ],
         },
         planner_reason="legitimate-glue",
+        planner_mode="conversational",
+        resolved_intent="",
     )
     assert verdict.verdict == "pass"
 
@@ -305,17 +326,25 @@ async def test_all_glue_draft_with_pack_regenerates_or_fails_explicitly() -> Non
         async def ainvoke_structured(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
-            _ = (prompt, system, schema, retry_count)
-            if "Рад, что ты написал" in prompt:
+            _ = (system, schema, retry_count)
+            # Per-unit routing on the judged unit only: the passage text
+            # itself lives in every prompt, so match <response_unit>.
+            import re as _re
+
+            match = _re.search(r"<response_unit>(.*?)</response_unit>", prompt, _re.S)
+            unit = match.group(1).strip() if match else prompt
+            if "Поддержка рядом" in unit:
                 return {
-                    "requires_book_evidence": False,
+                    "requires_book_evidence": True,
                     "supported": True,
-                    "evidence_passage_ids": [],
+                    "evidence_passage_ids": ["p1"],
+                    "addresses_intent": True,
                 }
             return {
-                "requires_book_evidence": True,
+                "requires_book_evidence": False,
                 "supported": True,
-                "evidence_passage_ids": ["p1"],
+                "evidence_passage_ids": [],
+                "addresses_intent": False,
             }
 
     outcome = await run_v2_answer_turn(
@@ -341,14 +370,23 @@ def test_gate_c_negative_controls_fail_while_grounded_passes() -> None:
         NATURAL_RETRY_REPLY,
     )
     from aa.qualification.product_contract_live import (
-        _assess_prompt_reply_relevance,
         _is_grounded_substantive_reply,
+        assess_reply_relevance_with_rubric,
     )
 
     prompt = "Вечером тяжело пережить тягу, как обходиться?"
     grounded_reply = "Поддержка рядом помогает пережить тягу сегодня."
     assert _is_grounded_substantive_reply(_grounded_snapshot(), grounded_reply) is True
-    assert _assess_prompt_reply_relevance(prompt, grounded_reply) is True
+    passing_telemetry = {
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "answer_relevant": True,
+    }
+    assert (
+        assess_reply_relevance_with_rubric(prompt, grounded_reply, telemetry=passing_telemetry)
+        is True
+    )
 
     # Greeting plus a generic non-answer is not helpful even with counts:
     # production adequacy fails it, so Gate C fails it despite identifiers.
@@ -361,13 +399,31 @@ def test_gate_c_negative_controls_fail_while_grounded_passes() -> None:
         qualified=False,
     )
     assert _is_grounded_substantive_reply(generic_snapshot, generic) is False
-    assert _assess_prompt_reply_relevance(prompt, generic) is False
+    failing_telemetry = {
+        "adequacy_verdict": "fail",
+        "answers_request": False,
+        "technically_grounded": False,
+        "answer_relevant": False,
+    }
+    assert assess_reply_relevance_with_rubric(prompt, generic, telemetry=failing_telemetry) is False
 
     # Out-of-context supported book quote is irrelevant.
-    assert _assess_prompt_reply_relevance(prompt, "Ведите финансовый бюджет спокойно.") is False
+    assert (
+        assess_reply_relevance_with_rubric(
+            prompt,
+            "Ведите финансовый бюджет спокойно.",
+            telemetry=dict(failing_telemetry),
+        )
+        is False
+    )
 
     # Citation present but no useful step fails relevance.
-    assert _assess_prompt_reply_relevance(prompt, "См. источник PC-S-1.") is False
+    assert (
+        assess_reply_relevance_with_rubric(
+            prompt, "См. источник PC-S-1.", telemetry=dict(failing_telemetry)
+        )
+        is False
+    )
 
     # Planner timeout with empty queries never counts as grounded help.
     timeout_snapshot = _grounded_snapshot(
@@ -409,6 +465,8 @@ def test_gate_c_negative_controls_fail_while_grounded_passes() -> None:
             ],
         },
         planner_reason="legitimate-glue",
+        planner_mode="conversational",
+        resolved_intent="",
     )
     assert glue_ok.verdict == "pass"
 
@@ -432,7 +490,13 @@ def test_telemetry_is_causal_and_privacy_safe() -> None:
         result = await node(turn_input("Привет! Как обходиться с тягой вечером?"))
         assert result["retry_state"]["planner_outcome"] == "timeout"
         assert result["retry_state"]["planner_reason"] == "timeout"
-        assert result["search_queries"] == []
+        # Model-driven fallback: a planner error never counts as glue, so
+        # the node emits a bounded generic retrieval fallback from the
+        # actual turn context instead of an empty query list.
+        queries = result["search_queries"]
+        assert queries
+        assert any("Привет! Как обходиться с тягой вечером?" in item for item in queries)
+        assert result["retry_state"]["planner_mode"] == "retrieval"
 
         runtime = GraphTurnRuntime()
         graph_result = {
@@ -488,10 +552,15 @@ def test_live_lane_proves_usefulness_on_sent_message() -> None:
     assert "held_out_scenarios" in live_source
     assert "book_grounded_families" in live_source
     assert "live-answer-relevance-" in live_source
-    assert "_assess_prompt_reply_relevance" in live_source
+    assert "assess_reply_relevance_with_rubric" in live_source
+    assert "_assess_live_relevance" in live_source
+    assert "load_held_out_corpus" in live_source
     assert "api.sent_texts[-1]" in live_source
     assert "last_telemetry_for_thread" in live_source
     assert "adequacy_verdict" in live_source
+    assert "_assess_prompt_reply_relevance" not in live_source
+    assert "_extract_step_numbers_for_relevance" not in live_source
+    assert "_prompt_allows_context_rescue" not in live_source
 
 
 def test_no_exact_question_whitelist_in_product() -> None:

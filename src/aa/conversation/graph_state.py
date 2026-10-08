@@ -23,6 +23,8 @@ class TurnState(TypedDict, total=False):
     context: dict[str, Any]
     current_user_message: str
     search_queries: list[str]
+    planner_mode: str
+    resolved_intent: str
     retrieval_hits: list[dict[str, Any]]
     evidence_pack: list[dict[str, Any]]
     retrieval_latency_ms: float
@@ -51,6 +53,8 @@ def initial_state(user_message: str, *, summary: str = "") -> TurnState:
         conversation_summary=summary,
         current_user_message=user_message,
         search_queries=[],
+        planner_mode="retrieval",
+        resolved_intent="",
         retrieval_hits=[],
         evidence_pack=[],
         retrieval_latency_ms=0.0,

@@ -127,7 +127,10 @@ async def test_planner_timeout_reprobes_structured_next_turn(
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)
             queries = ", ".join(f'"tailored query variant {i}"' for i in range(12))
-            return '{"queries": [' + queries + "]}"
+            return (
+                '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+                '"queries": [' + queries + "]}"
+            )
 
     model = _SlowStructured()
     first = await run_planner("evening craving", model=model)

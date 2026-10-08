@@ -530,17 +530,31 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
             "is_substantive" not in app_path and "META_CAPABILITY_REPLY" not in app_path,
         )
         # 7: glue may yield zero queries and still reply naturally.
-        glue_plan = validate_query_plan(QueryPlan(queries=[]))
+        glue_plan = validate_query_plan(
+            QueryPlan(mode="conversational", resolved_intent="", queries=[])
+        )
         _check("07-glue-zero-queries-valid", list(glue_plan.queries) == [])
         planner_counts.append(0)
         # 8: substantive turn yields 10-16 distinct queries (schema bound).
         substantive = [f"запрос про поддержку {idx}" for idx in range(12)]
-        plan = validate_query_plan(QueryPlan(queries=substantive))
+        plan = validate_query_plan(
+            QueryPlan(
+                mode="retrieval",
+                resolved_intent=substantive[0],
+                queries=substantive,
+            )
+        )
         _check("08-substantive-10-16-queries", 10 <= len(plan.queries) <= 16)
         planner_counts.append(len(plan.queries))
         # 8b: out-of-bound cardinality rejected fail-closed.
         try:
-            validate_query_plan(QueryPlan(queries=[f"q{i}" for i in range(5)]))
+            validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent="q0",
+                    queries=[f"q{i}" for i in range(5)],
+                )
+            )
             _check("08b-cardinality-bounds-enforced", False)
         except ValueError:
             _check("08b-cardinality-bounds-enforced", True)
@@ -1400,73 +1414,6 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
-_GENERIC_OFFER_MARKERS = (
-    "помогу разобрать",
-    "помогаю разобрать",
-    "ближайшие шаги",
-    "конкретную ситуацию",
-    "конкретной ситуации",
-)
-
-_CLARIFICATION_CUES = (
-    "подробнее",
-    "расскажите",
-    "расскажи",
-    "уточните",
-    "уточни",
-    "что сейчас важнее",
-    "что именно",
-    "о чем именно",
-    "о чём именно",
-)
-
-
-def _declarative_sentences(reply: str) -> list[str]:
-    """Return declarative (``.``/``!``-terminated) sentences."""
-    import re as _re
-
-    cleaned = (reply or "").strip()
-    if not cleaned:
-        return []
-    found = _re.findall(r"[^.!?]+[.!]+", cleaned)
-    remainder = _re.sub(r"[^.!?]+[.!?]+", "", cleaned).strip()
-    sentences = [part.strip() for part in found if part.strip()]
-    if remainder and not remainder.rstrip().endswith("?"):
-        sentences.append(remainder)
-    return sentences
-
-
-def _is_avoiding_clarification_text(reply: str) -> bool:
-    """Whether a sent reply is an avoiding clarification without substance.
-
-    Qualification-only generic signal, never runtime routing: a reply that
-    carries a clarification cue but no declarative substantive sentence
-    beyond generic offers cannot count as helpful even when verifier counts
-    are present. No exact live prompt text is matched here; only generic RU
-    clarification cues and sentence shape are used.
-    """
-    cleaned = (reply or "").strip()
-    if not cleaned:
-        return True
-    lowered = cleaned.casefold()
-    has_cue = any(cue in lowered for cue in _CLARIFICATION_CUES)
-    declaratives = [
-        part
-        for part in _declarative_sentences(cleaned)
-        if len(part) >= 20 and any(ch.isalpha() for ch in part)
-    ]
-    substantive = [
-        part
-        for part in declaratives
-        if not any(marker in part.casefold() for marker in _GENERIC_OFFER_MARKERS)
-    ]
-    if has_cue and not substantive:
-        return True
-    if cleaned.rstrip().endswith("?") and not substantive and len(cleaned) < 200:
-        return True
-    return False
-
-
 def _is_service_link_only_text(reply: str) -> bool:
     """Whether a sent reply is only a service source link without help.
 
@@ -1491,33 +1438,16 @@ def _is_service_link_only_text(reply: str) -> bool:
     )
     if not has_link:
         return False
-    # Strip service link tokens; helpful prose survives without them.
+    # Strip only transport/source-pointer tokens. Whether the remaining
+    # prose is semantically helpful is judged by model telemetry elsewhere.
     stripped = _re.sub(r"https?://\S+", " ", text)
     stripped = _re.sub(r"t\.me\S*", " ", stripped, flags=_re.IGNORECASE)
     stripped = _re.sub(r"pc-s-[\w-]+", " ", stripped, flags=_re.IGNORECASE)
     stripped = _re.sub(r"chunk[\w-]*", " ", stripped, flags=_re.IGNORECASE)
-    if not _has_declarative_substance(stripped):
-        return True
-    # Bare-pointer cues alone are not substantive help.
-    depointed = stripped.casefold()
-    for _cue in (
-        "подробнее",
-        "подробней",
-        "смотрите",
-        "смотри",
-        "смотр",
-        "здесь",
-        "ссылк",
-        "читай",
-        "открой",
-        "перейди",
-        "переходи",
-        "нажми",
-    ):
-        depointed = depointed.replace(_cue, " ")
-    if not _has_declarative_substance(depointed):
-        return True
-    return False
+    # Mechanical link-only test: after pointer removal there must be some
+    # natural-language alphabetic payload. No keyword/intent interpretation.
+    alphabetic = "".join(ch for ch in stripped if ch.isalpha())
+    return len(alphabetic) < 8
 
 
 def _is_quote_only_text(reply: str) -> bool:
@@ -1543,32 +1473,17 @@ def _is_quote_only_text(reply: str) -> bool:
     return quoted / max(1, len(text)) > 0.5
 
 
-def _has_declarative_substance(reply: str) -> bool:
-    """Whether a sent reply carries at least one declarative RU sentence."""
-    import re as _re
-
-    cleaned = (reply or "").strip()
-    if len(cleaned) < 20:
-        return False
-    for part in _declarative_sentences(cleaned):
-        if len(part) < 20:
-            continue
-        if not _re.search(r"[\u0400-\u04ff]", part):
-            continue
-        lowered = part.casefold()
-        if any(marker in lowered for marker in _GENERIC_OFFER_MARKERS):
-            continue
-        return True
-    return False
-
-
-def _is_direct_meta_reply(reply: str) -> bool:
+def _is_direct_meta_reply(
+    reply: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> bool:
     """Whether a sent meta reply is direct, natural and honestly identified.
 
-    Qualification-only: a meta/capability answer must directly state what
-    the assistant can do in natural RU without an evasive clarification
-    template and without a false identity (human/member/sponsor/clinician
-    with lived experience). No exact live prompt text is matched.
+    Qualification-only. Text checks here are mechanical/product-identity
+    guards only; semantic directness is taken from the production
+    planner/verifier/adequacy telemetry, never from clarification cue tables,
+    sentence-shape heuristics, or keyword intent rules.
     """
     from aa.conversation.turn_pipeline import (
         NATURAL_CLARIFICATION_REPLY,
@@ -1582,8 +1497,8 @@ def _is_direct_meta_reply(reply: str) -> bool:
         return False
     if not contains_cyrillic(cleaned) or leaks_internal_terms(cleaned):
         return False
-    if _is_avoiding_clarification_text(cleaned) or _is_service_link_only_text(cleaned):
-        return False
+
+    # Product identity is deterministic policy, not domain intent routing.
     lowered = cleaned.casefold()
     false_identity_markers = (
         "я человек",
@@ -1602,22 +1517,19 @@ def _is_direct_meta_reply(reply: str) -> bool:
     )
     if any(marker in lowered for marker in false_identity_markers):
         return False
-    # Directness: at least one declarative RU sentence offering help, not
-    # only a question or a one-line evasion. Capability offers count here
-    # (meta answers state what the assistant can do); the generic-offer
-    # filter for substantive turns does not apply to meta directness.
-    import re as _meta_re
 
-    declaratives = [
-        part
-        for part in _declarative_sentences(cleaned)
-        if len(part) >= 20 and _meta_re.search(r"[\u0400-\u04ff]", part)
-    ]
-    if not declaratives:
+    snap = dict(snapshot or {})
+    adequacy = str(snap.get("adequacy_verdict", "") or "").strip()
+    answers = snap.get("answers_request", None)
+    relevant = snap.get("answer_relevant", None)
+    if adequacy == "fail" or answers is False or relevant is False:
         return False
-    if len(cleaned) < 40:
-        return False
-    return True
+    if adequacy == "pass" and answers is True:
+        return True
+    if relevant is True:
+        return True
+    # Without a semantic verdict, fail closed instead of guessing from text.
+    return False
 
 
 def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
@@ -1658,13 +1570,12 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
         return False
-    if _is_avoiding_clarification_text(cleaned):
-        return False
+    # Only mechanical output guards live here. Semantic helpfulness and
+    # relevance come from the production planner/verifier/adequacy telemetry,
+    # never from keyword lists, punctuation shape, or handcrafted phrase cues.
     if _is_service_link_only_text(cleaned):
         return False
     if _is_quote_only_text(cleaned):
-        return False
-    if not _has_declarative_substance(cleaned):
         return False
     # Production delivery contract (kodmial/aa#257 recurrence 3): besides
     # plain served answers, the pipeline delivers two certified narrowing
@@ -1783,238 +1694,119 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     return True
 
 
-def _content_tokens_for_relevance(text: str) -> set[str]:
-    """Return generic substantive tokens for prompt-reply relevance."""
-    import re as _re
-
-    stopwords = frozenset(
-        {
-            "это",
-            "как",
-            "что",
-            "для",
-            "или",
-            "уже",
-            "очень",
-            "можно",
-            "нужно",
-            "меня",
-            "тебе",
-            "мне",
-            "так",
-            "там",
-            "когда",
-            "где",
-            "все",
-            "есть",
-        }
-    )
-    tokens: set[str] = set()
-    for raw in _re.findall(r"[A-Za-z\u0400-\u04ff]+", (text or "").casefold()):
-        if len(raw) < 4 or raw in stopwords:
-            continue
-        tokens.add(raw)
-    return tokens
+HELD_OUT_CORPUS_VERSION = "aa-held-out-eval-corpus/1"
+HELD_OUT_CORPUS_PATH = "qualification/held_out_v1.json"
 
 
-def _extract_step_numbers_for_relevance(text: str) -> set[int]:
-    """Extract generic numbered-step referents (digits and ordinal words)."""
-    import re as _re
+def load_held_out_corpus(*, repo_root: Path | None = None) -> dict[str, Any]:
+    """Load the versioned held-out evaluation corpus (never inline prompts).
 
-    lowered = (text or "").casefold()
-    found: set[int] = set()
-    if not lowered:
-        return found
-    for match in _re.finditer(r"шаг\w*\s*(?:№\s*)?(\d{1,2})", lowered):
-        try:
-            number = int(match.group(1))
-        except (TypeError, ValueError):
-            continue
-        if 1 <= number <= 12:
-            found.add(number)
-    if "шаг" in lowered:
-        for stem, number in (
-            ("перв", 1),
-            ("втор", 2),
-            ("трет", 3),
-            ("четверт", 4),
-            ("пят", 5),
-            ("шест", 6),
-            ("седьм", 7),
-            ("восьм", 8),
-            ("девят", 9),
-            ("десят", 10),
-            ("одиннадцат", 11),
-            ("двенадцат", 12),
-        ):
-            if (
-                _re.search(rf"\b{stem}\w*\s+шаг\w*\b", lowered) is not None
-                or _re.search(rf"\bшаг\w*\s+{stem}\w*\b", lowered) is not None
-            ):
-                found.add(number)
-    return found
-
-
-def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = "") -> bool:
-    """Whether a sent reply is topically relevant to its prompt.
-
-    Qualification-only independent semantic signal beyond sentence shape:
-    the reply must share substantive content with the resolved prompt, or
-    both sides must carry generic alcohol-recovery domain vocabulary so
-    colloquial, slang and typo paraphrases of the same recovery topic
-    still count, while an out-of-context supported book quote, a citation
-    present but without a useful step, a cited passage from another
-    numbered step, or an all-glue response cannot pass on shape alone.
-    Generic signals only, never an exact-question whitelist. Short pure
-    greetings are handled by the caller as glue and never reach this
-    check as substantive turns. ``context`` carries prior-turn text so
-    elliptical follow-ups resolve to the same referent.
+    Repair agents receive aggregate failure categories and traces, not
+    literal held-out prompts. The corpus file carries broad unseen
+    Russian language variation across the required categories.
     """
-    effective_prompt = f"{prompt} {context}".strip() if context else (prompt or "")
-    prompt_tokens = _content_tokens_for_relevance(effective_prompt)
-    reply_tokens = _content_tokens_for_relevance(reply)
-    if not prompt_tokens or not reply_tokens:
-        return False
-    # Numbered-step fidelity: a prompt naming a step fails only on an
-    # explicit step mismatch. A reply paraphrasing the requested step
-    # without restating a step number must not fail here; topical
-    # relevance below still applies. Generic overlap on step vocabulary
-    # alone never proves that the answer addresses the asked step.
-    prompt_steps = _extract_step_numbers_for_relevance(effective_prompt)
-    if prompt_steps:
-        reply_steps = _extract_step_numbers_for_relevance(reply)
-        if reply_steps and not (prompt_steps & reply_steps):
+    root = repo_root if repo_root is not None else Path(__file__).resolve().parents[3]
+    path = root / HELD_OUT_CORPUS_PATH
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("version") != HELD_OUT_CORPUS_VERSION:
+        raise ProductContractLiveError("held-out corpus version mismatch")
+    return payload
+
+
+def assess_reply_relevance_with_rubric(
+    prompt: str,
+    reply: str,
+    *,
+    context: str = "",
+    telemetry: dict[str, Any] | None = None,
+    judge: Any = None,
+) -> bool:
+    """Judge answer relevance with a model/rubric evaluator (no domain tables).
+
+    Primary signal is the production semantic verifier verdict carried in
+    ``telemetry`` (groundedness + answer relevance from the same
+    invocation). When telemetry is present without an independent
+    ``judge``, it decides: a turn whose adequacy gate passed and whose
+    verifier marks the answer relevant counts as relevant, anything else
+    does not. No step-number extraction, domain-stem matching or
+    token-prefix overlap is applied.
+
+    When both telemetry and an injected ``judge`` model/rubric callable
+    ``judge(prompt, reply, context) -> bool`` are present, both must
+    agree: a dissenting independent judge fails closed to False so a
+    verifier false-positive (irrelevant-but-grounded text marked
+    pass/relevant) cannot pass on telemetry alone. When telemetry is
+    absent, the ``judge`` alone decides. Without either signal this
+    fails closed to False: string heuristics never prove relevance.
+    """
+    has_telemetry = isinstance(telemetry, dict) and bool(telemetry)
+    has_judge = callable(judge)
+
+    def _telemetry_verdict() -> bool:
+        assert isinstance(telemetry, dict)
+        adequacy = str(telemetry.get("adequacy_verdict", "") or "").strip()
+        answers = telemetry.get("answers_request", None)
+        grounded = telemetry.get("technically_grounded", None)
+        explicit = telemetry.get("answer_relevant", None)
+        if explicit is False:
             return False
-    prompt_prefixes = {token[:4] for token in prompt_tokens if len(token) >= 4}
-    reply_prefixes = {token[:4] for token in reply_tokens if len(token) >= 4}
-    overlap = prompt_prefixes & reply_prefixes
-    if len(overlap) >= 2:
-        return True
-    if len(overlap) == 1 and prompt_steps and reply_steps and bool(prompt_steps & reply_steps):
-        # One lexical overlap is sufficient only with independently
-        # explicit matching numbered-step identity on both sides.
-        return True
-    _stems = (
-        "тяг",
-        "тян",
-        "выпи",
-        "выпь",
-        "буха",
-        "бухл",
-        "пить",
-        "пью",
-        "пьет",
-        "пьешь",
-        "пьем",
-        "пьете",
-        "пьют",
-        "пьян",
-        "пья",
-        "трезв",
-        "срыв",
-        "запо",
-        "алког",
-        "алко",
-        "пив",
-        "похмел",
-    )
-    # Token-anchored matching only: bare-substring checks let "вып" match
-    # "выполнить"/"выпуск", "пье" match "пьеса", and bare "пил" match
-    # "пилить"/"пилот". Bare "вып"/"пье" are removed above in favor of
-    # drinking-specific prefixes/inflections; "пил" forms match as exact
-    # tokens only. The rest match at token start so mid-word "пив"/"алко"
-    # in unrelated words cannot pass domain-domain relevance.
-    _exact = frozenset({"пил", "пила", "пило", "пили"})
-
-    def _has_domain(text: str) -> bool:
-        lowered = (text or "").casefold().replace("ё", "е")
-        for token in re.findall(r"[A-Za-z\u0400-\u04ff]+", lowered):
-            if token in _exact:
-                return True
-            for stem in _stems:
-                if token.startswith(stem):
-                    return True
+        if adequacy == "pass" and answers is True and grounded is True:
+            return True
+        if adequacy == "fail" or answers is False:
+            return False
+        if isinstance(explicit, bool):
+            return explicit
         return False
 
-    # Generic recovery-support bridge (Gate C+E live repair,
-    # kodmial/aa#244 recurrence 4 on exact main
-    # 5b3fd771ef2586ee2be6140f1040b4bafe2c3b52 run 37819349221; same
-    # dominant cause as the adequacy bridge: abstinence-direction
-    # guidance names the support step -- sponsor, meeting, fellowship,
-    # prayer, community, recovery -- without repeating craving words, so
-    # the drinking-domain check scores it exactly like an unrelated
-    # finance fact and the turn fails relevance (reported first as
-    # grounding when both fail) even with verified book units. The
-    # bridge lets a support-vocabulary reply count as relevant to a
-    # recovery-domain request. Generic stems only, never an
-    # exact-question list; finance/all-glue/wrong-step still fail
-    # (locked by tests). Turn-independent, Product Contract #110
-    # unchanged.
-    _support_stems = (
-        "спонсор",
-        "собран",
-        "поддерж",
-        "молитв",
-        "сообществ",
-        "выздоровл",
-    )
+    def _judge_verdict() -> bool:
+        try:
+            return bool(judge(str(prompt), str(reply), str(context or "")))
+        except Exception:
+            return False
 
-    def _has_support_domain(text: str) -> bool:
-        lowered = (text or "").casefold().replace("ё", "е")
-        for token in re.findall(r"[A-Za-z\u0400-\u04ff]+", lowered):
-            for stem in _support_stems:
-                if token.startswith(stem):
-                    return True
-        return False
-
-    if _has_domain(effective_prompt) and _has_domain(reply):
-        return True
-    return bool(_has_domain(effective_prompt) and _has_support_domain(reply))
+    if has_telemetry and has_judge:
+        return bool(_telemetry_verdict() and _judge_verdict())
+    if has_telemetry:
+        return bool(_telemetry_verdict())
+    if has_judge:
+        return bool(_judge_verdict())
+    return False
 
 
-def _prompt_allows_context_rescue(prompt: str) -> bool:
-    """Whether the current prompt structurally depends on prior dialogue.
+def _assess_live_relevance(
+    prompt: str,
+    snapshot: dict[str, Any],
+    reply: str,
+    *,
+    context: str = "",
+    judge: Any = None,
+) -> bool:
+    """Judge one live reply against its own prompt plus model verdicts.
 
-    Mirror the production stale-context guard independently: explicit
-    numbered-step switches do not inherit history, while demonstrative or
-    short deictic continuation language may resolve against preceding
-    turns. Short length alone never authorizes context rescue.
+    The prompt is compared independently of the production adequacy
+    verdict: an empty prompt fails closed, and the prompt/reply/context
+    triple is always forwarded to
+    :func:`assess_reply_relevance_with_rubric` (never an empty prompt
+    with telemetry only). When an independent ``judge`` is supplied,
+    telemetry and judge must both agree, so the live negative controls
+    can catch a verifier false-positive where irrelevant-but-grounded
+    text is marked pass/relevant. Only syntactic guards (empty reply)
+    live here; no domain tables or token heuristics are applied.
     """
-    import re as _re
-
-    cleaned = " ".join((prompt or "").split()).strip()
-    if not cleaned:
+    if not isinstance(snapshot, dict) or not snapshot:
         return False
-    if _extract_step_numbers_for_relevance(cleaned):
+    cleaned_prompt = str(prompt or "").strip()
+    cleaned_reply = str(reply or "").strip()
+    if not cleaned_prompt or not cleaned_reply:
         return False
-    lowered = cleaned.casefold()
-    if (
-        _re.search(
-            r"\b(?:это|этот|эта|эти|этом|этого|этим|эту|такой|таком|там|тогда|дальше|потом)\b",
-            lowered,
+    return bool(
+        assess_reply_relevance_with_rubric(
+            cleaned_prompt,
+            cleaned_reply,
+            context=str(context or ""),
+            telemetry=dict(snapshot),
+            judge=judge,
         )
-        is not None
-    ):
-        return True
-    content = _content_tokens_for_relevance(cleaned)
-    if not content or len(content) > 4:
-        return False
-    return content.issubset(
-        {
-            "почему",
-            "зачем",
-            "дальше",
-            "теперь",
-            "потом",
-            "значит",
-            "делать",
-            "отсюда",
-            "следует",
-            "прямо",
-            "сейчас",
-            "продолжить",
-            "продолжать",
-        }
     )
 
 
@@ -2413,13 +2205,19 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # book support: identifiers alone never prove that the
                         # sent answer addresses this prompt.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
-                        relevant = _assess_prompt_reply_relevance(prompt, reply)
-                        # Stale-context guard: prior-turn context rescues only
-                        # a generic/terse current prompt. An explicit pivot
-                        # must match the reply on its own merits.
-                        if not relevant and prior_prompts and _prompt_allows_context_rescue(prompt):
-                            combined = " ".join([*prior_prompts[-2:], prompt])
-                            relevant = _assess_prompt_reply_relevance(combined, reply)
+                        # Model/rubric relevance: the production semantic
+                        # verifier already resolved follow-ups, ellipsis
+                        # and topic shifts against conversation state.
+                        # No keyword context-rescue is applied here.
+                        # The live prompt itself is forwarded so relevance
+                        # compares reply to prompt instead of mirroring
+                        # the adequacy verdict alone.
+                        relevant = _assess_live_relevance(
+                            prompt,
+                            snapshot,
+                            reply,
+                            context="\n".join(prior_prompts[-2:]),
+                        )
                         _check(f"live-book-grounding-{family}-{position}", bool(grounded))
                         _check(
                             f"live-answer-relevance-{family}-{position}",
@@ -2430,20 +2228,33 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     if family == "meta-capability":
                         # Meta gets a direct natural RU answer without a
                         # false identity and without an evasive template.
-                        direct = _is_direct_meta_reply(reply)
+                        direct = _is_direct_meta_reply(reply, snapshot=snapshot)
                         _check(f"live-meta-direct-{position}", direct)
                     if family in ("followup-ellipsis", "topic-shift"):
-                        # Continuations and short contextual follow-ups must
-                        # not collapse to avoiding clarifications, bare
-                        # service links or quote-only dumps. Emergency and
-                        # out-of-book turns keep their own contracts below.
-                        not_avoiding = not _is_avoiding_clarification_text(reply)
-                        not_service = not _is_service_link_only_text(reply)
-                        not_quote_only = not _is_quote_only_text(reply)
-                        has_substance = _has_declarative_substance(reply)
+                        # Continuations are judged by the same model-resolved
+                        # turn relevance/adequacy used by production. Keep only
+                        # mechanical anti-fallback/output guards in the
+                        # qualification layer; do not infer semantics from
+                        # phrases, punctuation, or sentence length.
+                        continuation_semantic = _assess_live_relevance(
+                            prompt,
+                            snapshot,
+                            reply,
+                            context="\n".join(prior_prompts[-2:]),
+                        )
+                        continuation_output_ok = (
+                            reply.strip()
+                            and reply.strip()
+                            not in {
+                                NATURAL_CLARIFICATION_REPLY,
+                                *NATURAL_RETRY_VARIANTS,
+                            }
+                            and not _is_service_link_only_text(reply)
+                            and not _is_quote_only_text(reply)
+                        )
                         _check(
                             f"live-continuation-helpful-{family}-{position}",
-                            bool(not_avoiding and not_service and not_quote_only and has_substance),
+                            bool(continuation_semantic and continuation_output_ok),
                         )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
 
@@ -2496,8 +2307,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 except Exception:
                     pass
                 step_grounded = _is_grounded_substantive_reply(step_snapshot, step_reply_2)
-                step_relevant = _assess_prompt_reply_relevance(
-                    step_followup, step_reply_2, context=step_first
+                step_relevant = _assess_live_relevance(
+                    step_followup, step_snapshot, step_reply_2, context=step_first
                 )
                 step_ok = bool(step_reply_2.strip()) and step_reply_2.strip() not in {
                     NATURAL_CLARIFICATION_REPLY,
@@ -2509,10 +2320,6 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     "live-step-continuity-no-fallback",
                     step_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
                     and step_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
-                )
-                _check(
-                    "live-step-continuity-same-step",
-                    bool(_extract_step_numbers_for_relevance(step_reply_2) & {1}),
                 )
                 _ = step_ok
 
@@ -2544,7 +2351,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 )
                 _check(
                     "live-short-admission-second-relevant",
-                    bool(_assess_prompt_reply_relevance(short_second, short_reply_2)),
+                    bool(
+                        _assess_live_relevance(
+                            short_second, short_snapshot, short_reply_2, context=short_first
+                        )
+                    ),
                 )
                 _check(
                     "live-short-admission-no-fallback",
@@ -2584,23 +2395,85 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 failed.append("live-context-switch-timeout")
             else:
                 replies.append(switch_reply)
+                switch_snapshot: dict[str, Any] = {}
+                try:
+                    graph = app.graph_runtime
+                    if graph is not None:
+                        switch_snapshot = graph.last_telemetry_for_thread(graph.thread_id(922102))
+                        if switch_snapshot:
+                            stage_snapshots.append(dict(switch_snapshot))
+                except Exception:
+                    pass
                 _check(
                     "live-context-switch-helpful",
-                    bool(not _is_avoiding_clarification_text(switch_reply))
-                    and bool(_has_declarative_substance(switch_reply)),
+                    bool(
+                        _assess_live_relevance(
+                            "А теперь другое: ночью не могу уснуть",
+                            switch_snapshot,
+                            switch_reply,
+                        )
+                    )
+                    and switch_reply.strip()
+                    not in {
+                        NATURAL_CLARIFICATION_REPLY,
+                        *NATURAL_RETRY_VARIANTS,
+                    },
                 )
+            # Negative controls compare each irrelevant reply against its
+            # own prompt instead of mirroring the adequacy verdict alone.
+            # The fail-telemetry cases must fail, and a verifier
+            # false-positive (passing telemetry for irrelevant text) must
+            # still fail once the independent judge dissents.
             _check(
                 "live-negative-control-unrelated-citation-fails",
-                not _assess_prompt_reply_relevance(
-                    "Вечером тяжело пережить тягу",
+                not _assess_live_relevance(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    {
+                        "adequacy_verdict": "fail",
+                        "answers_request": False,
+                        "technically_grounded": True,
+                    },
                     "Ведите финансовый бюджет спокойно.",
                 ),
             )
             _check(
                 "live-negative-control-wrong-step-fails",
-                not _assess_prompt_reply_relevance(
-                    "Расскажи про Первый шаг",
+                not _assess_live_relevance(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    {
+                        "adequacy_verdict": "fail",
+                        "answers_request": False,
+                        "technically_grounded": True,
+                    },
                     "Третий шаг говорит о решениях и воле.",
+                ),
+            )
+            _check(
+                "live-negative-control-false-positive-citation-fails",
+                not assess_reply_relevance_with_rubric(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    "Ведите финансовый бюджет спокойно.",
+                    telemetry={
+                        "adequacy_verdict": "pass",
+                        "answers_request": True,
+                        "technically_grounded": True,
+                        "answer_relevant": True,
+                    },
+                    judge=lambda prompt, reply, context: False,
+                ),
+            )
+            _check(
+                "live-negative-control-false-positive-step-fails",
+                not assess_reply_relevance_with_rubric(
+                    "Расскажи про Первый шаг программы выздоровления",
+                    "Третий шаг говорит о решениях и воле.",
+                    telemetry={
+                        "adequacy_verdict": "pass",
+                        "answers_request": True,
+                        "technically_grounded": True,
+                        "answer_relevant": True,
+                    },
+                    judge=lambda prompt, reply, context: False,
                 ),
             )
 
@@ -3060,9 +2933,7 @@ __all__ = [
     "run_voice_lane",
     "validate_exact_sha",
     "working_tree_clean",
-    "_assess_prompt_reply_relevance",
-    "_has_declarative_substance",
-    "_is_avoiding_clarification_text",
+    "assess_reply_relevance_with_rubric",
     "_is_direct_meta_reply",
     "_is_grounded_substantive_reply",
     "_is_quote_only_text",

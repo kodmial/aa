@@ -158,6 +158,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
         import time as _time
 
         from aa.conversation.answer_adequacy import planner_reason_for as _reason_for
+        from aa.conversation.planner_node import build_generic_fallback_queries
 
         started = _time.perf_counter()
         try:
@@ -165,6 +166,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             queries = result.get("search_queries", [])
             count = len(queries) if isinstance(queries, list) else 0
+            mode = str(result.get("planner_mode", "retrieval") or "retrieval")
             logger.info(
                 "v2 planner done",
                 extra={
@@ -176,35 +178,53 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             retry = dict(update.get("retry_state", {}) or {})
             retry["planner_latency_ms"] = round(elapsed_ms, 1)
             retry["planner_query_count"] = count
-            outcome = "ok" if count else "empty"
-            retry["planner_outcome"] = outcome
-            retry["planner_reason"] = _reason_for(count, outcome)
+            retry["planner_mode"] = mode
+            retry["resolved_intent"] = str(result.get("resolved_intent", "") or "")
+            if mode == "conversational":
+                outcome = "empty"
+                retry["planner_outcome"] = outcome
+                retry["planner_reason"] = "legitimate-glue"
+            else:
+                outcome = "ok" if count else "empty"
+                retry["planner_outcome"] = outcome
+                retry["planner_reason"] = _reason_for(count, outcome)
             update["retry_state"] = retry
             return update
         except QueryPlanValidationError as exc:
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.warning("v2 planner failed closed", extra={"category": "planner-invalid"})
+            # Invalid semantic output is never conversational glue. Use the
+            # generic retrieval fallback from the raw turn plus bounded
+            # managed context, just as for provider/timeout failures.
+            try:
+                _summary = str(state.get("conversation_summary", "") or "")
+                _recent_raw: list[str] = []
+                for _msg in list(state.get("messages", []) or [])[-4:]:
+                    _content = getattr(_msg, "content", "")
+                    if isinstance(_content, str) and _content.strip():
+                        _recent_raw.append(_content.strip()[:200])
+                _fallback = build_generic_fallback_queries(
+                    str(state.get("current_user_message", "")),
+                    summary=_summary,
+                    recent=_recent_raw,
+                )
+            except Exception:
+                _fallback = []
             return {
-                "search_queries": [],
+                "search_queries": list(_fallback),
                 "planner_invoked": True,
+                "planner_mode": "retrieval",
+                "resolved_intent": str(state.get("current_user_message", "")),
                 "retry_state": {
                     "planner_error": str(exc)[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
-                    "planner_query_count": 0,
+                    "planner_query_count": len(_fallback),
                     "planner_outcome": "invalid",
                     "planner_reason": "invalid",
+                    "planner_mode": "retrieval",
                 },
             }
         except Exception as exc:
-            # kodmial/aa#240: a planner provider/timeout failure must be
-            # classified in stage telemetry, never crash the whole graph
-            # into a telemetry-less application fallback. Provider 429
-            # still propagates for runner retire/restart; any other
-            # provider or timeout failure records its outcome/latency so
-            # Gate C attributes the turn to the planner stage and the
-            # answer phase proceeds fail-closed (empty pack, no fake
-            # grounded plan). Turn-independent, Product Contract #110
-            # unchanged.
             from aa.opencode.errors import OpenCodeRateLimitError as _PlannerRateLimit
 
             if isinstance(exc, _PlannerRateLimit):
@@ -221,15 +241,34 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             logger.warning("v2 planner failed closed", extra={"category": outcome})
             from aa.conversation.answer_adequacy import planner_reason_for as _error_reason_for
 
+            # Generic semantic retrieval fallback: raw turn plus bounded
+            # recent conversation; never reinterpreted as glue.
+            try:
+                _error_summary = str(state.get("conversation_summary", "") or "")
+                _error_recent: list[str] = []
+                for _msg in list(state.get("messages", []) or [])[-4:]:
+                    _content = getattr(_msg, "content", "")
+                    if isinstance(_content, str) and _content.strip():
+                        _error_recent.append(_content.strip()[:200])
+                _error_fallback = build_generic_fallback_queries(
+                    str(state.get("current_user_message", "")),
+                    summary=_error_summary,
+                    recent=_error_recent,
+                )
+            except Exception:
+                _error_fallback = []
             return {
-                "search_queries": [],
+                "search_queries": list(_error_fallback),
                 "planner_invoked": True,
+                "planner_mode": "retrieval",
+                "resolved_intent": str(state.get("current_user_message", "")),
                 "retry_state": {
                     "planner_error": type(exc).__name__[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
-                    "planner_query_count": 0,
+                    "planner_query_count": len(_error_fallback),
                     "planner_outcome": outcome,
-                    "planner_reason": _error_reason_for(0, outcome),
+                    "planner_reason": _error_reason_for(len(_error_fallback), outcome),
+                    "planner_mode": "retrieval",
                 },
             }
 

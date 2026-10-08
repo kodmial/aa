@@ -743,7 +743,13 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             from aa.retrieval.evidence import render_book_evidence, retrieve_evidence
 
             substantive_queries = [f"запрос про поддержку {idx}" for idx in range(12)]
-            plan = validate_query_plan(QueryPlan(queries=substantive_queries))
+            plan = validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent=substantive_queries[0],
+                    queries=substantive_queries,
+                )
+            )
             cardinality_ok = 10 <= len(plan.queries) <= 16
             proof_index = _build_substantive_proof_index()
             try:

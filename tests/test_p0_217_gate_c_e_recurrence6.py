@@ -84,7 +84,10 @@ def _twelve_queries(base: str = "support sobriety") -> list[str]:
 
 
 def _twelve_payload(base: str = "support sobriety") -> str:
-    return '{"queries": ["' + '", "'.join(_twelve_queries(base)) + '"]}'
+    return (
+        '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+        '"queries": ["' + '", "'.join(_twelve_queries(base)) + '"]}'
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +130,11 @@ async def test_slow_structured_serves_tailored_text_queries_not_generic(
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
             await asyncio.sleep(60.0)
-            return {"queries": _twelve_queries("unreachable structured")}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("unreachable structured"),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = system
@@ -156,12 +163,16 @@ async def test_overall_expiry_fails_closed_without_generic_plan() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             await asyncio.sleep(60.0)
-            return {"queries": _twelve_queries()}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries(),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)
             await asyncio.sleep(60.0)
-            return '{"queries": []}'
+            return '{"mode": "conversational", "resolved_intent": "", "queries": []}'
 
     started = time.perf_counter()
     with pytest.raises(OpenCodeTimeoutError):
@@ -183,12 +194,12 @@ async def test_no_identical_generic_plan_for_different_slow_turns() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             await asyncio.sleep(60.0)
-            return {"queries": []}
+            return {"mode": "conversational", "resolved_intent": "", "queries": []}
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)
             await asyncio.sleep(60.0)
-            return '{"queries": []}'
+            return '{"mode": "conversational", "resolved_intent": "", "queries": []}'
 
     for turn in ("evening craving", "family quarrel tonight"):
         with pytest.raises(OpenCodeTimeoutError):
@@ -213,7 +224,11 @@ async def test_fast_structured_path_unchanged() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
-            return {"queries": _twelve_queries()}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries(),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)

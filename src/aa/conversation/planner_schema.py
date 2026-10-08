@@ -1,52 +1,44 @@
-"""Minimal structured planner schema for the v2 turn graph (issue #113).
+"""Model-driven turn planner schema for the v2 turn graph (issues #112, #268).
 
-The ``#112`` planner contract is intentionally tiny: the output schema is
-only ``QueryPlan { queries: list[str] }``. Valid lengths are exactly 0 or
-10-16 distinct queries after whitespace/case normalization. Zero is allowed
-only when a natural answer can contain no substantive claim; that judgment
-is model-driven inside the structured output, never a hand-written router.
+The planner receives the current user turn plus managed conversation
+state and returns a typed structured result:
 
-Validation here is structural, never semantic: no intent labels,
-categories, substantive flags, confidence scores, aspect taxonomies,
-ambiguity taxonomies or hand-written keyword/slang/theme dictionaries.
+- ``mode``: ``conversational`` | ``retrieval``
+- ``resolved_intent``: standalone semantic formulation of what the user
+  means now (empty only for purely conversational turns)
+- ``queries``: [] for conversational turns, otherwise 10..16 Russian queries
+
+Application code validates schema/cardinality only. It never infers
+meaning from words, punctuation, step numbers, greeting lists, recovery
+stems, first-person markers or manually curated intents.
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+PlannerMode = Literal["conversational", "retrieval"]
 
 MIN_NONEMPTY_QUERIES = 10
 MAX_QUERIES = 16
-# Bounded native structured retry budget (Gate C+E live repair,
-# kodmial/aa#217 recurrence 4 on exact main 7a9c907 run 37697730282:
-# C:live-answer-no-generic-collapse plus E:latency-budget-exceeded
-# p50 20.4s / p95 33.3s / max 34.3s with planner p50 7.0s / p95 16.4s /
-# max 28.7s, retrieval p50 0.5s, repair_turns=0). Prior repairs bounded
-# per-message/per-passage display tokens at the planner/answer/verifier
-# boundaries and saved ~9s p50 across runs, but the persistent planner
-# tail is server-side structured retries, not display tokens: each
-# planner call pays up to 3 sequential model invocations inside OpenCode
-# (initial + 2 validation retries) before the AA-level text fallback,
-# so one weak-model invalid plan costs ~8-16s before serving anything.
-# The verifier precedent (run 37538518277) already halved its worst case
-# to a single server retry with unchanged strict Pydantic validation.
-# This changes strategy at the responsible OpenCode-request boundary
-# (retry budget, not another token-display patch): one server retry
-# bounds the planner tail while grounding stays strict (only a fully
-# validated 0 or 10-16 distinct-query plan is accepted; anything else
-# fails closed to the bounded text fallback or raises). Turn-
-# independent, never an exact-question special case.
+MAX_RESOLVED_INTENT_CHARS = 2000
+# Bounded native structured retry budget: OpenCode owns the retry, AA code
+# performs exactly one Pydantic validation afterwards.
 PLANNER_MAX_ATTEMPTS = 1
 
 
 class QueryPlan(BaseModel):
-    """Structured retrieval plan produced by the hidden planner node."""
+    """Structured turn-understanding plan produced by the hidden planner."""
 
+    mode: PlannerMode = Field(default="retrieval")
+    resolved_intent: str = Field(default="")
     queries: list[str] = Field(default_factory=list)
 
 
 class QueryPlanValidationError(ValueError):
-    """Structural rejection of a planner output (cardinality/duplicates)."""
+    """Structural rejection of a planner output (mode/cardinality/duplicates)."""
 
 
 def normalize_queries(raw: list[str]) -> list[str]:
@@ -70,23 +62,49 @@ def normalize_queries(raw: list[str]) -> list[str]:
 
 
 def validate_query_plan(plan: QueryPlan) -> QueryPlan:
-    """Enforce the 0-or-10..16 structural contract on a parsed plan."""
+    """Enforce the structural contract on a parsed plan.
+
+    - ``mode`` must be ``conversational`` or ``retrieval``;
+    - ``conversational`` requires zero queries;
+    - ``retrieval`` requires 10..16 distinct non-empty queries and a
+      non-empty ``resolved_intent``;
+    - no lexical, semantic or domain judgment is applied here.
+
+    There is deliberately no semantic migration leniency here.
+    An explicit retrieval plan with empty queries or empty resolved_intent
+    is invalid and must fail closed into the generic retrieval fallback;
+    it must never be reinterpreted as conversational glue.
+    """
+    mode = plan.mode
+    if mode not in ("conversational", "retrieval"):
+        raise QueryPlanValidationError(
+            f"planner mode must be conversational|retrieval, got {mode!r}"
+        )
+    intent = " ".join(str(plan.resolved_intent or "").split())
+    if len(intent) > MAX_RESOLVED_INTENT_CHARS:
+        raise QueryPlanValidationError("resolved_intent exceeds the length budget")
     queries = normalize_queries(list(plan.queries))
-    if not queries:
-        return QueryPlan(queries=[])
+    if mode == "conversational":
+        if queries:
+            raise QueryPlanValidationError("conversational plans must carry zero queries")
+        return QueryPlan(mode="conversational", resolved_intent="", queries=[])
+    if not intent:
+        raise QueryPlanValidationError("retrieval plans require a non-empty resolved_intent")
     if not MIN_NONEMPTY_QUERIES <= len(queries) <= MAX_QUERIES:
         raise QueryPlanValidationError(
             "non-empty plans require "
             f"{MIN_NONEMPTY_QUERIES}-{MAX_QUERIES} distinct queries, "
             f"got {len(queries)}"
         )
-    return QueryPlan(queries=queries)
+    return QueryPlan(mode="retrieval", resolved_intent=intent, queries=queries)
 
 
 __all__ = [
     "MAX_QUERIES",
+    "MAX_RESOLVED_INTENT_CHARS",
     "MIN_NONEMPTY_QUERIES",
     "PLANNER_MAX_ATTEMPTS",
+    "PlannerMode",
     "QueryPlan",
     "QueryPlanValidationError",
     "normalize_queries",

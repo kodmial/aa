@@ -213,24 +213,10 @@ NATURAL_RETRY_REPLY = (
 # count an unverified service message as an answered user request.
 NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
 
-# Deterministic whole-book diversified recovery queries for the #252
-# outbound safety path. They focus a blocked drink-to-test draft back on
-# staying sober and recovery support. Generic recovery wording only;
-# never an exact live qualification prompt.
-OUTBOUND_RECOVERY_QUERIES: tuple[str, ...] = (
-    "как оставаться трезвым сегодня",
-    "поддержка при сильном желании выпить",
-    "первые шаги выздоровления без алкоголя",
-    "что помогает не пить в трудный вечер",
-    "как пережить вечер без спиртного",
-    "обращение за поддержкой в трудную минуту",
-    "молитва и спокойствие при беспокойстве",
-    "честный разговор о трудностях трезвости",
-    "ближайшие трезвые действия на сегодня",
-    "как справляться с навязчивыми мыслями о спиртном",
-    "поддержка сообщества при трудностях",
-    "утреннее решение оставаться трезвым",
-)
+# Outbound-safety recovery uses the same generic semantic fallback as any
+# other retrieval need: the raw current turn plus bounded conversation
+# context. No canned query-expansion tables are maintained here.
+OUTBOUND_RECOVERY_QUERIES: tuple[str, ...] = ()
 
 
 def select_retry_reply(user_message: str) -> str:
@@ -414,16 +400,24 @@ def narrowed_grounding_state(
             "scope": str(verdict.scope),
             "supported": bool(verdict.supported),
             "evidence_passage_ids": list(verdict.evidence_passage_ids),
+            "addresses_intent": bool(getattr(verdict, "addresses_intent", False)),
         }
         for verdict in result.units
         if verdict.unit_id in kept_ids and bool(verdict.supported)
     ]
     if not filtered:
         return {"verified": False, "units": [], "all_required_supported": False}
+    relevant = any(
+        item.get("scope") == "book" and bool(item.get("addresses_intent", False))
+        for item in filtered
+    )
+    needs_book = any(item.get("scope") == "book" for item in filtered)
     return {
         "verified": True,
         "all_required_supported": True,
         "units": filtered,
+        "answer_relevant": bool(relevant or not needs_book),
+        "relevance_category": "" if (relevant or not needs_book) else "irrelevant-citation",
     }
 
 
@@ -441,12 +435,15 @@ def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
     return {
         "verified": True,
         "all_required_supported": bool(result.all_required_supported),
+        "answer_relevant": bool(getattr(result, "answer_relevant", False)),
+        "relevance_category": str(getattr(result, "relevance_category", "") or ""),
         "units": [
             {
                 "unit_id": verdict.unit_id,
                 "scope": str(verdict.scope),
                 "supported": bool(verdict.supported),
                 "evidence_passage_ids": list(verdict.evidence_passage_ids),
+                "addresses_intent": bool(getattr(verdict, "addresses_intent", False)),
             }
             for verdict in result.units
         ],
@@ -529,11 +526,15 @@ async def _verify_draft(
     *,
     verifier_model: Any,
     turn_budget_s: float | None = None,
+    resolved_intent: str = "",
+    user_message: str = "",
+    conversation_context: str = "",
 ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
     """Split and verify one draft; never raises verification errors.
 
-    ``turn_budget_s`` caps this verifier round with the remaining
-    end-to-end turn budget (recurrence 10); ``None`` keeps the verifier
+    The same invocation returns groundedness and intent-relevance
+    verdicts. ``turn_budget_s`` caps this verifier round with the
+    remaining end-to-end turn budget; ``None`` keeps the verifier
     default. Provider 429 still propagates.
     """
     try:
@@ -549,10 +550,23 @@ async def _verify_draft(
         return units, None, False
     try:
         if turn_budget_s is None:
-            result = await run_verifier(units, pack_dicts, model=verifier_model)
+            result = await run_verifier(
+                units,
+                pack_dicts,
+                model=verifier_model,
+                resolved_intent=resolved_intent,
+                user_message=user_message,
+                conversation_context=conversation_context,
+            )
         else:
             result = await run_verifier(
-                units, pack_dicts, model=verifier_model, turn_budget_s=turn_budget_s
+                units,
+                pack_dicts,
+                model=verifier_model,
+                turn_budget_s=turn_budget_s,
+                resolved_intent=resolved_intent,
+                user_message=user_message,
+                conversation_context=conversation_context,
             )
     except (VerifierValidationError, ValueError) as exc:
         # Per-unit only verifier (kodmial/aa#190): run_verifier performs
@@ -578,6 +592,8 @@ async def _verify_draft(
         return units, result, False
     if any(not verdict.supported for verdict in result.units):
         return units, result, False
+    if not bool(getattr(result, "answer_relevant", False)):
+        return units, result, False
     return units, result, True
 
 
@@ -599,6 +615,8 @@ async def run_v2_answer_turn(
     planner_reason: str | None = None,
     planner_outcome_raw: str | None = None,
     turn_trace_id: str | None = None,
+    planner_mode: str | None = None,
+    resolved_intent: str | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -637,22 +655,19 @@ async def run_v2_answer_turn(
         assess_turn_adequacy as _assess_adequacy,
     )
     from aa.conversation.answer_adequacy import (
-        build_recovery_queries as _build_recovery,
+        build_generic_fallback_queries as _build_recovery,
     )
     from aa.conversation.answer_adequacy import (
-        is_meta_request as _is_meta_request,
+        effective_request as _effective_request_fn,
     )
     from aa.conversation.answer_adequacy import (
-        is_proven_glue_message as _is_proven_glue,
+        is_conversational_plan as _is_conversational,
     )
     from aa.conversation.answer_adequacy import (
         new_turn_trace_id as _new_trace_id,
     )
     from aa.conversation.answer_adequacy import (
         planner_reason_for as _planner_reason_for,
-    )
-    from aa.conversation.answer_adequacy import (
-        resolve_effective_request as _resolve_request,
     )
     from aa.conversation.answer_adequacy import (
         runtime_sha as _runtime_sha,
@@ -680,26 +695,36 @@ async def run_v2_answer_turn(
         )
     else:
         _effective_reason = _planner_reason_for(_query_hint, "ok" if _query_hint else "empty")
-    _recent_texts_for_adequacy: list[str] = []
-    for _msg in list(recent or []):
-        _content = getattr(_msg, "content", "")
-        if isinstance(_content, str) and _content.strip():
-            _recent_texts_for_adequacy.append(_content.strip()[:400])
+    # Model-driven turn understanding: the planner already resolved the
+    # intent. When upstream did not supply a mode, derive it from the
+    # reason without inspecting text; provider errors never count as glue.
+    _mode = str(planner_mode or "").strip()
+    if not _mode:
+        _mode = (
+            "conversational"
+            if _effective_reason == "legitimate-glue" and _query_hint == 0
+            else "retrieval"
+        )
+    _resolved_intent = str(resolved_intent or "").strip()
+    if not _resolved_intent:
+        _resolved_intent = " ".join(user_message.split()).strip()
     try:
-        _resolved_request = _resolve_request(
-            user_message, summary=summary, recent=_recent_texts_for_adequacy
+        _resolved_request = _effective_request_fn(
+            resolved_intent=_resolved_intent, user_message=user_message
         )
     except Exception:
         _resolved_request = user_message
-    _proven_glue = bool(
-        _is_proven_glue(
-            user_message,
-            summary=summary,
-            recent_count=len(_recent_texts_for_adequacy),
-            recent=_recent_texts_for_adequacy,
-        )
-        or _is_meta_request(user_message)
-    )
+    _recent_texts: list[str] = []
+    for _msg in list(recent or []):
+        _content = getattr(_msg, "content", "")
+        if isinstance(_content, str) and _content.strip():
+            _recent_texts.append(_content.strip()[:400])
+    _conversation_context = " ".join([summary.strip(), *_recent_texts[-4:]]).strip()[:2000]
+    # Schema-only glue decision: conversational mode with zero queries.
+    try:
+        _proven_glue = bool(_is_conversational(mode=_mode, query_count=_query_hint))
+    except Exception:
+        _proven_glue = bool(_mode == "conversational" and _query_hint == 0)
     _trace_id = str(turn_trace_id or _new_trace_id())
 
     telemetry: dict[str, Any] = {
@@ -732,18 +757,6 @@ async def run_v2_answer_turn(
         "runtime_sha": _runtime_sha(),
     }
 
-    def _prior_user_context() -> list[str]:
-        """Immediately preceding user turns for follow-up relevance only."""
-        try:
-            texts = [
-                str(getattr(item, "content", "") or "")
-                for item in list(recent or [])
-                if getattr(item, "type", "") == "human"
-            ]
-        except Exception:
-            return []
-        return [text for text in texts if text.strip()][-2:]
-
     def _record_adequacy(
         *,
         reply_text: str,
@@ -760,10 +773,9 @@ async def run_v2_answer_turn(
                 verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
-                summary=summary,
-                recent=_recent_texts_for_adequacy,
-                resolved_request=_resolved_request,
-                prior_user_messages=_prior_user_context(),
+                planner_mode=_mode,
+                resolved_intent=_resolved_intent,
+                planner_query_count=_query_hint,
             )
         except Exception as exc:
             # Fail closed: an assessment error on a substantive turn must
@@ -818,10 +830,9 @@ async def run_v2_answer_turn(
                 ),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
-                summary=summary,
-                recent=_recent_texts_for_adequacy,
-                resolved_request=_resolved_request,
-                prior_user_messages=_prior_user_context(),
+                planner_mode=_mode,
+                resolved_intent=_resolved_intent,
+                planner_query_count=_query_hint,
             )
         except Exception as exc:
             logger.info(
@@ -904,13 +915,13 @@ async def run_v2_answer_turn(
         ) or (initial_query_count is None or _query_hint == 0)
         if _needs_recovery:
             try:
-                _recent_texts: list[str] = []
+                _recovery_recent: list[str] = []
                 for _msg in list(recent or [])[-2:]:
                     _content = getattr(_msg, "content", "")
                     if isinstance(_content, str) and _content.strip():
-                        _recent_texts.append(_content.strip()[:200])
+                        _recovery_recent.append(_content.strip()[:200])
                 _recovery_queries = _build_recovery(
-                    user_message, summary=summary, recent=_recent_texts
+                    user_message, summary=summary, recent=_recovery_recent
                 )
             except Exception:
                 _recovery_queries = []
@@ -1054,6 +1065,9 @@ async def run_v2_answer_turn(
                 active_pack,
                 verifier_model=verifier_model,
                 turn_budget_s=turn_budget_s,
+                resolved_intent=_resolved_intent,
+                user_message=user_message,
+                conversation_context=_conversation_context,
             )
         finally:
             telemetry["verifier_latency_ms"] = round(
@@ -1768,13 +1782,24 @@ async def run_v2_answer_turn(
                 if planner_model is None or retrieval_index is None:
                     break
                 try:
+                    from aa.conversation.answer_adequacy import (
+                        build_generic_fallback_queries as _safety_fallback,
+                    )
                     from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
 
                     active_config = (
                         retrieval_config if retrieval_config is not None else RetrievalConfig()
                     )
+                    _safety_queries = _safety_fallback(
+                        f"{user_message}\n{SAFE_RECOVERY_INSTRUCTION}",
+                        summary=summary,
+                        recent=None,
+                        max_queries=12,
+                    )
+                    if not _safety_queries:
+                        break
                     fresh = retrieve_evidence(
-                        retrieval_index, list(OUTBOUND_RECOVERY_QUERIES), config=active_config
+                        retrieval_index, list(_safety_queries), config=active_config
                     )
                     from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
 
@@ -2155,10 +2180,19 @@ async def answer_pipeline_node(
         _prior_reason = str(_prior_retry_for_reason_d.get("planner_reason", ""))
         _prior_outcome_for_reason = str(_prior_retry_for_reason_d.get("planner_outcome", ""))
         _prior_trace = str(_prior_retry_for_reason_d.get("turn_trace_id", ""))
+        _prior_mode = str(
+            _prior_retry_for_reason_d.get("planner_mode", state.get("planner_mode", "retrieval"))
+            or "retrieval"
+        )
+        _prior_intent = str(
+            _prior_retry_for_reason_d.get("resolved_intent", state.get("resolved_intent", "")) or ""
+        )
     except Exception:
         _prior_reason = ""
         _prior_outcome_for_reason = ""
         _prior_trace = ""
+        _prior_mode = str(state.get("planner_mode", "retrieval") or "retrieval")
+        _prior_intent = str(state.get("resolved_intent", "") or "")
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -2177,6 +2211,8 @@ async def answer_pipeline_node(
         planner_reason=_prior_reason or None,
         planner_outcome_raw=_prior_outcome_for_reason or None,
         turn_trace_id=_prior_trace or None,
+        planner_mode=_prior_mode or None,
+        resolved_intent=_prior_intent or None,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot

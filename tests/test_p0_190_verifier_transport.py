@@ -87,13 +87,20 @@ def test_transport_schema_has_booleans_not_scope() -> None:
     assert '"enum"' not in dumped
     props = schema["properties"]
     assert isinstance(props, dict)
-    assert set(props) == {"requires_book_evidence", "supported", "evidence_passage_ids"}
+    assert set(props) == {
+        "requires_book_evidence",
+        "supported",
+        "evidence_passage_ids",
+        "addresses_intent",
+    }
     assert props["requires_book_evidence"] == {"type": "boolean"}
     assert props["supported"] == {"type": "boolean"}
+    assert props["addresses_intent"] == {"type": "boolean"}
     assert schema["required"] == [
         "requires_book_evidence",
         "supported",
         "evidence_passage_ids",
+        "addresses_intent",
     ]
     assert "scope" not in dumped
     assert "unit_id" not in dumped

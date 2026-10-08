@@ -813,7 +813,15 @@ async def test_single_unsupported_claim_triggers_targeted_repair(
             },
         ]
     )
-    planner = _PlannerModel([{"queries": _twelve_queries()}])
+    planner = _PlannerModel(
+        [
+            {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries(),
+            }
+        ]
+    )
 
     import hashlib as _hashlib
 
@@ -880,7 +888,18 @@ async def test_persistent_failure_narrowed_after_two_rounds(
         ]
     )
     planner = _PlannerModel(
-        [{"queries": _twelve_queries("луна")}, {"queries": _twelve_queries("вечер")}]
+        [
+            {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("луна"),
+            },
+            {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("вечер"),
+            },
+        ]
     )
 
     from aa.retrieval import evidence as evidence_mod
@@ -1227,7 +1246,7 @@ async def test_graph_runs_answer_pipeline_end_to_end() -> None:
     from langchain_core.runnables import RunnableLambda
 
     async def _plan(_messages: Any) -> Any:
-        return {"queries": []}
+        return {"mode": "conversational", "resolved_intent": "", "queries": []}
 
     answer = _AnswerModel(["Понимаю. Расскажите, что сейчас важнее всего?"])
     verifier = _VerifierModel(
@@ -1270,7 +1289,7 @@ async def test_graph_without_answer_models_keeps_old_semantics() -> None:
     from langchain_core.runnables import RunnableLambda
 
     async def _plan(_messages: Any) -> Any:
-        return {"queries": []}
+        return {"mode": "conversational", "resolved_intent": "", "queries": []}
 
     graph = build_turn_graph(planner_model=RunnableLambda(_plan))
     result = await graph.ainvoke(turn_input("привет"))
@@ -1613,11 +1632,17 @@ def test_verifier_single_schema_is_ref_free_without_ids() -> None:
     assert "scope" not in dumped
     assert "all_required_supported" not in dumped
     props = cast(dict[str, Any], schema["properties"])
-    assert set(props) == {"requires_book_evidence", "supported", "evidence_passage_ids"}
+    assert set(props) == {
+        "requires_book_evidence",
+        "supported",
+        "evidence_passage_ids",
+        "addresses_intent",
+    }
     assert schema["required"] == [
         "requires_book_evidence",
         "supported",
         "evidence_passage_ids",
+        "addresses_intent",
     ]
 
 
