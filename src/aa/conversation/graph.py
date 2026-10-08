@@ -157,6 +157,8 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
     async def run_hidden_planner(state: TurnState) -> dict[str, Any]:
         import time as _time
 
+        from aa.conversation.answer_adequacy import planner_reason_for as _reason_for
+
         started = _time.perf_counter()
         try:
             result = await planner_node(state, model=planner_model)
@@ -174,7 +176,9 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             retry = dict(update.get("retry_state", {}) or {})
             retry["planner_latency_ms"] = round(elapsed_ms, 1)
             retry["planner_query_count"] = count
-            retry["planner_outcome"] = "ok" if count else "empty"
+            outcome = "ok" if count else "empty"
+            retry["planner_outcome"] = outcome
+            retry["planner_reason"] = _reason_for(count, outcome)
             update["retry_state"] = retry
             return update
         except QueryPlanValidationError as exc:
@@ -188,6 +192,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_latency_ms": round(elapsed_ms, 1),
                     "planner_query_count": 0,
                     "planner_outcome": "invalid",
+                    "planner_reason": "invalid",
                 },
             }
         except Exception as exc:
@@ -214,6 +219,8 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             except Exception:
                 outcome = "failed"
             logger.warning("v2 planner failed closed", extra={"category": outcome})
+            from aa.conversation.answer_adequacy import planner_reason_for as _error_reason_for
+
             return {
                 "search_queries": [],
                 "planner_invoked": True,
@@ -222,6 +229,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_latency_ms": round(elapsed_ms, 1),
                     "planner_query_count": 0,
                     "planner_outcome": outcome,
+                    "planner_reason": _error_reason_for(0, outcome),
                 },
             }
 
