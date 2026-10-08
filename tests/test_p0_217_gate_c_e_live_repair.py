@@ -97,7 +97,7 @@ class _VerifierModel:
 
 async def test_answer_generation_uses_bounded_window_but_verifier_sees_full_pack() -> None:
     """Generation input is bounded; grounding still validates full pack."""
-    assert ANSWER_GENERATION_MAX_PASSAGES == 6
+    assert ANSWER_GENERATION_MAX_PASSAGES == 5
     pack = [_pack_entry(index) for index in range(10)]
     draft = "Поддержка рядом помогает пережить тягу спокойно."
     units = split_response_units(draft)

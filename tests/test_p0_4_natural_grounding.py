@@ -1462,7 +1462,7 @@ def test_verifier_normalizes_weak_provider_formatting() -> None:
     """Boolean transport rejects scope strings; evidence ids trim strictly."""
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
     # Scope-shaped payloads are rejected: the model must emit booleans.
     with pytest.raises(VerifierValidationError):
         validate_unit_decision({"scope": "Book", "supported": True, "evidence_passage_ids": []})
@@ -1502,15 +1502,18 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
     # Short ordinal display ids keep the window bounded and copyable; long
     # provenance ids never enter the prompt (Gate C run 37556798996).
     # Window tightened 8 -> 6 for run 37561542378 (14/14 clarifications,
-    # verifier never served, max 51.4s over budget on the weak fallback).
+    # verifier never served, max 51.4s over budget on the weak fallback),
+    # then 6 -> 5 for kodmial/aa#217 recurrence 7 (exact main 58f943c run
+    # 37709271567: verifier input averages ~3k tokens per slow text-path
+    # request while drafts cite only top-ranked passages).
     assert 'id="p1"' in user_text
-    assert 'id="p6"' in user_text
-    assert 'id="p7"' not in user_text
+    assert 'id="p5"' in user_text
+    assert 'id="p6"' not in user_text
+    assert "chapter-3#exp0005" not in user_text
     assert "chapter-3#exp0006" not in user_text
-    assert "chapter-3#exp0007" not in user_text
     assert "chapter-3#exp0011" not in user_text
     assert len(passages) == 12
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
 
 
 async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
@@ -1942,18 +1945,20 @@ def test_v2_answer_carries_bounded_generation_budget_before_user_message() -> No
 def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
     """Gate C repair (run 37561542378): verifier input fits the live SLO.
 
-    Six top-ranked passages of 800 display chars keep the structured
-    verifier prompt small enough for the weak fallback to serve within
-    budget, while deterministic cite/quote/checksum gates still validate
-    against the full stored pack.
+    Five top-ranked passages of 600 display chars keep the verifier
+    prompt small enough to serve within budget (tightened 6x800 -> 5x600
+    for kodmial/aa#217 recurrence 7, exact main 58f943c run 37709271567:
+    verifier input averages ~3k tokens per slow text-path request while
+    drafts cite only top-ranked passages), while deterministic
+    cite/quote/checksum gates still validate against the full stored pack.
     """
     from aa.conversation.verifier import (
         VERIFIER_MAX_EVIDENCE_PASSAGES,
         VERIFIER_MAX_PASSAGE_CHARS,
     )
 
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 6
-    assert VERIFIER_MAX_PASSAGE_CHARS == 800
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
+    assert VERIFIER_MAX_PASSAGE_CHARS == 600
 
 
 def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:

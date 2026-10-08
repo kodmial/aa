@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -431,6 +432,7 @@ async def _run_planner_provider(
                 # fail-closed on content).
                 pass
         try:
+            attempt_started = time.monotonic()
             raw = await asyncio.wait_for(
                 structured_invoke(
                     user_text,
@@ -445,6 +447,38 @@ async def _run_planner_provider(
                 "planner structured attempt timed out; tailored text fallback used",
                 extra={"category": "structured-attempt-timeout"},
             )
+            # Deadline-aware capability inference (Gate C+E live repair,
+            # kodmial/aa#217 recurrence 7 on exact main 58f943c run
+            # 37709271567: planner p50 8.4s / p95 9.9s with exactly one
+            # audited text request per turn. The recurrence-6 bound works
+            # (no more 10s-wall pinning, tailored plans served), but every
+            # turn still burns the full structured-attempt budget before
+            # the text fallback because a caller-side timeout never
+            # reaches the callee-observed capability cache in
+            # model_adapter (only "structured output missing" marks it).
+            # A true caller-observed deadline expiry is the same evidence:
+            # this path does not serve native structured output within
+            # budget, so later turns go text-direct instead of re-burning
+            # the budget per turn. Only a true deadline expiry marks: a
+            # fast callee-raised timeout keeps the historical path (text
+            # fallback without marking). TTL-bounded (recovery re-probes),
+            # 429 never marks, content validation still fails closed
+            # downstream. Turn-independent, never an exact-question
+            # special case.
+            if time.monotonic() - attempt_started >= structured_attempt_budget:
+                try:
+                    from aa.conversation.model_adapter import (
+                        mark_omitted_structured_unavailable,
+                    )
+                except Exception:
+                    mark_omitted_structured_unavailable = None  # type: ignore[assignment]
+                if mark_omitted_structured_unavailable is not None:
+                    try:
+                        is_omitted_wire = getattr(model, "wire_agent", None) == ""
+                        if is_omitted_wire:
+                            mark_omitted_structured_unavailable(model)
+                    except Exception:
+                        pass
             text_reply = await _invoke_planner_text(
                 model, user_text=user_text, system_text=system_text
             )
