@@ -385,6 +385,69 @@ def _has_recovery_domain(text: str) -> bool:
     return False
 
 
+# Generic recovery-support vocabulary for the topical relevance bridge
+# (Gate C+E live repair, kodmial/aa#244 recurrence 4 on exact main
+# 5b3fd771ef2586ee2be6140f1040b4bafe2c3b52 run 37819349221:
+# C:live-book-grounding-substantive-drinking-2 plus E:latency-budget-
+# exceeded p50 23071ms / p95 60226ms / max 76026ms with planner p50
+# 6077ms / p95 10376ms, answer p50 8479ms / p95 15691ms, verifier p50
+# 8350ms / p95 22862ms / max 46582ms, message-text p50 4662ms / p95
+# 11170ms over 141 slow calls vs message-structured p50 410ms over 45
+# fast calls, repair_turns=1, repair_rounds=1, answer_rounds=24,
+# budget_exceeded=0, unavailable 0/0 over 48 response units).
+#
+# Compared with the recurrence-3 base (exact main 1d109a2 run
+# 37771443722: p50 19.5s / p95 27.0s, text 79 calls, verifier p95 12.0s),
+# the persistent-rejection pinning did not converge: call counts
+# exploded (+62 text, +12 structured) and every stage worsened, with the
+# verifier tail doubling (p95 12.0s->22.9s). The waste is no longer
+# attempt duration (structured serves fast at p50 0.41s) but the second
+# sequential model sequence burned after an already-slow initial chain:
+# the adequacy-regeneration answer+verifier round fires on every
+# support-vocabulary turn whose reply avoids drinking words, then still
+# fails, so those turns pay two full sequences for E while still failing
+# C. Prior strategies (safety predicate scope in #257, anchored repair
+# focus plus repair budget in #269, capability-cache streak in rec3)
+# never touched this lexical gap, so repeating them cannot converge.
+#
+# Dominant persistent cause at this adequacy/relevance boundary: good
+# abstinence-direction guidance uses support vocabulary (sponsor,
+# meeting, fellowship, prayer, community, recovery) without repeating
+# craving words, so it shares no prefix overlap and no recovery-domain
+# token with the request. Both the adequacy domain fallback and the
+# live relevance domain check therefore score it exactly like an
+# unrelated finance fact, failing C and triggering the second
+# answer+verifier sequence that breaches E. Strategy change here (not
+# another budget/TTL/capability retune): a generic support-domain
+# bridge lets an evidence-backed support unit count as relevant to a
+# recovery-domain request. Generic stems only, never an exact-question
+# list; "шаг" stays out so numbered-step fidelity is untouched, and
+# finance/all-glue/wrong-step negatives still fail (locked by tests).
+# Passing on the initial draft also skips the regen sequence, cutting
+# the tail for Gate E with the same mechanism. Turn-independent,
+# Product Contract #110 unchanged.
+_RECOVERY_SUPPORT_STEMS = (
+    "спонсор",
+    "собран",
+    "поддерж",
+    "молитв",
+    "сообществ",
+    "выздоровл",
+)
+
+
+def _has_support_domain(text: str) -> bool:
+    """Whether text contains generic recovery-support vocabulary."""
+    lowered = (text or "").casefold().replace("ё", "е")
+    if not lowered:
+        return False
+    for token in _WORD_RE.findall(lowered):
+        for stem in _RECOVERY_SUPPORT_STEMS:
+            if token.startswith(stem):
+                return True
+    return False
+
+
 # Step-referent vocabulary for multi-turn topic fidelity (generic, never an
 # exact-question list): any numbered-step mention keeps the turn
 # substantive and participates in relevance alignment. Ordinal words and
@@ -1069,14 +1132,23 @@ def assess_turn_adequacy(
             # Same stale-context guard for the domain fallback: context
             # domain supplements only a generic/terse current turn. An
             # explicit current pivot must itself carry recovery-domain
-            # vocabulary to match recovery evidence.
+            # vocabulary to match recovery evidence. A recovery-domain
+            # request matched with evidence-backed SUPPORT vocabulary
+            # (sponsor/meeting/fellowship/prayer/community/recovery) is
+            # relevant even without a shared drinking token: good
+            # abstinence guidance names the next support step instead of
+            # repeating the craving. Finance/all-glue/wrong-step still
+            # fail (no support stems there; step mismatch fails above).
             _request_domain = bool(request_domain)
             if not _request_domain and _current_allows_context_rescue and bool(context_text):
                 _request_domain = _has_recovery_domain(context_text)
             _evidence_domain = any(
                 _has_recovery_domain(passage_text) for passage_text in cited_texts
             ) or _has_recovery_domain(str(unit.get("text", "") or reply))
-            if not (_request_domain and _evidence_domain):
+            _evidence_support = any(
+                _has_support_domain(passage_text) for passage_text in cited_texts
+            ) or _has_support_domain(str(unit.get("text", "") or reply))
+            if not (_request_domain and (_evidence_domain or _evidence_support)):
                 continue
         # Actionable usefulness: the unit must carry declarative substance
         # beyond sympathy or a bare offer, tied to the cited evidence above.

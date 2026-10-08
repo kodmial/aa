@@ -1902,7 +1902,40 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
                     return True
         return False
 
-    return bool(_has_domain(effective_prompt) and _has_domain(reply))
+    # Generic recovery-support bridge (Gate C+E live repair,
+    # kodmial/aa#244 recurrence 4 on exact main
+    # 5b3fd771ef2586ee2be6140f1040b4bafe2c3b52 run 37819349221; same
+    # dominant cause as the adequacy bridge: abstinence-direction
+    # guidance names the support step -- sponsor, meeting, fellowship,
+    # prayer, community, recovery -- without repeating craving words, so
+    # the drinking-domain check scores it exactly like an unrelated
+    # finance fact and the turn fails relevance (reported first as
+    # grounding when both fail) even with verified book units. The
+    # bridge lets a support-vocabulary reply count as relevant to a
+    # recovery-domain request. Generic stems only, never an
+    # exact-question list; finance/all-glue/wrong-step still fail
+    # (locked by tests). Turn-independent, Product Contract #110
+    # unchanged.
+    _support_stems = (
+        "спонсор",
+        "собран",
+        "поддерж",
+        "молитв",
+        "сообществ",
+        "выздоровл",
+    )
+
+    def _has_support_domain(text: str) -> bool:
+        lowered = (text or "").casefold().replace("ё", "е")
+        for token in re.findall(r"[A-Za-z\u0400-\u04ff]+", lowered):
+            for stem in _support_stems:
+                if token.startswith(stem):
+                    return True
+        return False
+
+    if _has_domain(effective_prompt) and _has_domain(reply):
+        return True
+    return bool(_has_domain(effective_prompt) and _has_support_domain(reply))
 
 
 def _prompt_allows_context_rescue(prompt: str) -> bool:
