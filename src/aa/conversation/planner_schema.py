@@ -70,11 +70,10 @@ def validate_query_plan(plan: QueryPlan) -> QueryPlan:
       non-empty ``resolved_intent``;
     - no lexical, semantic or domain judgment is applied here.
 
-    Migration leniency (schema only, no meaning inferred): a legacy
-    empty-queries plan without an explicit conversational mode normalizes
-    to conversational, and a legacy retrieval plan without an explicit
-    intent derives it mechanically from the first query. Production
-    planner output always carries explicit values.
+    There is deliberately no semantic migration leniency here.
+    An explicit retrieval plan with empty queries or empty resolved_intent
+    is invalid and must fail closed into the generic retrieval fallback;
+    it must never be reinterpreted as conversational glue.
     """
     mode = plan.mode
     if mode not in ("conversational", "retrieval"):
@@ -85,14 +84,12 @@ def validate_query_plan(plan: QueryPlan) -> QueryPlan:
     if len(intent) > MAX_RESOLVED_INTENT_CHARS:
         raise QueryPlanValidationError("resolved_intent exceeds the length budget")
     queries = normalize_queries(list(plan.queries))
-    if not queries:
-        return QueryPlan(mode="conversational", resolved_intent="", queries=[])
-    if not intent:
-        intent = queries[0][:MAX_RESOLVED_INTENT_CHARS]
     if mode == "conversational":
         if queries:
             raise QueryPlanValidationError("conversational plans must carry zero queries")
         return QueryPlan(mode="conversational", resolved_intent="", queries=[])
+    if not intent:
+        raise QueryPlanValidationError("retrieval plans require a non-empty resolved_intent")
     if not MIN_NONEMPTY_QUERIES <= len(queries) <= MAX_QUERIES:
         raise QueryPlanValidationError(
             "non-empty plans require "
