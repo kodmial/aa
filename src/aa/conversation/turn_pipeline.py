@@ -181,6 +181,7 @@ def _effective_turn_budget_s() -> float:
 def _effective_repair_budget_s() -> float:
     return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
 
+
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."

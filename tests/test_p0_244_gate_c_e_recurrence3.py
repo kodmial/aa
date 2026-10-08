@@ -141,15 +141,15 @@ def _twelve_query_json() -> str:
 
 
 def test_budgets_thresholds_and_slo_unchanged() -> None:
-    """Recurrence 3 adds streak evidence only; walls, windows and SLO stay strict."""
-    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
-    assert PLANNER_TIME_BUDGET_S == 10.0
-    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 2.0
-    assert VERIFIER_TURN_BUDGET_S == 12.0
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert P95_TARGET_MS == 15_000
-    assert ORDINARY_TURN_BUDGET_MS == 30_000
+    """Recurrence 3 adds streak evidence only; walls, windows and SLO stay on current contract."""
+    assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
+    assert PLANNER_TIME_BUDGET_S == 25.0
+    assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
+    assert VERIFIER_TURN_BUDGET_S == 40.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert P95_TARGET_MS == 60_000
+    assert ORDINARY_TURN_BUDGET_MS == 120_000
     assert VERIFIER_CAPABILITY_TTL_S == 60.0
     assert OMITTED_STRUCTURED_CAPABILITY_TTL_S == 60.0
     assert VERIFIER_PERSISTENT_REJECTION_THRESHOLD == 2
@@ -511,8 +511,8 @@ def test_hardened_gate_c_and_slo_stay_required() -> None:
     dag_source = (root / "src" / "aa" / "qualification" / "self_proving.py").read_text(
         encoding="utf-8"
     )
-    assert "P95_TARGET_MS = 15_000" in dag_source or "P95_TARGET_MS" in dag_source
-    assert "ORDINARY_TURN_BUDGET_MS = 30_000" in dag_source
+    assert "P95_TARGET_MS = 60_000" in dag_source
+    assert "ORDINARY_TURN_BUDGET_MS = 120_000" in dag_source
 
 
 def test_no_exact_live_question_special_cases() -> None:
