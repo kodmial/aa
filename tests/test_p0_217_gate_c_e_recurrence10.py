@@ -126,7 +126,10 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=125000.0,
+        # Temporary quality-first SLO: end-to-end budget is 105s (< 120s
+        # hard SLO), so a spent turn needs upstream past 105s (was 35s
+        # under the old 27s budget).
+        upstream_latency_ms=110000.0,
     )
     assert time.perf_counter() - started < 5.0
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -167,7 +170,11 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=103500.0,
+        # Temporary quality-first SLO: 105s end-to-end budget. Upstream
+        # 103s leaves ~2s remaining: the answer still runs (1s min
+        # slice) but the verifier round cannot usefully start (3s min
+        # slice), so it skips to retry. Was 25s under the old 27s budget.
+        upstream_latency_ms=103000.0,
     )
     assert answer.calls == 1
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -227,9 +234,14 @@ async def test_verifier_receives_reduced_remaining_budget(
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=75000.0,
+        # Temporary quality-first SLO: 105s end-to-end budget with a 40s
+        # verifier default. Upstream 97s leaves ~8s remaining: below the
+        # 40s verifier default (reduced slice propagates) but above the
+        # 3s skip floor (round still runs). Was 19s under the old 27s
+        # budget with a 12s verifier default.
+        upstream_latency_ms=97000.0,
     )
-    # Remaining is ~30s: below the 40s verifier default (reduced slice
+    # Remaining is ~8s: below the 40s verifier default (reduced slice
     # propagates) but above the 3s skip floor (round still runs).
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
@@ -257,7 +269,10 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
-            clock["now"] += 115.0
+            # Temporary quality-first SLO: the turn must spend past the
+            # 105s end-to-end budget to serve retry (was 30s under the
+            # old 27s budget).
+            clock["now"] += 110.0
             return {
                 "requires_book_evidence": True,
                 "supported": False,
