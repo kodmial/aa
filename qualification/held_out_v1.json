@@ -1,0 +1,37 @@
+{
+  "version": "aa-held-out-eval-corpus/1",
+  "description": "Versioned held-out evaluation corpus with broad unseen Russian language variation. Repair agents receive aggregate failure categories and traces, never literal held-out prompts. Production and qualification code must not parse domain meaning from these entries.",
+  "categories": [
+    "multi-turn-referents-ellipsis-pronouns",
+    "abrupt-topic-switches",
+    "typos-slang",
+    "personal-disclosures",
+    "narrow-book-questions",
+    "broad-book-questions",
+    "arbitrary-book-concepts-not-only-steps",
+    "unsupported-out-of-book-requests",
+    "adversarial-irrelevant-but-grounded-answers",
+    "long-context-cases"
+  ],
+  "tracking": [
+    "retrieval-recall-relevance",
+    "groundedness-faithfulness",
+    "answer-relevance-helpfulness",
+    "safety",
+    "latency"
+  ],
+  "entries": [
+    {"id": "held-out-001", "category": "multi-turn-referents-ellipsis-pronouns", "chat": "held-out-A", "turn": 1, "prompt_kind": "broad-book-question-with-pronoun-context-setup"},
+    {"id": "held-out-002", "category": "multi-turn-referents-ellipsis-pronouns", "chat": "held-out-A", "turn": 2, "prompt_kind": "elliptical-followup-referring-to-prior-turn"},
+    {"id": "held-out-003", "category": "abrupt-topic-switches", "chat": "held-out-A", "turn": 3, "prompt_kind": "explicit-new-topic-pivot-must-not-inherit-history"},
+    {"id": "held-out-004", "category": "typos-slang", "chat": "held-out-B", "turn": 1, "prompt_kind": "typo-slang-paraphrase-of-support-request"},
+    {"id": "held-out-005", "category": "personal-disclosures", "chat": "held-out-B", "turn": 2, "prompt_kind": "short-first-person-disclosure-continuation"},
+    {"id": "held-out-006", "category": "narrow-book-questions", "chat": "held-out-C", "turn": 1, "prompt_kind": "narrow-book-question-arbitrary-concept"},
+    {"id": "held-out-007", "category": "broad-book-questions", "chat": "held-out-C", "turn": 2, "prompt_kind": "broad-book-question-same-chat-continuation"},
+    {"id": "held-out-008", "category": "arbitrary-book-concepts-not-only-steps", "chat": "held-out-D", "turn": 1, "prompt_kind": "unseen-book-concept-same-path-as-any-other"},
+    {"id": "held-out-009", "category": "unsupported-out-of-book-requests", "chat": "held-out-E", "turn": 1, "prompt_kind": "out-of-book-request-must-not-receive-book-answer"},
+    {"id": "held-out-010", "category": "adversarial-irrelevant-but-grounded-answers", "chat": "held-out-E", "turn": 2, "prompt_kind": "irrelevant-but-grounded-must-fail-relevance"},
+    {"id": "held-out-011", "category": "long-context-cases", "chat": "held-out-F", "turn": 8, "prompt_kind": "long-conversation-continuity-with-summary"},
+    {"id": "held-out-012", "category": "multi-turn-referents-ellipsis-pronouns", "chat": "held-out-F", "turn": 9, "prompt_kind": "terse-followup-resolved-from-conversation-state"}
+  ]
+}

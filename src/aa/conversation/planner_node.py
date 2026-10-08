@@ -27,7 +27,6 @@ from pydantic import ValidationError
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.planner_schema import (
-    MAX_QUERIES,
     MIN_NONEMPTY_QUERIES,
     PLANNER_MAX_ATTEMPTS,
     QueryPlan,
@@ -138,8 +137,8 @@ def query_plan_json_schema() -> dict[str, Any]:
 
     OpenCode owns bounded structured-output retries, so constraints that can
     be expressed in JSON Schema must live here rather than only in the
-    post-response Pydantic validator. This makes 1..9/17+ query plans, exact
-    duplicate strings, and blank items retryable inside the same planner call.
+    post-response Pydantic validator. Only schema/cardinality lives here;
+    no semantic judgment is expressed.
     """
     schema = dict(QueryPlan.model_json_schema())
     properties = dict(schema["properties"])
@@ -148,13 +147,50 @@ def query_plan_json_schema() -> dict[str, Any]:
     items["pattern"] = r"\S"
     queries["items"] = items
     queries["uniqueItems"] = True
-    queries["anyOf"] = [
-        {"maxItems": 0},
-        {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
-    ]
     properties["queries"] = queries
     schema["properties"] = properties
+    schema["required"] = ["mode", "resolved_intent", "queries"]
     return schema
+
+
+def build_generic_fallback_queries(
+    user_message: str,
+    *,
+    summary: str = "",
+    recent: list[str] | None = None,
+    max_queries: int = 12,
+) -> list[str]:
+    """Build a generic semantic retrieval fallback without interpreting meaning.
+
+    Used only when planner execution fails. The raw current turn plus
+    bounded recent conversation supply retrieval inputs; provider failure
+    is never reinterpreted as conversational glue, so this always returns
+    a non-empty retrieval query set when the turn has any text.
+    """
+    cleaned = " ".join((user_message or "").split()).strip()
+    if not cleaned:
+        return []
+    queries: list[str] = [cleaned]
+    summary_cleaned = " ".join((summary or "").split()).strip()
+    if summary_cleaned:
+        candidate = f"{cleaned} {summary_cleaned[:240]}".strip()
+        candidate = " ".join(candidate.split())
+        if candidate and candidate.casefold() not in {item.casefold() for item in queries}:
+            queries.append(candidate)
+    for item in list(recent or [])[:4]:
+        text = " ".join(str(item).split()).strip()
+        if not text or len(text) < 2:
+            continue
+        candidate = f"{cleaned} {text[:200]}".strip()
+        candidate = " ".join(candidate.split())
+        if candidate.casefold() in {entry.casefold() for entry in queries}:
+            continue
+        queries.append(candidate)
+        if len(queries) >= max_queries:
+            break
+    while len(queries) < MIN_NONEMPTY_QUERIES and len(queries) > 1:
+        queries.append(cleaned)
+    return queries[:max_queries]
 
 
 def _render_context_value(value: object) -> str:
@@ -246,10 +282,13 @@ def _reply_structured_content(reply: object) -> object:
 # Provider 429 always propagates immediately and never triggers the
 # text path. Turn-independent, never an exact-question special case.
 PLANNER_TEXT_JSON_SUFFIX = (
-    "\n\nReturn ONLY a JSON object with exactly one key: "
-    '{"queries": array of strings}. '
-    'Use {"queries": []} for purely conversational glue; otherwise '
-    "return 10 to 16 semantically distinct Russian search queries. "
+    "\n\nReturn ONLY a JSON object with exactly these keys: "
+    '{"mode": "conversational"|"retrieval", '
+    '"resolved_intent": string, "queries": array of strings}. '
+    'Use {"mode": "conversational", "resolved_intent": "", "queries": []} '
+    "only for purely conversational turns; otherwise return "
+    '{"mode": "retrieval", "resolved_intent": standalone intent, '
+    '"queries": 10 to 16 Russian search queries}. '
     "No other text, no markdown, no explanation."
 )
 
@@ -575,12 +614,13 @@ async def planner_node(
     *,
     model: Runnable[list[BaseMessage], BaseMessage] | Any,
 ) -> dict[str, Any]:
-    """LangGraph planner node: hidden plan into ``search_queries``.
+    """LangGraph planner node: hidden model-driven plan into state.
 
     Only orchestration state is written; ``messages`` is left untouched so
     hidden calls never pollute the user-facing conversation. The full
     framework-managed history is consumed; no fixed message-count slice is
-    applied.
+    applied. The plan carries ``mode``, ``resolved_intent`` and ``queries``;
+    application code validates schema/cardinality only.
     """
     user_message = str(state.get("current_user_message", ""))
     summary = str(state.get("conversation_summary", ""))
@@ -590,7 +630,12 @@ async def planner_node(
     if recent and recent[-1].type == "human" and user_message:
         recent = recent[:-1]
     plan = await run_planner(user_message, model=model, summary=summary, recent=recent)
-    return {"search_queries": list(plan.queries), "planner_invoked": True}
+    return {
+        "search_queries": list(plan.queries),
+        "planner_invoked": True,
+        "planner_mode": str(plan.mode),
+        "resolved_intent": str(plan.resolved_intent),
+    }
 
 
 __all__ = [
@@ -598,6 +643,7 @@ __all__ = [
     "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S",
     "PLANNER_TEXT_JSON_SUFFIX",
     "PLANNER_TIME_BUDGET_S",
+    "build_generic_fallback_queries",
     "build_planner_messages",
     "parse_planner_text_json",
     "planner_node",

@@ -194,7 +194,7 @@ async def test_budget_breach_retry_is_explicit_failure_for_gate_c() -> None:
 
 
 async def test_planner_timeout_is_classified_not_graph_crash() -> None:
-    """Planner provider timeouts land in stage telemetry with empty queries."""
+    """Planner provider timeouts land in stage telemetry with fallback queries."""
 
     def _timeout(messages: Any) -> Any:
         _ = messages
@@ -203,10 +203,13 @@ async def test_planner_timeout_is_classified_not_graph_crash() -> None:
     node = make_planner_node(planner_model=RunnableLambda(_timeout))
     result = await node(turn_input("вечером тяжело без выпивки"))
     assert result["planner_invoked"] is True
-    assert result["search_queries"] == []
+    # Generic fallback supplies retrieval queries instead of empty.
+    assert len(result["search_queries"]) >= 1
+    assert result["planner_mode"] == "retrieval"
     retry_state = result["retry_state"]
-    assert retry_state["planner_query_count"] == 0
+    assert retry_state["planner_query_count"] == len(result["search_queries"])
     assert retry_state["planner_outcome"] == "timeout"
+    assert retry_state["planner_reason"] == "timeout"
 
 
 async def test_planner_timeout_in_graph_keeps_telemetry() -> None:
@@ -219,7 +222,8 @@ async def test_planner_timeout_in_graph_keeps_telemetry() -> None:
     graph = build_turn_graph(planner_model=RunnableLambda(_timeout))
     result = await graph.ainvoke(turn_input("вечером тяжело без выпивки"))
     assert result["planner_invoked"] is True
-    assert result["search_queries"] == []
+    assert len(result["search_queries"]) >= 1
+    assert result["planner_mode"] == "retrieval"
     assert result["retry_state"]["planner_outcome"] == "timeout"
 
 

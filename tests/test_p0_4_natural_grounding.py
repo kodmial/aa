@@ -1613,11 +1613,17 @@ def test_verifier_single_schema_is_ref_free_without_ids() -> None:
     assert "scope" not in dumped
     assert "all_required_supported" not in dumped
     props = cast(dict[str, Any], schema["properties"])
-    assert set(props) == {"requires_book_evidence", "supported", "evidence_passage_ids"}
+    assert set(props) == {
+        "requires_book_evidence",
+        "supported",
+        "evidence_passage_ids",
+        "addresses_intent",
+    }
     assert schema["required"] == [
         "requires_book_evidence",
         "supported",
         "evidence_passage_ids",
+        "addresses_intent",
     ]
 
 

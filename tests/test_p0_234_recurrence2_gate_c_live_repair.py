@@ -74,11 +74,13 @@ class _VerifierSupportsGroundedOnly:
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": False,
             }
         return {
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["chapter-3#exp0000"],
+            "addresses_intent": True,
         }
 
 
@@ -159,22 +161,31 @@ async def test_regen_partial_support_serves_narrowed_instead_of_retry() -> None:
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
             _ = (system, schema, retry_count)
-            if "Рад, что ты написал" in prompt and _GROUNDED[:12] not in prompt:
+            # Judge only the response unit: evidence always carries grounded
+            # text, so whole-prompt checks misclassify glue as supported.
+            if "<response_unit>" in prompt and "</response_unit>" in prompt:
+                unit_text = prompt.split("<response_unit>", 1)[1].split("</response_unit>", 1)[0]
+            else:
+                unit_text = prompt
+            if "Рад, что ты написал" in unit_text or unit_text.strip() == "Привет!":
                 return {
                     "requires_book_evidence": False,
                     "supported": True,
                     "evidence_passage_ids": [],
+                    "addresses_intent": True,
                 }
-            if _GROUNDED[:12] in prompt:
+            if _GROUNDED[:12] in unit_text:
                 return {
                     "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["chapter-3#exp0000"],
+                    "addresses_intent": True,
                 }
             return {
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": False,
             }
 
     outcome = await pipeline.run_v2_answer_turn(

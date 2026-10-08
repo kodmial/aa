@@ -80,7 +80,13 @@ def _twelve_queries() -> list[str]:
 
 
 def _plan_obj(queries: list[str]) -> dict[str, Any]:
-    return {"queries": queries}
+    if not queries:
+        return {"mode": "conversational", "resolved_intent": "", "queries": []}
+    return {
+        "mode": "retrieval",
+        "resolved_intent": "standalone intent for test turn",
+        "queries": queries,
+    }
 
 
 def _script_model(
@@ -132,7 +138,7 @@ def test_planner_dedupes_whitespace_case_duplicates() -> None:
 
 
 def test_planner_schema_has_only_queries_field() -> None:
-    assert set(QueryPlan.model_fields) == {"queries"}
+    assert set(QueryPlan.model_fields) == {"mode", "resolved_intent", "queries"}
     assert MIN_NONEMPTY_QUERIES == 10
     assert MAX_QUERIES == 16
 
@@ -153,14 +159,13 @@ def test_query_plan_json_schema_derives_from_pydantic() -> None:
     schema = query_plan_json_schema()
     assert schema["type"] == "object"
     assert "queries" in schema["properties"]
+    assert "mode" in schema["properties"]
+    assert "resolved_intent" in schema["properties"]
+    assert schema["required"] == ["mode", "resolved_intent", "queries"]
     queries = schema["properties"]["queries"]
     assert queries["items"]["type"] == "string"
     assert queries["items"]["pattern"] == r"\S"
     assert queries["uniqueItems"] is True
-    assert queries["anyOf"] == [
-        {"maxItems": 0},
-        {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
-    ]
 
 
 def test_planner_node_has_no_text_json_machinery() -> None:

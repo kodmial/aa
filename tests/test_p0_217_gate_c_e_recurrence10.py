@@ -193,8 +193,16 @@ async def test_verifier_receives_reduced_remaining_budget(
     captured: dict[str, Any] = {}
 
     async def _recorder(
-        units: Any, passages: Any, *, model: Any, turn_budget_s: float | None = None
+        units: Any,
+        passages: Any,
+        *,
+        model: Any,
+        turn_budget_s: float | None = None,
+        resolved_intent: str = "",
+        user_message: str = "",
+        conversation_context: str = "",
     ) -> GroundingResult:
+        _ = (resolved_intent, user_message, conversation_context)
         captured["turn_budget_s"] = turn_budget_s
         captured["units"] = len(list(units))
         pack_ids = {
@@ -210,11 +218,14 @@ async def test_verifier_receives_reduced_remaining_budget(
                     scope="book",
                     supported=True,
                     evidence_passage_ids=[cited],
+                    addresses_intent=True,
                 )
                 for unit in units
             ],
             all_required_supported=True,
             unavailable_unit_ids=[],
+            answer_relevant=True,
+            relevance_category="",
         )
 
     monkeypatch.setattr(pipeline, "run_verifier", _recorder)

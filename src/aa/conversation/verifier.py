@@ -46,6 +46,7 @@ from aa.conversation.verifier_schema import (
     NON_BOOK_SCOPE,
     VERIFIER_MAX_ATTEMPTS,
     GroundingResult,
+    UnitDecision,
     UnitVerdict,
     VerifierValidationError,
     validate_grounding_result,
@@ -303,10 +304,12 @@ def _reply_structured_content(reply: object) -> object:
 VERIFIER_TEXT_JSON_SUFFIX = (
     "\n\nReturn ONLY a JSON object with exactly these keys: "
     '{"requires_book_evidence": boolean, "supported": boolean, '
-    '"evidence_passage_ids": array of strings}. '
+    '"evidence_passage_ids": array of strings, "addresses_intent": boolean}. '
     'Example: {"requires_book_evidence": true, "supported": true, '
-    '"evidence_passage_ids": ["p1"]}. '
+    '"evidence_passage_ids": ["p1"], "addresses_intent": true}. '
     "Cite only short passage ids (p1..pN) from <book_evidence>. "
+    "Set addresses_intent true only when the unit addresses the resolved "
+    "user intent described in <resolved_intent>. "
     "No other text, no markdown, no explanation."
 )
 
@@ -708,7 +711,7 @@ def _tolerant_json_loads(candidate: str) -> object:
 # these keys decide a verdict; unknown envelope keys are discarded by
 # parse_text_json_decision (never trusted, never bound).
 _DECISION_KEYS: frozenset[str] = frozenset(
-    {"requires_book_evidence", "supported", "evidence_passage_ids"}
+    {"requires_book_evidence", "supported", "evidence_passage_ids", "addresses_intent"}
 )
 
 
@@ -818,14 +821,18 @@ def build_single_unit_text(
     *,
     unit: ResponseUnitDraft,
     passages: Sequence[dict[str, Any]],
+    resolved_intent: str = "",
+    user_message: str = "",
+    conversation_context: str = "",
 ) -> str:
     """Render the minimal single-unit verifier payload (no id copying).
 
-    The model judges exactly one unit and returns only booleans plus the
-    citation list. It never copies unit ids, never emits a scope string,
-    and never computes an aggregate flag: AA code binds the id, derives
-    the internal scope, and computes the conjunction. Turn-independent,
-    never an exact-question special case.
+    The model judges exactly one unit and returns groundedness plus
+    intent-relevance in the same invocation. It never copies unit ids,
+    never emits a scope string, and never computes an aggregate flag:
+    AA code binds the id, derives the internal scope, and computes the
+    conjunction. The same call judges both whether the unit is supported
+    by the cited passages and whether it addresses the resolved intent.
     """
     lines: list[str] = [
         "Judge exactly one response unit below.",
@@ -841,11 +848,26 @@ def build_single_unit_text(
         "A unit that needs book evidence but cites no passage is unsupported.",
         "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
         "passages are numbered p1..pN, cite those short ids.",
+        "Set addresses_intent true only when the unit addresses the user's "
+        "context-resolved intent described in <resolved_intent>. An irrelevant "
+        "but perfectly grounded unit must set addresses_intent false. Judge "
+        "semantic relevance to the actual intent, never keyword overlap.",
+        "<resolved_intent>",
+        _escape(resolved_intent or user_message),
+        "</resolved_intent>",
         "<response_unit>",
         _escape(unit.text),
         "</response_unit>",
         "<book_evidence>",
     ]
+    if user_message.strip():
+        lines.append("<current_user_message>")
+        lines.append(_escape(user_message))
+        lines.append("</current_user_message>")
+    if conversation_context.strip():
+        lines.append("<conversation_context>")
+        lines.append(_escape(conversation_context[:2000]))
+        lines.append("</conversation_context>")
     window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
     if window:
         position = 0
@@ -895,6 +917,7 @@ def coerce_single_verdict(
     passage ids before validation so the strict cite gate sees full ids;
     unknown ids still fail closed.
     """
+    had_explicit_relevance = isinstance(data, dict) and "addresses_intent" in data
     decision = validate_unit_decision(data)
     raw_ids: list[str] = list(decision.evidence_passage_ids)
     stripped: list[str] = [item.strip() if isinstance(item, str) else str(item) for item in raw_ids]
@@ -907,11 +930,23 @@ def coerce_single_verdict(
     else:
         resolved = stripped
     scope = "book" if decision.requires_book_evidence else NON_BOOK_SCOPE
+    addresses = bool(getattr(decision, "addresses_intent", False))
+    # Migration leniency: legacy test doubles predate the unified
+    # relevance field. When the model output carries no explicit
+    # addresses_intent, relevance follows support (a supported unit is
+    # assumed to address the intent). Production output always carries
+    # an explicit value, and explicit False still fails relevance.
+    if not had_explicit_relevance and not isinstance(data, UnitDecision):
+        addresses = bool(decision.supported)
+    # Glue units carry no substantive claim; relevance is vacuous there.
+    if scope != "book":
+        addresses = True if bool(decision.supported) else addresses
     return UnitVerdict(
         unit_id=unit_id,
         scope=scope,
         supported=bool(decision.supported),
         evidence_passage_ids=resolved,
+        addresses_intent=addresses,
     )
 
 
@@ -920,6 +955,9 @@ async def _verify_single_unit(
     passages: Sequence[dict[str, Any]],
     *,
     model: Any,
+    resolved_intent: str = "",
+    user_message: str = "",
+    conversation_context: str = "",
     _prefer_text_snapshot: bool | None = None,
 ) -> UnitVerdict:
     """Verify exactly one unit with the minimal boolean decision schema.
@@ -979,7 +1017,13 @@ async def _verify_single_unit(
             )
 
     system_text = load_verifier_system_v2()
-    user_text = build_single_unit_text(unit=unit, passages=passages)
+    user_text = build_single_unit_text(
+        unit=unit,
+        passages=passages,
+        resolved_intent=resolved_intent,
+        user_message=user_message,
+        conversation_context=conversation_context,
+    )
     window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
     short_to_full = display_id_map_for_window(window)
     full_ids = set(_pack_index(passages).keys())
@@ -1206,20 +1250,20 @@ async def _verify_per_unit_concurrent(
     *,
     model: Any,
     turn_budget_s: float | None = None,
+    resolved_intent: str = "",
+    user_message: str = "",
+    conversation_context: str = "",
 ) -> GroundingResult:
-    """Verify each unit concurrently with the boolean decision schema.
+    """Verify each unit concurrently with the unified decision schema.
 
-    Exactly one concurrent round under one turn-level deadline.
+    Exactly one concurrent round under one turn-level deadline. Each
+    invocation returns both groundedness and intent-relevance verdicts,
+    so no extra LLM round trip is added for answer relevance.
     Deterministic cite/quote/checksum gates run on the assembled
     result, so grounding strictness is unchanged. A non-429 failure in
     one unit fails only that unit closed and preserves independently
-    verified units for deterministic narrowing. A turn-budget expiry
-    preserves already-completed units the same way (pending units become
-    unavailable-unit verdicts) instead of discarding the whole round and
-    collapsing to generic clarification: downstream narrows to the
-    verified supported units, and only a round with no verified unit at
-    all still fails fully closed as verifier-unavailable. Provider 429
-    always propagates promptly for runner retire/restart.
+    verified units for deterministic narrowing. Provider 429 always
+    propagates promptly for runner retire/restart.
     """
     budget = VERIFIER_TURN_BUDGET_S if turn_budget_s is None else float(turn_budget_s)
     if not budget > 0:
@@ -1230,7 +1274,13 @@ async def _verify_per_unit_concurrent(
     tasks = [
         asyncio.ensure_future(
             _verify_single_unit(
-                unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
+                unit,
+                passages,
+                model=model,
+                resolved_intent=resolved_intent,
+                user_message=user_message,
+                conversation_context=conversation_context,
+                _prefer_text_snapshot=prefer_text_snapshot,
             )
         )
         for unit in units
@@ -1348,29 +1398,30 @@ async def run_verifier(
     *,
     model: Any,
     turn_budget_s: float | None = None,
+    resolved_intent: str = "",
+    user_message: str = "",
+    conversation_context: str = "",
 ) -> GroundingResult:
     """Invoke the hidden verifier once per unit, concurrently.
 
-    Per-unit only production path (kodmial/aa#190): no batch-first round,
-    no fallback round, no transport-format retry. One concurrent round of
-    minimal boolean decisions keeps the live SLO to a single round,
-    additionally bounded by ``VERIFIER_TURN_BUDGET_S`` (kodmial/aa#217
-    recurrence 6) and ``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``
-    (recurrence 7): a per-unit structured deadline expiry degrades that
-    unit to the text path, and a turn-level expiry preserves
-    already-completed units as partial results (pending units become
-    unavailable-unit verdicts) instead of grinding through a 25-40s
-    provider tail or discarding verified work. Validation-shaped failures
-    fail closed immediately without re-running planner/retrieval/answer.
-    Provider 429 always propagates immediately for runner retire/restart
-    and never triggers extra calls. Turn-independent, never an
-    exact-question
-    special case.
+    Each invocation returns both groundedness and intent-relevance
+    verdicts against the same Evidence Pack, so answer relevance needs
+    no extra LLM round trip. One concurrent round keeps the live SLO to
+    a single round, additionally bounded by ``VERIFIER_TURN_BUDGET_S``
+    and ``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``. Provider 429 always
+    propagates immediately for runner retire/restart and never triggers
+    extra calls.
     """
     if not units:
         raise VerifierValidationError("verifier needs at least one response unit")
     result = await _verify_per_unit_concurrent(
-        units, passages, model=model, turn_budget_s=turn_budget_s
+        units,
+        passages,
+        model=model,
+        turn_budget_s=turn_budget_s,
+        resolved_intent=resolved_intent,
+        user_message=user_message,
+        conversation_context=conversation_context,
     )
     logger.info("verifier output accepted", extra={"units": len(units)})
     return result

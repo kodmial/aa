@@ -329,7 +329,13 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
         return _fail_b(expected_sha, run_id, product, runtime, "planner-shape", type(exc).__name__)
     # -- planner cardinality/shape (real production schema) --
     try:
-        plan = validate_query_plan(QueryPlan(queries=[f"запрос {i}" for i in range(12)]))
+        plan = validate_query_plan(
+            QueryPlan(
+                mode="retrieval",
+                resolved_intent="запрос 0",
+                queries=[f"запрос {i}" for i in range(12)],
+            )
+        )
         if not 10 <= len(plan.queries) <= 16:
             return _fail_b(
                 expected_sha,
@@ -340,7 +346,7 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 "cardinality out of bounds",
             )
         try:
-            validate_query_plan(QueryPlan(queries=["q0"]))
+            validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="q0", queries=["q0"]))
             return _fail_b(
                 expected_sha,
                 run_id,

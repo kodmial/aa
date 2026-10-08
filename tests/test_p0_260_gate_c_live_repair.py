@@ -1,32 +1,15 @@
-"""P0 kodmial/aa#260: repair Gate C live-production-path failures.
+"""P0 kodmial/aa#268: Gate C live repair on the model-driven architecture.
 
-Proven product failures on exact main c113c31920e5ed99f62d6bf400e03d2870c0b824
-(run 37790650674):
-
-- C:live-meta-direct-1 (a natural capability probe served an evasive or
-  fallback reply instead of a direct capability answer);
-- C:live-book-grounding-substantive-drinking-11 plus
-  C:live-answer-relevance-long-conversation-17 (two book-grounded turns
-  lost on relevance/grounding while siblings passed);
-- C:live-answer-no-generic-collapse (one turn collapsed to a retry
-  fallback) plus C:live-substantive-grounded-book-answer (6/8 grounded).
-
-Diagnosis at the production-path boundary (turn-independent, no
-exact-question special cases, Product Contract #110 unchanged):
-
-- the meta classifier only recognized contiguous marker substrings, so
-  ordinary capability paraphrases with split capability tokens were
-  misrouted to the substantive book path, where adequacy demanded book
-  evidence for a capability question and the turn collapsed to retry;
-- whole-turn relevance compared only the immediate prompt, so a terse
-  contextual follow-up in an ongoing conversation failed even when the
-  evidence-backed answer continued the resolved topic.
-
-Fix: token-level structural capability recognition (second person plus
-capability vocabulary in a short single-segment probe, neutral filler
-scaffolding ignored, recovery domain still substantive) and
-same-conversation context resolution for relevance in both production
-adequacy and the live qualification lane.
+The #260 token-level capability classifier and prompt-combining relevance
+heuristics are replaced: the hidden planner decides glue vs substantive
+through its mode (conversational with zero queries is glue, retrieval is
+substantive regardless of wording), and whole-turn relevance comes from
+the unified verifier verdicts (per-unit ``addresses_intent`` plus
+turn-level ``answer_relevant``). Prior turns were already resolved into
+the planner intent, so they are accepted for compatibility and ignored.
+The live qualification lane judges relevance with
+``assess_reply_relevance_with_rubric`` over authoritative telemetry (or
+an injected judge), failing closed without either signal.
 """
 
 from __future__ import annotations
@@ -54,10 +37,13 @@ def _pack_entry(
 def _book_grounding(
     passage_id: str = "chapter-3#exp0000",
     unit_text: str = "Поддержка рядом помогает пережить тягу сегодня.",
+    addresses_intent: bool = True,
+    answer_relevant: bool = True,
 ) -> dict[str, Any]:
     return {
         "verified": True,
         "all_required_supported": True,
+        "answer_relevant": answer_relevant,
         "units": [
             {
                 "unit_id": "u1",
@@ -65,35 +51,49 @@ def _book_grounding(
                 "supported": True,
                 "evidence_passage_ids": [passage_id],
                 "text": unit_text,
+                "addresses_intent": addresses_intent,
             }
         ],
     }
 
 
-def test_natural_capability_probes_are_meta() -> None:
-    from aa.conversation.answer_adequacy import is_meta_request
+def test_conversational_mode_with_zero_queries_is_glue() -> None:
+    from aa.conversation.answer_adequacy import is_conversational_plan
 
-    assert is_meta_request("Ты кто?") is True
-    assert is_meta_request("Что ты умеешь?") is True
-    assert is_meta_request("Ты можешь быть полезен?") is True
-    assert is_meta_request("А ты вообще что умеешь?") is True
+    assert is_conversational_plan(mode="conversational", query_count=0) is True
+    assert is_conversational_plan(mode="conversational", query_count=4) is False
 
 
-def test_capability_prefix_with_recovery_request_stays_substantive() -> None:
-    from aa.conversation.answer_adequacy import is_meta_request
+def test_retrieval_mode_is_substantive_regardless_of_wording() -> None:
+    from aa.conversation.answer_adequacy import assess_turn_adequacy, is_conversational_plan
 
-    assert is_meta_request("Ты кто? Помоги с тягой вечером.") is False
-    assert is_meta_request("Вечером тяжело, сильная тяга, как справиться?") is False
-    assert is_meta_request("Подскажи, как справиться с желанием?") is False
-    assert is_meta_request("Привет! Помоги разобраться с тягой вечером?") is False
+    # Mode alone decides; no turn text is inspected here.
+    assert is_conversational_plan(mode="retrieval", query_count=0) is False
+    assert is_conversational_plan(mode="retrieval", query_count=12) is False
+    for wording in (
+        "frozen-260-marker-alpha capability wording",
+        "frozen-260-marker-beta capability wording",
+    ):
+        pack = [_pack_entry()]
+        verdict = assess_turn_adequacy(
+            user_message=wording,
+            reply="Поддержка рядом помогает пережить тягу сегодня.",
+            evidence_pack=pack,
+            grounding_result=_book_grounding(),
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent=wording,
+        )
+        assert verdict.verdict == "pass"
+        assert verdict.substantive_request is True
 
 
 def test_meta_without_book_passes_adequacy_as_glue() -> None:
     from aa.conversation.answer_adequacy import assess_turn_adequacy
 
     verdict = assess_turn_adequacy(
-        user_message="Ты можешь быть полезен?",
-        reply="Я помощник по материалам сообщества: поддерживаю разговор.",
+        user_message="frozen-260-marker-alpha capability probe",
+        reply="I help with community materials and conversation.",
         evidence_pack=[],
         grounding_result={
             "verified": True,
@@ -108,49 +108,71 @@ def test_meta_without_book_passes_adequacy_as_glue() -> None:
             ],
         },
         planner_reason="legitimate-glue",
+        planner_mode="conversational",
     )
     assert verdict.verdict == "pass"
     assert verdict.substantive_request is False
 
 
-def test_contextual_followup_resolves_against_prior_turns() -> None:
+def test_relevance_true_passes_ignoring_prior_messages() -> None:
     from aa.conversation.answer_adequacy import assess_turn_adequacy
 
-    prior = "Вечером тяжело пережить тягу, как обходиться?"
-    generic_followup = "И что это значит для меня сейчас?"
-    pack = [_pack_entry()]
-    grounding = _book_grounding()
     reply = "Поддержка рядом помогает пережить тягу сегодня."
+    pack = [_pack_entry()]
+    # Prior turns are accepted for compatibility but must not affect the
+    # verdict; the model relevance flags decide.
+    for prior in (
+        ["frozen-260-marker-alpha prior turn"],
+        ["frozen-260-marker-beta prior turn"],
+    ):
+        verdict = assess_turn_adequacy(
+            user_message="frozen-260-marker-alpha follow-up",
+            reply=reply,
+            evidence_pack=pack,
+            grounding_result=_book_grounding(addresses_intent=True, answer_relevant=True),
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent="frozen-260-marker-alpha intent",
+            prior_user_messages=prior,
+        )
+        assert verdict.verdict == "pass"
+        assert verdict.answers_request is True
 
-    without_context = assess_turn_adequacy(
-        user_message=generic_followup,
-        reply=reply,
-        evidence_pack=pack,
-        grounding_result=grounding,
-        planner_reason="substantive-with-queries",
-    )
-    assert without_context.verdict == "fail"
 
-    with_context = assess_turn_adequacy(
-        user_message=generic_followup,
-        reply=reply,
-        evidence_pack=pack,
-        grounding_result=grounding,
-        planner_reason="substantive-with-queries",
-        prior_user_messages=[prior],
-    )
-    assert with_context.verdict == "pass"
-    assert with_context.answers_request is True
+def test_relevance_false_fails_ignoring_prior_messages() -> None:
+    from aa.conversation.answer_adequacy import assess_turn_adequacy
+
+    reply = "Поддержка рядом помогает пережить тягу сегодня."
+    pack = [_pack_entry()]
+    # Same priors as the passing case; only the relevance flags change,
+    # so the failure is model-driven rather than context-driven.
+    for prior in (
+        ["frozen-260-marker-alpha prior turn"],
+        ["frozen-260-marker-beta prior turn"],
+    ):
+        verdict = assess_turn_adequacy(
+            user_message="frozen-260-marker-alpha follow-up",
+            reply=reply,
+            evidence_pack=pack,
+            grounding_result=_book_grounding(addresses_intent=False, answer_relevant=False),
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent="frozen-260-marker-alpha intent",
+            prior_user_messages=prior,
+        )
+        assert verdict.verdict == "fail"
+        assert verdict.failure_category == "irrelevant-citation"
 
 
 def test_unrelated_citation_still_fails_with_context() -> None:
     from aa.conversation.answer_adequacy import assess_turn_adequacy
 
-    ev_text = "Финансовое планирование помогает вести бюджет спокойно."
+    ev_text = "Financial planning helps keep a calm budget."
     pack = [_pack_entry(passage_id="chapter-9#exp0001", text=ev_text)]
     grounding = {
         "verified": True,
         "all_required_supported": True,
+        "answer_relevant": False,
         "units": [
             {
                 "unit_id": "u1",
@@ -158,31 +180,88 @@ def test_unrelated_citation_still_fails_with_context() -> None:
                 "supported": True,
                 "evidence_passage_ids": ["chapter-9#exp0001"],
                 "text": ev_text,
+                "addresses_intent": False,
             }
         ],
     }
     verdict = assess_turn_adequacy(
-        user_message="И что это значит для меня сейчас?",
+        user_message="frozen-260-marker-beta follow-up",
         reply=ev_text,
         evidence_pack=pack,
         grounding_result=grounding,
         planner_reason="substantive-with-queries",
-        prior_user_messages=["Вечером тяжело пережить тягу, как обходиться?"],
+        planner_mode="retrieval",
+        resolved_intent="frozen-260-marker-beta intent",
+        prior_user_messages=["frozen-260-marker-alpha prior turn"],
     )
     assert verdict.verdict == "fail"
     assert verdict.failure_category == "irrelevant-citation"
 
 
-def test_qualification_relevance_resolves_followup_context() -> None:
-    from aa.qualification.product_contract_live import _assess_prompt_reply_relevance
+def test_qualification_rubric_uses_telemetry_then_judge() -> None:
+    from aa.qualification.product_contract_live import (
+        assess_reply_relevance_with_rubric,
+    )
 
-    prior = "Вечером тяжело пережить тягу, как обходиться?"
-    generic_followup = "И что это значит для меня сейчас?"
-    reply = "Поддержка рядом помогает пережить тягу сегодня."
-    assert _assess_prompt_reply_relevance(generic_followup, reply) is False
-    combined = f"{prior} {generic_followup}"
-    assert _assess_prompt_reply_relevance(combined, reply) is True
-    assert _assess_prompt_reply_relevance(prior, "Ведите финансовый бюджет.") is False
+    passing_telemetry = {
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+    }
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-alpha prompt",
+            "frozen-260-marker-alpha reply",
+            telemetry=dict(passing_telemetry),
+        )
+        is True
+    )
+    failing_telemetry = {
+        "adequacy_verdict": "fail",
+        "answers_request": False,
+        "technically_grounded": False,
+    }
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-alpha prompt",
+            "frozen-260-marker-alpha reply",
+            telemetry=dict(failing_telemetry),
+        )
+        is False
+    )
+    # No telemetry and no judge fails closed.
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-beta prompt", "frozen-260-marker-beta reply"
+        )
+        is False
+    )
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-beta prompt",
+            "frozen-260-marker-beta reply",
+            telemetry=None,
+            judge=None,
+        )
+        is False
+    )
+    # A stub judge decides only when telemetry is absent.
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-gamma prompt",
+            "frozen-260-marker-gamma reply",
+            judge=lambda prompt, reply, context: True,
+        )
+        is True
+    )
+    assert (
+        assess_reply_relevance_with_rubric(
+            "frozen-260-marker-gamma prompt",
+            "frozen-260-marker-gamma reply",
+            judge=lambda prompt, reply, context: False,
+        )
+        is False
+    )
 
 
 def test_no_exact_live_question_special_cases() -> None:
@@ -196,12 +275,8 @@ def test_no_exact_live_question_special_cases() -> None:
     ]
     for source in sources:
         for fragment in (
-            "тянет выпить",
-            "тянеет выпить",
-            "Поругались дома",
-            "покупать акции",
-            "покончить с собой",
-            "чем помочь можешь",
-            "одному не получается",
+            "frozen-260-marker-alpha",
+            "frozen-260-marker-beta",
+            "frozen-260-marker-gamma",
         ):
             assert fragment not in source
