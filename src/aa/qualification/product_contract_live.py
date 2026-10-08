@@ -1657,14 +1657,15 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
             "passed-after-adequacy-repair",
         ):
             return False
-    # Whole-turn adequacy (kodmial/aa#251): when the production adequacy
-    # gate ran, its verdict is authoritative. Validated identifiers alone
-    # never prove topical relevance, so an explicit adequacy failure, a
-    # planner error reason, or a negative split status fails even when
-    # counts are positive. Snapshots without these keys keep the legacy
-    # path so older unit callers stay backward compatible.
-    adequacy = str(snapshot.get("adequacy_verdict", "") or "").strip()
-    if adequacy and adequacy != "pass":
+    # Whole-turn adequacy (kodmial/aa#251, hardened kodmial/aa#281):
+    # the production adequacy gate verdict is authoritative for every
+    # ordinary book-grounded turn. Validated identifiers and support
+    # counts alone never prove topical relevance, so a missing or
+    # non-PASS adequacy verdict fails even when counts are positive.
+    # All four model-driven semantic flags are emitted by the real
+    # production graph (GraphTurnRuntime._record_stage_telemetry from
+    # turn-pipeline telemetry), so requiring them never invents a key.
+    if str(snapshot.get("adequacy_verdict", "") or "").strip() != "pass":
         return False
     # A narrowing delivery keeps the turn's repair-history mark: the
     # pipeline records "adequacy-repair-failed" when the full adequacy
@@ -1685,11 +1686,15 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     planner_reason = str(snapshot.get("planner_reason", "") or "").strip()
     if planner_reason in ("provider-error", "timeout", "invalid"):
         return False
-    if "answers_request" in snapshot and not bool(snapshot.get("answers_request")):
+    # Fail closed (kodmial/aa#281): numeric telemetry must never prove
+    # a PASS. Each model-driven semantic flag must be explicitly True.
+    # A missing key (None) or False both fail, even with favorable
+    # counts, diversified text, valid passage IDs and served outcome.
+    if snapshot.get("answers_request") is not True:
         return False
-    if "technically_grounded" in snapshot and not bool(snapshot.get("technically_grounded")):
+    if snapshot.get("technically_grounded") is not True:
         return False
-    if "qualified" in snapshot and not bool(snapshot.get("qualified")):
+    if snapshot.get("qualified") is not True:
         return False
     return True
 

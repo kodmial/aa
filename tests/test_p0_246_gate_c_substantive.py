@@ -70,6 +70,12 @@ def _grounded_snapshot(**overrides: object) -> dict[str, object]:
         "retrieval_passages": 3,
         "verified_book_units": 1,
         "response_units": 1,
+        # Production semantic flags (kodmial/aa#281): the real graph
+        # emits all four; counts alone never prove a PASS.
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "qualified": True,
     }
     snapshot.update(overrides)
     return snapshot
@@ -93,6 +99,7 @@ def _passing_semantic_snapshot(**overrides: object) -> dict[str, object]:
         adequacy_verdict="pass",
         answers_request=True,
         technically_grounded=True,
+        qualified=True,
         answer_relevant=True,
     )
     snapshot.update(overrides)
@@ -183,6 +190,45 @@ def test_sympathy_only_without_substance_fails() -> None:
         assess_reply_relevance_with_rubric("prompt", sympathy, telemetry=_failing_telemetry())
         is False
     )
+
+
+def test_missing_semantic_verdict_fails_despite_favorable_counts() -> None:
+    # kodmial/aa#281: numeric telemetry must never prove a PASS. A
+    # missing/non-PASS semantic verdict FAILs even with diversified
+    # arbitrary output, valid passage IDs and answer_outcome=served.
+    reply = "Поддержка рядом помогает пережить тягу сегодня."
+    full = _grounded_snapshot()
+    assert _is_grounded_substantive_reply(full, reply) is True
+    numeric_only = {
+        "answer_outcome": "served",
+        "verifier_outcome": "passed",
+        "verifier_unavailable_units": 0,
+        "turn_budget_exceeded": False,
+        "planner_query_count": 12,
+        "retrieval_passages": 3,
+        "verified_book_units": 1,
+        "response_units": 1,
+    }
+    assert _is_grounded_substantive_reply(numeric_only, reply) is False
+    assert (
+        _is_grounded_substantive_reply(
+            numeric_only, "Совершенно другой разнообразный произвольный текст."
+        )
+        is False
+    )
+    for missing in ("adequacy_verdict", "answers_request", "technically_grounded", "qualified"):
+        pruned = dict(full)
+        del pruned[missing]
+        assert _is_grounded_substantive_reply(pruned, reply) is False
+    for false_flag in (
+        {"adequacy_verdict": "fail"},
+        {"adequacy_verdict": "unknown"},
+        {"adequacy_verdict": ""},
+        {"answers_request": False},
+        {"technically_grounded": False},
+        {"qualified": False},
+    ):
+        assert _is_grounded_substantive_reply({**full, **false_flag}, reply) is False
 
 
 def test_unavailable_verifier_fails() -> None:

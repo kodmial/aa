@@ -439,13 +439,51 @@ def test_gate_c_rejects_bookless_retry_diversity() -> None:
 
     verified = {
         "answer_outcome": "served",
+        "verifier_outcome": "passed",
+        "verifier_unavailable_units": 0,
+        "turn_budget_exceeded": False,
         "planner_query_count": 12,
         "retrieval_passages": 5,
         "verified_book_units": 1,
+        "response_units": 1,
+        # Production semantic flags (kodmial/aa#281): GraphTurnRuntime
+        # emits all four on every real turn; counts alone never suffice.
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "qualified": True,
     }
     # Only the qualification predicate is under test here; this string
     # is not claimed to be a source quotation or a real generated answer.
     assert _is_grounded_substantive_reply(verified, "Проверенный ответ по книге.")
+    # Fail closed (kodmial/aa#281): a missing semantic verdict FAILs even
+    # when numeric counts, diversified arbitrary output, valid book
+    # passage IDs and answer_outcome=served all appear favorable.
+    numeric_only = {
+        "answer_outcome": "served",
+        "planner_query_count": 12,
+        "retrieval_passages": 5,
+        "verified_book_units": 1,
+    }
+    assert not _is_grounded_substantive_reply(numeric_only, "Проверенный ответ по книге.")
+    assert not _is_grounded_substantive_reply(
+        numeric_only, "Совершенно другой разнообразный произвольный текст."
+    )
+    for missing in ("adequacy_verdict", "answers_request", "technically_grounded", "qualified"):
+        pruned = dict(verified)
+        del pruned[missing]
+        assert not _is_grounded_substantive_reply(pruned, "Проверенный ответ по книге.")
+    for false_flag in (
+        {"adequacy_verdict": "fail"},
+        {"adequacy_verdict": "unknown"},
+        {"adequacy_verdict": ""},
+        {"answers_request": False},
+        {"technically_grounded": False},
+        {"qualified": False},
+    ):
+        assert not _is_grounded_substantive_reply(
+            {**verified, **false_flag}, "Проверенный ответ по книге."
+        )
     for retry in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
         assert not _is_grounded_substantive_reply(verified, retry)
 
