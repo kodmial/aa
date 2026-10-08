@@ -1,0 +1,1 @@
+This branch intentionally blocks stale OpenCode run 37810775634, which captured the superseded #266 specification before the no-reranker correction. Do not merge this branch.
