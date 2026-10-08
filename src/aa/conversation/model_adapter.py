@@ -124,6 +124,19 @@ OMITTED_STRUCTURED_CAPABILITY_TTL_S = 60.0
 _OMITTED_STRUCTURED_UNAVAILABLE: dict[str, float] = {}
 _OMITTED_STRUCTURED_LOCK = threading.Lock()
 
+# Persistent-rejection pinning (Gate C+E live repair, kodmial/aa#244
+# recurrence 3; same run evidence as the verifier persistent-rejection
+# threshold: structured attempts never time out but rejections persist,
+# so waste is call count, not duration). Two consecutive
+# capability-suggestive omitted-structured rejections pin the path for
+# the TTL; isolated blips still re-probe. Timeout/transient, content
+# validation and provider 429 never count; any structured success
+# resets the streak. Turn-independent, never an exact-question special
+# case. 429 always propagates and never marks.
+OMITTED_STRUCTURED_PERSISTENT_THRESHOLD = 2
+
+_OMITTED_STRUCTURED_CONSECUTIVE: dict[str, tuple[int, float]] = {}
+
 
 def _circuit_key(primary_model: str) -> str:
     """Return the process-wide circuit key for one pinned primary model."""
@@ -173,6 +186,7 @@ def clear_primary_circuit() -> None:
     # assertions. Production never calls this helper.
     with _OMITTED_STRUCTURED_LOCK:
         _OMITTED_STRUCTURED_UNAVAILABLE.clear()
+        _OMITTED_STRUCTURED_CONSECUTIVE.clear()
 
 
 def _omitted_structured_key(model: Any | None) -> str:
@@ -203,8 +217,32 @@ def _omitted_structured_entry_fresh(recorded_at: float) -> bool:
         return False
 
 
+def _omitted_consecutive_fresh(recorded_at: float) -> bool:
+    try:
+        return (time.monotonic() - float(recorded_at)) < OMITTED_STRUCTURED_CAPABILITY_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
+def _omitted_streak_counts(key: str) -> bool:
+    """Whether a fresh persistent-rejection streak pins ``key``."""
+    entry = _OMITTED_STRUCTURED_CONSECUTIVE.get(key)
+    if entry is None:
+        return False
+    count, recorded_at = entry
+    if not _omitted_consecutive_fresh(recorded_at):
+        _OMITTED_STRUCTURED_CONSECUTIVE.pop(key, None)
+        return False
+    return int(count) >= OMITTED_STRUCTURED_PERSISTENT_THRESHOLD
+
+
 def omitted_structured_unavailable(model: Any | None = None) -> bool:
-    """Whether omitted structured output is cached unavailable for this path."""
+    """Whether omitted structured output is cached unavailable for this path.
+
+    A fresh persistent-rejection streak (recurrence 3) counts exactly
+    like a mark, so persistently rejecting paths skip the doomed
+    structured attempt without waiting for another slow failure.
+    """
     with _OMITTED_STRUCTURED_LOCK:
         if model is None:
             fresh: list[str] = []
@@ -214,6 +252,9 @@ def omitted_structured_unavailable(model: Any | None = None) -> bool:
             for key in list(_OMITTED_STRUCTURED_UNAVAILABLE):
                 if key not in fresh:
                     _OMITTED_STRUCTURED_UNAVAILABLE.pop(key, None)
+            for key in list(_OMITTED_STRUCTURED_CONSECUTIVE):
+                if _omitted_streak_counts(key) and key not in fresh:
+                    fresh.append(key)
             return bool(fresh)
         key = _omitted_structured_key(model)
         if key == "":
@@ -222,12 +263,14 @@ def omitted_structured_unavailable(model: Any | None = None) -> bool:
                 for stamp in _OMITTED_STRUCTURED_UNAVAILABLE.values()
             )
         cached_at: float | None = _OMITTED_STRUCTURED_UNAVAILABLE.get(key)
-        if cached_at is None:
-            return False
-        if not _omitted_structured_entry_fresh(cached_at):
-            _OMITTED_STRUCTURED_UNAVAILABLE.pop(key, None)
-            return False
-        return True
+        if cached_at is not None:
+            if not _omitted_structured_entry_fresh(cached_at):
+                _OMITTED_STRUCTURED_UNAVAILABLE.pop(key, None)
+            else:
+                return True
+        if _omitted_streak_counts(key):
+            return True
+        return False
 
 
 def mark_omitted_structured_unavailable(model: Any | None = None) -> None:
@@ -239,10 +282,55 @@ def mark_omitted_structured_unavailable(model: Any | None = None) -> None:
         _OMITTED_STRUCTURED_UNAVAILABLE[key] = time.monotonic()
 
 
+def record_omitted_structured_rejection(
+    model: Any | None = None, *, immediate: bool = False
+) -> None:
+    """Record one capability-suggestive omitted-structured rejection.
+
+    Deterministic failures pass ``immediate=True`` and mark at once
+    (existing behavior). Generic provider errors pass ``immediate=False``:
+    an isolated rejection only starts a streak, while
+    ``OMITTED_STRUCTURED_PERSISTENT_THRESHOLD`` consecutive rejections
+    mark the path for the TTL. Timeout/transient, content validation
+    and provider 429 must never call this. Any structured success
+    clears the streak via :func:`record_omitted_structured_success`.
+    """
+    key = _omitted_structured_key(model)
+    if not key:
+        key = "default"
+    with _OMITTED_STRUCTURED_LOCK:
+        now = time.monotonic()
+        if immediate:
+            _OMITTED_STRUCTURED_UNAVAILABLE[key] = now
+            _OMITTED_STRUCTURED_CONSECUTIVE[key] = (
+                OMITTED_STRUCTURED_PERSISTENT_THRESHOLD,
+                now,
+            )
+            return
+        entry = _OMITTED_STRUCTURED_CONSECUTIVE.get(key)
+        if entry is not None and _omitted_consecutive_fresh(entry[1]):
+            count = int(entry[0]) + 1
+        else:
+            count = 1
+        _OMITTED_STRUCTURED_CONSECUTIVE[key] = (count, now)
+        if count >= OMITTED_STRUCTURED_PERSISTENT_THRESHOLD:
+            _OMITTED_STRUCTURED_UNAVAILABLE[key] = now
+
+
+def record_omitted_structured_success(model: Any | None = None) -> None:
+    """Clear the consecutive-rejection streak after a structured success."""
+    key = _omitted_structured_key(model)
+    if not key:
+        key = "default"
+    with _OMITTED_STRUCTURED_LOCK:
+        _OMITTED_STRUCTURED_CONSECUTIVE.pop(key, None)
+
+
 def clear_omitted_structured_cache() -> None:
     """Reset the omitted-structured capability cache (tests only)."""
     with _OMITTED_STRUCTURED_LOCK:
         _OMITTED_STRUCTURED_UNAVAILABLE.clear()
+        _OMITTED_STRUCTURED_CONSECUTIVE.clear()
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -980,6 +1068,7 @@ def build_verifier_model(
 __all__ = [
     "ANSWER_AGENT_V2",
     "OMITTED_STRUCTURED_CAPABILITY_TTL_S",
+    "OMITTED_STRUCTURED_PERSISTENT_THRESHOLD",
     "PLANNER_AGENT_V2",
     "PLANNER_TRANSPORT_AGENT_V2",
     "PRIMARY_ACCESS_CIRCUIT_TTL_S",
@@ -995,6 +1084,8 @@ __all__ = [
     "clear_primary_circuit",
     "mark_omitted_structured_unavailable",
     "omitted_structured_unavailable",
+    "record_omitted_structured_rejection",
+    "record_omitted_structured_success",
     "render_messages_text",
     "split_system_and_user",
 ]
