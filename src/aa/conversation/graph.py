@@ -244,30 +244,30 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             # Generic semantic retrieval fallback: raw turn plus bounded
             # recent conversation; never reinterpreted as glue.
             try:
-                _summary = str(state.get("conversation_summary", "") or "")
-                _recent_raw: list[str] = []
+                _error_summary = str(state.get("conversation_summary", "") or "")
+                _error_recent: list[str] = []
                 for _msg in list(state.get("messages", []) or [])[-4:]:
                     _content = getattr(_msg, "content", "")
                     if isinstance(_content, str) and _content.strip():
-                        _recent_raw.append(_content.strip()[:200])
-                _fallback = build_generic_fallback_queries(
+                        _error_recent.append(_content.strip()[:200])
+                _error_fallback = build_generic_fallback_queries(
                     str(state.get("current_user_message", "")),
-                    summary=_summary,
-                    recent=_recent_raw,
+                    summary=_error_summary,
+                    recent=_error_recent,
                 )
             except Exception:
-                _fallback = []
+                _error_fallback = []
             return {
-                "search_queries": list(_fallback),
+                "search_queries": list(_error_fallback),
                 "planner_invoked": True,
                 "planner_mode": "retrieval",
                 "resolved_intent": str(state.get("current_user_message", "")),
                 "retry_state": {
                     "planner_error": type(exc).__name__[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
-                    "planner_query_count": len(_fallback),
+                    "planner_query_count": len(_error_fallback),
                     "planner_outcome": outcome,
-                    "planner_reason": _error_reason_for(len(_fallback), outcome),
+                    "planner_reason": _error_reason_for(len(_error_fallback), outcome),
                     "planner_mode": "retrieval",
                 },
             }

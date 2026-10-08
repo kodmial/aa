@@ -122,7 +122,10 @@ def test_planner_text_suffix_demands_strict_json_only() -> None:
 
 def test_parse_planner_text_json_accepts_fenced_payload() -> None:
     """Fenced text JSON with 12 queries parses for strict validation."""
-    payload = '{"queries": ["' + '", "'.join(_twelve_queries()) + '"]}'
+    payload = (
+        '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+        '"queries": ["' + '", "'.join(_twelve_queries()) + '"]}'
+    )
     parsed = parse_planner_text_json(f"```json\n{payload}\n```")
     assert len(parsed["queries"]) == 12
 
@@ -147,7 +150,10 @@ async def test_planner_structured_provider_error_falls_back_to_text_once() -> No
             self.text_calls += 1
             assert "Return ONLY a JSON object" in prompt
             queries = _twelve_queries()
-            return '{"queries": ["' + '", "'.join(queries) + '"]}'
+            return (
+                '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+                '"queries": ["' + '", "'.join(queries) + '"]}'
+            )
 
     model = _StructuredFailsOnce()
     plan = await run_planner("evening craving", model=model)

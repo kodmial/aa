@@ -111,7 +111,10 @@ def _twelve_queries(base: str = "support sobriety") -> list[str]:
 
 
 def _twelve_payload(base: str = "support sobriety") -> str:
-    return '{"queries": ["' + '", "'.join(_twelve_queries(base)) + '"]}'
+    return (
+        '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+        '"queries": ["' + '", "'.join(_twelve_queries(base)) + '"]}'
+    )
 
 
 def _pack_entry(
@@ -186,7 +189,11 @@ async def test_planner_structured_timeout_marks_capability_for_next_turn(
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
             await asyncio.sleep(60.0)
-            return {"queries": _twelve_queries("unreachable structured")}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("unreachable structured"),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = system
@@ -234,7 +241,11 @@ async def test_planner_structured_timeout_does_not_mark_custom_wire(
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
             await asyncio.sleep(60.0)
-            return {"queries": _twelve_queries("unreachable structured")}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries("unreachable structured"),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)

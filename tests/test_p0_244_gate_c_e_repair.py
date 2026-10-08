@@ -122,7 +122,10 @@ async def test_slow_structured_planner_degrades_within_tightened_budget() -> Non
     async def _fast_text(prompt: str, *, system: str = "") -> str:
         _ = (prompt, system)
         queries = ", ".join(f'"query variant {i}"' for i in range(12))
-        return '{"queries": [' + queries + "]}"
+        return (
+            '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+            '"queries": [' + queries + "]}"
+        )
 
     class _Model:
         async def ainvoke_structured(

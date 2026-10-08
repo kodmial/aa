@@ -87,9 +87,22 @@ def test_planner_reason_mapping_is_structural() -> None:
 
 
 def test_query_plan_schema_normalizes_empty_to_conversational() -> None:
-    from aa.conversation.planner_schema import QueryPlan, validate_query_plan
+    import pytest
 
-    empty = validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="", queries=[]))
+    from aa.conversation.planner_schema import (
+        QueryPlan,
+        QueryPlanValidationError,
+        validate_query_plan,
+    )
+
+    # Model-driven (#268): an explicit retrieval plan with empty queries
+    # or empty intent is invalid and fails closed; it is never
+    # reinterpreted as conversational glue. Only an explicit
+    # conversational plan carries zero queries.
+    with pytest.raises(QueryPlanValidationError):
+        validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="", queries=[]))
+
+    empty = validate_query_plan(QueryPlan(mode="conversational", resolved_intent="", queries=[]))
     assert empty.mode == "conversational"
     assert empty.queries == []
 

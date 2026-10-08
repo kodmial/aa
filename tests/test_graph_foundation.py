@@ -110,9 +110,7 @@ def _script_model(
 
 
 def test_planner_accepts_explicit_conversational_plan() -> None:
-    plan = validate_query_plan(
-        QueryPlan(mode="conversational", resolved_intent="", queries=[])
-    )
+    plan = validate_query_plan(QueryPlan(mode="conversational", resolved_intent="", queries=[]))
     assert plan.mode == "conversational"
     assert plan.queries == []
 
@@ -124,31 +122,71 @@ def test_planner_rejects_empty_retrieval_plan() -> None:
 
 def test_planner_rejects_retrieval_without_resolved_intent() -> None:
     with pytest.raises(QueryPlanValidationError):
-        validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="", queries=_twelve_queries()))
+        validate_query_plan(
+            QueryPlan(mode="retrieval", resolved_intent="", queries=_twelve_queries())
+        )
 
 
 def test_planner_accepts_ten_and_sixteen() -> None:
-    assert len(validate_query_plan(QueryPlan(queries=_twelve_queries()[:10])).queries) == 10
+    assert (
+        len(
+            validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent="standalone intent for test turn",
+                    queries=_twelve_queries()[:10],
+                )
+            ).queries
+        )
+        == 10
+    )
     extended = _twelve_queries() + ["a", "b", "c", "d"]
-    assert len(validate_query_plan(QueryPlan(queries=extended)).queries) == 16
+    assert (
+        len(
+            validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent="standalone intent for test turn",
+                    queries=extended,
+                )
+            ).queries
+        )
+        == 16
+    )
 
 
 @pytest.mark.parametrize("count", [1, 2, 5, 9, 17, 20])
 def test_planner_rejects_other_cardinalities(count: int) -> None:
     queries = [f"запрос {index}" for index in range(count)]
     with pytest.raises(QueryPlanValidationError):
-        validate_query_plan(QueryPlan(queries=queries))
+        validate_query_plan(
+            QueryPlan(
+                mode="retrieval",
+                resolved_intent="standalone intent for test turn",
+                queries=queries,
+            )
+        )
 
 
 def test_planner_dedupes_whitespace_case_duplicates() -> None:
     plan = validate_query_plan(
-        QueryPlan(queries=["  Трезвость  "] + [f"запрос {index}" for index in range(9)])
+        QueryPlan(
+            mode="retrieval",
+            resolved_intent="standalone intent for test turn",
+            queries=["  Трезвость  "] + [f"запрос {index}" for index in range(9)],
+        )
     )
     assert len(plan.queries) == 10
     with pytest.raises(QueryPlanValidationError):
         # Nine distinct after collapsing one exact duplicate.
         duplicates = ["Трезвость", "трезвость "] + [f"запрос {index}" for index in range(8)]
-        validate_query_plan(QueryPlan(queries=duplicates))
+        validate_query_plan(
+            QueryPlan(
+                mode="retrieval",
+                resolved_intent="standalone intent for test turn",
+                queries=duplicates,
+            )
+        )
 
 
 def test_planner_schema_has_only_queries_field() -> None:
@@ -160,9 +198,12 @@ def test_planner_schema_has_only_queries_field() -> None:
 def test_validate_structured_plan_uses_native_object() -> None:
     plan = validate_structured_plan(_plan_obj(_twelve_queries()))
     assert len(plan.queries) == 12
-    assert validate_structured_plan(
-        QueryPlan(mode="conversational", resolved_intent="", queries=[])
-    ).queries == []
+    assert (
+        validate_structured_plan(
+            QueryPlan(mode="conversational", resolved_intent="", queries=[])
+        ).queries
+        == []
+    )
     with pytest.raises(QueryPlanValidationError):
         validate_structured_plan(_plan_obj(["один"]))
     with pytest.raises(QueryPlanValidationError):
@@ -254,7 +295,11 @@ async def test_planner_fails_closed_without_retry() -> None:
     result = await graph.ainvoke(turn_input("тяга"))
     assert result["planner_invoked"] is True
     assert result["planner_mode"] == "retrieval"
-    assert result["search_queries"] == ["тяга"]
+    # Invalid planner output fails closed to a generic semantic retrieval
+    # fallback from the raw turn plus bounded context, never to glue.
+    queries = result["search_queries"]
+    assert queries
+    assert any("тяга" in item for item in queries)
     assert result["retry_state"]["planner_outcome"] == "invalid"
     assert "planner_error" in result["retry_state"]
 

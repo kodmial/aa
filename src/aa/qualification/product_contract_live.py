@@ -2153,7 +2153,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         continuation_semantic = _assess_live_relevance(snapshot, reply)
                         continuation_output_ok = (
                             reply.strip()
-                            and reply.strip() not in {
+                            and reply.strip()
+                            not in {
                                 NATURAL_CLARIFICATION_REPLY,
                                 *NATURAL_RETRY_VARIANTS,
                             }
@@ -2309,7 +2310,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 _check(
                     "live-context-switch-helpful",
                     bool(_assess_live_relevance(switch_snapshot, switch_reply))
-                    and switch_reply.strip() not in {
+                    and switch_reply.strip()
+                    not in {
                         NATURAL_CLARIFICATION_REPLY,
                         *NATURAL_RETRY_VARIANTS,
                     },
@@ -2794,8 +2796,6 @@ __all__ = [
     "validate_exact_sha",
     "working_tree_clean",
     "assess_reply_relevance_with_rubric",
-    "_has_declarative_substance",
-    "_is_avoiding_clarification_text",
     "_is_direct_meta_reply",
     "_is_grounded_substantive_reply",
     "_is_quote_only_text",

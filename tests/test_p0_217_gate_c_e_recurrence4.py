@@ -51,7 +51,10 @@ def _twelve_queries(base: str = "support sobriety") -> list[str]:
 
 
 def _twelve_payload() -> str:
-    return '{"queries": ["' + '", "'.join(_twelve_queries()) + '"]}'
+    return (
+        '{"mode": "retrieval", "resolved_intent": "standalone intent for test turn", '
+        '"queries": ["' + '", "'.join(_twelve_queries()) + '"]}'
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -164,7 +167,11 @@ async def test_custom_wire_planner_still_tries_structured_first() -> None:
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
-            return {"queries": _twelve_queries()}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries(),
+            }
 
     model = _CustomWire()
     mark_omitted_structured_unavailable(model)
@@ -196,7 +203,11 @@ async def test_uncached_omitted_planner_still_tries_structured_first() -> None:
             _ = (prompt, system, schema, retry_count)
             self.structured_calls += 1
             assert retry_count == PLANNER_MAX_ATTEMPTS
-            return {"queries": _twelve_queries()}
+            return {
+                "mode": "retrieval",
+                "resolved_intent": "standalone intent for test turn",
+                "queries": _twelve_queries(),
+            }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
             _ = (prompt, system)
