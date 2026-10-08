@@ -229,6 +229,7 @@ class GraphTurnRuntime:
                 "response_units": int(response_units),
                 "repair_rounds": int(embedded_d.get("repair_rounds", 0)),
                 "repair_budget_exceeded": bool(embedded_d.get("repair_budget_exceeded", False)),
+                "turn_budget_exceeded": bool(embedded_d.get("turn_budget_exceeded", False)),
                 "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),
