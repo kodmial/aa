@@ -92,7 +92,7 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 def test_answer_bounds_are_configured() -> None:
     """Recurrence-8 bounds: answer attempt budget plus history-count window."""
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
     assert ANSWER_FAST_RETRY_MAX_PASSAGES == 2
     assert ANSWER_FAST_RETRY_MAX_HISTORY == 2
     assert ANSWER_MAX_HISTORY_MESSAGES == 6
