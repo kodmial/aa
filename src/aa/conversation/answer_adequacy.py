@@ -434,6 +434,12 @@ def resolve_effective_request(
     cleaned = " ".join((user_message or "").split()).strip()
     if not cleaned:
         return ""
+    # Step-switch fidelity: an explicit numbered step in the live turn is
+    # self-contained and wins over conversation history. Unioning context
+    # here would merge the previous step with the newly requested one, so a
+    # stale-step reply could intersect the unioned set and survive a switch.
+    if extract_step_numbers(cleaned):
+        return cleaned
     summary_cleaned = " ".join((summary or "").split()).strip()
     recent_texts = [
         " ".join(str(item).split()).strip() for item in list(recent or [])[:2] if str(item).strip()
@@ -798,7 +804,16 @@ def assess_turn_adequacy(
             pack_by_id[passage_id] = text
     request_tokens = _content_tokens(effective_request)
     request_prefixes = _token_prefixes(request_tokens)
-    request_steps = extract_step_numbers(effective_request)
+    # Step-switch fidelity: the live turn's explicit numbered step wins over
+    # context. The resolved text unions history for elliptical follow-ups,
+    # so extracting steps from it alone would yield {old, new} after a
+    # switch and let a stale-step citation intersect the union. When the
+    # live message names a step, require the citation to name that step.
+    live_steps = extract_step_numbers(user_message)
+    if live_steps:
+        request_steps = live_steps
+    else:
+        request_steps = extract_step_numbers(effective_request)
     request_domain = _has_recovery_domain(effective_request) or _has_recovery_domain(user_message)
     relevant_unit_found = False
     for unit in supported_units:
