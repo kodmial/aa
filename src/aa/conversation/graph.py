@@ -18,6 +18,7 @@ user text, summaries, model outputs or raw chat identifiers.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -187,6 +188,40 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_latency_ms": round(elapsed_ms, 1),
                     "planner_query_count": 0,
                     "planner_outcome": "invalid",
+                },
+            }
+        except Exception as exc:
+            # kodmial/aa#240: a planner provider/timeout failure must be
+            # classified in stage telemetry, never crash the whole graph
+            # into a telemetry-less application fallback. Provider 429
+            # still propagates for runner retire/restart; any other
+            # provider or timeout failure records its outcome/latency so
+            # Gate C attributes the turn to the planner stage and the
+            # answer phase proceeds fail-closed (empty pack, no fake
+            # grounded plan). Turn-independent, Product Contract #110
+            # unchanged.
+            from aa.opencode.errors import OpenCodeRateLimitError as _PlannerRateLimit
+
+            if isinstance(exc, _PlannerRateLimit):
+                raise
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
+            try:
+                from aa.opencode.errors import OpenCodeTimeoutError as _PlannerTimeout
+
+                outcome = "timeout" if isinstance(exc, _PlannerTimeout | TimeoutError) else "failed"
+            except Exception:
+                outcome = "failed"
+            logger.warning("v2 planner failed closed", extra={"category": outcome})
+            return {
+                "search_queries": [],
+                "planner_invoked": True,
+                "retry_state": {
+                    "planner_error": type(exc).__name__[:120],
+                    "planner_latency_ms": round(elapsed_ms, 1),
+                    "planner_query_count": 0,
+                    "planner_outcome": outcome,
                 },
             }
 
