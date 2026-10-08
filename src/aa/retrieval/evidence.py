@@ -171,6 +171,30 @@ def validate_planner_queries(queries: object) -> list[str]:
     return cleaned
 
 
+def validate_recovery_queries(queries: object) -> list[str]:
+    """Validate one bounded empty-pack recovery query list (fails closed).
+
+    Recovery uses the live turn plus conversation context directly (never
+    canned generic queries) and carries 1..6 queries, so it cannot meet
+    the planner 10..16 cardinality. This validator accepts 1..16
+    non-empty strings; the planner contract stays unchanged.
+    """
+    if not isinstance(queries, list):
+        raise EvidenceError("recovery queries must be a list of strings")
+    if not queries:
+        return []
+    cleaned: list[str] = []
+    for query in queries:
+        if not isinstance(query, str) or not query.strip():
+            raise EvidenceError("recovery queries must be non-empty strings")
+        cleaned.append(query.strip())
+    if not 1 <= len(cleaned) <= MAX_PLANNER_QUERIES:
+        raise EvidenceError(
+            f"recovery query lists require 1-{MAX_PLANNER_QUERIES} queries, got {len(cleaned)}"
+        )
+    return cleaned
+
+
 def empty_evidence_pack(*, corpus_version: str = "") -> EvidencePack:
     """Return the empty pack for a purely conversational turn (no retrieval)."""
     return EvidencePack(
@@ -873,6 +897,103 @@ def retrieve_evidence(
     )
 
 
+def retrieve_evidence_for_recovery(
+    index: HybridIndex,
+    queries: object,
+    *,
+    config: RetrievalConfig | None = None,
+) -> EvidencePack:
+    """Run the RRF-only pipeline for one bounded empty-pack recovery list.
+
+    Recovery carries the live turn plus conversation context directly
+    (1..6 queries, never canned generics), so planner 10..16 cardinality
+    cannot apply here. Ranking, dedup/diversity, small-to-big expansion
+    and budget selection are identical to :func:`retrieve_evidence`;
+    only the query-count validator allows short recovery lists.
+    """
+    active = config if config is not None else RetrievalConfig()
+    if active.branch_top_k <= 0 or active.rrf_k <= 0:
+        raise EvidenceError("branch_top_k and rrf_k must be > 0")
+    if active.pool_cap <= 0 or active.top_child_cap <= 0:
+        raise EvidenceError("pool caps must be > 0")
+    if active.max_per_section <= 0 or active.neighbor_window < 0:
+        raise EvidenceError("diversity/neighbor parameters are invalid")
+    if active.budget_tokens <= 0:
+        raise EvidenceError("budget_tokens must be > 0")
+    cleaned = validate_recovery_queries(queries)
+    corpus_version = str(index.metadata.get("ru_artifact_sha256", ""))
+    if not cleaned:
+        return empty_evidence_pack(corpus_version=corpus_version)
+    started = time.perf_counter()
+    ranked_lists, per_query_ids = run_branch_searches(
+        index, cleaned, branch_top_k=active.branch_top_k
+    )
+    fused, pool_ids = fuse_query_pool(
+        ranked_lists,
+        per_query_ids,
+        rrf_k=active.rrf_k,
+        pool_cap=active.pool_cap,
+    )
+    diverse = dedup_and_diversify(
+        index,
+        pool_ids,
+        fused,
+        pool_cap=active.pool_cap,
+        max_per_section=active.max_per_section,
+    )
+    sections = {chunk_id: record.section for chunk_id, record in index.chunks.items()}
+    winners = select_top_candidates(
+        diverse,
+        top_cap=active.top_child_cap,
+        sections=sections,
+    )
+    expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
+    selected, total = select_passages_under_budget(
+        expanded,
+        budget_tokens=active.budget_tokens,
+        index=index,
+        priority_child_ids=tuple(candidate.chunk_id for candidate in winners),
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    metadata: dict[str, Any] = {
+        "planner_query_count": len(cleaned),
+        "primary_query_digest": _short_digest(cleaned[0]),
+        "branch_lists": len(ranked_lists),
+        "branch_top_k": active.branch_top_k,
+        "rrf_k": active.rrf_k,
+        "pool_cap": active.pool_cap,
+        "fused_unique": len(fused),
+        "pool_unique": len(pool_ids),
+        "diverse_unique": len(diverse),
+        "top_child_cap": active.top_child_cap,
+        "selected_winners": len(winners),
+        "retrieval_backend": "rrf-only/1",
+        "recovery": True,
+        "neighbor_window": active.neighbor_window,
+        "expanded_passages": len(expanded),
+        "selected_passages": len(selected),
+        "budget_tokens": active.budget_tokens,
+        "total_tokens": total,
+        "latency_ms": elapsed_ms,
+        "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+        "latency_over_budget": elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS,
+    }
+    logger.info(
+        "v2 recovery evidence queries=%d pool=%d winners=%d passages=%d tokens=%d",
+        len(cleaned),
+        len(diverse),
+        len(winners),
+        len(selected),
+        total,
+    )
+    return EvidencePack(
+        passages=tuple(selected),
+        total_tokens=total,
+        corpus_version=corpus_version,
+        retrieval_metadata=metadata,
+    )
+
+
 def to_prompt_passages(pack: EvidencePack) -> list[Any]:
     """Map pack passages to prompt-builder passages (exact text + provenance)."""
     from aa.conversation.prompt_builder import EvidencePassage
@@ -934,9 +1055,11 @@ __all__ = [
     "fuse_query_pool",
     "render_book_evidence",
     "retrieve_evidence",
+    "retrieve_evidence_for_recovery",
     "run_branch_searches",
     "select_passages_under_budget",
     "select_top_candidates",
     "to_prompt_passages",
     "validate_planner_queries",
+    "validate_recovery_queries",
 ]
