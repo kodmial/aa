@@ -333,7 +333,9 @@ def _has_structural_capability_shape(cleaned: str) -> bool:
 # exact-question list): lets colloquial, slang and typo paraphrases of the
 # same recovery topic count as relevant while a verified but unrelated
 # book fact (for example finance) still fails. Only the domain is
-# recognized here; the exact request is never matched.
+# recognized here; the exact request is never matched. Short inflected
+# forms (for example first-person drinking disclosures) are covered via
+# short stems, never via memorized user sentences.
 _RECOVERY_DOMAIN_STEMS = (
     "тяг",
     "выпи",
@@ -341,21 +343,264 @@ _RECOVERY_DOMAIN_STEMS = (
     "буха",
     "бухл",
     "пить",
+    "пью",
+    "пьет",
+    "пьешь",
+    "пьем",
+    "пьете",
+    "пьют",
     "пьян",
+    "пья",
     "трезв",
     "срыв",
     "запо",
     "алког",
+    "алко",
+    "пив",
     "похмел",
 )
+
+# Whole-word drinking past-tense forms: bare "пил" as a substring matches
+# "пилить"/"пилот", so these are matched as exact tokens only. "выпил" and
+# longer drinking forms are already covered by the "выпи"/"выпь" prefixes.
+_RECOVERY_EXACT_TOKENS = frozenset({"пил", "пила", "пило", "пили"})
 
 
 def _has_recovery_domain(text: str) -> bool:
     """Whether text contains generic alcohol-recovery domain vocabulary."""
+    lowered = (text or "").casefold().replace("ё", "е")
+    if not lowered:
+        return False
+    # Token-anchored matching only: bare-substring checks let "вып" match
+    # "выполнить"/"выпуск", "пье" match "пьеса", and mid-word "пив"/"алко"
+    # match unrelated words. Bare "вып"/"пье" are removed above in favor of
+    # drinking-specific prefixes/inflections; the rest match at token start.
+    tokens = _WORD_RE.findall(lowered)
+    for token in tokens:
+        if token in _RECOVERY_EXACT_TOKENS:
+            return True
+        for stem in _RECOVERY_DOMAIN_STEMS:
+            if token.startswith(stem):
+                return True
+    return False
+
+
+# Step-referent vocabulary for multi-turn topic fidelity (generic, never an
+# exact-question list): any numbered-step mention keeps the turn
+# substantive and participates in relevance alignment. Ordinal words and
+# digits are both recognized so paraphrases still align.
+_STEP_WORD_RE = re.compile(
+    r"шаг\w*|step\s*\d+|\bперв\w*\s+шаг\w*|\bвтор\w*\s+шаг\w*"
+    r"|\bтрет\w*\s+шаг\w*|\bчетверт\w*\s+шаг\w*"
+    r"|\bпят\w*\s+шаг\w*|\bшест\w*\s+шаг\w*"
+)
+_STEP_DIGIT_RE = re.compile(r"шаг\w*\s*(?:№\s*)?(\d{1,2})", re.IGNORECASE)
+_STEP_ORDINAL_TO_NUMBER = (
+    ("перв", 1),
+    ("втор", 2),
+    ("трет", 3),
+    ("четверт", 4),
+    ("пят", 5),
+    ("шест", 6),
+    ("седьм", 7),
+    ("восьм", 8),
+    ("девят", 9),
+    ("десят", 10),
+    ("одиннадцат", 11),
+    ("двенадцат", 12),
+)
+
+# Positively proven greeting vocabulary (generic, never an exact-question
+# list): only messages composed entirely of conversational greeting,
+# thanks or farewell words count as proven glue. Anything else, including
+# short first-person disclosures, stays substantive.
+_GREETING_VOCABULARY = frozenset(
+    {
+        "привет",
+        "приветствую",
+        "здравствуй",
+        "здравствуйте",
+        "добрый",
+        "добрая",
+        "доброе",
+        "день",
+        "вечер",
+        "утро",
+        "спасибо",
+        "благодарю",
+        "пока",
+        "свидания",
+        "до",
+    }
+)
+
+# First-person disclosure signals (generic, never an exact-question list):
+# short personal statements default to substantive/support-requiring and
+# are never proven glue from length alone.
+_PERSONAL_DISCLOSURE_RE = re.compile(
+    r"\bя\b|\bмне\b|\bменя\b|\bмной\b|\bмною\b|\bмой\b|\bмоя\b|\bмое\b"
+    r"|\bмою\b|\bмои\b|\bпью\b|\bпил\w*|\bвыпил\w*|\bне\s+могу\b"
+    r"|\bкаждый\s+день\b",
+    re.IGNORECASE,
+)
+
+# Demonstrative/elliptical follow-up cues: the live request alone carries
+# no referent and must be resolved from conversation context.
+_FOLLOWUP_REFERENCE_RE = re.compile(
+    r"\bэто\b|\bэтот\b|\bэта\b|\bэти\b|\bэтом\b|\bэтого\b|\bэтим\b|\bэту\b"
+    r"|\bтакой\b|\bтаком\b|\bтам\b|\bтогда\b|\bдальше\b|\bпотом\b",
+    re.IGNORECASE,
+)
+
+
+def _has_step_reference(text: str) -> bool:
+    """Whether text carries a generic numbered-step referent."""
     lowered = (text or "").casefold()
     if not lowered:
         return False
-    return any(stem in lowered for stem in _RECOVERY_DOMAIN_STEMS)
+    if _STEP_WORD_RE.search(lowered) is not None:
+        return True
+    return _STEP_DIGIT_RE.search(lowered) is not None
+
+
+def extract_step_numbers(text: str) -> set[int]:
+    """Extract generic numbered-step referents from text (digits/ordinals)."""
+    lowered = (text or "").casefold()
+    found: set[int] = set()
+    if not lowered:
+        return found
+    for match in _STEP_DIGIT_RE.finditer(lowered):
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= 12:
+            found.add(number)
+    for stem, number in _STEP_ORDINAL_TO_NUMBER:
+        if (
+            re.search(rf"\b{stem}\w*\s+шаг\w*\b", lowered) is not None
+            or re.search(rf"\bшаг\w*\s+{stem}\w*\b", lowered) is not None
+        ):
+            found.add(number)
+    return found
+
+
+def _has_personal_disclosure(text: str) -> bool:
+    """Whether text carries a generic first-person disclosure signal."""
+    if not text:
+        return False
+    if _PERSONAL_DISCLOSURE_RE.search(text) is not None:
+        return True
+    return _has_recovery_domain(text)
+
+
+def _is_positive_greeting(cleaned: str) -> bool:
+    """Whether a short message is positively a greeting/thanks/farewell."""
+    lowered = (cleaned or "").casefold().strip()
+    if not lowered:
+        return False
+    stripped = re.sub(r"[!.,…?;:]+", " ", lowered)
+    words = [item for item in _WORD_RE.findall(stripped) if len(item) >= 2]
+    if not words:
+        return False
+    if any(len(item) < 2 for item in words):
+        return False
+    # Bare time fragments ("день"/"вечер"/"утро") and the preposition "до"
+    # are not standalone greetings: a single-word "вечер" is an elliptical
+    # time reference, not contentless glue. They count only inside a
+    # multi-word greeting such as "добрый вечер" or "до свидания".
+    if len(words) == 1 and words[0] in frozenset({"день", "вечер", "утро", "до"}):
+        return False
+    return all(item in _GREETING_VOCABULARY for item in words)
+
+
+def _has_substantive_context(summary: str, recent: Sequence[str] | None) -> bool:
+    """Whether conversation context already carries a substantive topic."""
+    if _has_recovery_domain(summary) or _has_step_reference(summary):
+        return True
+    for item in list(recent or [])[:4]:
+        text = str(item or "")
+        if _has_recovery_domain(text) or _has_step_reference(text):
+            return True
+    return False
+
+
+def _is_context_dependent_followup(text: str) -> bool:
+    """Whether the live turn structurally depends on prior dialogue.
+
+    Context rescue is deliberately narrow. Explicit numbered-step switches
+    stay on their own merits; demonstratives/non-numbered step references
+    and short deictic continuation language may resolve against history.
+    Short length by itself is never sufficient, so an explicit topic pivot
+    cannot inherit stale recovery context.
+    """
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return False
+    if extract_step_numbers(cleaned):
+        return False
+    if _FOLLOWUP_REFERENCE_RE.search(cleaned) is not None:
+        return True
+    if _has_step_reference(cleaned):
+        return True
+    content = _content_tokens(cleaned)
+    if not content or len(content) > 4:
+        return False
+    return content.issubset(
+        {
+            "почему",
+            "зачем",
+            "дальше",
+            "теперь",
+            "потом",
+            "значит",
+            "делать",
+            "отсюда",
+            "следует",
+            "прямо",
+            "сейчас",
+            "продолжить",
+            "продолжать",
+        }
+    )
+
+
+def resolve_effective_request(
+    user_message: str,
+    summary: str = "",
+    recent: Sequence[str] | None = None,
+) -> str:
+    """Resolve the live request against conversation context.
+
+    Short elliptical follow-ups (for example references to a previously
+    discussed step) carry no standalone referent; the resolved text joins
+    the live message with the running summary and recent turns so the
+    planner, retrieval, answer and adequacy stages share one referent.
+    Generic structural resolution only: no exact user question is matched.
+    """
+    cleaned = " ".join((user_message or "").split()).strip()
+    if not cleaned:
+        return ""
+    # Step-switch fidelity: an explicit numbered step in the live turn is
+    # self-contained and wins over conversation history. Unioning context
+    # here would merge the previous step with the newly requested one, so a
+    # stale-step reply could intersect the unioned set and survive a switch.
+    if extract_step_numbers(cleaned):
+        return cleaned
+    summary_cleaned = " ".join((summary or "").split()).strip()
+    recent_texts = [
+        " ".join(str(item).split()).strip() for item in list(recent or [])[:2] if str(item).strip()
+    ]
+    needs_context = _is_context_dependent_followup(cleaned)
+    if not needs_context:
+        return cleaned
+    parts = [cleaned]
+    if summary_cleaned:
+        parts.append(f"Контекст: {summary_cleaned[:400]}")
+    for item in recent_texts:
+        if item and item.casefold() not in cleaned.casefold():
+            parts.append(f"Ранее: {item[:240]}")
+    return " ".join(parts).strip()
 
 
 def planner_reason_for(query_count: int, raw_outcome: str) -> str:
@@ -404,20 +649,27 @@ def _token_prefixes(tokens: set[str], width: int = 4) -> set[str]:
     return {token[:width] for token in tokens if len(token) >= width}
 
 
-def is_proven_glue_message(user_message: str, *, summary: str = "", recent_count: int = 0) -> bool:
+def is_proven_glue_message(
+    user_message: str,
+    *,
+    summary: str = "",
+    recent_count: int = 0,
+    recent: Sequence[str] | None = None,
+) -> bool:
     """Whether a turn is positively proven contentless conversational glue.
 
     Conservative fail-closed default: every uncertain turn is treated as
-    potentially substantive, never as proven glue. Only a very short
-    greeting/thanks-style message with no question mark, no generic
-    interrogative/request structure and no substantive continuation
-    counts as proven glue. A combined greeting plus request for recovery
-    steps is therefore never proven glue here.
+    potentially substantive, never as proven glue. A message is glue only
+    when it is positively a greeting/thanks/farewell composed entirely of
+    conversational vocabulary, with no question mark, no generic
+    interrogative/request structure, no recovery-domain or step referent,
+    no first-person disclosure, and no substantive continuation. Length or
+    the absence of a question mark alone never proves glue. Conversation
+    context participates: an active substantive topic in the summary or
+    recent turns keeps borderline short text substantive.
 
-    Generic structural signal only: no exact user question is matched and
-    no recovery-topic keyword list decides the outcome.
+    Generic structural signal only: no exact user question is matched.
     """
-    _ = (summary, recent_count)
     cleaned = " ".join((user_message or "").split()).strip()
     if not cleaned:
         return False
@@ -438,7 +690,19 @@ def is_proven_glue_message(user_message: str, *, summary: str = "", recent_count
         return False
     if _has_recovery_domain(lowered):
         return False
-    return True
+    if _has_step_reference(lowered):
+        return False
+    if _has_personal_disclosure(cleaned):
+        return False
+    # Conversational context is load-bearing: a short disclosure after a
+    # recovery discussion is a continuation, never empty glue.
+    recent_texts = list(recent or [])
+    substantive_context = _has_substantive_context(summary, recent_texts)
+    if not substantive_context and recent_count > 0 and summary.strip():
+        substantive_context = True
+    if substantive_context and not _is_positive_greeting(cleaned):
+        return False
+    return _is_positive_greeting(cleaned)
 
 
 def build_recovery_queries(
@@ -554,6 +818,9 @@ def assess_turn_adequacy(
     verifier_outcome: str = "unknown",
     unavailable_units: int = 0,
     turn_budget_exceeded: bool = False,
+    summary: str = "",
+    recent: Sequence[str] | None = None,
+    resolved_request: str = "",
     prior_user_messages: Sequence[str] = (),
 ) -> AdequacyAssessment:
     """Judge the whole turn: task, context, candidate and relevant evidence.
@@ -563,8 +830,11 @@ def assess_turn_adequacy(
     answering that request must be present and verified. Validated source
     identifiers alone never prove topical relevance: the supported unit
     must share substantive content with both the cited exact passages and
-    the user's request. Pure greetings, honest self-identity and genuinely
-    contentless turns keep a passing glue verdict without book evidence.
+    the resolved user intent, including the active numbered-step referent
+    carried across turns. A cited passage from another step or irrelevant
+    book material fails even with token overlap. Pure greetings, honest
+    self-identity and genuinely contentless turns keep a passing glue
+    verdict without book evidence.
 
     ``prior_user_messages`` carries the immediately preceding user turns
     in the same conversation (oldest first, generic context only). A
@@ -580,7 +850,17 @@ def assess_turn_adequacy(
     pack = [item for item in (evidence_pack or []) if isinstance(item, dict)]
     supported_units = _supported_book_units(grounding_result)
     verified_count = len(supported_units)
-    substantive = not is_proven_glue_message(user_message)
+    recent_texts = [str(item) for item in (recent or []) if str(item).strip()]
+    try:
+        recent_count = len(recent_texts)
+    except Exception:
+        recent_count = 0
+    effective_request = (resolved_request or "").strip() or resolve_effective_request(
+        user_message, summary=summary, recent=recent_texts
+    )
+    substantive = not is_proven_glue_message(
+        user_message, summary=summary, recent_count=recent_count, recent=recent_texts
+    )
     if substantive and is_meta_request(user_message):
         substantive = False
     if turn_budget_exceeded:
@@ -674,8 +954,23 @@ def assess_turn_adequacy(
         text = item.get("text")
         if isinstance(passage_id, str) and passage_id and isinstance(text, str) and text:
             pack_by_id[passage_id] = text
-    request_tokens = _content_tokens(user_message)
+    request_tokens = _content_tokens(effective_request)
     request_prefixes = _token_prefixes(request_tokens)
+    # Step-switch fidelity: the live turn's explicit numbered step wins over
+    # context. The resolved text unions history for elliptical follow-ups,
+    # so extracting steps from it alone would yield {old, new} after a
+    # switch and let a stale-step citation intersect the union. When the
+    # live message names a step, require the citation to name that step.
+    live_steps = extract_step_numbers(user_message)
+    if live_steps:
+        request_steps = live_steps
+    else:
+        request_steps = extract_step_numbers(effective_request)
+    request_domain = _has_recovery_domain(effective_request) or _has_recovery_domain(user_message)
+    # Contextual follow-up resolution (generic, turn-independent): a terse
+    # follow-up carries little topical content on its own, so relevance
+    # also resolves against the immediately preceding user turns. The
+    # current-turn check stays primary; context only rescues continuity.
     context_text = " ".join(
         str(item).strip() for item in (prior_user_messages or []) if str(item).strip()
     )
@@ -711,26 +1006,43 @@ def assess_turn_adequacy(
             continue
         if unit_text.rstrip().endswith("?") and len(unit_text) < 60:
             continue
-        # Topical relevance to this request: the evidence-backed unit must
-        # share substantive content with the request, or both sides must
-        # carry generic alcohol-recovery domain vocabulary so colloquial,
-        # slang and typo paraphrases of the same topic still count while a
-        # verified but unrelated book fact still fails. Without this,
-        # identifiers alone would prove relevance.
+        # Numbered-step fidelity: when the resolved request names a step,
+        # only an explicit step mismatch fails. A verified passage from
+        # another step (for example Step Three decisions served for a
+        # Step One question) fails even when generic vocabulary overlaps
+        # on words such as step or decision. Evidence that paraphrases
+        # the requested step without literally naming a step number
+        # must not fail here; topical relevance below still applies.
+        cited_steps: set[int] = set()
+        if request_steps:
+            for passage_text in cited_texts:
+                cited_steps |= extract_step_numbers(passage_text)
+            cited_steps |= extract_step_numbers(unit_text)
+            if cited_steps and not (request_steps & cited_steps):
+                continue
+        # Topical relevance to the resolved intent, with same-conversation
+        # context rescue: the evidence-backed unit must share substantive
+        # content with the resolved request. At least two distinct prefix
+        # overlaps prove semantic alignment; a single overlap proves
+        # relevance once the numbered-step referent already aligns above
+        # or when a direct lexical tie exists. With no direct overlap only
+        # a shared recovery domain (short disclosures, slang, typos) still
+        # counts while an unrelated book fact fails. A terse contextual
+        # follow-up additionally resolves against the immediately
+        # preceding user turns instead of failing a continuous grounded
+        # answer for not echoing a generic follow-up. Stale-context guard:
+        # context rescues only a generic/terse current turn (at most two
+        # substantive tokens); an explicit new-topic pivot must match on
+        # its own merits, otherwise a prior craving turn would rescue a
+        # craving-only reply to a current finance question.
+        overlap_count = len(request_prefixes & (unit_prefixes | evidence_prefixes))
         _direct_overlap = bool(
             request_prefixes and (request_prefixes & (unit_prefixes | evidence_prefixes))
         )
-        # Stale-context guard: an explicit new-topic current request must
-        # be answered on its own merits. Context only rescues a
-        # generic/terse current turn that carries little standalone
-        # topical content; otherwise a prior craving turn would rescue a
-        # craving-only reply to a current finance-budget question.
-        # Bound at four substantive tokens so a generic continuation
-        # with demonstratives and adverbs (four generic tokens, no
-        # recovery-domain vocabulary of its own) still resolves against
-        # the immediately preceding turns, while a six-token explicit
-        # pivot with distinct topic content stays on its own merits.
-        _current_allows_context_rescue = len(request_tokens) <= 4
+        # Stale-context guard uses the raw live turn (not the unioned
+        # resolved text) so elliptical follow-ups stay rescuable while
+        # explicit pivots do not inherit history.
+        _current_allows_context_rescue = _is_context_dependent_followup(user_message)
         if not _direct_overlap and context_prefixes and _current_allows_context_rescue:
             # Contextual follow-up resolution (generic, turn-independent):
             # a terse follow-up in an ongoing conversation is relevant
@@ -738,12 +1050,27 @@ def assess_turn_adequacy(
             # immediately preceding user turns. The current-turn check
             # above stays primary; context only rescues continuity.
             _direct_overlap = bool(context_prefixes & (unit_prefixes | evidence_prefixes))
-        if not _direct_overlap:
+            if _direct_overlap:
+                overlap_count = max(overlap_count, 1)
+        if overlap_count >= 2:
+            pass
+        elif (
+            overlap_count == 1
+            and request_steps
+            and cited_steps
+            and bool(request_steps & cited_steps)
+        ):
+            # One lexical overlap is only enough when the answer/evidence
+            # also explicitly carries the same numbered-step identity.
+            # Otherwise a generic word such as "решения" cannot make an
+            # unrelated or wrong-step paraphrase look relevant.
+            pass
+        else:
             # Same stale-context guard for the domain fallback: context
             # domain supplements only a generic/terse current turn. An
             # explicit current pivot must itself carry recovery-domain
             # vocabulary to match recovery evidence.
-            _request_domain = _has_recovery_domain(user_message)
+            _request_domain = bool(request_domain)
             if not _request_domain and _current_allows_context_rescue and bool(context_text):
                 _request_domain = _has_recovery_domain(context_text)
             _evidence_domain = any(
@@ -751,6 +1078,10 @@ def assess_turn_adequacy(
             ) or _has_recovery_domain(str(unit.get("text", "") or reply))
             if not (_request_domain and _evidence_domain):
                 continue
+        # Actionable usefulness: the unit must carry declarative substance
+        # beyond sympathy or a bare offer, tied to the cited evidence above.
+        if len(unit_tokens) < 2 and len(unit_text) < 40:
+            continue
         relevant_unit_found = True
         break
     if not relevant_unit_found:
@@ -902,10 +1233,12 @@ __all__ = [
     "build_recovery_queries",
     "check_substantive_delivery_invariant",
     "digest_text",
+    "extract_step_numbers",
     "is_meta_request",
     "is_proven_glue_message",
     "new_turn_trace_id",
     "planner_reason_for",
+    "resolve_effective_request",
     "runtime_sha",
     "snapshot_statuses",
     "trace_id_for_snapshot",

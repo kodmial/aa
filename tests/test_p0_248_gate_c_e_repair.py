@@ -70,7 +70,7 @@ from aa.qualification.self_proving import ORDINARY_TURN_BUDGET_MS, P95_TARGET_MS
 
 
 def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
-    text = "Support nearby helps to get through craving today."
+    text = "Поддержка рядом помогает пережить тягу сегодня."
     return {
         "passage_id": passage_id,
         "text": text,
@@ -169,11 +169,11 @@ async def test_grounded_turn_still_serves_with_repair() -> None:
             return {
                 "requires_book_evidence": True,
                 "supported": True,
-                "evidence_passage_ids": ["p1"],
+                "evidence_passage_ids": ["chapter-3#exp0000"],
             }
 
     outcome = await run_v2_answer_turn(
-        user_message="evening craving",
+        user_message="Вечером тяжело пережить тягу, как обходиться?",
         summary="",
         recent=[HumanMessage(content="hello")],
         evidence_pack=[_pack_dict()],
