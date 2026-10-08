@@ -92,14 +92,6 @@ FORBIDDEN_EVIDENCE_KEYS = frozenset(
     }
 )
 
-LEGACY_ROUTING_MARKERS: tuple[str, ...] = (
-    "is_substantive",
-    "META_CAPABILITY_REPLY",
-    "FAIL_CLOSED_REPLY",
-    "run_trivial_turn",
-    "TurnRunner",
-)
-
 MECHANICS_TERMS: tuple[str, ...] = (
     "retrieval",
     "corpus",
@@ -706,21 +698,13 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             except Exception as exc:
                 _record("telegram-readiness", False, started, f"telegram:{type(exc).__name__}")
         else:
-            from aa.telegram.transport import PollingTelegramTransport
-
-            bootstrap = Path(ROOT / "src" / "aa" / "telegram" / "transport.py").read_text(
-                encoding="utf-8"
-            )
-            telegram_ok = (
-                "getMe" in bootstrap
-                and "deleteWebhook" in bootstrap
-                and issubclass(PollingTelegramTransport, object)
-            )
+            # Fail closed without a token: no Bot API authentication was
+            # proven, so the check must FAIL instead of passing offline.
             _record(
                 "telegram-readiness",
-                telegram_ok,
+                False,
                 started,
-                "transport-contract",
+                "telegram-token-missing",
             )
 
         # Synthetic Russian meta turn through the production Telegram adapter.
@@ -829,16 +813,58 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         except Exception as exc:
             _record("followup-continuity", False, started, f"followup:{type(exc).__name__}")
 
-        # No legacy routing path was invoked.
+        # No legacy routing path was invoked at runtime.
         started = time.perf_counter()
-        app_source = (ROOT / "src" / "aa" / "app.py").read_text(encoding="utf-8")
-        legacy_ok = all(marker not in app_source for marker in LEGACY_ROUTING_MARKERS)
-        _record(
-            "no-legacy-routing",
-            legacy_ok,
-            started,
-            "no-legacy-path" if legacy_ok else "legacy-routing-present",
-        )
+        try:
+            from aa.conversation import orchestrator as _orch_mod
+            from aa.conversation.meta import META_CAPABILITY_REPLY as _META_REPLY
+
+            _legacy_calls: list[str] = []
+            _orig_is_substantive: Any = _orch_mod.is_substantive
+            _orig_run_trivial: Any = _orch_mod.run_trivial_turn
+            _orig_turn_runner: Any = _orch_mod.TurnRunner
+            _orig_fail_closed: str = str(_orch_mod.FAIL_CLOSED_REPLY)
+
+            def _spy_is_substantive(text: str, *args: Any, **kwargs: Any) -> bool:
+                _legacy_calls.append("is_substantive")
+                return bool(_orig_is_substantive(text, *args, **kwargs))
+
+            async def _spy_run_trivial(*args: Any, **kwargs: Any) -> Any:
+                _legacy_calls.append("run_trivial_turn")
+                return await _orig_run_trivial(*args, **kwargs)
+
+            def _spy_turn_runner(*args: Any, **kwargs: Any) -> Any:
+                _legacy_calls.append("TurnRunner")
+                return _orig_turn_runner(*args, **kwargs)
+
+            setattr(_orch_mod, "is_substantive", _spy_is_substantive)  # noqa: B010
+            setattr(_orch_mod, "run_trivial_turn", _spy_run_trivial)  # noqa: B010
+            setattr(_orch_mod, "TurnRunner", _spy_turn_runner)  # noqa: B010
+            try:
+                _probe_meta = await app.respond(830011, "Кто ты?")
+                _probe_sub = await app.respond(830012, "Что книга говорит о страхе перед людьми?")
+            finally:
+                setattr(_orch_mod, "is_substantive", _orig_is_substantive)  # noqa: B010
+                setattr(_orch_mod, "run_trivial_turn", _orig_run_trivial)  # noqa: B010
+                setattr(_orch_mod, "TurnRunner", _orig_turn_runner)  # noqa: B010
+            legacy_ok = (
+                not _legacy_calls
+                and _probe_meta.strip() != _META_REPLY.strip()
+                and _probe_sub.strip() != _orig_fail_closed.strip()
+                and bool(_probe_meta.strip())
+                and bool(_probe_sub.strip())
+            )
+            legacy_detail = "no-legacy-path" if legacy_ok else "legacy-routing-present"
+            if _legacy_calls:
+                legacy_detail = f"legacy-routing-invoked:{','.join(sorted(set(_legacy_calls)))}"
+            _record(
+                "no-legacy-routing",
+                legacy_ok,
+                started,
+                legacy_detail,
+            )
+        except Exception as exc:
+            _record("no-legacy-routing", False, started, f"legacy-probe:{type(exc).__name__}")
 
         # Deterministic safety-routing fixture.
         started = time.perf_counter()
@@ -914,16 +940,17 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         except Exception as exc:
             _record("typing-heartbeat", False, started, f"heartbeat:{type(exc).__name__}")
 
-        # Short voice fixture through ASR to turn to TTS path.
+        # Short voice fixture through the qualified ASR to turn to TTS path.
         started = time.perf_counter()
         try:
+            from aa.telegram.transport import VoiceAttachment
             from aa.telegram.tts import (
                 compact_voice_text_to_policy,
                 resolve_tts_voice,
                 voice_for_presentation,
                 voice_policy_passes,
             )
-            from aa.telegram.voice import voice_error_reply
+            from aa.telegram.voice import build_pipeline, voice_error_reply
 
             presentation_ok = (
                 voice_for_presentation("male-presenting") == "xenia"
@@ -940,6 +967,82 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
                 and bool(compacted.strip())
                 and voice_policy_passes(compacted)
             )
+
+            # Prove the ASR-to-turn wiring at runtime through the real
+            # production voice boundary: download/decode/ASR run inside
+            # ``VoicePipeline`` (transcribe_voice_with_presentation into the
+            # same LangGraph turn used by text), with the TTS artifact
+            # falling back to bounded text when models are absent.
+            class _CanaryFetcher:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def fetch(self, file_id: str) -> bytes:
+                    self.calls += 1
+                    if not file_id:
+                        raise ValueError("missing file id")
+                    return b"canary-ogg"
+
+            class _CanaryDecoder:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def decode(self, ogg_bytes: bytes, *, workdir: object) -> list[float]:
+                    self.calls += 1
+                    if not ogg_bytes:
+                        raise ValueError("empty payload")
+                    return [0.1] * 1600
+
+            class _CanaryRecognizer:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                @property
+                def available(self) -> bool:
+                    return True
+
+                def transcribe(self, samples: object) -> str:
+                    self.calls += 1
+                    return "не могу уснуть, подскажите ближайшие шаги"
+
+            _fetcher = _CanaryFetcher()
+            _decoder = _CanaryDecoder()
+            _recognizer = _CanaryRecognizer()
+            _voice_pipeline = build_pipeline(
+                fetcher=_fetcher,
+                decoder=_decoder,
+                recognizer=_recognizer,
+            )
+            _saved_pipeline = app._voice_pipeline
+            app._voice_pipeline = _voice_pipeline
+            try:
+                transport.sent.clear()
+                await app._process_dispatched_update(
+                    TelegramIncoming(
+                        update_id=822001,
+                        chat_id=chat_meta + 5,
+                        message_id=1,
+                        text="",
+                        voice=VoiceAttachment(
+                            file_id="canary-voice",
+                            duration_seconds=3,
+                            file_size_bytes=100,
+                        ),
+                    )
+                )
+                asr_reply = transport.sent[-1].text if transport.sent else ""
+            finally:
+                app._voice_pipeline = _saved_pipeline
+            asr_ok = (
+                _fetcher.calls == 1
+                and _decoder.calls == 1
+                and _recognizer.calls == 1
+                and len(transport.sent) == 1
+                and bool(asr_reply.strip())
+                and _contains_cyrillic(asr_reply)
+                and envelope_passes(asr_reply)
+            )
+            voice_ok = voice_ok and asr_ok
             # The response artifact is produced through the same delivery
             # path: a voice turn falls back to bounded text when TTS models
             # are absent, never dropping the answer.
