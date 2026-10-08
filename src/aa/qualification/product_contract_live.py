@@ -1473,13 +1473,49 @@ def _is_service_link_only_text(reply: str) -> bool:
     Qualification-only generic signal: real grounded answers carry natural
     prose and no Bot API links/internal ids. A reply whose substantive
     content is only a URL or a bare source pointer fails helpfulness.
+    A brief grounded answer that helpfully includes a link alongside
+    substantive prose is not link-only.
     """
-    lowered = (reply or "").casefold()
+    import re as _re
+
+    text = reply or ""
+    lowered = text.casefold()
     if not lowered.strip():
         return True
-    if "http://" in lowered or "https://" in lowered or "t.me" in lowered:
+    has_link = (
+        "http://" in lowered
+        or "https://" in lowered
+        or "t.me" in lowered
+        or "pc-s-" in lowered
+        or "chunk" in lowered
+    )
+    if not has_link:
+        return False
+    # Strip service link tokens; helpful prose survives without them.
+    stripped = _re.sub(r"https?://\S+", " ", text)
+    stripped = _re.sub(r"t\.me\S*", " ", stripped, flags=_re.IGNORECASE)
+    stripped = _re.sub(r"pc-s-[\w-]+", " ", stripped, flags=_re.IGNORECASE)
+    stripped = _re.sub(r"chunk[\w-]*", " ", stripped, flags=_re.IGNORECASE)
+    if not _has_declarative_substance(stripped):
         return True
-    if "pc-s-" in lowered or "chunk" in lowered:
+    # Bare-pointer cues alone are not substantive help.
+    depointed = stripped.casefold()
+    for _cue in (
+        "подробнее",
+        "подробней",
+        "смотрите",
+        "смотри",
+        "смотр",
+        "здесь",
+        "ссылк",
+        "читай",
+        "открой",
+        "перейди",
+        "переходи",
+        "нажми",
+    ):
+        depointed = depointed.replace(_cue, " ")
+    if not _has_declarative_substance(depointed):
         return True
     return False
 
@@ -1657,9 +1693,9 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     # callers without graph enrichment omit response_units; accept them
     # when verified book units are present (production still records
     # response_units via GraphTurnRuntime).
-    if response_units > 0 and verified > response_units:
+    if verified <= 0:
         return False
-    if response_units <= 0 and verified <= 0:
+    if response_units > 0 and verified != response_units:
         return False
     return True
 
