@@ -478,8 +478,8 @@ def extract_step_numbers(text: str) -> set[int]:
             found.add(number)
     for stem, number in _STEP_ORDINAL_TO_NUMBER:
         if (
-            re.search(rf"\\b{stem}\\w*\\s+шаг\\w*\\b", lowered) is not None
-            or re.search(rf"\\bшаг\\w*\\s+{stem}\\w*\\b", lowered) is not None
+            re.search(rf"\b{stem}\w*\s+шаг\w*\b", lowered) is not None
+            or re.search(rf"\bшаг\w*\s+{stem}\w*\b", lowered) is not None
         ):
             found.add(number)
     return found
