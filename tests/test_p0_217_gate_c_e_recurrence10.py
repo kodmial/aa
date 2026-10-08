@@ -90,9 +90,17 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 
 def test_end_to_end_budget_configured() -> None:
-    """Recurrence-10 owns one turn budget under the 15s p95 target."""
-    assert TURN_END_TO_END_BUDGET_S == 14.0
-    assert TURN_END_TO_END_BUDGET_S < 15.0
+    """Recurrence-10 budget, E-aligned by kodmial/aa#240.
+
+    The 14s guard converted ordinary answerable turns (sequential stage
+    sum p50 ~10s / p95 ~21s) into bookless hash-selected filler. The
+    budget now tracks the Gate E hard SLO (max < 30s, delivery margin
+    kept) so ordinary slow turns complete as grounded answers; only a
+    turn past the hard SLO still fails fast with explicit failure
+    telemetry.
+    """
+    assert TURN_END_TO_END_BUDGET_S == 27.0
+    assert TURN_END_TO_END_BUDGET_S < 30.0
     assert TURN_ANSWER_MIN_SLICE_S == 1.0
     assert TURN_VERIFIER_MIN_SLICE_S == 3.0
     # Stage budgets are unchanged (strategy change, not a retune).
@@ -118,10 +126,11 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=20000.0,
+        upstream_latency_ms=35000.0,
     )
     assert time.perf_counter() - started < 5.0
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
+    assert outcome["text"] == NATURAL_RETRY_REPLY
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
     assert outcome["telemetry"]["answer_rounds"] == 0
@@ -158,10 +167,11 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=12000.0,
+        upstream_latency_ms=25000.0,
     )
     assert answer.calls == 1
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
+    assert outcome["text"] == NATURAL_RETRY_REPLY
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
     assert outcome["telemetry"]["verifier_outcome"] == "skipped-turn-budget"
@@ -217,9 +227,9 @@ async def test_verifier_receives_reduced_remaining_budget(
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=5000.0,
+        upstream_latency_ms=19000.0,
     )
-    # Remaining is ~9s: below the 12s verifier default (reduced slice
+    # Remaining is ~8s: below the 12s verifier default (reduced slice
     # propagates) but above the 3s skip floor (round still runs).
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
@@ -247,7 +257,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
-            clock["now"] += 20.0
+            clock["now"] += 30.0
             return {
                 "requires_book_evidence": True,
                 "supported": False,
@@ -267,6 +277,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
     )
     assert outcome["telemetry"]["verifier_outcome"] == "unsupported"
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
+    assert outcome["text"] == NATURAL_RETRY_REPLY
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
 

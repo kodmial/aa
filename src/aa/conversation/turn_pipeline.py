@@ -135,46 +135,29 @@ ANSWER_FAST_RETRY_MAX_HISTORY = 2
 TURN_REPAIR_TIME_BUDGET_S = 15.0
 
 # End-to-end turn guard (Gate C+E live repair, kodmial/aa#217 recurrence
-# 10 on exact main 94fd5b5 run 37722464604: C:live-answer-no-generic-
-# collapse (3 clarifications) plus E:latency-budget-exceeded p50 10.0s /
-# p95 21.2s / max 29.7s with planner p50 5.4s / p95 8.8s, retrieval p50
-# 0.7s / p95 3.5s, answer p50 5.3s / p95 10.0s / max 10.0s, verifier p50
-# 5ms / p95 12.0s / max 12.0s, repair_turns=0, repair_rounds=0,
-# answer_rounds=9, budget_exceeded=0, unavailable_units_total=2 over 2
-# turns with 17 response units, clarifications=3, message-text p50 5.3s /
-# p95 12.0s / max 28.4s). Per-stage comparison with recurrence 9 (exact
-# main 922dd07 run 37720236046: planner 4.8/6.9/9.7s, retrieval 0.4s,
-# answer 6.8/15.1/17.4s, verifier 3.7/7.8/8.7s, unavailable 0/19,
-# clarifications 7, text max 12.7s) proves the recurrence-9 answer
-# fail-fast converged (answer p95 15.1s -> 10.0s, max capped at the 10s
-# attempt budget) while every sibling stage stayed individually within
-# its own bound: planner p95 8.8s <= 10s wall, verifier p95 pinned
-# exactly at the 12s turn budget, retrieval p95 3.5s. The dominant
-# persistent cause is therefore the sequential SUM of individually
-# bounded stages (8.8 + 3.5 + 10.0 + 12.0 >> 15s p95 target / 30s max):
-# retuning any single stage timeout, or trimming input tokens a sixth
-# time, cannot converge because each stage already respects its bound
-# and one provider tail (message-text max 28.4s, past every stage
-# budget) breaches whichever stage holds it. The verifier budget expiry
-# is simultaneously the C mechanism: unavailable 0 -> 2 units over 2
-# turns, and those slow rounds clarify after grinding the full 12s.
-# Strategy change at the turn-orchestration boundary (not another
-# per-stage timeout/token retune): the answer phase knows the upstream
-# planner+retrieval cost (passed in as ``upstream_latency_ms``) and owns
-# one end-to-end budget for the whole graph turn. Every further model
-# call (answer attempt, verifier round, repair re-plan, envelope regen)
-# is bounded by the REMAINING end-to-end budget instead of its full
-# stage budget, and a turn that has already exceeded the budget fails
-# fast to deterministically narrowed supported material or the natural
-# retry reply (distinct from the generic clarification, preserving
-# no-collapse and diversity) instead of grinding another 12s verifier
-# round that clarifies anyway. Fast healthy turns (mocked tests, fast
-# provider: remaining exceeds every stage budget) behave byte-identically
-# to before. Provider 429 always propagates for runner retire/restart;
+# 10 on exact main 94fd5b5 run 37722464604, corrected by kodmial/aa#240
+# on manual Telegram evidence 2026-10-08): the recurrence-10 guard above
+# owned one end-to-end budget for the whole graph turn and failed fast
+# to the natural retry reply once it expired. Live per-stage comparison
+# (planner p50 ~5s / p95 ~9s, retrieval p50 <1s, answer p50 ~5-7s,
+# verifier p50 ~4-5s) proves the sequential SUM of individually bounded
+# stages routinely lands at 10-21s: ordinary answerable turns therefore
+# expired the 14s guard while the provider tail was still serving, and
+# finished as hash-selected bookless filler with zero verified book
+# units (the #240 regression). Strategy change at the same
+# turn-orchestration boundary: the end-to-end budget is aligned with
+# the Gate E hard SLO (max < 30s, delivery margin kept) instead of the
+# 15s p95 target, so ordinary 14-27s turns complete as verified
+# grounded answers and Gate E honestly measures their latency; only a
+# turn past the hard SLO still fails fast with explicit failure
+# telemetry (turn_budget_exceeded, retry-turn-budget outcome, zero
+# verified book units), which the hardened Gate C counts as failure,
+# never as completion. Fast healthy turns behave byte-identically to
+# before. Provider 429 always propagates for runner retire/restart;
 # content failures still fail closed (never a fake grounded plan).
 # Turn-independent, never an exact-question special case. Product
 # Contract #110 unchanged.
-TURN_END_TO_END_BUDGET_S = 14.0
+TURN_END_TO_END_BUDGET_S = 27.0
 
 # Minimum useful slices of the remaining end-to-end budget. Below the
 # answer slice no answer call is started; below the verifier slice no
