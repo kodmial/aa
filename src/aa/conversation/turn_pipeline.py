@@ -264,7 +264,10 @@ def select_retry_reply(user_message: str) -> str:
         return variants[0]
     if not normalized:
         return variants[0]
-    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    try:
+        digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    except Exception:
+        return variants[0]
     return variants[int.from_bytes(digest[:8], "big") % len(variants)]
 
 
