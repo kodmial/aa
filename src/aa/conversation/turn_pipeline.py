@@ -22,7 +22,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.output_limits import (
@@ -2151,6 +2151,7 @@ async def answer_pipeline_node(
             "final_response": NATURAL_CLARIFICATION_REPLY,
             "grounding_result": grounding_result_to_state(None),
             "retry_state": {"answer_rounds": 0},
+            "messages": [AIMessage(content=NATURAL_CLARIFICATION_REPLY)],
         }
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
     _search_queries = state.get("search_queries", [])
@@ -2306,12 +2307,25 @@ async def answer_pipeline_node(
         # Privacy-safe stage telemetry travels in orchestration state only;
         # it carries counts/latencies/outcomes, never user or evidence text.
         retry_state["turn_telemetry"] = telemetry
+    # Persist the served assistant reply into LangGraph thread memory so
+    # the next turn's planner/answer/verifier resolve follow-ups, ellipsis
+    # and topic continuity against the full conversation (prior user AND
+    # assistant turns), not user turns alone. Without this, a terse
+    # follow-up ("why is this important?", "what should I do with this?")
+    # loses its antecedent: the planner resolves a generic intent,
+    # retrieval drifts, adequacy fails and the turn collapses to a retry
+    # fallback (Gate C live-continuation-helpful + generic-collapse).
+    # The HumanMessage input is already merged by the runtime; only the
+    # assistant reply is appended here. History stays role-correct and
+    # token-bounded by the existing memory/answer windows.
+    served_text = str(outcome["text"])
     return {
-        "draft_response": str(outcome["text"]),
-        "final_response": str(outcome["text"]),
+        "draft_response": served_text,
+        "final_response": served_text,
         "grounding_result": dict(outcome["verification"]),
         "retry_state": retry_state,
         "recent_quote_ranges": list(outcome["recent_quote_ranges"]),
+        "messages": [AIMessage(content=served_text)],
     }
 
 
