@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -1004,14 +1005,16 @@ async def _verify_single_unit(
         attempt_budget = VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S
         attempt_started = time.monotonic()
         try:
-            raw = await asyncio.wait_for(
-                structured_invoke(
-                    user_text,
-                    system=system_text,
-                    schema=verifier_single_json_schema(),
-                    retry_count=VERIFIER_MAX_ATTEMPTS,
-                ),
-                timeout=attempt_budget,
+            structured_call = structured_invoke(
+                user_text,
+                system=system_text,
+                schema=verifier_single_json_schema(),
+                retry_count=VERIFIER_MAX_ATTEMPTS,
+            )
+            raw = (
+                await structured_call
+                if _diagnostic_no_turn_limits()
+                else await asyncio.wait_for(structured_call, timeout=attempt_budget)
             )
         except TimeoutError:
             # Gate C+E live repair, kodmial/aa#244 recurrence 2 on exact
@@ -1168,6 +1171,11 @@ VERIFIER_TURN_BUDGET_S = 12.0
 VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
 
 
+def _diagnostic_no_turn_limits() -> bool:
+    """Bypass AA-owned verifier deadlines only for controlled manual diagnosis."""
+    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+
+
 def _first_fatal_outcome(done: set[asyncio.Task[UnitVerdict]]) -> BaseException | None:
     """Return the first round-aborting outcome among finished units, if any.
 
@@ -1217,7 +1225,7 @@ async def _verify_per_unit_concurrent(
     if not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
+    deadline = None if _diagnostic_no_turn_limits() else loop.time() + budget
     prefer_text_snapshot = _verifier_prefers_text(model)
     tasks = [
         asyncio.ensure_future(
@@ -1230,8 +1238,8 @@ async def _verify_per_unit_concurrent(
     pending: set[asyncio.Task[UnitVerdict]] = set(tasks)
     try:
         while pending:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
                 break
             done, pending = await asyncio.wait(
                 pending, timeout=remaining, return_when=asyncio.FIRST_EXCEPTION
