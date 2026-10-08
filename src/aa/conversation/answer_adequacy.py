@@ -226,6 +226,9 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
     otherwise at least one supported book unit with ``addresses_intent``
     proves relevance, and a turn with no book requirement is relevant
     by construction. No keyword, step-number or token-overlap heuristics.
+    Fail closed until the unified relevance field is present: a supported
+    book unit without an explicit ``addresses_intent`` verdict never
+    proves relevance.
     """
     if not isinstance(grounding_result, dict):
         return False
@@ -238,9 +241,6 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
     needs_book = any(isinstance(item, dict) and item.get("scope") == "book" for item in units)
     if not needs_book:
         return True
-    has_relevance_signal = any(
-        isinstance(item, dict) and "addresses_intent" in item for item in units
-    )
     for item in units:
         if not isinstance(item, dict):
             continue
@@ -249,12 +249,6 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
             and item.get("supported") is True
             and bool(item.get("evidence_passage_ids"))
         ):
-            if not has_relevance_signal:
-                # Migration leniency: legacy grounding dicts predate the
-                # unified relevance field; a supported book unit counts
-                # as relevant. New verdicts always carry an explicit
-                # addresses_intent flag.
-                return True
             if item.get("addresses_intent") is True:
                 return True
     return False
@@ -276,6 +270,7 @@ def assess_turn_adequacy(
     recent: Sequence[str] | None = None,
     resolved_request: str = "",
     prior_user_messages: Sequence[str] = (),
+    planner_query_count: int | None = None,
 ) -> AdequacyAssessment:
     """Judge the whole turn from model verdicts only.
 
@@ -292,6 +287,20 @@ def assess_turn_adequacy(
     pack = [item for item in (evidence_pack or []) if isinstance(item, dict)]
     supported_units = _supported_book_units(grounding_result)
     verified_count = len(supported_units)
+    try:
+        stored_query_count: int | None = (
+            int(planner_query_count) if planner_query_count is not None else None
+        )
+    except (TypeError, ValueError):
+        stored_query_count = 0
+    if stored_query_count is None:
+        # No stored planner count supplied (backward-compatible direct
+        # calls): fall back to zero so a true zero-query conversational
+        # turn with an empty pack still reads as glue, while retrieval
+        # stays substantive regardless. Callers with a stale non-empty
+        # pack must supply the stored planner count explicitly; pack
+        # length is evidence passages, never planner queries.
+        stored_query_count = 0
     substantive = not is_conversational_plan(
         mode=planner_mode
         if planner_mode
@@ -300,7 +309,7 @@ def assess_turn_adequacy(
             if planner_reason == PLANNER_REASON_LEGITIMATE_GLUE
             else "retrieval"
         ),
-        query_count=len(pack) if planner_mode else verified_count,
+        query_count=stored_query_count,
     )
     # When the caller supplies only a legacy planner reason without an
     # explicit mode, treat legitimate-glue as conversational and every
@@ -343,20 +352,15 @@ def assess_turn_adequacy(
             except Exception:
                 all_supported = True
             if not all_supported and verified_count == 0:
-                units = grounding_result.get("units", [])
-                has_unsupported = isinstance(units, list) and any(
-                    isinstance(item, dict) and item.get("supported") is not True for item in units
+                return AdequacyAssessment(
+                    substantive_request=False,
+                    technically_grounded=False,
+                    answers_request=False,
+                    verdict=ADEQUACY_FAIL,
+                    failure_category=FAILURE_UNSUPPORTED_CLAIM,
+                    verified_book_units=verified_count,
+                    evidence_passages=len(pack),
                 )
-                if has_unsupported:
-                    return AdequacyAssessment(
-                        substantive_request=False,
-                        technically_grounded=False,
-                        answers_request=False,
-                        verdict=ADEQUACY_FAIL,
-                        failure_category=FAILURE_UNSUPPORTED_CLAIM,
-                        verified_book_units=verified_count,
-                        evidence_passages=len(pack),
-                    )
         return AdequacyAssessment(
             substantive_request=False,
             technically_grounded=verified_count > 0,

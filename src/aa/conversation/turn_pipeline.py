@@ -772,6 +772,7 @@ async def run_v2_answer_turn(
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
                 planner_mode=_mode,
                 resolved_intent=_resolved_intent,
+                planner_query_count=_query_hint,
             )
         except Exception as exc:
             # Fail closed: an assessment error on a substantive turn must
@@ -828,6 +829,7 @@ async def run_v2_answer_turn(
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
                 planner_mode=_mode,
                 resolved_intent=_resolved_intent,
+                planner_query_count=_query_hint,
             )
         except Exception as exc:
             logger.info(
