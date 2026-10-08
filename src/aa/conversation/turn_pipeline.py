@@ -134,6 +134,56 @@ ANSWER_FAST_RETRY_MAX_HISTORY = 2
 # healthy provider) still use both rounds.
 TURN_REPAIR_TIME_BUDGET_S = 15.0
 
+# End-to-end turn guard (Gate C+E live repair, kodmial/aa#217 recurrence
+# 10 on exact main 94fd5b5 run 37722464604: C:live-answer-no-generic-
+# collapse (3 clarifications) plus E:latency-budget-exceeded p50 10.0s /
+# p95 21.2s / max 29.7s with planner p50 5.4s / p95 8.8s, retrieval p50
+# 0.7s / p95 3.5s, answer p50 5.3s / p95 10.0s / max 10.0s, verifier p50
+# 5ms / p95 12.0s / max 12.0s, repair_turns=0, repair_rounds=0,
+# answer_rounds=9, budget_exceeded=0, unavailable_units_total=2 over 2
+# turns with 17 response units, clarifications=3, message-text p50 5.3s /
+# p95 12.0s / max 28.4s). Per-stage comparison with recurrence 9 (exact
+# main 922dd07 run 37720236046: planner 4.8/6.9/9.7s, retrieval 0.4s,
+# answer 6.8/15.1/17.4s, verifier 3.7/7.8/8.7s, unavailable 0/19,
+# clarifications 7, text max 12.7s) proves the recurrence-9 answer
+# fail-fast converged (answer p95 15.1s -> 10.0s, max capped at the 10s
+# attempt budget) while every sibling stage stayed individually within
+# its own bound: planner p95 8.8s <= 10s wall, verifier p95 pinned
+# exactly at the 12s turn budget, retrieval p95 3.5s. The dominant
+# persistent cause is therefore the sequential SUM of individually
+# bounded stages (8.8 + 3.5 + 10.0 + 12.0 >> 15s p95 target / 30s max):
+# retuning any single stage timeout, or trimming input tokens a sixth
+# time, cannot converge because each stage already respects its bound
+# and one provider tail (message-text max 28.4s, past every stage
+# budget) breaches whichever stage holds it. The verifier budget expiry
+# is simultaneously the C mechanism: unavailable 0 -> 2 units over 2
+# turns, and those slow rounds clarify after grinding the full 12s.
+# Strategy change at the turn-orchestration boundary (not another
+# per-stage timeout/token retune): the answer phase knows the upstream
+# planner+retrieval cost (passed in as ``upstream_latency_ms``) and owns
+# one end-to-end budget for the whole graph turn. Every further model
+# call (answer attempt, verifier round, repair re-plan, envelope regen)
+# is bounded by the REMAINING end-to-end budget instead of its full
+# stage budget, and a turn that has already exceeded the budget fails
+# fast to deterministically narrowed supported material or the natural
+# retry reply (distinct from the generic clarification, preserving
+# no-collapse and diversity) instead of grinding another 12s verifier
+# round that clarifies anyway. Fast healthy turns (mocked tests, fast
+# provider: remaining exceeds every stage budget) behave byte-identically
+# to before. Provider 429 always propagates for runner retire/restart;
+# content failures still fail closed (never a fake grounded plan).
+# Turn-independent, never an exact-question special case. Product
+# Contract #110 unchanged.
+TURN_END_TO_END_BUDGET_S = 14.0
+
+# Minimum useful slices of the remaining end-to-end budget. Below the
+# answer slice no answer call is started; below the verifier slice no
+# verifier round is started (fail fast to narrowed/retry instead of
+# launching a round that cannot complete and would clarify as
+# unavailable). Values stay small so only truly doomed rounds skip.
+TURN_ANSWER_MIN_SLICE_S = 1.0
+TURN_VERIFIER_MIN_SLICE_S = 3.0
+
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."
@@ -319,8 +369,14 @@ async def _verify_draft(
     pack_dicts: list[dict[str, Any]],
     *,
     verifier_model: Any,
+    turn_budget_s: float | None = None,
 ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
-    """Split and verify one draft; never raises verification errors."""
+    """Split and verify one draft; never raises verification errors.
+
+    ``turn_budget_s`` caps this verifier round with the remaining
+    end-to-end turn budget (recurrence 10); ``None`` keeps the verifier
+    default. Provider 429 still propagates.
+    """
     try:
         units = split_response_units(draft)
     except (ResponseUnitError, ValueError) as exc:
@@ -333,7 +389,12 @@ async def _verify_draft(
         logger.info("v2 draft failed language/leak guard")
         return units, None, False
     try:
-        result = await run_verifier(units, pack_dicts, model=verifier_model)
+        if turn_budget_s is None:
+            result = await run_verifier(units, pack_dicts, model=verifier_model)
+        else:
+            result = await run_verifier(
+                units, pack_dicts, model=verifier_model, turn_budget_s=turn_budget_s
+            )
     except (VerifierValidationError, ValueError) as exc:
         # Per-unit only verifier (kodmial/aa#190): run_verifier performs
         # exactly one concurrent per-unit round of minimal boolean
@@ -375,6 +436,7 @@ async def run_v2_answer_turn(
     recent_quote_ranges: list[dict[str, Any]] | None = None,
     max_repair_rounds: int = MAX_TARGETED_REPAIR_ROUNDS,
     initial_query_count: int | None = None,
+    upstream_latency_ms: float = 0.0,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -386,8 +448,17 @@ async def run_v2_answer_turn(
     snapshot (counts/latencies/outcomes only, never user text or
     evidence text) so planner, retrieval, answer, verifier, repair and
     delivery stages can be distinguished in live qualification.
+
+    ``upstream_latency_ms`` carries the already-spent graph-turn cost
+    (planner + retrieval, measured upstream) so this phase can enforce
+    the end-to-end turn budget (recurrence 10); callers without upstream
+    state pass ``0.0`` and behave exactly as before.
     """
     turn_started = time.perf_counter()
+    try:
+        upstream_spent_s = max(0.0, float(upstream_latency_ms) / 1000.0)
+    except (TypeError, ValueError):
+        upstream_spent_s = 0.0
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
     initial_pack_empty = not pack
@@ -409,10 +480,23 @@ async def run_v2_answer_turn(
         "verifier_unavailable_units": 0,
         "repair_rounds": 0,
         "repair_budget_exceeded": False,
+        "turn_budget_exceeded": False,
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
         "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
     }
+
+    def _end_to_end_elapsed_s() -> float:
+        """Already-spent graph-turn time: upstream plus this phase."""
+        return upstream_spent_s + (time.perf_counter() - turn_started)
+
+    def _remaining_budget_s() -> float:
+        """Remaining end-to-end budget for further model calls."""
+        return TURN_END_TO_END_BUDGET_S - _end_to_end_elapsed_s()
+
+    def _mark_turn_budget_exceeded() -> None:
+        telemetry["turn_budget_exceeded"] = True
+        telemetry["repair_budget_exceeded"] = True
 
     def _finish_telemetry() -> None:
         telemetry["total_latency_ms"] = round((time.perf_counter() - turn_started) * 1000.0, 1)
@@ -438,6 +522,21 @@ async def run_v2_answer_turn(
     async def _draft_with_pack(active_pack: list[dict[str, Any]], prompt_text: str) -> str | None:
         from aa.opencode.errors import OpenCodeRateLimitError
 
+        # End-to-end guard (recurrence 10): bound this attempt by the
+        # remaining turn budget, not just the stage budget, so a slow
+        # upstream cannot stack a full second 10s tail on top. No new
+        # model call starts when the remaining slice cannot usefully
+        # serve one; the caller serves narrowed/retry instead.
+        remaining = _remaining_budget_s()
+        if remaining < TURN_ANSWER_MIN_SLICE_S:
+            logger.info(
+                "v2 answer attempt skipped for end-to-end budget",
+                extra={"category": "answer-turn-budget"},
+            )
+            _mark_turn_budget_exceeded()
+            telemetry["answer_outcome"] = "failed"
+            return None
+        attempt_budget = min(ANSWER_DRAFT_ATTEMPT_BUDGET_S, remaining)
         passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
@@ -449,7 +548,7 @@ async def run_v2_answer_turn(
                     passages=passages,
                     user_message=prompt_text,
                 ),
-                timeout=ANSWER_DRAFT_ATTEMPT_BUDGET_S,
+                timeout=attempt_budget,
             )
             telemetry["answer_latency_ms"] = round(
                 float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
@@ -492,11 +591,19 @@ async def run_v2_answer_turn(
             return None
 
     async def _verify_with_telemetry(
-        draft_text: str, active_pack: list[dict[str, Any]]
+        draft_text: str,
+        active_pack: list[dict[str, Any]],
+        *,
+        turn_budget_s: float | None = None,
     ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
         started = time.perf_counter()
         try:
-            return await _verify_draft(draft_text, active_pack, verifier_model=verifier_model)
+            return await _verify_draft(
+                draft_text,
+                active_pack,
+                verifier_model=verifier_model,
+                turn_budget_s=turn_budget_s,
+            )
         finally:
             telemetry["verifier_latency_ms"] = round(
                 telemetry["verifier_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
@@ -516,8 +623,51 @@ async def run_v2_answer_turn(
             "telemetry": dict(telemetry),
         }
 
+    def _verifier_round_budget() -> float | None:
+        """Remaining end-to-end slice for one verifier round.
+
+        Returns ``None`` when the full verifier default applies (fast
+        turn: remaining covers the whole stage budget, so behavior is
+        byte-identical to before), otherwise the reduced remaining
+        slice. Callers skip the round entirely when the slice cannot
+        usefully serve one verifier call.
+        """
+        from aa.conversation.verifier import VERIFIER_TURN_BUDGET_S
+
+        remaining = _remaining_budget_s()
+        if remaining >= VERIFIER_TURN_BUDGET_S:
+            return None
+        return max(0.0, remaining)
+
+    def _retry_outcome(*, verifier_outcome: str) -> dict[str, Any]:
+        """Serve the natural retry reply (never the generic clarification)."""
+        telemetry["verifier_outcome"] = verifier_outcome
+        _finish_telemetry()
+        return {
+            "text": NATURAL_RETRY_REPLY,
+            "units": [],
+            "verification": grounding_result_to_state(None),
+            "rounds": 0,
+            "recent_quote_ranges": recent_ranges,
+            "telemetry": dict(telemetry),
+        }
+
     telemetry["answer_outcome"] = "draft-ok"
-    units, result, passed = await _verify_with_telemetry(draft, pack)
+    verifier_slice = _verifier_round_budget()
+    if verifier_slice is not None and verifier_slice < TURN_VERIFIER_MIN_SLICE_S:
+        # End-to-end guard (recurrence 10): a slow upstream plus a slow
+        # answer already consumed the turn. Starting a verifier round
+        # that cannot complete would grind into turn-budget expiry and
+        # clarify as unavailable (the recurrence-10 C mechanism) while
+        # breaching the E SLO. Fail fast with no verifier call: the
+        # natural retry reply preserves no-collapse and diversity.
+        logger.info(
+            "v2 verifier round skipped for end-to-end budget",
+            extra={"category": "verifier-turn-budget"},
+        )
+        _mark_turn_budget_exceeded()
+        return _retry_outcome(verifier_outcome="skipped-turn-budget")
+    units, result, passed = await _verify_with_telemetry(draft, pack, turn_budget_s=verifier_slice)
     if result is not None:
         telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
     if passed:
@@ -592,6 +742,17 @@ async def run_v2_answer_turn(
                 extra={"rounds": rounds},
             )
             break
+        if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+            # End-to-end guard (recurrence 10): the upstream plus this
+            # phase already spent the whole turn. Another re-plan round
+            # would breach the E SLO and clarify anyway; narrow/retry
+            # downstream instead.
+            logger.info(
+                "v2 repair skipped for end-to-end budget",
+                extra={"rounds": rounds},
+            )
+            _mark_turn_budget_exceeded()
+            break
         missing = unsupported_unit_texts(units, result) if units else [draft]
         missing = [text for text in missing if text.strip()]
         if planner_model is None or retrieval_index is None:
@@ -651,7 +812,17 @@ async def run_v2_answer_turn(
         if next_draft is None:
             break
         current_draft = next_draft
-        units, result, passed = await _verify_with_telemetry(current_draft, pack)
+        repair_slice = _verifier_round_budget()
+        if repair_slice is not None and repair_slice < TURN_VERIFIER_MIN_SLICE_S:
+            logger.info(
+                "v2 repair re-verify skipped for end-to-end budget",
+                extra={"rounds": rounds},
+            )
+            _mark_turn_budget_exceeded()
+            break
+        units, result, passed = await _verify_with_telemetry(
+            current_draft, pack, turn_budget_s=repair_slice
+        )
         if result is not None:
             telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
         if passed:
@@ -703,8 +874,12 @@ async def run_v2_answer_turn(
             # validated supported units, otherwise clarification); fast
             # turns still use the single compact regeneration. Turn-
             # independent, never an exact-question special case.
-            if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S:
+            if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S or (
+                _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S
+            ):
                 telemetry["repair_budget_exceeded"] = True
+                if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+                    _mark_turn_budget_exceeded()
                 logger.info(
                     "v2 envelope regeneration skipped for live-SLO budget",
                     extra={"rounds": rounds},
@@ -721,24 +896,35 @@ async def run_v2_answer_turn(
                 )
                 second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
                 if second is not None:
-                    second_units, second_result, second_passed = await _verify_with_telemetry(
-                        second, pack
-                    )
-                    if second_passed and second_units and second_result is not None:
-                        if envelope_passes(second):
-                            final = second
-                            units, result = second_units, second_result
-                        else:
-                            final = compact_supported_to_envelope(
-                                second_units, second_result, text=second
-                            )
-                            units, result = second_units, second_result
-                            if not envelope_passes(final) or not contains_cyrillic(final):
-                                final = NATURAL_CLARIFICATION_REPLY
-                    else:
+                    regen_slice = _verifier_round_budget()
+                    if regen_slice is not None and regen_slice < TURN_VERIFIER_MIN_SLICE_S:
+                        logger.info(
+                            "v2 regen re-verify skipped for end-to-end budget",
+                            extra={"rounds": rounds},
+                        )
+                        _mark_turn_budget_exceeded()
                         final = compact_supported_to_envelope(units, result, text=final)
                         if not envelope_passes(final):
                             final = NATURAL_CLARIFICATION_REPLY
+                    else:
+                        second_units, second_result, second_passed = await _verify_with_telemetry(
+                            second, pack, turn_budget_s=regen_slice
+                        )
+                        if second_passed and second_units and second_result is not None:
+                            if envelope_passes(second):
+                                final = second
+                                units, result = second_units, second_result
+                            else:
+                                final = compact_supported_to_envelope(
+                                    second_units, second_result, text=second
+                                )
+                                units, result = second_units, second_result
+                                if not envelope_passes(final) or not contains_cyrillic(final):
+                                    final = NATURAL_CLARIFICATION_REPLY
+                        else:
+                            final = compact_supported_to_envelope(units, result, text=final)
+                            if not envelope_passes(final):
+                                final = NATURAL_CLARIFICATION_REPLY
                 else:
                     final = compact_supported_to_envelope(units, result, text=final)
                     if not envelope_passes(final):
@@ -806,6 +992,32 @@ async def run_v2_answer_turn(
                 "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
                 "telemetry": dict(telemetry),
             }
+    if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+        # End-to-end guard (recurrence 10): no verified supported
+        # material exists, but the turn already spent its whole budget.
+        # Clarifying here would add the recurrence-10 generic collapse
+        # on top of the SLO breach (slow rounds clarify after grinding
+        # the full verifier budget). Serve the natural retry reply
+        # instead: it carries no substantive claim (grounding-safe),
+        # is distinct from the generic clarification (no-collapse and
+        # diversity preserved), and costs no further model call. Fast
+        # turns keep the historical clarification path below, so
+        # genuine grounding gaps still ask for detail.
+        logger.info(
+            "v2 slow turn serves retry instead of clarification",
+            extra={"category": "turn-budget-fallback"},
+        )
+        _mark_turn_budget_exceeded()
+        telemetry["answer_outcome"] = "retry-turn-budget"
+        _finish_telemetry()
+        return {
+            "text": NATURAL_RETRY_REPLY,
+            "units": units,
+            "verification": grounding_result_to_state(result),
+            "rounds": rounds,
+            "recent_quote_ranges": recent_ranges,
+            "telemetry": dict(telemetry),
+        }
     telemetry["answer_outcome"] = "clarification"
     _finish_telemetry()
     return {
@@ -843,6 +1055,23 @@ async def answer_pipeline_node(
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
     _search_queries = state.get("search_queries", [])
     _initial_query_count = len(_search_queries) if isinstance(_search_queries, list) else 0
+    # End-to-end guard (recurrence 10): measure the already-spent
+    # upstream graph-turn cost (planner wall clock + local retrieval)
+    # from orchestration state so the answer phase can bound its own
+    # model calls by the remaining turn budget. Counts/latencies only,
+    # never prompts or text.
+    _upstream_latency_ms = 0.0
+    try:
+        _prior_retry = state.get("retry_state", {})
+        _prior_retry_d = dict(_prior_retry) if isinstance(_prior_retry, dict) else {}
+        _prior_planner = float(_prior_retry_d.get("planner_latency_ms", 0.0) or 0.0)
+        _retrieval_latency = state.get("retrieval_latency_ms", 0.0)
+        _retrieval_f = (
+            float(_retrieval_latency) if isinstance(_retrieval_latency, (int, float)) else 0.0
+        )
+        _upstream_latency_ms = max(0.0, _prior_planner) + max(0.0, _retrieval_f)
+    except (TypeError, ValueError):
+        _upstream_latency_ms = 0.0
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -857,6 +1086,7 @@ async def answer_pipeline_node(
             item for item in state.get("recent_quote_ranges", []) if isinstance(item, dict)
         ],
         initial_query_count=_initial_query_count,
+        upstream_latency_ms=_upstream_latency_ms,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot
@@ -941,7 +1171,10 @@ __all__ = [
     "MAX_TARGETED_REPAIR_ROUNDS",
     "NATURAL_CLARIFICATION_REPLY",
     "NATURAL_RETRY_REPLY",
+    "TURN_ANSWER_MIN_SLICE_S",
+    "TURN_END_TO_END_BUDGET_S",
     "TURN_REPAIR_TIME_BUDGET_S",
+    "TURN_VERIFIER_MIN_SLICE_S",
     "answer_pipeline_node",
     "compact_supported_to_envelope",
     "contains_cyrillic",
