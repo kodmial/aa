@@ -12,7 +12,9 @@ native structured verdict cannot look green:
   through the ordinary text path and still yields a strictly validated
   decision (same single concurrent per-unit round);
 - provider 429 always propagates immediately and never triggers text fallback;
-- invalid text JSON / extra keys / unknown citations still fail closed;
+- invalid text JSON / missing keys / wrong types / unknown citations still
+  fail closed (unknown envelope keys are dropped without being trusted;
+  see kodmial/aa#217 recurrence 7);
 - planner/retrieval/answer are untouched by the verifier text fallback.
 """
 
@@ -270,18 +272,44 @@ def test_parse_text_json_decision_strict() -> None:
         parse_text_json_decision("просто текст без json")
     with pytest.raises(VerifierValidationError):
         parse_text_json_decision('["not", "an", "object"]')
-    # Extra model-invented keys stay rejected: grounding semantics unchanged.
+    # Envelope tolerance (kodmial/aa#217 recurrence 7): model-invented
+    # keys are dropped without being trusted, so a fully-determined
+    # verdict does not burn a second slow text round-trip. The unit id
+    # stays bound by AA code and the aggregate stays AA-computed, so a
+    # "unit_id" or "all_required_supported" key can never take effect;
+    # grounding semantics are unchanged (verdict is a function of the
+    # three known keys only).
+    extra = parse_text_json_decision(
+        json.dumps(
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [],
+                "unit_id": "u1",
+                "reasoning": "model prose habit",
+            }
+        )
+    )
+    assert extra == {
+        "requires_book_evidence": True,
+        "supported": True,
+        "evidence_passage_ids": [],
+    }
+    # Missing required keys and wrong value types still fail closed.
+    with pytest.raises(VerifierValidationError):
+        parse_text_json_decision(json.dumps({"supported": True, "evidence_passage_ids": []}))
     with pytest.raises(VerifierValidationError):
         parse_text_json_decision(
             json.dumps(
                 {
                     "requires_book_evidence": True,
-                    "supported": True,
+                    "supported": ["not-a-bool"],
                     "evidence_passage_ids": [],
-                    "unit_id": "u1",
                 }
             )
         )
+    with pytest.raises(VerifierValidationError):
+        parse_text_json_decision(json.dumps({"comment": "nothing but envelope"}))
 
 
 def test_planner_has_no_text_json_fallback() -> None:

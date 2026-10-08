@@ -203,7 +203,16 @@ async def test_structured_429_never_marks_capability() -> None:
 
 
 def test_tolerant_text_json_variants_still_strict_on_keys() -> None:
-    """Small-model text deviations parse; extra keys still fail closed."""
+    """Small-model text deviations parse; required keys/types stay strict.
+
+    Envelope tolerance (kodmial/aa#217 recurrence 7): unknown keys are
+    dropped without being trusted instead of failing the whole decision,
+    so a fully-determined verdict does not burn a second slow text
+    round-trip per unit. Missing required keys, wrong value types, and
+    non-object payloads still fail closed; grounding semantics are
+    unchanged (verdict is a function of the three known keys only, unit
+    id bound by AA code, aggregate computed by AA code).
+    """
     pack_id = "chapter-3#exp0000"
     trailing = (
         '{"requires_book_evidence": true, "supported": true, "evidence_passage_ids": ["p1"],}'
@@ -219,17 +228,25 @@ def test_tolerant_text_json_variants_still_strict_on_keys() -> None:
     assert parse_text_json_decision(fenced)["evidence_passage_ids"] == [pack_id]
     with pytest.raises(VerifierValidationError):
         parse_text_json_decision("просто текст без json")
-    with pytest.raises(VerifierValidationError):
-        parse_text_json_decision(
-            json.dumps(
-                {
-                    "requires_book_evidence": True,
-                    "supported": True,
-                    "evidence_passage_ids": [],
-                    "reasoning": "extra key",
-                }
-            )
+    # Unknown envelope keys are dropped without being trusted; the
+    # verdict still comes from the three known keys only.
+    assert parse_text_json_decision(
+        json.dumps(
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [],
+                "reasoning": "extra key",
+            }
         )
+    ) == {
+        "requires_book_evidence": True,
+        "supported": True,
+        "evidence_passage_ids": [],
+    }
+    # Missing keys and wrong types still fail closed.
+    with pytest.raises(VerifierValidationError):
+        parse_text_json_decision(json.dumps({"supported": True, "evidence_passage_ids": []}))
 
 
 def test_verifier_suffix_has_explicit_example() -> None:

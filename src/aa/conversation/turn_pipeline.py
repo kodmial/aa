@@ -69,7 +69,16 @@ MAX_PACK_PASSAGES = 12
 # strictness is unchanged: the model may only use listed authoritative
 # evidence and every claim is still validated against the full pack.
 # Turn-independent, never an exact-question special case.
-ANSWER_GENERATION_MAX_PASSAGES = 6
+#
+# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
+# 58f943c run 37709271567: answer input averages ~9k tokens per request
+# on the slow text path (p50 6.0s) while drafts cite only the
+# top-ranked passages (short 2-3 sentence drafts, response_units_total=5
+# over 8 answer rounds). Narrowing the generation window from 6 to the
+# top 5 RRF-ranked passages removes the least-relevant generation input
+# from every ordinary turn; verification, checksum, quote and cite gates
+# still use the full stored pack, so grounding strictness is unchanged.
+ANSWER_GENERATION_MAX_PASSAGES = 5
 
 # Live SLO guard (Gate C live repair, run 37615447071 on exact main
 # e92385f): ordinary turns reached p50 34s / p95 59s / max 64s over the
