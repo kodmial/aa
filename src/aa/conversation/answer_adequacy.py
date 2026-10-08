@@ -564,6 +564,7 @@ def _is_context_dependent_followup(text: str) -> bool:
         }
     )
 
+
 def resolve_effective_request(
     user_message: str,
     summary: str = "",

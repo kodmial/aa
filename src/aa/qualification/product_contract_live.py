@@ -1921,10 +1921,13 @@ def _prompt_allows_context_rescue(prompt: str) -> bool:
     if _extract_step_numbers_for_relevance(cleaned):
         return False
     lowered = cleaned.casefold()
-    if _re.search(
-        r"\b(?:это|этот|эта|эти|этом|этого|этим|эту|такой|таком|там|тогда|дальше|потом)\b",
-        lowered,
-    ) is not None:
+    if (
+        _re.search(
+            r"\b(?:это|этот|эта|эти|этом|этого|этим|эту|такой|таком|там|тогда|дальше|потом)\b",
+            lowered,
+        )
+        is not None
+    ):
         return True
     content = _content_tokens_for_relevance(cleaned)
     if not content or len(content) > 4:
@@ -1946,6 +1949,7 @@ def _prompt_allows_context_rescue(prompt: str) -> bool:
             "продолжать",
         }
     )
+
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
