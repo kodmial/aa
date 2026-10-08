@@ -25,6 +25,7 @@ the ID-completeness gate (exactly one verdict per response unit).
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import json
 import logging
@@ -72,7 +73,15 @@ VERIFIER_AGENT_V2 = "aa-verifier-v2"
 # cited id is still validated against the full pack plus
 # checksum/quote gates. Turn-independent, never an exact-question special
 # case.
-VERIFIER_MAX_EVIDENCE_PASSAGES = 6
+#
+# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
+# 58f943c run 37709271567: verifier input averages ~3k tokens per
+# request on the slow text path (p50 6.0s) while drafts cite only the
+# top-ranked passages (response_units_total=5 over 8 answer rounds).
+# Narrowing the display window from 6 to the top 5 passages removes the
+# least-relevant display tokens from every verifier call; verification,
+# checksum, quote and cite gates still use the full stored pack.
+VERIFIER_MAX_EVIDENCE_PASSAGES = 5
 
 # Bounded per-passage display length for the verifier prompt only.
 # Truncating display text bounds input tokens and latency while
@@ -81,7 +90,12 @@ VERIFIER_MAX_EVIDENCE_PASSAGES = 6
 # the model can see the passage is incomplete and withhold support instead
 # of judging on a silently cut prefix. Turn-independent, never an
 # exact-question special case.
-VERIFIER_MAX_PASSAGE_CHARS = 800
+#
+# Recurrence 7 (same run): 800 chars still leaves the verifier as the
+# largest per-unit model input on the critical path; 600 chars keeps
+# several sentences of decisive context per passage with the explicit
+# marker while cutting ~25% of display tokens per call.
+VERIFIER_MAX_PASSAGE_CHARS = 600
 
 VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
@@ -555,16 +569,35 @@ def _tolerant_json_loads(candidate: str) -> object:
     raise last_error
 
 
+# Transport decision keys carried by one text-path verifier decision. Only
+# these keys decide a verdict; unknown envelope keys are discarded by
+# parse_text_json_decision (never trusted, never bound).
+_DECISION_KEYS: frozenset[str] = frozenset(
+    {"requires_book_evidence", "supported", "evidence_passage_ids"}
+)
+
+
 def parse_text_json_decision(text: str) -> dict[str, Any]:
     """Strictly parse one text-path verifier decision (fail-closed).
 
-    Accepts only a single JSON object with exactly the transport decision
-    keys; extra keys, missing keys, wrong types, or non-object JSON all
-    raise :class:`VerifierValidationError`. Small-model text deviations
+    Accepts only a single JSON object carrying the transport decision
+    keys; missing keys, wrong types, or non-object JSON all raise
+    :class:`VerifierValidationError`. Small-model text deviations
     (fences, leading explanations, trailing commas, single quotes, Python
-    literals) are normalized before parsing, but Pydantic key/type
-    strictness is unchanged. Turn-independent, never an exact-question
-    special case.
+    literals) are normalized before parsing, and unknown envelope keys
+    are dropped without being trusted: only ``requires_book_evidence``,
+    ``supported`` and ``evidence_passage_ids`` decide the verdict, with
+    Pydantic key-presence/type strictness unchanged on those three. The
+    unit id stays bound by AA code and the aggregate stays AA-computed,
+    so a model-invented ``unit_id`` or ``all_required_supported`` key can
+    never take effect (it is discarded, not honored). Dropping envelope
+    keys instead of failing the whole decision avoids a second slow
+    sequential text round-trip per unit for a verdict whose semantics are
+    already fully determined (Gate C+E live repair, kodmial/aa#217
+    recurrence 7: verifier p50 10.1s / p95 12.0s with zero unavailable
+    units shows units routinely paying the validation-retry round-trip).
+    Turn-independent, never an exact-question special case. Provider 429
+    never reaches this parser (it propagates before parsing).
     """
     cleaned = _strip_text_json_fences(text or "")
     if not cleaned:
@@ -582,7 +615,12 @@ def parse_text_json_decision(text: str) -> dict[str, Any]:
         raise VerifierValidationError(f"verifier text output is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise VerifierValidationError("verifier text output is not a JSON object")
-    # Strict validation (extra keys rejected, types checked) happens in
+    # Envelope tolerance: unknown keys are discarded, never trusted. Only
+    # the three transport decision keys below are validated (presence +
+    # types via validate_unit_decision); a payload carrying nothing but
+    # unknown keys still fails closed on the missing required keys.
+    data = {key: value for key, value in data.items() if key in _DECISION_KEYS}
+    # Strict validation (required keys, value types) happens in
     # validate_unit_decision via coerce_single_verdict; surface its error
     # shape here for a uniform fail-closed boundary.
     validate_unit_decision(data)
@@ -756,20 +794,20 @@ async def _verify_single_unit(
     channel itself is unavailable on this provider path (deterministic
     schema rejection, missing structured payload), the same single-unit
     decision is retried once as bounded plain-text JSON through the
-    ordinary text path and strictly validated. Transient/timeout and
-    structured content-validation failures also retry once via text but
-    never poison the capability cache, so one slow call or one bad
-    decision cannot permanently disable structured calls. After a
-    deterministic capability failure the model path prefers the text path
-    directly (bounded by TTL, per model path) so later units/turns do not
-    burn two slow provider round-trips per unit (the live max-latency
-    pathology). When the shared primary circuit is already open (live
-    fallback path serving after a primary rejection) the structured
-    attempt is skipped proactively for the same reason. The text path
-    itself retries at most once on strict-validation failure so one
-    weak-model non-compliant reply does not collapse the turn to
-    verifier-unavailable without a second bounded attempt; grounding
-    stays strict because every attempt is fully Pydantic-validated.
+    ordinary text path and strictly validated. A caller-observed
+    structured deadline expiry (``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``,
+    kodmial/aa#217 recurrence 7) marks the capability the same way: a
+    channel that cannot serve one unit within budget will not serve the
+    next one either. Marks are TTL-bounded per model path (later rounds
+    re-snapshot the mark instead of re-burning the budget, and a
+    recovered provider is re-probed). When the shared primary
+    circuit is already open (live fallback path serving after a primary
+    rejection) the structured attempt is skipped proactively for the
+    same reason. The text path itself retries at most once on
+    strict-validation failure so one weak-model non-compliant reply does
+    not collapse the turn to verifier-unavailable without a second
+    bounded attempt; grounding stays strict because every attempt is
+    fully Pydantic-validated.
     This stays inside the one concurrent per-unit round (no
     extra verifier round, no planner/retrieval/answer rerun). Provider 429
     always propagates immediately for runner retire/restart.
@@ -810,23 +848,54 @@ async def _verify_single_unit(
     structured_invoke = getattr(model, "ainvoke_structured", None)
     # Snapshot the capability at round start so concurrent units in one
     # turn behave consistently (all try structured or all use text).
-    # The cache is still marked on deterministic failure for future turns.
-    # An already-open primary circuit (fallback path serving) also prefers
-    # text proactively so the fallback path never burns a doomed
-    # structured round-trip per unit.
+    # A per-unit live read would make scripted provider queues (and the
+    # production round) nondeterministic: concurrently started units
+    # would diverge depending on scheduling luck when the first failure
+    # marks mid-round, while gaining nothing (concurrent starts cannot
+    # observe each other's marks in time to skip). Freshness across
+    # rounds is preserved because every run_verifier call re-snapshots,
+    # and the per-unit structured bound below caps a hung attempt
+    # regardless of the snapshot. An already-open primary circuit
+    # (fallback path serving) also prefers text proactively so the
+    # fallback path never burns a doomed structured round-trip per unit.
     prefer_text = (
         _prefer_text_snapshot
         if _prefer_text_snapshot is not None
         else _verifier_prefers_text(model)
     )
     if callable(structured_invoke) and not prefer_text:
+        attempt_budget = VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S
+        attempt_started = time.monotonic()
         try:
-            raw = await structured_invoke(
-                user_text,
-                system=system_text,
-                schema=verifier_single_json_schema(),
-                retry_count=VERIFIER_MAX_ATTEMPTS,
+            raw = await asyncio.wait_for(
+                structured_invoke(
+                    user_text,
+                    system=system_text,
+                    schema=verifier_single_json_schema(),
+                    retry_count=VERIFIER_MAX_ATTEMPTS,
+                ),
+                timeout=attempt_budget,
             )
+        except TimeoutError:
+            # Caller-observed structured deadline (same deadline-aware
+            # capability inference as the planner in kodmial/aa#217
+            # recurrence 7): a structured channel that cannot serve one
+            # unit within budget will not serve the next one either, so
+            # mark it and fall back to text for this unit; later rounds
+            # re-snapshot the mark instead of re-burning the budget.
+            # Only a true deadline expiry
+            # marks: a fast callee-raised timeout is a provider error,
+            # not a capability signal, and keeps the historical
+            # fail-closed path below. Provider 429 is raised by the
+            # adapter (never a TimeoutError) and still propagates.
+            if time.monotonic() - attempt_started >= attempt_budget:
+                logger.info(
+                    "verifier structured attempt timed out; text fallback used",
+                    extra={"category": "structured-attempt-timeout"},
+                )
+                mark_structured_unavailable(model)
+                return await _text_decision()
+            raise
         except OpenCodeRateLimitError:
             raise
         except _STRUCTURED_CAPABILITY_ERRORS as exc:
@@ -922,7 +991,55 @@ async def _verify_single_unit(
 # boolean schema, strict cite/quote/checksum gates); provider 429 always
 # propagates for runner retire/restart. Turn-independent, never an
 # exact-question special case. Product Contract #110 unchanged.
+#
+# Recurrence 7 on exact main 58f943c run 37709271567: the expiry raised
+# away the whole round (completed sibling verdicts were discarded with
+# the timed-out gather), so budget-expiry turns collapsed to the exact
+# generic clarification with repair skipped and narrowed empty. The
+# expiry now preserves completed units as partial results (pending units
+# become unavailable-unit verdicts, still fail-closed per unit) so those
+# turns narrow to verified supported material instead of clarifying;
+# only a round with no verified unit at all still fails fully closed.
 VERIFIER_TURN_BUDGET_S = 12.0
+
+
+# Per-unit bound for one native structured verifier attempt (Gate C+E
+# live repair, kodmial/aa#217 recurrence 7 on exact main 58f943c run
+# 37709271567: verifier p50 10.1s / p95 12.0s hugging the 12s turn
+# budget with zero unavailable units). The turn budget from recurrence 6
+# caps the whole round but a single hung structured attempt can burn
+# most of it while sibling units wait, and the caller-side expiry never
+# reached the capability cache, so every unit re-burned the wait. Only
+# this single attempt is bounded here; a slow structured channel
+# degrades quickly to the tailored text path within the same unit while
+# the turn-level deadline below stays the backstop. Strict validation of
+# both paths is unchanged; 429 propagates and never triggers the text
+# path. Turn-independent, never an exact-question special case.
+VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 4.0
+
+
+def _first_fatal_outcome(done: set[asyncio.Task[UnitVerdict]]) -> BaseException | None:
+    """Return the first round-aborting outcome among finished units, if any.
+
+    Provider 429 must retire the runner promptly (never wait out the turn
+    budget or serve a partial round). Spontaneous cancellation and
+    programming defects are not transport unavailability and propagate
+    unchanged; expected transport/format failures (``OpenCodeError``,
+    :class:`VerifierValidationError`) are not fatal here — they become
+    unavailable-unit verdicts in the partial assembly below.
+    """
+    for task in done:
+        if task.cancelled():
+            return asyncio.CancelledError()
+        try:
+            task.result()
+        except OpenCodeRateLimitError as exc:
+            return exc
+        except (OpenCodeError, VerifierValidationError):
+            continue
+        except BaseException as exc:  # noqa: BLE001 - fatal defects propagate
+            return exc
+    return None
 
 
 async def _verify_per_unit_concurrent(
@@ -939,76 +1056,109 @@ async def _verify_per_unit_concurrent(
     result, so grounding strictness is unchanged. A non-429 failure in
     one unit fails only that unit closed and preserves independently
     verified units for deterministic narrowing. A turn-budget expiry
-    fails the whole turn closed as verifier-unavailable (fast
-    narrow/clarify downstream) instead of grinding through a 25-40s
-    provider tail. Provider 429 always propagates for runner
-    retire/restart.
+    preserves already-completed units the same way (pending units become
+    unavailable-unit verdicts) instead of discarding the whole round and
+    collapsing to generic clarification: downstream narrows to the
+    verified supported units, and only a round with no verified unit at
+    all still fails fully closed as verifier-unavailable. Provider 429
+    always propagates promptly for runner retire/restart.
     """
-    import asyncio as _asyncio
-
     budget = VERIFIER_TURN_BUDGET_S if turn_budget_s is None else float(turn_budget_s)
     if not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
     prefer_text_snapshot = _verifier_prefers_text(model)
-    try:
-        raw_results = await _asyncio.wait_for(
-            _asyncio.gather(
-                *(
-                    _verify_single_unit(
-                        unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
-                    )
-                    for unit in units
-                ),
-                return_exceptions=True,
-            ),
-            timeout=budget,
+    tasks = [
+        asyncio.ensure_future(
+            _verify_single_unit(
+                unit, passages, model=model, _prefer_text_snapshot=prefer_text_snapshot
+            )
         )
-    except TimeoutError as exc:
+        for unit in units
+    ]
+    pending: set[asyncio.Task[UnitVerdict]] = set(tasks)
+    try:
+        while pending:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_EXCEPTION
+            )
+            fatal = _first_fatal_outcome(done)
+            if fatal is not None:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise fatal
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        raise
+    expired = bool(pending)
+    for task in pending:
+        task.cancel()
+    # Settle every task (lets requested cancellations complete) so the
+    # classification below never observes a half-cancelled task. With
+    # return_exceptions, per-task failures arrive as values, never raise.
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if expired:
         logger.info(
-            "verifier turn budget exceeded; failing closed without slow grind",
+            "verifier turn budget exceeded; preserving completed units instead of slow grind",
             extra={"category": "verifier-turn-timeout", "units": len(units)},
         )
-        raise OpenCodeTimeoutError("verifier turn budget exceeded") from exc
+    # Collect every completed outcome (verdict or exception) so no
+    # "exception never retrieved" warning escapes; cancelled tasks
+    # surface as CancelledError and are represented as unavailable below.
+    outcomes: list[object] = []
+    for task in tasks:
+        if task.cancelled():
+            outcomes.append(asyncio.CancelledError())
+            continue
+        try:
+            outcomes.append(task.result())
+        except BaseException as exc:  # noqa: BLE001 - collected, classified below
+            outcomes.append(exc)
 
-    # A single provider/format failure must not discard independently
-    # verified units from the same draft. Failed units are represented as
-    # deterministic unsupported book claims, so they can never cross the
-    # product boundary; successfully verified units remain eligible for
-    # deterministic narrowing. Provider 429 is different: the whole runner
-    # must retire/restart and therefore always propagates.
+    # Provider 429 retires the runner: propagate promptly instead of
+    # serving a partial round. Cancellation/system exceptions and
+    # programming defects are not transport unavailability and propagate
+    # unchanged; anything else fail-closed becomes an unavailable unit.
     expected_unavailable_errors = (OpenCodeError, VerifierValidationError)
-    for item in raw_results:
+    for item in outcomes:
         if isinstance(item, OpenCodeRateLimitError):
             raise item
-        if isinstance(item, BaseException) and not isinstance(item, expected_unavailable_errors):
-            # Cancellation/system exceptions and programming defects are not
-            # transport unavailability. Do not silently turn them into a
-            # partial user answer.
+        if isinstance(item, BaseException) and not isinstance(
+            item, (*expected_unavailable_errors, asyncio.CancelledError)
+        ):
             raise item
 
     verdicts: list[UnitVerdict] = []
     unavailable_unit_ids: list[str] = []
     first_unavailable: BaseException | None = None
-    for unit, item in zip(units, raw_results, strict=True):
-        if isinstance(item, expected_unavailable_errors):
-            if first_unavailable is None:
-                first_unavailable = item
-            unavailable_unit_ids.append(unit.unit_id)
-            verdicts.append(
-                UnitVerdict(
-                    unit_id=unit.unit_id,
-                    scope="book",
-                    supported=False,
-                    evidence_passage_ids=[],
-                )
-            )
-            logger.info(
-                "verifier unit unavailable; failing only that unit closed",
-                extra={"category": type(item).__name__},
-            )
-        else:
-            assert isinstance(item, UnitVerdict)
+    for unit, item in zip(units, outcomes, strict=True):
+        if isinstance(item, UnitVerdict):
             verdicts.append(item)
+            continue
+        if first_unavailable is None:
+            if isinstance(item, BaseException) and not isinstance(item, asyncio.CancelledError):
+                first_unavailable = item
+            else:
+                first_unavailable = OpenCodeTimeoutError("verifier turn budget exceeded")
+        unavailable_unit_ids.append(unit.unit_id)
+        verdicts.append(
+            UnitVerdict(
+                unit_id=unit.unit_id,
+                scope="book",
+                supported=False,
+                evidence_passage_ids=[],
+            )
+        )
+        logger.info(
+            "verifier unit unavailable; failing only that unit closed",
+            extra={"category": type(item).__name__},
+        )
 
     # If every unit failed at the provider/format boundary there is no
     # verified material to salvage. Preserve the historical unavailable
@@ -1045,14 +1195,18 @@ async def run_verifier(
 
     Per-unit only production path (kodmial/aa#190): no batch-first round,
     no fallback round, no transport-format retry. One concurrent round of
-    minimal boolean decisions keeps the live SLO to a single round, now
+    minimal boolean decisions keeps the live SLO to a single round,
     additionally bounded by ``VERIFIER_TURN_BUDGET_S`` (kodmial/aa#217
-    recurrence 6): a turn-level expiry raises
-    :class:`OpenCodeTimeoutError` fail-closed instead of grinding through
-    a 25-40s provider tail. Validation-shaped failures fail closed
-    immediately without re-running planner/retrieval/answer. Provider 429
-    always propagates immediately for runner retire/restart and never
-    triggers extra calls. Turn-independent, never an exact-question
+    recurrence 6) and ``VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S``
+    (recurrence 7): a per-unit structured deadline expiry degrades that
+    unit to the text path, and a turn-level expiry preserves
+    already-completed units as partial results (pending units become
+    unavailable-unit verdicts) instead of grinding through a 25-40s
+    provider tail or discarding verified work. Validation-shaped failures
+    fail closed immediately without re-running planner/retrieval/answer.
+    Provider 429 always propagates immediately for runner retire/restart
+    and never triggers extra calls. Turn-independent, never an
+    exact-question
     special case.
     """
     if not units:
@@ -1067,6 +1221,7 @@ async def run_verifier(
 __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_CAPABILITY_TTL_S",
+    "VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S",
     "VERIFIER_TURN_BUDGET_S",
     "VERIFIER_MAX_EVIDENCE_PASSAGES",
     "VERIFIER_MAX_PASSAGE_CHARS",

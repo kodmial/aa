@@ -58,7 +58,15 @@ class EvidencePassage:
 # still use full exact text, so grounding strictness is unchanged.
 # Turn-independent, never an exact-question special case, Product
 # Contract #110 unchanged.
-ANSWER_MAX_PASSAGE_CHARS = 800
+#
+# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
+# 58f943c run 37709271567: answer input averages ~9k tokens per request
+# and the answer stage (p50 8.9s / p95 12.5s) is the slowest single model
+# call on the critical path. 600 chars keep several sentences of
+# decisive context per passage with the explicit marker while cutting
+# ~25% of display tokens per passage; the stored pack and all gates
+# still use full exact text.
+ANSWER_MAX_PASSAGE_CHARS = 600
 
 ANSWER_MAX_MESSAGE_CHARS = 500
 
