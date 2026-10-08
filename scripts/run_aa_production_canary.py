@@ -386,7 +386,7 @@ def classify_failure(name: str) -> FailureClass:
 def assert_evidence_privacy_safe(payload: dict[str, Any]) -> None:
     """Reject privacy-sensitive keys in persisted canary evidence."""
     for key, value in payload.items():
-        if str(key).lower() in FORBIDDEN_EVIDENCE_KEYS and isinstance(value, str) and value:
+        if str(key).lower() in FORBIDDEN_EVIDENCE_KEYS and value:
             raise ValueError(f"canary evidence carries forbidden key {key!r}")
         if isinstance(value, dict):
             assert_evidence_privacy_safe(value)
@@ -755,7 +755,7 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
                 and bool(resolved)
                 and _contains_cyrillic(error_reply)
                 and bool(compacted.strip())
-                and (voice_policy_passes(compacted) or bool(compacted.strip()))
+                and voice_policy_passes(compacted)
             )
             # The response artifact is produced through the same delivery
             # path: a voice turn falls back to bounded text when TTS models
@@ -999,8 +999,23 @@ def main(argv: list[str] | None = None) -> int:
                 check=False,
             )
             current_main = current_main_sha(ROOT)
-        except ValueError:
-            current_main = expected_sha
+        except ValueError as exc:
+            summary = CanarySummary(
+                main_sha=expected_sha,
+                run_id=run_id,
+                status="FAIL",
+                activation=activation,
+                checks=tuple(checks),
+                failure_class="github-infrastructure",
+                startup_duration_ms=startup_ms,
+                peak_rss_mb=_peak_rss_mb(),
+            )
+            _write_evidence(out_dir, summary)
+            print(
+                f"production canary infrastructure failure: cannot revalidate main: {exc}",
+                file=sys.stderr,
+            )
+            return 4
     if current_main and current_main != expected_sha:
         summary = CanarySummary(
             main_sha=expected_sha,
@@ -1022,8 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
         rechecked = resolve_activation(
             expected_sha,
             contract_status=contract_status,
-            issue6_closed=None if _parse_flag(args.issue6_closed) is None else True,
-            qual_pass_for_sha=None if _parse_flag(args.qual_pass) is None else True,
+            issue6_closed=_parse_flag(args.issue6_closed),
+            qual_pass_for_sha=_parse_flag(args.qual_pass),
         )
     except Exception:
         rechecked = activation
