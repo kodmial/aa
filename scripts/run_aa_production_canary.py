@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ import resource
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -410,6 +412,131 @@ def _leaks_mechanics(text: str) -> bool:
     return any(term in lowered for term in MECHANICS_TERMS)
 
 
+_TRANSIENT_NETWORK_TOKENS: tuple[str, ...] = (
+    "network",
+    "timeout",
+    "timed out",
+    "urlerror",
+    "connection",
+    "socket",
+    "dns",
+    "unreachable",
+    "refused",
+    "reset",
+    "ssl",
+    "temporary",
+)
+
+
+def _transient_aware_detail(prefix: str, exc: BaseException, fallback: str) -> str:
+    """Render a readiness detail that preserves transient failure signals.
+
+    ``classify_failure`` only sees check detail tokens, so a swallowed
+    429/network/timeout would otherwise classify as ``product-regression``
+    and open a P0 repair issue for an external blip. Rate limits keep an
+    explicit ``429`` token; transport failures keep ``network``/``timeout``
+    tokens; anything else keeps the product fallback unchanged.
+    """
+    name = type(exc).__name__
+    haystack = f"{name} {exc}".lower()
+    if "429" in haystack or "rate-limit" in haystack or "rate_limit" in haystack:
+        return f"{prefix}-transient-rate-limit-429:{name}"
+    if any(token in haystack for token in _TRANSIENT_NETWORK_TOKENS):
+        return f"{prefix}-transient-network-timeout:{name}"
+    return f"{fallback}:{name}" if name else fallback
+
+
+def _build_substantive_proof_index() -> Any:
+    """Build a minimal RAM-resident hybrid index for the substantive proof.
+
+    The proof index is synthetic (no corpus text) but runs the real
+    production pipeline: FTS5/BM25 lexical branches plus hashing dense
+    branches, RRF fusion, dedup/diversity, small-to-big expansion, and
+    Evidence Pack selection through :func:`retrieve_evidence`. A broken
+    hybrid branch, fusion, or pack stage raises or yields an empty pack
+    and fails the substantive check instead of passing on a canned reply.
+    """
+    import tempfile
+
+    from aa.retrieval.dense import (
+        HASHING_BACKEND_NAME,
+        HASHING_DIM,
+        ExactIPIndex,
+        hashing_embed,
+    )
+    from aa.retrieval.index import ChunkRecord, HybridIndex, logical_chunk_id
+    from aa.retrieval.lexical import build_lexical_db, load_lexical_into_memory
+
+    sections = (
+        ("canary-proof-поддержка", "canary-proof-p1"),
+        ("canary-proof-страх", "canary-proof-p2"),
+        ("canary-proof-шаги", "canary-proof-p3"),
+    )
+    bodies = (
+        "Запрос о поддержке разбираем спокойно: страх перед людьми слабеет, когда рядом поддержка.",
+        "Поддержка рядом: запрос о тяге вечером, спокойный разбор и ближайшие шаги.",
+        "Каждый запрос о поддержке встречаем спокойно: страх называем, шаги намечаем.",
+    )
+    records: list[ChunkRecord] = []
+    chunk_ids: list[str] = []
+    chunk_sections: list[str] = []
+    chunk_texts: list[str] = []
+    for pos, ((section, parent), body) in enumerate(zip(sections, bodies, strict=True)):
+        for rep in range(3):
+            text = f"{body} Поддержка и запрос {pos}-{rep}."
+            chunk_id = f"canary-proof-s{pos}:ru:c{pos * 3 + rep:04d}"
+            prev_id = f"canary-proof-s{pos}:ru:c{pos * 3 + rep - 1:04d}" if rep > 0 else None
+            next_id = f"canary-proof-s{pos}:ru:c{pos * 3 + rep + 1:04d}" if rep < 2 else None
+            start = sum(len(f"{bodies[pos]} Поддержка и запрос {pos}-{r}.") for r in range(rep))
+            records.append(
+                ChunkRecord(
+                    chunk_id=chunk_id,
+                    logical_chunk_id=logical_chunk_id(chunk_id),
+                    section=section,
+                    book="canary-proof",
+                    parent=parent,
+                    prev=prev_id,
+                    next=next_id,
+                    source_id="canary-proof",
+                    source_file="canary-proof.txt",
+                    source_sha256=hashlib.sha256(b"canary-proof").hexdigest(),
+                    char_start=start,
+                    char_end=start + len(text),
+                    text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    text=text,
+                    corpus_version="canary-proof/1",
+                )
+            )
+            chunk_ids.append(chunk_id)
+            chunk_sections.append(section)
+            chunk_texts.append(text)
+    tmpdir = tempfile.mkdtemp(prefix="aa-canary-proof-lexical-")
+    build_lexical_db(
+        Path(tmpdir) / "lexical.db",
+        chunk_ids=chunk_ids,
+        sections=chunk_sections,
+        texts=chunk_texts,
+    )
+    lexical_conn = load_lexical_into_memory(Path(tmpdir) / "lexical.db")
+    dense = ExactIPIndex.build(
+        chunk_ids,
+        [hashing_embed(text, dim=HASHING_DIM) for text in chunk_texts],
+        backend=HASHING_BACKEND_NAME,
+    )
+    return HybridIndex(
+        directory=Path(tmpdir),
+        metadata={
+            "embedding_backend": HASHING_BACKEND_NAME,
+            "embedding_dim": HASHING_DIM,
+            "ru_artifact_sha256": "canary-proof",
+        },
+        chunks={record.chunk_id: record for record in records},
+        dense=dense,
+        lexical_conn=lexical_conn,
+        ram_resident=True,
+    )
+
+
 async def _run_compact_checks() -> tuple[list[CheckResult], float]:
     """Run the compact production-boundary checks hermetically."""
     from aa.app import Application
@@ -528,13 +655,15 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         try:
             await app.opencode_runtime.ensure_ready()
             ready_ok = bool(app.opencode_runtime.ready)
-        except Exception:
+            ready_detail = "opencode-ready" if ready_ok else "opencode-not-ready"
+        except Exception as exc:
             ready_ok = False
+            ready_detail = _transient_aware_detail("opencode", exc, "opencode-not-ready")
         _record(
             "opencode-readiness",
             ready_ok,
             started,
-            "opencode-ready" if ready_ok else "opencode-not-ready",
+            ready_detail,
         )
 
         # Telegram Bot API readiness without a real user message.
@@ -545,21 +674,34 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
                 probe_url = f"https://api.telegram.org/bot{token}/getMe"
                 request = urllib.request.Request(probe_url, method="GET")
 
-                def _probe() -> bool:
+                def _probe() -> tuple[bool, str]:
                     try:
                         with urllib.request.urlopen(request, timeout=15) as response:
                             payload = json.loads(response.read().decode("utf-8"))
                         result = payload.get("result") or {}
-                        return bool(payload.get("ok") is True and result.get("is_bot") is True)
-                    except Exception:
-                        return False
+                        ok = bool(payload.get("ok") is True and result.get("is_bot") is True)
+                        return ok, "bot-api-ready" if ok else "telegram-auth-failed"
+                    except urllib.error.HTTPError as exc:
+                        if exc.code == 429:
+                            return False, "telegram-transient-rate-limit-429"
+                        if 500 <= exc.code < 600:
+                            return False, f"telegram-transient-network-http-{exc.code}"
+                        return False, f"telegram-http-{exc.code}"
+                    except Exception as exc:
+                        # Timeouts, DNS/reset connection errors, and other
+                        # transport failures must stay distinguishable from
+                        # an auth failure so a transient blip never opens a
+                        # P0 product repair issue.
+                        return False, _transient_aware_detail(
+                            "telegram", exc, "telegram-auth-failed"
+                        )
 
-                telegram_ok = await asyncio.to_thread(_probe)
+                telegram_ok, telegram_detail = await asyncio.to_thread(_probe)
                 _record(
                     "telegram-readiness",
                     telegram_ok,
                     started,
-                    "bot-api-ready" if telegram_ok else "telegram-auth-failed",
+                    telegram_detail,
                 )
             except Exception as exc:
                 _record("telegram-readiness", False, started, f"telegram:{type(exc).__name__}")
@@ -606,17 +748,51 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         )
 
         # Synthetic Russian substantive turn with planner/retrieval/evidence grounding.
+        # The validated 12-query plan is fed into the real hybrid RRF-only
+        # pipeline (lexical + dense branches, RRF fusion, Evidence Pack
+        # selection/rendering), not just counted: broken hybrid retrieval
+        # or pack construction raises or yields an empty pack and FAILs.
         started = time.perf_counter()
         substantive_ok = False
         substantive_detail = "substantive-turn-failed"
         try:
+            from aa.retrieval.evidence import render_book_evidence, retrieve_evidence
+
             substantive_queries = [f"запрос про поддержку {idx}" for idx in range(12)]
             plan = validate_query_plan(QueryPlan(queries=substantive_queries))
             cardinality_ok = 10 <= len(plan.queries) <= 16
+            proof_index = _build_substantive_proof_index()
+            try:
+                pack = retrieve_evidence(proof_index, plan.queries)
+            finally:
+                if proof_index.lexical_conn is not None:
+                    proof_index.lexical_conn.close()
+            meta = dict(pack.retrieval_metadata)
+            rendered = render_book_evidence(pack)
+            retrieval_ok = (
+                len(pack.passages) > 0
+                and pack.total_tokens > 0
+                and bool(pack.corpus_version)
+                and meta.get("planner_query_count") == len(plan.queries)
+                and meta.get("retrieval_backend") == "rrf-only/1"
+                and int(meta.get("selected_passages", 0)) == len(pack.passages)
+                and all(
+                    passage.exact_text.strip()
+                    and passage.passage_id
+                    and passage.source_id
+                    and passage.section_id
+                    and hashlib.sha256(passage.exact_text.encode("utf-8")).hexdigest()
+                    == passage.text_sha256
+                    for passage in pack.passages
+                )
+                and "<passage" in rendered
+                and "section=" in rendered
+                and "(no book evidence" not in rendered
+            )
             reply = await app.respond(chat_meta + 1, "Что книга говорит о страхе перед людьми?")
             thread = runtime.thread_id(chat_meta + 1)
             history = runtime.history_for_thread(thread)
-            pack_ok = cardinality_ok and len(history) == 2
+            pack_ok = cardinality_ok and retrieval_ok and len(history) == 2
             grounded_ok = (
                 bool(reply.strip())
                 and _contains_cyrillic(reply)
@@ -627,6 +803,12 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             substantive_ok = pack_ok and grounded_ok
             if substantive_ok:
                 substantive_detail = "planner-12-hybrid-evidence-grounded"
+            elif not cardinality_ok:
+                substantive_detail = "substantive-planner-cardinality"
+            elif not retrieval_ok:
+                substantive_detail = "substantive-evidence-pack-failed"
+            else:
+                substantive_detail = "substantive-reply-ungrounded"
         except Exception as exc:
             substantive_detail = f"substantive:{type(exc).__name__}"
         _record("substantive-turn", substantive_ok, started, substantive_detail)
@@ -958,12 +1140,12 @@ def main(argv: list[str] | None = None) -> int:
         # Provider/infrastructure signals travel as structured detail tokens.
         details = " ".join(check.detail for check in failed)
         candidate = classify_failure(details)
-        # An infrastructure-looking detail is only trusted when the failing
-        # check is the one that owns external I/O (telegram-readiness).
-        # Anything else stays a product regression so external blips cannot
-        # mask a real product defect.
+        # An infrastructure-looking detail is only trusted when every
+        # failing check owns external I/O (telegram-readiness,
+        # opencode-readiness). Anything else stays a product regression
+        # so external blips cannot mask a real product defect.
         if candidate in ("provider-transient", "github-infrastructure") and not all(
-            check.name == "telegram-readiness" for check in failed
+            check.name in ("telegram-readiness", "opencode-readiness") for check in failed
         ):
             candidate = "product-regression"
         failure_class = candidate

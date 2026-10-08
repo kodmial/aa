@@ -112,9 +112,9 @@ jobs:
             const marker = `<!-- continuum-qualification-result issue=7 sha=${sha} result=pass -->`;
             let qualPass = false;
             for (let page = 1; page <= 5 && !qualPass; page++) {
-              const comments = await apiRetry(`list issue 7 comments page ${page}`, () =>
-                github.paginate(github.rest.issues.listComments, {
-                  owner, repo, issue_number: 7, per_page: 100,
+              const { data: comments } = await apiRetry(`list issue 7 comments page ${page}`, () =>
+                github.rest.issues.listComments({
+                  owner, repo, issue_number: 7, per_page: 100, page,
                 })
               );
               qualPass = comments.some(c => String(c.body || '').includes(marker));
@@ -462,11 +462,18 @@ jobs:
               }
             }
             const marker = '<!-- aa-production-canary-repair:v1 -->';
+            // Close only repairs recorded for the exact SHA that just
+            // passed: a PASS for one root cause must never close
+            // unrelated still-failing fingerprints (other SHAs or other
+            // failure sets stay open).
+            const shaLine = `Exact main SHA: \`${sha}\``;
             const issues = await apiRetry('list open issues', () =>
               github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 })
             );
             const matching = issues.filter(
-              issue => !issue.pull_request && String(issue.body || '').includes(marker)
+              issue => !issue.pull_request
+                && String(issue.body || '').includes(marker)
+                && String(issue.body || '').includes(shaLine)
             );
             for (const issue of matching) {
               await apiRetry(`close canary repair issue #${issue.number}`, () =>
