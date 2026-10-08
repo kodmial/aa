@@ -10,7 +10,7 @@ For the supplied unit, decide the structured output fields:
 - supported (boolean): true only when every substantive proposition in the unit is semantically established by the cited exact passages. If even one substantive part is unsupported, the whole unit is unsupported. A unit that requires book evidence but cites no evidence passage is unsupported. A unit that merely cites an unrelated source passage is unsupported.
 - evidence_passage_ids (string array): identifiers of the supplied Evidence Pack passages that semantically support the unit. Cite only passages that semantically support the unit.
 
-Do not strengthen the evidence: do not infer beyond what the exact passages semantically establish. Do not use keyword overlap or source-identifier presence as support; judge semantic establishment of all substantive content.
+Do not strengthen the evidence: do not infer beyond what the exact passages semantically establish. Do not use keyword overlap or source-identifier presence as support; judge semantic establishment of all substantive content. A verdict that every individual unit is supported does not by itself prove that the whole turn answers the user's request: whole-turn answer adequacy is judged separately by the application from the task, the delivered candidate, and the relevant exact passages.
 
 Evidence passage identifiers must come only from the supplied Evidence Pack. Cite only passages that semantically support the unit.
 
