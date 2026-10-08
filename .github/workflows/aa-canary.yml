@@ -323,6 +323,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Download privacy-safe canary evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-production-canary-evidence
+          path: canary-out/
+
       - name: Create or reuse exactly one P0 repair issue
         uses: actions/github-script@v7
         env:
@@ -359,15 +365,19 @@ jobs:
               core.notice(`Canary result is STALE (tested=${sha.slice(0, 12)} current=${currentMain.slice(0, 12)}); no repair issue is created.`);
               return;
             }
-            let failedChecks = 'unknown-check';
-            let failureClass = 'product-regression';
+            let failedChecks;
+            let failureClass;
             try {
               const result = JSON.parse(fs.readFileSync('canary-out/result.json', 'utf8'));
               const failed = Array.isArray(result.failed_checks) ? result.failed_checks : [];
-              if (failed.length) failedChecks = failed.join(',');
-              if (result.failure_class) failureClass = String(result.failure_class);
+              if (!failed.length) {
+                throw new Error('canary result has no failed_checks');
+              }
+              failedChecks = failed.join(',');
+              failureClass = result.failure_class ? String(result.failure_class) : 'product-regression';
             } catch (error) {
-              core.warning(`No canary result evidence; using generic category: ${error.message}`);
+              core.warning(`Missing exact canary evidence; no repair issue is created: ${error.message}`);
+              return;
             }
             if (failureClass !== 'product-regression') {
               core.notice(`Canary failure class is ${failureClass}; no product repair issue is created.`);

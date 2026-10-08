@@ -102,13 +102,14 @@ MECHANICS_TERMS: tuple[str, ...] = (
     "retrieval",
     "corpus",
     "grounding",
+    "evidence",
     "evidence pack",
     "reranker",
     "planner",
     "chunk",
     "embedding",
     "поиск по корпусу",
-    "эвidence",
+    "эвиденс",
 )
 
 logger = logging.getLogger("aa.production_canary")
