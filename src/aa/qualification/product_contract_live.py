@@ -1814,7 +1814,10 @@ def _extract_step_numbers_for_relevance(text: str) -> set[int]:
             ("одиннадцат", 11),
             ("двенадцат", 12),
         ):
-            if stem in lowered:
+            if (
+                re.search(rf"\\b{stem}\\w*\\s+шаг\\w*\\b", lowered) is not None
+                or re.search(rf"\\bшаг\\w*\\s+{stem}\\w*\\b", lowered) is not None
+            ):
                 found.add(number)
     return found
 
@@ -1854,11 +1857,9 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
     overlap = prompt_prefixes & reply_prefixes
     if len(overlap) >= 2:
         return True
-    if len(overlap) == 1 and not prompt_steps:
-        return True
-    if len(overlap) == 1 and prompt_steps:
-        # With an explicit step referent already aligned above, one shared
-        # content prefix plus step agreement proves topical relevance.
+    if len(overlap) == 1 and prompt_steps and reply_steps and bool(prompt_steps & reply_steps):
+        # One lexical overlap is sufficient only with independently
+        # explicit matching numbered-step identity on both sides.
         return True
     _stems = (
         "тяг",
