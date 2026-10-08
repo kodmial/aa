@@ -336,5 +336,5 @@ def test_no_exact_live_question_special_cases_in_product() -> None:
 def test_gate_e_slo_stays_strict() -> None:
     from aa.qualification.self_proving import ORDINARY_TURN_BUDGET_MS, P95_TARGET_MS
 
-    assert P95_TARGET_MS == 60_000
-    assert ORDINARY_TURN_BUDGET_MS == 120_000
+    assert P95_TARGET_MS == 15_000
+    assert ORDINARY_TURN_BUDGET_MS == 30_000
