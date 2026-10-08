@@ -216,9 +216,13 @@ def certify_outbound_safety(text: str) -> bool:
     still fails when it advises drinking. Only the boolean travels
     here; the category stays in the safety log.
     """
-    from aa.safety.outbound import is_outbound_safe
+    try:
+        from aa.safety.outbound import is_outbound_safe
 
-    return is_outbound_safe(text)
+        return is_outbound_safe(text)
+    except Exception:
+        logger.warning("outbound safety certification failed closed", exc_info=True)
+        return False
 
 
 def outbound_safety_category(text: str) -> str:

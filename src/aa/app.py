@@ -1066,7 +1066,14 @@ class Application:
                 reply = SAFE_UNAVAILABLE_REPLY
                 fallback_used = True
         except Exception:
-            pass
+            logger.warning("outbound safety gate error: failing closed", exc_info=True)
+            try:
+                from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _SAFE_FALLBACK_REPLY
+
+                reply = _SAFE_FALLBACK_REPLY
+            except Exception:
+                reply = NATURAL_CLARIFICATION_REPLY
+            fallback_used = True
         is_clarification = reply.strip() == NATURAL_CLARIFICATION_REPLY
         fitted = self._fit_envelope(reply)
         total_ms = (_time.perf_counter() - turn_started) * 1000.0
