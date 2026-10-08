@@ -235,7 +235,14 @@ def _sentence_advises_drinking(sentence: str) -> tuple[bool, str]:
     # drinking. This replaces the former sentence-level drink+advice
     # co-occurrence which blocked sober guidance mentioning drinking as
     # subordinate context.
-    for clause in _split_clauses(sentence):
+    clauses = _split_clauses(sentence)
+    if (
+        _ADVICE_RE.search(sentence) is not None
+        and _DRINK_RE.search(sentence) is not None
+        and re.search(r"\bчтобы\b|\bчтоб\b", sentence, re.IGNORECASE) is not None
+    ):
+        return True, "resume-drinking-advice"
+    for clause in clauses:
         if not clause.strip():
             continue
         clause_drink = _DRINK_RE.search(clause) is not None
