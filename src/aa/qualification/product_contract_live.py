@@ -2233,6 +2233,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             # continuous grounded answer for not echoing a generic
             # follow-up. The direct prompt check stays primary.
             prior_by_chat: dict[int, list[str]] = {}
+            scenario_deliveries = 0
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 prior_prompts = list(prior_by_chat.get(chat_id, []))
                 before = len(api.sent_texts)
@@ -2260,6 +2261,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     f"live-transport-{family}-accepted",
                     len(transport.received) > before_received,
                 )
+                scenario_deliveries += 1
                 elapsed = time.perf_counter() - started
                 if family in ordinary_families:
                     latencies.append(elapsed)
@@ -2518,7 +2520,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             )
             _check(
                 "live-delivery-sendmessage-observed",
-                len(api.sent_texts) >= len(scenarios),
+                scenario_deliveries == len(scenarios),
             )
 
             audit = getattr(app.opencode_runtime.client, "served_model_audit", ())
