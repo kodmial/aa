@@ -191,6 +191,62 @@ _GENERIC_META_MARKERS = (
     "ваша роль",
 )
 
+# Generic structural capability vocabulary (individual tokens only, never
+# an exact-question phrase): second-person references plus capability
+# words plus neutral filler scaffolding around a short capability probe.
+# Natural paraphrases split a capability request across non-contiguous
+# tokens, so token-level structure is required; contiguous marker
+# substrings alone under-recognize ordinary probes and misroute them to
+# the substantive book path.
+_SECOND_PERSON_TOKENS = frozenset(
+    {
+        "ты",
+        "вы",
+        "твой",
+        "твоя",
+        "твои",
+        "твоих",
+        "ваш",
+        "ваша",
+        "ваши",
+        "тебя",
+        "вас",
+        "тобой",
+    }
+)
+
+_CAPABILITY_TOKENS = frozenset(
+    {
+        "можешь",
+        "можете",
+        "умеешь",
+        "умеете",
+        "помочь",
+        "помогать",
+        "полезен",
+        "полезна",
+        "польза",
+        "возможности",
+        "роль",
+    }
+)
+
+_META_FILLER_TOKENS = frozenset(
+    {
+        "вообще",
+        "здесь",
+        "тут",
+        "просто",
+        "именно",
+        "пожалуйста",
+        "слушай",
+        "а",
+        "же",
+        "то",
+        "ли",
+    }
+)
+
 
 def is_meta_request(user_message: str) -> bool:
     """Whether a turn is a pure identity/capability probe.
@@ -205,7 +261,8 @@ def is_meta_request(user_message: str) -> bool:
     if not cleaned:
         return False
     lowered = cleaned.casefold()
-    if not any(marker in lowered for marker in _GENERIC_META_MARKERS):
+    has_marker = any(marker in lowered for marker in _GENERIC_META_MARKERS)
+    if not has_marker and not _has_structural_capability_shape(cleaned):
         return False
     # Any recovery-domain vocabulary makes the turn substantive, never
     # pure meta (for example a capability prefix plus an evening-craving
@@ -235,6 +292,9 @@ def is_meta_request(user_message: str) -> bool:
     # about capabilities) stay meta; any other substantive token in the
     # remainder proves a combined request. Tokens that only restate the
     # meta probe itself (overlapping marker inflections) are ignored.
+    # Neutral filler scaffolding around a short probe (general adverbs
+    # of place/manner and politeness particles) likewise stays meta:
+    # only a genuine topic remainder proves a combined request.
     interrogative_words: set[str] = set()
     for marker in _GENERIC_INTERROGATIVE_MARKERS:
         interrogative_words.update(_WORD_RE.findall(marker.casefold()))
@@ -245,9 +305,28 @@ def is_meta_request(user_message: str) -> bool:
     # "помочь"/"подсказать" inflections are request verbs, not proof of a
     # substantive topic on their own; require another topic token.
     remainder_tokens -= {"помочь", "подсказать", "подскажите", "помогите"}
+    remainder_tokens -= _CAPABILITY_TOKENS
+    remainder_tokens -= _META_FILLER_TOKENS
     if remainder_tokens:
         return False
     return True
+
+
+def _has_structural_capability_shape(cleaned: str) -> bool:
+    """Whether a short probe has generic capability-question structure.
+
+    Token-level only, never an exact-question phrase: a single short
+    interrogative segment addressing the assistant in the second person
+    with capability vocabulary. This recognizes ordinary paraphrases
+    whose capability words are split across non-contiguous tokens.
+    """
+    lowered = (cleaned or "").casefold()
+    if not lowered or "?" not in cleaned:
+        return False
+    words = set(_WORD_RE.findall(lowered))
+    if not (words & _SECOND_PERSON_TOKENS):
+        return False
+    return bool(words & _CAPABILITY_TOKENS)
 
 
 # Generic alcohol-recovery domain stems for topical relevance (never an
@@ -475,6 +554,7 @@ def assess_turn_adequacy(
     verifier_outcome: str = "unknown",
     unavailable_units: int = 0,
     turn_budget_exceeded: bool = False,
+    prior_user_messages: Sequence[str] = (),
 ) -> AdequacyAssessment:
     """Judge the whole turn: task, context, candidate and relevant evidence.
 
@@ -485,6 +565,15 @@ def assess_turn_adequacy(
     must share substantive content with both the cited exact passages and
     the user's request. Pure greetings, honest self-identity and genuinely
     contentless turns keep a passing glue verdict without book evidence.
+
+    ``prior_user_messages`` carries the immediately preceding user turns
+    in the same conversation (oldest first, generic context only). A
+    terse contextual follow-up carries little topical content on its own;
+    the planner already resolves such follow-ups against history, so
+    relevance here also resolves against that history instead of failing
+    a continuous grounded answer for not echoing a generic follow-up.
+    The substantive/glue determination itself stays on the current turn
+    only, so context never turns a substantive request into glue.
     """
     _ = planner_reason
     cleaned_reply = (reply or "").strip()
@@ -587,6 +676,10 @@ def assess_turn_adequacy(
             pack_by_id[passage_id] = text
     request_tokens = _content_tokens(user_message)
     request_prefixes = _token_prefixes(request_tokens)
+    context_text = " ".join(
+        str(item).strip() for item in (prior_user_messages or []) if str(item).strip()
+    )
+    context_prefixes = _token_prefixes(_content_tokens(context_text)) if context_text else set()
     relevant_unit_found = False
     for unit in supported_units:
         cited = unit.get("evidence_passage_ids", [])
@@ -627,8 +720,17 @@ def assess_turn_adequacy(
         _direct_overlap = bool(
             request_prefixes and (request_prefixes & (unit_prefixes | evidence_prefixes))
         )
+        if not _direct_overlap and context_prefixes:
+            # Contextual follow-up resolution (generic, turn-independent):
+            # a terse follow-up in an ongoing conversation is relevant
+            # when the evidence-backed unit shares content with the
+            # immediately preceding user turns. The current-turn check
+            # above stays primary; context only rescues continuity.
+            _direct_overlap = bool(context_prefixes & (unit_prefixes | evidence_prefixes))
         if not _direct_overlap:
-            _request_domain = _has_recovery_domain(user_message)
+            _request_domain = _has_recovery_domain(user_message) or (
+                bool(context_text) and _has_recovery_domain(context_text)
+            )
             _evidence_domain = any(
                 _has_recovery_domain(passage_text) for passage_text in cited_texts
             ) or _has_recovery_domain(str(unit.get("text", "") or reply))
