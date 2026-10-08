@@ -140,7 +140,14 @@ def test_answer_small_history_passes_through() -> None:
 async def test_answer_attempt_timeout_uses_fast_minimal_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A hung answer attempt degrades to the minimal prompt within budget."""
+    """A hung answer attempt fails fast (recurrence 9 supersedes retry).
+
+    Recurrence 9 on exact main 922dd07 (run 37720236046: answer p95
+    15.1s, max 17.4s past the 12.7s single-call tail) proved the
+    recurrence-8 minimal retry accumulates instead of capping. The
+    single attempt now fails fast to the retry reply with one model
+    call only.
+    """
     import aa.conversation.turn_pipeline as pipeline
 
     monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 0.05)
@@ -203,8 +210,9 @@ async def test_answer_attempt_timeout_uses_fast_minimal_retry(
     )
     elapsed = time.perf_counter() - started
     assert elapsed < 5.0
+    assert outcome["text"] == NATURAL_RETRY_REPLY
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["answer_rounds"] >= 2
+    assert outcome["telemetry"]["answer_rounds"] == 1
 
 
 async def test_answer_double_timeout_serves_retry_not_clarification(
