@@ -189,6 +189,41 @@ def test_same_step_passes_with_resolved_referent() -> None:
     assert verdict.answers_request is True
 
 
+def test_single_generic_overlap_does_not_prove_step_relevance() -> None:
+    from aa.conversation.answer_adequacy import assess_turn_adequacy
+
+    text = "Решения требуют терпения."
+    pack = [_pack_entry(passage_id="chapter-5#exp0002", text=text)]
+    verdict = assess_turn_adequacy(
+        user_message="А какие решения принимают в этом шаге?",
+        reply=text,
+        evidence_pack=pack,
+        grounding_result=_grounding(passage_id="chapter-5#exp0002", text=text),
+        planner_reason="substantive-with-queries",
+        summary="Обсуждаем Первый шаг программы",
+        recent=["Расскажи про Первый шаг"],
+    )
+    assert verdict.verdict == "fail"
+    assert verdict.failure_category == "irrelevant-citation"
+
+
+def test_gate_c_single_generic_overlap_does_not_prove_relevance() -> None:
+    from aa.qualification.product_contract_live import (
+        _assess_prompt_reply_relevance,
+        _extract_step_numbers_for_relevance,
+    )
+
+    assert (
+        _assess_prompt_reply_relevance(
+            "Какие решения важны в Первом шаге?",
+            "Решения требуют терпения.",
+        )
+        is False
+    )
+    assert _extract_step_numbers_for_relevance("В пятницу обсуждали шаг программы") == set()
+    assert _extract_step_numbers_for_relevance("Пятый шаг программы") == {5}
+
+
 def test_short_disclosure_generic_retry_fails() -> None:
     from aa.conversation.answer_adequacy import assess_turn_adequacy
     from aa.conversation.turn_pipeline import NATURAL_RETRY_REPLY
