@@ -118,11 +118,11 @@ GATE_C_STAGES: tuple[str, ...] = (
 # exact-main PASS without a human-required terminal state.
 MAX_REPAIR_CYCLES = 3
 
-# Temporary quality-first live text SLO (Gate E, 2026-10-08 user decision):
-# allow slow real-model reasoning while retaining a bounded user experience.
-# Whole-turn quality/safety/grounding Gate C is unchanged.
-ORDINARY_TURN_BUDGET_MS = 120_000
-P95_TARGET_MS = 60_000
+# Immutable Product Contract qualification must fail closed on real ordinary
+# text latency: p95 <= 15s and every ordinary turn < 30s. These bounds
+# apply to Gate E regardless of Gate C's semantic/content outcome.
+ORDINARY_TURN_BUDGET_MS = 30_000
+P95_TARGET_MS = 15_000
 
 # Provider/infrastructure policy carried by the DAG (never product PASS).
 HTTP_429_RESTART_MARKER = "OPENCODE_429_RESTART_REQUIRED"
