@@ -208,13 +208,51 @@ class GraphTurnRuntime:
             grounding_d = dict(grounding) if isinstance(grounding, dict) else {}
             grounding_units = grounding_d.get("units", [])
             response_units = len(grounding_units) if isinstance(grounding_units, list) else 0
+            try:
+                from aa.conversation.answer_adequacy import planner_reason_for as _tele_reason
+                from aa.conversation.answer_adequacy import runtime_sha as _tele_sha
+                from aa.conversation.answer_adequacy import trace_id_for_snapshot as _tele_trace
+            except Exception:
+                _tele_reason = None  # type: ignore[assignment]
+                _tele_sha = None  # type: ignore[assignment]
+                _tele_trace = None  # type: ignore[assignment]
+            _planner_outcome = str(
+                embedded_d.get("planner_outcome", "invoked" if query_count else "glue")
+            )
+            _planner_reason = str(embedded_d.get("planner_reason", "") or "")
+            if not _planner_reason and _tele_reason is not None:
+                try:
+                    _planner_reason = str(
+                        _tele_reason(
+                            int(embedded_d.get("planner_query_count", query_count) or 0),
+                            _planner_outcome,
+                        )
+                    )
+                except Exception:
+                    _planner_reason = "unknown"
+            _trace_id = str(embedded_d.get("turn_trace_id", "") or "")
+            if not _trace_id and _tele_trace is not None:
+                try:
+                    _trace_id = str(_tele_trace(dict(embedded_d)))
+                except Exception:
+                    _trace_id = ""
+            _runtime_sha = str(embedded_d.get("runtime_sha", "") or "")
+            if not _runtime_sha and _tele_sha is not None:
+                try:
+                    _runtime_sha = str(_tele_sha())
+                except Exception:
+                    _runtime_sha = "unknown"
             snapshot: dict[str, Any] = {
                 "planner_query_count": int(embedded_d.get("planner_query_count", query_count)),
-                "planner_outcome": str(
-                    embedded_d.get("planner_outcome", "invoked" if query_count else "glue")
-                ),
+                "planner_outcome": _planner_outcome,
+                "planner_reason": _planner_reason or "unknown",
                 "planner_latency_ms": float(embedded_d.get("planner_latency_ms", 0.0)),
                 "retrieval_passages": int(embedded_d.get("retrieval_passages", pack_count)),
+                "retrieval_hits": int(
+                    embedded_d.get(
+                        "retrieval_hits", embedded_d.get("retrieval_passages", pack_count)
+                    )
+                ),
                 "retrieval_outcome": str(embedded_d.get("retrieval_outcome", "unknown")),
                 "retrieval_latency_ms": float(
                     embedded_d.get(
@@ -244,6 +282,13 @@ class GraphTurnRuntime:
                 "repair_budget_exceeded": bool(embedded_d.get("repair_budget_exceeded", False)),
                 "turn_budget_exceeded": bool(embedded_d.get("turn_budget_exceeded", False)),
                 "all_required_supported": bool(grounding_d.get("all_required_supported", False)),
+                "adequacy_verdict": str(embedded_d.get("adequacy_verdict", "unknown")),
+                "failure_category": str(embedded_d.get("failure_category", "")),
+                "answers_request": bool(embedded_d.get("answers_request", False)),
+                "technically_grounded": bool(embedded_d.get("technically_grounded", False)),
+                "qualified": bool(embedded_d.get("qualified", False)),
+                "turn_trace_id": _trace_id,
+                "runtime_sha": _runtime_sha or "unknown",
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),
             }
@@ -252,6 +297,7 @@ class GraphTurnRuntime:
                 "v2 turn telemetry",
                 extra={
                     "planner_outcome": snapshot["planner_outcome"],
+                    "planner_reason": snapshot["planner_reason"],
                     "retrieval_outcome": snapshot["retrieval_outcome"],
                     "answer_outcome": snapshot["answer_outcome"],
                     "answer_latency_ms": snapshot["answer_latency_ms"],
@@ -259,6 +305,8 @@ class GraphTurnRuntime:
                     "verifier_latency_ms": snapshot["verifier_latency_ms"],
                     "verifier_unavailable_units": snapshot["verifier_unavailable_units"],
                     "response_units": snapshot["response_units"],
+                    "adequacy_verdict": snapshot["adequacy_verdict"],
+                    "failure_category": snapshot["failure_category"],
                     "repair_budget_exceeded": snapshot["repair_budget_exceeded"],
                     "latency_ms": snapshot["total_latency_ms"],
                 },

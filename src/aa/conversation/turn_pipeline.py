@@ -436,6 +436,9 @@ async def run_v2_answer_turn(
     max_repair_rounds: int = MAX_TARGETED_REPAIR_ROUNDS,
     initial_query_count: int | None = None,
     upstream_latency_ms: float = 0.0,
+    planner_reason: str | None = None,
+    planner_outcome_raw: str | None = None,
+    turn_trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -458,15 +461,72 @@ async def run_v2_answer_turn(
         upstream_spent_s = max(0.0, float(upstream_latency_ms) / 1000.0)
     except (TypeError, ValueError):
         upstream_spent_s = 0.0
+    from aa.conversation.answer_adequacy import (
+        ADEQUACY_FAIL as _ADEQ_FAIL,
+    )
+    from aa.conversation.answer_adequacy import (
+        ADEQUACY_PASS as _ADEQ_PASS,
+    )
+    from aa.conversation.answer_adequacy import (
+        FAILURE_BUDGET_EXCEEDED as _FAIL_BUDGET,
+    )
+    from aa.conversation.answer_adequacy import (
+        FAILURE_REPAIR_FAILED as _FAIL_REPAIR,
+    )
+    from aa.conversation.answer_adequacy import (
+        assess_turn_adequacy as _assess_adequacy,
+    )
+    from aa.conversation.answer_adequacy import (
+        build_recovery_queries as _build_recovery,
+    )
+    from aa.conversation.answer_adequacy import (
+        is_meta_request as _is_meta_request,
+    )
+    from aa.conversation.answer_adequacy import (
+        is_proven_glue_message as _is_proven_glue,
+    )
+    from aa.conversation.answer_adequacy import (
+        new_turn_trace_id as _new_trace_id,
+    )
+    from aa.conversation.answer_adequacy import (
+        planner_reason_for as _planner_reason_for,
+    )
+    from aa.conversation.answer_adequacy import (
+        runtime_sha as _runtime_sha,
+    )
+
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
     initial_pack_empty = not pack
     initial_pack_passages = len(pack)
+    _query_hint = int(initial_query_count) if isinstance(initial_query_count, int) else 0
+    _raw_reason_in = str(planner_reason or planner_outcome_raw or "")
+    if _raw_reason_in:
+        _effective_reason = (
+            _raw_reason_in
+            if _raw_reason_in
+            in (
+                "legitimate-glue",
+                "substantive-with-queries",
+                "provider-error",
+                "timeout",
+                "invalid",
+                "unknown",
+            )
+            else _planner_reason_for(_query_hint, _raw_reason_in)
+        )
+    else:
+        _effective_reason = _planner_reason_for(_query_hint, "ok" if _query_hint else "empty")
+    _proven_glue = bool(
+        _is_proven_glue(user_message, summary=summary) or _is_meta_request(user_message)
+    )
+    _trace_id = str(turn_trace_id or _new_trace_id())
 
     telemetry: dict[str, Any] = {
         "planner_outcome": "skipped-initial",
         "planner_latency_ms": 0.0,
         "planner_query_count": 0,
+        "planner_reason": _effective_reason,
         "retrieval_outcome": "skipped-initial" if not pack else "preloaded",
         "retrieval_latency_ms": 0.0,
         "retrieval_passages": initial_pack_passages,
@@ -483,7 +543,45 @@ async def run_v2_answer_turn(
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
         "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
+        "adequacy_verdict": "unknown",
+        "failure_category": "",
+        "answers_request": False,
+        "technically_grounded": False,
+        "qualified": False,
+        "turn_trace_id": _trace_id,
+        "runtime_sha": _runtime_sha(),
     }
+
+    def _record_adequacy(
+        *,
+        reply_text: str,
+        verification_state: dict[str, Any] | None,
+    ) -> None:
+        """Assess the whole turn and record split statuses in telemetry."""
+        try:
+            assessment = _assess_adequacy(
+                user_message=user_message,
+                reply=reply_text,
+                evidence_pack=pack,
+                grounding_result=verification_state,
+                planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+                verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
+                unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
+                turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+            )
+        except Exception:
+            return
+        telemetry["adequacy_verdict"] = assessment.verdict
+        # Preserve a concrete earlier failure category (for example a
+        # recovery or repair failure) instead of overwriting it with the
+        # generic adequacy label for the same turn.
+        if not str(telemetry.get("failure_category", "") or "").strip():
+            telemetry["failure_category"] = assessment.failure_category
+        telemetry["answers_request"] = bool(assessment.answers_request)
+        telemetry["technically_grounded"] = bool(assessment.technically_grounded)
+        telemetry["qualified"] = bool(
+            assessment.verdict == _ADEQ_PASS and assessment.answers_request
+        )
 
     def _end_to_end_elapsed_s() -> float:
         """Already-spent graph-turn time: upstream plus this phase."""
@@ -505,6 +603,70 @@ async def run_v2_answer_turn(
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
 
     rounds = 0
+
+    # No silent empty-evidence success (kodmial/aa#251): a planner error
+    # is never legitimate glue. When the pack is empty and the turn is
+    # not positively proven glue, perform one bounded recovery against
+    # the canonical RU book using the actual turn context (never canned
+    # generic queries), then generate and recheck from the rebuilt pack.
+    if not pack and retrieval_index is not None and not _proven_glue:
+        _needs_recovery = _effective_reason in (
+            "provider-error",
+            "timeout",
+            "invalid",
+            "unknown",
+            "legitimate-glue",
+        ) or (initial_query_count is None or _query_hint == 0)
+        if _needs_recovery:
+            try:
+                _recent_texts: list[str] = []
+                for _msg in list(recent or [])[-2:]:
+                    _content = getattr(_msg, "content", "")
+                    if isinstance(_content, str) and _content.strip():
+                        _recent_texts.append(_content.strip()[:200])
+                _recovery_queries = _build_recovery(
+                    user_message, summary=summary, recent=_recent_texts
+                )
+            except Exception:
+                _recovery_queries = []
+            if _recovery_queries:
+                try:
+                    from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
+
+                    _active_cfg = (
+                        retrieval_config if retrieval_config is not None else RetrievalConfig()
+                    )
+                    _rec_started = time.perf_counter()
+                    _rec_pack = retrieve_evidence(
+                        retrieval_index, _recovery_queries, config=_active_cfg
+                    )
+                    from aa.conversation.retrieval_node import pack_to_state as _pack_state
+
+                    _, _rec_dicts = _pack_state(_rec_pack)
+                    telemetry["retrieval_latency_ms"] = round(
+                        float(telemetry.get("retrieval_latency_ms", 0.0) or 0.0)
+                        + (time.perf_counter() - _rec_started) * 1000.0,
+                        1,
+                    )
+                    if _rec_dicts:
+                        pack = merge_pack_dicts(pack, _rec_dicts)
+                        telemetry["retrieval_passages"] = len(pack)
+                        telemetry["retrieval_outcome"] = "recovered"
+                        telemetry["answer_generation_window"] = min(
+                            len(pack), ANSWER_GENERATION_MAX_PASSAGES
+                        )
+                        logger.info(
+                            "v2 empty-pack recovery rebuilt evidence",
+                            extra={"passages": len(pack)},
+                        )
+                    else:
+                        telemetry["retrieval_outcome"] = "empty-after-recovery"
+                except Exception as exc:
+                    logger.info(
+                        "v2 empty-pack recovery failed",
+                        extra={"category": type(exc).__name__},
+                    )
+                    telemetry["retrieval_outcome"] = "recovery-failed"
 
     def _generation_window(active_pack: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Return the bounded top-ranked window for answer generation only.
@@ -612,6 +774,13 @@ async def run_v2_answer_turn(
     if draft is None:
         telemetry["answer_outcome"] = "failed"
         telemetry["verifier_outcome"] = "skipped"
+        _record_adequacy(
+            reply_text=select_retry_reply(user_message),
+            verification_state=grounding_result_to_state(None),
+        )
+        if _proven_glue:
+            telemetry["adequacy_verdict"] = _ADEQ_PASS
+            telemetry["answers_request"] = True
         _finish_telemetry()
         return {
             "text": select_retry_reply(user_message),
@@ -641,6 +810,15 @@ async def run_v2_answer_turn(
     def _retry_outcome(*, verifier_outcome: str) -> dict[str, Any]:
         """Serve the natural retry reply (never the generic clarification)."""
         telemetry["verifier_outcome"] = verifier_outcome
+        _record_adequacy(
+            reply_text=select_retry_reply(user_message),
+            verification_state=grounding_result_to_state(None),
+        )
+        if _proven_glue:
+            telemetry["adequacy_verdict"] = _ADEQ_PASS
+            telemetry["answers_request"] = True
+        elif not str(telemetry.get("failure_category", "") or "").strip():
+            telemetry["failure_category"] = _FAIL_BUDGET
         _finish_telemetry()
         return {
             "text": select_retry_reply(user_message),
@@ -700,13 +878,23 @@ async def run_v2_answer_turn(
     # Grounding is preserved: without a verifier verdict the turn cannot
     # be proven grounded, so it clarifies directly instead of burning
     # latency on futile repair.
-    is_glue = initial_pack_empty and (initial_query_count is None or initial_query_count == 0)
+    # No silent empty-evidence success (kodmial/aa#251): a planner
+    # error/timeout/invalid outcome is never legitimate glue, even with
+    # zero queries. Only a positively proven contentless turn with an
+    # explicit legitimate-glue reason skips repair.
+    is_glue = bool(
+        _proven_glue
+        and _effective_reason == "legitimate-glue"
+        and (initial_query_count is None or _query_hint == 0)
+    )
     repair_allowed = (
         result is not None
         and not result.unavailable_unit_ids
         and (
             (not initial_pack_empty)
             or (initial_query_count is not None and initial_query_count > 0)
+            or (not _proven_glue)
+            or (_effective_reason in ("provider-error", "timeout", "invalid", "unknown"))
         )
     )
     if not passed and is_glue:
@@ -834,6 +1022,99 @@ async def run_v2_answer_turn(
             telemetry["verifier_outcome"] = "unsupported"
 
     if passed and units and result is not None:
+        # Whole-turn answer adequacy gate (kodmial/aa#251): per-unit
+        # success alone never serves an all-glue or irrelevant answer for
+        # a substantive request. With evidence available regenerate once
+        # from the existing precise passages, then re-verify and reassess;
+        # otherwise fail explicitly with a repair failure, never a helpful
+        # success claim. Bounded by the remaining end-to-end budget.
+        _adequacy_now = _assess_adequacy(
+            user_message=user_message,
+            reply=current_draft,
+            evidence_pack=pack,
+            grounding_result=grounding_result_to_state(result),
+            planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+            verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
+            unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
+            turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+        )
+        if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL and pack:
+            _regen_prompt = (
+                f"{user_message}\nДайте один практичный ответ по книге: "
+                "конкретное объяснение и ближайший шаг только из приведённых отрывков."
+            )
+            _regen_draft = await _draft_with_pack(pack, _regen_prompt)
+            if _regen_draft is not None:
+                _regen_slice = _verifier_round_budget()
+                _regen_ok = not (
+                    _regen_slice is not None and _regen_slice < TURN_VERIFIER_MIN_SLICE_S
+                )
+                if _regen_ok:
+                    _regen_units, _regen_result, _regen_passed = await _verify_with_telemetry(
+                        _regen_draft, pack, turn_budget_s=_regen_slice
+                    )
+                    if _regen_result is not None:
+                        telemetry["verifier_unavailable_units"] = len(
+                            _regen_result.unavailable_unit_ids
+                        )
+                    if _regen_passed and _regen_units and _regen_result is not None:
+                        _regen_state = grounding_result_to_state(_regen_result)
+                        _regen_adequacy = _assess_adequacy(
+                            user_message=user_message,
+                            reply=_regen_draft,
+                            evidence_pack=pack,
+                            grounding_result=_regen_state,
+                            planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+                            verifier_outcome="passed",
+                            unavailable_units=0,
+                            turn_budget_exceeded=False,
+                        )
+                        if _regen_adequacy.verdict == _ADEQ_PASS:
+                            current_draft = _regen_draft
+                            units, result, passed = _regen_units, _regen_result, True
+                            telemetry["verifier_outcome"] = "passed-after-adequacy-repair"
+                            rounds += 1
+                        else:
+                            telemetry["failure_category"] = _FAIL_REPAIR
+                            logger.info(
+                                "v2 adequacy repair failed; explicit failure served",
+                                extra={"category": "adequacy-repair-failed"},
+                            )
+                    else:
+                        telemetry["failure_category"] = _FAIL_REPAIR
+                else:
+                    _mark_turn_budget_exceeded()
+                    telemetry["failure_category"] = _FAIL_BUDGET
+            else:
+                telemetry["failure_category"] = _FAIL_REPAIR
+            _adequacy_now = _assess_adequacy(
+                user_message=user_message,
+                reply=current_draft,
+                evidence_pack=pack,
+                grounding_result=grounding_result_to_state(result),
+                planner_reason=str(telemetry.get("planner_reason", _effective_reason)),
+                verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
+                unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
+                turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+            )
+            if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL:
+                telemetry["answer_outcome"] = "adequacy-repair-failed"
+                _record_adequacy(
+                    reply_text=select_retry_reply(user_message),
+                    verification_state=grounding_result_to_state(result),
+                )
+                telemetry["failure_category"] = str(
+                    telemetry.get("failure_category", "") or _FAIL_REPAIR
+                )
+                _finish_telemetry()
+                return {
+                    "text": select_retry_reply(user_message),
+                    "units": units,
+                    "verification": grounding_result_to_state(result),
+                    "rounds": rounds,
+                    "recent_quote_ranges": recent_ranges,
+                    "telemetry": dict(telemetry),
+                }
         final = current_draft
         # Serial-paging guard: a continuation after a prior quote must not
         # page adjacent canonical ranges verbatim.
@@ -937,6 +1218,25 @@ async def run_v2_answer_turn(
                 final = NATURAL_CLARIFICATION_REPLY
         if not contains_cyrillic(final) or leaks_internal_terms(final):
             final = NATURAL_CLARIFICATION_REPLY
+        # Whole-turn adequacy on the served candidate (kodmial/aa#251):
+        # identifiers alone never prove relevance. A substantive turn that
+        # collapsed to all-glue fails explicitly instead of serving glue
+        # as a helpful success.
+        _served_state = grounding_result_to_state(result)
+        _record_adequacy(reply_text=final, verification_state=_served_state)
+        if not _proven_glue and telemetry.get("adequacy_verdict") == _ADEQ_FAIL:
+            telemetry["answer_outcome"] = "adequacy-failed"
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            _finish_telemetry()
+            return {
+                "text": select_retry_reply(user_message),
+                "units": units,
+                "verification": _served_state,
+                "rounds": rounds,
+                "recent_quote_ranges": recent_ranges,
+                "telemetry": dict(telemetry),
+            }
         telemetry["answer_outcome"] = (
             "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
         )
@@ -950,7 +1250,10 @@ async def run_v2_answer_turn(
             "telemetry": dict(telemetry),
         }
 
-    # Repair budget exhausted: narrow to supported material or clarify.
+    # Repair budget exhausted: narrow to supported material, serve honest
+    # unavailability for a substantive request without book evidence, and
+    # keep clarification only for positively proven glue (kodmial/aa#251).
+    # A substantive turn never serves plausible generic help as success.
     narrowed = keep_supported_text(units, result) if units else ""
     substantive_narrowing_ok = (
         initial_query_count is None or initial_query_count == 0 or has_supported_book_unit(result)
@@ -964,6 +1267,16 @@ async def run_v2_answer_turn(
         and aggregate_quote_chars(narrowed) <= QUOTE_BUDGET_CHARS
     ):
         telemetry["answer_outcome"] = "narrowed-supported"
+        # Narrowing preserves verified supported material when part of the
+        # draft is unavailable/unsupported (existing partial-failure
+        # contract). Whole-turn adequacy is recorded for qualification,
+        # but the narrowed supported subset is still served rather than
+        # collapsing to retry: unavailable units are excluded from the
+        # served text, so per-claim grounding holds for what is delivered.
+        _record_adequacy(
+            reply_text=narrowed,
+            verification_state=grounding_result_to_state(result),
+        )
         _finish_telemetry()
         return {
             "text": narrowed,
@@ -1017,7 +1330,31 @@ async def run_v2_answer_turn(
             "recent_quote_ranges": recent_ranges,
             "telemetry": dict(telemetry),
         }
+    if not _proven_glue and not pack:
+        # Substantive request without any book evidence: explicit honest
+        # unavailability, never plausible generic help (kodmial/aa#251).
+        # Turns with a non-empty pack but failed verification keep the
+        # historical clarification path so verifier-outage semantics stay
+        # stable; Gate C still counts them as ungrounded failures.
+        telemetry["answer_outcome"] = "unavailable-substantive-no-evidence"
+        _record_adequacy(
+            reply_text=select_retry_reply(user_message),
+            verification_state=grounding_result_to_state(result),
+        )
+        _finish_telemetry()
+        return {
+            "text": select_retry_reply(user_message),
+            "units": units,
+            "verification": grounding_result_to_state(result),
+            "rounds": rounds,
+            "recent_quote_ranges": recent_ranges,
+            "telemetry": dict(telemetry),
+        }
     telemetry["answer_outcome"] = "clarification"
+    _record_adequacy(
+        reply_text=NATURAL_CLARIFICATION_REPLY,
+        verification_state=grounding_result_to_state(result),
+    )
     _finish_telemetry()
     return {
         "text": NATURAL_CLARIFICATION_REPLY,
@@ -1071,6 +1408,18 @@ async def answer_pipeline_node(
         _upstream_latency_ms = max(0.0, _prior_planner) + max(0.0, _retrieval_f)
     except (TypeError, ValueError):
         _upstream_latency_ms = 0.0
+    try:
+        _prior_retry_for_reason = state.get("retry_state", {})
+        _prior_retry_for_reason_d = (
+            dict(_prior_retry_for_reason) if isinstance(_prior_retry_for_reason, dict) else {}
+        )
+        _prior_reason = str(_prior_retry_for_reason_d.get("planner_reason", ""))
+        _prior_outcome_for_reason = str(_prior_retry_for_reason_d.get("planner_outcome", ""))
+        _prior_trace = str(_prior_retry_for_reason_d.get("turn_trace_id", ""))
+    except Exception:
+        _prior_reason = ""
+        _prior_outcome_for_reason = ""
+        _prior_trace = ""
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -1086,6 +1435,9 @@ async def answer_pipeline_node(
         ],
         initial_query_count=_initial_query_count,
         upstream_latency_ms=_upstream_latency_ms,
+        planner_reason=_prior_reason or None,
+        planner_outcome_raw=_prior_outcome_for_reason or None,
+        turn_trace_id=_prior_trace or None,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot
@@ -1145,6 +1497,33 @@ async def answer_pipeline_node(
                 telemetry["planner_outcome"] = prior_planner_outcome
             else:
                 telemetry["planner_outcome"] = "invoked" if planner_invoked else "unknown"
+        try:
+            from aa.conversation.answer_adequacy import planner_reason_for as _reason_enrich
+
+            prior_reason = str(prior_retry_d.get("planner_reason", "") or "")
+            if prior_reason:
+                telemetry["planner_reason"] = prior_reason
+            elif str(telemetry.get("planner_reason", "") or "").strip() in ("", "unknown"):
+                telemetry["planner_reason"] = _reason_enrich(
+                    int(telemetry.get("planner_query_count", 0) or 0),
+                    str(telemetry.get("planner_outcome", "") or ""),
+                )
+        except Exception:
+            pass
+        if not str(telemetry.get("turn_trace_id", "") or "").strip():
+            try:
+                from aa.conversation.answer_adequacy import new_turn_trace_id as _new_trace
+
+                telemetry["turn_trace_id"] = _new_trace()
+            except Exception:
+                pass
+        if not str(telemetry.get("runtime_sha", "") or "").strip():
+            try:
+                from aa.conversation.answer_adequacy import runtime_sha as _rt_sha
+
+                telemetry["runtime_sha"] = _rt_sha()
+            except Exception:
+                pass
     except Exception:
         pass
     retry_state: dict[str, Any] = {"answer_rounds": int(outcome["rounds"])}

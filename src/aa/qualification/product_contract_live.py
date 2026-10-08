@@ -1697,7 +1697,104 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if response_units > 0 and verified != response_units:
         return False
+    # Whole-turn adequacy (kodmial/aa#251): when the production adequacy
+    # gate ran, its verdict is authoritative. Validated identifiers alone
+    # never prove topical relevance, so an explicit adequacy failure, a
+    # planner error reason, or a negative split status fails even when
+    # counts are positive. Snapshots without these keys keep the legacy
+    # path so older unit callers stay backward compatible.
+    adequacy = str(snapshot.get("adequacy_verdict", "") or "").strip()
+    if adequacy and adequacy != "pass":
+        return False
+    failure_category = str(snapshot.get("failure_category", "") or "").strip()
+    if failure_category:
+        return False
+    planner_reason = str(snapshot.get("planner_reason", "") or "").strip()
+    if planner_reason in ("provider-error", "timeout", "invalid"):
+        return False
+    if "answers_request" in snapshot and not bool(snapshot.get("answers_request")):
+        return False
+    if "technically_grounded" in snapshot and not bool(snapshot.get("technically_grounded")):
+        return False
+    if "qualified" in snapshot and not bool(snapshot.get("qualified")):
+        return False
     return True
+
+
+def _content_tokens_for_relevance(text: str) -> set[str]:
+    """Return generic substantive tokens for prompt-reply relevance."""
+    import re as _re
+
+    stopwords = frozenset(
+        {
+            "это",
+            "как",
+            "что",
+            "для",
+            "или",
+            "уже",
+            "очень",
+            "можно",
+            "нужно",
+            "меня",
+            "тебе",
+            "мне",
+            "так",
+            "там",
+            "когда",
+            "где",
+            "все",
+            "есть",
+        }
+    )
+    tokens: set[str] = set()
+    for raw in _re.findall(r"[A-Za-z\u0400-\u04ff]+", (text or "").casefold()):
+        if len(raw) < 4 or raw in stopwords:
+            continue
+        tokens.add(raw)
+    return tokens
+
+
+def _assess_prompt_reply_relevance(prompt: str, reply: str) -> bool:
+    """Whether a sent reply is topically relevant to its prompt.
+
+    Qualification-only independent semantic signal beyond sentence shape:
+    the reply must share substantive content prefixes with the prompt, or
+    both sides must carry generic alcohol-recovery domain vocabulary so
+    colloquial, slang and typo paraphrases of the same recovery topic
+    still count, while an out-of-context supported book quote, a citation
+    present but without a useful step, or an all-glue response cannot pass
+    on shape alone. Generic signals only, never an exact-question
+    whitelist. Short pure greetings are handled by the caller as glue and
+    never reach this check as substantive turns.
+    """
+    prompt_tokens = _content_tokens_for_relevance(prompt)
+    reply_tokens = _content_tokens_for_relevance(reply)
+    if not prompt_tokens or not reply_tokens:
+        return False
+    prompt_prefixes = {token[:4] for token in prompt_tokens if len(token) >= 4}
+    reply_prefixes = {token[:4] for token in reply_tokens if len(token) >= 4}
+    if prompt_prefixes & reply_prefixes:
+        return True
+    _stems = (
+        "тяг",
+        "выпи",
+        "выпь",
+        "буха",
+        "бухл",
+        "пить",
+        "пьян",
+        "трезв",
+        "срыв",
+        "запо",
+        "алког",
+        "похмел",
+    )
+    lowered_prompt = (prompt or "").casefold()
+    lowered_reply = (reply or "").casefold()
+    prompt_domain = any(stem in lowered_prompt for stem in _stems)
+    reply_domain = any(stem in lowered_reply for stem in _stems)
+    return bool(prompt_domain and reply_domain)
 
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
@@ -1928,6 +2025,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     920006,
                     "Мне трудно признать, что одному не получается",
                 ),
+                (
+                    "mixed-greeting-substantive",
+                    920008,
+                    "Привет! К вечеру очень тянет выпить, как с этим обходиться?",
+                ),
             )
             held_out_scenarios: tuple[tuple[str, int, str], ...] = (
                 (
@@ -1970,6 +2072,11 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     920006,
                     "И что из этого следует для меня прямо сейчас?",
                 ),
+                (
+                    "mixed-greeting-substantive",
+                    921006,
+                    "Привет, подскажи че делать когда под вечер тянеет выпить",
+                ),
             )
             scenarios = core_scenarios + held_out_scenarios
 
@@ -1982,14 +2089,18 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 "topic-shift",
                 "unsupported-out-of-book",
                 "long-conversation",
+                "mixed-greeting-substantive",
             }
             # The two scenario variants in each AA-substantive family
             # MUST actually deliver verifier-supported book material.
             # Meta and out-of-book requests have different contracts.
+            # Mixed greeting plus a substantive request is substantive:
+            # a pure-glue reply there is the kodmial/aa#251 failure class.
             book_grounded_families = {
                 "substantive-drinking",
                 "family-relationship",
                 "long-conversation",
+                "mixed-greeting-substantive",
             }
             book_grounded_expected = sum(
                 family in book_grounded_families for family, _, _ in scenarios
@@ -2064,10 +2175,19 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     if family in book_grounded_families:
                         # Helpfulness is judged on the real sent Telegram
                         # message plus this turn's actual telemetry snapshot,
-                        # never on an intermediate draft.
+                        # never on an intermediate draft. Independent semantic
+                        # relevance (kodmial/aa#251) applies on top of strict
+                        # book support: identifiers alone never prove that the
+                        # sent answer addresses this prompt.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
-                        _check(f"live-book-grounding-{family}-{position}", grounded)
-                        book_grounded_successes += int(grounded)
+                        relevant = _assess_prompt_reply_relevance(prompt, reply)
+                        _check(f"live-book-grounding-{family}-{position}", bool(grounded))
+                        _check(
+                            f"live-answer-relevance-{family}-{position}",
+                            bool(relevant),
+                        )
+                        helpful = bool(grounded and relevant)
+                        book_grounded_successes += int(helpful)
                     if family == "meta-capability":
                         # Meta gets a direct natural RU answer without a
                         # false identity and without an evasive template.
@@ -2543,6 +2663,7 @@ __all__ = [
     "run_voice_lane",
     "validate_exact_sha",
     "working_tree_clean",
+    "_assess_prompt_reply_relevance",
     "_has_declarative_substance",
     "_is_avoiding_clarification_text",
     "_is_direct_meta_reply",
