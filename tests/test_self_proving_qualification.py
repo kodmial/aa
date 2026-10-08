@@ -227,7 +227,8 @@ def test_gate_c_telemetry_requires_stages_and_diversity() -> None:
 def test_gate_e_slo_guard_rejects_pathological_latency() -> None:
     # The runtime #37422302821 failure (~30-60s ordinary turns) must fail.
     slow = [
-        _telemetry(f"family-{i}", reply_signature(f"reply {i}"), total_ms=125000.0) for i in range(2)
+        _telemetry(f"family-{i}", reply_signature(f"reply {i}"), total_ms=125000.0)
+        for i in range(2)
     ]
     ok, detail, metrics = evaluate_gate_e_telemetry(
         slow, heartbeat_sends=40, heartbeat_interval_ms=4000.0
