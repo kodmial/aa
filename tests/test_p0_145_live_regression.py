@@ -115,6 +115,7 @@ async def test_glue_turn_skips_repair_and_reports_telemetry() -> None:
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": [],
+                "addresses_intent": False,
             }
             for _ in units
         ]
@@ -172,17 +173,20 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [first_pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": [first_pack[0]["passage_id"]],
+                "addresses_intent": False,
             },
             *(
                 {
                     "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["chapter-3#exp0001"],
+                    "addresses_intent": True,
                 }
                 for _ in repaired_units
             ),

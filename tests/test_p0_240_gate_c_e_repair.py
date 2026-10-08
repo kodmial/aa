@@ -131,6 +131,7 @@ async def test_slow_but_answerable_turn_serves_grounded_answer() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
 
     outcome = await run_v2_answer_turn(

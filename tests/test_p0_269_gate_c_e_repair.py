@@ -135,11 +135,13 @@ async def test_repair_replan_focus_stays_anchored_to_live_request(
                     "requires_book_evidence": True,
                     "supported": False,
                     "evidence_passage_ids": ["chapter-3#exp0000"],
+                    "addresses_intent": False,
                 }
             return {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": True,
             }
 
     class _CapturePlan:
@@ -217,6 +219,7 @@ async def test_binding_repair_budget_skips_replan_on_slow_turn(
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": False,
             }
 
     outcome = await pipeline.run_v2_answer_turn(

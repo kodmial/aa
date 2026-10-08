@@ -132,6 +132,7 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
             "requires_book_evidence": True,
             "supported": supported,
             "evidence_passage_ids": [passage_id] if supported else [],
+            "addresses_intent": bool(supported),
         }
     )
 
@@ -194,6 +195,7 @@ async def test_text_fallback_rejects_unknown_citations_fail_closed() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["no-such-passage"],
+            "addresses_intent": True,
         }
     )
     client = _AdapterScriptedClient(
@@ -239,11 +241,13 @@ async def test_native_structured_success_uses_no_text_call() -> None:
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
         ],
         text_outcomes=[],
@@ -264,7 +268,7 @@ def test_parse_text_json_decision_strict() -> None:
     pack_id = "chapter-3#exp0000"
     ok = parse_text_json_decision(
         '```json\n{"requires_book_evidence": true, "supported": true, '
-        f'"evidence_passage_ids": ["{pack_id}"]}}\n```'
+        f'"evidence_passage_ids": ["{pack_id}"], "addresses_intent": true}}\n```'
     )
     assert ok["supported"] is True
     assert ok["evidence_passage_ids"] == [pack_id]
@@ -278,13 +282,14 @@ def test_parse_text_json_decision_strict() -> None:
     # stays bound by AA code and the aggregate stays AA-computed, so a
     # "unit_id" or "all_required_supported" key can never take effect;
     # grounding semantics are unchanged (verdict is a function of the
-    # three known keys only).
+    # four known keys only).
     extra = parse_text_json_decision(
         json.dumps(
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
                 "unit_id": "u1",
                 "reasoning": "model prose habit",
             }
@@ -294,6 +299,7 @@ def test_parse_text_json_decision_strict() -> None:
         "requires_book_evidence": True,
         "supported": True,
         "evidence_passage_ids": [],
+        "addresses_intent": True,
     }
     # Missing required keys and wrong value types still fail closed.
     with pytest.raises(VerifierValidationError):
@@ -351,6 +357,7 @@ async def test_text_fallback_unsupported_verdict_stays_unsupported() -> None:
             "requires_book_evidence": True,
             "supported": False,
             "evidence_passage_ids": [pack[0]["passage_id"]],
+            "addresses_intent": False,
         }
     )
     client = _AdapterScriptedClient(

@@ -288,7 +288,7 @@ async def test_verifier_slow_structured_degrades_within_unit_bound(
             self.text_calls += 1
             return (
                 '{"requires_book_evidence": true, "supported": true, '
-                '"evidence_passage_ids": ["p1"]}'
+                '"evidence_passage_ids": ["p1"], "addresses_intent": true}'
             )
 
     pack = [_pack_entry()]
@@ -324,12 +324,14 @@ async def test_verifier_turn_expiry_preserves_completed_units() -> None:
                     "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["chapter-3#exp0000"],
+                    "addresses_intent": True,
                 }
             await asyncio.sleep(60.0)
             return {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": True,
             }
 
     pack = [_pack_entry()]
@@ -366,6 +368,7 @@ async def test_verifier_turn_expiry_all_pending_still_raises_unavailable() -> No
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
 
     units = split_response_units("Понимаю. Поддержка рядом помогает.")
@@ -400,6 +403,7 @@ async def test_verifier_429_propagates_fast_despite_slow_sibling() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
 
     units = split_response_units("Тяга проходит. Вторая долгая проверка тянется.")
@@ -411,7 +415,7 @@ async def test_verifier_429_propagates_fast_despite_slow_sibling() -> None:
 
 
 def test_text_parser_drops_unknown_keys_without_trusting_them() -> None:
-    """Envelope tolerance: verdict is a function of the three known keys only."""
+    """Envelope tolerance: verdict is a function of the four known keys only."""
     import json
 
     decision = parse_text_json_decision(
@@ -420,6 +424,7 @@ def test_text_parser_drops_unknown_keys_without_trusting_them() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
                 "unit_id": "u1",
                 "all_required_supported": True,
                 "reasoning": "model prose habit",
@@ -430,6 +435,7 @@ def test_text_parser_drops_unknown_keys_without_trusting_them() -> None:
         "requires_book_evidence": True,
         "supported": True,
         "evidence_passage_ids": ["p1"],
+        "addresses_intent": True,
     }
     # Missing required keys and wrong value types still fail closed.
     with pytest.raises(VerifierValidationError):
@@ -441,6 +447,7 @@ def test_text_parser_drops_unknown_keys_without_trusting_them() -> None:
                     "requires_book_evidence": ["not-a-bool"],
                     "supported": True,
                     "evidence_passage_ids": [],
+                    "addresses_intent": True,
                 }
             )
         )

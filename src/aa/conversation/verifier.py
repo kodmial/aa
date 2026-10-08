@@ -46,7 +46,6 @@ from aa.conversation.verifier_schema import (
     NON_BOOK_SCOPE,
     VERIFIER_MAX_ATTEMPTS,
     GroundingResult,
-    UnitDecision,
     UnitVerdict,
     VerifierValidationError,
     validate_grounding_result,
@@ -724,8 +723,10 @@ def parse_text_json_decision(text: str) -> dict[str, Any]:
     (fences, leading explanations, trailing commas, single quotes, Python
     literals) are normalized before parsing, and unknown envelope keys
     are dropped without being trusted: only ``requires_book_evidence``,
-    ``supported`` and ``evidence_passage_ids`` decide the verdict, with
-    Pydantic key-presence/type strictness unchanged on those three. The
+    ``supported``, ``evidence_passage_ids`` and ``addresses_intent`` decide
+    the verdict, with Pydantic key-presence/type strictness unchanged on
+    those four (``addresses_intent`` is a strict boolean: missing, null, or
+    wrong-type fails closed even when the unit is supported). The
     unit id stays bound by AA code and the aggregate stays AA-computed,
     so a model-invented ``unit_id`` or ``all_required_supported`` key can
     never take effect (it is discarded, not honored). Dropping envelope
@@ -754,7 +755,7 @@ def parse_text_json_decision(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise VerifierValidationError("verifier text output is not a JSON object")
     # Envelope tolerance: unknown keys are discarded, never trusted. Only
-    # the three transport decision keys below are validated (presence +
+    # the four transport decision keys below are validated (presence +
     # types via validate_unit_decision); a payload carrying nothing but
     # unknown keys still fails closed on the missing required keys.
     data = {key: value for key, value in data.items() if key in _DECISION_KEYS}
@@ -916,8 +917,16 @@ def coerce_single_verdict(
     or compute the aggregate. Short display ids resolve to full stored
     passage ids before validation so the strict cite gate sees full ids;
     unknown ids still fail closed.
+
+    Fail-closed relevance (kodmial/aa#283): every production decision must
+    carry an explicit strict boolean ``addresses_intent``. A missing, null,
+    or wrong-type relevance verdict raises :class:`VerifierValidationError`
+    even when the unit is book-supported with valid citations. Support
+    never implies relevance; an omitted relevance verdict is never
+    upgraded into PASS.
     """
-    had_explicit_relevance = isinstance(data, dict) and "addresses_intent" in data
+    if isinstance(data, dict) and "addresses_intent" not in data:
+        raise VerifierValidationError("verifier decision missing addresses_intent")
     decision = validate_unit_decision(data)
     raw_ids: list[str] = list(decision.evidence_passage_ids)
     stripped: list[str] = [item.strip() if isinstance(item, str) else str(item) for item in raw_ids]
@@ -930,15 +939,11 @@ def coerce_single_verdict(
     else:
         resolved = stripped
     scope = "book" if decision.requires_book_evidence else NON_BOOK_SCOPE
-    addresses = bool(getattr(decision, "addresses_intent", False))
-    # Migration leniency: legacy test doubles predate the unified
-    # relevance field. When the model output carries no explicit
-    # addresses_intent, relevance follows support (a supported unit is
-    # assumed to address the intent). Production output always carries
-    # an explicit value, and explicit False still fails relevance.
-    if not had_explicit_relevance and not isinstance(data, UnitDecision):
-        addresses = bool(decision.supported)
-    # Glue units carry no substantive claim; relevance is vacuous there.
+    addresses = bool(decision.addresses_intent)
+    # Glue units carry no substantive claim; relevance is vacuous there and
+    # does not affect the turn aggregate (only supported book units with an
+    # explicit true relevance prove relevance). The explicit relevance value
+    # was still validated above, so no omitted verdict can pass through here.
     if scope != "book":
         addresses = True if bool(decision.supported) else addresses
     return UnitVerdict(

@@ -118,6 +118,7 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
             "requires_book_evidence": True,
             "supported": supported,
             "evidence_passage_ids": [passage_id] if supported else [],
+            "addresses_intent": bool(supported),
         }
     )
 
@@ -133,6 +134,7 @@ async def test_structured_invalid_falls_back_to_text_once() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
                 "unit_id": "u1",
             }
         ],
@@ -210,32 +212,37 @@ def test_tolerant_text_json_variants_still_strict_on_keys() -> None:
     so a fully-determined verdict does not burn a second slow text
     round-trip per unit. Missing required keys, wrong value types, and
     non-object payloads still fail closed; grounding semantics are
-    unchanged (verdict is a function of the three known keys only, unit
+    unchanged (verdict is a function of the four known keys only, unit
     id bound by AA code, aggregate computed by AA code).
     """
     pack_id = "chapter-3#exp0000"
     trailing = (
-        '{"requires_book_evidence": true, "supported": true, "evidence_passage_ids": ["p1"],}'
+        '{"requires_book_evidence": true, "supported": true, '
+        '"evidence_passage_ids": ["p1"], "addresses_intent": true,}'
     )
     assert parse_text_json_decision(trailing)["evidence_passage_ids"] == ["p1"]
-    single = "{'requires_book_evidence': True, 'supported': True, 'evidence_passage_ids': ['p1']}"
+    single = (
+        "{'requires_book_evidence': True, 'supported': True, "
+        "'evidence_passage_ids': ['p1'], 'addresses_intent': True}"
+    )
     assert parse_text_json_decision(single)["supported"] is True
     fenced = (
         "Here is the decision:\n```json\n"
         '{"requires_book_evidence": true, "supported": true, '
-        f'"evidence_passage_ids": ["{pack_id}"]}}\n```'
+        f'"evidence_passage_ids": ["{pack_id}"], "addresses_intent": true}}\n```'
     )
     assert parse_text_json_decision(fenced)["evidence_passage_ids"] == [pack_id]
     with pytest.raises(VerifierValidationError):
         parse_text_json_decision("просто текст без json")
     # Unknown envelope keys are dropped without being trusted; the
-    # verdict still comes from the three known keys only.
+    # verdict still comes from the four known keys only.
     assert parse_text_json_decision(
         json.dumps(
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
                 "reasoning": "extra key",
             }
         )
@@ -243,6 +250,7 @@ def test_tolerant_text_json_variants_still_strict_on_keys() -> None:
         "requires_book_evidence": True,
         "supported": True,
         "evidence_passage_ids": [],
+        "addresses_intent": True,
     }
     # Missing keys and wrong types still fail closed.
     with pytest.raises(VerifierValidationError):

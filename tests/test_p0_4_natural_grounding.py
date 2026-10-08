@@ -118,20 +118,24 @@ def _expand_to_decisions(entry: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(unit, dict):
                 continue
             scope = str(unit.get("scope", "book"))
+            supported = bool(unit.get("supported", False))
             decisions.append(
                 {
                     "requires_book_evidence": scope == "book",
-                    "supported": bool(unit.get("supported", False)),
+                    "supported": supported,
                     "evidence_passage_ids": list(unit.get("evidence_passage_ids", [])),
+                    "addresses_intent": bool(unit.get("addresses_intent", supported)),
                 }
             )
         return decisions
     if "scope" in entry and "requires_book_evidence" not in entry:
+        supported = bool(entry.get("supported", False))
         return [
             {
                 "requires_book_evidence": str(entry.get("scope", "book")) == "book",
-                "supported": bool(entry.get("supported", False)),
+                "supported": supported,
                 "evidence_passage_ids": list(entry.get("evidence_passage_ids", [])),
+                "addresses_intent": bool(entry.get("addresses_intent", supported)),
             }
         ]
     return [dict(entry)]
@@ -171,6 +175,7 @@ def _support_result(
                 "scope": scope,
                 "supported": True,
                 "evidence_passage_ids": cites,
+                "addresses_intent": True,
             }
         )
     return {"units": units, "all_required_supported": True}
@@ -337,6 +342,7 @@ def test_verifier_rejects_book_without_evidence_and_unknown_passage() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": [],
+            "addresses_intent": True,
         },
         unit_id="u1",
     )
@@ -364,6 +370,7 @@ def test_verifier_rejects_book_without_evidence_and_unknown_passage() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["no-such-passage"],
+            "addresses_intent": True,
         },
         unit_id="u1",
     )
@@ -400,6 +407,7 @@ def test_verifier_rejects_verbatim_quote_absent_from_cited_passage() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": [pack[0]["passage_id"]],
+            "addresses_intent": True,
         },
         unit_id="u1",
     )
@@ -1320,6 +1328,7 @@ async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": True,
             }
         ]
     )
@@ -1352,6 +1361,7 @@ async def test_verifier_invalid_twice_fails_closed_without_third_call() -> None:
                 "requires_book_evidence": "yes",
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
 
     verifier = _AlwaysInvalid()
@@ -1413,6 +1423,7 @@ def test_verifier_native_schema_is_ref_free() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["chapter-3#exp0000"],
+            "addresses_intent": True,
         }
     )
     assert decision.requires_book_evidence is True
@@ -1493,11 +1504,17 @@ def test_verifier_normalizes_weak_provider_formatting() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": [pack[0]["passage_id"]],
+            "addresses_intent": True,
         },
         unit_id=units[0].unit_id,
     )
     second = coerce_single_verdict(
-        {"requires_book_evidence": False, "supported": True, "evidence_passage_ids": []},
+        {
+            "requires_book_evidence": False,
+            "supported": True,
+            "evidence_passage_ids": [],
+            "addresses_intent": True,
+        },
         unit_id=units[1].unit_id,
     )
     assert first.scope == "book"
@@ -1549,6 +1566,7 @@ async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             }
             for _ in units
         ]
@@ -1565,6 +1583,7 @@ async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
             for _ in units
         ]
@@ -1675,11 +1694,13 @@ async def test_verifier_per_unit_fallback_serves_after_batch_id_flake() -> None:
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
         ]
     )
@@ -1707,6 +1728,7 @@ async def test_verifier_per_unit_fallback_stays_strict_on_cites() -> None:
                     "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["no-such-passage"],
+                    "addresses_intent": True,
                 }
             ]
         ),
@@ -1733,11 +1755,17 @@ def test_verifier_order_remap_repairs_id_flake_without_extra_calls() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": [pack[0]["passage_id"]],
+            "addresses_intent": True,
         },
         unit_id=units[0].unit_id,
     )
     second = coerce_single_verdict(
-        {"requires_book_evidence": False, "supported": True, "evidence_passage_ids": []},
+        {
+            "requires_book_evidence": False,
+            "supported": True,
+            "evidence_passage_ids": [],
+            "addresses_intent": True,
+        },
         unit_id=units[1].unit_id,
     )
     assert [first.unit_id, second.unit_id] == [u.unit_id for u in units]
@@ -1751,7 +1779,12 @@ def test_verifier_unsupported_needs_no_citation_or_quote() -> None:
     pack = [_pack_entry()]
     pack_ids = {str(pack[0]["passage_id"])}
     unsupported = coerce_single_verdict(
-        {"requires_book_evidence": True, "supported": False, "evidence_passage_ids": []},
+        {
+            "requires_book_evidence": True,
+            "supported": False,
+            "evidence_passage_ids": [],
+            "addresses_intent": False,
+        },
         unit_id="u1",
     )
     assert unsupported.supported is False
@@ -1836,6 +1869,7 @@ def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["p1"],
+            "addresses_intent": True,
         },
         unit_id="u1",
         short_to_full=window_map,
@@ -1849,6 +1883,7 @@ def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["chapter-7#atom-abc123"],
+            "addresses_intent": True,
         },
         unit_id="u1",
         short_to_full=window_map,
@@ -1864,6 +1899,7 @@ def test_verifier_short_display_ids_resolve_to_full_pack() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["p9"],
+            "addresses_intent": True,
         },
         unit_id="u1",
         short_to_full=window_map,
@@ -1906,6 +1942,7 @@ def test_verifier_single_unit_short_ids_resolve() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["p1"],
+            "addresses_intent": True,
         },
         unit_id="u1",
         short_to_full={"p1": "chapter-3#exp0000"},
@@ -1919,6 +1956,7 @@ def test_verifier_single_unit_short_ids_resolve() -> None:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["p2"],
+            "addresses_intent": True,
         },
         unit_id="u1",
         short_to_full={"p1": "chapter-3#exp0000"},
@@ -2023,11 +2061,13 @@ async def test_verifier_falls_back_to_per_unit_on_batch_provider_error() -> None
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
         ]
     )

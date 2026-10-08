@@ -120,6 +120,7 @@ async def test_pipeline_serves_safe_abstinence_guidance() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
 
     outcome = await run_v2_answer_turn(

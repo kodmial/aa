@@ -114,6 +114,7 @@ def test_transport_schema_has_booleans_not_scope() -> None:
             "requires_book_evidence": False,
             "supported": True,
             "evidence_passage_ids": [],
+            "addresses_intent": True,
         }
     )
     assert decision.requires_book_evidence is False
@@ -134,6 +135,7 @@ def test_no_unit_id_copying_and_no_model_aggregate() -> None:
             "requires_book_evidence": False,
             "supported": True,
             "evidence_passage_ids": [],
+            "addresses_intent": True,
         },
         unit_id="u7",
     )
@@ -146,6 +148,7 @@ def test_no_unit_id_copying_and_no_model_aggregate() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
                 "all_required_supported": True,
             }
         )
@@ -153,11 +156,21 @@ def test_no_unit_id_copying_and_no_model_aggregate() -> None:
 
 def test_scope_derived_deterministically_in_code() -> None:
     bookish = coerce_single_verdict(
-        {"requires_book_evidence": True, "supported": True, "evidence_passage_ids": ["p1"]},
+        {
+            "requires_book_evidence": True,
+            "supported": True,
+            "evidence_passage_ids": ["p1"],
+            "addresses_intent": True,
+        },
         unit_id="u1",
     )
     glue = coerce_single_verdict(
-        {"requires_book_evidence": False, "supported": True, "evidence_passage_ids": []},
+        {
+            "requires_book_evidence": False,
+            "supported": True,
+            "evidence_passage_ids": [],
+            "addresses_intent": True,
+        },
         unit_id="u2",
     )
     assert bookish.scope == "book"
@@ -170,7 +183,14 @@ async def test_unknown_and_missing_citations_fail_closed() -> None:
     pack = [_pack_entry()]
     draft = "Поддержка рядом помогает."
     missing = _ScriptedVerifier(
-        [{"requires_book_evidence": True, "supported": True, "evidence_passage_ids": []}]
+        [
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+            }
+        ]
     )
     _, result, passed = await _verify_draft(draft, pack, verifier_model=missing)
     assert passed is False
@@ -182,6 +202,7 @@ async def test_unknown_and_missing_citations_fail_closed() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["no-such-passage"],
+                "addresses_intent": True,
             }
         ]
     )
@@ -202,6 +223,7 @@ class _PartiallyUnavailableVerifier:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
         raise OpenCodeTransientError("fixture verifier transport failure")
 
@@ -264,6 +286,7 @@ async def test_partial_verifier_failure_does_not_serve_glue_only_for_substantive
                     "requires_book_evidence": False,
                     "supported": True,
                     "evidence_passage_ids": [],
+                    "addresses_intent": True,
                 }
             raise OpenCodeTransientError("fixture verifier transport failure")
 
@@ -313,11 +336,13 @@ async def test_one_concurrent_verifier_round_only() -> None:
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
         ]
     )
