@@ -447,7 +447,8 @@ _PERSONAL_DISCLOSURE_RE = re.compile(
 # Demonstrative/elliptical follow-up cues: the live request alone carries
 # no referent and must be resolved from conversation context.
 _FOLLOWUP_REFERENCE_RE = re.compile(
-    r"\bэтот\b|\bэтом\b|\bэтого\b|\bтакой\b|\bтаком\b|\bтам\b|\bтогда\b",
+    r"\bэто\b|\bэтот\b|\bэта\b|\bэти\b|\bэтом\b|\bэтого\b|\bэтим\b|\bэту\b"
+    r"|\bтакой\b|\bтаком\b|\bтам\b|\bтогда\b|\bдальше\b|\bпотом\b",
     re.IGNORECASE,
 )
 
@@ -521,6 +522,32 @@ def _has_substantive_context(summary: str, recent: Sequence[str] | None) -> bool
     return False
 
 
+def _is_context_dependent_followup(text: str) -> bool:
+    """Whether the live turn structurally depends on prior dialogue.
+
+    Context rescue is deliberately narrow: explicit demonstratives,
+    non-numbered step references, or very short generic follow-up words.
+    Short length alone is never enough, so a terse but explicit topic
+    pivot cannot inherit stale recovery context.
+    """
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return False
+    if extract_step_numbers(cleaned):
+        return False
+    if _FOLLOWUP_REFERENCE_RE.search(cleaned) is not None:
+        return True
+    if _has_step_reference(cleaned):
+        return True
+    words = [item.casefold() for item in _WORD_RE.findall(cleaned) if len(item) >= 2]
+    if len(words) > 3:
+        return False
+    content = _content_tokens(cleaned)
+    return bool(content) and content.issubset(
+        {"почему", "зачем", "дальше", "теперь", "потом", "значит", "делать"}
+    )
+
+
 def resolve_effective_request(
     user_message: str,
     summary: str = "",
@@ -547,12 +574,7 @@ def resolve_effective_request(
     recent_texts = [
         " ".join(str(item).split()).strip() for item in list(recent or [])[:2] if str(item).strip()
     ]
-    needs_context = (
-        _FOLLOWUP_REFERENCE_RE.search(cleaned) is not None
-        or _has_step_reference(cleaned)
-        or len(cleaned) < 80
-        or len(_WORD_RE.findall(cleaned.casefold())) <= 6
-    )
+    needs_context = _is_context_dependent_followup(cleaned)
     if not needs_context:
         return cleaned
     parts = [cleaned]
@@ -1004,7 +1026,7 @@ def assess_turn_adequacy(
         # Stale-context guard uses the raw live turn (not the unioned
         # resolved text) so elliptical follow-ups stay rescuable while
         # explicit pivots do not inherit history.
-        _current_allows_context_rescue = len(raw_request_tokens) <= 2
+        _current_allows_context_rescue = _is_context_dependent_followup(user_message)
         if not _direct_overlap and context_prefixes and _current_allows_context_rescue:
             # Contextual follow-up resolution (generic, turn-independent):
             # a terse follow-up in an ongoing conversation is relevant
