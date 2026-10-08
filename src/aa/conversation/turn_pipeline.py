@@ -613,6 +613,18 @@ async def run_v2_answer_turn(
         "runtime_sha": _runtime_sha(),
     }
 
+    def _prior_user_context() -> list[str]:
+        """Immediately preceding user turns for follow-up relevance only."""
+        try:
+            texts = [
+                str(getattr(item, "content", "") or "")
+                for item in list(recent or [])
+                if getattr(item, "type", "") == "human"
+            ]
+        except Exception:
+            return []
+        return [text for text in texts if text.strip()][-2:]
+
     def _record_adequacy(
         *,
         reply_text: str,
@@ -629,6 +641,7 @@ async def run_v2_answer_turn(
                 verifier_outcome=str(telemetry.get("verifier_outcome", "unknown")),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+                prior_user_messages=_prior_user_context(),
             )
         except Exception as exc:
             # Fail closed: an assessment error on a substantive turn must
@@ -683,6 +696,7 @@ async def run_v2_answer_turn(
                 ),
                 unavailable_units=int(telemetry.get("verifier_unavailable_units", 0) or 0),
                 turn_budget_exceeded=bool(telemetry.get("turn_budget_exceeded", False)),
+                prior_user_messages=_prior_user_context(),
             )
         except Exception as exc:
             logger.info(
