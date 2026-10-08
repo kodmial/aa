@@ -754,6 +754,10 @@ def test_adapter_carries_no_semantic_policy() -> None:
         "omitted_structured_unavailable",
         "mark_omitted_structured_unavailable",
         "clear_omitted_structured_cache",
+        "_omitted_consecutive_fresh",
+        "_omitted_streak_counts",
+        "record_omitted_structured_rejection",
+        "record_omitted_structured_success",
     }
 
 
