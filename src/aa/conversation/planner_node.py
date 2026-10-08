@@ -86,17 +86,23 @@ PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 PLANNER_TIME_BUDGET_S = 10.0
 
 # Per-attempt bound for the single native structured planner call (Gate
-# C+E live repair, kodmial/aa#217 recurrence 6; evidence above). The
-# structured channel serves fast when healthy (p50 ~0.4s) and tails
-# badly when not (p95 ~10s, capped previously only by the whole-turn
-# wall that then discarded the turn's tailored work for generic
-# queries). Bounding just this attempt lets a slow structured channel
-# degrade quickly to the tailored text path within the same overall
-# wall: typical turns pay one fast call, tail turns still serve
-# model-generated queries for this turn's request instead of identical
-# generic vocabulary. Strict Pydantic validation is unchanged on both
+# C+E live repair, kodmial/aa#217 recurrence 6; evidence above, tightened
+# for kodmial/aa#244 on exact main a0d377a run 37753553708:
+# C:live-book-grounding-substantive-drinking-2 plus E:latency-budget-
+# exceeded p50 18.9s / p95 24.3s with planner p50 4.6s / p95 10.0s
+# (pinned at the 10s wall), answer p50 6.6s / p95 10.0s (pinned at its
+# 10s wall), verifier p50 4.7s / p95 9.4s, message-text p50 4.5s / p95
+# 10.0s / max 30.0s over 73 text calls). The structured channel serves
+# fast when healthy (structured p50 ~0.5s) and tails badly when not;
+# bounding just this attempt lets a slow structured channel degrade one
+# second faster to the tailored text path within the same overall wall:
+# typical turns still pay one fast call, tail turns still serve
+# model-generated queries for this turn's request instead of timing out
+# to an empty plan (the #244 C mechanism: empty pack -> ungrounded
+# retry -> live-book-grounding failure) while cutting the sequential
+# sum for Gate E. Strict Pydantic validation is unchanged on both
 # paths; 429 propagates and never triggers the text path.
-PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 4.0
+PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 3.0
 
 
 def _display_message_text(value: object) -> str:

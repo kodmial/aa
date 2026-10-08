@@ -60,7 +60,7 @@ def _twelve_queries(base: str = "support sobriety") -> list[str]:
 
 def test_answer_passage_display_bounded_but_provenance_preserved() -> None:
     """Long passages truncate in display; ids and structure stay intact."""
-    assert ANSWER_MAX_PASSAGE_CHARS == 600
+    assert ANSWER_MAX_PASSAGE_CHARS == 500
     long_text = "x" * 3000
     context = render_turn_context(
         summary="",
