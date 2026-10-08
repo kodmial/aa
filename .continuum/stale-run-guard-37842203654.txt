@@ -1,0 +1,1 @@
+Blocks stale Gate C symptom-repair run 37842203654 for #260. The failing live-meta-direct predicate is superseded by architecture PR #271/#268, which removes handcrafted semantic acceptance predicates. Do not merge a pre-#271 symptom patch.
