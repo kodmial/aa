@@ -720,7 +720,13 @@ def assess_turn_adequacy(
         _direct_overlap = bool(
             request_prefixes and (request_prefixes & (unit_prefixes | evidence_prefixes))
         )
-        if not _direct_overlap and context_prefixes:
+        # Stale-context guard: an explicit new-topic current request must
+        # be answered on its own merits. Context only rescues a
+        # generic/terse current turn that carries little standalone
+        # topical content; otherwise a prior craving turn would rescue a
+        # craving-only reply to a current finance-budget question.
+        _current_allows_context_rescue = len(request_tokens) <= 2
+        if not _direct_overlap and context_prefixes and _current_allows_context_rescue:
             # Contextual follow-up resolution (generic, turn-independent):
             # a terse follow-up in an ongoing conversation is relevant
             # when the evidence-backed unit shares content with the
@@ -728,9 +734,13 @@ def assess_turn_adequacy(
             # above stays primary; context only rescues continuity.
             _direct_overlap = bool(context_prefixes & (unit_prefixes | evidence_prefixes))
         if not _direct_overlap:
-            _request_domain = _has_recovery_domain(user_message) or (
-                bool(context_text) and _has_recovery_domain(context_text)
-            )
+            # Same stale-context guard for the domain fallback: context
+            # domain supplements only a generic/terse current turn. An
+            # explicit current pivot must itself carry recovery-domain
+            # vocabulary to match recovery evidence.
+            _request_domain = _has_recovery_domain(user_message)
+            if not _request_domain and _current_allows_context_rescue and bool(context_text):
+                _request_domain = _has_recovery_domain(context_text)
             _evidence_domain = any(
                 _has_recovery_domain(passage_text) for passage_text in cited_texts
             ) or _has_recovery_domain(str(unit.get("text", "") or reply))

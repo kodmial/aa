@@ -1826,6 +1826,18 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str) -> bool:
     return bool(prompt_domain and reply_domain)
 
 
+def _prompt_allows_context_rescue(prompt: str) -> bool:
+    """Whether the current prompt is generic/terse enough for context rescue.
+
+    An explicit new-topic prompt must be answered on its own merits; stale
+    prior-turn context must not rescue a reply that ignores the current
+    request. Only a current turn carrying little standalone topical
+    content (at most two substantive tokens) may resolve relevance
+    against the immediately preceding turns in the same chat.
+    """
+    return len(_content_tokens_for_relevance(prompt)) <= 2
+
+
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
@@ -2220,7 +2232,10 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # sent answer addresses this prompt.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
                         relevant = _assess_prompt_reply_relevance(prompt, reply)
-                        if not relevant and prior_prompts:
+                        # Stale-context guard: prior-turn context rescues only
+                        # a generic/terse current prompt. An explicit pivot
+                        # must match the reply on its own merits.
+                        if not relevant and prior_prompts and _prompt_allows_context_rescue(prompt):
                             combined = " ".join([*prior_prompts[-2:], prompt])
                             relevant = _assess_prompt_reply_relevance(combined, reply)
                         _check(f"live-book-grounding-{family}-{position}", bool(grounded))
