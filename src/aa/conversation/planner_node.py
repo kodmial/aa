@@ -509,6 +509,22 @@ async def _run_planner_provider(
                 "planner structured channel unavailable; text fallback used",
                 extra={"category": type(exc).__name__},
             )
+            # Recurrence 3 for kodmial/aa#244: one isolated generic error
+            # is still not capability evidence, but consecutive generic
+            # rejections are persistent provider evidence, so the streak
+            # is recorded and pins the path once it reaches the
+            # persistent-rejection threshold (provider 429 is already
+            # re-raised above and never records; deterministic failures
+            # are marked by the adapter itself).
+            try:
+                from aa.conversation.model_adapter import record_omitted_structured_rejection
+            except Exception:
+                record_omitted_structured_rejection = None  # type: ignore[assignment]
+            if record_omitted_structured_rejection is not None:
+                try:
+                    record_omitted_structured_rejection(model)
+                except Exception:
+                    pass
             text_reply = await _invoke_planner_text(
                 model, user_text=user_text, system_text=system_text
             )
@@ -516,6 +532,15 @@ async def _run_planner_provider(
             logger.info("planner output accepted", extra={"queries": len(plan.queries)})
             return plan
         plan = validate_structured_plan(raw)
+        try:
+            from aa.conversation.model_adapter import record_omitted_structured_success
+        except Exception:
+            record_omitted_structured_success = None  # type: ignore[assignment]
+        if record_omitted_structured_success is not None:
+            try:
+                record_omitted_structured_success(model)
+            except Exception:
+                pass
         logger.info("planner output accepted", extra={"queries": len(plan.queries)})
         return plan
     reply = await model.ainvoke(messages)
