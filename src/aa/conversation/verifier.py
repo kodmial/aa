@@ -95,7 +95,17 @@ VERIFIER_MAX_EVIDENCE_PASSAGES = 5
 # largest per-unit model input on the critical path; 600 chars keeps
 # several sentences of decisive context per passage with the explicit
 # marker while cutting ~25% of display tokens per call.
-VERIFIER_MAX_PASSAGE_CHARS = 600
+#
+# kodmial/aa#244 on exact main a0d377a run 37753553708
+# (C:live-book-grounding-substantive-drinking-2 plus E p50 18.9s / p95
+# 24.3s, verifier p50 4.7s / p95 9.4s over 38 per-unit text calls at
+# message-text p50 4.5s / p95 10.0s): 500 chars keeps several sentences
+# of decisive context per passage with the explicit marker while cutting
+# a further ~17% of display tokens per verifier call. Verification,
+# checksum, quote and cite gates still use the full stored pack, so
+# grounding strictness is unchanged. Turn-independent, never an
+# exact-question special case.
+VERIFIER_MAX_PASSAGE_CHARS = 500
 
 VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
@@ -1006,16 +1016,22 @@ VERIFIER_TURN_BUDGET_S = 12.0
 # Per-unit bound for one native structured verifier attempt (Gate C+E
 # live repair, kodmial/aa#217 recurrence 7 on exact main 58f943c run
 # 37709271567: verifier p50 10.1s / p95 12.0s hugging the 12s turn
-# budget with zero unavailable units). The turn budget from recurrence 6
-# caps the whole round but a single hung structured attempt can burn
-# most of it while sibling units wait, and the caller-side expiry never
-# reached the capability cache, so every unit re-burned the wait. Only
-# this single attempt is bounded here; a slow structured channel
-# degrades quickly to the tailored text path within the same unit while
-# the turn-level deadline below stays the backstop. Strict validation of
-# both paths is unchanged; 429 propagates and never triggers the text
-# path. Turn-independent, never an exact-question special case.
-VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 4.0
+# budget with zero unavailable units; tightened for kodmial/aa#244 on
+# exact main a0d377a run 37753553708: verifier p50 4.7s / p95 9.4s over
+# 38 per-unit calls with 1 unavailable unit, message-text p50 4.5s /
+# p95 10.0s). The turn budget from recurrence 6 caps the whole round
+# but a single hung structured attempt can burn most of it while
+# sibling units wait, and the caller-side expiry never reached the
+# capability cache, so every unit re-burned the wait. Only this single
+# attempt is bounded here; a slow structured channel degrades one second
+# faster to the tailored text path within the same unit while the
+# turn-level deadline below stays the backstop, cutting the sequential
+# sum for Gate E and converting verifier timeouts (unavailable units ->
+# ungrounded -> C failure) into validated text verdicts. Strict
+# validation of both paths is unchanged; 429 propagates and never
+# triggers the text path. Turn-independent, never an exact-question
+# special case.
+VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 3.0
 
 
 def _first_fatal_outcome(done: set[asyncio.Task[UnitVerdict]]) -> BaseException | None:

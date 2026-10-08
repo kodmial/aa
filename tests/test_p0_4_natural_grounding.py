@@ -1958,7 +1958,7 @@ def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
     )
 
     assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
-    assert VERIFIER_MAX_PASSAGE_CHARS == 600
+    assert VERIFIER_MAX_PASSAGE_CHARS == 500
 
 
 def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:
