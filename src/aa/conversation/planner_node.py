@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from typing import Any
 
@@ -82,7 +83,7 @@ PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 # 429 always propagates for runner retire/restart; content validation
 # failures still fail closed. Turn-independent, never an
 # exact-question special case. Product Contract #110 unchanged.
-PLANNER_TIME_BUDGET_S = 10.0
+PLANNER_TIME_BUDGET_S = 25.0
 
 # Per-attempt bound for the single native structured planner call (Gate
 # C+E live repair, kodmial/aa#217 recurrence 6; evidence above, tightened
@@ -109,7 +110,16 @@ PLANNER_TIME_BUDGET_S = 10.0
 # planner+answer+verifier sum for Gate E. Strict Pydantic validation
 # is unchanged on both paths; 429 propagates and never triggers the
 # text path.
-PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 2.0
+PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
+
+
+def _diagnostic_no_turn_limits() -> bool:
+    """Temporarily disable AA-owned latency budgets in manual Telegram tests.
+
+    Provider/network error deadlines and runner lifetime remain authoritative.
+    Ordinary production and qualification (env absent) are unchanged.
+    """
+    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
 
 
 def _display_message_text(value: object) -> str:
@@ -372,10 +382,16 @@ async def run_planner(
             user_text=user_text,
             system_text=system_text,
             messages=messages,
-            structured_attempt_budget=min(PLANNER_STRUCTURED_ATTEMPT_BUDGET_S, budget),
+            structured_attempt_budget=(
+                float("inf")
+                if _diagnostic_no_turn_limits()
+                else min(PLANNER_STRUCTURED_ATTEMPT_BUDGET_S, budget)
+            ),
         )
 
     try:
+        if _diagnostic_no_turn_limits():
+            return await _provider_plan()
         return await asyncio.wait_for(_provider_plan(), timeout=budget)
     except TimeoutError as exc:
         # Fail closed as a provider timeout: serving identical generic
@@ -445,14 +461,16 @@ async def _run_planner_provider(
                 # fail-closed on content).
                 pass
         try:
-            raw = await asyncio.wait_for(
-                structured_invoke(
-                    user_text,
-                    system=system_text,
-                    schema=query_plan_json_schema(),
-                    retry_count=PLANNER_MAX_ATTEMPTS,
-                ),
-                timeout=structured_attempt_budget,
+            structured_call = structured_invoke(
+                user_text,
+                system=system_text,
+                schema=query_plan_json_schema(),
+                retry_count=PLANNER_MAX_ATTEMPTS,
+            )
+            raw = (
+                await structured_call
+                if _diagnostic_no_turn_limits()
+                else await asyncio.wait_for(structured_call, timeout=structured_attempt_budget)
             )
         except TimeoutError:
             logger.info(

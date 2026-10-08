@@ -270,7 +270,7 @@ async def test_planner_timeout_empty_pack_serves_honest_unavailability() -> None
         planner_model=None,
         retrieval_index=None,
         initial_query_count=0,
-        upstream_latency_ms=35000.0,
+        upstream_latency_ms=120000.0,
     )
     assert outcome["text"] == NATURAL_RETRY_REPLY
     telemetry = outcome["telemetry"]

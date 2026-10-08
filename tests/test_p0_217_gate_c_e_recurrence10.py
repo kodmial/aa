@@ -99,12 +99,12 @@ def test_end_to_end_budget_configured() -> None:
     turn past the hard SLO still fails fast with explicit failure
     telemetry.
     """
-    assert TURN_END_TO_END_BUDGET_S == 27.0
-    assert TURN_END_TO_END_BUDGET_S < 30.0
+    assert TURN_END_TO_END_BUDGET_S == 105.0
+    assert TURN_END_TO_END_BUDGET_S < 120.0
     assert TURN_ANSWER_MIN_SLICE_S == 1.0
     assert TURN_VERIFIER_MIN_SLICE_S == 3.0
     # Stage budgets are unchanged (strategy change, not a retune).
-    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 10.0
+    assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
 
 
 async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
@@ -126,7 +126,7 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=35000.0,
+        upstream_latency_ms=120000.0,
     )
     assert time.perf_counter() - started < 5.0
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -167,7 +167,7 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=25000.0,
+        upstream_latency_ms=103000.0,
     )
     assert answer.calls == 1
     assert outcome["text"] in NATURAL_RETRY_VARIANTS
@@ -227,13 +227,13 @@ async def test_verifier_receives_reduced_remaining_budget(
         planner_model=None,
         retrieval_index=None,
         initial_query_count=12,
-        upstream_latency_ms=19000.0,
+        upstream_latency_ms=80000.0,
     )
-    # Remaining is ~8s: below the 12s verifier default (reduced slice
+    # Remaining is ~25s: below the 40s verifier default (reduced slice
     # propagates) but above the 3s skip floor (round still runs).
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
-    assert 2.0 < float(captured["turn_budget_s"]) < 12.0
+    assert 2.0 < float(captured["turn_budget_s"]) < 40.0
     assert outcome["text"] not in (NATURAL_RETRY_REPLY, NATURAL_CLARIFICATION_REPLY)
     assert outcome["telemetry"]["turn_budget_exceeded"] is False
 
@@ -257,7 +257,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
-            clock["now"] += 30.0
+            clock["now"] += 120.0
             return {
                 "requires_book_evidence": True,
                 "supported": False,

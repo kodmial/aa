@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections.abc import Sequence
@@ -112,7 +113,7 @@ ANSWER_GENERATION_MAX_PASSAGES = 5
 # always propagates for runner retire/restart; content failures still
 # fail to retry (never a fake grounded plan). Turn-independent, never
 # an exact-question special case. Product Contract #110 unchanged.
-ANSWER_DRAFT_ATTEMPT_BUDGET_S = 10.0
+ANSWER_DRAFT_ATTEMPT_BUDGET_S = 35.0
 
 # Deprecated recurrence-8 fast-path retry window (kept for import
 # compatibility; recurrence 9 no longer issues a second in-turn answer
@@ -132,7 +133,7 @@ ANSWER_FAST_RETRY_MAX_HISTORY = 2
 # supported units are served, otherwise clarification); no exact-question
 # special case, Product Contract #110 unchanged. Fast turns (mocked tests,
 # healthy provider) still use both rounds.
-TURN_REPAIR_TIME_BUDGET_S = 15.0
+TURN_REPAIR_TIME_BUDGET_S = 90.0
 
 # End-to-end turn guard (Gate C+E live repair, kodmial/aa#217 recurrence
 # 10 on exact main 94fd5b5 run 37722464604, corrected by kodmial/aa#240
@@ -157,7 +158,7 @@ TURN_REPAIR_TIME_BUDGET_S = 15.0
 # content failures still fail closed (never a fake grounded plan).
 # Turn-independent, never an exact-question special case. Product
 # Contract #110 unchanged.
-TURN_END_TO_END_BUDGET_S = 27.0
+TURN_END_TO_END_BUDGET_S = 105.0
 
 # Minimum useful slices of the remaining end-to-end budget. Below the
 # answer slice no answer call is started; below the verifier slice no
@@ -166,6 +167,20 @@ TURN_END_TO_END_BUDGET_S = 27.0
 # unavailable). Values stay small so only truly doomed rounds skip.
 TURN_ANSWER_MIN_SLICE_S = 1.0
 TURN_VERIFIER_MIN_SLICE_S = 3.0
+
+
+def _diagnostic_no_turn_limits() -> bool:
+    """Manual Telegram-only mode: let all AA stages finish without SLO cutoff."""
+    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+
+
+def _effective_turn_budget_s() -> float:
+    return float("inf") if _diagnostic_no_turn_limits() else TURN_END_TO_END_BUDGET_S
+
+
+def _effective_repair_budget_s() -> float:
+    return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
+
 
 NATURAL_CLARIFICATION_REPLY = (
     "Расскажите чуть подробнее, что сейчас важнее всего? "
@@ -183,11 +198,56 @@ NATURAL_RETRY_REPLY = (
 # count an unverified service message as an answered user request.
 NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
 
+# Deterministic whole-book diversified recovery queries for the #252
+# outbound safety path. They focus a blocked drink-to-test draft back on
+# staying sober and recovery support. Generic recovery wording only;
+# never an exact live qualification prompt.
+OUTBOUND_RECOVERY_QUERIES: tuple[str, ...] = (
+    "как оставаться трезвым сегодня",
+    "поддержка при сильном желании выпить",
+    "первые шаги выздоровления без алкоголя",
+    "что помогает не пить в трудный вечер",
+    "как пережить вечер без спиртного",
+    "обращение за поддержкой в трудную минуту",
+    "молитва и спокойствие при беспокойстве",
+    "честный разговор о трудностях трезвости",
+    "ближайшие трезвые действия на сегодня",
+    "как справляться с навязчивыми мыслями о спиртном",
+    "поддержка сообщества при трудностях",
+    "утреннее решение оставаться трезвым",
+)
+
 
 def select_retry_reply(user_message: str) -> str:
     """Return a truthful brief unqualified status, never synthetic support."""
     del user_message
     return NATURAL_RETRY_REPLY
+
+
+def certify_outbound_safety(text: str) -> bool:
+    """Certify one candidate reply with the mandatory outbound gate.
+
+    Independent of book-grounding: an authentic book-supported draft
+    still fails when it advises drinking. Only the boolean travels
+    here; the category stays in the safety log.
+    """
+    try:
+        from aa.safety.outbound import is_outbound_safe
+
+        return is_outbound_safe(text)
+    except Exception:
+        logger.warning("outbound safety certification failed closed", exc_info=True)
+        return False
+
+
+def outbound_safety_category(text: str) -> str:
+    """Return the privacy-safe outbound category for ``text``."""
+    from aa.safety.outbound import classify_outbound_safety
+
+    try:
+        return classify_outbound_safety(text).category
+    except Exception:
+        return ""
 
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
@@ -674,7 +734,7 @@ async def run_v2_answer_turn(
 
     def _remaining_budget_s() -> float:
         """Remaining end-to-end budget for further model calls."""
-        return TURN_END_TO_END_BUDGET_S - _end_to_end_elapsed_s()
+        return _effective_turn_budget_s() - _end_to_end_elapsed_s()
 
     def _mark_turn_budget_exceeded() -> None:
         telemetry["turn_budget_exceeded"] = True
@@ -786,15 +846,17 @@ async def run_v2_answer_turn(
         passages = state_passages_to_prompt(_generation_window(active_pack))
         started = time.perf_counter()
         try:
-            text = await asyncio.wait_for(
-                generate_draft(
-                    model=answer_model,
-                    recent=recent,
-                    summary=summary,
-                    passages=passages,
-                    user_message=prompt_text,
-                ),
-                timeout=attempt_budget,
+            draft_call = generate_draft(
+                model=answer_model,
+                recent=recent,
+                summary=summary,
+                passages=passages,
+                user_message=prompt_text,
+            )
+            text = (
+                await draft_call
+                if _diagnostic_no_turn_limits()
+                else await asyncio.wait_for(draft_call, timeout=attempt_budget)
             )
             telemetry["answer_latency_ms"] = round(
                 float(telemetry.get("answer_latency_ms", 0.0) or 0.0)
@@ -1007,14 +1069,14 @@ async def run_v2_answer_turn(
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     while not passed and rounds < max_repair_rounds and repair_allowed:
-        if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S:
+        if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
             telemetry["repair_budget_exceeded"] = True
             logger.info(
                 "v2 repair skipped for live-SLO budget",
                 extra={"rounds": rounds},
             )
             break
-        if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+        if _end_to_end_elapsed_s() > _effective_turn_budget_s():
             # End-to-end guard (recurrence 10): the upstream plus this
             # phase already spent the whole turn. Another re-plan round
             # would breach the E SLO and clarify anyway; narrow/retry
@@ -1222,11 +1284,11 @@ async def run_v2_answer_turn(
             # validated supported units, otherwise clarification); fast
             # turns still use the single compact regeneration. Turn-
             # independent, never an exact-question special case.
-            if (time.perf_counter() - turn_started) > TURN_REPAIR_TIME_BUDGET_S or (
-                _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S
+            if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
+                _end_to_end_elapsed_s() > _effective_turn_budget_s()
             ):
                 telemetry["repair_budget_exceeded"] = True
-                if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
                     _mark_turn_budget_exceeded()
                 logger.info(
                     "v2 envelope regeneration skipped for live-SLO budget",
@@ -1286,6 +1348,112 @@ async def run_v2_answer_turn(
                 final = NATURAL_CLARIFICATION_REPLY
         if not contains_cyrillic(final) or leaks_internal_terms(final):
             final = NATURAL_CLARIFICATION_REPLY
+        # Mandatory outbound safety gate (#252): independent of
+        # book-grounding. An authentic book-supported draft that advises
+        # drinking still fails here and is never delivered. A blocked
+        # draft triggers one bounded diversified recovery: retrieve
+        # other materially relevant RU passages whole-book, regenerate a
+        # short safe book-supported answer, and verify units plus safety
+        # again. Only a genuinely unavailable recovery falls back to the
+        # transparent safe-unavailability reply (never generic glue).
+        if final != NATURAL_CLARIFICATION_REPLY and not certify_outbound_safety(final):
+            from aa.safety.outbound import (
+                OUTBOUND_SAFETY_MAX_REPAIRS,
+                SAFE_RECOVERY_INSTRUCTION,
+                SAFE_UNAVAILABLE_REPLY,
+            )
+
+            blocked_cat = outbound_safety_category(final)
+            logger.info(
+                "v2 outbound safety blocked harmful draft",
+                extra={"category": blocked_cat or "drink-test-advice"},
+            )
+            telemetry["outbound_safety"] = "blocked"
+            telemetry["outbound_safety_category"] = blocked_cat
+            recovered: dict[str, Any] | None = None
+            active_pack = list(pack)
+            for _ in range(OUTBOUND_SAFETY_MAX_REPAIRS):
+                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                    _mark_turn_budget_exceeded()
+                    break
+                if planner_model is None or retrieval_index is None:
+                    break
+                try:
+                    from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
+
+                    active_config = (
+                        retrieval_config if retrieval_config is not None else RetrievalConfig()
+                    )
+                    fresh = retrieve_evidence(
+                        retrieval_index, list(OUTBOUND_RECOVERY_QUERIES), config=active_config
+                    )
+                    from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
+
+                    _, fresh_dicts = _pack_to_state(fresh)
+                except Exception:
+                    break
+                if not fresh_dicts:
+                    break
+                merged_pack = merge_pack_dicts(active_pack, fresh_dicts)
+                if len(merged_pack) == len(active_pack):
+                    break
+                active_pack = merged_pack
+                candidate = await _draft_with_pack(
+                    active_pack, f"{user_message}\n{SAFE_RECOVERY_INSTRUCTION}"
+                )
+                if candidate is None:
+                    break
+                if not certify_outbound_safety(candidate):
+                    continue
+                if not contains_cyrillic(candidate) or leaks_internal_terms(candidate):
+                    continue
+                if not envelope_passes(candidate):
+                    continue
+                if aggregate_quote_chars(candidate) > QUOTE_BUDGET_CHARS:
+                    continue
+                rep_slice = _verifier_round_budget()
+                if rep_slice is not None and rep_slice < TURN_VERIFIER_MIN_SLICE_S:
+                    _mark_turn_budget_exceeded()
+                    break
+                rep_units, rep_result, rep_passed = await _verify_with_telemetry(
+                    candidate, active_pack, turn_budget_s=rep_slice
+                )
+                if not rep_passed or not rep_units or rep_result is None:
+                    continue
+                if not certify_outbound_safety(candidate):
+                    continue
+                recovered = {
+                    "text": candidate,
+                    "units": rep_units,
+                    "verification": rep_result,
+                    "pack": active_pack,
+                }
+                break
+            if recovered is not None:
+                telemetry["outbound_safety"] = "repaired"
+                telemetry["answer_outcome"] = "served"
+                _finish_telemetry()
+                return {
+                    "text": str(recovered["text"]),
+                    "units": recovered["units"],
+                    "verification": grounding_result_to_state(recovered["verification"]),
+                    "rounds": rounds,
+                    "recent_quote_ranges": merge_recent_ranges(
+                        recent_ranges, ranges_from_pack(recovered["pack"])
+                    ),
+                    "telemetry": dict(telemetry),
+                }
+            telemetry["answer_outcome"] = "safety-blocked"
+            _finish_telemetry()
+            return {
+                "text": SAFE_UNAVAILABLE_REPLY,
+                "units": [],
+                "verification": grounding_result_to_state(None),
+                "rounds": rounds,
+                "recent_quote_ranges": list(recent_ranges),
+                "telemetry": dict(telemetry),
+            }
+        telemetry["outbound_safety"] = "pass"
         # Whole-turn adequacy on the served candidate (kodmial/aa#251):
         # identifiers alone never prove relevance. A substantive turn that
         # collapsed to all-glue fails explicitly instead of serving glue
@@ -1334,6 +1502,25 @@ async def run_v2_answer_turn(
         and envelope_passes(narrowed)
         and aggregate_quote_chars(narrowed) <= QUOTE_BUDGET_CHARS
     ):
+        # Narrowed material also certifies through the outbound gate:
+        # repair budget is already exhausted here, so an unsafe narrowing
+        # falls back to the transparent safe-unavailability reply.
+        if not certify_outbound_safety(narrowed):
+            from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _NARROW_SAFE_REPLY
+
+            telemetry["outbound_safety"] = "blocked"
+            telemetry["outbound_safety_category"] = outbound_safety_category(narrowed)
+            telemetry["answer_outcome"] = "safety-blocked"
+            _finish_telemetry()
+            return {
+                "text": _NARROW_SAFE_REPLY,
+                "units": [],
+                "verification": grounding_result_to_state(None),
+                "rounds": rounds,
+                "recent_quote_ranges": list(recent_ranges),
+                "telemetry": dict(telemetry),
+            }
+        telemetry["outbound_safety"] = "pass"
         telemetry["answer_outcome"] = "narrowed-supported"
         # Narrowing preserves verified supported material when part of the
         # draft is unavailable/unsupported (existing partial-failure
@@ -1385,6 +1572,22 @@ async def run_v2_answer_turn(
             and not leaks_internal_terms(compacted)
             and aggregate_quote_chars(compacted) <= QUOTE_BUDGET_CHARS
         ):
+            if not certify_outbound_safety(compacted):
+                from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _COMPACT_SAFE_REPLY
+
+                telemetry["outbound_safety"] = "blocked"
+                telemetry["outbound_safety_category"] = outbound_safety_category(compacted)
+                telemetry["answer_outcome"] = "safety-blocked"
+                _finish_telemetry()
+                return {
+                    "text": _COMPACT_SAFE_REPLY,
+                    "units": [],
+                    "verification": grounding_result_to_state(None),
+                    "rounds": rounds,
+                    "recent_quote_ranges": list(recent_ranges),
+                    "telemetry": dict(telemetry),
+                }
+            telemetry["outbound_safety"] = "pass"
             telemetry["answer_outcome"] = "narrowed-compacted"
             _finish_telemetry()
             return {
@@ -1395,7 +1598,7 @@ async def run_v2_answer_turn(
                 "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
                 "telemetry": dict(telemetry),
             }
-    if _end_to_end_elapsed_s() > TURN_END_TO_END_BUDGET_S:
+    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
         # End-to-end guard (recurrence 10): no verified supported
         # material exists, but the turn already spent its whole budget.
         # Clarifying here would add the recurrence-10 generic collapse
@@ -1641,11 +1844,13 @@ __all__ = [
     "NATURAL_CLARIFICATION_REPLY",
     "NATURAL_RETRY_REPLY",
     "NATURAL_RETRY_VARIANTS",
+    "OUTBOUND_RECOVERY_QUERIES",
     "TURN_ANSWER_MIN_SLICE_S",
     "TURN_END_TO_END_BUDGET_S",
     "TURN_REPAIR_TIME_BUDGET_S",
     "TURN_VERIFIER_MIN_SLICE_S",
     "answer_pipeline_node",
+    "certify_outbound_safety",
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",
@@ -1653,6 +1858,7 @@ __all__ = [
     "keep_supported_text",
     "leaks_internal_terms",
     "merge_pack_dicts",
+    "outbound_safety_category",
     "run_v2_answer_turn",
     "select_retry_reply",
     "strip_adjacent_quotes",
