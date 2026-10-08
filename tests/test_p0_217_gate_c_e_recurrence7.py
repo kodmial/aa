@@ -156,7 +156,15 @@ def test_stage_budgets_and_windows_are_bounded() -> None:
 async def test_planner_structured_timeout_marks_capability_for_next_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A caller-observed structured deadline teaches the path: turn 2 goes text-direct."""
+    """A caller-observed deadline falls back without pinning the fast path.
+
+    Recurrence-2 update for kodmial/aa#244 on exact main 6f8d4e1 run
+    37764195857 (structured p50 0.40s over 28 fast calls vs text p50
+    5.1s over 73 slow calls; planner p50 5.7s pinned by 60s text
+    preference): a deadline is latency, not capability evidence, so the
+    slow turn serves tailored text once while the next turn re-probes
+    fast structured instead of going text-direct for a full minute.
+    """
 
     monkeypatch.setattr(planner_module, "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
 
@@ -191,14 +199,14 @@ async def test_planner_structured_timeout_marks_capability_for_next_turn(
     assert [query.split(" variant ")[0] for query in first.queries] == ["tailored turn query"] * 12
     assert model.structured_calls == 1
     assert model.text_calls == 1
-    # The deadline expiry (not just a callee-observed error) marks the
+    # The deadline expiry (latency, not capability) must not mark the
     # omitted-structured capability for this model path.
-    assert omitted_structured_unavailable(model) is True
+    assert omitted_structured_unavailable(model) is False
 
     second = await run_planner("family quarrel tonight", model=model)
     assert [query.split(" variant ")[0] for query in second.queries] == ["tailored turn query"] * 12
-    # No second doomed structured round-trip: the turn goes text-direct.
-    assert model.structured_calls == 1
+    # The next turn re-probes structured first instead of going text-direct.
+    assert model.structured_calls == 2
     assert model.text_calls == 2
 
 
@@ -283,8 +291,9 @@ async def test_verifier_slow_structured_degrades_within_unit_bound(
     assert model.structured_calls == 1
     assert model.text_calls == 1
     assert elapsed < 5.0
-    # The caller-observed deadline marks the capability for later units/turns.
-    assert structured_text_fallback_preferred(model) is True
+    # The caller-observed deadline is latency, not capability evidence
+    # (kodmial/aa#244 recurrence 2): later units/turns re-probe structured.
+    assert structured_text_fallback_preferred(model) is False
 
 
 async def test_verifier_turn_expiry_preserves_completed_units() -> None:
