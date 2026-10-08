@@ -1666,10 +1666,22 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if not _has_declarative_substance(cleaned):
         return False
+    # Production delivery contract (kodmial/aa#257 recurrence 3): besides
+    # plain served answers, the pipeline delivers two certified narrowing
+    # successes -- "narrowed-adequacy" and "narrowed-adequacy-regen". Both
+    # are served only after the narrowed text passes the envelope gate,
+    # the outbound safety gate and a fresh whole-turn adequacy PASS on
+    # the narrowed subset itself (turn_pipeline adequacy-narrowing
+    # paths). They are verified adequate book deliveries, never fallbacks,
+    # so the grounding allowlist must recognize them. Any other outcome
+    # (clarification, retry, adequacy-failed, safety-blocked, ...) still
+    # fails here.
     if snapshot.get("answer_outcome") not in (
         "served",
         "narrowed-supported",
         "narrowed-compacted",
+        "narrowed-adequacy",
+        "narrowed-adequacy-regen",
     ):
         return False
     # The independent verifier must have produced usable verdicts: no
@@ -1719,10 +1731,18 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     _answer_outcome = str(snapshot.get("answer_outcome", "") or "").strip()
     _verifier_outcome = str(snapshot.get("verifier_outcome", "") or "").strip()
+    # The served allowlist must equal the set of verifier success tokens
+    # the pipeline attaches to a served answer: the initial pass, the
+    # targeted-repair pass, the duplicate-retrieval existing-pack regen
+    # pass (turn_pipeline serves it as "served" when retrieval adds no new
+    # passages yet the regen from the current pack fully verifies), and
+    # the adequacy-regen pass. Any other outcome (unsupported, skipped,
+    # failed, ...) still fails a served turn.
     if _answer_outcome == "served" and _verifier_outcome not in ("", "unknown"):
         if _verifier_outcome not in (
             "passed",
             "passed-after-repair",
+            "passed-after-repair-existing-pack",
             "passed-after-adequacy-repair",
         ):
             return False
@@ -1735,8 +1755,21 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     adequacy = str(snapshot.get("adequacy_verdict", "") or "").strip()
     if adequacy and adequacy != "pass":
         return False
+    # A narrowing delivery keeps the turn's repair-history mark: the
+    # pipeline records "adequacy-repair-failed" when the full adequacy
+    # regen fails and then serves the verified adequate subset as
+    # narrowed-adequacy(-regen) with a fresh adequacy PASS. The delivered
+    # subset itself is certified, so exactly this mark is accepted on
+    # exactly the two narrowing outcomes (retry/clarification turns that
+    # carry the same mark still fail via the outcome allowlist above, and
+    # any other failure mark still fails here).
     failure_category = str(snapshot.get("failure_category", "") or "").strip()
-    if failure_category:
+    if failure_category not in ("", "adequacy-repair-failed"):
+        return False
+    if failure_category == "adequacy-repair-failed" and _answer_outcome not in (
+        "narrowed-adequacy",
+        "narrowed-adequacy-regen",
+    ):
         return False
     planner_reason = str(snapshot.get("planner_reason", "") or "").strip()
     if planner_reason in ("provider-error", "timeout", "invalid"):
