@@ -69,7 +69,7 @@ from aa.conversation.turn_pipeline import (
     ANSWER_FAST_RETRY_MAX_HISTORY,
     ANSWER_FAST_RETRY_MAX_PASSAGES,
     NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_REPLY,
+    NATURAL_RETRY_VARIANTS,
     run_v2_answer_turn,
 )
 from aa.opencode.errors import OpenCodeRateLimitError
@@ -210,7 +210,7 @@ async def test_answer_attempt_timeout_uses_fast_minimal_retry(
     )
     elapsed = time.perf_counter() - started
     assert elapsed < 5.0
-    assert outcome["text"] == NATURAL_RETRY_REPLY
+    assert outcome["text"] in NATURAL_RETRY_VARIANTS
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["answer_rounds"] == 1
 
@@ -242,7 +242,7 @@ async def test_answer_double_timeout_serves_retry_not_clarification(
         initial_query_count=12,
     )
     assert time.perf_counter() - started < 5.0
-    assert outcome["text"] == NATURAL_RETRY_REPLY
+    assert outcome["text"] in NATURAL_RETRY_VARIANTS
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
 
 

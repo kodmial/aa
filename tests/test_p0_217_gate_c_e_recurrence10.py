@@ -66,6 +66,7 @@ from aa.conversation.turn_pipeline import (
     ANSWER_DRAFT_ATTEMPT_BUDGET_S,
     NATURAL_CLARIFICATION_REPLY,
     NATURAL_RETRY_REPLY,
+    NATURAL_RETRY_VARIANTS,
     TURN_ANSWER_MIN_SLICE_S,
     TURN_END_TO_END_BUDGET_S,
     TURN_VERIFIER_MIN_SLICE_S,
@@ -120,7 +121,7 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
         upstream_latency_ms=20000.0,
     )
     assert time.perf_counter() - started < 5.0
-    assert outcome["text"] == NATURAL_RETRY_REPLY
+    assert outcome["text"] in NATURAL_RETRY_VARIANTS
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
     assert outcome["telemetry"]["answer_rounds"] == 0
@@ -160,7 +161,7 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
         upstream_latency_ms=12000.0,
     )
     assert answer.calls == 1
-    assert outcome["text"] == NATURAL_RETRY_REPLY
+    assert outcome["text"] in NATURAL_RETRY_VARIANTS
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
     assert outcome["telemetry"]["verifier_outcome"] == "skipped-turn-budget"
@@ -265,7 +266,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
         initial_query_count=12,
     )
     assert outcome["telemetry"]["verifier_outcome"] == "unsupported"
-    assert outcome["text"] == NATURAL_RETRY_REPLY
+    assert outcome["text"] in NATURAL_RETRY_VARIANTS
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
     assert outcome["telemetry"]["turn_budget_exceeded"] is True
 
