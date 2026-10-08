@@ -1017,6 +1017,95 @@ jobs:
                 const match = String(systemicExisting.body || '').match(/Systemic recurrence: \`(\d+)\`/);
                 systemicRecurrence = match ? Number(match[1]) + 1 : 2;
               }
+              const MAX_SYSTEMIC_REPAIR_RECURRENCE = 2;
+              if (systemicRecurrence > MAX_SYSTEMIC_REPAIR_RECURRENCE) {
+                if (systemicExisting) {
+                  await apiRetry('retire exhausted systemic repair issue', () =>
+                    github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: systemicExisting.number,
+                      state: 'closed',
+                      state_reason: 'not_planned',
+                      labels: ['priority:p0', 'automation:blocked'],
+                    })
+                  );
+                }
+
+                const breakerMarker = '<!-- aa-self-proving-convergence-breaker:v1 -->';
+                const breakerExisting = issues
+                  .filter(issue => !issue.pull_request && String(issue.body || '').includes(breakerMarker))
+                  .find(issue => String(issue.body || '').includes(`Convergence scope: \`${systemicScope}\``));
+                const breakerBody = [
+                  breakerMarker,
+                  `Convergence scope: \`${systemicScope}\``,
+                  '',
+                  '## Automatic convergence breaker',
+                  '',
+                  `Failure fingerprint: \`${fingerprint}\``,
+                  `Blocking gate: \`${blocking}\``,
+                  `Component: \`${component}\``,
+                  `Main SHA: \`${sha}\``,
+                  `Qualification run: \`${runId}\``,
+                  `Local repair recurrence: \`${recurrence}\``,
+                  `Systemic recurrence: \`${systemicRecurrence}\``,
+                  timingLine,
+                  stageTimingLine,
+                  verifierLine,
+                  transportTimingLine,
+                  tokenUsageLine,
+                  modelPathLine,
+                  '',
+                  '### Required convergence-breaker behavior',
+                  '',
+                  '- This is the final automatic mutation strategy for this convergence scope. Do not resume narrow or systemic retry loops.',
+                  '- Reconstruct the failure across recent exact-main qualification history and identify the smallest architecture invariant that explains all repeated failures.',
+                  '- Do not add literal qualification-prompt branches, domain keyword/stem tables, numbered-step parsing, token-overlap relevance, or handcrafted semantic qualification predicates.',
+                  '- Do not weaken Product Contract #110, Gate semantics, grounding, relevance, safety, or the current Gate E SLO.',
+                  '- Produce at most one architecture-level repair with generic regression coverage, then require a fresh exact-main qualification.',
+                  '- If this same convergence scope fails again after the breaker repair, keep Product Contract UNQUALIFIED and leave this breaker blocked. Do not dispatch further automatic code mutations for the same scope.',
+                  '',
+                  'This is a circuit breaker for code mutation, not a Product Contract override. Other unrelated automation may continue.',
+                ].join('\n');
+
+                if (breakerExisting) {
+                  await apiRetry('block exhausted convergence scope', () =>
+                    github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: breakerExisting.number,
+                      state: 'open',
+                      title: `P0 BLOCKED: Product Contract convergence exhausted (${systemicScope})`,
+                      body: breakerBody,
+                      labels: ['priority:p0', 'automation:blocked'],
+                    })
+                  );
+                  core.setFailed(
+                    `Convergence scope ${systemicScope} exhausted its one breaker repair; further automatic mutations are blocked.`
+                  );
+                  return;
+                }
+
+                const created = await apiRetry('create convergence breaker issue', () =>
+                  github.rest.issues.create({
+                    owner,
+                    repo,
+                    title: `P0 BREAKER: one final architecture repair for ${systemicScope}`,
+                    body: breakerBody,
+                    labels: ['priority:p0', 'automation:ready'],
+                  })
+                );
+                core.warning(
+                  `Created one-shot convergence breaker #${created.data.number} for ${systemicScope}.`
+                );
+                await apiRetry('wake issue scheduler for convergence breaker', () =>
+                  github.rest.actions.createWorkflowDispatch({
+                    owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+                  })
+                );
+                return;
+              }
+
               const systemicBody = [
                 systemicMarker,
                 `Systemic scope: \`${systemicScope}\``,
