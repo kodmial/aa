@@ -169,10 +169,7 @@ async def test_safety_recovery_serves_certified_delivery() -> None:
 
 async def test_safety_recovered_snapshot_passes_grounding_and_relevance() -> None:
     from aa.conversation.turn_pipeline import run_v2_answer_turn
-    from aa.qualification.product_contract_live import (
-        _assess_prompt_reply_relevance,
-        _is_grounded_substantive_reply,
-    )
+    from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
     def _fake_retrieve(index: object, queries: object, *, config: object = None) -> Any:
         _ = (index, queries, config)
@@ -231,7 +228,17 @@ async def test_safety_recovered_snapshot_passes_grounding_and_relevance() -> Non
         "qualified": bool(telemetry.get("qualified", False)),
     }
     reply = str(outcome["text"])
-    assert _assess_prompt_reply_relevance("Как мне бросить пить?", reply) is True
+    # Task #268: relevance comes from the single structured semantic
+    # verifier invocation (groundedness + answer relevance together),
+    # never from lexical prefix/token-overlap or domain-stem heuristics.
+    assert verification.get("answer_relevant") is True
+    assert any(
+        isinstance(unit, dict)
+        and unit.get("scope") == "book"
+        and unit.get("supported") is True
+        and unit.get("addresses_intent") is True
+        for unit in units
+    )
     assert _is_grounded_substantive_reply(snapshot, reply) is True
 
 
