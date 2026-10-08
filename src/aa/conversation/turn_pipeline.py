@@ -172,49 +172,22 @@ NATURAL_CLARIFICATION_REPLY = (
     "Помогу разобрать конкретную ситуацию и ближайшие шаги."
 )
 
-NATURAL_RETRY_REPLY = "Давайте продолжим спокойно. Расскажите, что сейчас беспокоит сильнее всего?"
-
-# Frozen natural retry pool (kodmial/aa#240: SHA-256 hash selection
-# removed). The Gate C live repair in kodmial/aa#236 sized this pool
-# above the reply-diversity floor and spread slow-tail turns across it
-# by message hash, so an all-fallback run could still satisfy
-# ``len(set(replies)) >= 8``. Manual Telegram evidence on 2026-10-08
-# proves that variety is not help: real drinking/recovery requests were
-# served hash-selected filler with zero verified book units while Gate C
-# reported PASS on diversity. The pool stays frozen (byte-identical, in
-# order) so qualification keeps counting every template retry as a
-# failed non-answer; selection no longer uses the hash (see
-# :func:`select_retry_reply`). A retry without verified substantive
-# material is an explicit product failure, never completion.
-NATURAL_RETRY_VARIANTS: tuple[str, ...] = (
-    NATURAL_RETRY_REPLY,
-    "Хорошо, давайте разберём это спокойно. Что для вас сейчас важнее всего?",
-    "Понял вас. Давайте продолжим спокойно. Расскажите чуть подробнее о текущей ситуации?",
-    "Спасибо, что делитесь. Давайте разберём это вместе. Что сейчас тревожит сильнее всего?",
-    "Принято, давайте обсудим это не спеша. Что сейчас выходит на первый план?",
-    "Хорошо, что вы написали. Давайте разберёмся по порядку. С чего начнём?",
-    "Понимаю вас. Давайте посмотрим на это внимательнее. Что беспокоит прямо сейчас?",
-    "Спасибо, что рассказали. Давайте продолжим разбираться. Что кажется самым важным?",
-    "Давайте разберём это шаг за шагом. Расскажите, что происходит сейчас?",
-    "Я вас слушаю. Давайте обсудим это спокойно. Что волнует сильнее всего?",
+NATURAL_RETRY_REPLY = (
+    "Сейчас не удалось надёжно проверить ответ по книге "
+    "«Анонимные алкоголики». Пожалуйста, попробуйте ещё раз позже."
 )
+
+# A technical/non-grounded fallback is never a successful AA response.
+# Earlier hash-selected variants existed solely to pass the diversity
+# floor despite returning no supported book content. Do not vary or
+# count an unverified service message as an answered user request.
+NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
 
 
 def select_retry_reply(user_message: str) -> str:
-    """Return the single grounding-safe retry continuation.
-
-    kodmial/aa#240 removed SHA-256 hash selection across
-    :data:`NATURAL_RETRY_VARIANTS`: spreading bookless filler over ten
-    variants only beat the Gate C diversity floor while real
-    drinking/recovery requests went unanswered. The pool stays frozen
-    so qualification keeps counting every template retry as a failed
-    non-answer, but selection is now stable and single: degraded turns
-    collapse visibly to one string instead of mimicking helpful
-    variety. A retry without verified substantive material is an
-    explicit product failure, never completion.
-    """
-    _ = user_message
-    return NATURAL_RETRY_VARIANTS[0]
+    """Return a truthful brief unqualified status, never synthetic support."""
+    del user_message
+    return NATURAL_RETRY_REPLY
 
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")

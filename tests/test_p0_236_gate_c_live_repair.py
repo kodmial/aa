@@ -1,19 +1,14 @@
-"""Gate C live repair for kodmial/aa#236 (recurrence 2), superseded by #240.
+"""Regression guard: the Gate C repair must not game reply diversity.
 
-Live run 37732467481 on exact main d4cb46f spread slow-tail turns
-across a SHA-256-selected pool sized above the diversity floor, so an
-all-fallback run could still satisfy ``len(set(replies)) >= 8``.
-Manual Telegram evidence on 2026-10-08 (kodmial/aa#240) proves that
-variety is not help: real drinking/recovery requests were served
-hash-selected filler with zero verified book units while Gate C
-reported PASS on diversity.
-
-kodmial/aa#240 keeps the pool frozen (byte-identical, in order) so
-qualification keeps counting every template retry as a failed
-non-answer, but selection is now stable and single: degraded turns
-collapse visibly to one string instead of mimicking helpful variety.
-A retry without verified substantive material is an explicit product
-failure, never completion. Product Contract #110 is unchanged.
+A formerly shipped SHA-256 pool of 10 polite non-answers met the old
+8-distinct-reply test while real Telegram users received no book-grounded
+help (manual Telegram evidence on 2026-10-08, kodmial/aa#240: real
+drinking/recovery requests were served hash-selected filler with zero
+verified book units while Gate C reported PASS on diversity). Technical
+failures must now be identified as unqualified and counted as product
+failures, not disguised as valid AA advice: selection is stable and
+single, so fallback runs collapse visibly to one honest unqualified
+status instead of mimicking helpful variety.
 """
 
 from __future__ import annotations
@@ -27,20 +22,17 @@ from aa.conversation.turn_pipeline import (
     leaks_internal_terms,
     select_retry_reply,
 )
+from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
 
-def test_retry_variants_contract() -> None:
-    # The pool must clear the live ``len(set(replies)) >= 8`` diversity
-    # floor even in an all-fallback worst case.
-    assert len(NATURAL_RETRY_VARIANTS) >= 8
-    assert NATURAL_RETRY_VARIANTS[0] == NATURAL_RETRY_REPLY
-    assert len(set(NATURAL_RETRY_VARIANTS)) == len(NATURAL_RETRY_VARIANTS)
-    for variant in NATURAL_RETRY_VARIANTS:
-        assert variant.strip()
-        assert variant != NATURAL_CLARIFICATION_REPLY
-        assert contains_cyrillic(variant)
-        assert not leaks_internal_terms(variant)
-        assert envelope_passes(variant)
+def test_unqualified_retry_is_honest_bounded_russian_status() -> None:
+    assert NATURAL_RETRY_VARIANTS == (NATURAL_RETRY_REPLY,)
+    assert NATURAL_RETRY_REPLY != NATURAL_CLARIFICATION_REPLY
+    assert "не удалось" in NATURAL_RETRY_REPLY
+    assert "книге" in NATURAL_RETRY_REPLY
+    assert contains_cyrillic(NATURAL_RETRY_REPLY)
+    assert not leaks_internal_terms(NATURAL_RETRY_REPLY)
+    assert envelope_passes(NATURAL_RETRY_REPLY)
 
 
 def test_retry_selection_is_stable_single_without_content_matching() -> None:
@@ -95,3 +87,54 @@ def test_all_fallback_worst_case_cannot_clear_diversity_floor() -> None:
     retries = [select_retry_reply(prompt) for prompt in prompts]
     assert len(set(retries)) == 1
     assert all(reply != NATURAL_CLARIFICATION_REPLY for reply in retries)
+
+
+def test_retry_is_not_shuffled_to_fake_diversity() -> None:
+    prompts = (
+        "Как бросить пить?",
+        "К вечеру опять тянет выпить",
+        "Я думал ты дашь рекомендации",
+        "Что делать с зависимостью?",
+        "Стоит ли купить акции?",
+        "",
+        "   ",
+    )
+    assert {select_retry_reply(prompt) for prompt in prompts} == {NATURAL_RETRY_REPLY}
+    assert select_retry_reply("КАК БРОСИТЬ ПИТЬ?") == NATURAL_RETRY_REPLY
+
+
+def test_bookless_retries_never_prove_grounded_help() -> None:
+    # Even optimistic stage numbers must not qualify a known non-answer.
+    snapshot = {
+        "answer_outcome": "served",
+        "planner_query_count": 12,
+        "retrieval_passages": 5,
+        "verified_book_units": 2,
+    }
+    assert not _is_grounded_substantive_reply(snapshot, NATURAL_RETRY_REPLY)
+    assert not _is_grounded_substantive_reply(snapshot, NATURAL_CLARIFICATION_REPLY)
+    assert not _is_grounded_substantive_reply(
+        {**snapshot, "verified_book_units": 0}, "Неподтверждённый ответ."
+    )
+
+
+def test_all_fallback_worst_case_must_fail_grounded_gate() -> None:
+    # The earlier test expected >=8 distinct strings from 16 bookless
+    # replies; that was the defect. Any all-fallback sample must fail.
+    retries = [
+        select_retry_reply(f"тестовое сообщение номер {i} " + "длинный хвост " * (i % 5))
+        for i in range(16)
+    ]
+    assert len(set(retries)) == 1
+    assert all(
+        not _is_grounded_substantive_reply(
+            {
+                "answer_outcome": "retry-turn-budget",
+                "planner_query_count": 12,
+                "retrieval_passages": 5,
+                "verified_book_units": 0,
+            },
+            text,
+        )
+        for text in retries
+    )
