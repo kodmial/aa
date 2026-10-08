@@ -209,11 +209,13 @@ class _VerifierModel:
         self._results: list[dict[str, Any]] = []
         for entry in results:
             for unit in entry.get("units", []):
+                supported = bool(unit.get("supported", False))
                 self._results.append(
                     {
                         "requires_book_evidence": str(unit.get("scope", "book")) == "book",
-                        "supported": bool(unit.get("supported", False)),
+                        "supported": supported,
                         "evidence_passage_ids": list(unit.get("evidence_passage_ids", [])),
+                        "addresses_intent": bool(unit.get("addresses_intent", supported)),
                     }
                 )
         self.calls = 0

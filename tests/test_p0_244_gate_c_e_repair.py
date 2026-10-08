@@ -161,6 +161,7 @@ async def test_grounded_turn_still_serves_with_narrowed_window() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": True,
             }
 
     outcome = await run_v2_answer_turn(

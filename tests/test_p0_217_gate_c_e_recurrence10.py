@@ -288,6 +288,7 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": [],
+                "addresses_intent": False,
             }
 
     outcome = await run_v2_answer_turn(
@@ -325,6 +326,7 @@ async def test_fast_turn_unsupported_still_clarifies() -> None:
                 "requires_book_evidence": True,
                 "supported": False,
                 "evidence_passage_ids": [],
+                "addresses_intent": False,
             }
 
     outcome = await run_v2_answer_turn(

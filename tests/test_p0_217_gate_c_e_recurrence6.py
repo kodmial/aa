@@ -378,6 +378,7 @@ async def test_slow_verifier_fails_closed_fast() -> None:
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
 
     units = split_response_units("Понимаю. Поддержка рядом помогает.")
@@ -412,6 +413,7 @@ async def test_slow_verifier_maps_to_unavailable_without_slow_grind(
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             }
 
     started = time.perf_counter()
@@ -475,11 +477,13 @@ async def test_fast_verifier_path_unchanged_single_round() -> None:
                 "requires_book_evidence": False,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
             },
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [pack[0]["passage_id"]],
+                "addresses_intent": True,
             },
         ]
     )

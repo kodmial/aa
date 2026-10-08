@@ -162,7 +162,7 @@ async def test_verifier_timeout_and_transient_do_not_pin(
             _ = (prompt, system)
             return (
                 '{"requires_book_evidence": true, "supported": true, '
-                '"evidence_passage_ids": ["p1"]}'
+                '"evidence_passage_ids": ["p1"], "addresses_intent": true}'
             )
 
     hanging = _HangingStructured()
@@ -185,7 +185,7 @@ async def test_verifier_timeout_and_transient_do_not_pin(
             _ = (prompt, system)
             return (
                 '{"requires_book_evidence": true, "supported": true, '
-                '"evidence_passage_ids": ["p1"]}'
+                '"evidence_passage_ids": ["p1"], "addresses_intent": true}'
             )
 
     transient = _TransientStructured()
@@ -213,7 +213,7 @@ async def test_verifier_deterministic_still_marks() -> None:
             _ = (prompt, system)
             return (
                 '{"requires_book_evidence": true, "supported": true, '
-                '"evidence_passage_ids": ["p1"]}'
+                '"evidence_passage_ids": ["p1"], "addresses_intent": true}'
             )
 
     model = _DeterministicMissing()

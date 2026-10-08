@@ -308,6 +308,7 @@ async def test_pipeline_serves_support_guidance_in_one_sequence() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["chapter-3#exp0000"],
+                "addresses_intent": True,
             }
 
     answer = _Answer()

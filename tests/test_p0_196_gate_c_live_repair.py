@@ -116,6 +116,7 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
             "requires_book_evidence": True,
             "supported": supported,
             "evidence_passage_ids": [passage_id] if supported else [],
+            "addresses_intent": bool(supported),
         }
     )
 
@@ -263,6 +264,7 @@ async def test_invalid_structured_decision_prefers_text_afterwards() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
+                "addresses_intent": True,
                 "reasoning": "extra key",
             }
 

@@ -191,7 +191,7 @@ async def test_answer_attempt_timeout_uses_fast_minimal_retry(
             _ = (prompt, system)
             return (
                 '{"requires_book_evidence": true, "supported": true, '
-                '"evidence_passage_ids": ["p1"]}'
+                '"evidence_passage_ids": ["p1"], "addresses_intent": true}'
             )
 
     _ = _VerifyPass

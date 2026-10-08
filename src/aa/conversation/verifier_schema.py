@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 ScopeName = Literal["book", "product_meta", "conversation_glue"]
 
@@ -32,12 +32,17 @@ VERIFIER_MAX_ATTEMPTS = 1
 
 
 class UnitDecision(BaseModel):
-    """Provider-native per-unit verifier decision (transport only)."""
+    """Provider-native per-unit verifier decision (transport only).
+
+    Every field requires an explicit strict boolean: a missing, null, or
+    wrong-type ``addresses_intent`` fails closed even when the unit is
+    book-supported with valid citations. Support never implies relevance.
+    """
 
     requires_book_evidence: bool
     supported: bool
     evidence_passage_ids: list[str] = Field(default_factory=list)
-    addresses_intent: bool = Field(default=False)
+    addresses_intent: StrictBool
 
     model_config = {"extra": "forbid"}
 

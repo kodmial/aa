@@ -180,6 +180,7 @@ async def test_harmful_verified_draft_is_blocked_with_safe_unavailability() -> N
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
 
     outcome = await run_v2_answer_turn(
@@ -229,6 +230,7 @@ async def test_safe_verified_draft_still_serves() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
 
     outcome = await run_v2_answer_turn(

@@ -72,6 +72,7 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
             "requires_book_evidence": True,
             "supported": supported,
             "evidence_passage_ids": [passage_id] if supported else [],
+            "addresses_intent": bool(supported),
         }
     )
 
@@ -123,7 +124,12 @@ async def test_fallback_path_skips_structured_proactively() -> None:
     assert len(units) == 1
     client = _AdapterScriptedClient(
         structured_outcomes=[
-            {"requires_book_evidence": True, "supported": True, "evidence_passage_ids": ["p1"]}
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
+            }
         ],
         text_outcomes=[_decision_json(pack[0]["passage_id"])],
     )

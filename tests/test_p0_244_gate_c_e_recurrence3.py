@@ -130,6 +130,7 @@ def _decision_json() -> str:
             "requires_book_evidence": True,
             "supported": True,
             "evidence_passage_ids": ["p1"],
+            "addresses_intent": True,
         }
     )
 
@@ -190,6 +191,7 @@ async def test_verifier_single_generic_rejection_still_reprobes() -> None:
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": ["p1"],
+                "addresses_intent": True,
             }
 
         async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
@@ -267,6 +269,7 @@ async def test_verifier_success_resets_rejection_streak() -> None:
                     "requires_book_evidence": True,
                     "supported": True,
                     "evidence_passage_ids": ["p1"],
+                    "addresses_intent": True,
                 }
             raise OpenCodeNotReadyError("opencode runtime has not been started")
 
