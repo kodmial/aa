@@ -1896,6 +1896,7 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
         return True
     _stems = (
         "тяг",
+        "тян",
         "выпи",
         "выпь",
         "буха",

@@ -84,14 +84,33 @@ _SUFFIXES = sorted(
 )
 
 
+_VOWEL_REPEAT_RE = re.compile(r"([аеиоуыэюяaeiou])\1+", re.IGNORECASE)
+
+# Colloquial spoken forms mapped to their literary base for retrieval
+# only (generic slang, never an exact-question list): ``че`` is the
+# colloquial form of ``что`` and otherwise fragments BM25 recall on
+# colloquial turns while the dense branch alone must carry them.
+_COLLOQUIAL_TOKEN_MAP = {
+    "че": "что",
+}
+
+
 def normalize_ru(text: str) -> str:
-    """Normalize Russian text for retrieval (casefold, ``ё`` → ``е``)."""
-    return text.casefold().replace("ё", "е")
+    """Normalize Russian text for retrieval (casefold, ``ё`` → ``е``).
+
+    A repeated-vowel collapse (``ее`` → ``е``) absorbs generic
+    doubled-vowel typos on both the index and query sides consistently;
+    double consonants (``ссора``, ``поддержка``) are preserved so their
+    stems stay distinct from single-consonant forms.
+    """
+    folded = text.casefold().replace("ё", "е")
+    return _VOWEL_REPEAT_RE.sub(r"\1", folded)
 
 
 def ru_tokens(text: str) -> list[str]:
     """Extract normalized alphanumeric tokens from ``text``."""
-    return _TOKEN_RE.findall(normalize_ru(text))
+    tokens = _TOKEN_RE.findall(normalize_ru(text))
+    return [_COLLOQUIAL_TOKEN_MAP.get(token, token) for token in tokens]
 
 
 def ru_stem(token: str) -> str:
@@ -100,9 +119,16 @@ def ru_stem(token: str) -> str:
     Suffixes apply iteratively (longest first) so conjugated forms such
     as ``бухаю`` reduce to the same stem as the infinitive ``бухать``
     (``бухаю`` → ``буха`` → ``бух``). Stems never shrink below 3 chars.
+
+    Craving-root unification: verb inflections (``тянет``/``тяну``) and
+    the noun family (``тяга``) share one retrieval root (``тяг``) so
+    inflected and typo-doubled forms meet the same FTS term on both the
+    index and query sides. Generic root only, never an exact question.
     """
     token = normalize_ru(token)
     if len(token) <= 3:
+        if token.startswith("тян"):
+            return "тяг"
         return token
     changed = True
     while changed and len(token) > 3:
@@ -114,6 +140,8 @@ def ru_stem(token: str) -> str:
                 token = token[: len(token) - len(suffix)]
                 changed = True
                 break
+    if token.startswith("тян"):
+        return "тяг"
     return token
 
 
