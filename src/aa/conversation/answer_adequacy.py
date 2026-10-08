@@ -223,12 +223,14 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
 
     Deterministic aggregation of per-unit model verdicts from the same
     verifier invocation: explicit ``answer_relevant`` wins when present,
-    otherwise at least one supported book unit with ``addresses_intent``
-    proves relevance, and a turn with no book requirement is relevant
-    by construction. No keyword, step-number or token-overlap heuristics.
-    Fail closed until the unified relevance field is present: a supported
-    book unit without an explicit ``addresses_intent`` verdict never
-    proves relevance.
+    otherwise every supported book unit must carry an explicit
+    ``addresses_intent`` true verdict (kodmial/aa#286: one relevant
+    sentence no longer passes padding or off-topic digressions), and a
+    turn with no book requirement is relevant by construction. No
+    keyword, step-number or token-overlap heuristics. Fail closed until
+    the unified relevance field is present: a supported book unit
+    without an explicit ``addresses_intent`` verdict never proves
+    relevance.
     """
     if not isinstance(grounding_result, dict):
         return False
@@ -241,17 +243,20 @@ def _turn_is_relevant(grounding_result: dict[str, Any] | None) -> bool:
     needs_book = any(isinstance(item, dict) and item.get("scope") == "book" for item in units)
     if not needs_book:
         return True
-    for item in units:
-        if not isinstance(item, dict):
-            continue
-        if (
-            item.get("scope") == "book"
-            and item.get("supported") is True
-            and bool(item.get("evidence_passage_ids"))
-        ):
-            if item.get("addresses_intent") is True:
-                return True
-    return False
+    supported_book = [
+        item
+        for item in units
+        if isinstance(item, dict)
+        and item.get("scope") == "book"
+        and item.get("supported") is True
+        and bool(item.get("evidence_passage_ids"))
+    ]
+    if not supported_book:
+        return False
+    for item in supported_book:
+        if item.get("addresses_intent") is not True:
+            return False
+    return True
 
 
 def assess_turn_adequacy(
