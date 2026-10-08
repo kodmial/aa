@@ -1906,16 +1906,46 @@ def _assess_prompt_reply_relevance(prompt: str, reply: str, *, context: str = ""
 
 
 def _prompt_allows_context_rescue(prompt: str) -> bool:
-    """Whether the current prompt is generic/terse enough for context rescue.
+    """Whether the current prompt structurally depends on prior dialogue.
 
-    An explicit new-topic prompt must be answered on its own merits; stale
-    prior-turn context must not rescue a reply that ignores the current
-    request. Only a current turn carrying little standalone topical
-    content (at most two substantive tokens) may resolve relevance
-    against the immediately preceding turns in the same chat.
+    Mirror the production stale-context guard independently: explicit
+    numbered-step switches do not inherit history, while demonstrative or
+    short deictic continuation language may resolve against preceding
+    turns. Short length alone never authorizes context rescue.
     """
-    return len(_content_tokens_for_relevance(prompt)) <= 2
+    import re as _re
 
+    cleaned = " ".join((prompt or "").split()).strip()
+    if not cleaned:
+        return False
+    if _extract_step_numbers_for_relevance(cleaned):
+        return False
+    lowered = cleaned.casefold()
+    if _re.search(
+        r"\b(?:это|этот|эта|эти|этом|этого|этим|эту|такой|таком|там|тогда|дальше|потом)\b",
+        lowered,
+    ) is not None:
+        return True
+    content = _content_tokens_for_relevance(cleaned)
+    if not content or len(content) > 4:
+        return False
+    return content.issubset(
+        {
+            "почему",
+            "зачем",
+            "дальше",
+            "теперь",
+            "потом",
+            "значит",
+            "делать",
+            "отсюда",
+            "следует",
+            "прямо",
+            "сейчас",
+            "продолжить",
+            "продолжать",
+        }
+    )
 
 async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.

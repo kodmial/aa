@@ -528,10 +528,11 @@ def _has_substantive_context(summary: str, recent: Sequence[str] | None) -> bool
 def _is_context_dependent_followup(text: str) -> bool:
     """Whether the live turn structurally depends on prior dialogue.
 
-    Context rescue is deliberately narrow: explicit demonstratives,
-    non-numbered step references, or very short generic follow-up words.
-    Short length alone is never enough, so a terse but explicit topic
-    pivot cannot inherit stale recovery context.
+    Context rescue is deliberately narrow. Explicit numbered-step switches
+    stay on their own merits; demonstratives/non-numbered step references
+    and short deictic continuation language may resolve against history.
+    Short length by itself is never sufficient, so an explicit topic pivot
+    cannot inherit stale recovery context.
     """
     cleaned = " ".join((text or "").split()).strip()
     if not cleaned:
@@ -542,14 +543,26 @@ def _is_context_dependent_followup(text: str) -> bool:
         return True
     if _has_step_reference(cleaned):
         return True
-    words = [item.casefold() for item in _WORD_RE.findall(cleaned) if len(item) >= 2]
-    if len(words) > 3:
-        return False
     content = _content_tokens(cleaned)
-    return bool(content) and content.issubset(
-        {"почему", "зачем", "дальше", "теперь", "потом", "значит", "делать"}
+    if not content or len(content) > 4:
+        return False
+    return content.issubset(
+        {
+            "почему",
+            "зачем",
+            "дальше",
+            "теперь",
+            "потом",
+            "значит",
+            "делать",
+            "отсюда",
+            "следует",
+            "прямо",
+            "сейчас",
+            "продолжить",
+            "продолжать",
+        }
     )
-
 
 def resolve_effective_request(
     user_message: str,
