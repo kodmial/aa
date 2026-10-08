@@ -942,7 +942,6 @@ def assess_turn_adequacy(
             pack_by_id[passage_id] = text
     request_tokens = _content_tokens(effective_request)
     request_prefixes = _token_prefixes(request_tokens)
-    raw_request_tokens = _content_tokens(user_message)
     # Step-switch fidelity: the live turn's explicit numbered step wins over
     # context. The resolved text unions history for elliptical follow-ups,
     # so extracting steps from it alone would yield {old, new} after a
