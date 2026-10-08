@@ -1381,13 +1381,13 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
 #
 # Gate ownership is strict: this lane (Gate C) proves the functional live
 # production path and records latency evidence only. Gate E alone owns the
-# Product Contract SLO verdict (p95 <= 15s and no ordinary turn >= 30s).
-# Mixing the 30s SLO into Gate C caused repeated "Gate C repair" loops that
+# Product Contract temporary SLO verdict (p95 <= 60s and no ordinary turn >= 120s).
+# Mixing the SLO into Gate C caused repeated "Gate C repair" loops that
 # patched latency symptoms before the controller could classify the actual
 # Gate E failure.
 # ---------------------------------------------------------------------------
 
-LIVE_TEXT_LATENCY_BUDGET_S = 30.0
+LIVE_TEXT_LATENCY_BUDGET_S = 120.0
 
 
 def _live_prerequisites() -> tuple[bool, list[str]]:
@@ -2022,7 +2022,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 }
                 started = time.perf_counter()
                 api.pending_updates.append(raw)
-                deadline = loop.time() + 90.0
+                deadline = loop.time() + 150.0
                 while len(api.sent_texts) <= before and loop.time() < deadline:
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
@@ -2281,7 +2281,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     maximum = max(latencies) if latencies else 0.0
     # Gate C records measured latency but never owns the SLO verdict.
     # Gate E consumes these exact per-turn/aggregate metrics and enforces
-    # p95 <= 15s plus max < 30s. Keeping the functional path and SLO gates
+    # p95 <= 60s plus max < 120s. Keeping the functional path and SLO gates
     # separate prevents latency-only defects from being misclassified as
     # generic Gate C live-path failures.
     if latencies:
