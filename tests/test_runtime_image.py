@@ -140,3 +140,18 @@ def test_pins_helper_accepts_current_tree() -> None:
         cwd=str(ROOT),
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_image_promotion_script_dry_run() -> None:
+    import subprocess
+    import sys
+
+    args = [sys.executable, "scripts/promote_runtime_image.py", "--digest"]
+    valid = subprocess.run(
+        [*args, "sha256:" + "1" * 64], capture_output=True, text=True, cwd=str(ROOT)
+    )
+    assert valid.returncode == 0, valid.stderr
+    invalid = subprocess.run(
+        [*args, "sha256:" + "0" * 64], capture_output=True, text=True, cwd=str(ROOT)
+    )
+    assert invalid.returncode != 0
