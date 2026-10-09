@@ -444,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / PROTECTED_SHA_FILENAME).write_text(
         hashlib.sha256(encrypted).hexdigest() + "\n", encoding="utf-8"
     )
+    selector_available = bool(diagnostics) and all(
+        t.selector_available and not t.fallback_used for t in diagnostics
+    )
     summary = summarize_public_295(
         main_sha=expected_sha,
         corpus_sha=corpus_sha,
@@ -452,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         turns=diagnostics,
         status=status,
         run_id=str(run_id),
-        selector_available=True,
+        selector_available=selector_available,
     )
     (out_dir / SUMMARY_FILENAME).write_text(
         json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

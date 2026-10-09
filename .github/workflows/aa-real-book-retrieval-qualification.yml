@@ -503,6 +503,10 @@ jobs:
             echo "#295 secret material in outputs" >&2
             exit 1
           fi
+          if grep -R -q --fixed-strings "AGE-SECRET-KEY-" eval-real-book-295-out/ 2>/dev/null; then
+            echo "#295 secret material in outputs" >&2
+            exit 1
+          fi
           echo "#295 encrypted-only upload guard passed"
 
       - name: Upload #295 encrypted protected artifact (source text stays encrypted)
