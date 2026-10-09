@@ -81,16 +81,18 @@ class _429Failure:
 
 async def test_transport_unavailable_cannot_be_misreported_as_semantic_negative() -> None:
     failed = await judge_whole_turn(
-        resolved_intent="synthetic question", reply="Синтетический ответ.",
-        model=_TransportUnavailable()
+        resolved_intent="synthetic question",
+        reply="Синтетический ответ.",
+        model=_TransportUnavailable(),
     )
     assert failed.helpful is False
     assert failed.available is False
     assert failed.failure_category == "OpenCodeDeterministicError"
 
     negative = await judge_whole_turn(
-        resolved_intent="synthetic question", reply="Неподходящий ответ.",
-        model=_NegativeSemanticVerdict()
+        resolved_intent="synthetic question",
+        reply="Неподходящий ответ.",
+        model=_NegativeSemanticVerdict(),
     )
     assert negative.helpful is False
     assert negative.available is True
