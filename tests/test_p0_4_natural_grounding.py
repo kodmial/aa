@@ -60,6 +60,9 @@ def _pack_entry(
     char_start: int = 0,
     char_end: int = 120,
 ) -> dict[str, Any]:
+    # kodmial/aa#308: fixtures carry the authoritative #303 stable source
+    # identity so whole-answer exact-quote anchoring can bind a quoted span
+    # to a specific exact source range (source_sha256 required by contract).
     return {
         "passage_id": passage_id,
         "text": text,
@@ -68,6 +71,7 @@ def _pack_entry(
         "char_start": char_start,
         "char_end": char_end,
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_sha256": "s" * 64,
     }
 
 
