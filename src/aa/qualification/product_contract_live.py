@@ -2267,6 +2267,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     flush=True,
                 )
                 active_judge_metrics: dict[str, Any] = {}
+                snapshot: dict[str, Any] = {}
                 grounded_for_scenario: bool | None = None
                 relevant_for_scenario: bool | None = None
                 helpful_for_scenario: bool | None = None
@@ -2341,7 +2342,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     _check(f"live-typing-heartbeat-{family}", heartbeat_ok)
                     if not heartbeat_ok:
                         heartbeat_continuity_failures += 1
-                    snapshot: dict[str, Any] = {}
+                    snapshot = {}
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
