@@ -43,19 +43,9 @@ jobs:
     # 330-minute job timeout stays below the 6-hour hosted-runner ceiling so
     # Telegram/OpenCode cleanup always has headroom.
     timeout-minutes: 330
-    # Issue #298: prebuilt job runtime. The exact digest is recorded in
-    # docker/aa-runtime.digest and kept in sync by
-    # scripts/promote_runtime_image.py. Pull uses container.credentials with
-    # the scoped GITHUB_TOKEN. A missing/inaccessible image or digest
-    # mismatch fails the job here before any poller starts (never READY,
-    # never a duplicate poller). One-commit rollback: delete this
-    # `container:` block to return to the legacy ubuntu-latest runner; the
-    # install steps below keep a bounded cold-miss path.
-    container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    # Image promotion occurs only after the trusted GHCR build and its
+    # fresh-runner canary validate a real immutable digest. Until promotion,
+    # keep the existing hosted-runner path so /run remains operational.
     steps:
       - name: Reject duplicate runtime
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -88,22 +78,6 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Verify prebuilt runtime image preflight
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Issue #298: fail-closed preflight. Confirms the container digest
-          # matches docker/aa-runtime.digest and the checkout equals current
-          # HEAD before Telegram/OpenCode start. A bad image fails here and
-          # can never claim READY or launch a second poller. Full codec,
-          # import, OpenCode, and model-identity checks run after the
-          # bounded install steps in "Verify hot-path readiness" below.
-          python scripts/verify_runtime_image.py --pins-only
-          digest="$(tail -n 1 docker/aa-runtime.digest)"
-          grep -qF "$digest" .github/workflows/aa-runtime.yml
-          sha="$(git rev-parse HEAD)"
-          echo "Checked-out application source HEAD: $sha"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -429,16 +403,6 @@ jobs:
             fi
             sleep $((attempt * 10))
           done
-
-      - name: Verify hot-path readiness
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Issue #298: full hot-path gate after the bounded install steps.
-          # Exercises the ffmpeg OGG/Opus smoke, Python 3.12 native imports,
-          # pinned OpenCode, model identity (--check-only, no downloads),
-          # exact HEAD, and reports timings. Fails closed before STARTING.
-          python scripts/verify_runtime_image.py --allow-placeholder-digest
 
       - name: Build and validate AA knowledge runtime
         env:
