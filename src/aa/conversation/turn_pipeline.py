@@ -390,6 +390,99 @@ def outbound_safety_category(text: str) -> str:
         return ""
 
 
+def certified_user_span_texts(
+    *,
+    draft: str,
+    units: Sequence[ResponseUnitDraft],
+    result: GroundingResult | None,
+    pack: list[dict[str, Any]],
+    recent: Sequence[Any] | None = None,
+    user_message: str = "",
+) -> frozenset[str]:
+    """Return trusted user-attributed span texts for one verified draft.
+
+    Carries the #308 candidate-level origin trust across textual
+    modifications owned by later stages (narrowing, compaction,
+    transport splitting): a span counts as a faithful user quotation in
+    repaired/final text only when it was certified ``user_report`` on
+    the checked candidate AND still anchors verbatim to a trusted
+    HumanMessage slice. Anything else counts toward the book quota fail
+    closed. Never raises; empty set means no trusted exemption.
+    """
+    if result is None or not units or not draft.strip():
+        return frozenset()
+    try:
+        from aa.conversation.quote_provenance import certify_answer_candidate
+
+        try:
+            from aa.conversation.quote_provenance import (
+                build_user_message_index,
+                extract_answer_quotes,
+            )
+        except ImportError:
+            return frozenset()
+        certificate = certify_answer_candidate(
+            answer=draft,
+            units=units,
+            verdicts=result.units,
+            passages=[dict(item) for item in pack if isinstance(item, dict)],
+            user_index=build_user_message_index(list(recent or []), user_message),
+        )
+        user_ranges = {
+            (span.answer_char_start, span.answer_char_end)
+            for span in certificate.spans
+            if span.origin == "user_report"
+        }
+        return frozenset(
+            span.span_text
+            for span in extract_answer_quotes(draft).spans
+            if (span.answer_char_start, span.answer_char_end) in user_ranges
+            and span.span_text.strip()
+        )
+    except Exception:
+        return frozenset()
+
+
+def final_book_quote_chars(
+    text: str,
+    *,
+    user_span_texts: frozenset[str] | set[str] | None = None,
+    pack: list[dict[str, Any]] | None = None,
+    recent: Sequence[Any] | None = None,
+    user_message: str = "",
+) -> int:
+    """Return origin-specific verbatim-book quote chars for final text.
+
+    The shared extractor detects every quoted span, but the book
+    copyright quota applies to verified ``book_claim`` spans, not to
+    faithful ``user_report`` quotations of a person's own messages.
+    A span is exempt only when it carries trusted origin (certified
+    ``user_report`` on the checked candidate) and still anchors
+    verbatim to a HumanMessage slice; ambiguity or missing source
+    mapping counts fail closed so an apparent book quote can never
+    evade the quota by masquerading as a user report.
+    """
+    from aa.conversation.quote_provenance import anchor_user_span, extract_answer_quotes
+
+    trusted = set(user_span_texts or set())
+    try:
+        from aa.conversation.quote_provenance import build_user_message_index
+
+        user_index = build_user_message_index(list(recent or []), user_message)
+    except ImportError:
+        user_index = []
+    _ = pack
+    total = 0
+    for span in extract_answer_quotes(text).spans:
+        span_text = span.span_text
+        if not span_text.strip():
+            continue
+        if span_text in trusted and anchor_user_span(span_text, user_index) is not None:
+            continue
+        total += len(span_text)
+    return total
+
+
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 
 _INTERNAL_TERMS = (
@@ -552,6 +645,10 @@ def narrowed_grounding_state(
             "supported": bool(verdict.supported),
             "evidence_passage_ids": list(verdict.evidence_passage_ids),
             "addresses_intent": bool(getattr(verdict, "addresses_intent", False)),
+            "origin": str(getattr(verdict, "origin", "conversation_glue") or "conversation_glue"),
+            "origin_ref": dict(getattr(verdict, "origin_ref", None) or {})
+            if isinstance(getattr(verdict, "origin_ref", None), dict)
+            else {},
         }
         for verdict in result.units
         if verdict.unit_id in kept_ids and bool(verdict.supported)
@@ -597,6 +694,12 @@ def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
                 "supported": bool(verdict.supported),
                 "evidence_passage_ids": list(verdict.evidence_passage_ids),
                 "addresses_intent": bool(getattr(verdict, "addresses_intent", False)),
+                "origin": str(
+                    getattr(verdict, "origin", "conversation_glue") or "conversation_glue"
+                ),
+                "origin_ref": dict(getattr(verdict, "origin_ref", None) or {})
+                if isinstance(getattr(verdict, "origin_ref", None), dict)
+                else {},
             }
             for verdict in result.units
         ],
@@ -740,6 +843,7 @@ async def _verify_draft(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    recent: Sequence[Any] | None = None,
 ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
     """Split and verify one draft; never raises verification errors.
 
@@ -768,6 +872,8 @@ async def _verify_draft(
                 resolved_intent=resolved_intent,
                 user_message=user_message,
                 conversation_context=conversation_context,
+                recent=recent,
+                answer_text=draft,
             )
         else:
             result = await run_verifier(
@@ -778,6 +884,8 @@ async def _verify_draft(
                 resolved_intent=resolved_intent,
                 user_message=user_message,
                 conversation_context=conversation_context,
+                recent=recent,
+                answer_text=draft,
             )
     except (VerifierValidationError, ValueError) as exc:
         # Per-unit only verifier (kodmial/aa#190): run_verifier performs
@@ -1338,6 +1446,7 @@ async def run_v2_answer_turn(
                 resolved_intent=_resolved_intent,
                 user_message=user_message,
                 conversation_context=_conversation_context,
+                recent=list(recent or []),
             )
         finally:
             telemetry["verifier_latency_ms"] = round(
@@ -1745,13 +1854,30 @@ async def run_v2_answer_turn(
         _pad_kept = keep_relevant_supported_units(units, result)
         if _pad_kept and len(_pad_kept) < len(units) and has_relevant_supported_book_unit(result):
             _pad_candidate = keep_relevant_supported_text(_pad_kept, result)
+            # Origin-specific book quota (#308): faithful user_report
+            # quotations are exempt; ambiguity counts fail closed.
+            _pad_user_spans = certified_user_span_texts(
+                draft=current_draft,
+                units=units,
+                result=result,
+                pack=pack,
+                recent=list(recent or []),
+                user_message=user_message,
+            )
             if (
                 _pad_candidate
                 and _pad_candidate != current_draft
                 and contains_cyrillic(_pad_candidate)
                 and not leaks_internal_terms(_pad_candidate)
                 and envelope_passes(_pad_candidate)
-                and aggregate_quote_chars(_pad_candidate) <= QUOTE_BUDGET_CHARS
+                and final_book_quote_chars(
+                    _pad_candidate,
+                    user_span_texts=_pad_user_spans,
+                    pack=pack,
+                    recent=list(recent or []),
+                    user_message=user_message,
+                )
+                <= QUOTE_BUDGET_CHARS
                 and certify_outbound_safety(_pad_candidate)
             ):
                 _pad_state = narrowed_grounding_state(_pad_kept, result)
@@ -1940,11 +2066,26 @@ async def run_v2_answer_turn(
                                     QUOTE_BUDGET_CHARS as _RQB,
                                 )
 
+                                _regen_user_spans = certified_user_span_texts(
+                                    draft=_regen_draft,
+                                    units=_regen_units,
+                                    result=_regen_result,
+                                    pack=pack,
+                                    recent=list(recent or []),
+                                    user_message=user_message,
+                                )
                                 if (
                                     contains_cyrillic(_regen_narrowed)
                                     and not leaks_internal_terms(_regen_narrowed)
                                     and envelope_passes(_regen_narrowed)
-                                    and aggregate_quote_chars(_regen_narrowed) <= _RQB
+                                    and final_book_quote_chars(
+                                        _regen_narrowed,
+                                        user_span_texts=_regen_user_spans,
+                                        pack=pack,
+                                        recent=list(recent or []),
+                                        user_message=user_message,
+                                    )
+                                    <= _RQB
                                     and certify_outbound_safety(_regen_narrowed)
                                 ):
                                     _rn_state = narrowed_grounding_state(_regen_kept, _regen_result)
@@ -2000,11 +2141,29 @@ async def run_v2_answer_turn(
                                 QUOTE_BUDGET_CHARS as _PQB,
                             )
 
+                            _part_draft_text = (
+                                _regen_draft if isinstance(_regen_draft, str) else current_draft
+                            )
+                            _part_user_spans = certified_user_span_texts(
+                                draft=_part_draft_text,
+                                units=_part_units,
+                                result=_part_result,
+                                pack=pack,
+                                recent=list(recent or []),
+                                user_message=user_message,
+                            )
                             if (
                                 contains_cyrillic(_part_narrowed)
                                 and not leaks_internal_terms(_part_narrowed)
                                 and envelope_passes(_part_narrowed)
-                                and aggregate_quote_chars(_part_narrowed) <= _PQB
+                                and final_book_quote_chars(
+                                    _part_narrowed,
+                                    user_span_texts=_part_user_spans,
+                                    pack=pack,
+                                    recent=list(recent or []),
+                                    user_message=user_message,
+                                )
+                                <= _PQB
                                 and certify_outbound_safety(_part_narrowed)
                             ):
                                 _pn_state = narrowed_grounding_state(_part_kept, _part_result)
@@ -2061,11 +2220,26 @@ async def run_v2_answer_turn(
                 if _narrowed_candidate and _narrowed_candidate != current_draft:
                     from aa.conversation.output_limits import QUOTE_BUDGET_CHARS as _QB
 
+                    _narrow_user_spans = certified_user_span_texts(
+                        draft=current_draft,
+                        units=units,
+                        result=result,
+                        pack=pack,
+                        recent=list(recent or []),
+                        user_message=user_message,
+                    )
                     _narrow_ok = (
                         contains_cyrillic(_narrowed_candidate)
                         and not leaks_internal_terms(_narrowed_candidate)
                         and envelope_passes(_narrowed_candidate)
-                        and aggregate_quote_chars(_narrowed_candidate) <= _QB
+                        and final_book_quote_chars(
+                            _narrowed_candidate,
+                            user_span_texts=_narrow_user_spans,
+                            pack=pack,
+                            recent=list(recent or []),
+                            user_message=user_message,
+                        )
+                        <= _QB
                         and certify_outbound_safety(_narrowed_candidate)
                     )
                     if _narrow_ok:
@@ -2117,6 +2291,28 @@ async def run_v2_answer_turn(
                     "paging-guard", "adjacent paging blocked", telemetry=dict(telemetry)
                 )
         transport_segments: list[str] | None = None
+        # Origin-specific book quota (#308): user_report spans exempt,
+        # ambiguity counts fail closed. Computed once for the served
+        # draft; quote-budget calculation before and after Telegram
+        # splitting uses the same canonical spans.
+        _served_user_spans = certified_user_span_texts(
+            draft=current_draft,
+            units=units,
+            result=result,
+            pack=pack,
+            recent=list(recent or []),
+            user_message=user_message,
+        )
+
+        def _served_book_quotes(candidate: str) -> int:
+            return final_book_quote_chars(
+                candidate,
+                user_span_texts=_served_user_spans,
+                pack=pack,
+                recent=list(recent or []),
+                user_message=user_message,
+            )
+
         if not envelope_passes(final):
             # Issue #295: a fully verified grounded complete answer keeps
             # its essential final points across sequential envelope-passing
@@ -2131,7 +2327,7 @@ async def run_v2_answer_turn(
                 passed
                 and units
                 and result is not None
-                and aggregate_quote_chars(final) <= QUOTE_BUDGET_CHARS
+                and _served_book_quotes(final) <= QUOTE_BUDGET_CHARS
                 and contains_cyrillic(final)
                 and not leaks_internal_terms(final)
                 and certify_outbound_safety(final)
@@ -2143,7 +2339,7 @@ async def run_v2_answer_turn(
                     _segments = []
                 if 1 < len(_segments) <= MAX_TRANSPORT_SEGMENTS and all(
                     envelope_passes(seg)
-                    and aggregate_quote_chars(seg) <= QUOTE_BUDGET_CHARS
+                    and _served_book_quotes(seg) <= QUOTE_BUDGET_CHARS
                     and contains_cyrillic(seg)
                     and not leaks_internal_terms(seg)
                     and certify_outbound_safety(seg)
@@ -2293,10 +2489,10 @@ async def run_v2_answer_turn(
                             raise TurnFailed(
                                 "envelope-exceeded", "no envelope fit", telemetry=dict(telemetry)
                             ) from None
-        # Quote-budget deterministic guard.
-        # (Verified split answers already satisfied the aggregate budget
+        # Quote-budget deterministic guard (origin-specific, #308).
+        # (Verified split answers already satisfied the book budget
         # before splitting; splitting never bypasses it.)
-        if aggregate_quote_chars(final) > QUOTE_BUDGET_CHARS:
+        if _served_book_quotes(final) > QUOTE_BUDGET_CHARS:
             try:
                 compacted = compact_text_to_envelope(final)
             except ValueError:
@@ -2729,13 +2925,32 @@ async def run_v2_answer_turn(
     substantive_narrowing_ok = (
         initial_query_count is None or initial_query_count == 0 or has_supported_book_unit(result)
     )
+    # Origin-specific book quota for narrowed delivery (#308).
+    _tail_user_spans = certified_user_span_texts(
+        draft=current_draft,
+        units=units if units else [],
+        result=result,
+        pack=pack,
+        recent=list(recent or []),
+        user_message=user_message,
+    )
+
+    def _tail_book_quotes(candidate: str) -> int:
+        return final_book_quote_chars(
+            candidate,
+            user_span_texts=_tail_user_spans,
+            pack=pack,
+            recent=list(recent or []),
+            user_message=user_message,
+        )
+
     if (
         narrowed
         and substantive_narrowing_ok
         and contains_cyrillic(narrowed)
         and not leaks_internal_terms(narrowed)
         and envelope_passes(narrowed)
-        and aggregate_quote_chars(narrowed) <= QUOTE_BUDGET_CHARS
+        and _tail_book_quotes(narrowed) <= QUOTE_BUDGET_CHARS
     ):
         # Narrowed material also certifies through the outbound gate:
         # repair budget is already exhausted here, so an unsafe narrowing
@@ -2804,7 +3019,7 @@ async def run_v2_answer_turn(
             envelope_passes(compacted)
             and contains_cyrillic(compacted)
             and not leaks_internal_terms(compacted)
-            and aggregate_quote_chars(compacted) <= QUOTE_BUDGET_CHARS
+            and _tail_book_quotes(compacted) <= QUOTE_BUDGET_CHARS
         ):
             if not certify_outbound_safety(compacted):
                 telemetry["outbound_safety"] = "blocked"
@@ -3099,6 +3314,8 @@ __all__ = [
     "anchored_adequacy_regen_prompt",
     "anchored_repair_focus",
     "build_safety_recovery_queries",
+    "certified_user_span_texts",
+    "final_book_quote_chars",
     "generate_dialogue_reply",
     "safety_candidate_fingerprint",
     "safety_recovery_request",

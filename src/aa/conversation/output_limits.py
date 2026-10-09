@@ -67,6 +67,15 @@ back to clarification instead of unbounded paging.
 MAX_COMPACT_REGENERATIONS = 1
 
 _QUOTED_SPAN_RE = re.compile(r"[«\"„“]([^«»\"\n]{1,2000})[»\"”]")
+"""Legacy pattern retained for import compatibility only.
+
+The authoritative quote-span detector is
+:func:`aa.conversation.quote_provenance.extract_answer_quotes`, which
+handles multi-line spans (this pattern explicitly excluded ``\\n`` and
+left a cross-line quote-budget bypass). New code must use the canonical
+parser; :func:`extract_quoted_spans` and :func:`aggregate_quote_chars`
+below delegate to it so extraction and budget always agree.
+"""
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?!\s*\[)|(?<=\])\s+|\n+")
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:#[A-Za-z0-9_:.\-]+)?)\]")
 _URL_RE = re.compile(r"https?://[^\s)>\]]+|www\.[^\s)>\]]+|tg://[^\s)>\]]+")
@@ -192,19 +201,31 @@ def count_words(text: str) -> int:
 
 
 def extract_quoted_spans(text: str) -> list[str]:
-    """Return quoted spans (without surrounding quotes/citations)."""
-    return [match.group(1).strip() for match in _QUOTED_SPAN_RE.finditer(text)]
+    """Return quoted spans (without surrounding quotes/citations).
+
+    Delegates to the canonical whole-answer quote parser
+    (:mod:`aa.conversation.quote_provenance`) so multi-line quotations
+    spanning periods, paragraphs and newlines are single spans and
+    extraction agrees with budget calculation on every span.
+    """
+    from aa.conversation.quote_provenance import extract_answer_quotes
+
+    return [span.span_text.strip() for span in extract_answer_quotes(text).spans]
 
 
 def aggregate_quote_chars(text: str) -> int:
     """Return aggregate verbatim quoted characters in ``text``.
 
-    Counts characters inside explicit quote marks. Citation brackets
-    (``[source/section#chunk]``) are provenance pointers, never quote
-    content, and are excluded.
+    Counts characters inside explicit quote marks (all origins; the
+    origin-specific book quota lives in
+    :func:`aa.conversation.quote_provenance.book_quote_chars_for_answer`).
+    Citation brackets (``[source/section#chunk]``) are provenance
+    pointers, never quote content, and are excluded.
     """
+    from aa.conversation.quote_provenance import total_quoted_chars
+
     without_citations = _CITATION_RE.sub("", text)
-    return sum(len(span) for span in extract_quoted_spans(without_citations) if span)
+    return total_quoted_chars(without_citations)
 
 
 def is_bulk_reproduction_request(text: str) -> bool:

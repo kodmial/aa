@@ -193,8 +193,10 @@ async def test_verifier_receives_reduced_remaining_budget(
         resolved_intent: str = "",
         user_message: str = "",
         conversation_context: str = "",
+        recent: Any | None = None,
+        answer_text: str | None = None,
     ) -> GroundingResult:
-        _ = (resolved_intent, user_message, conversation_context)
+        _ = (resolved_intent, user_message, conversation_context, recent, answer_text)
         captured["turn_budget_s"] = turn_budget_s
         captured["units"] = len(list(units))
         pack_ids = {
