@@ -158,6 +158,48 @@
       "terms": "unknown",
       "title": "Primorsky (Vladivostok) AA directory",
       "url": "https://aarussia.ru/aagroups/russiagroups/"
+    },
+    {
+      "source_id": "region-amur",
+      "title": "Amur region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "kind": "regional_directory",
+      "robots": "unknown",
+      "terms": "unknown",
+      "permission_status": "navigation-link-only",
+      "checked_at": "2026-10-09T12:00:00+00:00",
+      "notes": "Amur (Blagoveshchensk) inline listings reviewed on the national catalog page; minimal manually reviewed timetable pointers only.",
+      "provenance": "Regional section linked from the national catalog.",
+      "reproduction_basis": "minimal-navigation-pointers-only",
+      "allowlist_outgoing": true
+    },
+    {
+      "source_id": "region-arkhangelsk",
+      "title": "Arkhangelsk region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "kind": "regional_directory",
+      "robots": "unknown",
+      "terms": "unknown",
+      "permission_status": "navigation-link-only",
+      "checked_at": "2026-10-09T12:00:00+00:00",
+      "notes": "Arkhangelsk inline listings reviewed on the national catalog page; minimal manually reviewed timetable pointers only.",
+      "provenance": "Regional section linked from the national catalog.",
+      "reproduction_basis": "minimal-navigation-pointers-only",
+      "allowlist_outgoing": true
+    },
+    {
+      "source_id": "region-belgorod",
+      "title": "Belgorod region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "kind": "regional_directory",
+      "robots": "unknown",
+      "terms": "unknown",
+      "permission_status": "navigation-link-only",
+      "checked_at": "2026-10-09T12:00:00+00:00",
+      "notes": "Belgorod inline listings reviewed on the national catalog page; minimal manually reviewed timetable pointers only.",
+      "provenance": "Regional section linked from the national catalog.",
+      "reproduction_basis": "minimal-navigation-pointers-only",
+      "allowlist_outgoing": true
     }
   ]
 }

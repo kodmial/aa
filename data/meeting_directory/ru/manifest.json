@@ -1,37 +1,65 @@
 {
-  "checked_at": "2026-10-05T10:00:00+00:00",
-  "collection_scope": "Russia-only navigation snapshot (issue #316). Covers Moscow, Saint Petersburg, Yekaterinburg, Kazan with verified group/slot rows; Novosibirsk, Kirov (two same-named localities), Vladivostok as official region-directory fallback only; plus three online groups from the national online catalog. Remaining Russian regions are not imported in v1; the national root catalog URL is the fallback. Website reports 1303 registered groups as of August 2026; that number is not an import quota and is not claimed here.",
+  "checked_at": "2026-10-09T12:00:00+00:00",
+  "collection_scope": "Russia-only navigation snapshot (issues #316, #317). Covers Moscow, Saint Petersburg, Yekaterinburg, Blagoveshchensk, Arkhangelsk, Belgorod with verified group/slot rows; Kazan rows are present but stale; Novosibirsk, Kirov (two same-named localities), Vladivostok as official region-directory fallback only; plus four online groups from the national online catalog (three with verified timetables, one navigation-only). Remaining Russian regions are not imported; the national root catalog URL is the fallback. Website reports 1303 registered groups as of August 2026; that number is not an import quota and is not claimed here.",
   "data_digests": {
-    "groups.json": "sha256:4b56603f89433622e3de874e984e74812adb64462a1121b9605babddf574f33b",
-    "sources.json": "sha256:a55306dd637416a70ca7ce0db7806f3520a1ed6b6a694897d679fd57b81a3e8d"
+    "groups.json": "sha256:5414de32463c5cdc144ce3f6b53ca6dacae3fef6582e5985a87fbff29fe3cefc",
+    "sources.json": "sha256:6fba6f71522f3873bb548156d51001ade6c3ad11debb93dde6613db58e686a15"
   },
-  "fetched_at": "2026-10-05T10:00:00+00:00",
+  "fetched_at": "2026-10-09T12:00:00+00:00",
   "freshness_policy": "Weekly non-destructive source check; 30-day freshness review threshold for detailed times/addresses (configurable). Stale schedules are served as official-link navigation with an unconfirmed-schedule caveat, never as exact today/tomorrow claims. Even fresh published times are not live availability.",
   "gaps": [
-    "Regions beyond the eight listed regional pointers have no v1 rows; use the root catalog URL.",
+    "Regions beyond the eleven listed regional pointers have no rows; use the root catalog URL.",
     "Novosibirsk, both Kirov localities and Vladivostok have directory links only, no verified group rows.",
     "Online group Vecherniy has an unparsed/unknown schedule and unknown timezone: navigation only.",
     "Kazan Idel schedule_verified_at is 2026-07-01 and is served as stale navigation, not exact occurrences.",
     "No phone numbers, entry codes, personal identities, or transient join links are stored by policy."
   ],
   "omission_reasons": {
-    "bulk_group_import": "Bulk republication rights unconfirmed (robots/terms unknown); v1 keeps minimal manually reviewed pointers plus official links.",
+    "bulk_group_import": "Bulk republication rights unconfirmed (robots/terms unknown); snapshot keeps minimal manually reviewed pointers plus official links.",
     "contacts_and_codes": "Privacy gate: contacts, intercom/access codes and personal data are never stored.",
     "external_region_sites": "External regional sites need a per-source adapter, permission check and health tracking before deep import."
   },
   "record_counts": {
-    "groups": 8,
-    "online_group_records": 3,
-    "places": 8,
-    "region_directory_links": 8,
-    "slots": 11,
-    "slots_rankable": 10,
+    "groups": 12,
+    "online_group_records": 4,
+    "places": 11,
+    "region_directory_links": 11,
+    "slots": 17,
+    "slots_rankable": 16,
     "slots_unrankable": 1,
-    "sources": 11,
-    "verified_group_records": 5
+    "sources": 14,
+    "verified_group_records": 8,
+    "directory_only_places": 4,
+    "stale_slots": 1,
+    "fresh_rankable_slots": 15
+  },
+  "coverage_317": {
+    "fresh_in_person_cities": [
+      "Moscow",
+      "Saint Petersburg",
+      "Yekaterinburg",
+      "Blagoveshchensk",
+      "Arkhangelsk",
+      "Belgorod"
+    ],
+    "fresh_in_person_timezones": [
+      "Europe/Moscow",
+      "Asia/Yekaterinburg",
+      "Asia/Yakutsk"
+    ],
+    "fresh_online_slots": [
+      "s-online-rassvet-daily-2000",
+      "s-online-partizan-daily-2000",
+      "s-online-tikhookeanskaya-wed-1900",
+      "s-spb-severnaya-sun-2000-online"
+    ],
+    "primary_online_evidence": "s-online-partizan-daily-2000",
+    "verification_method": "Manual review of first-party national pages on 2026-10-05/09: Blagoveshchensk Edinstvo Mon/Wed/Fri 19:00, Arkhangelsk Istok Sun 19:00, Belgorod group 12 daily 18:30 from https://aarussia.ru/aagroups/russiagroups/ inline sections; Partizan Online daily 20:00 MSK from https://aarussia.ru/online-groups/ (page states most times are Moscow time; Partizan entry states 20:00 msk). Timezones mapped from city to IANA (Blagoveshchensk Asia/Yakutsk, others Europe/Moscow) and validated with zoneinfo; venues stored as generic public-venue pointers without addresses, phones, codes or personal data.",
+    "floor": "at least three distinct in-person cities spanning more than one Russian timezone with fresh rankable slots, plus at least one online group with source-verified schedule and timezone",
+    "floor_status": "met"
   },
   "schema_version": 1,
-  "snapshot_version": "ru-2026-10-05-v1",
+  "snapshot_version": "ru-2026-10-09-v2",
   "source_urls": [
     "https://aarussia.ru/aagroups/",
     "https://aarussia.ru/aagroups/russiagroups/",
