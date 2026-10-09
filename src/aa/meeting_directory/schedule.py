@@ -265,9 +265,19 @@ def rank_upcoming_meetings(
         payload = _decode_cursor(cursor, snapshot.version, snapshot.digest)
         if payload.get("scope", "") != cursor_scope:
             raise InvalidCursorError("cursor does not belong to this search")
-        if payload.get("now") != now.isoformat():
+        try:
+            cursor_now = datetime.fromisoformat(payload.get("now", ""))
+        except (ValueError, TypeError) as exc:
+            raise InvalidCursorError("malformed cursor timestamp") from exc
+        if cursor_now.tzinfo is None:
+            raise InvalidCursorError("malformed cursor timestamp")
+        cursor_now = cursor_now.astimezone(UTC)
+        if now < cursor_now:
             raise InvalidCursorError("cursor expired for a new search time")
-        boundary_start = datetime.fromisoformat(payload["after"])
+        try:
+            boundary_start = datetime.fromisoformat(payload.get("after", ""))
+        except (ValueError, TypeError) as exc:
+            raise InvalidCursorError("malformed cursor boundary") from exc
         if boundary_start.tzinfo is None:
             raise InvalidCursorError("malformed cursor boundary")
         boundary_start = boundary_start.astimezone(UTC)

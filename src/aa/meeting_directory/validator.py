@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from urllib.parse import urlparse
 
 from aa.meeting_directory.models import (
@@ -296,11 +296,11 @@ def _parse_slots(raw_groups: dict[str, object]) -> list[SlotRecord]:
             raise ValueError("weekly slot must list weekdays")
         start_raw = entry.get("start_local")
         start_local = str(start_raw) if isinstance(start_raw, str) else None
-        if start_local is not None and not re.fullmatch(r"[0-2]\d:[0-5]\d", start_local):
+        if start_local is not None and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", start_local):
             raise ValueError(f"invalid start_local: {start_local!r}")
         end_raw = entry.get("end_local")
         end_local = str(end_raw) if isinstance(end_raw, str) else None
-        if end_local is not None and not re.fullmatch(r"[0-2]\d:[0-5]\d", end_local):
+        if end_local is not None and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", end_local):
             raise ValueError(f"invalid end_local: {end_local!r}")
         status = str(entry.get("parsing_status", "unparsed"))
         if status not in ("verified", "unparsed", "stale"):
@@ -318,9 +318,32 @@ def _parse_slots(raw_groups: dict[str, object]) -> list[SlotRecord]:
         for stamp in cancellations:
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp):
                 raise ValueError(f"invalid cancellation date: {stamp!r}")
+            try:
+                date.fromisoformat(stamp)
+            except ValueError as exc:
+                raise ValueError(f"invalid cancellation date: {stamp!r}") from exc
         date_raw = entry.get("date")
         if recurrence == "dated" and not isinstance(date_raw, str):
             raise ValueError("dated slot must carry a date")
+        if isinstance(date_raw, str):
+            try:
+                date.fromisoformat(date_raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid slot date: {date_raw!r}") from exc
+        valid_from_raw = entry.get("valid_from")
+        valid_from = str(valid_from_raw) if isinstance(valid_from_raw, str) else None
+        if valid_from is not None:
+            try:
+                date.fromisoformat(valid_from)
+            except ValueError as exc:
+                raise ValueError(f"invalid valid_from: {valid_from!r}") from exc
+        valid_until_raw = entry.get("valid_until")
+        valid_until = str(valid_until_raw) if isinstance(valid_until_raw, str) else None
+        if valid_until is not None:
+            try:
+                date.fromisoformat(valid_until)
+            except ValueError as exc:
+                raise ValueError(f"invalid valid_until: {valid_until!r}") from exc
         month_week = entry.get("month_week")
         month_weekday = entry.get("month_weekday")
         source_url = _require_str(entry, "source_url")
@@ -339,12 +362,8 @@ def _parse_slots(raw_groups: dict[str, object]) -> list[SlotRecord]:
                 date=str(date_raw) if isinstance(date_raw, str) else None,
                 month_week=int(month_week) if isinstance(month_week, int) else None,
                 month_weekday=int(month_weekday) if isinstance(month_weekday, int) else None,
-                valid_from=str(entry.get("valid_from"))
-                if isinstance(entry.get("valid_from"), str)
-                else None,
-                valid_until=str(entry.get("valid_until"))
-                if isinstance(entry.get("valid_until"), str)
-                else None,
+                valid_from=valid_from,
+                valid_until=valid_until,
                 cancellations=cancellations,
                 access=access,  # type: ignore[arg-type]
                 source_url=source_url.strip(),
@@ -387,6 +406,9 @@ def _check_identity_and_links(
     for slot in slots:
         if slot.group_id not in group_id_set:
             raise ValueError(f"slot {slot.slot_id!r} has unknown group")
+    for link in region_links:
+        if link.source_id not in source_ids:
+            raise ValueError(f"region link {link.link_id!r} has unknown source")
     for place in places:
         if place.source_id not in source_ids:
             raise ValueError(f"place {place.place_id!r} has unknown source")
