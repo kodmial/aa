@@ -347,6 +347,32 @@ async def test_selector_invalid_non_rate_limit_reply_uses_bounded_fallback() -> 
     assert choice.selected_chunk_ids
     assert set(choice.selected_chunk_ids) <= allowed
     assert len(choice.selected_chunk_ids) <= MAX_SELECTED_CHUNKS
+    fallback_metrics = selection_telemetry(previews=previews, selection=choice)
+    assert fallback_metrics["selection_model_used"] is False
+    assert fallback_metrics["selection_fallback_used"] is True
+
+
+async def test_valid_model_selection_provenance_distinguishes_real_verdict() -> None:
+    """A bound model only counts after a validated model decision, not fallback."""
+
+    class ValidModel:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+        ) -> object:
+            _ = (prompt, system, schema, retry_count)
+            return {
+                "selected_chunk_ids": [_previews(count=4)[2].chunk_id],
+                "need_more_detail": False,
+                "followup_queries": [],
+            }
+
+    previews = _previews(count=4)
+    selected = await aselect_semantic_candidates(
+        previews, resolved_intent="разобрать тягу", model=ValidModel()
+    )
+    metrics = selection_telemetry(previews=previews, selection=selected)
+    assert metrics["selection_model_used"] is True
+    assert metrics["selection_fallback_used"] is False
 
 
 # ---------------------------------------------------------------------------
