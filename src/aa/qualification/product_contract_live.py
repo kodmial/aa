@@ -3154,8 +3154,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     try:
         _judge_unavailable = int(judge_unavailable_count)
         _judge_failures = {
-            str(category)[:64]: int(count)
-            for category, count in judge_failure_categories.items()
+            str(category)[:64]: int(count) for category, count in judge_failure_categories.items()
         }
     except Exception:
         _judge_unavailable = 0
