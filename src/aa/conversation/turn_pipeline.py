@@ -80,7 +80,7 @@ MAX_PACK_PASSAGES = 12
 # top 5 RRF-ranked passages removes the least-relevant generation input
 # from every ordinary turn; verification, checksum, quote and cite gates
 # still use the full stored pack, so grounding strictness is unchanged.
-ANSWER_GENERATION_MAX_PASSAGES = 5
+ANSWER_GENERATION_MAX_PASSAGES = MAX_PACK_PASSAGES
 
 # Bounded single answer-draft attempt (Gate C+E live repair,
 # kodmial/aa#217 recurrence 9 on exact main 922dd07 run 37720236046:
@@ -828,11 +828,11 @@ async def run_v2_answer_turn(
         "turn_budget_exceeded": False,
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
-        "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
+        "answer_generation_window": initial_pack_passages,
         "evidence_window_omitted_generation": max(
-            0, initial_pack_passages - ANSWER_GENERATION_MAX_PASSAGES
+            0
         ),
-        "evidence_window_omitted_verifier": max(0, initial_pack_passages - 5),
+        "evidence_window_omitted_verifier": 0,
         "adequacy_verdict": "unknown",
         "failure_category": "",
         "answers_request": False,
@@ -984,9 +984,9 @@ async def run_v2_answer_turn(
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
         try:
             telemetry["evidence_window_omitted_generation"] = max(
-                0, len(pack) - ANSWER_GENERATION_MAX_PASSAGES
+                0
             )
-            telemetry["evidence_window_omitted_verifier"] = max(0, len(pack) - 5)
+            telemetry["evidence_window_omitted_verifier"] = 0
             telemetry["retrieval_passages"] = len(pack)
         except Exception:
             pass
@@ -1044,9 +1044,7 @@ async def run_v2_answer_turn(
                         pack = merge_pack_dicts(pack, _rec_dicts)
                         telemetry["retrieval_passages"] = len(pack)
                         telemetry["retrieval_outcome"] = "recovered"
-                        telemetry["answer_generation_window"] = min(
-                            len(pack), ANSWER_GENERATION_MAX_PASSAGES
-                        )
+                        telemetry["answer_generation_window"] = len(pack)
                         logger.info(
                             "v2 empty-pack recovery rebuilt evidence",
                             extra={"passages": len(pack)},
@@ -1063,23 +1061,14 @@ async def run_v2_answer_turn(
     def _generation_window(
         active_pack: list[dict[str, Any]], *, wider: bool = False
     ) -> list[dict[str, Any]]:
-        """Return the bounded top-ranked window for answer generation only.
+        """Send all retrieved book passages to OpenCode, without rank slicing.
 
-        The stored pack order is already fused-rank priority, so the
-        leading slice keeps the most relevant authoritative passages.
-        Verification always uses the full pack; only generation input
-        tokens are bounded here. The initial draft uses the top-5
-        window; bounded repair attempts may use the wider top-8 window
-        (kodmial/aa#286 item 3) so decisive evidence at ranks 6-8 is not
-        permanently invisible, without blindly enlarging every turn.
-        Provenance, source-exactness and latency bounds are unchanged.
+        The same source-complete Evidence Pack is used for initial drafts
+        and revisions. Relevance selection belongs to retrieval/reranking,
+        not an arbitrary top-N cutoff in answer generation.
         """
-        from aa.conversation.whole_turn_judge import REPAIR_GENERATION_MAX_PASSAGES
-
-        limit = REPAIR_GENERATION_MAX_PASSAGES if wider else ANSWER_GENERATION_MAX_PASSAGES
-        if len(active_pack) <= limit:
-            return active_pack
-        return active_pack[:limit]
+        del wider  # Backwards-compatible repair caller; no narrower window.
+        return active_pack
 
     async def _draft_with_pack(
         active_pack: list[dict[str, Any]], prompt_text: str, *, wider: bool = False
@@ -2155,9 +2144,7 @@ async def run_v2_answer_turn(
                     pack = _safe_pack
                     telemetry["retrieval_passages"] = len(pack)
                     telemetry["retrieval_outcome"] = "repaired"
-                    telemetry["answer_generation_window"] = min(
-                        len(pack), ANSWER_GENERATION_MAX_PASSAGES
-                    )
+                    telemetry["answer_generation_window"] = len(pack)
                 try:
                     _safe_result = recovered["verification"]
                     _safe_unavailable = len(getattr(_safe_result, "unavailable_unit_ids", ()) or ())
