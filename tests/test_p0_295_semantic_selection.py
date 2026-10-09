@@ -30,6 +30,7 @@ from aa.conversation.semantic_selection import (
     MAX_SELECTED_CHUNKS,
     CandidatePreview,
     SemanticSelectionError,
+    aselect_semantic_candidates,
     heuristic_select,
     order_pack_semantically,
     preview_candidates,
@@ -301,3 +302,48 @@ def test_source_coverage_spans_sections_without_loss() -> None:
     sections = {item["section_id"] for item in ordered}
     assert sections == {item["section_id"] for item in pack}
     assert len(sections) >= 4
+
+
+async def test_selector_429_propagates_for_runner_resume() -> None:
+    """A provider 429 must not turn into lexical fallback or a false PASS."""
+    from aa.opencode.errors import OpenCodeRateLimitError
+
+    class RateLimitedModel:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+        ) -> object:
+            _ = (prompt, system, schema, retry_count)
+            raise OpenCodeRateLimitError("http=429")
+
+    with pytest.raises(OpenCodeRateLimitError, match="429"):
+        await aselect_semantic_candidates(
+            _previews(count=20),
+            resolved_intent="трезвый утренний разбор тяги поддержка",
+            model=RateLimitedModel(),
+        )
+
+
+async def test_selector_invalid_non_rate_limit_reply_uses_bounded_fallback() -> None:
+    """A malformed model decision does not manufacture unknown book ids."""
+
+    class InvalidModel:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+        ) -> object:
+            _ = (prompt, system, schema, retry_count)
+            return {
+                "selected_chunk_ids": ["unknown#chunk"],
+                "need_more_detail": False,
+                "followup_queries": [],
+            }
+
+    previews = _previews(count=20)
+    choice = await aselect_semantic_candidates(
+        previews,
+        resolved_intent="трезвый утренний разбор тяги поддержка",
+        model=InvalidModel(),
+    )
+    allowed = {item.chunk_id for item in previews}
+    assert choice.selected_chunk_ids
+    assert set(choice.selected_chunk_ids) <= allowed
+    assert len(choice.selected_chunk_ids) <= MAX_SELECTED_CHUNKS
