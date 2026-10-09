@@ -56,31 +56,12 @@ logger = logging.getLogger("aa.conversation.turn_pipeline")
 MAX_TARGETED_REPAIR_ROUNDS = 2
 MAX_PACK_PASSAGES = 12
 
-# Bounded answer-generation evidence window (Gate C+E live repair, run
-# 37664757721 on exact main 0202b0b: p50 29.6s / p95 42.0s / max 45.5s
-# over the 30s budget with planner p50 5.7s / p95 12.1s and a
-# live-answer-no-generic-collapse, repair_turns=0). The initial
-# draft+verify chain already exceeds budget before any repair: the
-# answer prompt carries the full 16k-token Evidence Pack while the
-# verifier display window is already bounded to 6 passages, so every
-# ordinary turn pays the largest provider input on the answer call,
-# generates long multi-unit drafts on the weak fallback path, and then
-# pays one verifier round-trip per unit. The window below keeps the top
-# RRF-ranked passages for generation only; verification, checksum,
-# quote and cite gates still use the full stored pack, so grounding
-# strictness is unchanged: the model may only use listed authoritative
-# evidence and every claim is still validated against the full pack.
-# Turn-independent, never an exact-question special case.
-#
-# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
-# 58f943c run 37709271567: answer input averages ~9k tokens per request
-# on the slow text path (p50 6.0s) while drafts cite only the
-# top-ranked passages (short 2-3 sentence drafts, response_units_total=5
-# over 8 answer rounds). Narrowing the generation window from 6 to the
-# top 5 RRF-ranked passages removes the least-relevant generation input
-# from every ordinary turn; verification, checksum, quote and cite gates
-# still use the full stored pack, so grounding strictness is unchanged.
-ANSWER_GENERATION_MAX_PASSAGES = MAX_PACK_PASSAGES
+# The generator receives the entire retrieved Evidence Pack (no top-5/top-8
+# evidence window). A passage's completeness is a source-fidelity invariant,
+# independent of answer latency or qualification thresholds.
+# Retained only for backwards import compatibility; zero means no
+# generation-stage passage-count cap.
+ANSWER_GENERATION_MAX_PASSAGES = 0
 
 # Bounded single answer-draft attempt (Gate C+E live repair,
 # kodmial/aa#217 recurrence 9 on exact main 922dd07 run 37720236046:
@@ -829,9 +810,7 @@ async def run_v2_answer_turn(
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
         "answer_generation_window": initial_pack_passages,
-        "evidence_window_omitted_generation": max(
-            0
-        ),
+        "evidence_window_omitted_generation": 0,
         "evidence_window_omitted_verifier": 0,
         "adequacy_verdict": "unknown",
         "failure_category": "",
@@ -983,9 +962,7 @@ async def run_v2_answer_turn(
         except NameError:
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
         try:
-            telemetry["evidence_window_omitted_generation"] = max(
-                0
-            )
+            telemetry["evidence_window_omitted_generation"] = 0
             telemetry["evidence_window_omitted_verifier"] = 0
             telemetry["retrieval_passages"] = len(pack)
         except Exception:
