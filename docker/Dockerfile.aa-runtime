@@ -39,7 +39,10 @@ RUN set -eux; \
         ffmpeg \
         git \
         libopus0 \
-        sudo; \
+        sudo \
+        libstdc++6 \
+        libgomp1 \
+        libicu72; \
     rm -rf /var/lib/apt/lists/*; \
     ffmpeg -version | head -n 1; \
     ffmpeg -hide_banner -h encoder=libopus 2>&1 | grep -q libopus; \
@@ -73,7 +76,7 @@ RUN set -eux; \
     python -c "import torch, sherpa_onnx, onnxruntime, faiss, transformers; print('deps ok')"
 
 # Pinned OpenCode CLI (single source of truth: docker/opencode.version).
-COPY docker/opencode.version /opt/aa/opencode.version
+COPY opencode.version /opt/aa/opencode.version
 RUN set -eux; \
     want="$(cat /opt/aa/opencode.version)"; \
     for attempt in 1 2 3; do \
