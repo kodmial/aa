@@ -380,8 +380,17 @@ def get_upcoming_meetings(
 
 def coverage_summary(
     snapshot: DirectorySnapshot | None = None,
+    now_utc: datetime | None = None,
 ) -> dict[str, int]:
-    """Report separate region-navigation vs verified group/slot coverage."""
+    """Report separate region-navigation vs verified group/slot coverage.
+
+    Counts keep ``directory_only`` navigation strictly apart from rankable
+    future meetings: a regional link never counts as a meeting. When
+    ``now_utc`` is given, freshness is evaluated against
+    ``STALE_THRESHOLD_DAYS``; otherwise only structural rankability is
+    reported plus the statically stale count is omitted (set to -1 as
+    unknown).
+    """
     directory = snapshot if snapshot is not None else get_cached_snapshot()
     rankable = sum(
         1
@@ -391,14 +400,147 @@ def coverage_summary(
         and slot.start_local is not None
         and slot.recurrence != "unknown"
     )
+    moment = now_utc.astimezone(UTC) if now_utc is not None else None
+    if moment is None:
+        fresh_rankable = -1
+        stale_slots = -1
+    else:
+        fresh_rankable = sum(
+            1
+            for slot in directory.slots
+            if slot.parsing_status == "verified"
+            and slot.timezone != "unknown"
+            and slot.start_local is not None
+            and slot.recurrence != "unknown"
+            and slot.schedule_verified_at is not None
+            and (moment - slot.schedule_verified_at).days <= STALE_THRESHOLD_DAYS
+        )
+        stale_slots = sum(
+            1
+            for slot in directory.slots
+            if slot.parsing_status == "verified"
+            and slot.schedule_verified_at is not None
+            and (moment - slot.schedule_verified_at).days > STALE_THRESHOLD_DAYS
+        )
+    directory_only_places = sum(
+        1 for place in directory.places if place.coverage_kind == "directory_only"
+    )
+    verified_places = sum(
+        1 for place in directory.places if place.coverage_kind == "verified_groups"
+    )
+    online_groups = sum(1 for group in directory.groups if group.group_format == "online")
     return {
         "places": len(directory.places),
+        "verified_places": verified_places,
+        "directory_only_places": directory_only_places,
         "region_directory_links": len(directory.region_links),
         "verified_groups": len(directory.groups),
+        "online_groups": online_groups,
         "slots": len(directory.slots),
         "rankable_slots": rankable,
+        "unrankable_slots": len(directory.slots) - rankable,
+        "fresh_rankable_slots": fresh_rankable,
+        "stale_slots": stale_slots,
         "sources": len(directory.sources),
     }
+
+
+def coverage_by_place(
+    snapshot: DirectorySnapshot | None = None,
+    now_utc: datetime | None = None,
+) -> dict[str, dict[str, object]]:
+    """Report per-place group/slot/fallback coverage for issue #317.
+
+    For every known place: group count, structurally rankable slot count,
+    fresh rankable slot count (when ``now_utc`` is given, else -1), and the
+    typed fallback that ``get_upcoming_meetings`` would return when no
+    future occurrence exists (``None`` status means real occurrences were
+    produced). Regional links never count as meetings.
+    """
+    directory = snapshot if snapshot is not None else get_cached_snapshot()
+    moment = now_utc.astimezone(UTC) if now_utc is not None else datetime.now(UTC)
+    report: dict[str, dict[str, object]] = {}
+    for place in sorted(directory.places, key=lambda item: item.place_id):
+        place_groups = [g for g in directory.groups if g.place_id == place.place_id]
+        place_slots = [
+            s for s in directory.slots if s.group_id in {g.group_id for g in place_groups}
+        ]
+        rankable = sum(
+            1
+            for s in place_slots
+            if s.parsing_status == "verified"
+            and s.timezone != "unknown"
+            and s.start_local is not None
+            and s.recurrence != "unknown"
+        )
+        fresh = sum(
+            1
+            for s in place_slots
+            if s.parsing_status == "verified"
+            and s.timezone != "unknown"
+            and s.start_local is not None
+            and s.recurrence != "unknown"
+            and s.schedule_verified_at is not None
+            and (moment - s.schedule_verified_at).days <= STALE_THRESHOLD_DAYS
+        )
+        if place.coverage_kind == "directory_only":
+            status: object = "directory_only"
+            future = 0
+        elif not place_slots:
+            status = "directory_only"
+            future = 0
+        elif fresh == 0 and rankable > 0:
+            status = "schedule_stale"
+            future = 0
+        elif rankable == 0:
+            status = "schedule_unknown"
+            future = 0
+        else:
+            probe = get_upcoming_meetings(
+                place_id=place.place_id, now_utc=moment, limit=1, snapshot=directory
+            )
+            future = len(probe.occurrences)
+            status = probe.fallback if probe.fallback is not None else "upcoming"
+        report[place.place_id] = {
+            "display_name": place.display_name,
+            "coverage_kind": place.coverage_kind,
+            "groups": len(place_groups),
+            "rankable_slots": rankable,
+            "fresh_rankable_slots": fresh,
+            "future_occurrences_probe": future,
+            "status": status,
+        }
+    return report
+
+
+def snapshot_identity(
+    snapshot: DirectorySnapshot | None = None,
+) -> dict[str, str]:
+    """Return the exact version/digest pair consumers pin for regression."""
+    directory = snapshot if snapshot is not None else get_cached_snapshot()
+    return {"version": directory.version, "digest": directory.digest}
+
+
+def fixture_find_next(
+    place_id: str | None = None,
+    now_utc: datetime | None = None,
+    format: QueryFormat | None = None,  # noqa: A002 - consumer contract name
+    limit: int = 3,
+    snapshot: DirectorySnapshot | None = None,
+) -> UpcomingMeetingResult:
+    """Small digest-pinned contract callable by integration #315.
+
+    Thin deterministic wrapper over :func:`get_upcoming_meetings` so a
+    source-importer change that empties all scheduled slots fails loudly in
+    the coverage test instead of silently returning link-only success.
+    """
+    return get_upcoming_meetings(
+        place_id=place_id,
+        format=format,
+        now_utc=now_utc,
+        limit=limit,
+        snapshot=snapshot,
+    )
 
 
 def resolve_locality(
@@ -414,9 +556,12 @@ def resolve_locality(
 # Re-exported for tests and tooling.
 __all__ = [
     "ROOT_CATALOG_URL",
+    "coverage_by_place",
     "coverage_summary",
+    "fixture_find_next",
     "get_sources",
     "get_upcoming_meetings",
     "resolve_locality",
     "search",
+    "snapshot_identity",
 ]

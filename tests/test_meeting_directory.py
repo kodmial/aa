@@ -46,7 +46,7 @@ def _snapshot_dir() -> Path:
 
 def test_snapshot_loads_offline_with_separate_coverage() -> None:
     snapshot = load_snapshot(_snapshot_dir())
-    assert snapshot.version == "ru-2026-10-05-v1"
+    assert snapshot.version == "ru-2026-10-09-v2"
     summary = coverage_summary(snapshot)
     assert summary["region_directory_links"] >= 8
     assert summary["verified_groups"] >= 5

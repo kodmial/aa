@@ -32,11 +32,14 @@ from aa.meeting_directory.models import (
     UpcomingMeetingResult,
 )
 from aa.meeting_directory.query import (
+    coverage_by_place,
     coverage_summary,
+    fixture_find_next,
     get_sources,
     get_upcoming_meetings,
     resolve_locality,
     search,
+    snapshot_identity,
 )
 from aa.meeting_directory.schedule import (
     DEFAULT_LOOKAHEAD_DAYS,
@@ -55,8 +58,10 @@ __all__ = [
     "MeetingOccurrence",
     "MeetingResource",
     "UpcomingMeetingResult",
+    "coverage_by_place",
     "coverage_summary",
     "default_snapshot_dir",
+    "fixture_find_next",
     "get_cached_snapshot",
     "get_sources",
     "get_upcoming_meetings",
@@ -64,4 +69,5 @@ __all__ = [
     "reset_cache",
     "resolve_locality",
     "search",
+    "snapshot_identity",
 ]

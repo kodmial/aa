@@ -36,6 +36,43 @@ def _read_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def check_coverage_floor(snapshot) -> tuple[bool, str]:
+    """Enforce the issue #317 smoke coverage floor (fail, never silent green)."""
+    from datetime import UTC, datetime
+
+    from aa.meeting_directory.query import coverage_by_place, get_upcoming_meetings
+
+    now = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    by_place = coverage_by_place(snapshot, now)
+    in_person_ok = [
+        place_id
+        for place_id, row in by_place.items()
+        if row["coverage_kind"] == "verified_groups"
+        and row["status"] == "upcoming"
+        and row["future_occurrences_probe"] >= 1
+        and any(
+            group.group_format in ("in_person", "hybrid")
+            for group in snapshot.groups
+            if group.place_id == place_id
+        )
+    ]
+    zones = set()
+    for place_id in in_person_ok:
+        for slot in snapshot.slots:
+            group_ids = {g.group_id for g in snapshot.groups if g.place_id == place_id}
+            if slot.group_id in group_ids and slot.timezone != "unknown":
+                zones.add(slot.timezone)
+    online = get_upcoming_meetings(format="online", now_utc=now, limit=3, snapshot=snapshot)
+    online_ok = online.fallback is None and len(online.occurrences) >= 1
+    ok = len(in_person_ok) >= 3 and len(zones) >= 2 and online_ok
+    detail = (
+        f"floor in_person_cities={len(in_person_ok)} timezones={len(zones)} "
+        f"online_occurrences={len(online.occurrences)} "
+        f"online_fallback={online.fallback} status={'met' if ok else 'BLOCKED'}"
+    )
+    return ok, detail
+
+
 def check_snapshot(snapshot_dir: Path = SNAPSHOT_DIR) -> int:
     """Validate the committed snapshot and verify manifest digests."""
     try:
@@ -76,6 +113,11 @@ def check_snapshot(snapshot_dir: Path = SNAPSHOT_DIR) -> int:
         f"sources={len(snapshot.sources)} "
         f"rights_unknown={len(stale_sources)}"
     )
+    floor_ok, detail = check_coverage_floor(snapshot)
+    print(detail)
+    if not floor_ok:
+        print("Coverage floor BLOCKED: refusing silent nearest-meeting success.", file=sys.stderr)
+        return 1
     return 0
 
 
