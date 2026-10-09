@@ -37,8 +37,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: aa-runtime-image
-  cancel-in-progress: false
+  # Cancel obsolete PR image builds; never interrupt publishing from main.
+  group: aa-runtime-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -276,12 +277,22 @@ jobs:
           [[ "$VALIDATED_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
             echo "::error::Missing immutable image digest"; exit 1;
           }
-          # Refuse stale image promotion if main advanced after the build.
+          # Application commits do not change the reusable dependency image.
+          # But if any image input changed during the canary, rebuild on main
+          # instead of pinning an incompatible stale dependency environment.
           checked="$(git rev-parse HEAD)"
           current="$(git ls-remote origin refs/heads/main | cut -f1)"
-          if [[ "$checked" != "$GITHUB_SHA" || "$current" != "$GITHUB_SHA" ]]; then
-            echo "::error::Main changed during image canary; rebuild image on current main."
+          if [[ "$checked" != "$current" ]]; then
+            echo "::error::Main moved during promotion checkout; refusing stale PR."
             exit 1
+          fi
+          if [[ "$checked" != "$GITHUB_SHA" ]] && ! git diff --quiet "$GITHUB_SHA" "$checked" -- \\
+            docker/Dockerfile.aa-runtime docker/.dockerignore docker/opencode.version \\
+            pyproject.toml corpus/embedding.lock.json corpus/voice.lock.json \\
+            scripts/verify_runtime_image.py .github/workflows/aa-runtime-image.yml; then
+            echo "::warning::Image inputs advanced; dispatching one fresh main image build."
+            gh workflow run aa-runtime-image.yml --ref main
+            exit 0
           fi
           python scripts/promote_runtime_image.py --digest "$VALIDATED_IMAGE_DIGEST" --apply
           if git diff --quiet -- docker/aa-runtime.digest .github/workflows/aa-runtime.yml; then
