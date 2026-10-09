@@ -101,6 +101,25 @@ def test_safe_unavailability_reply_passes_its_own_gate() -> None:
     assert is_outbound_safe(SAFE_UNAVAILABLE_REPLY)
 
 
+def test_safe_unavailability_reply_is_neutral_and_premise_free() -> None:
+    # kodmial/aa#300: the unavailable fallback must never assert the user
+    # asked to test themselves by drinking. It stays neutral,
+    # context-independent and truthful.
+    lowered = SAFE_UNAVAILABLE_REPLY.casefold()
+    assert "пробовать пить" not in lowered
+    assert "проверить себя" not in lowered
+    assert "проверь себя" not in lowered
+    assert "пить" not in lowered
+    assert "тест себя" not in lowered
+    assert "употреблен" not in lowered
+    from aa.conversation.output_limits import envelope_passes
+    from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
+
+    assert contains_cyrillic(SAFE_UNAVAILABLE_REPLY)
+    assert not leaks_internal_terms(SAFE_UNAVAILABLE_REPLY)
+    assert envelope_passes(SAFE_UNAVAILABLE_REPLY)
+
+
 def test_outbound_gate_is_deterministic() -> None:
     samples = [*NEGATIVE_CASES[:3], *SAFE_CASES[:3]]
     for sample in samples:
@@ -200,13 +219,26 @@ async def test_harmful_verified_draft_is_blocked_with_safe_unavailability() -> N
     assert REPORTED_SHAPE not in outcome["text"]
     assert not is_outbound_safe(REPORTED_SHAPE)
     assert is_outbound_safe(outcome["text"])
-    # No index is bound, so no diversified recovery is possible: the turn
-    # serves the transparent safe-unavailability reply, never generic glue.
+    # No index is bound and the answer model only emits the harmful shape,
+    # so even same-pack regeneration cannot produce a safe candidate: the
+    # turn serves the neutral safe-unavailability reply, never generic glue
+    # and never the irrelevant drink-test premise.
     assert outcome["text"] == SAFE_UNAVAILABLE_REPLY
     assert outcome["text"] not in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY)
+    lowered = outcome["text"].casefold()
+    assert "пробовать пить" not in lowered
+    assert "проверить себя" not in lowered
+    assert "пить" not in lowered
     telemetry = outcome.get("telemetry", {})
     assert telemetry.get("answer_outcome") == "safety-blocked"
     assert telemetry.get("outbound_safety") == "blocked"
+    # The fallback is an explicit non-success: Gate C FAILs, adequacy
+    # FAILs and the turn never qualifies as grounded help.
+    from aa.qualification.product_contract_live import _is_grounded_substantive_reply
+
+    assert telemetry.get("adequacy_verdict") == "fail"
+    assert telemetry.get("qualified") is False
+    assert _is_grounded_substantive_reply(dict(telemetry), outcome["text"]) is False
 
 
 async def test_safe_verified_draft_still_serves() -> None:
