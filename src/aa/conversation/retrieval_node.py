@@ -160,7 +160,6 @@ async def aretrieve_with_semantic_selection(
     only, never semantic authority when a model is bound.
     """
     from aa.retrieval.evidence import (
-        dedup_and_diversify,
         expand_small_to_big,
         fuse_query_pool,
         run_branch_searches,
@@ -184,15 +183,13 @@ async def aretrieve_with_semantic_selection(
     fused, pool_ids = fuse_query_pool(
         ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
     )
-    diverse = dedup_and_diversify(
-        index,
-        pool_ids,
-        fused,
-        pool_cap=active.pool_cap,
-        max_per_section=active.max_per_section,
-    )
-    ordered = sorted(diverse, key=lambda item: item.fused_score, reverse=True)
-    # Broad discovery previews BEFORE any top-N winner budgeting.
+    # Discovery previews use the broad fused pool directly; per-section
+    # diversity caps are applied only to fallback/budgeting after selection.
+    # Broad discovery previews BEFORE any per-section diversity truncation
+    # or top-N winner budgeting (issue #295). The genuinely broad fused
+    # pool (global RRF order, exact-ID dedup only, ranks >16 included) is
+    # shown to the LLM; diversity caps apply only to fallback/budgeting
+    # after the model has selected.
     from aa.conversation.semantic_selection import (
         MAX_FOLLOWUP_QUERIES,
         MAX_SELECTED_CHUNKS,
@@ -202,7 +199,8 @@ async def aretrieve_with_semantic_selection(
         selection_telemetry,
     )
 
-    fused_ordered = [(item.chunk_id, item.fused_score) for item in ordered]
+    broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
+    fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
     in_index = [cid for cid, _ in fused_ordered if cid in index.chunks]
     texts = {cid: getattr(index.chunks[cid], "text", "") for cid in in_index}
     sections = {cid: getattr(index.chunks[cid], "section", "") for cid in in_index}
@@ -270,9 +268,24 @@ async def aretrieve_with_semantic_selection(
         # Fail-safe bounded fallback (never empty silent success): top RRF
         # winners in fused order. Reached only when selection yields nothing
         # usable; deep ranks stay reachable via the previews above on retry.
+        # Diversity caps apply here only, never to discovery previews above.
+        from aa.retrieval.evidence import dedup_and_diversify as _dedup
+
+        _diverse_fallback = _dedup(
+            index,
+            pool_ids,
+            fused,
+            pool_cap=active.pool_cap,
+            max_per_section=active.max_per_section,
+        )
+        _ordered_fallback = sorted(
+            _diverse_fallback, key=lambda item: item.fused_score, reverse=True
+        )
         sections_map = {cid: getattr(index.chunks[cid], "section", "") for cid in index.chunks}
         winners = select_top_candidates(
-            ordered, top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS), sections=sections_map
+            _ordered_fallback,
+            top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS),
+            sections=sections_map,
         )
     expanded = await asyncio.to_thread(
         expand_small_to_big, index, winners, neighbor_window=active.neighbor_window
@@ -289,6 +302,19 @@ async def aretrieve_with_semantic_selection(
     except Exception:
         telemetry = {}
     from aa.retrieval.evidence import _short_digest as _digest
+    from aa.retrieval.evidence import dedup_and_diversify as _dedup_meta
+
+    try:
+        _diverse_meta = _dedup_meta(
+            index,
+            pool_ids,
+            fused,
+            pool_cap=active.pool_cap,
+            max_per_section=active.max_per_section,
+        )
+        _diverse_unique = len(_diverse_meta)
+    except Exception:
+        _diverse_unique = 0
 
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
@@ -299,7 +325,7 @@ async def aretrieve_with_semantic_selection(
         "pool_cap": active.pool_cap,
         "fused_unique": len(fused),
         "pool_unique": len(pool_ids),
-        "diverse_unique": len(diverse),
+        "diverse_unique": _diverse_unique,
         "top_child_cap": active.top_child_cap,
         "selected_winners": len(winners),
         "retrieval_backend": "rrf-only/1+semantic-selection",
@@ -319,7 +345,7 @@ async def aretrieve_with_semantic_selection(
     logger.info(
         "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d",
         len(cleaned),
-        len(diverse),
+        len(previews),
         len(winners),
         len(selected),
         total,
