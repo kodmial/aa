@@ -15,7 +15,11 @@ def _source_passages(count: int = 10) -> list[EvidencePassage]:
             passage_id=f"chapter-3#exp{i:04d}",
             source="canonical-ru",
             section="chapter-3",
-            text=f"Начало фрагмента {i}. " + ("Подлинный книжный контекст. " * 35) + f" Конец фрагмента {i}.",
+            text=(
+                f"Начало фрагмента {i}. "
+                + ("Подлинный книжный контекст. " * 35)
+                + f" Конец фрагмента {i}."
+            ),
         )
         for i in range(count)
     ]
