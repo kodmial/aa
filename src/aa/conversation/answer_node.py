@@ -60,8 +60,13 @@ async def generate_draft(
     summary: str,
     passages: list[EvidencePassage],
     user_message: str,
+    safety_policy: str = "",
 ) -> str:
-    """Generate one natural grounded Russian draft from the Evidence Pack."""
+    """Generate one natural grounded Russian draft from the Evidence Pack.
+
+    ``safety_policy`` is a separate control block (kodmial/aa#300), never
+    merged into ``user_message``; empty for ordinary drafts.
+    """
     if not user_message.strip():
         raise ValueError("refusing to generate an answer without a user message")
     system_text = load_aa_agent_system_v2()
@@ -71,6 +76,7 @@ async def generate_draft(
         passages=passages,
         user_message=user_message,
         system_prompt=system_text,
+        safety_policy=safety_policy,
     )
     reply = await model.ainvoke(messages)
     text = _reply_text(reply).strip()

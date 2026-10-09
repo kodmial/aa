@@ -114,11 +114,14 @@ def render_turn_context(
     summary: str,
     passages: list[EvidencePassage],
     user_message: str,
+    safety_policy: str = "",
 ) -> str:
     """Render the current-turn structured context payload (user role).
 
     ``<user_message>`` is always last so the real request stays
-    structurally unambiguous.
+    structurally unambiguous. ``safety_policy`` travels as a separate
+    ``<safety_policy>`` control block (kodmial/aa#300), never merged into
+    ``<user_message>`` or any retrieval query.
     """
     from aa.conversation.output_limits import (
         DEFAULT_GENERATION_BUDGET_TOKENS,
@@ -155,6 +158,10 @@ def render_turn_context(
     lines.append("<response_budget>")
     lines.append(generation_budget_instruction(DEFAULT_GENERATION_BUDGET_TOKENS))
     lines.append("</response_budget>")
+    if safety_policy.strip():
+        lines.append("<safety_policy>")
+        lines.append(_escape_text(safety_policy.strip()))
+        lines.append("</safety_policy>")
     lines.append("<user_message>")
     lines.append(_escape_text(user_message))
     lines.append("</user_message>")
@@ -168,6 +175,7 @@ def build_answer_messages(
     passages: list[EvidencePassage],
     user_message: str,
     system_prompt: str | None = None,
+    safety_policy: str = "",
 ) -> list[BaseMessage]:
     """Assemble the full answer-node model input in contract order.
 
@@ -202,7 +210,10 @@ def build_answer_messages(
     assembled.append(
         HumanMessage(
             content=render_turn_context(
-                summary=summary, passages=passages, user_message=user_message
+                summary=summary,
+                passages=passages,
+                user_message=user_message,
+                safety_policy=safety_policy,
             )
         )
     )
