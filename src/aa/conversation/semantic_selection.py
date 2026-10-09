@@ -321,6 +321,7 @@ async def aselect_semantic_candidates(
     conversation_context: str = "",
     user_message: str = "",
     model: Any | None = None,
+    known_chunk_ids: set[str] | None = None,
 ) -> SemanticSelection:
     """Model-driven selection with deterministic fallback (bounded).
 
@@ -328,18 +329,27 @@ async def aselect_semantic_candidates(
     :func:`heuristic_select` so deep relevant candidates still surface
     without inventing ids. Unknown cited ids fail closed to the
     heuristic. Provider 429 propagates.
+
+    ``known_chunk_ids``, when supplied, is the independent retrieval
+    ground truth (fused pool / indexed source) that previews are
+    verified against before any selector model call. It must never be
+    derived from ``previews`` itself.
     """
     preview_list = list(previews)[:MAX_SELECTION_CANDIDATES]
     if not preview_list:
         return SemanticSelection(selected_chunk_ids=[], need_more_detail=True, followup_queries=[])
-    known = {p.chunk_id for p in preview_list}
+    preview_ids = {p.chunk_id for p in preview_list}
     # Discovery-preview integrity before any selector model call
     # (kodmial/aa#310): previews must reference verifiable indexed
     # chunks, but a missing full-read blob never rejects selection.
+    # ``known_chunk_ids`` must come from the independent fused/indexed
+    # source supplied by the caller; deriving it from ``preview_list``
+    # would make membership tautologically true and let an invented
+    # chunk_id pass the pre-model gate.
     try:
         from aa.conversation.evidence_integrity import validate_preview_references
 
-        validate_preview_references(preview_list, known_chunk_ids=known)
+        validate_preview_references(preview_list, known_chunk_ids=known_chunk_ids)
     except Exception as exc:
         raise SemanticSelectionError(f"selection previews invalid: {exc}") from exc
     if model is None:
@@ -363,7 +373,7 @@ async def aselect_semantic_candidates(
                 schema=semantic_selection_schema(),
                 retry_count=1,
             )
-            selected = validate_semantic_selection(raw, known_chunk_ids=known)
+            selected = validate_semantic_selection(raw, known_chunk_ids=preview_ids)
             selected._used_model = True  # Validated real model verdict, not a fallback.
             return selected
         text_invoke = getattr(model, "_ainvoke_text", None) or getattr(model, "ainvoke", None)
@@ -389,7 +399,7 @@ async def aselect_semantic_candidates(
             data = _json.loads(payload)
         except Exception as exc:
             raise SemanticSelectionError(f"selection text is not JSON: {exc}") from exc
-        selected = validate_semantic_selection(data, known_chunk_ids=known)
+        selected = validate_semantic_selection(data, known_chunk_ids=preview_ids)
         selected._used_model = True
         return selected
     except Exception as exc:

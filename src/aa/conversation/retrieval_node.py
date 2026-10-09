@@ -219,12 +219,16 @@ async def aretrieve_with_semantic_selection(
     sel_started = time.perf_counter()
     # Provider 429 propagates (runner retire/checkpoint resume); other
     # model failures fall back to the bounded heuristic inside the selector.
+    # Pre-model preview gate verifies against this independent fused/index
+    # ground truth, never against the previews themselves.
+    known_chunk_ids = {cid for cid in fused if cid in index.chunks}
     selection = await aselect_semantic_candidates(
         previews,
         resolved_intent=resolved_intent,
         conversation_context=conversation_context,
         user_message=user_message,
         model=selection_model,
+        known_chunk_ids=known_chunk_ids,
     )
     sel_ms = (time.perf_counter() - sel_started) * 1000.0
     winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]

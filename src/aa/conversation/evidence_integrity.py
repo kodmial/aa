@@ -53,20 +53,17 @@ def validate_full_passage_entry(entry: object, *, position: int = 0) -> None:
         raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing text_sha256")
     if _sha256_text(text) != text_sha:
         raise EvidencePackIntegrityError(f"{label} {passage_id!r} has wrong text_sha256")
-    # Source-hash/corpus provenance is validated when present.
-    # Production packs from ``pack_to_state`` always carry ``source_sha256``
+    # Source-hash/corpus provenance is always required for full passages.
+    # Production packs from ``pack_to_state`` carry ``source_sha256``
     # and ``corpus_version`` (#303 stable identity, pinned at delivery by
-    # #304); pre-#303 minimal fixtures omit these keys entirely and stay
-    # parseable so the strict text/hash/source/range gates below still
-    # apply to them. A present-but-empty value is corrupt and fails closed.
-    if "source_sha256" in entry:
-        source_sha = entry.get("source_sha256")
-        if not isinstance(source_sha, str) or not source_sha.strip():
-            raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing source_sha256")
-    if "corpus_version" in entry:
-        corpus_version = entry.get("corpus_version")
-        if not isinstance(corpus_version, str) or not corpus_version.strip():
-            raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing corpus_version")
+    # #304). An absent or present-but-empty value is corrupt and fails
+    # closed before any model call.
+    source_sha = entry.get("source_sha256")
+    if not isinstance(source_sha, str) or not source_sha.strip():
+        raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing source_sha256")
+    corpus_version = entry.get("corpus_version")
+    if not isinstance(corpus_version, str) or not corpus_version.strip():
+        raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing corpus_version")
     source_id = entry.get("source_id", entry.get("source", ""))
     if not isinstance(source_id, str) or not source_id.strip():
         raise EvidencePackIntegrityError(f"{label} {passage_id!r} has missing source_id")
