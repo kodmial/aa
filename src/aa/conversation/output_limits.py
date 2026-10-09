@@ -48,7 +48,20 @@ DEFAULT_GENERATION_BUDGET_TOKENS = 320
 
 Issue #295: large enough for appropriately detailed natural Russian
 answers driven by the question and book grounding; the hard Telegram
-envelope below stays the authoritative transport bound.
+envelope below stays the authoritative per-message transport bound.
+A verified complete answer that exceeds one envelope is delivered as
+sequential envelope-passing segments (see
+:func:`split_text_to_envelope_segments`), never truncated to leading
+units.
+"""
+
+MAX_TRANSPORT_SEGMENTS = 4
+"""Bounded multi-message delivery for one verified complete answer.
+
+Each segment independently satisfies the hard envelope + quote budget
+(aggregate quote budget still applies to the whole answer, so splitting
+never bypasses copyright/safety guards). More segments than this fall
+back to clarification instead of unbounded paging.
 """
 
 MAX_COMPACT_REGENERATIONS = 1
@@ -390,6 +403,77 @@ def compact_text_to_envelope(text: str) -> str:
     return compacted
 
 
+def split_text_to_envelope_segments(text: str) -> list[str]:
+    """Split a verified complete answer into envelope-passing segments.
+
+    Issue #295: deterministic complete-unit split (never mid-sentence,
+    mid-quote, mid-Markdown, mid-URL or mid-grapheme) so a legitimate
+    grounded answer that exceeds one 900/130 envelope keeps its essential
+    final points across sequential Telegram messages instead of being
+    truncated to leading units. Each segment independently passes
+    :func:`envelope_passes` and Markdown balance.
+
+    Guards (never bypassed by splitting):
+
+    - aggregate verbatim quote budget applies to the WHOLE answer first:
+      :class:`ValueError` when ``aggregate_quote_chars(text)`` exceeds
+      :data:`QUOTE_BUDGET_CHARS`;
+    - at most :data:`MAX_TRANSPORT_SEGMENTS` segments; :class:`ValueError`
+      when more would be needed (caller falls back to clarification);
+    - a single complete unit that alone exceeds the envelope yields
+      :data:`ENVELOPE_FALLBACK_REPLY` handling by the caller (here raised
+      as :class:`ValueError` so no mid-unit cut is ever produced).
+
+    Only lengths/categories are logged, never text.
+    """
+    if envelope_passes(text) and _markdown_balanced(text):
+        return [text]
+    if aggregate_quote_chars(text) > QUOTE_BUDGET_CHARS:
+        raise ValueError("verbatim quote budget exceeded; splitting must not bypass it")
+    units = _split_compaction_units(text)
+    if not units:
+        raise ValueError("no complete units to transport")
+    segments: list[str] = []
+    current: list[str] = []
+    for unit in units:
+        candidate = " ".join([*current, unit]) if current else unit
+        if _prefix_fits(candidate):
+            current.append(unit)
+            continue
+        # Current segment is full: balance and flush it, then start fresh.
+        if not current:
+            # Single complete unit exceeds the envelope: never cut inside.
+            raise ValueError("single complete unit exceeds the transport envelope")
+        while current and not _markdown_balanced(" ".join(current)):
+            current.pop()
+        if not current:
+            raise ValueError("cannot balance a transport segment")
+        segments.append(" ".join(current))
+        if len(segments) >= MAX_TRANSPORT_SEGMENTS:
+            raise ValueError("verified answer needs more transport segments than budgeted")
+        current = [unit]
+        if not _prefix_fits(unit):
+            raise ValueError("single complete unit exceeds the transport envelope")
+    if current:
+        while current and not _markdown_balanced(" ".join(current)):
+            current.pop()
+        if not current:
+            raise ValueError("cannot balance a transport segment")
+        segments.append(" ".join(current))
+    if not segments:
+        raise ValueError("no transport segments produced")
+    if len(segments) > MAX_TRANSPORT_SEGMENTS:
+        raise ValueError("verified answer needs more transport segments than budgeted")
+    for segment in segments:
+        if not envelope_passes(segment):
+            raise ValueError("transport segment exceeds the envelope")
+    logger.info(
+        "verified answer split for transport",
+        extra={"segments": len(segments), "graphemes": count_graphemes(text)},
+    )
+    return segments
+
+
 def validate_outbound_text(text: str) -> None:
     """Fail closed when ``text`` escapes the upstream envelope.
 
@@ -417,6 +501,7 @@ __all__ = [
     "HARD_CHARS",
     "HARD_WORDS",
     "MAX_COMPACT_REGENERATIONS",
+    "MAX_TRANSPORT_SEGMENTS",
     "QUOTE_BUDGET_CHARS",
     "SIMPLE_ACK_TARGET_CHARS",
     "TARGET_CHARS",
@@ -435,5 +520,6 @@ __all__ = [
     "is_continuation_request",
     "is_length_attack_request",
     "resolve_generation_budget",
+    "split_text_to_envelope_segments",
     "validate_outbound_text",
 ]

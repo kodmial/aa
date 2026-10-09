@@ -1024,14 +1024,19 @@ async def test_ordinary_output_stays_within_envelope() -> None:
 
 
 async def test_overlong_first_generation_compactly_regenerates_once() -> None:
+    # Issue #295 approved behavior: a fully verified grounded complete
+    # answer is served whole via bounded transport segments (no extra
+    # compact regeneration, no leading-sentence truncation of final
+    # points). Each segment passes the envelope; the full text keeps all
+    # 60 supported sentences.
+    from aa.conversation.output_limits import MAX_TRANSPORT_SEGMENTS
+
     pack = [_pack_entry()]
     sentence = "Поддержка рядом помогает пережить тягу спокойно"
     long_draft = " ".join(f"{sentence}." for _ in range(60))
     assert not envelope_passes(long_draft)
-    short_draft = f"{sentence}."
     long_units = split_response_units(long_draft)
-    short_units = split_response_units(short_draft)
-    answer = _AnswerModel([long_draft, short_draft])
+    answer = _AnswerModel([long_draft])
     verifier = _VerifierModel(
         [
             {
@@ -1046,18 +1051,6 @@ async def test_overlong_first_generation_compactly_regenerates_once() -> None:
                 ],
                 "all_required_supported": True,
             },
-            {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [pack[0]["passage_id"]],
-                    }
-                    for unit in short_units
-                ],
-                "all_required_supported": True,
-            },
         ]
     )
     outcome = await run_v2_answer_turn(
@@ -1068,9 +1061,13 @@ async def test_overlong_first_generation_compactly_regenerates_once() -> None:
         answer_model=answer,
         verifier_model=verifier,
     )
-    assert answer.calls == 2
-    assert envelope_passes(outcome["text"])
-    assert outcome["text"] == short_draft
+    assert answer.calls == 1
+    assert outcome["telemetry"].get("transport_split") is True
+    segments = outcome.get("segments") or []
+    assert 1 < len(segments) <= MAX_TRANSPORT_SEGMENTS
+    assert all(envelope_passes(seg) for seg in segments)
+    assert outcome["text"] == long_draft
+    assert outcome["text"].count(sentence) == 60
 
 
 async def test_provider_failure_returns_natural_reply_without_leak() -> None:

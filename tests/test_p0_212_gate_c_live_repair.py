@@ -91,7 +91,9 @@ class _VerifierModel:
 async def test_over_budget_envelope_overflow_skips_regeneration(
     monkeypatch: Any,
 ) -> None:
-    """A slow overflowing turn compacts deterministically without a 2nd round."""
+    """Issue #295: a slow verified overflowing turn splits (no 2nd round, no cut)."""
+    from aa.conversation.output_limits import MAX_TRANSPORT_SEGMENTS
+
     pack = [_pack_entry()]
     sentence = "Поддержка рядом помогает пережить тягу спокойно"
     long_draft = " ".join(f"{sentence}." for _ in range(60))
@@ -129,12 +131,19 @@ async def test_over_budget_envelope_overflow_skips_regeneration(
         retrieval_index=None,
     )
     assert answer.calls == 1
-    assert outcome["telemetry"]["repair_budget_exceeded"] is True
-    assert envelope_passes(outcome["text"])
+    # No extra provider round burns the SLO budget: the complete verified
+    # answer is preserved via bounded transport split, not truncated.
+    assert outcome["telemetry"].get("transport_split") is True
+    segments = outcome.get("segments") or []
+    assert 1 < len(segments) <= MAX_TRANSPORT_SEGMENTS
+    assert all(envelope_passes(seg) for seg in segments)
+    assert outcome["text"] == long_draft
 
 
 async def test_fast_envelope_overflow_still_regenerates() -> None:
-    """A fast overflowing turn still uses the single compact regeneration."""
+    """Issue #295: a fast verified overflowing turn splits (no cut, no regen)."""
+    from aa.conversation.output_limits import MAX_TRANSPORT_SEGMENTS
+
     pack = [_pack_entry()]
     sentence = "Поддержка рядом помогает пережить тягу спокойно"
     long_draft = " ".join(f"{sentence}." for _ in range(60))
@@ -142,8 +151,7 @@ async def test_fast_envelope_overflow_still_regenerates() -> None:
     assert not envelope_passes(long_draft)
     assert envelope_passes(short_draft)
     long_units = split_response_units(long_draft)
-    short_units = split_response_units(short_draft)
-    answer = _AnswerModel([long_draft, short_draft])
+    answer = _AnswerModel([long_draft])
     verifier = _VerifierModel(
         [
             {
@@ -155,18 +163,6 @@ async def test_fast_envelope_overflow_still_regenerates() -> None:
                         "evidence_passage_ids": [pack[0]["passage_id"]],
                     }
                     for unit in long_units
-                ],
-                "all_required_supported": True,
-            },
-            {
-                "units": [
-                    {
-                        "unit_id": unit.unit_id,
-                        "scope": "book",
-                        "supported": True,
-                        "evidence_passage_ids": [pack[0]["passage_id"]],
-                    }
-                    for unit in short_units
                 ],
                 "all_required_supported": True,
             },
@@ -184,7 +180,10 @@ async def test_fast_envelope_overflow_still_regenerates() -> None:
         planner_model=None,
         retrieval_index=None,
     )
-    assert answer.calls == 2
+    assert answer.calls == 1
     assert outcome["telemetry"]["repair_budget_exceeded"] is False
-    assert envelope_passes(outcome["text"])
-    assert outcome["text"] == short_draft
+    assert outcome["telemetry"].get("transport_split") is True
+    segments = outcome.get("segments") or []
+    assert 1 < len(segments) <= MAX_TRANSPORT_SEGMENTS
+    assert all(envelope_passes(seg) for seg in segments)
+    assert outcome["text"] == long_draft

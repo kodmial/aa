@@ -922,12 +922,55 @@ class Application:
         return True
 
     async def _send_text_reply(self, incoming: TelegramIncoming, reply: str) -> None:
-        """Deliver one bounded text reply with envelope fallback handling."""
+        """Deliver one bounded text reply with envelope fallback handling.
+
+        Issue #295: a fully verified complete answer that exceeds one
+        envelope is delivered as sequential envelope-passing segments with
+        identical content (voice synthesizes the same full text). Only a
+        turn whose stage telemetry carries ``transport_split`` may split;
+        every other over-envelope payload keeps the single-message
+        fail-closed path below. Each segment is guarded per message.
+        """
         import time as _time
 
         started = _time.perf_counter()
+
+        async def _send_single(text: str) -> None:
+            await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=text))
+
+        # Verified-split delivery: sequential segments, same content.
         try:
-            await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
+            stage: dict[str, object] = {}
+            if self._graph_runtime is not None:
+                try:
+                    thread = self._graph_runtime.thread_id(incoming.chat_id)
+                    stage = self._graph_runtime.last_telemetry_for_thread(thread)
+                except Exception:
+                    stage = {}
+            if bool(stage.get("transport_split")):
+                from aa.conversation.output_limits import split_text_to_envelope_segments
+
+                segments = split_text_to_envelope_segments(reply)
+                if 1 < len(segments) <= 4:
+                    for segment in segments:
+                        await _send_single(segment)
+                    elapsed_ms = (_time.perf_counter() - started) * 1000.0
+                    logger.info(
+                        "telegram delivery done",
+                        extra={
+                            "delivery_outcome": "sent-split",
+                            "delivery_latency_ms": round(elapsed_ms, 1),
+                            "reply_len": len(reply),
+                            "segments": len(segments),
+                        },
+                    )
+                    return
+        except TelegramApiError:
+            logger.warning("telegram split delivery failed; fallback path used")
+        except Exception:
+            pass
+        try:
+            await _send_single(reply)
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.info(
                 "telegram delivery done",
@@ -1016,8 +1059,13 @@ class Application:
         never a technical fail-closed reply.
 
         Only lengths and routing decisions are logged, never message bodies.
-        Every returned reply is confined to the #83 hard Telegram envelope.
-        Replies are returned as a single message; overflow is never split.
+        Ordinary replies are confined to the #83 hard Telegram envelope per
+        message. Issue #295: a fully verified grounded complete answer that
+        exceeds one envelope is returned in full (same identical content for
+        text and voice per #294); text delivery sends it as sequential
+        envelope-passing segments, voice synthesizes the identical full
+        text. Bulk/attack, unverified or unsafe drafts stay single-message
+        (compacted/fallback, never split).
         """
         logger.info("turn started", extra={"text_len": len(text)})
         import time as _time
@@ -1082,16 +1130,49 @@ class Application:
                 reply = NATURAL_CLARIFICATION_REPLY
             fallback_used = True
         is_clarification = reply.strip() == NATURAL_CLARIFICATION_REPLY
-        fitted = self._fit_envelope(reply)
-        total_ms = (_time.perf_counter() - turn_started) * 1000.0
-        # Privacy-safe turn telemetry: stage outcomes come from the graph
-        # runtime snapshot (counts/latencies/outcomes only); this log
-        # carries no user text, reply text or identifiers.
+        # Privacy-safe stage snapshot first: a verified split answer must
+        # bypass single-message compaction (delivery splits it below).
         try:
             thread = self._graph_runtime.thread_id(chat_id)
             stage = self._graph_runtime.last_telemetry_for_thread(thread)
         except Exception:
             stage = {}
+            thread = ""
+        allow_split = bool(stage.get("transport_split")) and not fallback_used
+        if allow_split:
+            try:
+                from aa.conversation.output_limits import (
+                    MAX_TRANSPORT_SEGMENTS as _MAX_SEG,
+                )
+                from aa.conversation.output_limits import (
+                    aggregate_quote_chars as _agg_q,
+                )
+                from aa.conversation.output_limits import (
+                    envelope_passes as _env_pass,
+                )
+                from aa.conversation.output_limits import (
+                    split_text_to_envelope_segments as _split,
+                )
+
+                _segs = _split(reply)
+                if (
+                    1 < len(_segs) <= _MAX_SEG
+                    and all(_env_pass(seg) for seg in _segs)
+                    and _agg_q(reply) <= 300
+                ):
+                    fitted = reply
+                else:
+                    fitted = self._fit_envelope(reply)
+                    allow_split = False
+            except Exception:
+                fitted = self._fit_envelope(reply)
+                allow_split = False
+        else:
+            fitted = self._fit_envelope(reply)
+        total_ms = (_time.perf_counter() - turn_started) * 1000.0
+        # Privacy-safe turn telemetry: stage outcomes come from the graph
+        # runtime snapshot (counts/latencies/outcomes only); this log
+        # carries no user text, reply text or identifiers.
         logger.info(
             "normal response served",
             extra={

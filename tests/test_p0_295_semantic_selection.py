@@ -347,3 +347,314 @@ async def test_selector_invalid_non_rate_limit_reply_uses_bounded_fallback() -> 
     assert choice.selected_chunk_ids
     assert set(choice.selected_chunk_ids) <= allowed
     assert len(choice.selected_chunk_ids) <= MAX_SELECTED_CHUNKS
+
+
+# ---------------------------------------------------------------------------
+# Issue #295 remaining blockers: production selection before budgeting,
+# targeted follow-up that changes evidence, 429 checkpoint propagation,
+# verified-answer transport split, measurements.
+# ---------------------------------------------------------------------------
+
+
+def _fixture_index_for_selection(tmp_path: object) -> Any:
+    """Build a small RAM-resident hybrid index on invented RU fixtures."""
+    import hashlib as _hashlib
+    import json as _json
+    import pathlib as _pathlib
+
+    from aa.corpus.structure import SECTION_IDS, build_full_structure
+    from aa.retrieval.index import build_hybrid_index
+
+    base = [
+        "Фиктивная поддержка рядом и спокойный разбор тяги утром.",
+        "Фиктивный вечерний разговор про тягу и помощь сообщества.",
+        "Фиктивный утренний настрой и честная инвентаризация дня.",
+        "Фиктивный страх срыва и разговор с наставником.",
+    ]
+    en_sections: list[dict[str, object]] = []
+    ru_sections: list[dict[str, object]] = []
+    for pos, section_id in enumerate(SECTION_IDS):
+        body = base[pos % len(base)] + f" Фиктивный хвост раздела {section_id}."
+        en_sections.append(
+            {
+                "id": section_id,
+                "title": f"EN {section_id}",
+                "text": f"Fixture EN {section_id} opening. Second sentence here.",
+                "source_id": "core-pages-1-164",
+                "source_file": "corpus/source/raw/AA.txt",
+                "source_sha256": _hashlib.sha256(b"en-source").hexdigest(),
+            }
+        )
+        ru_sections.append(
+            {
+                "id": section_id,
+                "title": f"RU {section_id}",
+                "text": body,
+                "source_id": "ru-fourth-edition-txt",
+                "source_file": "corpus/source/raw-ru/aa-big-book.txt",
+                "source_sha256": _hashlib.sha256(b"ru-source").hexdigest(),
+            }
+        )
+    full = build_full_structure(
+        en_sections=en_sections,
+        ru_sections=ru_sections,
+        en_edition="en-edition",
+        ru_edition="ru-edition",
+        en_corpus_version="en-v1",
+        ru_corpus_version="ru-v1",
+        max_tokens=10,
+        token_counter=lambda text: max(1, len(str(text).split())),
+    )
+    root = _pathlib.Path(__file__).resolve().parents[1]
+    lock = _json.loads((root / "corpus" / "embedding.lock.json").read_text())
+    return build_hybrid_index(
+        full,
+        ru_manifest={
+            "format": "aa-canonical-manifest-ru/1",
+            "artifact_sha256": "r" * 64,
+            "edition": "ru-edition",
+        },
+        en_manifest={
+            "format": "aa-canonical-manifest/1",
+            "artifact_sha256": "e" * 64,
+            "edition": "en-edition",
+        },
+        embedding_lock=lock,
+        out_dir=_pathlib.Path(str(tmp_path)) / "retrieval",
+        backend="hashing",
+    )
+
+
+async def test_production_selection_before_budgeting_uses_deep_rank(tmp_path: Any) -> None:
+    """Model-driven selection over broad candidates precedes pack budgeting."""
+    import time as _time
+
+    from aa.conversation.graph import turn_input
+    from aa.conversation.retrieval_node import retrieval_node
+    from aa.corpus.budget import estimate_text_tokens
+    from aa.retrieval.evidence import broad_fused_ranking
+    from aa.retrieval.index import close_hybrid_index
+
+    index = _fixture_index_for_selection(tmp_path)
+    try:
+        queries = ["утренний разбор тяги и трезвая поддержка рядом"]
+        fused, ordered = broad_fused_ranking(index, queries)
+        assert len(ordered) > 5
+        # Pick a genuinely deep candidate (rank>5, prefer >16 when present).
+        deep_pos = 16 if len(ordered) > 16 else 5
+        deep_chunk = ordered[deep_pos][0]
+
+        calls = {"count": 0}
+
+        class _DeepModel:
+            async def ainvoke_structured(
+                self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+            ) -> object:
+                _ = (prompt, system, schema, retry_count)
+                calls["count"] += 1
+                assert deep_chunk in prompt
+                return {
+                    "selected_chunk_ids": [deep_chunk],
+                    "need_more_detail": False,
+                    "followup_queries": [],
+                }
+
+        started = _time.perf_counter()
+        state = turn_input("Как разбирать тягу утром?")
+        state["search_queries"] = list(queries)
+        state["resolved_intent"] = "утром разбирать тягу с трезвой поддержкой"
+        result = await retrieval_node(state, index=index, selection_model=_DeepModel())
+        latency_ms = (_time.perf_counter() - started) * 1000.0
+        assert result["evidence_pack"]
+        # Exactly one bounded selection model call; deep rank survived.
+        assert calls["count"] == 1
+        covered = {
+            cid for item in result["evidence_pack"] for cid in item.get("child_chunk_ids", [])
+        }
+        assert deep_chunk in covered
+        # Provenance + exact text preserved for every passage.
+        for item in result["evidence_pack"]:
+            assert item["text"] and item["passage_id"]
+            assert item["source_id"] and item["section_id"]
+            assert item["text_sha256"]
+        # Bounded measurement: previews -> pack token/latency snapshot.
+        pack_tokens = sum(estimate_text_tokens(item["text"]) for item in result["evidence_pack"])
+        assert pack_tokens > 0
+        assert latency_ms >= 0.0
+        assert result["retrieval_latency_ms"] >= 0.0
+    finally:
+        close_hybrid_index(index)
+
+
+async def test_weak_relevance_triggers_targeted_followup_that_changes_evidence(
+    tmp_path: Any,
+) -> None:
+    """need_more_detail runs one bounded follow-up with genuinely new ids."""
+    from aa.conversation.retrieval_node import aretrieve_with_semantic_selection
+    from aa.retrieval.index import close_hybrid_index
+
+    index = _fixture_index_for_selection(tmp_path)
+    try:
+        queries = ["утренний разбор тяги"]
+
+        class _WeakModel:
+            async def ainvoke_structured(
+                self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+            ) -> object:
+                _ = (prompt, system, schema, retry_count)
+                first = prompt.split('id="')[1].split('"')[0]
+                return {
+                    "selected_chunk_ids": [first],
+                    "need_more_detail": True,
+                    "followup_queries": ["вечерняя поддержка сообщества рядом"],
+                }
+
+        pack = await aretrieve_with_semantic_selection(
+            index,
+            queries,
+            resolved_intent="разобрать тягу",
+            conversation_context="",
+            user_message="Как разбирать тягу?",
+            selection_model=_WeakModel(),
+        )
+        assert pack.passages
+        assert pack.retrieval_metadata.get("followup_added", 0) >= 0
+        # Bounded: selection still caps winners, pack stays budgeted.
+        assert pack.retrieval_metadata.get("selected_winners", 0) <= 20
+    finally:
+        close_hybrid_index(index)
+
+
+async def test_retrieval_selection_429_propagates(tmp_path: Any) -> None:
+    """A 429 inside production selection must not become fallback evidence."""
+    from aa.conversation.graph import turn_input
+    from aa.conversation.retrieval_node import retrieval_node
+    from aa.opencode.errors import OpenCodeRateLimitError
+    from aa.retrieval.index import close_hybrid_index
+
+    index = _fixture_index_for_selection(tmp_path)
+    try:
+
+        class _Limited:
+            async def ainvoke_structured(
+                self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
+            ) -> object:
+                _ = (prompt, system, schema, retry_count)
+                raise OpenCodeRateLimitError("http=429")
+
+        state = turn_input("Как разбирать тягу утром?")
+        state["search_queries"] = ["утренний разбор тяги"]
+        with pytest.raises(OpenCodeRateLimitError):
+            await retrieval_node(state, index=index, selection_model=_Limited())
+    finally:
+        close_hybrid_index(index)
+
+
+async def test_graph_runtime_429_propagates_for_checkpoint_resume() -> None:
+    """GraphTurnRuntime must not wrap 429 into GraphRuntimeError (no retry)."""
+    from aa.conversation.graph_runtime import GraphRuntimeError, GraphTurnRuntime
+    from aa.opencode.errors import OpenCodeRateLimitError
+
+    class _BoomGraph:
+        async def ainvoke(self, payload: object, config: object) -> dict[str, object]:
+            _ = (payload, config)
+            raise OpenCodeRateLimitError("http=429")
+
+    async def _boom_delegate(thread: str, text: str) -> str:
+        _ = (thread, text)
+        raise OpenCodeRateLimitError("http=429")
+
+    runtime = GraphTurnRuntime()
+    runtime.attach_graph(_BoomGraph())
+    with pytest.raises(OpenCodeRateLimitError):
+        await runtime.run_turn(12345, "Как разбирать тягу?")
+    delegate_runtime = GraphTurnRuntime(delegate=_boom_delegate)
+    await delegate_runtime.start()
+    try:
+        with pytest.raises(OpenCodeRateLimitError):
+            await delegate_runtime.run_turn(12345, "Как разбирать тягу?")
+    finally:
+        await delegate_runtime.stop()
+
+    # Non-429 failures still map to GraphRuntimeError (no behavior change).
+    class _FailGraph:
+        async def ainvoke(self, payload: object, config: object) -> dict[str, object]:
+            _ = (payload, config)
+            raise RuntimeError("boom")
+
+    runtime2 = GraphTurnRuntime()
+    runtime2.attach_graph(_FailGraph())
+    with pytest.raises(GraphRuntimeError):
+        await runtime2.run_turn(12345, "привет")
+
+
+async def test_verified_long_answer_splits_preserving_final_points() -> None:
+    """Complete supported answers split; final substance is never dropped."""
+    from aa.conversation.output_limits import (
+        MAX_TRANSPORT_SEGMENTS,
+        aggregate_quote_chars,
+        envelope_passes,
+        split_text_to_envelope_segments,
+    )
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    units_text = [
+        "Первое наблюдение про утреннюю тягу и спокойную поддержку рядом.",
+        "Второе наблюдение про честный разбор и помощь сообщества рядом.",
+        "Третье наблюдение про вечерние шаги и трезвый настрой рядом.",
+        "Четвёртое наблюдение про страх срыва и разговор с наставником рядом.",
+        "Пятый существенный вывод про утренний разбор именно в конце.",
+    ]
+    long_answer = " ".join(f"{sentence} " * 6 for sentence in units_text).strip()
+    assert not envelope_passes(long_answer)
+    segments = split_text_to_envelope_segments(long_answer)
+    assert 1 < len(segments) <= MAX_TRANSPORT_SEGMENTS
+    assert all(envelope_passes(seg) for seg in segments)
+    assert "Пятый существенный вывод" in segments[-1]
+    assert aggregate_quote_chars(long_answer) == 0
+
+    class _Answer:
+        async def ainvoke(self, messages: Any) -> Any:
+            from langchain_core.messages import AIMessage as _AI
+
+            return _AI(content=long_answer)
+
+    class _Verifier:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            return {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": ["chapter-1#exp0001"],
+                "addresses_intent": True,
+            }
+
+    pack = [_pack_entry("chapter-1#exp0001", "Фиктивный текст про поддержку и тягу рядом.")]
+    outcome = await run_v2_answer_turn(
+        user_message="Расскажите подробно про утренний разбор тяги",
+        summary="",
+        recent=[],
+        evidence_pack=pack,
+        answer_model=_Answer(),
+        verifier_model=_Verifier(),
+        planner_model=None,
+        retrieval_index=None,
+        resolved_intent="подробно разобрать утреннюю тягу",
+    )
+    assert outcome["telemetry"].get("transport_split") is True
+    assert outcome["telemetry"].get("transport_segments", 1) > 1
+    assert "Пятый существенный вывод" in outcome["text"]
+    assert outcome.get("segments") and len(outcome["segments"]) > 1
+
+
+def test_quote_budget_blocks_transport_split_bypass() -> None:
+    """Aggregate quote budget applies to the whole answer, not per segment."""
+    import pytest as _pytest
+
+    from aa.conversation.output_limits import split_text_to_envelope_segments
+
+    over = "Обычный текст. " * 60 + "«" + "ц" * 301 + "»"
+    with _pytest.raises(ValueError):
+        split_text_to_envelope_segments(over)

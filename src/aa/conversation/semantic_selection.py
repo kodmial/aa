@@ -350,7 +350,7 @@ async def aselect_semantic_candidates(
                 [SystemMessage(content=system), HumanMessage(content=user_text)]
             )
             content = getattr(message, "content", "")
-            text = content if isinstance(text, str) else str(content)
+            text = content if isinstance(content, str) else str(content)
         import json as _json
 
         cleaned = text.strip()

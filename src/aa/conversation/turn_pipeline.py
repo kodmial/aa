@@ -28,6 +28,7 @@ from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.output_limits import (
     HARD_CHARS,
     HARD_WORDS,
+    MAX_TRANSPORT_SEGMENTS,
     QUOTE_BUDGET_CHARS,
     aggregate_quote_chars,
     compact_retry_instruction,
@@ -35,6 +36,7 @@ from aa.conversation.output_limits import (
     envelope_passes,
     is_bulk_reproduction_request,
     is_continuation_request,
+    split_text_to_envelope_segments,
 )
 from aa.conversation.quote_state import (
     is_adjacent_to_recent,
@@ -1962,78 +1964,127 @@ async def run_v2_answer_turn(
                     ),
                     "telemetry": dict(telemetry),
                 }
+        transport_segments: list[str] | None = None
         if not envelope_passes(final):
-            # Live SLO guard (Gate C live repair, run 37638264853 on exact
-            # main e2e42de): the live lane failed only on
-            # live-text-max-over-budget (max 50.6s over the 30s hard budget,
-            # p50 31.1s, p95 44.5s over 14 ordinary turns) with no generic
-            # collapse, diversity passing, and planner/answer/verifier model
-            # identities healthy. The tail is long overflowing drafts: a
-            # passed draft that misses the #83 envelope currently pays a
-            # full extra answer+verifier round via compact regeneration,
-            # pushing an already-slow turn further over budget. When the
-            # turn already exceeds the live-SLO repair budget, skip that
-            # extra provider round and compact deterministically to leading
-            # supported units instead. Grounding stays strict (only
-            # validated supported units, otherwise clarification); fast
-            # turns still use the single compact regeneration. Turn-
-            # independent, never an exact-question special case.
-            if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
-                _end_to_end_elapsed_s() > _effective_turn_budget_s()
+            # Issue #295: a fully verified grounded complete answer keeps
+            # its essential final points across sequential envelope-passing
+            # transport segments instead of leading-sentence truncation.
+            # Every segment carries only verifier-supported content (the
+            # full draft passed before splitting), each passes the envelope,
+            # quote-aggregate and outbound-safety gates; bulk/attack,
+            # unverified or unsafe drafts keep the single-message compact
+            # path below. Bounded to MAX_TRANSPORT_SEGMENTS; overflow falls
+            # back to clarification, never unbounded paging.
+            if (
+                passed
+                and units
+                and result is not None
+                and aggregate_quote_chars(final) <= QUOTE_BUDGET_CHARS
+                and contains_cyrillic(final)
+                and not leaks_internal_terms(final)
+                and certify_outbound_safety(final)
             ):
-                telemetry["repair_budget_exceeded"] = True
-                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
-                    _mark_turn_budget_exceeded()
-                logger.info(
-                    "v2 envelope regeneration skipped for live-SLO budget",
-                    extra={"rounds": rounds},
-                )
-                final = compact_supported_to_envelope(units, result, text=final)
-                if not envelope_passes(final):
-                    final = NATURAL_CLARIFICATION_REPLY
-            else:
-                # At most one compact regeneration from the same pack.
-                compact_hint = compact_retry_instruction(
-                    remaining_chars=HARD_CHARS,
-                    remaining_words=HARD_WORDS,
-                    quote_remaining=QUOTE_BUDGET_CHARS,
-                )
-                second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
-                if second is not None:
-                    regen_slice = _verifier_round_budget()
-                    if regen_slice is not None and regen_slice < TURN_VERIFIER_MIN_SLICE_S:
-                        logger.info(
-                            "v2 regen re-verify skipped for end-to-end budget",
-                            extra={"rounds": rounds},
-                        )
+                try:
+                    _segments = split_text_to_envelope_segments(final)
+                except ValueError:
+                    _segments = []
+                if 1 < len(_segments) <= MAX_TRANSPORT_SEGMENTS and all(
+                    envelope_passes(seg)
+                    and aggregate_quote_chars(seg) <= QUOTE_BUDGET_CHARS
+                    and contains_cyrillic(seg)
+                    and not leaks_internal_terms(seg)
+                    and certify_outbound_safety(seg)
+                    for seg in _segments
+                ):
+                    transport_segments = _segments
+                    telemetry["transport_split"] = True
+                    telemetry["transport_segments"] = len(_segments)
+                    telemetry["answer_outcome"] = "served-split"
+                    logger.info(
+                        "v2 verified answer kept complete via transport split",
+                        extra={"segments": len(_segments)},
+                    )
+            if transport_segments is None:
+                # Live SLO guard (Gate C live repair, run 37638264853 on exact
+                # main e2e42de): the live lane failed only on
+                # live-text-max-over-budget (max 50.6s over the 30s hard budget,
+                # p50 31.1s, p95 44.5s over 14 ordinary turns) with no generic
+                # collapse, diversity passing, and planner/answer/verifier model
+                # identities healthy. The tail is long overflowing drafts: a
+                # passed draft that misses the #83 envelope currently pays a
+                # full extra answer+verifier round via compact regeneration,
+                # pushing an already-slow turn further over budget. When the
+                # turn already exceeds the live-SLO repair budget, skip that
+                # extra provider round and compact deterministically to leading
+                # supported units instead. Grounding stays strict (only
+                # validated supported units, otherwise clarification); fast
+                # turns still use the single compact regeneration. Turn-
+                # independent, never an exact-question special case.
+                # (Verified split answers above skip this entire
+                # single-message path so no trailing supported substance is
+                # lost; delivery splits deterministically.)
+                if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
+                    _end_to_end_elapsed_s() > _effective_turn_budget_s()
+                ):
+                    telemetry["repair_budget_exceeded"] = True
+                    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
                         _mark_turn_budget_exceeded()
-                        final = compact_supported_to_envelope(units, result, text=final)
-                        if not envelope_passes(final):
-                            final = NATURAL_CLARIFICATION_REPLY
-                    else:
-                        second_units, second_result, second_passed = await _verify_with_telemetry(
-                            second, pack, turn_budget_s=regen_slice
-                        )
-                        if second_passed and second_units and second_result is not None:
-                            if envelope_passes(second):
-                                final = second
-                                units, result = second_units, second_result
-                            else:
-                                final = compact_supported_to_envelope(
-                                    second_units, second_result, text=second
-                                )
-                                units, result = second_units, second_result
-                                if not envelope_passes(final) or not contains_cyrillic(final):
-                                    final = NATURAL_CLARIFICATION_REPLY
-                        else:
-                            final = compact_supported_to_envelope(units, result, text=final)
-                            if not envelope_passes(final):
-                                final = NATURAL_CLARIFICATION_REPLY
-                else:
+                    logger.info(
+                        "v2 envelope regeneration skipped for live-SLO budget",
+                        extra={"rounds": rounds},
+                    )
                     final = compact_supported_to_envelope(units, result, text=final)
                     if not envelope_passes(final):
                         final = NATURAL_CLARIFICATION_REPLY
+                else:
+                    # At most one compact regeneration from the same pack.
+                    compact_hint = compact_retry_instruction(
+                        remaining_chars=HARD_CHARS,
+                        remaining_words=HARD_WORDS,
+                        quote_remaining=QUOTE_BUDGET_CHARS,
+                    )
+                    second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
+                    if second is not None:
+                        regen_slice = _verifier_round_budget()
+                        if regen_slice is not None and regen_slice < TURN_VERIFIER_MIN_SLICE_S:
+                            logger.info(
+                                "v2 regen re-verify skipped for end-to-end budget",
+                                extra={"rounds": rounds},
+                            )
+                            _mark_turn_budget_exceeded()
+                            final = compact_supported_to_envelope(units, result, text=final)
+                            if not envelope_passes(final):
+                                final = NATURAL_CLARIFICATION_REPLY
+                        else:
+                            (
+                                second_units,
+                                second_result,
+                                second_passed,
+                            ) = await _verify_with_telemetry(
+                                second, pack, turn_budget_s=regen_slice
+                            )
+                            if second_passed and second_units and second_result is not None:
+                                if envelope_passes(second):
+                                    final = second
+                                    units, result = second_units, second_result
+                                else:
+                                    final = compact_supported_to_envelope(
+                                        second_units, second_result, text=second
+                                    )
+                                    units, result = second_units, second_result
+                                    if not envelope_passes(final) or not contains_cyrillic(final):
+                                        final = NATURAL_CLARIFICATION_REPLY
+                            else:
+                                final = compact_supported_to_envelope(units, result, text=final)
+                                if not envelope_passes(final):
+                                    final = NATURAL_CLARIFICATION_REPLY
+                    else:
+                        final = compact_supported_to_envelope(units, result, text=final)
+                        if not envelope_passes(final):
+                            final = NATURAL_CLARIFICATION_REPLY
         # Quote-budget deterministic guard.
+        # (Verified split answers already satisfied the aggregate budget
+        # before splitting; splitting never bypasses it.)
         if aggregate_quote_chars(final) > QUOTE_BUDGET_CHARS:
             compacted = compact_text_to_envelope(final)
             if envelope_passes(compacted) and contains_cyrillic(compacted):
@@ -2232,9 +2283,21 @@ async def run_v2_answer_turn(
                 "recent_quote_ranges": recent_ranges,
                 "telemetry": dict(telemetry),
             }
-        telemetry["answer_outcome"] = (
-            "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
-        )
+        if transport_segments is not None and final != NATURAL_CLARIFICATION_REPLY:
+            # Preserve the split verdict: the complete verified answer is
+            # served across sequential transport segments (delivery splits
+            # deterministically); adequacy below judges the full text so no
+            # trailing supported substance escapes relevance/grounding.
+            telemetry["answer_outcome"] = "served-split"
+            telemetry["transport_split"] = True
+            telemetry["transport_segments"] = len(transport_segments)
+        else:
+            telemetry["answer_outcome"] = (
+                "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
+            )
+            if transport_segments is None:
+                telemetry.setdefault("transport_split", False)
+                telemetry.setdefault("transport_segments", 1)
         _finish_telemetry()
         return {
             "text": final,
@@ -2243,6 +2306,7 @@ async def run_v2_answer_turn(
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
             "telemetry": dict(telemetry),
+            "segments": list(transport_segments) if transport_segments is not None else [final],
         }
 
     # Conversational delivery contract (kodmial/aa#284, hardened
