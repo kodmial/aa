@@ -446,7 +446,7 @@ def contiguous_source_runs(
             end = int(item.get("char_end", 0) or 0)
         except (TypeError, ValueError):
             continue
-        if not source_id or not section_id or end <= start:
+        if not source_id or not section_id or not source_sha or end <= start:
             continue
         corpus_version = str(item.get("corpus_version", "") or "")
         if runs:
@@ -629,15 +629,9 @@ def certify_answer_candidate(
     overlaps = map_spans_to_units(tuple(extraction.spans), unit_list)
 
     if extraction.dangling:
-        supported_ids = {
-            str(getattr(item, "unit_id", ""))
-            for item in verdict_list
-            if bool(getattr(item, "supported", False))
-        }
-        if supported_ids:
-            raise VerifierValidationError(
-                "answer candidate carries unmatched quotation; failing closed"
-            )
+        raise VerifierValidationError(
+            "answer candidate carries unmatched quotation; failing closed"
+        )
 
     provenances: list[SpanProvenance] = []
     book_chars = 0
@@ -822,7 +816,7 @@ def certify_answer_candidate(
         # book-verbatim unit fails closed instead of passing as a
         # harmless report.
         book_hit = anchor_book_span(unit_text, passages)
-        if book_hit is not None and len(unit_text.strip()) >= 24:
+        if book_hit is not None:
             if anchor_user_span(unit_text, trusted_users) is None:
                 raise VerifierValidationError(
                     f"user report {unit_id!r} carries unattributed book text; failing closed"
