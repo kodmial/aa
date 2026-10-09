@@ -407,23 +407,68 @@ async def test_voice_text_identity() -> None:
     from aa.config import Settings
     from aa.conversation.graph_runtime import GraphTurnRuntime
     from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
+    from aa.telegram.transport import (
+        StubTelegramTransport,
+        TelegramIncoming,
+        VoiceAttachment,
+    )
 
     async def _echo(thread: str, text: str) -> str:
         return f"Эхо: {text}"
 
+    class _FakeRecognizer:
+        @property
+        def available(self) -> bool:
+            return True
+
+    class _FakeVoicePipeline:
+        """Minimal ASR stand-in exercising voice bytes handling."""
+
+        def __init__(self, transcript: str) -> None:
+            self._transcript = transcript
+            self.calls = 0
+            self.recognizer = _FakeRecognizer()
+
+        async def transcribe_voice(
+            self,
+            *,
+            file_id: str,
+            file_size_bytes: int | None = None,
+            duration_seconds: int | None = None,
+        ) -> str:
+            _ = (file_id, file_size_bytes, duration_seconds)
+            self.calls += 1
+            return self._transcript
+
+    transport = StubTelegramTransport()
+    voice_pipeline = _FakeVoicePipeline("не могу уснуть")
     runtime = GraphTurnRuntime(delegate=_echo)
     await runtime.start()
     app = Application(
         Settings.from_env({}),
+        transport=transport,
         opencode_runtime=StubOpenCodeRuntime(
             OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
         ),
+        voice_pipeline=voice_pipeline,  # type: ignore[arg-type]
         graph_runtime=runtime,
     )
     await app.start()
     try:
         text_reply = await app.respond(424203, "не могу уснуть")
-        voice_reply = await app.respond(424203, "не могу уснуть")
+        await app._process_dispatched_update(
+            TelegramIncoming(
+                update_id=1,
+                chat_id=424204,
+                message_id=1,
+                text="",
+                command=None,
+                voice=VoiceAttachment(file_id="f1", duration_seconds=5, file_size_bytes=100),
+            )
+        )
+        assert voice_pipeline.calls == 1
+        assert len(transport.sent) == 1
+        voice_reply = transport.sent[0].text
         assert text_reply == voice_reply
         assert not is_service_error(text_reply)
     finally:

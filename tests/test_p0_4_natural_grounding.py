@@ -1641,19 +1641,7 @@ async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
             initial_query_count=12,
         )
     # Verifier outage is a typed unsuccessful outcome, never canned text.
-    assert (
-        _exc.value.category
-        in (
-            "unavailable-substantive-no-evidence",
-            "clarification-unavailable",
-            "adequacy-failed",
-            "verifier-unavailable",
-            "turn-budget-exceeded",
-            "answer-failed",
-        )
-        or "verifier" in _exc.value.category
-        or True
-    )
+    assert _exc.value.category == "clarification-unavailable"
 
 
 def test_verifier_single_schema_is_ref_free_without_ids() -> None:
