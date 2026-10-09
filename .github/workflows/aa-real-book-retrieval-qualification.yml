@@ -499,7 +499,7 @@ jobs:
             echo "#295 protected exact text outside the encrypted bundle" >&2
             exit 1
           fi
-          if grep -R "AA_BOOK_AGE_IDENTITY" eval-real-book-295-out/ 2>/dev/null; then
+          if grep -R -q "AA_BOOK_AGE_IDENTITY" eval-real-book-295-out/ 2>/dev/null; then
             echo "#295 secret material in outputs" >&2
             exit 1
           fi

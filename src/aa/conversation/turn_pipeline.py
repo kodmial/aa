@@ -1999,6 +1999,7 @@ async def run_v2_answer_turn(
                 and contains_cyrillic(final)
                 and not leaks_internal_terms(final)
                 and certify_outbound_safety(final)
+                and not is_bulk_reproduction_request(final)
             ):
                 try:
                     _segments = split_text_to_envelope_segments(final)

@@ -984,13 +984,27 @@ class Application:
             except TelegramApiError:
                 if _sent_count > 0:
                     # Partial split already delivered: resending the full
-                    # reply would duplicate user-visible messages.
+                    # reply would duplicate user-visible messages. Emit an
+                    # explicit retry signal so the user does not mistake the
+                    # prefix for the complete verified answer (issue #295).
                     logger.warning("telegram split delivery partial; full resend skipped")
+                    try:
+                        await self.transport.send(
+                            TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
+                        )
+                    except Exception:
+                        logger.warning("telegram split partial error-signal delivery failed")
                     return
                 logger.warning("telegram split delivery failed; fallback path used")
             except Exception:
                 if _sent_count > 0:
                     logger.warning("telegram split delivery partial; full resend skipped")
+                    try:
+                        await self.transport.send(
+                            TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
+                        )
+                    except Exception:
+                        logger.warning("telegram split partial error-signal delivery failed")
                     return
                 pass
         try:

@@ -256,12 +256,13 @@ async def aretrieve_with_semantic_selection(
                     key=lambda item: item.fused_score,
                     reverse=True,
                 )[:8]
+                followup_added = 0
                 for cand in fresh:
                     if len(winners) >= MAX_SELECTED_CHUNKS + 8:
                         break
                     winners.append(cand)
                     fused[cand.chunk_id] = cand
-                followup_added = len(fresh)
+                    followup_added += 1
             except Exception:
                 followup_added = 0
     if not winners:
