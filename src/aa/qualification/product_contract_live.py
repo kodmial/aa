@@ -2356,10 +2356,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         )
                         judge_calls += 1
                         judge_helpful_count += int(bool(judged_helpful))
-                        judge_unavailable_count += int(judge_metrics.get("judge_available") is False)
+                        judge_unavailable_count += int(
+                            judge_metrics.get("judge_available") is False
+                        )
                         if judge_metrics.get("judge_failure_category"):
                             _category = str(judge_metrics["judge_failure_category"])
-                            judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                            judge_failure_categories[_category] = (
+                                judge_failure_categories.get(_category, 0) + 1
+                            )
                         if bool(judge_metrics.get("judge_overrode_telemetry", False)):
                             judge_overrides += 1
                         seen_model = str(judge_metrics.get("judge_model", "") or "")
@@ -2403,10 +2407,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         )
                         judge_calls += 1
                         judge_helpful_count += int(bool(judged_continuation))
-                        judge_unavailable_count += int(continuation_judge_metrics.get("judge_available") is False)
+                        judge_unavailable_count += int(
+                            continuation_judge_metrics.get("judge_available") is False
+                        )
                         if continuation_judge_metrics.get("judge_failure_category"):
                             _category = str(continuation_judge_metrics["judge_failure_category"])
-                            judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                            judge_failure_categories[_category] = (
+                                judge_failure_categories.get(_category, 0) + 1
+                            )
                         if bool(continuation_judge_metrics.get("judge_overrode_telemetry", False)):
                             judge_overrides += 1
                         continuation_semantic = bool(continuation_semantic and judged_continuation)
@@ -2493,7 +2501,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 judge_unavailable_count += int(step_judge_metrics.get("judge_available") is False)
                 if step_judge_metrics.get("judge_failure_category"):
                     _category = str(step_judge_metrics["judge_failure_category"])
-                    judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                    judge_failure_categories[_category] = (
+                        judge_failure_categories.get(_category, 0) + 1
+                    )
                 if bool(step_judge_metrics.get("judge_overrode_telemetry", False)):
                     judge_overrides += 1
                 step_relevant = bool(step_relevant and step_judged)
@@ -2544,10 +2554,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     )
                     judge_calls += 1
                     judge_helpful_count += int(bool(step_judged_3))
-                    judge_unavailable_count += int(step_judge_metrics_3.get("judge_available") is False)
+                    judge_unavailable_count += int(
+                        step_judge_metrics_3.get("judge_available") is False
+                    )
                     if step_judge_metrics_3.get("judge_failure_category"):
                         _category = str(step_judge_metrics_3["judge_failure_category"])
-                        judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                        judge_failure_categories[_category] = (
+                            judge_failure_categories.get(_category, 0) + 1
+                        )
                     if bool(step_judge_metrics_3.get("judge_overrode_telemetry", False)):
                         judge_overrides += 1
                     _check("live-step-third-grounded", bool(step_grounded_3))
@@ -2604,7 +2618,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 judge_unavailable_count += int(short_judge_metrics.get("judge_available") is False)
                 if short_judge_metrics.get("judge_failure_category"):
                     _category = str(short_judge_metrics["judge_failure_category"])
-                    judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                    judge_failure_categories[_category] = (
+                        judge_failure_categories.get(_category, 0) + 1
+                    )
                 if bool(short_judge_metrics.get("judge_overrode_telemetry", False)):
                     judge_overrides += 1
                 _check(
@@ -2646,7 +2662,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 judge_unavailable_count += int(typo_judge_metrics.get("judge_available") is False)
                 if typo_judge_metrics.get("judge_failure_category"):
                     _category = str(typo_judge_metrics["judge_failure_category"])
-                    judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                    judge_failure_categories[_category] = (
+                        judge_failure_categories.get(_category, 0) + 1
+                    )
                 if bool(typo_judge_metrics.get("judge_overrode_telemetry", False)):
                     judge_overrides += 1
                 _check("live-typo-variant-judge-helpful", bool(typo_judged))
@@ -2696,7 +2714,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 judge_unavailable_count += int(switch_judge_metrics.get("judge_available") is False)
                 if switch_judge_metrics.get("judge_failure_category"):
                     _category = str(switch_judge_metrics["judge_failure_category"])
-                    judge_failure_categories[_category] = judge_failure_categories.get(_category, 0) + 1
+                    judge_failure_categories[_category] = (
+                        judge_failure_categories.get(_category, 0) + 1
+                    )
                 if bool(switch_judge_metrics.get("judge_overrode_telemetry", False)):
                     judge_overrides += 1
                 _check(
