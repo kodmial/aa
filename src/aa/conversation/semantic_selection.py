@@ -362,13 +362,13 @@ async def aselect_semantic_candidates(
             raise SemanticSelectionError(f"selection text is not JSON: {exc}") from exc
         return validate_semantic_selection(data, known_chunk_ids=known)
     except Exception as exc:
-        try:
-            from aa.opencode.errors import OpenCodeRateLimitError as _RateLimit2
+        # 429 must escape this selector: the workflow retires the runner
+        # and resumes from its last verified checkpoint. An inner broad
+        # except previously swallowed the re-raised rate-limit error.
+        from aa.opencode.errors import OpenCodeRateLimitError
 
-            if isinstance(exc, _RateLimit2):
-                raise
-        except Exception:
-            pass
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
         if isinstance(exc, SemanticSelectionError):
             logger.info("semantic selection invalid; heuristic fallback used")
         else:
