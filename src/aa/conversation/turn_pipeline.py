@@ -604,20 +604,78 @@ def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
 
 
 def merge_pack_dicts(
-    current: list[dict[str, Any]], incoming: list[dict[str, Any]]
+    current: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    resolved_intent: str = "",
+    conversation_context: str = "",
+    budget_tokens: int | None = None,
+    max_passages: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge new exact passages into a bounded Evidence Pack."""
-    merged: list[dict[str, Any]] = [dict(item) for item in current]
-    seen = {str(item.get("passage_id", "")) for item in merged}
-    for item in incoming:
-        if len(merged) >= MAX_PACK_PASSAGES:
-            break
-        key = str(item.get("passage_id", ""))
-        if not key or key in seen:
+    """Merge new exact passages with need-aware semantic re-selection.
+
+    All eligible old and new candidates are unioned first (stable-id
+    dedup with integrity failure on same-id/different-content, never a
+    silent keep-older), then the combined pool is reconsidered against
+    the still-unanswered request using currently available
+    resolved intent/dialogue context under an explicit total token
+    budget plus the pack count bound. A newly relevant source can
+    therefore displace an older irrelevant one in an already full pack
+    instead of being rejected for insertion order. Provenance and all
+    stored passage fields are preserved verbatim for the future
+    typed-needs/coverage contracts.
+    """
+    from aa.corpus.budget import RETRIEVED_PASSAGES_BUDGET_TOKENS, estimate_text_tokens
+    from aa.retrieval.evidence import check_passage_id_consistency, enrich_pack_provenance
+
+    cap = int(MAX_PACK_PASSAGES if max_passages is None else max_passages)
+    budget = int(RETRIEVED_PASSAGES_BUDGET_TOKENS if budget_tokens is None else budget_tokens)
+    combined: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in [*list(current or []), *list(incoming or [])]:
+        if not isinstance(item, dict):
             continue
-        seen.add(key)
-        merged.append(dict(item))
-    return merged
+        key = str(item.get("passage_id", ""))
+        text = item.get("text")
+        if not key or not isinstance(text, str) or not text:
+            continue
+        if key in combined:
+            check_passage_id_consistency(key, combined[key], item)
+            enrich_pack_provenance(combined[key], item)
+            continue
+        combined[key] = dict(item)
+        order.append(key)
+    pool = [combined[key] for key in order]
+    context = f"{resolved_intent or ''} {conversation_context or ''}".strip()
+    if context:
+        try:
+            from aa.conversation.semantic_selection import order_pack_semantically
+
+            pool = order_pack_semantically(
+                pool,
+                resolved_intent=str(resolved_intent or ""),
+                conversation_context=str(conversation_context or ""),
+            )
+        except Exception:
+            pool = [combined[key] for key in order]
+    selected: list[dict[str, Any]] = []
+    total = 0
+    for item in pool:
+        if cap > 0 and len(selected) >= cap:
+            break
+        try:
+            need = int(estimate_text_tokens(str(item.get("text", ""))))
+        except Exception:
+            continue
+        if need <= 0:
+            continue
+        if need > budget:
+            continue
+        if total + need > budget:
+            continue
+        selected.append(item)
+        total += need
+    return selected
 
 
 def compact_supported_to_envelope(
@@ -1150,7 +1208,12 @@ async def run_v2_answer_turn(
                         1,
                     )
                     if _rec_dicts:
-                        pack = merge_pack_dicts(pack, _rec_dicts)
+                        pack = merge_pack_dicts(
+                            pack,
+                            _rec_dicts,
+                            resolved_intent=_resolved_intent,
+                            conversation_context=_conversation_context,
+                        )
                         telemetry["retrieval_passages"] = len(pack)
                         telemetry["retrieval_outcome"] = "recovered"
                         telemetry["answer_generation_window"] = len(pack)
@@ -1571,7 +1634,12 @@ async def run_v2_answer_turn(
                     else:
                         _mark_turn_budget_exceeded()
             break
-        merged = merge_pack_dicts(pack, new_dicts)
+        merged = merge_pack_dicts(
+            pack,
+            new_dicts,
+            resolved_intent=_resolved_intent,
+            conversation_context=_conversation_context,
+        )
         if len(merged) == len(pack):
             # Same duplicate-retrieval collapse as above: the pack already
             # holds the only passages retrieval can find, so merging adds
@@ -2401,7 +2469,12 @@ async def run_v2_answer_turn(
                     except Exception:
                         break
                     if fresh_dicts:
-                        merged_pack = merge_pack_dicts(active_pack, fresh_dicts)
+                        merged_pack = merge_pack_dicts(
+                            active_pack,
+                            fresh_dicts,
+                            resolved_intent=_resolved_intent,
+                            conversation_context=_conversation_context,
+                        )
                         # Novel evidence is a bonus, never a requirement:
                         # regenerate even when nothing new arrived (the
                         # pack may already support a safe redraft) but
