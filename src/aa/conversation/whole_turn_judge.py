@@ -95,6 +95,8 @@ class WholeTurnJudgement:
     addresses_intent: bool
     contains_substantive_claim: bool
     model_identity: str = ""
+    available: bool = True
+    failure_category: str = ""
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,8 @@ async def judge_whole_turn(
         "You are an independent whole-turn response-quality judge. "
         "Return exactly the required strict boolean JSON decision."
     )
+    from aa.opencode.errors import OpenCodeRateLimitError
+
     try:
         structured = getattr(model, "ainvoke_structured", None)
         if callable(structured):
@@ -273,6 +277,8 @@ async def judge_whole_turn(
                     retry_count=WHOLE_TURN_JUDGE_MAX_ATTEMPTS,
                 )
                 decision = validate_whole_turn_decision(raw)
+            except OpenCodeRateLimitError:
+                raise
             except Exception:
                 text_invoke = getattr(model, "_ainvoke_text", None) or getattr(
                     model, "ainvoke", None
@@ -302,12 +308,19 @@ async def judge_whole_turn(
             text_reply = content if isinstance(content, str) else str(content)
             decision = validate_whole_turn_decision(parse_whole_turn_text_decision(text_reply))
     except Exception as exc:
-        logger.info("whole-turn judge failed closed", extra={"category": type(exc).__name__})
+        # A rate limit requires fresh-runner checkpoint recovery, not a
+        # fabricated negative semantic verdict. Keep the 429 lifecycle.
+        if isinstance(exc, OpenCodeRateLimitError):
+            raise
+        category = type(exc).__name__
+        logger.warning("whole-turn judge unavailable; failing closed", extra={"category": category})
         return WholeTurnJudgement(
             helpful=False,
             addresses_intent=False,
             contains_substantive_claim=False,
             model_identity=identity,
+            available=False,
+            failure_category=category,
         )
     return WholeTurnJudgement(
         helpful=bool(decision.helpful),
