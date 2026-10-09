@@ -39,7 +39,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 logger = logging.getLogger("aa.conversation.semantic_selection")
 
@@ -73,6 +73,8 @@ class SemanticSelection(BaseModel):
     followup_queries: list[str] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
+    # Internal provenance only: never supplied by, or trusted from, the model.
+    _used_model: bool = PrivateAttr(default=False)
 
 
 class SemanticSelectionError(ValueError):
@@ -336,7 +338,9 @@ async def aselect_semantic_candidates(
                 schema=semantic_selection_schema(),
                 retry_count=1,
             )
-            return validate_semantic_selection(raw, known_chunk_ids=known)
+            selected = validate_semantic_selection(raw, known_chunk_ids=known)
+            selected._used_model = True  # Validated real model verdict, not a fallback.
+            return selected
         text_invoke = getattr(model, "_ainvoke_text", None) or getattr(model, "ainvoke", None)
         if not callable(text_invoke):
             raise SemanticSelectionError("selection model has no invocation path")
@@ -360,7 +364,9 @@ async def aselect_semantic_candidates(
             data = _json.loads(payload)
         except Exception as exc:
             raise SemanticSelectionError(f"selection text is not JSON: {exc}") from exc
-        return validate_semantic_selection(data, known_chunk_ids=known)
+        selected = validate_semantic_selection(data, known_chunk_ids=known)
+        selected._used_model = True
+        return selected
     except Exception as exc:
         # 429 must escape this selector: the workflow retires the runner
         # and resumes from its last verified checkpoint. An inner broad
@@ -459,6 +465,8 @@ def selection_telemetry(
         "selection_followups": len(selection.followup_queries),
         "selection_digest": digest,
         "selection_latency_ms": round(float(latency_ms), 1),
+        "selection_model_used": bool(selection._used_model),
+        "selection_fallback_used": not bool(selection._used_model),
     }
 
 
