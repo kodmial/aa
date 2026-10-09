@@ -40,6 +40,10 @@ RUN set -eux; \
         git \
         libopus0 \
         sudo \
+        tar \
+        zstd \
+        gzip \
+        unzip \
         libstdc++6 \
         libgomp1 \
         libicu72; \
