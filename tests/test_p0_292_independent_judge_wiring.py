@@ -39,7 +39,12 @@ def test_real_whole_turn_judge_registered_for_opencode() -> None:
     )
     model = build_live_whole_turn_judge(object(), settings)
     assert model.agent == WHOLE_TURN_JUDGE_AGENT_V2
-    assert model.wire_agent == WHOLE_TURN_JUDGE_AGENT_V2
+    # Primary-only, omitted-wire route is the already-qualified verifier
+    # path. Never silently delegate AA answer quality to Space Bunny.
+    assert model.wire_agent == ""
+    assert model.transport_agent == ""
+    assert model.primary_model == settings.opencode_model
+    assert model.fallback_model == ""
 
 
 class _TransportUnavailable:
