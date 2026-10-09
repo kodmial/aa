@@ -98,14 +98,16 @@ def test_recovery_validator_rejects_bad_lists() -> None:
 
 
 def test_planner_validator_still_requires_ten_to_sixteen() -> None:
+    """Flexible 1..16 useful queries (#295); oversize lists still fail closed."""
     from aa.retrieval.evidence import EvidenceError, validate_planner_queries
 
+    assert validate_planner_queries(["only one query"]) == ["only one query"]
     try:
-        validate_planner_queries(["only one query"])
+        validate_planner_queries([f"q{i}" for i in range(17)])
     except EvidenceError:
         pass
     else:
-        raise AssertionError("planner 1-query list must still fail closed")
+        raise AssertionError("planner 17-query list must still fail closed")
 
 
 def test_recovery_retrieval_accepts_single_query(tmp_path: pathlib.Path) -> None:

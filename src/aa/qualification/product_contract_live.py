@@ -535,7 +535,7 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
         )
         _check("07-glue-zero-queries-valid", list(glue_plan.queries) == [])
         planner_counts.append(0)
-        # 8: substantive turn yields 10-16 distinct queries (schema bound).
+        # 8: substantive turn yields 1-16 distinct useful queries (schema bound, #295 flexible).
         substantive = [f"запрос про поддержку {idx}" for idx in range(12)]
         plan = validate_query_plan(
             QueryPlan(
@@ -544,15 +544,15 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
                 queries=substantive,
             )
         )
-        _check("08-substantive-10-16-queries", 10 <= len(plan.queries) <= 16)
+        _check("08-substantive-1-16-queries", 1 <= len(plan.queries) <= 16)
         planner_counts.append(len(plan.queries))
-        # 8b: out-of-bound cardinality rejected fail-closed.
+        # 8b: out-of-bound cardinality rejected fail-closed (#295: 1..16 valid).
         try:
             validate_query_plan(
                 QueryPlan(
                     mode="retrieval",
                     resolved_intent="q0",
-                    queries=[f"q{i}" for i in range(5)],
+                    queries=[f"q{i}" for i in range(17)],
                 )
             )
             _check("08b-cardinality-bounds-enforced", False)

@@ -28,6 +28,7 @@ from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.output_limits import (
     HARD_CHARS,
     HARD_WORDS,
+    MAX_TRANSPORT_SEGMENTS,
     QUOTE_BUDGET_CHARS,
     aggregate_quote_chars,
     compact_retry_instruction,
@@ -35,6 +36,7 @@ from aa.conversation.output_limits import (
     envelope_passes,
     is_bulk_reproduction_request,
     is_continuation_request,
+    split_text_to_envelope_segments,
 )
 from aa.conversation.quote_state import (
     is_adjacent_to_recent,
@@ -54,33 +56,38 @@ from aa.conversation.verifier_schema import GroundingResult, VerifierValidationE
 logger = logging.getLogger("aa.conversation.turn_pipeline")
 
 MAX_TARGETED_REPAIR_ROUNDS = 2
-MAX_PACK_PASSAGES = 12
+# Bounded Evidence Pack size (issue #295): wide enough that decisive
+# deep-ranked candidates (fused rank >16) survive to generation and
+# verification inside the 16k source-token budget; the budget selector
+# stays authoritative so real RAM/latency/token limits still bind.
+MAX_PACK_PASSAGES = 20
 
-# Bounded answer-generation evidence window (Gate C+E live repair, run
-# 37664757721 on exact main 0202b0b: p50 29.6s / p95 42.0s / max 45.5s
-# over the 30s budget with planner p50 5.7s / p95 12.1s and a
-# live-answer-no-generic-collapse, repair_turns=0). The initial
-# draft+verify chain already exceeds budget before any repair: the
-# answer prompt carries the full 16k-token Evidence Pack while the
-# verifier display window is already bounded to 6 passages, so every
-# ordinary turn pays the largest provider input on the answer call,
-# generates long multi-unit drafts on the weak fallback path, and then
-# pays one verifier round-trip per unit. The window below keeps the top
-# RRF-ranked passages for generation only; verification, checksum,
-# quote and cite gates still use the full stored pack, so grounding
-# strictness is unchanged: the model may only use listed authoritative
-# evidence and every claim is still validated against the full pack.
-# Turn-independent, never an exact-question special case.
-#
-# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
-# 58f943c run 37709271567: answer input averages ~9k tokens per request
-# on the slow text path (p50 6.0s) while drafts cite only the
-# top-ranked passages (short 2-3 sentence drafts, response_units_total=5
-# over 8 answer rounds). Narrowing the generation window from 6 to the
-# top 5 RRF-ranked passages removes the least-relevant generation input
-# from every ordinary turn; verification, checksum, quote and cite gates
-# still use the full stored pack, so grounding strictness is unchanged.
-ANSWER_GENERATION_MAX_PASSAGES = 5
+# The generator receives the entire retrieved Evidence Pack (no top-5/top-8
+# evidence window). A passage's completeness is a source-fidelity invariant,
+# independent of answer latency or qualification thresholds.
+# Retained only for backwards import compatibility; zero means no
+# generation-stage passage-count cap. Consume only via an explicit
+# ``<= 0`` check (as in ``assess_evidence_window_coverage``) or
+# :func:`apply_answer_generation_window`: never ``pack[:CONST]``
+# (``pack[:0]`` is empty) or ``if CONST`` (``bool(0)`` is False).
+ANSWER_GENERATION_MAX_PASSAGES = 0
+
+
+def apply_answer_generation_window(
+    pack: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the generation window for an Evidence Pack.
+
+    A non-positive cap means the whole pack reaches generation with full
+    text; a positive cap preserves legacy bounded slicing for
+    observability. Centralizes the ``<= 0 means uncapped`` rule so callers
+    never rely on ``pack[:CAP]`` or truthiness, both of which invert for
+    ``0``.
+    """
+    if int(ANSWER_GENERATION_MAX_PASSAGES) <= 0:
+        return pack
+    return pack[: int(ANSWER_GENERATION_MAX_PASSAGES)]
+
 
 # Bounded single answer-draft attempt (Gate C+E live repair,
 # kodmial/aa#217 recurrence 9 on exact main 922dd07 run 37720236046:
@@ -756,6 +763,38 @@ async def run_v2_answer_turn(
 
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
+    # Model-driven semantic ordering over the broad Evidence Pack (issue
+    # #295): reorder by generic intent relevance without dropping any
+    # passage, so decisive deep-ranked material surfaces for generation
+    # and verification while the full pack stays available. Deterministic
+    # and model-free here (the retrieval layer already applied the same
+    # promotion); a dedicated selection-model pass may reorder again
+    # upstream without ever pruning before budgeting.
+    _pack_order = "fused"
+    try:
+        from aa.conversation.semantic_selection import order_pack_semantically as _order_pack
+
+        _order_intent = str(resolved_intent or "").strip() or " ".join(user_message.split()).strip()
+        if pack and _order_intent:
+            pack = _order_pack(
+                pack, resolved_intent=_order_intent, conversation_context=str(summary or "")
+            )
+            _pack_order = "semantic"
+            logger.debug(
+                "evidence pack semantically ordered",
+                extra={"passages": len(pack)},
+            )
+        else:
+            logger.debug(
+                "evidence pack semantic reorder skipped; fused order kept",
+                extra={"pack_empty": not pack, "intent_empty": not _order_intent},
+            )
+    except Exception as exc:
+        _pack_order = "fused-fallback"
+        logger.debug(
+            "evidence pack semantic reorder failed; fused order kept",
+            extra={"category": type(exc).__name__},
+        )
     initial_pack_empty = not pack
     initial_pack_passages = len(pack)
     _query_hint = int(initial_query_count) if isinstance(initial_query_count, int) else 0
@@ -795,12 +834,17 @@ async def run_v2_answer_turn(
         )
     except Exception:
         _resolved_request = user_message
+    # Preserved multi-turn context (issue #295): wider per-message and
+    # context windows so short follow-ups, referents, topic shifts and
+    # sufficient original dialogue survive; managed LangGraph/LangMem
+    # compaction upstream still bounds genuine model-context pressure.
+    # Voice and text share this context pipeline per #294.
     _recent_texts: list[str] = []
     for _msg in list(recent or []):
         _content = getattr(_msg, "content", "")
         if isinstance(_content, str) and _content.strip():
-            _recent_texts.append(_content.strip()[:400])
-    _conversation_context = " ".join([summary.strip(), *_recent_texts[-4:]]).strip()[:2000]
+            _recent_texts.append(_content.strip()[:1200])
+    _conversation_context = " ".join([summary.strip(), *_recent_texts[-8:]]).strip()[:4000]
     # Schema-only glue decision: conversational mode with zero queries.
     try:
         _proven_glue = bool(_is_conversational(mode=_mode, query_count=_query_hint))
@@ -828,11 +872,12 @@ async def run_v2_answer_turn(
         "turn_budget_exceeded": False,
         "total_latency_ms": 0.0,
         "initial_pack_empty": initial_pack_empty,
-        "answer_generation_window": min(initial_pack_passages, ANSWER_GENERATION_MAX_PASSAGES),
-        "evidence_window_omitted_generation": max(
-            0, initial_pack_passages - ANSWER_GENERATION_MAX_PASSAGES
-        ),
-        "evidence_window_omitted_verifier": max(0, initial_pack_passages - 5),
+        "answer_generation_window": initial_pack_passages,
+        "evidence_window_omitted_generation": 0,
+        "evidence_window_omitted_verifier": 0,
+        "semantic_selection_applied": bool(initial_pack_passages > 0),
+        "pack_order": _pack_order,
+        "semantic_deep_rank_promoted": False,
         "adequacy_verdict": "unknown",
         "failure_category": "",
         "answers_request": False,
@@ -983,10 +1028,8 @@ async def run_v2_answer_turn(
         except NameError:
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
         try:
-            telemetry["evidence_window_omitted_generation"] = max(
-                0, len(pack) - ANSWER_GENERATION_MAX_PASSAGES
-            )
-            telemetry["evidence_window_omitted_verifier"] = max(0, len(pack) - 5)
+            telemetry["evidence_window_omitted_generation"] = 0
+            telemetry["evidence_window_omitted_verifier"] = 0
             telemetry["retrieval_passages"] = len(pack)
         except Exception:
             pass
@@ -1044,9 +1087,7 @@ async def run_v2_answer_turn(
                         pack = merge_pack_dicts(pack, _rec_dicts)
                         telemetry["retrieval_passages"] = len(pack)
                         telemetry["retrieval_outcome"] = "recovered"
-                        telemetry["answer_generation_window"] = min(
-                            len(pack), ANSWER_GENERATION_MAX_PASSAGES
-                        )
+                        telemetry["answer_generation_window"] = len(pack)
                         logger.info(
                             "v2 empty-pack recovery rebuilt evidence",
                             extra={"passages": len(pack)},
@@ -1063,23 +1104,14 @@ async def run_v2_answer_turn(
     def _generation_window(
         active_pack: list[dict[str, Any]], *, wider: bool = False
     ) -> list[dict[str, Any]]:
-        """Return the bounded top-ranked window for answer generation only.
+        """Send all retrieved book passages to OpenCode, without rank slicing.
 
-        The stored pack order is already fused-rank priority, so the
-        leading slice keeps the most relevant authoritative passages.
-        Verification always uses the full pack; only generation input
-        tokens are bounded here. The initial draft uses the top-5
-        window; bounded repair attempts may use the wider top-8 window
-        (kodmial/aa#286 item 3) so decisive evidence at ranks 6-8 is not
-        permanently invisible, without blindly enlarging every turn.
-        Provenance, source-exactness and latency bounds are unchanged.
+        The same source-complete Evidence Pack is used for initial drafts
+        and revisions. Relevance selection belongs to retrieval/reranking,
+        not an arbitrary top-N cutoff in answer generation.
         """
-        from aa.conversation.whole_turn_judge import REPAIR_GENERATION_MAX_PASSAGES
-
-        limit = REPAIR_GENERATION_MAX_PASSAGES if wider else ANSWER_GENERATION_MAX_PASSAGES
-        if len(active_pack) <= limit:
-            return active_pack
-        return active_pack[:limit]
+        del wider  # Backwards-compatible repair caller; no narrower window.
+        return apply_answer_generation_window(active_pack)
 
     async def _draft_with_pack(
         active_pack: list[dict[str, Any]], prompt_text: str, *, wider: bool = False
@@ -1394,7 +1426,17 @@ async def run_v2_answer_turn(
 
             active_config = retrieval_config if retrieval_config is not None else RetrievalConfig()
             retrieval_started = time.perf_counter()
-            new_pack = retrieve_evidence(retrieval_index, queries, config=active_config)
+            # Focused additional search (issue #295): repair retrieval
+            # carries the resolved intent for bounded semantic promotion
+            # so a decisive deep-ranked passage surfaces instead of
+            # regenerating on the same misleading top prefixes.
+            new_pack = retrieve_evidence(
+                retrieval_index,
+                queries,
+                config=active_config,
+                resolved_intent=_resolved_intent,
+                conversation_context=_conversation_context,
+            )
             from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
 
             _, new_dicts = _pack_to_state(new_pack)
@@ -1958,78 +2000,128 @@ async def run_v2_answer_turn(
                     ),
                     "telemetry": dict(telemetry),
                 }
+        transport_segments: list[str] | None = None
         if not envelope_passes(final):
-            # Live SLO guard (Gate C live repair, run 37638264853 on exact
-            # main e2e42de): the live lane failed only on
-            # live-text-max-over-budget (max 50.6s over the 30s hard budget,
-            # p50 31.1s, p95 44.5s over 14 ordinary turns) with no generic
-            # collapse, diversity passing, and planner/answer/verifier model
-            # identities healthy. The tail is long overflowing drafts: a
-            # passed draft that misses the #83 envelope currently pays a
-            # full extra answer+verifier round via compact regeneration,
-            # pushing an already-slow turn further over budget. When the
-            # turn already exceeds the live-SLO repair budget, skip that
-            # extra provider round and compact deterministically to leading
-            # supported units instead. Grounding stays strict (only
-            # validated supported units, otherwise clarification); fast
-            # turns still use the single compact regeneration. Turn-
-            # independent, never an exact-question special case.
-            if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
-                _end_to_end_elapsed_s() > _effective_turn_budget_s()
+            # Issue #295: a fully verified grounded complete answer keeps
+            # its essential final points across sequential envelope-passing
+            # transport segments instead of leading-sentence truncation.
+            # Every segment carries only verifier-supported content (the
+            # full draft passed before splitting), each passes the envelope,
+            # quote-aggregate and outbound-safety gates; bulk/attack,
+            # unverified or unsafe drafts keep the single-message compact
+            # path below. Bounded to MAX_TRANSPORT_SEGMENTS; overflow falls
+            # back to clarification, never unbounded paging.
+            if (
+                passed
+                and units
+                and result is not None
+                and aggregate_quote_chars(final) <= QUOTE_BUDGET_CHARS
+                and contains_cyrillic(final)
+                and not leaks_internal_terms(final)
+                and certify_outbound_safety(final)
+                and not is_bulk_reproduction_request(final)
             ):
-                telemetry["repair_budget_exceeded"] = True
-                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
-                    _mark_turn_budget_exceeded()
-                logger.info(
-                    "v2 envelope regeneration skipped for live-SLO budget",
-                    extra={"rounds": rounds},
-                )
-                final = compact_supported_to_envelope(units, result, text=final)
-                if not envelope_passes(final):
-                    final = NATURAL_CLARIFICATION_REPLY
-            else:
-                # At most one compact regeneration from the same pack.
-                compact_hint = compact_retry_instruction(
-                    remaining_chars=HARD_CHARS,
-                    remaining_words=HARD_WORDS,
-                    quote_remaining=QUOTE_BUDGET_CHARS,
-                )
-                second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
-                if second is not None:
-                    regen_slice = _verifier_round_budget()
-                    if regen_slice is not None and regen_slice < TURN_VERIFIER_MIN_SLICE_S:
-                        logger.info(
-                            "v2 regen re-verify skipped for end-to-end budget",
-                            extra={"rounds": rounds},
-                        )
+                try:
+                    _segments = split_text_to_envelope_segments(final)
+                except ValueError:
+                    _segments = []
+                if 1 < len(_segments) <= MAX_TRANSPORT_SEGMENTS and all(
+                    envelope_passes(seg)
+                    and aggregate_quote_chars(seg) <= QUOTE_BUDGET_CHARS
+                    and contains_cyrillic(seg)
+                    and not leaks_internal_terms(seg)
+                    and certify_outbound_safety(seg)
+                    for seg in _segments
+                ):
+                    transport_segments = _segments
+                    telemetry["transport_split"] = True
+                    telemetry["transport_segments"] = len(_segments)
+                    telemetry["answer_outcome"] = "served-split"
+                    logger.info(
+                        "v2 verified answer kept complete via transport split",
+                        extra={"segments": len(_segments)},
+                    )
+            if transport_segments is None:
+                # Live SLO guard (Gate C live repair, run 37638264853 on exact
+                # main e2e42de): the live lane failed only on
+                # live-text-max-over-budget (max 50.6s over the 30s hard budget,
+                # p50 31.1s, p95 44.5s over 14 ordinary turns) with no generic
+                # collapse, diversity passing, and planner/answer/verifier model
+                # identities healthy. The tail is long overflowing drafts: a
+                # passed draft that misses the #83 envelope currently pays a
+                # full extra answer+verifier round via compact regeneration,
+                # pushing an already-slow turn further over budget. When the
+                # turn already exceeds the live-SLO repair budget, skip that
+                # extra provider round and compact deterministically to leading
+                # supported units instead. Grounding stays strict (only
+                # validated supported units, otherwise clarification); fast
+                # turns still use the single compact regeneration. Turn-
+                # independent, never an exact-question special case.
+                # (Verified split answers above skip this entire
+                # single-message path so no trailing supported substance is
+                # lost; delivery splits deterministically.)
+                if (time.perf_counter() - turn_started) > _effective_repair_budget_s() or (
+                    _end_to_end_elapsed_s() > _effective_turn_budget_s()
+                ):
+                    telemetry["repair_budget_exceeded"] = True
+                    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
                         _mark_turn_budget_exceeded()
-                        final = compact_supported_to_envelope(units, result, text=final)
-                        if not envelope_passes(final):
-                            final = NATURAL_CLARIFICATION_REPLY
-                    else:
-                        second_units, second_result, second_passed = await _verify_with_telemetry(
-                            second, pack, turn_budget_s=regen_slice
-                        )
-                        if second_passed and second_units and second_result is not None:
-                            if envelope_passes(second):
-                                final = second
-                                units, result = second_units, second_result
-                            else:
-                                final = compact_supported_to_envelope(
-                                    second_units, second_result, text=second
-                                )
-                                units, result = second_units, second_result
-                                if not envelope_passes(final) or not contains_cyrillic(final):
-                                    final = NATURAL_CLARIFICATION_REPLY
-                        else:
-                            final = compact_supported_to_envelope(units, result, text=final)
-                            if not envelope_passes(final):
-                                final = NATURAL_CLARIFICATION_REPLY
-                else:
+                    logger.info(
+                        "v2 envelope regeneration skipped for live-SLO budget",
+                        extra={"rounds": rounds},
+                    )
                     final = compact_supported_to_envelope(units, result, text=final)
                     if not envelope_passes(final):
                         final = NATURAL_CLARIFICATION_REPLY
+                else:
+                    # At most one compact regeneration from the same pack.
+                    compact_hint = compact_retry_instruction(
+                        remaining_chars=HARD_CHARS,
+                        remaining_words=HARD_WORDS,
+                        quote_remaining=QUOTE_BUDGET_CHARS,
+                    )
+                    second = await _draft_with_pack(pack, f"{user_message}\n{compact_hint}")
+                    if second is not None:
+                        regen_slice = _verifier_round_budget()
+                        if regen_slice is not None and regen_slice < TURN_VERIFIER_MIN_SLICE_S:
+                            logger.info(
+                                "v2 regen re-verify skipped for end-to-end budget",
+                                extra={"rounds": rounds},
+                            )
+                            _mark_turn_budget_exceeded()
+                            final = compact_supported_to_envelope(units, result, text=final)
+                            if not envelope_passes(final):
+                                final = NATURAL_CLARIFICATION_REPLY
+                        else:
+                            (
+                                second_units,
+                                second_result,
+                                second_passed,
+                            ) = await _verify_with_telemetry(
+                                second, pack, turn_budget_s=regen_slice
+                            )
+                            if second_passed and second_units and second_result is not None:
+                                if envelope_passes(second):
+                                    final = second
+                                    units, result = second_units, second_result
+                                else:
+                                    final = compact_supported_to_envelope(
+                                        second_units, second_result, text=second
+                                    )
+                                    units, result = second_units, second_result
+                                    if not envelope_passes(final) or not contains_cyrillic(final):
+                                        final = NATURAL_CLARIFICATION_REPLY
+                            else:
+                                final = compact_supported_to_envelope(units, result, text=final)
+                                if not envelope_passes(final):
+                                    final = NATURAL_CLARIFICATION_REPLY
+                    else:
+                        final = compact_supported_to_envelope(units, result, text=final)
+                        if not envelope_passes(final):
+                            final = NATURAL_CLARIFICATION_REPLY
         # Quote-budget deterministic guard.
+        # (Verified split answers already satisfied the aggregate budget
+        # before splitting; splitting never bypasses it.)
         if aggregate_quote_chars(final) > QUOTE_BUDGET_CHARS:
             compacted = compact_text_to_envelope(final)
             if envelope_passes(compacted) and contains_cyrillic(compacted):
@@ -2155,9 +2247,7 @@ async def run_v2_answer_turn(
                     pack = _safe_pack
                     telemetry["retrieval_passages"] = len(pack)
                     telemetry["retrieval_outcome"] = "repaired"
-                    telemetry["answer_generation_window"] = min(
-                        len(pack), ANSWER_GENERATION_MAX_PASSAGES
-                    )
+                    telemetry["answer_generation_window"] = len(pack)
                 try:
                     _safe_result = recovered["verification"]
                     _safe_unavailable = len(getattr(_safe_result, "unavailable_unit_ids", ()) or ())
@@ -2230,9 +2320,21 @@ async def run_v2_answer_turn(
                 "recent_quote_ranges": recent_ranges,
                 "telemetry": dict(telemetry),
             }
-        telemetry["answer_outcome"] = (
-            "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
-        )
+        if transport_segments is not None and final != NATURAL_CLARIFICATION_REPLY:
+            # Preserve the split verdict: the complete verified answer is
+            # served across sequential transport segments (delivery splits
+            # deterministically); adequacy below judges the full text so no
+            # trailing supported substance escapes relevance/grounding.
+            telemetry["answer_outcome"] = "served-split"
+            telemetry["transport_split"] = True
+            telemetry["transport_segments"] = len(transport_segments)
+        else:
+            telemetry["answer_outcome"] = (
+                "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
+            )
+            if transport_segments is None:
+                telemetry.setdefault("transport_split", False)
+                telemetry.setdefault("transport_segments", 1)
         _finish_telemetry()
         return {
             "text": final,
@@ -2241,6 +2343,7 @@ async def run_v2_answer_turn(
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
             "telemetry": dict(telemetry),
+            "segments": list(transport_segments) if transport_segments is not None else [final],
         }
 
     # Conversational delivery contract (kodmial/aa#284, hardened
@@ -2729,6 +2832,7 @@ __all__ = [
     "anchored_adequacy_regen_prompt",
     "anchored_repair_focus",
     "answer_pipeline_node",
+    "apply_answer_generation_window",
     "certify_outbound_safety",
     "compact_supported_to_envelope",
     "contains_cyrillic",

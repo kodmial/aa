@@ -336,7 +336,7 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 queries=[f"запрос {i}" for i in range(12)],
             )
         )
-        if not 10 <= len(plan.queries) <= 16:
+        if not 1 <= len(plan.queries) <= 16:
             return _fail_b(
                 expected_sha,
                 run_id,
@@ -346,14 +346,20 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 "cardinality out of bounds",
             )
         try:
-            validate_query_plan(QueryPlan(mode="retrieval", resolved_intent="q0", queries=["q0"]))
+            validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent="q0",
+                    queries=[f"q{i}" for i in range(17)],
+                )
+            )
             return _fail_b(
                 expected_sha,
                 run_id,
                 product,
                 runtime,
                 "planner-cardinality",
-                "single query unexpectedly accepted",
+                "oversize query list unexpectedly accepted",
             )
         except ValueError:
             pass

@@ -1,7 +1,7 @@
-"""V2 retrieval node: planner queries to compact Evidence Pack (issue #116).
+"""V2 retrieval node: planner queries to compact Evidence Pack (issues #116, #295).
 
-The node consumes the minimal ``search_queries`` produced by the #113
-hidden planner (0 or 10..16 context-resolved Russian queries) and runs
+The node consumes the ``search_queries`` produced by the hidden
+planner (0 or 1..16 context-resolved useful Russian queries) and runs
 the RRF-only target pipeline from :mod:`aa.retrieval.evidence` over the
 #115 RAM-resident canonical index:
 
@@ -104,11 +104,273 @@ def state_passages_to_prompt(pack_dicts: list[dict[str, Any]]) -> list[EvidenceP
     return passages
 
 
+def _selection_context_from_state(state: TurnState) -> tuple[str, str, str]:
+    """Extract resolved intent, conversation context and user message.
+
+    Bounded windows only; callers never log the returned text.
+    """
+    try:
+        retry = state.get("retry_state", {})
+        retry_d = dict(retry) if isinstance(retry, dict) else {}
+        intent = str(retry_d.get("resolved_intent", state.get("resolved_intent", "")) or "")
+    except Exception:
+        intent = str(state.get("resolved_intent", "") or "")
+    if not intent.strip():
+        intent = str(state.get("current_user_message", "") or "")
+    user_message = str(state.get("current_user_message", "") or "")
+    try:
+        summary = str(state.get("conversation_summary", "") or "")
+    except Exception:
+        summary = ""
+    try:
+        from langchain_core.messages import BaseMessage as _BM
+
+        recent_texts: list[str] = []
+        for item in list(state.get("messages", []) or [])[-6:]:
+            if isinstance(item, _BM):
+                content = getattr(item, "content", "")
+                if isinstance(content, str) and content.strip():
+                    recent_texts.append(content.strip()[:1200])
+        context = " ".join([summary.strip(), *recent_texts[-6:]]).strip()[:4000]
+    except Exception:
+        context = str(summary or "")[:4000]
+    return intent, context, user_message
+
+
+async def aretrieve_with_semantic_selection(
+    index: HybridIndex,
+    queries: list[str],
+    *,
+    config: RetrievalConfig | None = None,
+    resolved_intent: str = "",
+    conversation_context: str = "",
+    user_message: str = "",
+    selection_model: Any | None = None,
+) -> EvidencePack:
+    """Run broad hybrid retrieval with model-driven selection before budgeting.
+
+    Issue #295: the genuinely broad BM25+E5/RRF pool (including fused rank
+    >16) is exposed as discovery previews; an LLM selects pertinent
+    candidates against the real context-resolved intent; exact complete
+    canonical passages (+neighbors, provenance preserved) are fetched only
+    for the validated selection; one bounded targeted follow-up search
+    genuinely changes the evidence when relevance is weak/unknown. Earlier
+    top-N caps never irreversibly hide candidates before selection. No
+    second-stage BGE; generic token-overlap is fallback/discovery ordering
+    only, never semantic authority when a model is bound.
+    """
+    from aa.retrieval.evidence import (
+        expand_small_to_big,
+        fuse_query_pool,
+        run_branch_searches,
+        select_passages_under_budget,
+        select_top_candidates,
+        validate_planner_queries,
+        validate_recovery_queries,
+    )
+
+    active = config if config is not None else RetrievalConfig()
+    cleaned = validate_planner_queries(queries)
+    if not cleaned:
+        from aa.retrieval.evidence import empty_evidence_pack
+
+        corpus = str(index.metadata.get("ru_artifact_sha256", ""))
+        return empty_evidence_pack(corpus_version=corpus)
+    started = time.perf_counter()
+    ranked_lists, per_query_ids = await asyncio.to_thread(
+        run_branch_searches, index, cleaned, branch_top_k=active.branch_top_k
+    )
+    fused, pool_ids = fuse_query_pool(
+        ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+    )
+    # Discovery previews use the broad fused pool directly; per-section
+    # diversity caps are applied only to fallback/budgeting after selection.
+    # Broad discovery previews BEFORE any per-section diversity truncation
+    # or top-N winner budgeting (issue #295). The genuinely broad fused
+    # pool (global RRF order, exact-ID dedup only, ranks >16 included) is
+    # shown to the LLM; diversity caps apply only to fallback/budgeting
+    # after the model has selected.
+    from aa.conversation.semantic_selection import (
+        MAX_FOLLOWUP_QUERIES,
+        MAX_SELECTED_CHUNKS,
+        MAX_SELECTION_CANDIDATES,
+        aselect_semantic_candidates,
+        preview_candidates,
+        selection_telemetry,
+    )
+
+    broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
+    fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
+    in_index = [cid for cid, _ in fused_ordered if cid in index.chunks]
+    texts = {cid: getattr(index.chunks[cid], "text", "") for cid in in_index}
+    sections = {cid: getattr(index.chunks[cid], "section", "") for cid in in_index}
+    sources = {cid: getattr(index.chunks[cid], "source_id", "") for cid in in_index}
+    previews = preview_candidates(
+        fused_ordered=fused_ordered,
+        texts=texts,
+        sections=sections,
+        sources=sources,
+        limit=MAX_SELECTION_CANDIDATES,
+    )
+    sel_started = time.perf_counter()
+    # Provider 429 propagates (runner retire/checkpoint resume); other
+    # model failures fall back to the bounded heuristic inside the selector.
+    selection = await aselect_semantic_candidates(
+        previews,
+        resolved_intent=resolved_intent,
+        conversation_context=conversation_context,
+        user_message=user_message,
+        model=selection_model,
+    )
+    sel_ms = (time.perf_counter() - sel_started) * 1000.0
+    winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
+    # One bounded targeted follow-up when the selector reports weak/unknown
+    # relevance: a focused additional search that must add genuinely new
+    # chunk ids (never a silent regeneration on the same top prefixes).
+    followup_added = 0
+    if selection.need_more_detail:
+        followups = list(selection.followup_queries[:MAX_FOLLOWUP_QUERIES])
+        if not followups and resolved_intent.strip():
+            followups = [" ".join(resolved_intent.split())[:500]]
+        try:
+            followups = validate_recovery_queries(followups)
+        except Exception:
+            followups = []
+        if followups:
+            try:
+                f_ranked, f_per_ids = await asyncio.to_thread(
+                    run_branch_searches, index, followups, branch_top_k=active.branch_top_k
+                )
+                f_fused, f_pool = fuse_query_pool(
+                    f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+                )
+                seen = {w.chunk_id for w in winners} | set(fused.keys())
+                # Genuinely new evidence first: ids absent from the first
+                # broad pool, best-first, bounded.
+                fresh = sorted(
+                    (
+                        cand
+                        for cid, cand in f_fused.items()
+                        if cid not in seen and cid in index.chunks
+                    ),
+                    key=lambda item: item.fused_score,
+                    reverse=True,
+                )[:8]
+                followup_added = 0
+                for cand in fresh:
+                    if len(winners) >= MAX_SELECTED_CHUNKS + 8:
+                        break
+                    winners.append(cand)
+                    fused[cand.chunk_id] = cand
+                    followup_added += 1
+            except Exception:
+                followup_added = 0
+    if not winners:
+        # Fail-safe bounded fallback (never empty silent success): top RRF
+        # winners in fused order. Reached only when selection yields nothing
+        # usable; deep ranks stay reachable via the previews above on retry.
+        # Diversity caps apply here only, never to discovery previews above.
+        from aa.retrieval.evidence import dedup_and_diversify as _dedup
+
+        _diverse_fallback = _dedup(
+            index,
+            pool_ids,
+            fused,
+            pool_cap=active.pool_cap,
+            max_per_section=active.max_per_section,
+        )
+        _ordered_fallback = sorted(
+            _diverse_fallback, key=lambda item: item.fused_score, reverse=True
+        )
+        # Section lookup stays bounded to the fallback candidates instead
+        # of iterating the whole index on every fallback turn.
+        sections_map: dict[str, str] = {}
+        for _item in _ordered_fallback:
+            _record = index.chunks.get(_item.chunk_id)
+            if _record is not None:
+                sections_map[_item.chunk_id] = str(getattr(_record, "section", "") or "")
+        winners = select_top_candidates(
+            _ordered_fallback,
+            top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS),
+            sections=sections_map,
+        )
+    expanded = await asyncio.to_thread(
+        expand_small_to_big, index, winners, neighbor_window=active.neighbor_window
+    )
+    selected, total = select_passages_under_budget(
+        expanded,
+        budget_tokens=active.budget_tokens,
+        index=index,
+        priority_child_ids=tuple(w.chunk_id for w in winners),
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    try:
+        telemetry = selection_telemetry(previews=previews, selection=selection, latency_ms=sel_ms)
+    except Exception:
+        telemetry = {}
+    from aa.retrieval.evidence import _short_digest as _digest
+    from aa.retrieval.evidence import dedup_and_diversify as _dedup_meta
+
+    try:
+        _diverse_meta = _dedup_meta(
+            index,
+            pool_ids,
+            fused,
+            pool_cap=active.pool_cap,
+            max_per_section=active.max_per_section,
+        )
+        _diverse_unique = len(_diverse_meta)
+    except Exception:
+        _diverse_unique = 0
+
+    metadata: dict[str, Any] = {
+        "planner_query_count": len(cleaned),
+        "primary_query_digest": _digest(cleaned[0]),
+        "branch_lists": len(ranked_lists),
+        "branch_top_k": active.branch_top_k,
+        "rrf_k": active.rrf_k,
+        "pool_cap": active.pool_cap,
+        "fused_unique": len(fused),
+        "pool_unique": len(pool_ids),
+        "diverse_unique": _diverse_unique,
+        "top_child_cap": active.top_child_cap,
+        "selected_winners": len(winners),
+        "retrieval_backend": "rrf-only/1+semantic-selection",
+        "semantic_selection_model": selection_model is not None,
+        "semantic_promoted": True,
+        "followup_added": followup_added,
+        "neighbor_window": active.neighbor_window,
+        "expanded_passages": len(expanded),
+        "selected_passages": len(selected),
+        "budget_tokens": active.budget_tokens,
+        "total_tokens": total,
+        "latency_ms": elapsed_ms,
+        "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+        "latency_over_budget": elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS,
+    }
+    metadata.update({f"selection_{k}": v for k, v in telemetry.items()})
+    logger.info(
+        "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d",
+        len(cleaned),
+        len(previews),
+        len(winners),
+        len(selected),
+        total,
+    )
+    return EvidencePack(
+        passages=tuple(selected),
+        total_tokens=total,
+        corpus_version=str(index.metadata.get("ru_artifact_sha256", "")),
+        retrieval_metadata=metadata,
+    )
+
+
 async def retrieval_node(
     state: TurnState,
     *,
     index: HybridIndex,
     config: RetrievalConfig | None = None,
+    selection_model: Any | None = None,
 ) -> dict[str, Any]:
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
@@ -118,6 +380,11 @@ async def retrieval_node(
     state (``retrieval_latency_ms``/``retrieval_over_budget``) for
     observability. Only counts and latencies are logged, never prompts
     or user text.
+
+    When ``selection_model`` is bound, model-driven semantic selection runs
+    over genuinely broad hybrid candidates (including fused rank >16)
+    BEFORE winner/pack budgeting; otherwise the bounded heuristic promotion
+    inside :func:`retrieve_evidence` applies.
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -145,7 +412,48 @@ async def retrieval_node(
         }
     active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
-    pack = await asyncio.to_thread(retrieve_evidence, index, queries, config=active_config)
+    resolved_intent, conversation_context, user_message = _selection_context_from_state(state)
+    if selection_model is not None:
+        # Model-driven path: broad candidates -> LLM selection -> exact
+        # full fetch -> budgeting. Provider 429 propagates for checkpoint
+        # recovery; any other selection failure falls back to the bounded
+        # heuristic pipeline below (never an empty silent success).
+        try:
+            pack = await aretrieve_with_semantic_selection(
+                index,
+                queries,
+                config=active_config,
+                resolved_intent=resolved_intent,
+                conversation_context=conversation_context,
+                user_message=user_message,
+                selection_model=selection_model,
+            )
+        except Exception as exc:
+            from aa.opencode.errors import OpenCodeRateLimitError as _SelRateLimit
+
+            if isinstance(exc, (_SelRateLimit, asyncio.CancelledError)):
+                raise
+            logger.info(
+                "v2 retrieval selection failed; heuristic pipeline used",
+                extra={"category": type(exc).__name__},
+            )
+            pack = await asyncio.to_thread(
+                retrieve_evidence,
+                index,
+                queries,
+                config=active_config,
+                resolved_intent=resolved_intent,
+                conversation_context=conversation_context,
+            )
+    else:
+        pack = await asyncio.to_thread(
+            retrieve_evidence,
+            index,
+            queries,
+            config=active_config,
+            resolved_intent=resolved_intent,
+            conversation_context=conversation_context,
+        )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     hits, pack_dicts = pack_to_state(pack)
@@ -181,17 +489,21 @@ def make_retrieval_node(
     *,
     index: HybridIndex,
     config: RetrievalConfig | None = None,
+    selection_model: Any | None = None,
 ) -> Any:
     """Build the evidence retrieval node bound to one RAM-resident index."""
     active_config = config if config is not None else RetrievalConfig()
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
-        return await retrieval_node(state, index=index, config=active_config)
+        return await retrieval_node(
+            state, index=index, config=active_config, selection_model=selection_model
+        )
 
     return run_evidence_retrieval
 
 
 __all__ = [
+    "aretrieve_with_semantic_selection",
     "make_retrieval_node",
     "pack_to_state",
     "retrieval_node",

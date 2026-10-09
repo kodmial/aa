@@ -38,20 +38,16 @@ from aa.conversation.v2_prompts import load_planner_system_v2
 
 logger = logging.getLogger("aa.conversation.planner_node")
 
-# Bounded per-message display length for the planner prompt only (Gate
-# C+E live repair, run 37664757721 on exact main 0202b0b: p50 29.6s /
-# p95 42.0s / max 45.5s with planner p50 5.7s / p95 12.1s). The planner
-# consumes the full framework-managed history (no message-count slice;
-# long-conversation tails make the planner prompt the second-largest
-# per-turn model input after the answer pack). Truncating each message
-# display bounds input tokens and planner latency while context
-# resolution is unchanged for ordinary turns: short follow-ups,
-# pronouns and ellipsis resolve from recent truncated context plus the
-# running summary, and truncation is explicitly marked so the model
-# never judges on a silently cut prefix. All messages are still sent
-# (message count and order unchanged); only per-message characters are
-# bounded. Turn-independent, never an exact-question special case.
-PLANNER_MAX_MESSAGE_CHARS = 500
+# Bounded per-message display length for the planner prompt (issue #295:
+# preserved multi-turn context). The planner consumes recent history
+# with a wider window so short follow-ups, pronouns, ellipsis, topic
+# shifts and referents resolve from genuine dialogue plus the running
+# summary. Per-message characters stay bounded with an explicit marker
+# (real model-context budget), but the window is wide enough that
+# ordinary multi-turn continuity is never silently cut. Message count
+# and order are preserved. Turn-independent, never an exact-question
+# special case.
+PLANNER_MAX_MESSAGE_CHARS = 1500
 
 PLANNER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
@@ -281,7 +277,7 @@ def _reply_structured_content(reply: object) -> object:
 # once as bounded plain-text JSON through the ordinary text path
 # (already proven to serve) and strictly Pydantic-validates it.
 # Grounding semantics are unchanged: only a fully validated 0 or
-# 10-16 distinct-query plan is accepted; anything else fails closed.
+# 1-16 distinct useful-query plan is accepted; anything else fails closed.
 # Provider 429 always propagates immediately and never triggers the
 # text path. Turn-independent, never an exact-question special case.
 PLANNER_TEXT_JSON_SUFFIX = (
@@ -291,7 +287,8 @@ PLANNER_TEXT_JSON_SUFFIX = (
     'Use {"mode": "conversational", "resolved_intent": "", "queries": []} '
     "only for purely conversational turns; otherwise return "
     '{"mode": "retrieval", "resolved_intent": standalone intent, '
-    '"queries": 10 to 16 Russian search queries}. '
+    '"queries": 1 to 16 distinct useful Russian search queries '
+    "(as many as genuinely help, never padded)}. "
     "No other text, no markdown, no explanation."
 )
 
@@ -392,7 +389,7 @@ async def run_planner(
     cache is set for an explicitly omitted-wire model, this goes directly
     to the single bounded text path (which itself tries the strong primary
     first), skipping the doomed weak structured call. Grounding is
-    unchanged (strict Pydantic 0-or-10..16 validation); 429 propagates and
+    unchanged (strict Pydantic 0-or-1..16 validation); 429 propagates and
     never triggers the text path. Turn-independent, never an
     exact-question special case.
 

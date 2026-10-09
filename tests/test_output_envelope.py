@@ -804,7 +804,7 @@ async def test_synthesis_prompt_carries_policy_and_no_planner_metadata(
 
 
 def test_generation_budget_defaults_and_validates() -> None:
-    assert DEFAULT_GENERATION_BUDGET_TOKENS == 160
+    assert DEFAULT_GENERATION_BUDGET_TOKENS == 320
     assert resolve_generation_budget(0) == DEFAULT_GENERATION_BUDGET_TOKENS
     assert resolve_generation_budget(200) == 200
     with pytest.raises(ValueError):

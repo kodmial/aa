@@ -126,7 +126,9 @@ async def test_safety_recovery_serves_certified_delivery() -> None:
 
     monkey_calls = {"retrieval": 0}
 
-    def _fake_retrieve(index: object, queries: object, *, config: object = None) -> Any:
+    def _fake_retrieve(  # noqa: E501
+        index: object, queries: object, *, config: object = None, **kwargs: Any
+    ) -> Any:
         _ = (index, queries, config)
         monkey_calls["retrieval"] += 1
         return _fresh_pack()
@@ -172,7 +174,9 @@ async def test_safety_recovered_snapshot_passes_grounding_and_relevance() -> Non
     from aa.conversation.turn_pipeline import run_v2_answer_turn
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
-    def _fake_retrieve(index: object, queries: object, *, config: object = None) -> Any:
+    def _fake_retrieve(  # noqa: E501
+        index: object, queries: object, *, config: object = None, **kwargs: Any
+    ) -> Any:
         _ = (index, queries, config)
         return _fresh_pack()
 

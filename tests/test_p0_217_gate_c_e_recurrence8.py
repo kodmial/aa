@@ -91,12 +91,11 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 
 def test_answer_bounds_are_configured() -> None:
-    """Recurrence-8 bounds: answer attempt budget plus history-count window."""
+    """History-count window preserves multi-turn context (#295)."""
     assert ANSWER_DRAFT_ATTEMPT_BUDGET_S == 35.0
     assert ANSWER_FAST_RETRY_MAX_PASSAGES == 2
     assert ANSWER_FAST_RETRY_MAX_HISTORY == 2
-    assert ANSWER_MAX_HISTORY_MESSAGES == 6
-    assert ANSWER_FAST_RETRY_MAX_PASSAGES < 5
+    assert ANSWER_MAX_HISTORY_MESSAGES == 12
     assert ANSWER_FAST_RETRY_MAX_HISTORY < ANSWER_MAX_HISTORY_MESSAGES
 
 
@@ -104,7 +103,7 @@ def test_answer_history_count_bounded_live_turn_preserved() -> None:
     """Only the last N history messages travel; live turn is intact."""
     from langchain_core.messages import BaseMessage
 
-    recent: list[BaseMessage] = [HumanMessage(content=f"history message {i}") for i in range(10)]
+    recent: list[BaseMessage] = [HumanMessage(content=f"history message {i}") for i in range(15)]
     live = "why does that matter tonight?"
     messages = build_answer_messages(
         recent=recent,
@@ -116,9 +115,9 @@ def test_answer_history_count_bounded_live_turn_preserved() -> None:
     body = "\n".join(str(item.content) for item in messages[1:])
     assert live in body
     # Last window preserved, oldest dropped.
-    assert "history message 9" in body
+    assert "history message 14" in body
     assert "history message 0" not in body
-    # Count bound: system + 6 history + 1 turn payload.
+    # Count bound: system + 12 history + 1 turn payload.
     assert len(messages) == 1 + ANSWER_MAX_HISTORY_MESSAGES + 1
 
 

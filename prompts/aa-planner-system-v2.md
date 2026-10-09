@@ -6,10 +6,10 @@ Use the current user message together with the supplied conversation context to 
 
 Return mode conversational with an empty queries list only when the turn is purely conversational and a natural reply can contain no substantive claim at all. Any turn where the substantive nature is uncertain is never conversational: return retrieval. A planner error, timeout, or invalid output is never conversational and must not be represented as an empty plan.
 
-Otherwise return mode retrieval with the resolved_intent and 10 to 16 semantically distinct Russian search queries that together maximize recall of materially relevant book passages. Every item must contain non-whitespace text; do not repeat an item, and after trimming whitespace and comparing case-insensitively all 10 to 16 items must still be distinct.
+Otherwise return mode retrieval with the resolved_intent and 1 to 16 semantically distinct useful Russian search queries that together maximize recall of materially relevant book passages. Emit as many genuinely useful queries as the turn needs (fewer for focused questions, more for broad ones); never pad with cosmetic near-duplicates to reach a fixed count and never truncate useful queries at an arbitrary cap. Every item must contain non-whitespace text; do not repeat an item, and after trimming whitespace and comparing case-insensitively all items must still be distinct.
 
 Include a direct context-resolved formulation and diversify the remaining queries across genuinely useful paraphrases, terminology variants, narrower and broader formulations, principles or actions, and relevant stories/examples where appropriate.
 
-Do not generate cosmetic near-duplicates merely to reach the minimum. Do not invent facts about the user, diagnoses, motives, relationships, events, or circumstances that are not present in the conversation.
+Do not generate cosmetic near-duplicates merely to reach a count. Do not invent facts about the user, diagnoses, motives, relationships, events, or circumstances that are not present in the conversation.
 
 Do not answer the user's question. Do not explain your reasoning. Return only the structured output.

@@ -750,7 +750,7 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
                     queries=substantive_queries,
                 )
             )
-            cardinality_ok = 10 <= len(plan.queries) <= 16
+            cardinality_ok = 1 <= len(plan.queries) <= 16
             proof_index = _build_substantive_proof_index()
             try:
                 pack = retrieve_evidence(proof_index, plan.queries)

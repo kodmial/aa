@@ -65,12 +65,12 @@ JUDGE_INDEPENDENCE_LIMITATION = (
 
 WHOLE_TURN_JUDGE_MAX_ATTEMPTS = 1
 
-# Bounded repair-generation window (issue #286 item 3): the initial
-# draft uses the top-ranked passages only; bounded repair attempts may
-# use a slightly wider rank window so decisive evidence at ranks 6-8
-# is not permanently invisible. Never blindly enlarged to the full
-# pack; provenance, source-exactness and latency bounds are unchanged.
-REPAIR_GENERATION_MAX_PASSAGES = 8
+# Repair generation uses the entire Evidence Pack (issues #286, #295).
+# The former top-5 initial / top-8 repair rank windows are removed: both
+# initial drafts and repair regens receive all selected canonical
+# passages with full text. Zero means no generation-stage cap (kept for
+# backwards import compatibility).
+REPAIR_GENERATION_MAX_PASSAGES = 0
 
 
 class WholeTurnDecision(BaseModel):
@@ -351,34 +351,39 @@ def assess_evidence_window_coverage(
     *,
     generation_window: int,
     verifier_window: int,
-    generation_max_chars: int = 500,
-    verifier_max_chars: int = 500,
+    generation_max_chars: int = 0,
+    verifier_max_chars: int = 0,
     cited_ids: Sequence[str] = (),
 ) -> EvidenceWindowCoverage:
     """Measure window coverage on counts only (never text).
 
-    Reports how many stored passages and characters fall outside the
-    bounded generation/verifier display windows, and how many cited
-    passage ids lie outside each window. Purely mechanical counting;
-    no semantic judgement.
+    A window value of ``0`` (or any value covering the whole pack) means
+    the full Evidence Pack reaches that stage with full text: nothing is
+    omitted there. Positive windows preserve the legacy bounded counting
+    for observability. Purely mechanical counting; no semantic judgement.
     """
     items = [item for item in (pack or []) if isinstance(item, dict)]
     total = len(items)
-    gen_window = max(0, int(generation_window))
-    ver_window = max(0, int(verifier_window))
+    gen_window = total if int(generation_window) <= 0 else min(total, int(generation_window))
+    ver_window = total if int(verifier_window) <= 0 else min(total, int(verifier_window))
     window_ids = [str(item.get("passage_id", "")) for item in items[:gen_window]]
     verifier_ids = [str(item.get("passage_id", "")) for item in items[:ver_window]]
     window_set = {value for value in window_ids if value}
     verifier_set = {value for value in verifier_ids if value}
     gen_omitted_chars = 0
     ver_omitted_chars = 0
+    # A max-chars value of 0 means full source text (no display cut).
     for item in items[:gen_window]:
         text = item.get("text", "")
-        if isinstance(text, str) and len(text) > generation_max_chars:
+        if (
+            isinstance(text, str)
+            and int(generation_max_chars) > 0
+            and len(text) > generation_max_chars
+        ):
             gen_omitted_chars += len(text) - generation_max_chars
     for item in items[:ver_window]:
         text = item.get("text", "")
-        if isinstance(text, str) and len(text) > verifier_max_chars:
+        if isinstance(text, str) and int(verifier_max_chars) > 0 and len(text) > verifier_max_chars:
             ver_omitted_chars += len(text) - verifier_max_chars
     # Passages beyond the window still hold full stored text; count the
     # total stored characters outside each window as omitted context.

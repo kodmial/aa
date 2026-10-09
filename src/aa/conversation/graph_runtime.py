@@ -151,6 +151,15 @@ class GraphTurnRuntime:
             except GraphRuntimeError:
                 raise
             except Exception as exc:
+                # Provider 429 retires the runner for fresh-VM checkpoint
+                # recovery; it must never collapse into a GraphRuntimeError
+                # (which the application would serve as a natural fallback
+                # and lose the resume signal). No blind retry here: the
+                # caller owns retire/restart.
+                from aa.opencode.errors import OpenCodeRateLimitError as _DelegateRateLimit
+
+                if isinstance(exc, _DelegateRateLimit):
+                    raise
                 raise GraphRuntimeError("delegate-failed", type(exc).__name__) from exc
             if not isinstance(reply, str) or not reply.strip():
                 raise GraphRuntimeError("empty-reply", "delegate returned no text")
@@ -175,6 +184,16 @@ class GraphTurnRuntime:
         except GraphRuntimeError:
             raise
         except Exception as exc:
+            # Provider 429 (planner, retrieval selection, answer, verifier
+            # or whole-turn judge) retires the runner for fresh-VM
+            # checkpoint recovery; wrapping it as "graph-failed" would let
+            # the application serve a natural fallback and lose the resume
+            # signal. Propagate without blind retry: the caller owns
+            # retire/restart and the checkpointer owns resume.
+            from aa.opencode.errors import OpenCodeRateLimitError as _TurnRateLimit
+
+            if isinstance(exc, _TurnRateLimit):
+                raise
             raise GraphRuntimeError("graph-failed", type(exc).__name__) from exc
         elapsed_ms = (_time.perf_counter() - started) * 1000.0
         final = str(result.get("final_response", "") or result.get("draft_response", ""))

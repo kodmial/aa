@@ -295,7 +295,7 @@ async def test_repair_budget_exceeded_skips_repair_and_narrows(
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fail_retrieve(index: Any, queries: object, *, config: Any = None) -> Any:
+    def _fail_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
         raise AssertionError("repair retrieval must not run over budget")
 
     monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fail_retrieve)
@@ -368,7 +368,7 @@ async def test_fast_turn_still_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
     from aa.retrieval import evidence as evidence_mod
     from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
         text = "Фиктивная другая поддержка рядом."
         passage = EvidencePassageData(
             passage_id="chapter-3#extra",

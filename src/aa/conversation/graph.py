@@ -342,13 +342,19 @@ def build_turn_graph(
         builder.add_node("retrieval_stub", retrieval_stub_node)
         retrieval_node_name = "retrieval_stub"
     else:
-        from aa.conversation.retrieval_node import make_retrieval_node
+        from aa.conversation.retrieval_node import make_retrieval_node as _make_node
 
+        # Issue #295: production retrieval uses the bound planner model for
+        # model-driven semantic selection over broad candidates BEFORE
+        # winner/pack budgeting (deep fused ranks stay inspectable). Unit
+        # tests without a selection-capable model keep the heuristic path.
+        _selection: Any = planner_model
         builder.add_node(
             "retrieval",
-            make_retrieval_node(
+            _make_node(
                 index=retrieval_index,
                 config=retrieval_config,
+                selection_model=_selection,
             ),
         )
         retrieval_node_name = "retrieval"

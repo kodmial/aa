@@ -59,16 +59,15 @@ def _twelve_queries(base: str = "support sobriety") -> list[str]:
 
 
 def test_answer_passage_display_bounded_but_provenance_preserved() -> None:
-    """Long passages truncate in display; ids and structure stay intact."""
-    assert ANSWER_MAX_PASSAGE_CHARS == 500
+    """Complete passages reach generation; ids and structure stay intact (#295)."""
+    assert ANSWER_MAX_PASSAGE_CHARS == 0
     long_text = "x" * 3000
     context = render_turn_context(
         summary="",
         passages=[EvidencePassage(passage_id="p1", source="s", section="c", text=long_text)],
         user_message="what helps with craving?",
     )
-    assert long_text not in context
-    assert "truncated" in context
+    assert long_text in context
     assert "p1" in context
     assert "<book_evidence>" in context
     assert "<user_message>" in context
@@ -76,7 +75,7 @@ def test_answer_passage_display_bounded_but_provenance_preserved() -> None:
 
 def test_answer_recent_bounded_but_count_and_live_turn_preserved() -> None:
     """Long history messages truncate; count/order and live turn preserved."""
-    assert ANSWER_MAX_MESSAGE_CHARS == 500
+    assert ANSWER_MAX_MESSAGE_CHARS == 1500
     long_text = "word " + "y" * 2000
     live = "why does that matter?"
     recent: list[BaseMessage] = [

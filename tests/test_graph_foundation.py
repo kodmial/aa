@@ -105,7 +105,7 @@ def _script_model(
 
 
 # ---------------------------------------------------------------------------
-# Planner schema: exactly 0 or 10..16 distinct queries.
+# Planner schema: exactly 0 or 1..16 distinct useful queries (#295 flexible).
 # ---------------------------------------------------------------------------
 
 
@@ -155,7 +155,21 @@ def test_planner_accepts_ten_and_sixteen() -> None:
     )
 
 
-@pytest.mark.parametrize("count", [1, 2, 5, 9, 17, 20])
+def test_planner_accepts_flexible_small_counts() -> None:
+    """Issue #295: 1..9 useful queries are valid without padding."""
+    for count in (1, 2, 5, 9):
+        queries = [f"запрос {index}" for index in range(count)]
+        plan = validate_query_plan(
+            QueryPlan(
+                mode="retrieval",
+                resolved_intent="standalone intent for test turn",
+                queries=queries,
+            )
+        )
+        assert len(plan.queries) == count
+
+
+@pytest.mark.parametrize("count", [17, 20])
 def test_planner_rejects_other_cardinalities(count: int) -> None:
     queries = [f"запрос {index}" for index in range(count)]
     with pytest.raises(QueryPlanValidationError):
@@ -177,21 +191,35 @@ def test_planner_dedupes_whitespace_case_duplicates() -> None:
         )
     )
     assert len(plan.queries) == 10
-    with pytest.raises(QueryPlanValidationError):
-        # Nine distinct after collapsing one exact duplicate.
-        duplicates = ["Трезвость", "трезвость "] + [f"запрос {index}" for index in range(8)]
-        validate_query_plan(
-            QueryPlan(
-                mode="retrieval",
-                resolved_intent="standalone intent for test turn",
-                queries=duplicates,
-            )
+    # Exact case/whitespace duplicates collapse to one distinct query.
+    collapsed = validate_query_plan(
+        QueryPlan(
+            mode="retrieval",
+            resolved_intent="standalone intent for test turn",
+            queries=["Трезвость", "трезвость "],
         )
+    )
+    assert collapsed.queries == ["Трезвость"]
+    # Nine distinct after collapsing one exact duplicate stays valid
+    # under the flexible 1..16 contract.
+    duplicates = ["Трезвость", "трезвость "] + [f"запрос {index}" for index in range(8)]
+    assert (
+        len(
+            validate_query_plan(
+                QueryPlan(
+                    mode="retrieval",
+                    resolved_intent="standalone intent for test turn",
+                    queries=duplicates,
+                )
+            ).queries
+        )
+        == 9
+    )
 
 
 def test_planner_schema_has_only_queries_field() -> None:
     assert set(QueryPlan.model_fields) == {"mode", "resolved_intent", "queries"}
-    assert MIN_NONEMPTY_QUERIES == 10
+    assert MIN_NONEMPTY_QUERIES == 1
     assert MAX_QUERIES == 16
 
 
@@ -204,8 +232,7 @@ def test_validate_structured_plan_uses_native_object() -> None:
         ).queries
         == []
     )
-    with pytest.raises(QueryPlanValidationError):
-        validate_structured_plan(_plan_obj(["один"]))
+    assert len(validate_structured_plan(_plan_obj(["один"])).queries) == 1
     with pytest.raises(QueryPlanValidationError):
         validate_structured_plan("not a structured object")
     with pytest.raises(QueryPlanValidationError):
@@ -908,7 +935,7 @@ def test_prompt_artifacts_are_versioned_english() -> None:
     assert "Return only the user-facing Russian reply." in agent
     assert "all substantive ideas" in agent
     assert "Return only the structured output." in planner
-    assert "10 to 16 semantically distinct Russian search queries" in planner
+    assert "1 to 16 semantically distinct useful Russian search queries" in planner
     assert "Conversation memory is not an authority" in summarizer
     for text in (agent, planner, summarizer):
         assert not _has_cyrillic(text)

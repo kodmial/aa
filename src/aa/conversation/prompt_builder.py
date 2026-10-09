@@ -76,31 +76,21 @@ class EvidencePassage:
 # checksum/quote/cite gates and verifier verdicts still use full exact
 # text, so grounding strictness is unchanged. Turn-independent, never an
 # exact-question special case.
-ANSWER_MAX_PASSAGE_CHARS = 500
+# Source passages must reach OpenCode in their entirety.
+ANSWER_MAX_PASSAGE_CHARS = 0  # Deprecated compatibility constant; passage text is never clipped.
 
-ANSWER_MAX_MESSAGE_CHARS = 500
+ANSWER_MAX_MESSAGE_CHARS = 1500
 
-# Bounded answer history count (Gate C+E live repair, kodmial/aa#217
-# recurrence 8 on exact main 46cf046 run 37717319855:
-# C:live-answer-no-generic-collapse plus E:latency-budget-exceeded p50
-# 18.0s / p95 30.1s / max 43.7s with planner p50 5.5s / p95 8.2s,
-# retrieval p50 0.4s, answer p50 7.3s / p95 11.8s / max 25.3s
-# (matching the message-text max 25.3s) and verifier p50 5.0s / p95
-# 12.0s, repair_turns=0, 74 text calls at p50 4.5s). Comparison with
-# recurrence 7 (58f943c run 37709271567: planner 8.4/9.9s, verifier
-# 10.1/12.0s, answer ~8.9s) shows recurrences 6/7 bounded the planner
-# and verifier attempt times, leaving the single answer draft as the
-# only unbounded model call on the base chain: one provider tail
-# directly breaches the 30s max and starves the downstream verifier
-# (2 unavailable units -> generic clarification). Repeating the same
-# per-passage/per-message char trim cannot converge (6->5 already
-# done twice on both windows). This bounds a different dimension at
-# the answer-assembly boundary: message COUNT. Only the last N
-# messages travel; older continuity stays via the running summary and
-# the live user message travels untruncated. Verification, checksum,
-# quote and cite gates still use the full stored pack. Turn-
-# independent, never an exact-question special case.
-ANSWER_MAX_HISTORY_MESSAGES = 6
+# Answer history window (issue #295: preserved multi-turn context).
+# The last N messages travel with a wide per-message bound so short
+# follow-ups, referents, topic shifts and sufficient original dialogue
+# stay available for pronoun/ellipsis resolution; older continuity stays
+# via the running summary and the live user message travels untruncated.
+# Verification, checksum, quote and cite gates still use the full stored
+# pack. Turn-independent, never an exact-question special case. Voice
+# and text share this exact pipeline per #294 (voice ASR/TTS is
+# transport-only, never a separate content limit).
+ANSWER_MAX_HISTORY_MESSAGES = 12
 
 ANSWER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
@@ -142,7 +132,7 @@ def render_turn_context(
     lines.append("<book_evidence>")
     if passages:
         for passage in passages:
-            display = _display_answer_text(passage.text, limit=ANSWER_MAX_PASSAGE_CHARS)
+            display = passage.text  # Preserve entire canonical evidence passage.
             lines.append(
                 f"<passage id={_xml_quoteattr(passage.passage_id)} "
                 f"source={_xml_quoteattr(passage.source)} "
