@@ -1831,15 +1831,22 @@ def build_live_whole_turn_judge(client: Any, settings: Any) -> Any:
     from aa.conversation.model_adapter import OpenCodeChatModel
     from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
 
+    # Grounding verifier uses Muse Spark without a Space Bunny fallback.
+    # The independent quality judge must have the same minimum model
+    # capability. In run 37884099275 the evaluator silently served Space
+    # Bunny for 16/17 invocations and overturned eight production verdicts.
+    # An unavailable primary is a visible fail-closed qualification blocker,
+    # NOT a fabricated semantic negative returned by a weaker model.
+    # Omit the wire agent just as build_verifier_model does: the logical
+    # audit identity, fresh session and independent system prompt remain.
     primary = str(getattr(settings, "opencode_model", "") or "")
-    fallback = str(getattr(settings, "opencode_fallback_model", "") or "")
-    base = OpenCodeChatModel(
+    return OpenCodeChatModel(
         client,
-        agent="aa-live-qualification-base",
+        agent=WHOLE_TURN_JUDGE_AGENT_V2,
         primary_model=primary,
-        fallback_model=fallback,
+        fallback_model="",
+        transport_agent="",
     )
-    return base.with_agent(WHOLE_TURN_JUDGE_AGENT_V2)
 
 
 async def assess_live_helpfulness_with_judge_metrics(
@@ -1898,7 +1905,8 @@ async def assess_live_helpfulness_with_judge_metrics(
     except OpenCodeRateLimitError:
         # Preserve the caller's fresh-runner 429 recovery contract.
         raise
-    except Exception:
+    except Exception as exc:
+        metrics["judge_failure_category"] = type(exc).__name__[:64]
         return False, metrics
     metrics["judge_helpful"] = bool(judgement.helpful)
     metrics["judge_available"] = bool(judgement.available)
