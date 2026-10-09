@@ -37,7 +37,7 @@ def test_dockerfile_is_reproducible_and_secret_free() -> None:
 def test_digest_file_and_runtime_pin_are_immutable_and_consistent() -> None:
     lines = _read(ROOT / "docker" / "aa-runtime.digest").strip().splitlines()
     digest = lines[-1].strip()
-    assert re.fullmatch(r"ghcr\\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}", digest)
+    assert re.fullmatch(r"ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}", digest)
     workflow = _read(WORKFLOWS / "aa-runtime.yml")
     container_active = "\n    container:\n" in workflow
     placeholder = digest.endswith(":" + "0" * 64)
