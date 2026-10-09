@@ -65,47 +65,11 @@ logger = logging.getLogger("aa.conversation.verifier")
 
 VERIFIER_AGENT_V2 = "aa-verifier-v2"
 
-# Bounded verifier evidence window: the full 16k-token Evidence Pack (up to
-# 12 passages) makes the verifier prompt the largest per-turn structured
-# model input. The display window keeps the top-ranked passages only,
-# cutting verifier input tokens and latency while the stored-pack
-# deterministic checks below still use the full pack, so grounding
-# strictness is unchanged: the model may only cite listed ids, and every
-# cited id is still validated against the full pack plus
-# checksum/quote gates. Turn-independent, never an exact-question special
-# case.
-#
-# Gate C+E live repair, kodmial/aa#217 recurrence 7 on exact main
-# 58f943c run 37709271567: verifier input averages ~3k tokens per
-# request on the slow text path (p50 6.0s) while drafts cite only the
-# top-ranked passages (response_units_total=5 over 8 answer rounds).
-# Narrowing the display window from 6 to the top 5 passages removes the
-# least-relevant display tokens from every verifier call; verification,
-# checksum, quote and cite gates still use the full stored pack.
+# Verify against every passage actually supplied to the answer generator.
+# Do not silently drop lower-ranked passages at the verifier boundary.
 VERIFIER_MAX_EVIDENCE_PASSAGES = 0  # No display-window cap: verify against the full pack.
 
-# Bounded per-passage display length for the verifier prompt only.
-# Truncating display text bounds input tokens and latency while
-# deterministic cite/quote/checksum gates still use the full stored pack.
-# Display truncation is explicitly marked with ``... [truncated ...]`` so
-# the model can see the passage is incomplete and withhold support instead
-# of judging on a silently cut prefix. Turn-independent, never an
-# exact-question special case.
-#
-# Recurrence 7 (same run): 800 chars still leaves the verifier as the
-# largest per-unit model input on the critical path; 600 chars keeps
-# several sentences of decisive context per passage with the explicit
-# marker while cutting ~25% of display tokens per call.
-#
-# kodmial/aa#244 on exact main a0d377a run 37753553708
-# (C:live-book-grounding-substantive-drinking-2 plus E p50 18.9s / p95
-# 24.3s, verifier p50 4.7s / p95 9.4s over 38 per-unit text calls at
-# message-text p50 4.5s / p95 10.0s): 500 chars keeps several sentences
-# of decisive context per passage with the explicit marker while cutting
-# a further ~17% of display tokens per verifier call. Verification,
-# checksum, quote and cite gates still use the full stored pack, so
-# grounding strictness is unchanged. Turn-independent, never an
-# exact-question special case.
+# Preserve exact canonical passage text for the OpenCode verifier.
 VERIFIER_MAX_PASSAGE_CHARS = 0  # No truncation of book evidence.
 
 VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
@@ -114,7 +78,6 @@ VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 def _display_passage_text(text: str) -> str:
     """Preserve every character of canonical book evidence for OpenCode."""
     return text
-
 
 
 def _escape(value: str) -> str:
