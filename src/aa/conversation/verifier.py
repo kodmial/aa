@@ -82,7 +82,7 @@ VERIFIER_AGENT_V2 = "aa-verifier-v2"
 # Narrowing the display window from 6 to the top 5 passages removes the
 # least-relevant display tokens from every verifier call; verification,
 # checksum, quote and cite gates still use the full stored pack.
-VERIFIER_MAX_EVIDENCE_PASSAGES = 5
+VERIFIER_MAX_EVIDENCE_PASSAGES = 0  # No display-window cap: verify against the full pack.
 
 # Bounded per-passage display length for the verifier prompt only.
 # Truncating display text bounds input tokens and latency while
@@ -106,19 +106,15 @@ VERIFIER_MAX_EVIDENCE_PASSAGES = 5
 # checksum, quote and cite gates still use the full stored pack, so
 # grounding strictness is unchanged. Turn-independent, never an
 # exact-question special case.
-VERIFIER_MAX_PASSAGE_CHARS = 500
+VERIFIER_MAX_PASSAGE_CHARS = 0  # No truncation of book evidence.
 
 VERIFIER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
 
 def _display_passage_text(text: str) -> str:
-    """Bound one passage display text for the verifier prompt (no semantics)."""
-    if len(text) <= VERIFIER_MAX_PASSAGE_CHARS:
-        return text
-    omitted = len(text) - VERIFIER_MAX_PASSAGE_CHARS
-    return text[:VERIFIER_MAX_PASSAGE_CHARS] + VERIFIER_TRUNCATION_SUFFIX_FORMAT.format(
-        omitted=omitted
-    )
+    """Preserve every character of canonical book evidence for OpenCode."""
+    return text
+
 
 
 def _escape(value: str) -> str:
@@ -869,7 +865,7 @@ def build_single_unit_text(
         lines.append("<conversation_context>")
         lines.append(_escape(conversation_context[:2000]))
         lines.append("</conversation_context>")
-    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    window = list(passages)
     if window:
         position = 0
         for passage in window:
@@ -1029,7 +1025,7 @@ async def _verify_single_unit(
         user_message=user_message,
         conversation_context=conversation_context,
     )
-    window = list(passages[:VERIFIER_MAX_EVIDENCE_PASSAGES])
+    window = list(passages)
     short_to_full = display_id_map_for_window(window)
     full_ids = set(_pack_index(passages).keys())
     structured_invoke = getattr(model, "ainvoke_structured", None)
