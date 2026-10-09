@@ -106,3 +106,24 @@ async def test_independent_judge_429_propagates_to_hosted_runner() -> None:
             reply="Тестовый ответ.",
             model=_429Failure(),
         )
+
+
+async def test_live_judge_429_is_not_counted_as_unhelpful() -> None:
+    from aa.opencode.errors import OpenCodeRateLimitError
+    from aa.qualification.product_contract_live import (
+        assess_live_helpfulness_with_judge_metrics,
+    )
+
+    snapshot = {
+        "adequacy_verdict": "pass",
+        "answers_request": True,
+        "technically_grounded": True,
+        "answer_relevant": True,
+    }
+    with pytest.raises(OpenCodeRateLimitError):
+        await assess_live_helpfulness_with_judge_metrics(
+            prompt="synthetic question",
+            snapshot=snapshot,
+            reply="Тестовый ответ.",
+            judge_model=_429Failure(),
+        )
