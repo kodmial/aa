@@ -85,7 +85,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Fail closed if private material would enter the image context.
+          # Docker context is ./docker; docker/.dockerignore allowlists only Dockerfile and version file.
+          # Verify that repository private assets cannot be included even if new files appear.
           forbidden=(
             "corpus/source/raw"
             "corpus/source/raw-ru"
@@ -109,11 +110,11 @@ jobs:
           echo "Build-context secret scan PASS."
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a05cbb56c5679a0e6939a802f0c851 # v3
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR (trusted publish events only)
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb463fcef0c0d # v3
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -128,10 +129,12 @@ jobs:
 
       - name: Build and push (trusted events) / build only (PRs)
         id: push
-        uses: docker/build-push-action@263435318d21b8e4b434bb7e354b0de442448e2 # v6
+        uses: docker/build-push-action@v6
         with:
-          context: .
-          file: docker/Dockerfile.aa-runtime
+          # Build context contains ONLY immutable environment inputs under docker/.
+          # The repository code and corpus are never sent to Docker BuildKit.
+          context: ./docker
+          file: ./docker/Dockerfile.aa-runtime
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
@@ -189,8 +192,8 @@ jobs:
             ffmpeg -version | head -n 1
             python -c "import torch, sherpa_onnx, onnxruntime; print(\"native imports ok\")"
             /root/.opencode/bin/opencode --version
-          ' || docker run --rm ghcr.io/kodmial/aa-runtime:sha-${{ github.sha }} true
-          echo "PR image validation done (no push)."
+          '
+          echo "PR image validation PASS (no push)."
 
       - name: Record digest artifact
         if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
