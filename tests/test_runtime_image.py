@@ -31,19 +31,47 @@ def test_dockerfile_is_reproducible_and_secret_free() -> None:
     assert "1.18.34" in _read(ROOT / "docker" / "opencode.version")
     for forbidden in ("TELEGRAM_BOT_TOKEN", "AGE-SECRET-KEY", "corpus/generated"):
         assert forbidden not in text
-    assert "COPY docker/opencode.version" in text
+    assert "COPY opencode.version" in text
 
 
 def test_digest_file_and_runtime_pin_are_immutable_and_consistent() -> None:
     lines = _read(ROOT / "docker" / "aa-runtime.digest").strip().splitlines()
     digest = lines[-1].strip()
-    assert re.fullmatch(r"ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}", digest)
+    assert re.fullmatch(r"ghcr\\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}", digest)
     workflow = _read(WORKFLOWS / "aa-runtime.yml")
-    assert "ghcr.io/kodmial/aa-runtime@sha256:" in workflow
-    assert digest in workflow
-    assert "container:" in workflow
-    assert "credentials:" in workflow
-    assert "packages: read" in workflow
+    container_active = "\\n    container:\\n" in workflow
+    placeholder = digest.endswith(":" + "0" * 64)
+    if placeholder:
+        # A PR that points production to a nonexistent image must NEVER merge.
+        assert not container_active
+        assert "ghcr.io/kodmial/aa-runtime@sha256:" not in workflow
+    else:
+        assert container_active
+        assert digest in workflow
+        assert "credentials:" in workflow
+        assert "packages: read" in workflow
+
+
+def test_docker_context_excludes_source_and_user_data() -> None:
+    dockerignore = _read(ROOT / "docker" / ".dockerignore")
+    assert "*" in dockerignore.splitlines()
+    assert "!Dockerfile.aa-runtime" in dockerignore.splitlines()
+    assert "!opencode.version" in dockerignore.splitlines()
+    workflow = _read(WORKFLOWS / "aa-runtime-image.yml")
+    assert "context: ./docker" in workflow
+    dockerfile = _read(ROOT / "docker" / "Dockerfile.aa-runtime")
+    copy_lines = [x.strip() for x in dockerfile.splitlines()
+                  if x.strip().startswith(("COPY ", "ADD "))]
+    assert copy_lines == ["COPY opencode.version /opt/aa/opencode.version"]
+
+
+def test_image_validation_cannot_fall_open() -> None:
+    workflow = _read(WORKFLOWS / "aa-runtime-image.yml")
+    assert "|| docker run" not in workflow
+    assert "PR image validation PASS" in workflow
+    assert "docker/build-push-action@v6" in workflow
+    assert "docker/setup-buildx-action@v3" in workflow
+    assert "docker/login-action@v3" in workflow
 
 
 def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
@@ -51,7 +79,7 @@ def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
     assert "group: aa-bot-runtime" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "Reject duplicate runtime" in workflow
-    assert "verify_runtime_image.py" in workflow
+    assert "verify_runtime_image.py" in _read(WORKFLOWS / "aa-runtime-image.yml")
     assert "git rev-parse HEAD" in workflow
     assert "opencode --version" in workflow
     assert "encoder=libopus" in workflow
