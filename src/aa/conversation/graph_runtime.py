@@ -178,25 +178,13 @@ class GraphTurnRuntime:
             try:
                 from aa.conversation.finalization import AnswerCandidate as _DCandidate
                 from aa.conversation.finalization import (
-                    VerificationCertificate as _DCertificate,
-                )
-                from aa.conversation.finalization import (
-                    WholeAnswerVerdict as _DWhole,
-                )
-                from aa.conversation.finalization import (
                     certify_candidate as _DCertify,
                 )
                 from aa.conversation.finalization import (
                     context_digest_for_turn as _DContext,
                 )
                 from aa.conversation.finalization import (
-                    evidence_digest_for_pack as _DEvidence,
-                )
-                from aa.conversation.finalization import (
                     normalize_answer_text as _DNormalize,
-                )
-                from aa.conversation.finalization import (
-                    sha256_text as _DSha,
                 )
 
                 normalized_reply = _DNormalize(reply)
@@ -221,28 +209,24 @@ class GraphTurnRuntime:
                         summary="",
                         recent_messages=[],
                     )
-                except Exception:
-                    # Certification must never weaken the delegate contract:
-                    # when the generic gate cannot certify (e.g. unsafe or
-                    # over-envelope test fixture), fall back to a
-                    # digest-bound clarification record so digest mismatch
-                    # still fails closed downstream without inventing a
-                    # positive semantic verdict.
-                    delegate_certificate = _DCertificate(
-                        answer_sha256=_DSha(normalized_reply),
-                        evidence_digest=_DEvidence([]),
-                        context_digest=delegate_context,
-                        claim_verdicts=[],
-                        whole_answer_verdict=_DWhole(
-                            supported=False,
-                            addresses_intent=False,
-                            coverage_ok=False,
-                            conditions_preserved=False,
-                            quote_ok=False,
-                            reason="delegate-uncertified",
-                            failure_code="delegate-uncertified",
-                        ),
+                except Exception as exc:
+                    # Fail closed: an uncertifiable delegate reply is
+                    # never delivered, appended to history, or masked
+                    # with a synthesized negative certificate.
+                    raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
+                try:
+                    from aa.conversation.finalization import (
+                        verify_certificate as _DVerify,
                     )
+
+                    _DVerify(
+                        candidate=delegate_candidate,
+                        certificate=delegate_certificate,
+                    )
+                except GraphRuntimeError:
+                    raise
+                except Exception as exc:
+                    raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
                 try:
                     self._last_certificates[thread] = {
                         "candidate": delegate_candidate.model_dump(mode="json"),
@@ -313,6 +297,29 @@ class GraphTurnRuntime:
 
             candidate_raw = result.get("answer_candidate", None)
             certificate_raw = result.get("verification_certificate", None)
+            if str(result.get("route", "normal")) != "normal":
+                # Control route (command/blocked/emergency): finalize
+                # returns no book candidate/certificate by design, so the
+                # book-certification gate must not reject it here. Control
+                # text still requires a non-empty reply and never consumes
+                # a book certificate.
+                if not isinstance(final_raw, str) or not final_raw.strip():
+                    raise GraphRuntimeError("empty-reply", "graph returned no text")
+                final = final_raw
+                try:
+                    self._last_certificates.pop(thread, None)
+                except Exception:
+                    pass
+                self._record_stage_telemetry(thread, result, elapsed_ms, len(final))
+                logger.info(
+                    "graph turn completed",
+                    extra={
+                        "reply_len": len(final),
+                        "latency_ms": round(elapsed_ms, 1),
+                        "route": str(result.get("route", "normal")),
+                    },
+                )
+                return final
             if not isinstance(candidate_raw, dict) or not isinstance(certificate_raw, dict):
                 raise GraphRuntimeError("uncertified-reply", "missing delivery certificate")
             candidate = _Candidate.model_validate(candidate_raw)

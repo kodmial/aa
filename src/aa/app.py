@@ -105,6 +105,58 @@ _NEW_REPLY = "Новая беседа начата."
 _TEMPORARY_ERROR_REPLY = SERVICE_ERROR_REPLY
 _BUSY_REPLY = "Сейчас много сообщений. Попробуйте ещё раз через минуту."
 
+
+def _is_allowed_control_reply(text: str) -> bool:
+    """Whether ``text`` is a typed non-answer control reply (no certificate).
+
+    Only explicitly classified control templates may bypass book
+    certification: the bounded emergency responses and the bounded voice
+    failure replies. Everything else without a certificate fails closed.
+    """
+    try:
+        from aa.safety.response import EMERGENCY_RESPONSE_EN, EMERGENCY_RESPONSE_RU
+
+        if text in (EMERGENCY_RESPONSE_RU, EMERGENCY_RESPONSE_EN):
+            return True
+    except Exception:
+        pass
+    try:
+        from aa.telegram.voice import (
+            VOICE_EMPTY_REPLY,
+            VOICE_ERROR_REPLY,
+            VOICE_TOO_LARGE_REPLY,
+            VOICE_UNAVAILABLE_REPLY,
+        )
+
+        if text in (
+            VOICE_ERROR_REPLY,
+            VOICE_EMPTY_REPLY,
+            VOICE_TOO_LARGE_REPLY,
+            VOICE_UNAVAILABLE_REPLY,
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_voiceable_control_reply(text: str) -> bool:
+    """Whether ``text`` is a deterministic control template safe to voice.
+
+    Only the bounded emergency responses may be synthesized: they carry
+    no book certificate by design and are tamper-evident by exact
+    allow-list match. Voice failure replies stay text-only.
+    """
+    try:
+        from aa.safety.response import EMERGENCY_RESPONSE_EN, EMERGENCY_RESPONSE_RU
+
+        if text in (EMERGENCY_RESPONSE_RU, EMERGENCY_RESPONSE_EN):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # Explicit runtime lifecycle states (issue #145). READY is published only
 # after OpenCode health + Telegram bootstrap + long polling are all live;
 # /bot status distinguishes STARTING (bootstrap in progress) from READY.
@@ -943,6 +995,78 @@ class Application:
             logger.info("voice reply fallback to text")
             _record_voice("failed", "sendVoice")
             return False
+        # Delivery gate re-verification (same as the text path): voice
+        # must never bypass the stale/missing-certificate block. Only
+        # the exact certified text may be synthesized; anything else
+        # falls back to text (which fails closed) instead of sending.
+        # Deterministic control templates (bounded emergency replies)
+        # carry no book certificate by design and are tamper-evident by
+        # exact allow-list match, so they may be voiced identically.
+        try:
+            from aa.conversation.finalization import (
+                AnswerCandidate as _VCandidate,
+            )
+            from aa.conversation.finalization import (
+                VerificationCertificate as _VCertificate,
+            )
+            from aa.conversation.finalization import (
+                normalize_answer_text as _vnormalize,
+            )
+            from aa.conversation.finalization import (
+                sha256_text as _vsha_check,
+            )
+            from aa.conversation.finalization import (
+                verify_certificate as _vverify,
+            )
+
+            if _vnormalize(reply) != reply:
+                logger.warning("voice delivery blocked: post-cert mutation")
+                _record_voice("failed", "sendVoice")
+                return False
+            if is_service_error(reply):
+                _record_voice("failed", "sendVoice")
+                return False
+            if not _is_voiceable_control_reply(reply):
+                cert_store_v: dict[str, Any] = {}
+                if self._graph_runtime is not None:
+                    try:
+                        thread_v = self._graph_runtime.thread_id(incoming.chat_id)
+                        cert_store_v = self._graph_runtime.last_certificate_for_thread(thread_v)
+                    except Exception:
+                        cert_store_v = {}
+                stored_candidate_v = (
+                    cert_store_v.get("candidate", {}) if isinstance(cert_store_v, dict) else {}
+                )
+                stored_certificate_v = (
+                    cert_store_v.get("certificate", {}) if isinstance(cert_store_v, dict) else {}
+                )
+                if (
+                    not isinstance(stored_candidate_v, dict)
+                    or not isinstance(stored_certificate_v, dict)
+                    or not stored_certificate_v.get("answer_sha256", "")
+                ):
+                    logger.warning("voice delivery blocked: missing certificate")
+                    _record_voice("failed", "sendVoice")
+                    return False
+                if _vsha_check(reply) != str(stored_certificate_v.get("answer_sha256", "")):
+                    logger.warning("voice delivery blocked: stale certificate")
+                    _record_voice("failed", "sendVoice")
+                    return False
+                _vverify(
+                    candidate=_VCandidate.model_validate(stored_candidate_v),
+                    certificate=_VCertificate.model_validate(stored_certificate_v),
+                )
+                if _VCandidate.model_validate(stored_candidate_v).text != reply:
+                    logger.warning("voice delivery blocked: stale certificate")
+                    _record_voice("failed", "sendVoice")
+                    return False
+        except Exception:
+            logger.warning("voice delivery blocked: certification error")
+            try:
+                _record_voice("failed", "sendVoice")
+            except Exception:
+                pass
+            return False
         voice = self._resolve_voice_for_turn(voice_presentation)
         if voice not in (DEFAULT_VOICE, "eugene"):
             voice = DEFAULT_VOICE
@@ -1087,6 +1211,17 @@ class Application:
                 and bool(stored_certificate.get("answer_sha256", ""))
             )
             if not has_certificate:
+                # Only explicitly classified control templates bypass
+                # book certification. Any other missing/stale certificate
+                # fails closed to the service error instead of sending
+                # with an empty certificate id.
+                if not _is_allowed_control_reply(reply):
+                    logger.warning("telegram delivery blocked: missing certificate")
+                    try:
+                        await _send_single(SERVICE_ERROR_REPLY)
+                    except Exception:
+                        pass
+                    return receipts
                 # Explicitly classified protocol/service/command/emergency
                 # control path (no book certificate by design): typed
                 # policy handling, never a certified book answer. Send
@@ -1137,8 +1272,39 @@ class Application:
                     except Exception:
                         pass
                     return receipts
+                # Full digest re-verification before send: text, evidence
+                # bundle, and context snapshot must all match the stored
+                # certificate, which must also carry a positive verdict.
+                from aa.conversation.finalization import (
+                    AnswerCandidate as _SendCandidate,
+                )
+                from aa.conversation.finalization import (
+                    VerificationCertificate as _SendCertificate,
+                )
+                from aa.conversation.finalization import (
+                    verify_certificate as _send_verify,
+                )
+
+                _send_verify(
+                    candidate=_SendCandidate.model_validate(stored_candidate),
+                    certificate=_SendCertificate.model_validate(stored_certificate),
+                )
+                if _SendCandidate.model_validate(stored_candidate).text != normalized or _sha(
+                    normalized
+                ) != str(_SendCertificate.model_validate(stored_certificate).answer_sha256):
+                    logger.warning("telegram delivery blocked: stale certificate")
+                    try:
+                        await _send_single(SERVICE_ERROR_REPLY)
+                    except Exception:
+                        pass
+                    return receipts
             except Exception:
-                pass
+                logger.warning("telegram delivery blocked: certification error")
+                try:
+                    await _send_single(SERVICE_ERROR_REPLY)
+                except Exception:
+                    pass
+                return receipts
             segments = _split_certified(normalized)
             pending = _build_receipts(
                 certified_text=normalized,

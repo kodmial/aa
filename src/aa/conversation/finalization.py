@@ -201,7 +201,6 @@ def infer_outcome_kind(
     telemetry: dict[str, Any] | None = None,
 ) -> OutcomeKind:
     """Infer the type-specific verification kind for one served candidate."""
-    _ = text
     telemetry_d = dict(telemetry) if isinstance(telemetry, dict) else {}
     if str(telemetry_d.get("outbound_safety", "") or "") == "repaired":
         return "safety"
@@ -216,6 +215,16 @@ def infer_outcome_kind(
     has_book = any(item.get("scope") == "book" for item in units)
     if has_book or bool(evidence_pack):
         return "answer"
+    # No book units and no evidence: only a short non-substantive
+    # clarification may take the weak path. Substantive text with
+    # missing/undetected verdicts must take the strong answer path so
+    # missing-verdicts/support/coverage checks fail closed instead of
+    # being skipped as clarification.
+    stripped = str(text or "").strip()
+    if stripped:
+        words = len(stripped.split())
+        if words >= 12 or len(stripped) >= 160:
+            return "answer"
     return "clarification"
 
 
@@ -374,8 +383,14 @@ def evaluate_whole_answer(
                         reason="story/example without source anchor",
                         failure_code="story-misuse",
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Anchor/provenance helper failure must fail closed: an
+            # unanchored narrative alongside book claims must never pass
+            # certification when anchoring itself could not be proven.
+            return WholeAnswerVerdict(
+                reason=f"story anchor check failed: {type(exc).__name__}",
+                failure_code="story-misuse",
+            )
     # Unanswered parts: whole-turn adequacy must pass for substantive kinds.
     if outcome_kind in ("answer", "safety"):
         try:
@@ -640,7 +655,20 @@ def certify_candidate(
     except Exception as exc:
         raise FinalizationError("outbound-safety", f"{type(exc).__name__}") from exc
     if not bool(envelope_passes(normalized)):
-        raise FinalizationError("envelope", "candidate exceeds the single-message envelope")
+        # A lawful multi-segment answer is certified whole and split only
+        # at the transport boundary with preservation proof
+        # (split_certified_text). Reject only payloads that cannot split
+        # into envelope-passing segments.
+        try:
+            from aa.conversation.output_limits import (
+                split_text_to_envelope_segments as _split_ok,
+            )
+
+            _split_ok(normalized)
+        except Exception as exc:
+            raise FinalizationError(
+                "envelope", "candidate exceeds the single-message envelope"
+            ) from exc
     # Language/privacy presentation contract on the exact text.
     try:
         from aa.conversation.turn_pipeline import contains_cyrillic as _has_cyrillic
@@ -748,10 +776,11 @@ def verify_transport_split(certified_text: str, segments: list[str]) -> None:
             raise FinalizationError("transport-envelope", "segment exceeds the envelope")
         if normalize_answer_text(segment) != segment:
             raise FinalizationError("transport-normalize", "segment mutated after certification")
-    # Order/text preservation: whitespace-normalized reassembly must equal
-    # the certified text; lengths must prove no semantic shortening.
+    # Order/text preservation: exact reassembly must equal the
+    # certified text; whitespace mutations (newline/paragraph collapses)
+    # fail closed and lengths must prove no semantic shortening.
     reassembled = " ".join(segments)
-    if _whitespace_key(reassembled) != _whitespace_key(normalized):
+    if reassembled != normalized:
         raise FinalizationError("transport-reorder", "segments do not reassemble to certified text")
     if _quote_chars(reassembled) != _quote_chars(normalized):
         raise FinalizationError("transport-quotes", "quote content changed in transport split")
@@ -777,8 +806,11 @@ def build_delivery_receipts(
     for index, segment in enumerate(segments):
         start = normalized.find(segment, cursor)
         if start < 0:
-            # Whitespace-joined reassembly proven above; locate by order.
-            start = cursor
+            # Never emit guessed offsets: a segment that cannot be
+            # located exactly means the split was not losslessly
+            # proven above, so fail closed instead of reporting
+            # incorrect char/utf8 ranges.
+            raise FinalizationError("transport-receipt", "segment not found in certified text")
         end = start + len(segment)
         cursor = end
         utf8_start = len(normalized[:start].encode("utf-8"))

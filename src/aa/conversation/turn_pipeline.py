@@ -3319,10 +3319,10 @@ async def answer_pipeline_node(
     served_pack = [
         dict(item) for item in (outcome.get("evidence_pack", []) or []) if isinstance(item, dict)
     ]
-    if not served_pack:
-        served_pack = [
-            dict(item) for item in state.get("evidence_pack", []) if isinstance(item, dict)
-        ]
+    # Never reuse the pre-repair state pack when the outcome carries no
+    # evidence: a repair that acquired new evidence but did not populate
+    # the outcome must fail closed on the empty pack downstream instead
+    # of certifying an outdated bundle.
     # Serialized unit texts let the finalizer bind the exact delivered
     # text to stored claim verdicts by verbatim text (renumbering-safe),
     # so narrowing/compaction subsets verify without borrowed verdicts.
