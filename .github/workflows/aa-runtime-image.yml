@@ -145,8 +145,10 @@ jobs:
             type=gha,scope=aa-runtime-image
           cache-to: |
             ${{ github.event_name != 'pull_request' && 'type=registry,ref=ghcr.io/kodmial/aa-runtime:buildcache,mode=max' || '' }}
-          provenance: true
-          sbom: true
+          # Docker --load on PR can only import a single-platform image,
+          # not an attestation manifest index. Trusted GHCR pushes retain both.
+          provenance: ${{ github.event_name != 'pull_request' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
 
       - name: Validate image contents (trusted events, by digest)
         if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
