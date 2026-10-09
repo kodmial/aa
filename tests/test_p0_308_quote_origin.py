@@ -32,7 +32,6 @@ from aa.conversation.quote_provenance import (
 from aa.conversation.response_units import split_response_units
 from aa.conversation.turn_pipeline import final_book_quote_chars as pipeline_book_quotes
 from aa.conversation.verifier import (
-    check_cited_passage_ids,
     check_exact_quotes,
     check_quote_origins,
     coerce_single_verdict,
@@ -310,21 +309,32 @@ def test_user_report_requiring_book_evidence_fails_closed() -> None:
 
 
 def test_advice_without_book_support_fails_closed() -> None:
-    """Reworded advice with no cited passage fails the cite gate."""
+    """Reworded advice with no cited passage fails closed (decision boundary)."""
     units = split_response_units("Вам следует полностью изменить жизнь сегодня.")
-    result = _assemble(
-        units,
-        [
+    # kodmial/aa#310: a supported book claim with empty citations fails at
+    # the strict decision boundary, before the cite gate ever runs.
+    with pytest.raises(VerifierValidationError):
+        _assemble(
+            units,
+            [
+                {
+                    "requires_book_evidence": True,
+                    "supported": True,
+                    "evidence_passage_ids": [],
+                    "addresses_intent": True,
+                }
+            ],
+        )
+    with pytest.raises(VerifierValidationError):
+        coerce_single_verdict(
             {
                 "requires_book_evidence": True,
                 "supported": True,
                 "evidence_passage_ids": [],
                 "addresses_intent": True,
-            }
-        ],
-    )
-    with pytest.raises(VerifierValidationError):
-        check_cited_passage_ids(result, pack_ids={"chapter-3#range:0-64:deadbeef"})
+            },
+            unit_id="u1",
+        )
 
 
 def test_mixed_user_report_and_book_claim_cannot_launder() -> None:

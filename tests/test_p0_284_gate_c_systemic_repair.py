@@ -130,6 +130,8 @@ async def test_substantive_verifier_outage_still_fails_closed() -> None:
             "char_start": 0,
             "char_end": len(pack_text),
             "text_sha256": hashlib.sha256(pack_text.encode("utf-8")).hexdigest(),
+            "source_sha256": "s" * 64,
+            "corpus_version": "r" * 64,
         }
     ]
     with _pt.raises(_TF) as _exc:

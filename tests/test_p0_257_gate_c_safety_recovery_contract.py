@@ -66,6 +66,8 @@ def _pack_entry(passage_id: str, text: str) -> dict[str, Any]:
         "char_start": 0,
         "char_end": len(text),
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_sha256": "s" * 64,
+        "corpus_version": "r" * 64,
     }
 
 

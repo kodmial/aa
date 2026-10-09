@@ -221,21 +221,31 @@ def build_planner_messages(
 
     The role prompt travels as a native system message; the human message
     carries only conversation context and the live turn. No JSON
-    instructions are embedded.
+    instructions are embedded. All dynamic content travels through the
+    shared safe serializer (kodmial/aa#310) as untrusted data: it cannot
+    terminate blocks, create elements, or impersonate roles.
     """
+    from aa.conversation.prompt_safety import (
+        UNTRUSTED_DATA_POLICY_LINE,
+        escape_xml_text,
+    )
+
     system_text = load_planner_system_v2()
-    lines: list[str] = []
+    lines: list[str] = [UNTRUSTED_DATA_POLICY_LINE]
     summary_text = _render_context_value(summary)
     if summary_text.strip():
         lines.append("Conversation context (continuity only, not evidence):")
-        lines.append(summary_text.strip())
+        lines.append("<conversation_context>")
+        lines.append(escape_xml_text(summary_text.strip()))
+        lines.append("</conversation_context>")
     if recent:
         lines.append("Recent messages:")
         for message in recent:
             role = "user" if message.type == "human" else "assistant"
-            lines.append(f"{role}: {_render_recent_value(message.content)}")
-    lines.append("Current user message:")
-    lines.append(user_message)
+            lines.append(f"{role}: {escape_xml_text(_render_recent_value(message.content))}")
+    lines.append("<current_user_message>")
+    lines.append(escape_xml_text(user_message))
+    lines.append("</current_user_message>")
     return [
         SystemMessage(content=system_text),
         HumanMessage(content="\n".join(lines)),

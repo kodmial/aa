@@ -21,11 +21,10 @@ later generation task owns the answer node itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xml.sax.saxutils import escape as _xml_escape
-from xml.sax.saxutils import quoteattr as _xml_quoteattr
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
+from aa.conversation.prompt_safety import escape_xml_text, quote_xml_attr
 from aa.conversation.v2_prompts import load_aa_agent_system_v2
 
 
@@ -106,7 +105,7 @@ def _display_answer_text(value: object, *, limit: int) -> str:
 
 def _escape_text(value: str) -> str:
     """Escape dynamic text so XML block boundaries stay literal data."""
-    return _xml_escape(value, {"'": "&apos;", '"': "&quot;"})
+    return escape_xml_text(value)
 
 
 def render_turn_context(
@@ -137,9 +136,9 @@ def render_turn_context(
         for passage in passages:
             display = passage.text  # Preserve entire canonical evidence passage.
             lines.append(
-                f"<passage id={_xml_quoteattr(passage.passage_id)} "
-                f"source={_xml_quoteattr(passage.source)} "
-                f"section={_xml_quoteattr(passage.section)}>"
+                f"<passage id={quote_xml_attr(passage.passage_id)} "
+                f"source={quote_xml_attr(passage.source)} "
+                f"section={quote_xml_attr(passage.section)}>"
                 f"{_escape_text(display)}</passage>"
             )
     else:

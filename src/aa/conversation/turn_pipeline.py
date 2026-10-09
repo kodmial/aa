@@ -995,6 +995,18 @@ async def run_v2_answer_turn(
 
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
+    # Authoritative pack integrity before any answer/verifier model call
+    # (kodmial/aa#310): corrupt packs fail here, before generation and
+    # before verification, including every repair path below. Empty pack
+    # (glue/user-report) passes.
+    try:
+        from aa.conversation.evidence_integrity import validate_book_pack_for_model_use
+
+        validate_book_pack_for_model_use(pack)
+    except Exception as exc:
+        from aa.conversation.failures import TurnFailed as _PackTurnFailed
+
+        raise _PackTurnFailed("evidence-integrity", f"evidence pack invalid: {exc}") from exc
     # Model-driven semantic ordering over the broad Evidence Pack (issue
     # #295): reorder by generic intent relevance without dropping any
     # passage, so decisive deep-ranked material surfaces for generation
@@ -1374,6 +1386,19 @@ async def run_v2_answer_turn(
             telemetry["answer_outcome"] = "failed"
             return None
         attempt_budget = min(ANSWER_DRAFT_ATTEMPT_BUDGET_S, remaining)
+        # Re-validate on every draft, including repair paths (kodmial/aa#310):
+        # merged/recovered packs fail before any answer LLM call.
+        try:
+            from aa.conversation.evidence_integrity import validate_book_pack_for_model_use
+
+            validate_book_pack_for_model_use(active_pack)
+        except Exception as exc:
+            logger.info(
+                "v2 answer pack integrity failed closed",
+                extra={"category": type(exc).__name__},
+            )
+            telemetry["answer_outcome"] = "failed"
+            return None
         passages = state_passages_to_prompt(_generation_window(active_pack, wider=wider))
         started = time.perf_counter()
         try:

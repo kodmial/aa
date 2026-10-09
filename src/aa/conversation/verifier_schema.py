@@ -15,9 +15,10 @@ computes an aggregate.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, StrictStr
 
 ScopeName = Literal["book", "product_meta", "conversation_glue"]
 
@@ -55,28 +56,68 @@ VERIFIER_MAX_ATTEMPTS = 1
 class UnitDecision(BaseModel):
     """Provider-native per-unit verifier decision (transport only).
 
-    Every field requires an explicit strict boolean: a missing, null, or
-    wrong-type ``addresses_intent`` fails closed even when the unit is
-    book-supported with valid citations. Support never implies relevance.
+    Every boolean field is strict: a missing, null, boolean-string
+    (``"true"``/``"false"``), integer (``0``/``1``), or wrong-type value
+    for ``requires_book_evidence``, ``supported`` or
+    ``addresses_intent`` fails closed even when the unit is
+    book-supported with valid citations. Support never implies
+    relevance. ``evidence_passage_ids`` is required (no silent default)
+    and carries strict strings only; extra keys and invalid types are
+    forbidden.
 
     ``claim_origin`` carries the model-led semantic origin classification
-    (kodmial/aa#308). It is optional on the wire so older providers stay
-    parseable; when absent AA code derives the origin deterministically
-    from ``requires_book_evidence`` (true -> ``book_claim``, false ->
-    ``conversation_glue``) and the deterministic provenance gate binds
-    it to offsets and roles. ``origin_ref`` is extensible provenance for
-    the origin (user message slice, book anchor, capability source, or
-    policy marker); a quote mark alone never sets the origin.
+    (kodmial/aa#308). It stays optional on the wire so older providers
+    stay parseable; when absent AA code derives the origin
+    deterministically from ``requires_book_evidence`` (true ->
+    ``book_claim``, false -> ``conversation_glue``) and the
+    deterministic provenance gate binds it to offsets and roles.
+    ``origin_ref`` is extensible provenance for the origin (user message
+    slice, book anchor, capability source, or policy marker); a quote
+    mark alone never sets the origin. When present, both are strictly
+    validated against the closed origin vocabulary; contradictory
+    combinations (``book_claim`` without book evidence, ``user_report``
+    requiring book evidence or citing book passages) fail closed in
+    :func:`aa.conversation.verifier.coerce_single_verdict` after
+    short-ID resolution and before any aggregate is computed.
     """
 
-    requires_book_evidence: bool
-    supported: bool
-    evidence_passage_ids: list[str] = Field(default_factory=list)
+    requires_book_evidence: StrictBool
+    supported: StrictBool
+    evidence_passage_ids: list[StrictStr]
     addresses_intent: StrictBool
     claim_origin: ClaimOrigin | None = None
     origin_ref: dict[str, object] = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
+
+
+@dataclass(frozen=True)
+class UnitProviderFailure:
+    """Typed internal provider-error/unavailable result (never a decision).
+
+    A valid model decision (:class:`UnitDecision`) and an internal
+    transport failure are different types by construction: only a fully
+    validated decision can become a supported verdict, while a provider
+    error becomes an unavailable unit that always fails closed and can
+    never be reinterpreted as product PASS.
+    """
+
+    unit_id: str
+    category: str
+    detail: str = ""
+
+
+def unavailable_unit_verdict(unit_id: str) -> UnitVerdict:
+    """Build the fail-closed verdict for one unavailable unit (typed)."""
+    return UnitVerdict(
+        unit_id=unit_id,
+        scope="book",
+        supported=False,
+        evidence_passage_ids=[],
+        addresses_intent=False,
+        origin="book_claim",
+        origin_ref={},
+    )
 
 
 class UnitVerdict(BaseModel):
@@ -137,7 +178,10 @@ def verifier_single_json_schema() -> dict[str, object]:
             # enum-free: the provider-facing hint stays minimal/robust
             # across weak fallback paths, while AA code strictly
             # validates the closed origin vocabulary via Pydantic
-            # (fail closed on unknown origins).
+            # (fail closed on unknown origins). The text fallback suffix
+            # elicits both keys; older providers that omit them stay
+            # parseable via deterministic derivation in
+            # ``coerce_single_verdict``.
             "claim_origin": {"type": "string"},
             "origin_ref": {"type": "object"},
         },
@@ -252,9 +296,11 @@ __all__ = [
     "NON_BOOK_SCOPE",
     "ScopeName",
     "UnitDecision",
+    "UnitProviderFailure",
     "UnitVerdict",
     "VERIFIER_MAX_ATTEMPTS",
     "VerifierValidationError",
+    "unavailable_unit_verdict",
     "validate_grounding_result",
     "validate_unit_decision",
     "verifier_single_json_schema",
