@@ -4,6 +4,14 @@ on:
   push:
   pull_request:
 
+# A feature branch emits both push and pull_request checks. Historically
+# every small repair commit spawned two *full* Python/Torch/OpenCode installs
+# plus full pytest/lint/mypy, while all older SHA runs continued consuming
+# runners. Only current-head CI can qualify a PR; cancel obsolete runs.
+concurrency:
+  group: aa-ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
