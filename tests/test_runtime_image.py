@@ -102,7 +102,7 @@ def test_image_workflow_publishes_only_from_trusted_events() -> None:
     assert "packages: write" in text
     assert "GITHUB_TOKEN" in text
     assert "type=registry" in text
-    assert "provenance: true" in text
+    assert "provenance: ${{ github.event_name != 'pull_request' }}" in text
     assert "pull_request" in text
     assert "owner-only" in text or "repository_owner" in text
     assert "canary" in text.lower()
