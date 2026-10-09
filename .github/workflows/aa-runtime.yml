@@ -263,7 +263,25 @@ jobs:
           # dependency layer; only the exact checked-out application source
           # is installed (seconds, no resolution). The full install is the
           # bounded cold-miss path for the legacy runner.
-          if python -c "import torch, sherpa_onnx, onnxruntime, faiss" 2>/dev/null; then
+          # The gate checks exact pinned versions from pyproject.toml (not
+          # mere importability) so a stale prebuilt image falls back to the
+          # full install instead of failing later, mirroring the pinned
+          # OpenCode version check below.
+          if python - <<'PY' 2>/dev/null; then
+            import importlib.metadata
+            import tomllib
+            from pathlib import Path
+            pins = {}
+            for dep in tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]:
+                name, sep, version = dep.partition("==")
+                if sep:
+                    pins[name.strip().lower().replace("_", "-")] = version.strip()
+            for dist, mod in (("torch", "torch"), ("sherpa-onnx", "sherpa_onnx"), ("onnxruntime", "onnxruntime"), ("faiss-cpu", "faiss")):
+                want = pins[dist]
+                got = importlib.metadata.version(dist)
+                assert got == want, f"{dist} {got} != pinned {want}"
+                __import__(mod)
+          PY
             pip install -e . --no-deps
           else
             python -m pip install --upgrade pip
