@@ -158,13 +158,16 @@ async def test_topic_shift_has_no_stale_lock_in() -> None:
 
 
 async def test_text_voice_text_continuity() -> None:
+    # Issue #294: voice is transport only. An ASR transcript enters the
+    # same respond() boundary as typed text with no voice flag; one
+    # shared thread holds text -> voice -> text continuity.
     runtime = _runtime()
     app = _app(runtime)
     await app.start()
     try:
         first = await app.respond(105, "тяга вечером, что делать?")
         assert first.strip()
-        voice_turn = await app.respond(105, "не могу уснуть после ссоры", voice_input=True)
+        voice_turn = await app.respond(105, "не могу уснуть после ссоры")
         _natural_ok(voice_turn)
         follow = await app.respond(105, "почему?")
         _natural_ok(follow)
@@ -409,20 +412,26 @@ async def test_final_envelope_and_quote_limits_enforced() -> None:
         await app.stop()
 
 
-async def test_voice_brevity_applied_to_graph_text() -> None:
-    async def _wordy(thread: str, text: str) -> str:
-        return " ".join(f"Поддержка помогает спокойно{idx}." for idx in range(10))
+async def test_voice_text_parity_no_post_verification_trimming() -> None:
+    # Issue #294: the final approved string is identical for voice and
+    # text. A long grounded answer (including its essential final
+    # sentence) passes through respond() intact for both formats; only
+    # the shared envelope may bound it, never a voice-only cap.
+    long_answer = " ".join(f"Поддержка помогает спокойно{idx}." for idx in range(10))
+    assert long_answer.strip().split()[-1].startswith("спокойно9")
 
-    from aa.telegram.tts import voice_policy_passes
+    async def _wordy(thread: str, text: str) -> str:
+        return long_answer
 
     runtime = GraphTurnRuntime(delegate=_wordy)
     await runtime.start()
     app = _app(runtime)
     await app.start()
     try:
-        reply = await app.respond(804, "тяга вечером", voice_input=True)
+        reply = await app.respond(804, "тяга вечером")
         _natural_ok(reply)
-        assert voice_policy_passes(reply)
+        assert reply == long_answer
+        assert "спокойно9" in reply
     finally:
         await app.stop()
 

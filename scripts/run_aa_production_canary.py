@@ -951,10 +951,8 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         try:
             from aa.telegram.transport import VoiceAttachment
             from aa.telegram.tts import (
-                compact_voice_text_to_policy,
                 resolve_tts_voice,
                 voice_for_presentation,
-                voice_policy_passes,
             )
             from aa.telegram.voice import build_pipeline, voice_error_reply
 
@@ -965,13 +963,21 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             )
             resolved = resolve_tts_voice("xenia")
             error_reply = voice_error_reply("voice-disabled")
-            compacted = compact_voice_text_to_policy("Поддержка рядом помогает. Что важно сейчас?")
+            # Issue #294 parity: no voice-only content rule survives;
+            # TTS synthesizes exactly the final approved text.
+            import inspect as _inspect
+
+            import aa.telegram.tts as _tts_mod
+            from aa.app import Application as _CanaryApp
+
+            _tts_names = set(dir(_tts_mod))
             voice_ok = (
                 presentation_ok
                 and bool(resolved)
                 and _contains_cyrillic(error_reply)
-                and bool(compacted.strip())
-                and voice_policy_passes(compacted)
+                and "voice_input" not in _inspect.signature(_CanaryApp.respond).parameters
+                and "voice_policy_passes" not in _tts_names
+                and "compact_voice_text_to_policy" not in _tts_names
             )
 
             # Prove the ASR-to-turn wiring at runtime through the real
@@ -1051,8 +1057,9 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             voice_ok = voice_ok and asr_ok
             # The response artifact is produced through the same delivery
             # path: a voice turn falls back to bounded text when TTS models
-            # are absent, never dropping the answer.
-            fallback_reply = await app.respond(chat_meta + 5, "не могу уснуть", voice_input=True)
+            # are absent, never dropping the answer. The conversational
+            # computation is identical (issue #294 parity).
+            fallback_reply = await app.respond(chat_meta + 5, "не могу уснуть")
             voice_ok = voice_ok and bool(fallback_reply.strip())
             _record(
                 "voice-fixture",

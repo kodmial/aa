@@ -451,11 +451,14 @@ def test_gigaam_recognizer_without_load_is_unavailable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Application: voice reaches the production text boundary as voice_input=True.
+# Application: voice transcripts reach the shared text boundary (issue #294).
 # ---------------------------------------------------------------------------
 
 
 async def test_voice_reaches_production_turn_boundary(tmp_path: Path) -> None:
+    # Issue #294: the ASR transcript enters the exact same respond()
+    # boundary as typed text, with no voice flag. Format selection
+    # (sendVoice) happens only in the delivery adapter afterwards.
     pipeline, _, _, _ = _pipeline(
         recognizer=FakeRecognizer(transcript="привет"),
         work_parent=tmp_path,
@@ -464,12 +467,12 @@ async def test_voice_reaches_production_turn_boundary(tmp_path: Path) -> None:
     await app.start()
     try:
         assert app.voice_available
-        seen: list[tuple[int, str, bool]] = []
+        seen: list[tuple[int, str]] = []
         original_respond = app.respond
 
-        async def _spy(chat_id: int, text: str, *, voice_input: bool = False) -> str:
-            seen.append((chat_id, text, voice_input))
-            return await original_respond(chat_id, text, voice_input=voice_input)
+        async def _spy(chat_id: int, text: str) -> str:
+            seen.append((chat_id, text))
+            return await original_respond(chat_id, text)
 
         app.respond = _spy  # type: ignore[method-assign]
         incoming = TelegramIncoming(
@@ -482,7 +485,8 @@ async def test_voice_reaches_production_turn_boundary(tmp_path: Path) -> None:
         )
         await app._process_dispatched_update(incoming)
         assert len(seen) == 1
-        assert seen[0] == (77, "привет", True)
+        assert seen[0] == (77, "привет")
+        assert "voice_input" not in original_respond.__code__.co_varnames
     finally:
         await app.stop()
 

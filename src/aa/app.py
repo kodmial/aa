@@ -80,10 +80,8 @@ from aa.telegram.tts import (
     TtsError,
     TtsPipeline,
     build_tts_pipeline,
-    compact_voice_text_to_policy,
     resolve_tts_voice,
     voice_for_presentation,
-    voice_policy_passes,
 )
 from aa.telegram.typing import TypingHeartbeat
 from aa.telegram.voice import (
@@ -714,19 +712,22 @@ class Application:
         ordinary conversational path; this transport layer never sends a
         user message to OpenCode directly.
         """
-        await self._respond_and_deliver(incoming, text=incoming.text, voice_input=False)
+        await self._respond_and_deliver(incoming, text=incoming.text, want_voice=False)
 
     async def _handle_voice_update(self, incoming: TelegramIncoming) -> None:
         """Process one Telegram voice note through ASR into the text boundary.
 
-        The transcript enters the exact same LangGraph conversational turn
-        boundary used by text messages, marked ``voice_input=True``. Any
-        download/decode/ASR failure sends one short Russian text error to
-        that user and leaves the poller alive. Temporary audio files are
-        removed by the pipeline in ``finally``. Acoustic presentation is
-        classified ephemerally from the already-decoded audio for
-        opposite-voice TTS routing only; it is never logged, persisted,
-        or exposed to the user.
+        The transcript enters the exact same LangGraph conversational
+        turn boundary used by text messages (issue #294: voice is
+        transport only, never a conversational mode). No audio flag or
+        acoustic feature reaches generation, retrieval, planning,
+        memory, grounding, verification or safety decisions. Any
+        download/decode/ASR failure sends one short Russian text error
+        to that user and leaves the poller alive. Temporary audio files
+        are removed by the pipeline in ``finally``. Acoustic
+        presentation is classified ephemerally from the already-decoded
+        audio for opposite-voice TTS routing only; it is never logged,
+        persisted, or exposed to the user.
         """
         attachment = incoming.voice
         if attachment is None:
@@ -762,8 +763,10 @@ class Application:
             await self._send_text_reply(incoming, voice_error_reply("voice-failed"))
             return
         # Ephemeral only: a per-turn local, never stored in sessions/history.
+        # ``want_voice`` selects the delivery format only (sendVoice vs
+        # sendMessage); the conversational computation is identical.
         await self._respond_and_deliver(
-            incoming, text=transcript, voice_input=True, voice_presentation=presentation
+            incoming, text=transcript, want_voice=True, voice_presentation=presentation
         )
 
     def _typing_heartbeat(self, chat_id: int) -> TypingHeartbeat:
@@ -778,7 +781,7 @@ class Application:
         incoming: TelegramIncoming,
         *,
         text: str,
-        voice_input: bool,
+        want_voice: bool,
         voice_presentation: str | None = None,
     ) -> None:
         """Run :meth:`respond` for one turn and deliver exactly one reply.
@@ -789,13 +792,15 @@ class Application:
         outbound message). Retried delivery keeps the heartbeat alive;
         generation finishing never stops it early.
 
-        Voice turns (``voice_input=True``) request voice output: the
-        already-generated answer is synthesized locally and delivered via
-        ``sendVoice``. Any TTS/encoding/delivery failure deterministically
-        falls back to the same answer as text; the response is never
-        dropped. Text turns always receive text output. ``voice_presentation``
-        is an ephemeral acoustic routing signal for the current turn only
-        (never persisted); ``None``/``unknown``/error defaults to ``xenia``.
+        ``want_voice`` is transport only (issue #294): voice turns
+        request voice output, so the already-generated final approved
+        answer is synthesized locally and delivered via ``sendVoice``
+        with no rewriting. Any TTS/encoding/delivery failure
+        deterministically falls back to the byte-identical answer as
+        text; the response is never dropped. Text turns always receive
+        text output. ``voice_presentation`` is an ephemeral acoustic
+        routing signal for the current turn only (never persisted);
+        ``None``/``unknown``/error defaults to ``xenia``.
         """
         self.sessions.record_message(incoming.chat_id)
         # Safety/commands bypass the heartbeat: only an accepted normal
@@ -804,14 +809,14 @@ class Application:
         decision = self.safety.check(text).decision
         if decision is SafetyDecision.EMERGENCY or decision is SafetyDecision.BLOCK:
             try:
-                reply = await self.respond(incoming.chat_id, text, voice_input=voice_input)
+                reply = await self.respond(incoming.chat_id, text)
             except OpenCodeRateLimitError:
                 raise
             except Exception:
                 reply = _TEMPORARY_ERROR_REPLY
             if not reply.strip():
                 return
-            if voice_input:
+            if want_voice:
                 delivered = await self._send_voice_reply(
                     incoming, reply, voice_presentation=voice_presentation
                 )
@@ -821,7 +826,7 @@ class Application:
             return
         if text.strip().startswith("/"):
             try:
-                reply = await self.respond(incoming.chat_id, text, voice_input=voice_input)
+                reply = await self.respond(incoming.chat_id, text)
             except OpenCodeRateLimitError:
                 raise
             except Exception:
@@ -834,7 +839,7 @@ class Application:
         await heartbeat.start()
         try:
             try:
-                reply = await self.respond(incoming.chat_id, text, voice_input=voice_input)
+                reply = await self.respond(incoming.chat_id, text)
             except OpenCodeRateLimitError:
                 raise
             except Exception:
@@ -844,7 +849,7 @@ class Application:
                 return
             # Delivery keeps the heartbeat alive: it stops only after
             # confirmed delivery (or definitive abort with no message).
-            if voice_input:
+            if want_voice:
                 delivered = await self._send_voice_reply(
                     incoming, reply, voice_presentation=voice_presentation
                 )
@@ -875,9 +880,11 @@ class Application:
     ) -> bool:
         """Synthesize and deliver one voice reply; ``False`` means fallback.
 
-        Returns ``True`` when the voice was delivered via ``sendVoice``.
-        Any TTS, encoding, or delivery failure logs only categories/sizes
-        and returns ``False`` so the caller sends the same answer as text.
+        TTS receives exactly the final approved string with no
+        rewriting (issue #294). Returns ``True`` when the voice was
+        delivered via ``sendVoice``. Any TTS, encoding, or delivery
+        failure logs only categories/sizes and returns ``False`` so
+        the caller sends the byte-identical answer as text.
         The presentation routing signal is ephemeral and never logged.
         """
         pipeline = self._tts_pipeline
@@ -985,15 +992,17 @@ class Application:
         await runtime.start()
         self._graph_runtime = runtime
 
-    async def respond(self, chat_id: int, text: str, *, voice_input: bool = False) -> str:
+    async def respond(self, chat_id: int, text: str) -> str:
         """Answer one inbound message with emergency precedence.
 
-        Ordinary turns use only the LangGraph runtime: the graph thread for
-        ``chat_id`` owns conversation memory, and text/voice transcripts
-        share that state. ``voice_input`` marks turns transcribed from
-        Telegram voice notes and requests the existing voice-mode brevity
-        (compact leading sentences to <=4/<=80) on the already-generated
-        grounded text.
+        Ordinary turns use only the LangGraph runtime: the graph thread
+        for ``chat_id`` owns conversation memory, and text/voice
+        transcripts share that state through this single boundary
+        (issue #294: voice is transport only, never a conversational
+        mode). No voice flag or acoustic feature may reach this method;
+        format choice (sendVoice vs sendMessage) lives in the Telegram
+        delivery adapter only, after this method returns the final
+        approved text.
 
         The deterministic safety layer runs first: an emergency turn returns
         the bounded Russian safe reply immediately with no graph work (the
@@ -1010,7 +1019,7 @@ class Application:
         Every returned reply is confined to the #83 hard Telegram envelope.
         Replies are returned as a single message; overflow is never split.
         """
-        logger.info("turn started", extra={"voice_input": voice_input, "text_len": len(text)})
+        logger.info("turn started", extra={"text_len": len(text)})
         import time as _time
 
         turn_started = _time.perf_counter()
@@ -1048,8 +1057,6 @@ class Application:
             logger.warning("graph turn used natural fallback")
             reply = select_retry_reply(text)
             fallback_used = True
-        if voice_input and reply.strip():
-            reply = self._apply_voice_brevity(reply)
         if not reply.strip():
             reply = NATURAL_CLARIFICATION_REPLY
             fallback_used = True
@@ -1100,16 +1107,6 @@ class Application:
             },
         )
         return fitted
-
-    def _apply_voice_brevity(self, reply: str) -> str:
-        """Apply the existing #77 voice-mode brevity to grounded text."""
-        if voice_policy_passes(reply) and envelope_passes(reply):
-            return reply
-        compacted = compact_voice_text_to_policy(reply)
-        if compacted.strip() and envelope_passes(compacted):
-            logger.info("voice reply compacted to policy")
-            return compacted
-        return self._fit_envelope(compacted if compacted.strip() else reply)
 
     @staticmethod
     def _fit_envelope(reply: str) -> str:

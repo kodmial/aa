@@ -1,4 +1,10 @@
-"""Local Russian TTS replies and concise voice mode tests (issue #77)."""
+"""Local Russian TTS transport tests (issue #77, parity via issue #294).
+
+Voice is transport only: TTS synthesizes exactly the final approved
+text with no voice-specific length or content rule. The former #77
+4-sentence / 80-word voice-only cap is superseded and must not appear
+here; parity with text is asserted instead.
+"""
 
 from __future__ import annotations
 
@@ -14,11 +20,6 @@ import pytest
 from aa import logging as aa_logging
 from aa.app import Application
 from aa.config import Settings
-from aa.conversation.orchestrator import (
-    build_synthesis_prompt,
-    build_trivial_prompt,
-    run_trivial_turn,
-)
 from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
 from aa.safety.response import EMERGENCY_RESPONSE_RU
 from aa.telegram.transport import (
@@ -31,7 +32,6 @@ from aa.telegram.transport import (
 from aa.telegram.tts import (
     ALLOWED_VOICES,
     DEFAULT_VOICE,
-    MAX_VOICE_COMPACT_REGENERATIONS,
     OPUS_BITRATE,
     OPUS_CHANNELS,
     TORCH_VERSION,
@@ -45,16 +45,9 @@ from aa.telegram.tts import (
     TtsError,
     TtsPipeline,
     build_tts_pipeline,
-    compact_voice_text_to_policy,
-    count_voice_sentences,
-    count_voice_words,
     resolve_tts_voice,
     voice_for_presentation,
-    voice_policy_passes,
 )
-
-PRIMARY = "opencode/muse-spark-1.3-contributor-free"
-FALLBACK = "opencode/space-bunny-free"
 
 
 def _settings(**overrides: str) -> Settings:
@@ -214,7 +207,6 @@ def test_fixed_tts_contract_is_pinned() -> None:
     assert ALLOWED_VOICES == frozenset({"xenia", "eugene"})
     assert OPUS_BITRATE == "32k"
     assert OPUS_CHANNELS == 1
-    assert MAX_VOICE_COMPACT_REGENERATIONS == 1
 
 
 def test_only_xenia_and_eugene_are_production_voices() -> None:
@@ -256,59 +248,61 @@ def test_tts_settings_default_and_env() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Voice-mode response contract: <=4 sentences / <=80 words.
+# Voice/text parity: no voice-only content rule (issue #294).
+# The former #77 4-sentence / 80-word voice-only cap is superseded and
+# must not reappear here in any form.
 # ---------------------------------------------------------------------------
 
 
-def test_voice_policy_counts_and_bounds() -> None:
-    short = "Привет. Как дела. Что нового. Расскажи."
-    assert count_voice_sentences(short) == 4
-    assert voice_policy_passes(short)
-    five = short + " Ещё одно."
-    assert count_voice_sentences(five) == 5
-    assert not voice_policy_passes(five)
-    long_words = "слово " * 81
-    assert count_voice_words(long_words.strip()) == 81
-    assert not voice_policy_passes(long_words.strip())
-    exactly_80 = " ".join(f"слово{i}" for i in range(80)) + "."
-    assert count_voice_words(exactly_80) == 80
-    assert voice_policy_passes(exactly_80)
-    assert not voice_policy_passes("   ")
+def test_no_voice_only_content_rule_in_tts_transport() -> None:
+    import aa.telegram.tts as tts_mod
+
+    names = set(dir(tts_mod))
+    for removed in (
+        "voice_policy_passes",
+        "compact_voice_text_to_policy",
+        "voice_generation_instruction",
+        "voice_compact_retry_instruction",
+        "split_voice_sentences",
+        "count_voice_sentences",
+        "count_voice_words",
+        "VOICE_MAX_SENTENCES",
+        "VOICE_MAX_WORDS",
+        "VOICE_TARGET_MIN_SENTENCES",
+        "VOICE_TARGET_MAX_SENTENCES",
+        "MAX_VOICE_COMPACT_REGENERATIONS",
+    ):
+        assert removed not in names, removed
 
 
-def test_compact_voice_returns_leading_sentences_fitting_both_bounds() -> None:
-    first = "Первое короткое предложение."
-    second = "Второе короткое предложение."
-    rest = " ".join(f"Длинное предложение номер {idx}." for idx in range(10))
-    text = f"{first} {second} {rest}"
-    assert not voice_policy_passes(text)
-    compacted = compact_voice_text_to_policy(text)
-    assert voice_policy_passes(compacted)
-    assert compacted.startswith(first)
-    assert count_voice_sentences(compacted) <= 4
-    assert count_voice_words(compacted) <= 80
-    # Word-bound case: leading sentences that fit 80 words only.
-    many = " ".join(f"Предложение номер {idx} здесь." for idx in range(30))
-    assert not voice_policy_passes(many)
-    compacted_many = compact_voice_text_to_policy(many)
-    assert voice_policy_passes(compacted_many)
-    assert many.startswith(compacted_many)
+def test_no_voice_flag_in_content_graph() -> None:
+    import inspect
+
+    import aa.conversation.orchestrator as orchestrator_mod
+    from aa.app import Application
+
+    assert "voice_input" not in inspect.signature(Application.respond).parameters
+    assert not hasattr(Application, "_apply_voice_brevity")
+    assert "voice_mode" not in inspect.signature(orchestrator_mod.build_synthesis_prompt).parameters
+    assert "voice_mode" not in inspect.signature(orchestrator_mod.build_trivial_prompt).parameters
+    assert "voice_mode" not in inspect.signature(orchestrator_mod.run_trivial_turn).parameters
+    assert (
+        "voice_mode"
+        not in inspect.signature(orchestrator_mod.TurnRunner.run_grounded_turn).parameters
+    )
+    assert not hasattr(orchestrator_mod, "enforce_grounded_voice_policy")
+    assert not hasattr(orchestrator_mod, "compact_grounded_to_voice")
+    source = inspect.getsource(orchestrator_mod)
+    assert "voice_mode" not in source
+    assert "ГОЛОСОВОЙ РЕЖИМ" not in source
 
 
-def test_voice_generation_budget_in_prompts() -> None:
-    trivial_plain = build_trivial_prompt(user_text="привет")
-    trivial_voice = build_trivial_prompt(user_text="привет", voice_mode=True)
-    assert "ГОЛОСОВОЙ РЕЖИМ" not in trivial_plain
-    assert "ГОЛОСОВОЙ РЕЖИМ" in trivial_voice
-    assert "4 предложений" in trivial_voice
-    assert "80 слов" in trivial_voice
-    assert "привет" in trivial_voice
-
-
-async def test_synthesis_prompt_carries_voice_budget(tmp_path: Path) -> None:
+async def test_prompts_carry_no_voice_instruction(tmp_path: Path) -> None:
     import hashlib
 
     from aa.conversation.orchestrator import (
+        build_synthesis_prompt,
+        build_trivial_prompt,
         deduplicate_cross_aspect,
         load_exact_evidence,
         run_planner,
@@ -317,6 +311,9 @@ async def test_synthesis_prompt_carries_voice_budget(tmp_path: Path) -> None:
     from aa.corpus.structure import SECTION_IDS, build_full_structure
     from aa.retrieval.index import build_hybrid_index
 
+    trivial = build_trivial_prompt(user_text="привет")
+    assert "ГОЛОСОВОЙ РЕЖИМ" not in trivial
+    assert "привет" in trivial
     en_sections: list[dict[str, object]] = []
     ru_sections: list[dict[str, object]] = []
     for section_id in SECTION_IDS:
@@ -364,44 +361,16 @@ async def test_synthesis_prompt_carries_voice_budget(tmp_path: Path) -> None:
     pack, _ = load_exact_evidence(
         index, merged, ru_corpus_version=str(index.metadata.get("ru_artifact_sha256", ""))
     )
-    plain = build_synthesis_prompt(user_text="тяга", pack=pack)
-    voiced = build_synthesis_prompt(user_text="тяга", pack=pack, voice_mode=True)
-    assert "ГОЛОСОВОЙ РЕЖИМ" not in plain
-    assert "ГОЛОСОВОЙ РЕЖИМ" in voiced
-    assert "4 предложений" in voiced
+    prompt = build_synthesis_prompt(user_text="тяга", pack=pack)
+    assert "ГОЛОСОВОЙ РЕЖИМ" not in prompt
+    # The former voice-only cap ("не более 4 предложений") is gone; the
+    # shared #83 envelope wording (900 chars / 130 words) is unchanged.
+    assert "4 предложений" not in prompt
 
 
-async def test_trivial_voice_allows_exactly_one_regeneration() -> None:
-    long_answer = " ".join(f"Длинное предложение номер {idx} здесь." for idx in range(20))
-    assert not voice_policy_passes(long_answer)
-    short_answer = "Коротко. Держись. Приходи."
-    assert voice_policy_passes(short_answer)
-    prompts: list[str] = []
+async def test_trivial_turn_applies_no_voice_regeneration() -> None:
+    from aa.conversation.orchestrator import run_trivial_turn
 
-    async def _send(
-        session_id: str, prompt: str, *, agent: str = "", model: str = "", **_kw: Any
-    ) -> str:
-        prompts.append(prompt)
-        if len(prompts) == 1:
-            return long_answer
-        return short_answer
-
-    result = await run_trivial_turn(
-        "привет",
-        session_id="s1",
-        send=_send,
-        agent="aa",
-        primary_model=PRIMARY,
-        fallback_model=FALLBACK,
-        voice_mode=True,
-    )
-    assert len(prompts) == 2
-    assert result.text == short_answer
-    assert voice_policy_passes(result.text)
-    assert "ГОЛОСОВОЙ РЕЖИМ" in prompts[0]
-
-
-async def test_trivial_voice_second_violation_compacts_to_leading() -> None:
     long_answer = " ".join(f"Длинное предложение номер {idx} здесь." for idx in range(20))
     prompts: list[str] = []
 
@@ -416,34 +385,8 @@ async def test_trivial_voice_second_violation_compacts_to_leading() -> None:
         session_id="s1",
         send=_send,
         agent="aa",
-        primary_model=PRIMARY,
-        fallback_model=FALLBACK,
-        voice_mode=True,
-    )
-    assert len(prompts) == 2
-    assert voice_policy_passes(result.text)
-    assert long_answer.startswith(result.text)
-    assert result.text != long_answer
-
-
-async def test_trivial_text_mode_does_not_regenerate_for_voice_policy() -> None:
-    long_answer = " ".join(f"Длинное предложение номер {idx} здесь." for idx in range(20))
-    prompts: list[str] = []
-
-    async def _send(
-        session_id: str, prompt: str, *, agent: str = "", model: str = "", **_kw: Any
-    ) -> str:
-        prompts.append(prompt)
-        return long_answer
-
-    result = await run_trivial_turn(
-        "привет",
-        session_id="s1",
-        send=_send,
-        agent="aa",
-        primary_model=PRIMARY,
-        fallback_model=FALLBACK,
-        voice_mode=False,
+        primary_model="opencode/muse-spark-1.3-contributor-free",
+        fallback_model="opencode/space-bunny-free",
     )
     assert len(prompts) == 1
     assert result.text == long_answer
@@ -744,11 +687,11 @@ async def test_emergency_voice_is_not_truncated_and_still_voiced(tmp_path: Path)
     )
     await app.start()
     try:
-        reply = await app.respond(7, "Я не могу дышать", voice_input=True)
+        # Issue #294 parity: emergencies use one shared template with no
+        # voice-specific trimming; voice delivery voices the identical text.
+        reply = await app.respond(7, "Я не могу дышать")
         assert reply == EMERGENCY_RESPONSE_RU
         assert "112" in reply
-        # Emergency may exceed the ordinary voice bound and must not be cut.
-        assert not voice_policy_passes(reply)
         await app._process_dispatched_update(
             TelegramIncoming(
                 update_id=70,
@@ -802,7 +745,7 @@ async def test_voice_turn_never_logs_reply_or_audio(tmp_path: Path) -> None:
             voice=VoiceAttachment(file_id="voice-secret", duration_seconds=5),
         )
         # Bypass ASR by calling the delivery boundary directly.
-        reply = await app.respond(81, "привет", voice_input=True)
+        reply = await app.respond(81, "привет")
         await app._send_voice_reply(incoming, reply)
     finally:
         await app.stop()

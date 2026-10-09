@@ -18,17 +18,13 @@ selection for #78 (opposite-voice routing) is represented here as a
 deterministic resolver that defaults to ``xenia``; the acoustic
 classifier itself lives in #78.
 
-Voice-mode response contract (ordinary non-emergency turns):
-
-- generation target of 2-4 short sentences;
-- hard contract of at most 4 sentences and at most 80 Russian words;
-- enforced in the LLM generation/output budget, not by blind truncation;
-- exactly one compact-regeneration attempt on violation;
-- deterministic fallback to the longest complete leading sentences that
-  fit both bounds.
-
-Safety/emergency responses may exceed the brevity bound when required
-for correctness.
+Transport-only contract (issue #294, supersedes the former #77
+voice-only brevity clauses): TTS synthesizes exactly the final
+approved conversational string with no rewriting, summarizing,
+shortening, prompting or LLM call after answer verification. There is
+no voice-specific sentence/word target or cap in this module. The
+shared Telegram reply envelope and safety controls apply identically
+to text and voice.
 
 Privacy: this module never logs synthesized text, generated audio, or
 temporary paths containing user identifiers. Only sizes, durations,
@@ -39,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import shutil
 import subprocess
 import tempfile
@@ -62,15 +57,6 @@ DEFAULT_VOICE = TTS_VOICE_XENIA
 ALLOWED_VOICES = frozenset({TTS_VOICE_XENIA, TTS_VOICE_EUGENE})
 OPUS_BITRATE = "32k"
 OPUS_CHANNELS = 1
-
-VOICE_MAX_SENTENCES = 4
-VOICE_MAX_WORDS = 80
-VOICE_TARGET_MIN_SENTENCES = 2
-VOICE_TARGET_MAX_SENTENCES = 4
-MAX_VOICE_COMPACT_REGENERATIONS = 1
-
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
-_CITATION_RE = re.compile(r"\[[A-Za-z0-9_.\-/]+(?:#[A-Za-z0-9_:.\-]+)?\]")
 
 
 class TtsError(Exception):
@@ -109,93 +95,6 @@ def voice_for_presentation(presentation: str | None) -> str:
     if presentation == "female-presenting":
         return TTS_VOICE_EUGENE
     return DEFAULT_VOICE
-
-
-def split_voice_sentences(text: str) -> list[str]:
-    """Split ``text`` into complete sentences for the voice policy."""
-    parts = [item.strip() for item in _SENTENCE_SPLIT_RE.split(text.strip()) if item.strip()]
-    return parts
-
-
-def count_voice_sentences(text: str) -> int:
-    """Count complete sentences in ``text`` under the voice policy."""
-    if not text.strip():
-        return 0
-    return len(split_voice_sentences(text))
-
-
-def count_voice_words(text: str) -> int:
-    """Count whitespace-separated words (citations excluded)."""
-    cleaned = _CITATION_RE.sub(" ", text)
-    return len(cleaned.split())
-
-
-def voice_policy_passes(text: str) -> bool:
-    """Whether ``text`` fits the hard voice contract (<=4 / <=80)."""
-    if not text.strip():
-        return False
-    return count_voice_sentences(text) <= VOICE_MAX_SENTENCES and (
-        count_voice_words(text) <= VOICE_MAX_WORDS
-    )
-
-
-def compact_voice_text_to_policy(text: str) -> str:
-    """Keep the longest leading sentences fitting <=4 sentences / <=80 words.
-
-    Cuts happen only at complete-sentence boundaries. When even the
-    first sentence cannot fit both bounds, the first sentence alone is
-    returned (shortest complete unit) so the caller never emits a
-    truncated fragment or an empty reply.
-    """
-    sentences = split_voice_sentences(text)
-    if not sentences:
-        return text.strip()
-    kept: list[str] = []
-    kept_words = 0
-    for sentence in sentences:
-        if len(kept) + 1 > VOICE_MAX_SENTENCES:
-            break
-        words = len(_CITATION_RE.sub(" ", sentence).split())
-        if kept_words + words > VOICE_MAX_WORDS:
-            break
-        kept.append(sentence)
-        kept_words += words
-    if kept:
-        compacted = " ".join(kept)
-        logger.info(
-            "voice reply compacted to policy",
-            extra={
-                "kept_sentences": len(kept),
-                "total_sentences": len(sentences),
-                "words": kept_words,
-            },
-        )
-        return compacted
-    logger.info("voice reply kept first sentence only")
-    return sentences[0]
-
-
-def voice_generation_instruction() -> str:
-    """Build the voice-mode budget hint embedded in synthesis prompts."""
-    return (
-        "ГОЛОСОВОЙ РЕЖИМ (обязательно): отвечай кратко для голосового "
-        "сообщения, обычно 2-4 коротких предложения. Жёсткий предел "
-        "голосового ответа: не более 4 предложений и не более 80 слов "
-        "всего. Один главный смысл, без списков и длинных цитат."
-    )
-
-
-def voice_compact_retry_instruction(
-    *, remaining_sentences: int = VOICE_MAX_SENTENCES, remaining_words: int = VOICE_MAX_WORDS
-) -> str:
-    """Build the explicit remaining-budget instruction for one voice regen."""
-    return (
-        "Перепиши ответ короче для голосового сообщения, используя ТОЛЬКО "
-        "те же проверенные отрывки. "
-        f"Остаток голосового бюджета: не более {remaining_sentences} предложений и "
-        f"{remaining_words} слов всего. Сохрани 2-4 коротких предложения и "
-        "один главный смысл. Не добавляй новых утверждений без опоры."
-    )
 
 
 def ensure_tts_model_file(model_path: Path) -> Path:
@@ -503,7 +402,6 @@ def build_tts_pipeline(
 __all__ = [
     "ALLOWED_VOICES",
     "DEFAULT_VOICE",
-    "MAX_VOICE_COMPACT_REGENERATIONS",
     "OPUS_BITRATE",
     "OPUS_CHANNELS",
     "TORCH_VERSION",
@@ -512,10 +410,6 @@ __all__ = [
     "TTS_SAMPLE_RATE",
     "TTS_VOICE_EUGENE",
     "TTS_VOICE_XENIA",
-    "VOICE_MAX_SENTENCES",
-    "VOICE_MAX_WORDS",
-    "VOICE_TARGET_MAX_SENTENCES",
-    "VOICE_TARGET_MIN_SENTENCES",
     "FfmpegOpusEncoder",
     "SileroSynthesizer",
     "SpeechSynthesizer",
@@ -523,14 +417,7 @@ __all__ = [
     "TtsPipeline",
     "VoiceEncoder",
     "build_tts_pipeline",
-    "compact_voice_text_to_policy",
-    "count_voice_sentences",
-    "count_voice_words",
     "ensure_tts_model_file",
     "resolve_tts_voice",
-    "split_voice_sentences",
-    "voice_compact_retry_instruction",
     "voice_for_presentation",
-    "voice_generation_instruction",
-    "voice_policy_passes",
 ]

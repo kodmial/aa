@@ -627,9 +627,10 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
         _check("21-memory-module-present", hasattr(memory_mod, "__name__"))
         # 22: hidden calls invisible (dispatcher never surfaces planner text).
         _check("22-hidden-call-invisibility", "planner" not in greeting.casefold())
-        # 23: text/voice shared state (voice_input shares thread).
+        # 23: text/voice shared state (issue #294: one shared thread,
+        # no voice flag; ASR transcripts enter respond() as plain text).
         await app.respond(910008, "тяга вечером, что делать?")
-        voice_turn = await app.respond(910008, "не могу уснуть", voice_input=True)
+        voice_turn = await app.respond(910008, "не могу уснуть")
         hist = runtime.history_for_thread(runtime.thread_id(910008))
         _check(
             "23-text-voice-shared-state",
@@ -1239,19 +1240,42 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
 
     startup_begin = time.perf_counter()
     try:
+        import inspect
+
+        import aa.conversation.orchestrator as orchestrator_mod
+        import aa.telegram.tts as tts_mod
+        from aa.app import Application
         from aa.telegram.tts import (
-            compact_voice_text_to_policy,
             resolve_tts_voice,
             voice_for_presentation,
-            voice_policy_passes,
         )
         from aa.telegram.voice import voice_error_reply
 
         _check("V01-voice-turn-boundary-present", callable(voice_error_reply))
-        # V02: ordinary voice reply <= 4 sentences / <= 80 words.
-        wordy = " ".join(f"Поддержка помогает спокойно{idx}." for idx in range(10))
-        compacted = compact_voice_text_to_policy(wordy)
-        _check("V02-voice-brevity-policy", voice_policy_passes(compacted))
+        # V02 (issue #294, supersedes the former #77 4/80 voice-only cap):
+        # voice/text parity. No voice-specific content rule survives in
+        # active implementation: no voice flag on respond(), no
+        # voice_mode in the content graph, no voice policy helpers in
+        # TTS, and no voice-only prompt text. The shared envelope and
+        # safety controls apply identically to both formats.
+        respond_params = inspect.signature(Application.respond).parameters
+        tts_names = set(dir(tts_mod))
+        orchestrator_src = inspect.getsource(orchestrator_mod)
+        app_src = inspect.getsource(Application)
+        _check(
+            "V02-voice-text-parity-no-voice-content-rule",
+            "voice_input" not in respond_params
+            and "voice_mode" not in orchestrator_src
+            and "voice_policy_passes" not in tts_names
+            and "compact_voice_text_to_policy" not in tts_names
+            and "voice_generation_instruction" not in tts_names
+            and "voice_compact_retry_instruction" not in tts_names
+            and "VOICE_MAX_SENTENCES" not in tts_names
+            and "VOICE_MAX_WORDS" not in tts_names
+            and "enforce_grounded_voice_policy" not in orchestrator_src
+            and "compact_grounded_to_voice" not in orchestrator_src
+            and "_apply_voice_brevity" not in app_src,
+        )
         # V03-V05: presentation routing incl. default.
         _check("V03-male-presenting-xenia", voice_for_presentation("male-presenting") == "xenia")
         _check(
@@ -1305,7 +1329,8 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
         from aa.conversation.output_limits import envelope_passes
 
         _check("V13-text-unchanged", envelope_passes("Привет! Что сейчас важнее?"))
-        # V14: emergency brevity exception (safety template not truncated).
+        # V14: emergency intact for both formats (safety template
+        # never truncated or rewritten; issue #294 parity).
         from aa.safety.response import build_emergency_response
         from aa.safety.router import SafetyRouter
 
