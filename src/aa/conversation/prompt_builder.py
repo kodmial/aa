@@ -76,6 +76,7 @@ class EvidencePassage:
 # checksum/quote/cite gates and verifier verdicts still use full exact
 # text, so grounding strictness is unchanged. Turn-independent, never an
 # exact-question special case.
+# Source passages must reach OpenCode in their entirety.
 ANSWER_MAX_PASSAGE_CHARS = 0  # Deprecated compatibility constant; passage text is never clipped.
 
 ANSWER_MAX_MESSAGE_CHARS = 500
