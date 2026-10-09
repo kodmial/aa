@@ -139,7 +139,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
           tags: |
-            ghcr.io/kodmial/aa-runtime:latest
             ghcr.io/kodmial/aa-runtime:sha-${{ github.sha }}
           cache-from: |
             type=registry,ref=ghcr.io/kodmial/aa-runtime:buildcache
@@ -241,3 +240,65 @@ jobs:
           # secrets: it exercises the hot path only (codec, native imports,
           # pinned OpenCode, model-identity checks, exact HEAD, timing).
           python scripts/verify_runtime_image.py --canary
+
+  propose-promotion:
+    needs: [build, canary]
+    if: github.event_name != 'pull_request' && needs.canary.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout exact published main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # The PR must trigger ordinary CI and Continuum review workflows.
+          # GITHUB_TOKEN-authored PRs do not trigger the required events.
+          token: ${{ secrets.TAP_PAT || github.token }}
+
+      - name: Create reviewed image activation PR after fresh-runner canary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          TAP_PAT_AVAILABLE: ${{ secrets.TAP_PAT != '' }}
+          VALIDATED_IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAP_PAT_AVAILABLE" != "true" ]]; then
+            echo "::error::TAP_PAT needed for activation PR to trigger CI/review; no direct main writes."
+            exit 1
+          fi
+          [[ "$VALIDATED_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::Missing immutable image digest"; exit 1;
+          }
+          # Refuse stale image promotion if main advanced after the build.
+          checked="$(git rev-parse HEAD)"
+          current="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$checked" != "$GITHUB_SHA" || "$current" != "$GITHUB_SHA" ]]; then
+            echo "::error::Main changed during image canary; rebuild image on current main."
+            exit 1
+          fi
+          python scripts/promote_runtime_image.py --digest "$VALIDATED_IMAGE_DIGEST" --apply
+          if git diff --quiet -- docker/aa-runtime.digest .github/workflows/aa-runtime.yml; then
+            echo "Image digest already active. No activation PR needed."
+            exit 0
+          fi
+          branch="image/aa-runtime-${VALIDATED_IMAGE_DIGEST#sha256:}"
+          branch="${branch:0:33}"
+          already="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$already" ]]; then
+            echo "Activation PR #$already already exists; not duplicating."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add docker/aa-runtime.digest .github/workflows/aa-runtime.yml
+          git commit -m "chore: activate canary-verified AA runtime image"
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore: activate validated AA runtime image (#298)" \
+            --body "Activates GHCR image \`ghcr.io/kodmial/aa-runtime@$VALIDATED_IMAGE_DIGEST\` only after the image-build run's fresh-runner canary passed. Source AA remains an exact-main checkout; no application code is built into the image. Ordinary CI/review and auto-merge are required before activation. Closes #298 only after verified deployment."
