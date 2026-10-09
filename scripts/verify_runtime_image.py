@@ -115,8 +115,11 @@ def check_pins() -> list[str]:
             errors.append("Docker build context must be ./docker (not repository root)")
     except OSError as exc:
         errors.append(f"image workflow unreadable: {exc}")
-    copy_lines = [line.strip() for line in docker_text.splitlines()
-                  if line.strip().startswith(("COPY ", "ADD "))]
+    copy_lines = [
+        line.strip()
+        for line in docker_text.splitlines()
+        if line.strip().startswith(("COPY ", "ADD "))
+    ]
     if copy_lines != ["COPY opencode.version /opt/aa/opencode.version"]:
         errors.append("image must copy only the pinned OpenCode version, never AA source")
     for forbidden in FORBIDDEN_DOCKER_COPY:
