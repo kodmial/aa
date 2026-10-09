@@ -1,0 +1,40 @@
+{
+  "checked_at": "2026-10-05T10:00:00+00:00",
+  "collection_scope": "Russia-only navigation snapshot (issue #316). Covers Moscow, Saint Petersburg, Yekaterinburg, Kazan with verified group/slot rows; Novosibirsk, Kirov (two same-named localities), Vladivostok as official region-directory fallback only; plus three online groups from the national online catalog. Remaining Russian regions are not imported in v1; the national root catalog URL is the fallback. Website reports 1303 registered groups as of August 2026; that number is not an import quota and is not claimed here.",
+  "data_digests": {
+    "groups.json": "sha256:4b56603f89433622e3de874e984e74812adb64462a1121b9605babddf574f33b",
+    "sources.json": "sha256:a55306dd637416a70ca7ce0db7806f3520a1ed6b6a694897d679fd57b81a3e8d"
+  },
+  "fetched_at": "2026-10-05T10:00:00+00:00",
+  "freshness_policy": "Weekly non-destructive source check; 30-day freshness review threshold for detailed times/addresses (configurable). Stale schedules are served as official-link navigation with an unconfirmed-schedule caveat, never as exact today/tomorrow claims. Even fresh published times are not live availability.",
+  "gaps": [
+    "Regions beyond the eight listed regional pointers have no v1 rows; use the root catalog URL.",
+    "Novosibirsk, both Kirov localities and Vladivostok have directory links only, no verified group rows.",
+    "Online group Vecherniy has an unparsed/unknown schedule and unknown timezone: navigation only.",
+    "Kazan Idel schedule_verified_at is 2026-07-01 and is served as stale navigation, not exact occurrences.",
+    "No phone numbers, entry codes, personal identities, or transient join links are stored by policy."
+  ],
+  "omission_reasons": {
+    "bulk_group_import": "Bulk republication rights unconfirmed (robots/terms unknown); v1 keeps minimal manually reviewed pointers plus official links.",
+    "contacts_and_codes": "Privacy gate: contacts, intercom/access codes and personal data are never stored.",
+    "external_region_sites": "External regional sites need a per-source adapter, permission check and health tracking before deep import."
+  },
+  "record_counts": {
+    "groups": 8,
+    "online_group_records": 3,
+    "places": 8,
+    "region_directory_links": 8,
+    "slots": 11,
+    "slots_rankable": 10,
+    "slots_unrankable": 1,
+    "sources": 11,
+    "verified_group_records": 5
+  },
+  "schema_version": 1,
+  "snapshot_version": "ru-2026-10-05-v1",
+  "source_urls": [
+    "https://aarussia.ru/aagroups/",
+    "https://aarussia.ru/aagroups/russiagroups/",
+    "https://aarussia.ru/online-groups/"
+  ]
+}

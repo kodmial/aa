@@ -1,0 +1,25 @@
+name: Meeting directory refresh check
+
+on:
+  schedule:
+    # Weekly non-destructive source check. Scheduled runs may be delayed or
+    # dropped by GitHub; never assume cron success. Manual dispatch always
+    # works when scheduled checks are missed.
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+# Never auto-commit to main: this workflow only validates the committed
+# snapshot and reports staleness. Changed data lands via human-reviewed PR.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate meeting directory snapshot
+        run: python3 scripts/refresh_meeting_directory.py --check
