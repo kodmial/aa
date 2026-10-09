@@ -43,7 +43,9 @@ def test_real_whole_turn_judge_registered_for_opencode() -> None:
 
 
 class _TransportUnavailable:
-    async def ainvoke_structured(self, prompt: str, *, system: str, schema: dict, retry_count: int = 1) -> dict:
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict, retry_count: int = 1
+    ) -> dict:
         from aa.opencode.errors import OpenCodeDeterministicError
 
         raise OpenCodeDeterministicError("missing agent")
@@ -55,7 +57,9 @@ class _TransportUnavailable:
 
 
 class _NegativeSemanticVerdict:
-    async def ainvoke_structured(self, prompt: str, *, system: str, schema: dict, retry_count: int = 1) -> dict:
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict, retry_count: int = 1
+    ) -> dict:
         return {
             "helpful": False,
             "addresses_intent": False,
@@ -64,7 +68,9 @@ class _NegativeSemanticVerdict:
 
 
 class _429Failure:
-    async def ainvoke_structured(self, prompt: str, *, system: str, schema: dict, retry_count: int = 1) -> dict:
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict, retry_count: int = 1
+    ) -> dict:
         from aa.opencode.errors import OpenCodeRateLimitError
 
         raise OpenCodeRateLimitError("429")
