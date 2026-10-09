@@ -144,16 +144,16 @@ def _clear_shared_caches() -> Any:
 
 
 def test_stage_budgets_and_windows_are_bounded() -> None:
-    """Recurrence-7 bounds: per-attempt deadlines plus tighter display windows."""
+    """Recurrence-7 bounds: per-attempt deadlines; evidence is full-pack (#295)."""
     assert PLANNER_TIME_BUDGET_S == 25.0
     assert PLANNER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
     assert VERIFIER_TURN_BUDGET_S == 40.0
     assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S == 6.0
     assert VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S < VERIFIER_TURN_BUDGET_S
-    assert ANSWER_GENERATION_MAX_PASSAGES == 5
-    assert ANSWER_MAX_PASSAGE_CHARS == 500
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
-    assert VERIFIER_MAX_PASSAGE_CHARS == 500
+    assert ANSWER_GENERATION_MAX_PASSAGES == 0
+    assert ANSWER_MAX_PASSAGE_CHARS == 0
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 0
+    assert VERIFIER_MAX_PASSAGE_CHARS == 0
 
 
 async def test_planner_structured_timeout_marks_capability_for_next_turn(

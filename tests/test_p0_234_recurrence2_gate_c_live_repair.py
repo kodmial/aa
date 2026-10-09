@@ -102,7 +102,7 @@ async def test_duplicate_retrieval_still_regenerates_from_existing_pack(
 
     monkeypatch.setattr("aa.conversation.planner_node.run_planner", _fake_planner)
 
-    def _fake_retrieve(index: Any, queries: Any, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: Any, *, config: Any = None, **kwargs: Any) -> Any:
         _ = (index, queries, config)
 
         class _Pack:

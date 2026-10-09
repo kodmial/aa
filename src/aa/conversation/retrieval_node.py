@@ -1,7 +1,7 @@
-"""V2 retrieval node: planner queries to compact Evidence Pack (issue #116).
+"""V2 retrieval node: planner queries to compact Evidence Pack (issues #116, #295).
 
-The node consumes the minimal ``search_queries`` produced by the #113
-hidden planner (0 or 10..16 context-resolved Russian queries) and runs
+The node consumes the ``search_queries`` produced by the hidden
+planner (0 or 1..16 context-resolved useful Russian queries) and runs
 the RRF-only target pipeline from :mod:`aa.retrieval.evidence` over the
 #115 RAM-resident canonical index:
 

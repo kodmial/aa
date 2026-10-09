@@ -198,7 +198,7 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
         text = "Фиктивная поддержка рядом помогает пережить тягу спокойно."

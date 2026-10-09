@@ -1015,7 +1015,6 @@ def build_synthesis_prompt(
     pack: EvidencePack,
     repair: str = "",
     generation_budget_tokens: int = 0,
-    voice_mode: bool = False,
 ) -> str:
     """Build the synthesis prompt sent to the named ``aa`` agent.
 
@@ -1029,9 +1028,9 @@ def build_synthesis_prompt(
     efficiency hint only (``0`` selects the conservative default); the
     deterministic character validator stays authoritative.
 
-    When ``voice_mode`` is true the prompt additionally carries the #77
-    voice budget (2-4 short sentences, at most 4 sentences / 80 words)
-    so brevity is enforced in generation, not by blind truncation.
+    Voice is transport only (issue #294): no voice flag or voice-only
+    budget may enter this prompt. Text and voice turns share this exact
+    prompt construction.
     """
     try:
         budget = resolve_generation_budget(generation_budget_tokens)
@@ -1062,10 +1061,6 @@ def build_synthesis_prompt(
         f"не более {QUOTE_BUDGET_CHARS} символов.",
         generation_budget_instruction(budget),
     ]
-    if voice_mode:
-        from aa.telegram.tts import voice_generation_instruction as _voice_instruction
-
-        lines.append(_voice_instruction())
     if repair:
         lines.extend(["", "ИСПРАВЛЕНИЕ (обязательно):", repair])
     if is_bulk_reproduction_request(user_text) or is_continuation_request(user_text):
@@ -1422,143 +1417,6 @@ async def enforce_grounded_envelope(
     return compacted, 1
 
 
-def compact_grounded_to_voice(response: GroundedResponse) -> GroundedResponse:
-    """Keep leading grounded units fitting voice (<=4/<=80) and envelope.
-
-    Lower-priority trailing units are dropped first; every retained unit
-    keeps its validated provenance and grounding verdict. When even the
-    first unit cannot fit both bounds, the first unit text is compacted
-    through the string-level voice policy so the caller never emits a
-    truncated fragment.
-    """
-    from aa.telegram.tts import compact_voice_text_to_policy as _compact_voice
-    from aa.telegram.tts import voice_policy_passes as _voice_passes
-
-    if _voice_passes(response.text) and envelope_passes(response.text):
-        return response
-    kept: list[ResponseUnit] = []
-    for unit in response.units:
-        candidate_units = [*kept, unit]
-        candidate_text = " ".join(item.text for item in candidate_units)
-        if not _voice_passes(candidate_text) or not envelope_passes(candidate_text):
-            break
-        kept.append(unit)
-    if kept:
-        compacted_text = " ".join(item.text for item in kept)
-        logger.info(
-            "grounded voice response compacted",
-            extra={"kept_units": len(kept), "total_units": len(response.units)},
-        )
-        return GroundedResponse(
-            text=compacted_text,
-            units=tuple(kept),
-            evidence=response.evidence,
-            diagnostics=response.diagnostics,
-        )
-    fallback_text = _compact_voice(response.text)
-    first = response.units[0]
-    single = ResponseUnit(
-        unit_id=first.unit_id,
-        text=fallback_text,
-        kind=first.kind,
-        priority=first.priority,
-        cited_locators=first.cited_locators,
-        grounding_passed=first.grounding_passed,
-        source_exact=first.source_exact,
-    )
-    logger.info("grounded voice response kept first unit only")
-    return GroundedResponse(
-        text=fallback_text,
-        units=(single,),
-        evidence=response.evidence,
-        diagnostics=response.diagnostics,
-    )
-
-
-async def enforce_grounded_voice_policy(
-    response: GroundedResponse,
-    *,
-    user_text: str,
-    pack: EvidencePack,
-    session_id: str,
-    send: Callable[..., Awaitable[str]],
-    agent: str,
-    primary_model: str,
-    fallback_model: str,
-    entails: EntailmentFn | None = None,
-    sleep: Callable[[float], Awaitable[None]] | None = None,
-    generation_budget_tokens: int = 0,
-) -> tuple[GroundedResponse, int]:
-    """Enforce the #77 voice contract with at most one compact regeneration.
-
-    Uses the same validated ``pack`` (no new retrieval, no new claims).
-    Returns ``(response, extra_sends)`` where ``extra_sends`` is ``0``
-    (first answer fit) or ``1`` (exactly one voice regeneration was
-    performed). When the regenerated answer still violates the voice
-    contract, deterministic leading-sentence compaction applies.
-    """
-    from aa.telegram.tts import voice_compact_retry_instruction as _voice_repair
-    from aa.telegram.tts import voice_policy_passes as _voice_passes
-
-    if _voice_passes(response.text):
-        return response, 0
-    logger.info("grounded answer exceeds voice policy; compact regeneration")
-    repair = _voice_repair()
-    repair_prompt = build_synthesis_prompt(
-        user_text=user_text,
-        pack=pack,
-        repair=repair,
-        generation_budget_tokens=generation_budget_tokens,
-        voice_mode=True,
-    )
-    try:
-        repaired = await send_with_fallback(
-            send,
-            session_id,
-            repair_prompt,
-            agent=agent,
-            primary_model=primary_model,
-            fallback_model=fallback_model,
-            sleep=sleep,
-        )
-    except OpenCodeSessionNotFoundError as exc:
-        raise TurnFailed("session-not-found", "opencode session is gone") from exc
-    repaired_diag = TurnDiagnostics(
-        substantive=response.diagnostics.substantive,
-        aspects=response.diagnostics.aspects,
-        retrieval_rounds=response.diagnostics.retrieval_rounds,
-        candidates=response.diagnostics.candidates,
-        evidence_chunks=len(pack.units),
-        evidence_tokens=pack.token_count,
-        tool_call_count=response.diagnostics.tool_call_count + 1,
-        coverage_gaps=response.diagnostics.coverage_gaps,
-        regeneration_count=response.diagnostics.regeneration_count + 1,
-        grounding_passed=None,
-        served_model=repaired.served_model,
-        fallback_used=repaired.fallback_used,
-        error_category=repaired.error_category,
-        retry_count=repaired.retry_count,
-    )
-    second = build_grounded_response(
-        answer=repaired.text,
-        pack=pack,
-        diagnostics=repaired_diag,
-        entails=entails,
-    )
-    unsupported = [unit for unit in second.units if unit.grounding_passed is False]
-    if unsupported:
-        raise TurnFailed(
-            "grounding-failed",
-            f"{len(unsupported)} regenerated unit(s) lack semantic support",
-        )
-    ensure_russian_only(second.text)
-    if _voice_passes(second.text):
-        logger.info("voice compact regeneration fit the policy")
-        return second, 1
-    compacted = compact_grounded_to_voice(second)
-    return compacted, 1
-
-
 def _classify_send_error(exc: BaseException) -> str:
     text = str(exc).casefold()
     if re.search(r"(?<!\d)429(?!\d)", text) is not None or "too many requests" in text:
@@ -1700,13 +1558,11 @@ class TurnRunner:
         send: Callable[..., Awaitable[str]],
         planner_fn: PlannerFn | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
-        voice_mode: bool = False,
     ) -> GroundedResponse:
         """Execute phases 1-9 for one substantive turn (fails closed).
 
-        When ``voice_mode`` is true the #77 voice contract (<=4 sentences
-        / <=80 words) is enforced in the generation budget with exactly
-        one voice compact regeneration, then deterministic compaction.
+        Voice is transport only (issue #294): this pipeline never takes
+        a voice flag. Text and voice turns share this exact path.
         """
         if not text.strip():
             raise TurnFailed("empty-turn", "refusing an empty turn")
@@ -1778,7 +1634,7 @@ class TurnRunner:
             tool_call_count=tool_calls,
         )
 
-        prompt = build_synthesis_prompt(user_text=text, pack=pack, voice_mode=voice_mode)
+        prompt = build_synthesis_prompt(user_text=text, pack=pack)
         try:
             synthesis = await send_with_fallback(
                 send,
@@ -1858,23 +1714,6 @@ class TurnRunner:
                 sleep=sleep,
                 generation_budget_tokens=self.generation_budget_tokens,
             )
-            if voice_mode:
-                voiced, _ = await enforce_grounded_voice_policy(
-                    enveloped,
-                    user_text=text,
-                    pack=pack,
-                    session_id=session_id,
-                    send=send,
-                    agent=self.agent,
-                    primary_model=self.primary_model,
-                    fallback_model=self.fallback_model,
-                    entails=self.entails,
-                    sleep=sleep,
-                    generation_budget_tokens=self.generation_budget_tokens,
-                )
-                if not envelope_passes(voiced.text):
-                    return compact_grounded_response(voiced)
-                return voiced
             return enveloped
         # One bounded regeneration for unsupported units, else fail closed.
         logger.info(
@@ -1887,9 +1726,7 @@ class TurnRunner:
             "Каждое существенное утверждение — с ссылкой; "
             "прямые цитаты — дословно. Английский текст запрещён."
         )
-        repair_prompt = build_synthesis_prompt(
-            user_text=text, pack=pack, repair=repair_note, voice_mode=voice_mode
-        )
+        repair_prompt = build_synthesis_prompt(user_text=text, pack=pack, repair=repair_note)
         try:
             repaired = await send_with_fallback(
                 send,
@@ -1957,37 +1794,20 @@ class TurnRunner:
             sleep=sleep,
             generation_budget_tokens=self.generation_budget_tokens,
         )
-        if voice_mode:
-            voiced, _ = await enforce_grounded_voice_policy(
-                enveloped,
-                user_text=text,
-                pack=pack,
-                session_id=session_id,
-                send=send,
-                agent=self.agent,
-                primary_model=self.primary_model,
-                fallback_model=self.fallback_model,
-                entails=self.entails,
-                sleep=sleep,
-                generation_budget_tokens=self.generation_budget_tokens,
-            )
-            if not envelope_passes(voiced.text):
-                return compact_grounded_response(voiced)
-            return voiced
         return enveloped
 
 
-def build_trivial_prompt(*, user_text: str, repair: str = "", voice_mode: bool = False) -> str:
-    """Build the RU-only prompt for a non-substantive turn."""
+def build_trivial_prompt(*, user_text: str, repair: str = "") -> str:
+    """Build the RU-only prompt for a non-substantive turn.
+
+    Voice is transport only (issue #294): no voice flag may enter
+    this prompt. Text and voice turns share this exact construction.
+    """
     base = (
         "Ответь ТОЛЬКО по-русски. Весь видимый ответ — на русском языке; "
         "английский текст запрещён.\n"
         f"{user_text}"
     )
-    if voice_mode:
-        from aa.telegram.tts import voice_generation_instruction as _voice_instruction
-
-        base = f"{base}\n{_voice_instruction()}"
     if repair:
         base = f"{base}\nИСПРАВЛЕНИЕ (обязательно):\n{repair}"
     return base
@@ -2002,7 +1822,6 @@ async def run_trivial_turn(
     primary_model: str,
     fallback_model: str,
     sleep: Callable[[float], Awaitable[None]] | None = None,
-    voice_mode: bool = False,
 ) -> SynthesisResult:
     """Answer a non-substantive turn directly through the named agent.
 
@@ -2011,9 +1830,9 @@ async def run_trivial_turn(
     an English fallback/error/provider fragment) fails the turn closed
     for a deterministic Russian fallback upstream.
 
-    When ``voice_mode`` is true the #77 voice contract (<=4 sentences /
-    <=80 words) is enforced in the generation budget with exactly one
-    compact regeneration, then deterministic leading-sentence compaction.
+    Voice is transport only (issue #294): no voice-only budget,
+    regeneration or compaction applies here. The shared envelope below
+    is the only size guard.
     """
     if not text.strip():
         raise TurnFailed("empty-turn", "refusing an empty turn")
@@ -2021,7 +1840,7 @@ async def run_trivial_turn(
         result = await send_with_fallback(
             send,
             session_id,
-            build_trivial_prompt(user_text=text, voice_mode=voice_mode),
+            build_trivial_prompt(user_text=text),
             agent=agent,
             primary_model=primary_model,
             fallback_model=fallback_model,
@@ -2031,58 +1850,6 @@ async def run_trivial_turn(
         raise TurnFailed("session-not-found", "opencode session is gone") from exc
     if not meets_russian_only(result.text):
         raise TurnFailed("language-violation", "trivial synthesis violated RU-only contract")
-    if voice_mode:
-        from aa.telegram.tts import (
-            compact_voice_text_to_policy as _compact_voice,
-        )
-        from aa.telegram.tts import (
-            voice_compact_retry_instruction as _voice_repair,
-        )
-        from aa.telegram.tts import (
-            voice_policy_passes as _voice_passes,
-        )
-
-        if _voice_passes(result.text):
-            pass
-        else:
-            logger.info("trivial voice answer exceeds policy; compact regeneration")
-            try:
-                second = await send_with_fallback(
-                    send,
-                    session_id,
-                    build_trivial_prompt(
-                        user_text=text,
-                        voice_mode=True,
-                        repair=_voice_repair(),
-                    ),
-                    agent=agent,
-                    primary_model=primary_model,
-                    fallback_model=fallback_model,
-                    sleep=sleep,
-                )
-            except OpenCodeSessionNotFoundError as exc:
-                raise TurnFailed("session-not-found", "opencode session is gone") from exc
-            if not meets_russian_only(second.text):
-                raise TurnFailed(
-                    "language-violation", "trivial synthesis violated RU-only contract"
-                )
-            if _voice_passes(second.text):
-                logger.info("trivial voice regeneration fit the policy")
-                result = second
-            else:
-                compacted_voice = _compact_voice(second.text)
-                if not meets_russian_only(compacted_voice):
-                    raise TurnFailed(
-                        "language-violation", "trivial synthesis violated RU-only contract"
-                    )
-                logger.info("trivial voice answer compacted to policy")
-                result = SynthesisResult(
-                    text=compacted_voice,
-                    served_model=second.served_model,
-                    fallback_used=second.fallback_used,
-                    error_category=second.error_category,
-                    retry_count=second.retry_count,
-                )
     if not envelope_passes(result.text):
         compacted = compact_text_to_envelope(result.text)
         if not meets_russian_only(compacted):
@@ -2130,11 +1897,9 @@ __all__ = [
     "build_trivial_prompt",
     "check_coverage",
     "compact_grounded_response",
-    "compact_grounded_to_voice",
     "contains_english_fallback",
     "deduplicate_cross_aspect",
     "enforce_grounded_envelope",
-    "enforce_grounded_voice_policy",
     "ensure_russian_only",
     "fit_evidence_budget",
     "is_substantive",

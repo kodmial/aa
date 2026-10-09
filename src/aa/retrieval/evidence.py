@@ -1,12 +1,14 @@
-"""Multi-query hybrid retrieval with Evidence Packs (issue #116).
+"""Multi-query hybrid retrieval with Evidence Packs (issues #116, #295).
 
 Target retrieval pipeline for the new conversation graph, built on the
-#113 planner state (``QueryPlan.queries``: 0 or 10..16 context-resolved
-Russian queries) and the #115 RAM-resident canonical index:
+planner state (``QueryPlan.queries``: 0 or 1..16 context-resolved
+Russian queries; #295 flexible meaning-driven count) and the #115
+RAM-resident canonical index:
 
 ```text
-QueryPlan(10-16) -> BM25 + E5/FAISS per query -> global RRF(k=60)
+QueryPlan(1-16) -> BM25 + E5/FAISS per query -> global RRF(k=60)
   -> per-query retention -> overlap dedup/diversity
+  -> model-driven semantic selection over broad candidates
   -> small-to-big expansion -> compact Evidence Pack (16k token budget)
 ```
 
@@ -19,8 +21,11 @@ Contract notes:
   FAISS ``IndexFlatIP`` over the same canonical child chunks);
 - raw BM25 and dense scores are never compared directly; fusion uses
   only the standard RRF primitive;
-- selection after fusion is RRF-only (fused-score order); canonical
-  text and provenance are never rewritten;
+- selection after fusion is RRF-ordered with an optional bounded
+  model-driven semantic promotion over genuinely broad candidates
+  (see :mod:`aa.conversation.semantic_selection`); canonical text and
+  provenance are never rewritten; deep fused ranks (>16) stay reachable
+  and are never irreversibly pruned before semantic inspection;
 - small-to-big expansion stays within one canonical source/section
   unless an explicit neighbor link crosses a valid boundary, merges
   overlapping/adjacent windows, and keeps exact text plus provenance;
@@ -31,8 +36,8 @@ Contract notes:
 This path has zero dependency on legacy semantic logic: no handwritten
 query-expansion dictionaries and no legacy planner structures. It is
 RAM-only (BM25 + E5/FAISS plus RRF) with zero network/download
-dependency on the hot path and no second-stage cross-encoder/BGE
-reranker.
+dependency on the hot path and no unconditional second-stage
+cross-encoder/BGE reranker.
 """
 
 from __future__ import annotations
@@ -67,13 +72,18 @@ from aa.retrieval.lexical import lexical_search_conn
 
 logger = logging.getLogger("aa.retrieval.evidence")
 
-MIN_PLANNER_QUERIES = 10
+MIN_PLANNER_QUERIES = 1
 MAX_PLANNER_QUERIES = 16
 BRANCH_TOP_K = 40
-POOL_CAP = 64
-TOP_CHILD_CAP = 16
-MAX_PER_SECTION = 4
-NEIGHBOR_WINDOW = 1
+# Broad-candidate recall (issue #295): the fused pool stays wide enough
+# that decisive passages at fused rank >16 remain inspectable by the
+# model-driven semantic selection layer before any top-N budgeting.
+# All caps stay bounded by real RAM/latency/token budgets; nothing here
+# claims infinite context fits one model call.
+POOL_CAP = 128
+TOP_CHILD_CAP = 32
+MAX_PER_SECTION = 6
+NEIGHBOR_WINDOW = 2
 # Interactive Telegram budget for one warm retrieval turn. The RRF-only
 # RAM path is expected to serve well within this budget.
 INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
@@ -153,7 +163,11 @@ def _short_digest(text: str) -> str:
 
 
 def validate_planner_queries(queries: object) -> list[str]:
-    """Validate the minimal #113 planner query list (fails closed)."""
+    """Validate the planner query list (fails closed).
+
+    Issue #295: 1..16 distinct useful queries; the planner itself is
+    responsible for emitting a meaning-driven count without padding.
+    """
     if not isinstance(queries, list):
         raise EvidenceError("planner queries must be a list of strings")
     if not queries:
@@ -175,9 +189,9 @@ def validate_recovery_queries(queries: object) -> list[str]:
     """Validate one bounded empty-pack recovery query list (fails closed).
 
     Recovery uses the live turn plus conversation context directly (never
-    canned generic queries) and carries 1..6 queries, so it cannot meet
-    the planner 10..16 cardinality. This validator accepts 1..16
-    non-empty strings; the planner contract stays unchanged.
+    canned generic queries) and carries 1..6 queries. This validator
+    accepts 1..16 non-empty strings; the flexible planner contract
+    (1..16 useful queries) stays unchanged.
     """
     if not isinstance(queries, list):
         raise EvidenceError("recovery queries must be a list of strings")
@@ -318,10 +332,10 @@ def fuse_query_pool(
     Per-query retention keeps multi-query recall: every query's best
     unique candidate is retained first (sorted by fused score and
     truncated only when distinct bests exceed ``pool_cap``), then the
-    rest of the pool fills by global RRF rank. With 10..16 planner
-    queries and the 64-cap pool this guarantees the ticket
+    rest of the pool fills by global RRF rank. With 1..16 planner
+    queries and the broad pool this guarantees the ticket
     rule (at least the best unique candidate per query) while leaving
-    ample slots for global RRF depth.
+    ample slots for global RRF depth, including fused ranks >16.
     """
     if rrf_k <= 0:
         raise EvidenceError("rrf_k must be > 0")
@@ -796,24 +810,75 @@ def select_passages_under_budget(
     return selected, total
 
 
+def broad_fused_ranking(
+    index: HybridIndex,
+    queries: object,
+    *,
+    config: RetrievalConfig | None = None,
+) -> tuple[dict[str, Any], list[tuple[str, float]]]:
+    """Expose the genuinely broad fused ranking for semantic selection.
+
+    Returns ``(fused_by_id, ordered)`` where ``ordered`` is
+    ``[(chunk_id, fused_score)]`` best-first over the full fused pool
+    (ranks >16 included). Used by the model-driven selection layer for
+    discovery previews; the Evidence Pack path below stays budgeted.
+    """
+    active = config if config is not None else RetrievalConfig()
+    cleaned = validate_planner_queries(queries)
+    if not cleaned:
+        return {}, []
+    ranked_lists, per_query_ids = run_branch_searches(
+        index, cleaned, branch_top_k=active.branch_top_k
+    )
+    fused, pool_ids = fuse_query_pool(
+        ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+    )
+    ordered = sorted(
+        ((chunk_id, fused[chunk_id].fused_score) for chunk_id in pool_ids if chunk_id in fused),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    # Include any remaining fused candidates beyond the pool cap tail so
+    # deep ranks stay inspectable when the pool itself is the bound.
+    if len(ordered) < len(fused):
+        seen = {chunk_id for chunk_id, _ in ordered}
+        rest = sorted(
+            (
+                (chunk_id, candidate.fused_score)
+                for chunk_id, candidate in fused.items()
+                if chunk_id not in seen
+            ),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        ordered.extend(rest)
+    return fused, ordered
+
+
 def retrieve_evidence(
     index: HybridIndex,
     queries: object,
     *,
     config: RetrievalConfig | None = None,
+    resolved_intent: str = "",
+    conversation_context: str = "",
 ) -> EvidencePack:
     """Run the full RRF-only pipeline for one planner query list.
 
-    ``queries`` is the minimal ``QueryPlan.queries`` from #113. An empty
-    list performs no retrieval and returns an empty pack. Otherwise the
-    count must be 10..16. The answering model receives only the
+    ``queries`` is the ``QueryPlan.queries`` (0 or 1..16 flexible
+    meaning-driven queries per issue #295). An empty
+    list performs no retrieval and returns an empty pack. The answering model receives only the
     returned exact passages; ``retrieval_metadata`` stays internal.
 
     Pipeline: ``QueryPlan -> BM25+E5 -> RRF -> dedup/diversity ->
-    small-to-big`` over the RAM-resident index with zero
-    network/download dependency and no second-stage reranker.
-    Per-query retention keeps each query's best unique candidate
-    first, then fills the remainder by global RRF rank.
+    semantic promotion (optional, bounded) -> small-to-big`` over the
+    RAM-resident index with zero network/download dependency and no
+    unconditional second-stage reranker. Per-query retention keeps each
+    query's best unique candidate first, then fills the remainder by
+    global RRF rank. When ``resolved_intent`` is supplied, a bounded
+    generic semantic promotion reorders winners so intent-relevant deep
+    candidates (fused rank >16) surface without dropping any candidate
+    before budgeting.
     """
     active = config if config is not None else RetrievalConfig()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
@@ -851,6 +916,33 @@ def retrieve_evidence(
         top_cap=active.top_child_cap,
         sections=sections,
     )
+    # Bounded semantic promotion (issue #295): when the planner resolved
+    # a real intent, reorder winners by generic intent relevance over
+    # short previews so a decisive deep-ranked candidate surfaces before
+    # expansion/budgeting. Stable: RRF order breaks ties, nothing is
+    # dropped here, and the empty-intent path behaves byte-identically.
+    semantic_promoted = False
+    if resolved_intent.strip():
+        try:
+            from aa.conversation.semantic_selection import (
+                PREVIEW_CHARS as _PREVIEW_CHARS,
+            )
+            from aa.conversation.semantic_selection import (
+                heuristic_relevance_score as _score,
+            )
+
+            _context = f"{resolved_intent.strip()} {conversation_context.strip()}".strip()
+            _order = {candidate.chunk_id: pos for pos, candidate in enumerate(winners)}
+            _scored = []
+            for candidate in winners:
+                record = index.chunks.get(candidate.chunk_id)
+                preview = str(getattr(record, "text", ""))[: _PREVIEW_CHARS * 2] if record else ""
+                _scored.append((_score(preview, _context), _order[candidate.chunk_id], candidate))
+            _scored.sort(key=lambda triple: (-triple[0], triple[1]))
+            winners = [candidate for _, _, candidate in _scored]
+            semantic_promoted = any(score > 0 for score, _, _ in _scored)
+        except Exception:
+            semantic_promoted = False
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
     selected, total = select_passages_under_budget(
         expanded,
@@ -872,6 +964,7 @@ def retrieve_evidence(
         "top_child_cap": active.top_child_cap,
         "selected_winners": len(winners),
         "retrieval_backend": "rrf-only/1",
+        "semantic_promoted": semantic_promoted,
         "neighbor_window": active.neighbor_window,
         "expanded_passages": len(expanded),
         "selected_passages": len(selected),
@@ -906,10 +999,10 @@ def retrieve_evidence_for_recovery(
     """Run the RRF-only pipeline for one bounded empty-pack recovery list.
 
     Recovery carries the live turn plus conversation context directly
-    (1..6 queries, never canned generics), so planner 10..16 cardinality
-    cannot apply here. Ranking, dedup/diversity, small-to-big expansion
-    and budget selection are identical to :func:`retrieve_evidence`;
-    only the query-count validator allows short recovery lists.
+    (1..6 queries, never canned generics). Ranking, dedup/diversity,
+    small-to-big expansion and budget selection are identical to
+    :func:`retrieve_evidence`; only the query-count validator allows
+    short recovery lists.
     """
     active = config if config is not None else RetrievalConfig()
     if active.branch_top_k <= 0 or active.rrf_k <= 0:
@@ -1043,6 +1136,7 @@ __all__ = [
     "NEIGHBOR_WINDOW",
     "POOL_CAP",
     "TOP_CHILD_CAP",
+    "broad_fused_ranking",
     "clear_query_vector_cache",
     "query_vector_cache_info",
     "EvidenceError",

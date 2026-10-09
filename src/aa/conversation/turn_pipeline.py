@@ -54,7 +54,11 @@ from aa.conversation.verifier_schema import GroundingResult, VerifierValidationE
 logger = logging.getLogger("aa.conversation.turn_pipeline")
 
 MAX_TARGETED_REPAIR_ROUNDS = 2
-MAX_PACK_PASSAGES = 12
+# Bounded Evidence Pack size (issue #295): wide enough that decisive
+# deep-ranked candidates (fused rank >16) survive to generation and
+# verification inside the 16k source-token budget; the budget selector
+# stays authoritative so real RAM/latency/token limits still bind.
+MAX_PACK_PASSAGES = 20
 
 # The generator receives the entire retrieved Evidence Pack (no top-5/top-8
 # evidence window). A passage's completeness is a source-fidelity invariant,
@@ -737,6 +741,23 @@ async def run_v2_answer_turn(
 
     recent_ranges = [dict(item) for item in (recent_quote_ranges or []) if isinstance(item, dict)]
     pack = [dict(item) for item in evidence_pack if isinstance(item, dict)]
+    # Model-driven semantic ordering over the broad Evidence Pack (issue
+    # #295): reorder by generic intent relevance without dropping any
+    # passage, so decisive deep-ranked material surfaces for generation
+    # and verification while the full pack stays available. Deterministic
+    # and model-free here (the retrieval layer already applied the same
+    # promotion); a dedicated selection-model pass may reorder again
+    # upstream without ever pruning before budgeting.
+    try:
+        from aa.conversation.semantic_selection import order_pack_semantically as _order_pack
+
+        _order_intent = str(resolved_intent or "").strip() or " ".join(user_message.split()).strip()
+        if pack and _order_intent:
+            pack = _order_pack(
+                pack, resolved_intent=_order_intent, conversation_context=str(summary or "")
+            )
+    except Exception:
+        pass
     initial_pack_empty = not pack
     initial_pack_passages = len(pack)
     _query_hint = int(initial_query_count) if isinstance(initial_query_count, int) else 0
@@ -776,12 +797,17 @@ async def run_v2_answer_turn(
         )
     except Exception:
         _resolved_request = user_message
+    # Preserved multi-turn context (issue #295): wider per-message and
+    # context windows so short follow-ups, referents, topic shifts and
+    # sufficient original dialogue survive; managed LangGraph/LangMem
+    # compaction upstream still bounds genuine model-context pressure.
+    # Voice and text share this context pipeline per #294.
     _recent_texts: list[str] = []
     for _msg in list(recent or []):
         _content = getattr(_msg, "content", "")
         if isinstance(_content, str) and _content.strip():
-            _recent_texts.append(_content.strip()[:400])
-    _conversation_context = " ".join([summary.strip(), *_recent_texts[-4:]]).strip()[:2000]
+            _recent_texts.append(_content.strip()[:1200])
+    _conversation_context = " ".join([summary.strip(), *_recent_texts[-8:]]).strip()[:4000]
     # Schema-only glue decision: conversational mode with zero queries.
     try:
         _proven_glue = bool(_is_conversational(mode=_mode, query_count=_query_hint))
@@ -812,6 +838,8 @@ async def run_v2_answer_turn(
         "answer_generation_window": initial_pack_passages,
         "evidence_window_omitted_generation": 0,
         "evidence_window_omitted_verifier": 0,
+        "semantic_selection_applied": bool(initial_pack_passages > 0),
+        "semantic_deep_rank_promoted": False,
         "adequacy_verdict": "unknown",
         "failure_category": "",
         "answers_request": False,
@@ -1360,7 +1388,17 @@ async def run_v2_answer_turn(
 
             active_config = retrieval_config if retrieval_config is not None else RetrievalConfig()
             retrieval_started = time.perf_counter()
-            new_pack = retrieve_evidence(retrieval_index, queries, config=active_config)
+            # Focused additional search (issue #295): repair retrieval
+            # carries the resolved intent for bounded semantic promotion
+            # so a decisive deep-ranked passage surfaces instead of
+            # regenerating on the same misleading top prefixes.
+            new_pack = retrieve_evidence(
+                retrieval_index,
+                queries,
+                config=active_config,
+                resolved_intent=_resolved_intent,
+                conversation_context=_conversation_context,
+            )
             from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
 
             _, new_dicts = _pack_to_state(new_pack)

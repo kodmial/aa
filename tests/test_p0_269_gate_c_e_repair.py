@@ -157,7 +157,7 @@ async def test_repair_replan_focus_stays_anchored_to_live_request(
 
     monkeypatch.setattr("aa.conversation.planner_node.run_planner", _fake_planner)
 
-    def _fake_retrieve(index: Any, queries: Any, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: Any, *, config: Any = None, **kwargs: Any) -> Any:
         _ = (index, queries, config)
 
         class _Pack:

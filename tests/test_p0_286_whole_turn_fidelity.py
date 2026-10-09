@@ -334,20 +334,22 @@ def test_evidence_window_coverage_and_repair_width() -> None:
         coverage_to_metrics,
     )
 
-    assert ANSWER_GENERATION_MAX_PASSAGES == 5
-    assert REPAIR_GENERATION_MAX_PASSAGES == 8
+    assert ANSWER_GENERATION_MAX_PASSAGES == 0
+    assert REPAIR_GENERATION_MAX_PASSAGES == 0
     pack = [
         _pack_entry(f"chapter-3#exp{i:04d}", f"Invented fixture text {i}. " * 40) for i in range(8)
     ]
     coverage = assess_evidence_window_coverage(
         pack,
         generation_window=ANSWER_GENERATION_MAX_PASSAGES,
-        verifier_window=5,
+        verifier_window=0,
         cited_ids=[pack[6]["passage_id"]],
     )
     assert coverage.pack_passages == 8
-    assert coverage.omitted_from_generation == 3
-    assert coverage.cited_outside_generation == 1
+    assert coverage.omitted_from_generation == 0
+    assert coverage.omitted_from_verifier == 0
+    assert coverage.cited_outside_generation == 0
+    assert coverage.cited_outside_verifier == 0
     metrics = coverage_to_metrics(coverage)
     assert metrics["pack_passages"] == 8
     assert "Invented fixture text" not in json.dumps(metrics)
@@ -356,25 +358,22 @@ def test_evidence_window_coverage_and_repair_width() -> None:
 async def test_repair_uses_wider_window_for_rank_six_evidence() -> None:
     import pathlib
 
-    # Bounded repair policy (no blind enlargement): the initial draft
-    # uses the top-5 window while bounded repair regens use the wider
-    # top-8 window, so decisive evidence at ranks 6-8 is reachable on
-    # retry without enlarging every turn. Proven statically here (the
-    # live lane records omitted-window counts per turn); the coverage
-    # test above proves the mechanical counting.
+    # Full-pack policy (#295): initial drafts and repair regens receive
+    # the entire Evidence Pack with full text, so decisive evidence at
+    # ranks 6+ (including >16 after semantic promotion) is reachable on
+    # the first attempt and on retry. Proven statically here plus the
+    # coverage test above.
     root = pathlib.Path(__file__).resolve().parents[1]
     src = (root / "src" / "aa" / "conversation" / "turn_pipeline.py").read_text(encoding="utf-8")
     assert "wider=True" in src
-    assert "REPAIR_GENERATION_MAX_PASSAGES" in src
-    # Initial vs repair widths are distinct and bounded.
+    # Live telemetry records the omitted-window counts (privacy-safe, zero at full pack).
+    assert "evidence_window_omitted_generation" in src
+    assert "evidence_window_omitted_verifier" in src
     from aa.conversation.turn_pipeline import ANSWER_GENERATION_MAX_PASSAGES
     from aa.conversation.whole_turn_judge import REPAIR_GENERATION_MAX_PASSAGES as _REPAIR
 
-    assert ANSWER_GENERATION_MAX_PASSAGES == 5
-    assert _REPAIR == 8
-    # Live telemetry records the omitted-window counts (privacy-safe).
-    assert "evidence_window_omitted_generation" in src
-    assert "evidence_window_omitted_verifier" in src
+    assert ANSWER_GENERATION_MAX_PASSAGES == 0
+    assert _REPAIR == 0
 
 
 def test_no_domain_regex_or_exact_oracle_in_new_control() -> None:

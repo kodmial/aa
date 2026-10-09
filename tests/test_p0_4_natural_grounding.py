@@ -835,7 +835,7 @@ async def test_single_unsupported_claim_triggers_targeted_repair(
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
         text = second_pack_entry["text"]
@@ -912,7 +912,7 @@ async def test_persistent_failure_narrowed_after_two_rounds(
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None) -> Any:
+    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
         text = "Фиктивная другая поддержка рядом."
@@ -1492,7 +1492,7 @@ def test_verifier_normalizes_weak_provider_formatting() -> None:
     """Boolean transport rejects scope strings; evidence ids trim strictly."""
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 0
     # Scope-shaped payloads are rejected: the model must emit booleans.
     with pytest.raises(VerifierValidationError):
         validate_unit_decision({"scope": "Book", "supported": True, "evidence_passage_ids": []})
@@ -1523,7 +1523,7 @@ def test_verifier_normalizes_weak_provider_formatting() -> None:
 
 
 def test_verifier_evidence_window_bounds_prompt_size() -> None:
-    """Bound verifier input latency with the display window."""
+    """Verifier receives the full pack with complete text (#295)."""
     from aa.conversation.verifier import VERIFIER_MAX_EVIDENCE_PASSAGES
 
     units = split_response_units("Понимаю. Тяга проходит.")
@@ -1535,21 +1535,16 @@ def test_verifier_evidence_window_bounds_prompt_size() -> None:
         for i in range(12)
     ]
     user_text = build_single_unit_text(unit=units[0], passages=passages)
-    # Short ordinal display ids keep the window bounded and copyable; long
-    # provenance ids never enter the prompt (Gate C run 37556798996).
-    # Window tightened 8 -> 6 for run 37561542378 (14/14 clarifications,
-    # verifier never served, max 51.4s over budget on the weak fallback),
-    # then 6 -> 5 for kodmial/aa#217 recurrence 7 (exact main 58f943c run
-    # 37709271567: verifier input averages ~3k tokens per slow text-path
-    # request while drafts cite only top-ranked passages).
+    # Short ordinal display ids stay copyable; long provenance ids never
+    # enter the prompt. The full pack (all 12) reaches the verifier.
     assert 'id="p1"' in user_text
     assert 'id="p5"' in user_text
-    assert 'id="p6"' not in user_text
-    assert "chapter-3#exp0005" not in user_text
-    assert "chapter-3#exp0006" not in user_text
-    assert "chapter-3#exp0011" not in user_text
+    assert 'id="p6"' in user_text
+    assert 'id="p12"' in user_text
+    for passage in passages:
+        assert passage["text"] in user_text
     assert len(passages) == 12
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 0
 
 
 async def test_verifier_retries_weak_formatting_but_not_deterministic() -> None:
@@ -1823,15 +1818,15 @@ def test_verifier_unsupported_needs_no_citation_or_quote() -> None:
 
 
 def test_verifier_display_truncates_long_passages_but_checks_full_pack() -> None:
-    """Display text is truncated while deterministic gates use the full pack."""
+    """Verifier receives complete text; deterministic gates use the full pack (#295)."""
     from aa.conversation.verifier import VERIFIER_MAX_PASSAGE_CHARS, build_single_unit_text
 
     long_text = "Фиктивная поддержка рядом. " * 200
-    assert len(long_text) > VERIFIER_MAX_PASSAGE_CHARS
+    assert VERIFIER_MAX_PASSAGE_CHARS == 0
     pack = [_pack_entry(text=long_text)]
     units = split_response_units("Понимаю. Тяга проходит.")
     user_text = build_single_unit_text(unit=units[0], passages=pack)
-    assert long_text not in user_text
+    assert long_text in user_text
     # Short display ids enter the prompt; the long provenance id resolves
     # only in AA-side validation against the full stored pack.
     assert 'id="p1"' in user_text
@@ -1999,29 +1994,25 @@ def test_v2_answer_carries_bounded_generation_budget_before_user_message() -> No
     )
     final = str(messages[-1].content)
     assert "<response_budget>" in final
-    assert "2-3 short sentences" in final
+    assert "answer length follows the question" in final.lower() or "Generation budget" in final
     assert final.index("<book_evidence>") < final.index("<response_budget>")
     assert final.index("<response_budget>") < final.index("<user_message>")
     assert final.rstrip().endswith("</user_message>")
 
 
 def test_verifier_window_tightened_for_weak_fallback_slo() -> None:
-    """Gate C repair (run 37561542378): verifier input fits the live SLO.
+    """Verifier receives the full pack with complete text (#295).
 
-    Five top-ranked passages of 600 display chars keep the verifier
-    prompt small enough to serve within budget (tightened 6x800 -> 5x600
-    for kodmial/aa#217 recurrence 7, exact main 58f943c run 37709271567:
-    verifier input averages ~3k tokens per slow text-path request while
-    drafts cite only top-ranked passages), while deterministic
-    cite/quote/checksum gates still validate against the full stored pack.
+    Deterministic cite/quote/checksum gates still validate against the
+    full stored pack; no display-window cap remains at this boundary.
     """
     from aa.conversation.verifier import (
         VERIFIER_MAX_EVIDENCE_PASSAGES,
         VERIFIER_MAX_PASSAGE_CHARS,
     )
 
-    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 5
-    assert VERIFIER_MAX_PASSAGE_CHARS == 500
+    assert VERIFIER_MAX_EVIDENCE_PASSAGES == 0
+    assert VERIFIER_MAX_PASSAGE_CHARS == 0
 
 
 def test_verifier_transport_schema_has_no_enum_but_code_stays_strict() -> None:

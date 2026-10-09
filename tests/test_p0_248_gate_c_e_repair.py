@@ -104,17 +104,20 @@ def test_capability_caches_recover_mid_lane() -> None:
 
 
 def test_display_windows_preserved_for_grounding() -> None:
-    """Evidence windows stay at 5/500 so held-out paraphrases keep context."""
-    assert ANSWER_MAX_PASSAGE_CHARS == 500
-    assert VERIFIER_MAX_PASSAGE_CHARS == 500
-    from aa.conversation.prompt_builder import _display_answer_text
+    """Complete evidence reaches generator and verifier for held-out paraphrases (#295)."""
+    assert ANSWER_MAX_PASSAGE_CHARS == 0
+    assert VERIFIER_MAX_PASSAGE_CHARS == 0
+    from aa.conversation.prompt_builder import EvidencePassage, render_turn_context
     from aa.conversation.verifier import _display_passage_text
 
     long_text = "x" * 3000
-    assert long_text not in _display_answer_text(long_text, limit=ANSWER_MAX_PASSAGE_CHARS)
-    assert "truncated" in _display_answer_text(long_text, limit=ANSWER_MAX_PASSAGE_CHARS)
-    assert long_text not in _display_passage_text(long_text)
-    assert "truncated" in _display_passage_text(long_text)
+    context = render_turn_context(
+        summary="",
+        passages=[EvidencePassage(passage_id="p1", source="s", section="c", text=long_text)],
+        user_message="что помогает?",
+    )
+    assert long_text in context
+    assert _display_passage_text(long_text) == long_text
 
 
 async def test_slow_structured_planner_degrades_within_tightened_budget() -> None:
@@ -153,7 +156,7 @@ async def test_slow_structured_planner_degrades_within_tightened_budget() -> Non
         wire_agent: str = ""
 
     plan = await run_planner("evening craving", model=_Model(), summary="", recent=[])
-    assert 10 <= len(plan.queries) <= 16
+    assert 1 <= len(plan.queries) <= 16
 
 
 async def test_grounded_turn_still_serves_with_repair() -> None:

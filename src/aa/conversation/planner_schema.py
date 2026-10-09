@@ -1,4 +1,4 @@
-"""Model-driven turn planner schema for the v2 turn graph (issues #112, #268).
+"""Model-driven turn planner schema for the v2 turn graph (issues #112, #268, #295).
 
 The planner receives the current user turn plus managed conversation
 state and returns a typed structured result:
@@ -6,7 +6,9 @@ state and returns a typed structured result:
 - ``mode``: ``conversational`` | ``retrieval``
 - ``resolved_intent``: standalone semantic formulation of what the user
   means now (empty only for purely conversational turns)
-- ``queries``: [] for conversational turns, otherwise 10..16 Russian queries
+- ``queries``: [] for conversational turns, otherwise 1..16 distinct
+  useful Russian queries (issue #295: meaning-driven count, never padded
+  to 10 or truncated at 16 by fiat)
 
 Application code validates schema/cardinality only. It never infers
 meaning from words, punctuation, step numbers, greeting lists, recovery
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 
 PlannerMode = Literal["conversational", "retrieval"]
 
-MIN_NONEMPTY_QUERIES = 10
+MIN_NONEMPTY_QUERIES = 1
 MAX_QUERIES = 16
 MAX_RESOLVED_INTENT_CHARS = 2000
 # Bounded native structured retry budget: OpenCode owns the retry, AA code
@@ -66,8 +68,10 @@ def validate_query_plan(plan: QueryPlan) -> QueryPlan:
 
     - ``mode`` must be ``conversational`` or ``retrieval``;
     - ``conversational`` requires zero queries;
-    - ``retrieval`` requires 10..16 distinct non-empty queries and a
-      non-empty ``resolved_intent``;
+    - ``retrieval`` requires 1..16 distinct useful non-empty queries and a
+      non-empty ``resolved_intent`` (issue #295: flexible meaning-driven
+      count; padding to a fixed minimum is rejected upstream by prompt
+      contract, not here);
     - no lexical, semantic or domain judgment is applied here.
 
     There is deliberately no semantic migration leniency here.
