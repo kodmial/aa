@@ -1,0 +1,106 @@
+# Prebuilt AA Telegram bot runtime image (issue #298).
+#
+# Reproducible Linux amd64 / Python 3.12 job runtime. Bakes OS media tooling,
+# the pinned Python dependency set from pyproject.toml, and pinned OpenCode
+# so a fresh GitHub-hosted runner starts the bot without apt-get, full pip
+# resolution, or an OpenCode curl install on the hot path.
+#
+# The exact AA application source is NOT frozen here: the runtime workflow
+# checks out exact main into /github/workspace and installs the project
+# itself with `pip install -e . --no-deps` (seconds). Dependency pins below
+# must mirror pyproject.toml; the image workflow fails closed on drift.
+#
+# No secrets, Telegram/user data, canonical book plaintext, decrypted
+# retrieval artifacts, audio, transcripts, or generated responses ever enter
+# this image. Public model weights are intentionally NOT baked in (see
+# docs/aa-runtime-image.md for the measured decision); they keep flowing
+# through the locked actions/cache + checksum-verified prefetch path.
+FROM --platform=linux/amd64 python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/root \
+    HF_HOME=/root/.cache/huggingface \
+    HF_HUB_OFFLINE=0 \
+    AA_PUBLIC_CACHE_ENABLED=1 \
+    PATH="/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin"
+
+# OS layer: verified ffmpeg with libopus plus the shell/git/curl/CA tooling
+# GitHub Actions and the AA runtime need inside a job container.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        libopus0 \
+        sudo; \
+    rm -rf /var/lib/apt/lists/*; \
+    ffmpeg -version | head -n 1; \
+    ffmpeg -hide_banner -h encoder=libopus 2>&1 | grep -q libopus; \
+    ffmpeg -hide_banner -h decoder=opus 2>&1 | grep -q opus; \
+    git --version; \
+    curl --version | head -n 1; \
+    bash --version | head -n 1
+
+# Pinned runtime Python dependencies (mirrors pyproject.toml [project]).
+# Installed as an explicit pinned layer so Dependabot-style drift is visible
+# here and verifiable by CI; the application checkout stays outside the image.
+RUN set -eux; \
+    python --version; \
+    python -m pip install --upgrade "pip==24.2"; \
+    pip install --no-cache-dir \
+        "cryptography>=41" \
+        "zstandard>=0.22" \
+        "sherpa-onnx==1.13.8" \
+        "torch==2.14.1" \
+        "onnxruntime==1.30.0" \
+        "langchain==1.4.3" \
+        "langchain-core==1.6.6" \
+        "langgraph==1.2.12" \
+        "langgraph-checkpoint-sqlite==3.1.1" \
+        "langmem==0.0.30" \
+        "pydantic==2.13.5" \
+        "razdel==0.5.0" \
+        "transformers==4.57.3" \
+        "faiss-cpu==1.13.2" \
+        "huggingface_hub>=0.23"; \
+    python -c "import torch, sherpa_onnx, onnxruntime, faiss, transformers; print('deps ok')"
+
+# Pinned OpenCode CLI (single source of truth: docker/opencode.version).
+COPY docker/opencode.version /opt/aa/opencode.version
+RUN set -eux; \
+    want="$(cat /opt/aa/opencode.version)"; \
+    for attempt in 1 2 3; do \
+        if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install \
+            | bash -s -- --version "$want"; then break; fi; \
+        if [ "$attempt" -eq 3 ]; then echo "OpenCode installer failed" >&2; exit 1; fi; \
+        sleep $((attempt * 10)); \
+    done; \
+    export PATH="$HOME/.opencode/bin:$PATH"; \
+    opencode --version | grep -F "$want"
+
+# Runtime conveniences: writable HOME/cache paths and an image marker plus a
+# dependency/ABI provenance record for the digest promotion notes.
+RUN set -eux; \
+    mkdir -p /root/.cache/pip /root/.cache/huggingface /tmp/aa-caches /github/workspace; \
+    chmod 755 /root /tmp/aa-caches; \
+    touch /opt/aa/runtime-image; \
+    { \
+        echo "base=python:3.12-slim-bookworm"; \
+        echo "arch=linux/amd64"; \
+        echo -n "python="; python --version; \
+        echo -n "ffmpeg="; ffmpeg -version 2>&1 | head -n 1; \
+        echo -n "opencode="; /root/.opencode/bin/opencode --version 2>&1 | head -n 1; \
+        echo "--- pip freeze (pinned) ---"; pip freeze | sort; \
+        echo "--- native imports ---"; \
+        python -c "import torch, sherpa_onnx, onnxruntime; print('native ok')"; \
+    } > /opt/aa/provenance.txt; \
+    cat /opt/aa/provenance.txt
+
+WORKDIR /github/workspace

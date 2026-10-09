@@ -1,0 +1,13 @@
+# Immutable GHCR runtime image digest (issue #298).
+#
+# Single line: ghcr.io/kodmial/aa-runtime@sha256:<64 lowercase hex>.
+# Updated ONLY by the documented digest promotion after
+# .github/workflows/aa-runtime-image.yml publishes and its fresh-runner
+# canary passes. The runtime workflow container pin must match this file
+# exactly; scripts/promote_runtime_image.py keeps both in sync.
+#
+# PLACEHOLDER: no validated image has been published yet. The zero digest
+# below intentionally fails closed (container pull fails before any poller
+# starts) until promotion replaces it. Rollback is one commit: remove the
+# `container:` block from aa-runtime.yml to return to the legacy runner.
+ghcr.io/kodmial/aa-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000

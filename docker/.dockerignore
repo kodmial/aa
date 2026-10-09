@@ -1,0 +1,31 @@
+# Build context hygiene for the public AA runtime image (issue #298).
+# Nothing secret, personal, or book-plaintext may enter image layers.
+.git
+.github
+.env
+.env.*
+*.age-key
+*AGE-SECRET-KEY*
+corpus/source/raw
+corpus/source/raw-ru
+corpus/source/encrypted/plaintext
+corpus/generated
+corpus/source/fetch-state.json
+corpus/source/fetch-ru-state.json
+models
+live-out
+self-proving-out
+eval-*
+canary-out
+runtime-status.json
+runtime-recovery
+gate-*.done
+aa-self-proving-checkpoints
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+.continuum-429-stage
+continuum-429-stage

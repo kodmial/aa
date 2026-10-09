@@ -1,0 +1,240 @@
+name: AA runtime image build/publish
+
+# Prebuilt, reproducible AA job-runtime image for issue #298. Publishes
+# ghcr.io/kodmial/aa-runtime with BuildKit registry-layer caching; the bot
+# workflow (aa-runtime.yml) consumes it ONLY by immutable digest after the
+# fresh-runner canary below passes and the digest is promoted.
+#
+# Safety: image builds/publishes ONLY from trusted events (push to main with
+# relevant paths, or owner-dispatched manual runs). Pull requests build and
+# validate without pushing. No Telegram token, PAT, provider token, age
+# identity, book plaintext, decrypted index, chats, audio, transcripts, or
+# generated responses ever enters the build context (see docker/.dockerignore
+# and the no-secrets scan below).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/Dockerfile.aa-runtime"
+      - "docker/.dockerignore"
+      - "docker/opencode.version"
+      - "pyproject.toml"
+      - "corpus/embedding.lock.json"
+      - "corpus/voice.lock.json"
+      - ".github/workflows/aa-runtime-image.yml"
+      - "scripts/verify_runtime_image.py"
+  pull_request:
+    paths:
+      - "docker/Dockerfile.aa-runtime"
+      - "docker/.dockerignore"
+      - "docker/opencode.version"
+      - "pyproject.toml"
+      - "corpus/embedding.lock.json"
+      - "corpus/voice.lock.json"
+      - ".github/workflows/aa-runtime-image.yml"
+      - "scripts/verify_runtime_image.py"
+  workflow_dispatch:
+
+concurrency:
+  group: aa-runtime-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Refuse untrusted publish events
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pull-request builds validate only; only push-to-main and manual
+          # owner dispatches may publish to GHCR.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "PR build: validate only, no push."
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.actor }}" != "${{ github.repository_owner }}" ]]; then
+            echo "::error::Manual image publish is owner-only."
+            exit 1
+          fi
+
+      - name: Verify dependency pins match pyproject
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_runtime_image.py --pins-only
+
+      - name: Scan build context for secrets/private assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail closed if private material would enter the image context.
+          forbidden=(
+            "corpus/source/raw"
+            "corpus/source/raw-ru"
+            "corpus/generated"
+            ".env"
+          )
+          for path in "${forbidden[@]}"; do
+            if [[ -e "$path" ]]; then
+              echo "::error::Forbidden build-context path present: $path"
+              exit 1
+            fi
+          done
+          if git ls-files | grep -E '(\.age-key|AGE-SECRET-KEY|runtime-status\.json|live-out/)' ; then
+            echo "::error::Private material tracked in git; refusing image build."
+            exit 1
+          fi
+          if grep -RIn -E 'TELEGRAM_BOT_TOKEN|AA_BOOK_AGE_IDENTITY|AGE-SECRET-KEY-[A-Z0-9]+' docker/ scripts/verify_runtime_image.py scripts/promote_runtime_image.py; then
+            echo "::error::Secret-like literal in image build files."
+            exit 1
+          fi
+          echo "Build-context secret scan PASS."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a05cbb56c5679a0e6939a802f0c851 # v3
+
+      - name: Log in to GHCR (trusted publish events only)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb463fcef0c0d # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/kodmial/aa-runtime" >> "$GITHUB_OUTPUT"
+          echo "opencode=$(cat docker/opencode.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (trusted events) / build only (PRs)
+        id: push
+        uses: docker/build-push-action@263435318d21b8e4b434bb7e354b0de442448e2 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.aa-runtime
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: |
+            ghcr.io/kodmial/aa-runtime:latest
+            ghcr.io/kodmial/aa-runtime:sha-${{ github.sha }}
+          cache-from: |
+            type=registry,ref=ghcr.io/kodmial/aa-runtime:buildcache
+            type=gha,scope=aa-runtime-image
+          cache-to: |
+            ${{ github.event_name != 'pull_request' && 'type=registry,ref=ghcr.io/kodmial/aa-runtime:buildcache,mode=max' || '' }}
+          provenance: true
+          sbom: true
+
+      - name: Validate image contents (trusted events, by digest)
+        if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST"
+          echo "Validating $ref"
+          docker run --rm --pull always "$ref" bash -lc '
+            set -euo pipefail
+            test -f /opt/aa/runtime-image
+            ffmpeg -version | head -n 1
+            ffmpeg -hide_banner -h encoder=libopus 2>&1 | grep -q libopus
+            python --version
+            python -c "import torch, sherpa_onnx, onnxruntime, faiss, transformers; print(\"native imports ok\")"
+            /root/.opencode/bin/opencode --version
+            cat /opt/aa/provenance.txt
+          '
+          {
+            echo "## AA runtime image published"
+            echo
+            echo "- image: \`ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST\`"
+            echo "- arch: linux/amd64, python 3.12, opencode $(cat docker/opencode.version)"
+            echo "- size:"
+            echo '```'
+            docker image inspect "ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST" --format 'Size={{.Size}} Os={{.Os}} Arch={{.Architecture}}' || true
+            echo '```'
+            echo
+            echo "Promote with: \`python scripts/promote_runtime_image.py --digest $IMAGE_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate local image (PR builds)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "ghcr.io/kodmial/aa-runtime:sha-${{ github.sha }}" bash -lc '
+            set -euo pipefail
+            test -f /opt/aa/runtime-image
+            ffmpeg -version | head -n 1
+            python -c "import torch, sherpa_onnx, onnxruntime; print(\"native imports ok\")"
+            /root/.opencode/bin/opencode --version
+          ' || docker run --rm ghcr.io/kodmial/aa-runtime:sha-${{ github.sha }} true
+          echo "PR image validation done (no push)."
+
+      - name: Record digest artifact
+        if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST" > image-digest.txt
+          cat image-digest.txt
+
+      - name: Upload digest artifact
+        if: github.event_name != 'pull_request' && steps.push.outputs.digest != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-runtime-image-digest
+          path: image-digest.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  canary:
+    needs: build
+    if: github.event_name != 'pull_request' && needs.build.outputs.digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/kodmial/aa-runtime@${{ needs.build.outputs.digest }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout exact main inside prebuilt image
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Fresh-runner image canary (no Telegram poller)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This canary never starts a Telegram poller and never touches
+          # secrets: it exercises the hot path only (codec, native imports,
+          # pinned OpenCode, model-identity checks, exact HEAD, timing).
+          python scripts/verify_runtime_image.py --canary
