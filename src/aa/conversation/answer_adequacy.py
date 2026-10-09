@@ -552,6 +552,17 @@ def digest_text(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:16]
 
 
+def safety_candidate_fingerprint(text: str) -> str:
+    """Return a privacy-safe digest identifying one safety-recovery candidate.
+
+    Normalized (whitespace-folded, case-folded) before digesting so
+    trivial formatting differences do not count as progress. Used only
+    for bounded-retry distinctness, never to select reply variety.
+    """
+    normalized = " ".join(str(text or "").split()).strip().casefold()
+    return digest_text(normalized)
+
+
 __all__ = [
     "ADEQUACY_FAIL",
     "ADEQUACY_PASS",
@@ -576,6 +587,7 @@ __all__ = [
     "build_recovery_queries",
     "check_substantive_delivery_invariant",
     "digest_text",
+    "safety_candidate_fingerprint",
     "effective_request",
     "is_conversational_plan",
     "new_turn_trace_id",

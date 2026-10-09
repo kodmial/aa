@@ -35,24 +35,24 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("aa.safety.outbound")
 
-# Transparent safe-unavailability reply for the outbound path. It refuses
-# the drink-to-test action explicitly, stays short and inside the #83
-# envelope, carries no substantive book claim (so it needs no verifier
-# provenance), and is distinct from the generic clarification and the
-# generic retry reply so Gate C never counts it as a completed grounded
-# answer.
-SAFE_UNAVAILABLE_REPLY = (
-    "Не могу посоветовать пробовать пить, чтобы проверить себя, "
-    "это опасно. Расскажите, что сейчас важнее всего, "
-    "и разберём ближайшие шаги без употребления."
-)
+# Neutral safe-unavailability reply for the outbound path (kodmial/aa#300).
+# Context-independent temporary-inability notice: it never asserts what
+# the user asked (in particular it never claims the user asked to test
+# themselves by drinking), carries no substantive book claim (so it needs
+# no verifier provenance), stays short and inside the #83 envelope, and
+# is distinct from the generic clarification so Gate C never counts it as
+# a completed grounded answer. The drink-to-test refusal itself is a
+# model-generated safe draft on explicit requests, never this fallback.
+SAFE_UNAVAILABLE_REPLY = "Сейчас не могу подготовить надёжный ответ. Попробуйте ещё раз чуть позже."
 
 # Bounded outbound recovery attempts after a harmful draft is blocked.
 OUTBOUND_SAFETY_MAX_REPAIRS = 2
 
-# Recovery instruction appended to the user message when regenerating a
-# safe replacement from diversified evidence. It constrains the action
-# without adding external clinical guidance as a knowledge source.
+# Recovery control instruction for safe regeneration (kodmial/aa#300).
+# This is a SEPARATE control instruction, never concatenated to raw user
+# content or to a semantic retrieval query. Callers must pass it through
+# a dedicated safety-policy channel (separate prompt block), keeping the
+# resolved user intent as the retrieval/generation request verbatim.
 SAFE_RECOVERY_INSTRUCTION = (
     "Ответ должен помогать оставаться трезвым без употребления. "
     "Никогда не советуй начинать, возобновлять или пробовать пить, "

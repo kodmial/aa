@@ -243,9 +243,62 @@ CONVERSATIONAL_FALLBACK_REPLY = (
 )
 
 # Outbound-safety recovery uses the same generic semantic fallback as any
-# other retrieval need: the raw current turn plus bounded conversation
+# other retrieval need: the resolved intent plus bounded conversation
 # context. No canned query-expansion tables are maintained here.
 OUTBOUND_RECOVERY_QUERIES: tuple[str, ...] = ()
+
+
+def safety_recovery_request(*, resolved_intent: str, user_message: str) -> str:
+    """Return the intent-preserving request for safety recovery.
+
+    The planner's resolved intent (with relevant history already folded
+    in upstream) stays primary; the raw turn is only a fallback. No
+    keyword, stem, domain-vocabulary or exact-utterance routing is
+    applied here: the caller passes model-resolved text through verbatim.
+    The safety control instruction is never merged into this string.
+    """
+    intent = " ".join(str(resolved_intent or "").split()).strip()
+    if intent:
+        return intent
+    return " ".join(str(user_message or "").split()).strip()
+
+
+def build_safety_recovery_queries(
+    resolved_request: str,
+    *,
+    summary: str = "",
+    recent_texts: Sequence[str] | None = None,
+    max_queries: int = 12,
+) -> list[str]:
+    """Build safety-recovery retrieval queries from the genuine user need.
+
+    Only the resolved request plus bounded conversation context travel
+    here. The safety control instruction is never part of a semantic
+    query, so retrieval cannot be polluted by policy wording.
+    """
+    from aa.conversation.answer_adequacy import build_generic_fallback_queries
+
+    cleaned = " ".join(str(resolved_request or "").split()).strip()
+    if not cleaned:
+        return []
+    recent = [str(item) for item in (recent_texts or []) if str(item).strip()]
+    try:
+        return build_generic_fallback_queries(
+            cleaned, summary=summary, recent=recent, max_queries=max_queries
+        )
+    except Exception:
+        return [cleaned]
+
+
+def safety_candidate_fingerprint(text: str) -> str:
+    """Return a privacy-safe digest identifying one recovery candidate.
+
+    Delegates to the adequacy-layer digest so this hot-path module keeps
+    no hash-selection machinery of its own (kodmial/aa#240 invariant).
+    """
+    from aa.conversation.answer_adequacy import safety_candidate_fingerprint as _fingerprint
+
+    return _fingerprint(text)
 
 
 def select_retry_reply(user_message: str) -> str:
@@ -1114,7 +1167,11 @@ async def run_v2_answer_turn(
         return apply_answer_generation_window(active_pack)
 
     async def _draft_with_pack(
-        active_pack: list[dict[str, Any]], prompt_text: str, *, wider: bool = False
+        active_pack: list[dict[str, Any]],
+        prompt_text: str,
+        *,
+        wider: bool = False,
+        safety_policy: str = "",
     ) -> str | None:
         from aa.opencode.errors import OpenCodeRateLimitError
 
@@ -1142,6 +1199,7 @@ async def run_v2_answer_turn(
                 summary=summary,
                 passages=passages,
                 user_message=prompt_text,
+                safety_policy=safety_policy,
             )
             text = (
                 await draft_call
@@ -2152,76 +2210,164 @@ async def run_v2_answer_turn(
             )
             telemetry["outbound_safety"] = "blocked"
             telemetry["outbound_safety_category"] = blocked_cat
+            telemetry["outbound_safety_recovery"] = "attempted"
             recovered: dict[str, Any] | None = None
             active_pack = list(pack)
-            for _ in range(OUTBOUND_SAFETY_MAX_REPAIRS):
-                if _end_to_end_elapsed_s() > _effective_turn_budget_s():
-                    _mark_turn_budget_exceeded()
-                    break
-                if planner_model is None or retrieval_index is None:
-                    break
-                try:
-                    from aa.conversation.answer_adequacy import (
-                        build_generic_fallback_queries as _safety_fallback,
-                    )
-                    from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
+            # Intent-preserving safe recovery (kodmial/aa#300): the
+            # planner's resolved intent plus conversation history stays
+            # the generation/retrieval request; the safety policy is a
+            # separate control block, never concatenated to user content
+            # or to a semantic query. The existing pack is tried first
+            # (zero novel IDs allowed); targeted retrieval only adds
+            # support for the genuine need afterwards. Every candidate
+            # must pass outbound safety, grounding, relevance and
+            # whole-turn adequacy before delivery. Bounded, with distinct
+            # fingerprints and no domain keyword routing.
+            _recovery_request = safety_recovery_request(
+                resolved_intent=_resolved_intent, user_message=user_message
+            )
+            _recovery_policy = SAFE_RECOVERY_INSTRUCTION
+            _seen_recovery: set[str] = {safety_candidate_fingerprint(final)}
+            _recovery_recent_texts: list[str] = list(_recent_texts[-4:])
+            _recovery_attempts = 0
 
-                    active_config = (
-                        retrieval_config if retrieval_config is not None else RetrievalConfig()
-                    )
-                    _safety_queries = _safety_fallback(
-                        f"{user_message}\n{SAFE_RECOVERY_INSTRUCTION}",
-                        summary=summary,
-                        recent=None,
-                        max_queries=12,
-                    )
-                    if not _safety_queries:
-                        break
-                    fresh = retrieve_evidence(
-                        retrieval_index, list(_safety_queries), config=active_config
-                    )
-                    from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
-
-                    _, fresh_dicts = _pack_to_state(fresh)
-                except Exception:
-                    break
-                if not fresh_dicts:
-                    break
-                merged_pack = merge_pack_dicts(active_pack, fresh_dicts)
-                if len(merged_pack) == len(active_pack):
-                    break
-                active_pack = merged_pack
-                candidate = await _draft_with_pack(
-                    active_pack, f"{user_message}\n{SAFE_RECOVERY_INSTRUCTION}"
-                )
-                if candidate is None:
-                    break
+            async def _certify_recovery_candidate(
+                candidate: str, candidate_pack: list[dict[str, Any]]
+            ) -> dict[str, Any] | None:
+                fingerprint = safety_candidate_fingerprint(candidate)
+                if fingerprint in _seen_recovery:
+                    return None
+                _seen_recovery.add(fingerprint)
                 if not certify_outbound_safety(candidate):
-                    continue
+                    return None
                 if not contains_cyrillic(candidate) or leaks_internal_terms(candidate):
-                    continue
+                    return None
                 if not envelope_passes(candidate):
-                    continue
+                    return None
                 if aggregate_quote_chars(candidate) > QUOTE_BUDGET_CHARS:
-                    continue
+                    return None
                 rep_slice = _verifier_round_budget()
                 if rep_slice is not None and rep_slice < TURN_VERIFIER_MIN_SLICE_S:
                     _mark_turn_budget_exceeded()
-                    break
+                    return None
                 rep_units, rep_result, rep_passed = await _verify_with_telemetry(
-                    candidate, active_pack, turn_budget_s=rep_slice
+                    candidate, candidate_pack, turn_budget_s=rep_slice
                 )
                 if not rep_passed or not rep_units or rep_result is None:
-                    continue
+                    return None
                 if not certify_outbound_safety(candidate):
-                    continue
-                recovered = {
+                    return None
+                rep_state = grounding_result_to_state(rep_result)
+                rep_adequacy = _safe_assess_adequacy(
+                    reply_text=candidate,
+                    verification_state=rep_state,
+                    verifier_outcome="passed",
+                )
+                if rep_adequacy.verdict != _ADEQ_PASS:
+                    return None
+                if not bool(getattr(rep_adequacy, "answers_request", False)):
+                    return None
+                return {
                     "text": candidate,
                     "units": rep_units,
                     "verification": rep_result,
-                    "pack": active_pack,
+                    "pack": list(candidate_pack),
                 }
-                break
+
+            # Phase 1: bounded same-pack regeneration (no novel IDs needed).
+            # Works even when planner/index are unavailable: the already
+            # retrieved pack may support a different safe helpful answer.
+            if active_pack and _recovery_request.strip():
+                for _ in range(OUTBOUND_SAFETY_MAX_REPAIRS):
+                    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                        _mark_turn_budget_exceeded()
+                        break
+                    if _recovery_attempts >= OUTBOUND_SAFETY_MAX_REPAIRS:
+                        break
+                    candidate = await _draft_with_pack(
+                        active_pack,
+                        _recovery_request,
+                        wider=True,
+                        safety_policy=_recovery_policy,
+                    )
+                    _recovery_attempts += 1
+                    if candidate is None:
+                        break
+                    certified = await _certify_recovery_candidate(candidate, active_pack)
+                    if certified is not None:
+                        recovered = certified
+                        break
+                    # Distinct unsafe/unverified candidates count as
+                    # progress; identical fingerprints are already skipped
+                    # inside the certifier, so keep trying within budget.
+                    continue
+            # Phase 2: bounded targeted retrieval for missing support,
+            # aimed at the genuine user need (never at policy wording or
+            # at the unsafe draft's premise).
+            if recovered is None and planner_model is not None and retrieval_index is not None:
+                for _ in range(OUTBOUND_SAFETY_MAX_REPAIRS):
+                    if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                        _mark_turn_budget_exceeded()
+                        break
+                    if _recovery_attempts >= 2 * OUTBOUND_SAFETY_MAX_REPAIRS:
+                        break
+                    try:
+                        from aa.retrieval.evidence import (
+                            RetrievalConfig,
+                            retrieve_evidence,
+                        )
+
+                        active_config = (
+                            retrieval_config if retrieval_config is not None else RetrievalConfig()
+                        )
+                        _safety_queries = build_safety_recovery_queries(
+                            _recovery_request,
+                            summary=summary,
+                            recent_texts=_recovery_recent_texts,
+                            max_queries=12,
+                        )
+                        if not _safety_queries:
+                            break
+                        # Safety invariant: policy wording never enters a
+                        # semantic query (checked in tests, never logged).
+                        fresh = retrieve_evidence(
+                            retrieval_index,
+                            list(_safety_queries),
+                            config=active_config,
+                            resolved_intent=_resolved_intent,
+                            conversation_context=_conversation_context,
+                        )
+                        from aa.conversation.retrieval_node import (
+                            pack_to_state as _pack_to_state,
+                        )
+
+                        _, fresh_dicts = _pack_to_state(fresh)
+                    except Exception:
+                        break
+                    if fresh_dicts:
+                        merged_pack = merge_pack_dicts(active_pack, fresh_dicts)
+                        # Novel evidence is a bonus, never a requirement:
+                        # regenerate even when nothing new arrived (the
+                        # pack may already support a safe redraft) but
+                        # track pack progress so identical retries stop.
+                        if merged_pack:
+                            active_pack = merged_pack
+                    elif not active_pack:
+                        break
+                    candidate = await _draft_with_pack(
+                        active_pack,
+                        _recovery_request,
+                        wider=True,
+                        safety_policy=_recovery_policy,
+                    )
+                    _recovery_attempts += 1
+                    if candidate is None:
+                        break
+                    certified = await _certify_recovery_candidate(candidate, active_pack)
+                    if certified is not None:
+                        recovered = certified
+                        break
+                    continue
             if recovered is not None:
                 # Production delivery contract (kodmial/aa#257 recurrence 4):
                 # the diversified safe recovery is a certified book delivery,
@@ -2291,6 +2437,20 @@ async def run_v2_answer_turn(
                         "telemetry": dict(telemetry),
                     }
             telemetry["answer_outcome"] = "safety-blocked"
+            # The neutral fallback is never a successful grounded answer:
+            # record its adequacy explicitly so it fails closed (Gate C
+            # FAIL, qualified False) instead of carrying a stale verdict.
+            _record_adequacy(
+                reply_text=SAFE_UNAVAILABLE_REPLY,
+                verification_state=grounding_result_to_state(None),
+            )
+            if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
             _finish_telemetry()
             return {
                 "text": SAFE_UNAVAILABLE_REPLY,
@@ -2463,6 +2623,17 @@ async def run_v2_answer_turn(
             telemetry["outbound_safety"] = "blocked"
             telemetry["outbound_safety_category"] = outbound_safety_category(narrowed)
             telemetry["answer_outcome"] = "safety-blocked"
+            _record_adequacy(
+                reply_text=_NARROW_SAFE_REPLY,
+                verification_state=grounding_result_to_state(None),
+            )
+            if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
             _finish_telemetry()
             return {
                 "text": _NARROW_SAFE_REPLY,
@@ -2530,6 +2701,17 @@ async def run_v2_answer_turn(
                 telemetry["outbound_safety"] = "blocked"
                 telemetry["outbound_safety_category"] = outbound_safety_category(compacted)
                 telemetry["answer_outcome"] = "safety-blocked"
+                _record_adequacy(
+                    reply_text=_COMPACT_SAFE_REPLY,
+                    verification_state=grounding_result_to_state(None),
+                )
+                if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
+                    telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                if not str(telemetry.get("failure_category", "") or "").strip():
+                    telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["answers_request"] = False
+                telemetry["technically_grounded"] = False
+                telemetry["qualified"] = False
                 _finish_telemetry()
                 return {
                     "text": _COMPACT_SAFE_REPLY,
@@ -2831,6 +3013,9 @@ __all__ = [
     "TURN_VERIFIER_MIN_SLICE_S",
     "anchored_adequacy_regen_prompt",
     "anchored_repair_focus",
+    "build_safety_recovery_queries",
+    "safety_candidate_fingerprint",
+    "safety_recovery_request",
     "answer_pipeline_node",
     "apply_answer_generation_window",
     "certify_outbound_safety",
