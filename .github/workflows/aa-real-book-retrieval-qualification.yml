@@ -417,6 +417,176 @@ jobs:
           # published deterministically as the marker below.
           exit 0
 
+      - name: Execute #295 production-selector diagnostics (separate premerge proof)
+        id: execute_295
+        if: always()
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          AA_EVAL_RECIPIENT: "age1cps60qh3crgt75lcul4ky2pn4nlqfle6m4mudfngwr3p22ycm3zsvg8ns8"
+          OPENCODE_BASE_URL: "http://127.0.0.1:4096"
+        run: |
+          set -euo pipefail
+          # #295 diagnostic section: clearly separated from the frozen #130
+          # RRF-only benchmark above (which stays unchanged). This section
+          # exercises THE ACTUAL PRODUCTION aretrieve_with_semantic_selection
+          # / retrieval_node(selection_model=<real OpenCodeChatModel>) over
+          # the same restored canonical RU E5/BM25/FAISS substrate, with
+          # resolved intent + carried multi-turn context and model selection
+          # BEFORE book budget. Metrics-only logs; exact text stays inside
+          # the encrypted bundle. A run without a deep-rank decisive case
+          # (rank >16 + source beyond char 500 at full fidelity) is
+          # INCOMPLETE, never PASS. The old #130 main-only result stays
+          # STALE for non-main SHAs and is never reported as Contract PASS.
+          mkdir -p eval-real-book-295-out
+          if [ -z "${AA_EVAL_RECIPIENT:-}" ]; then
+            python3 - <<'PY'
+          import json
+          import os
+          out = "eval-real-book-295-out/result-295.json"
+          payload = {"result": "INCOMPLETE", "reason": "AA_EVAL_AGE_RECIPIENT is not configured", "main_sha": os.environ.get("EXACT_SHA", ""), "issue": 295}
+          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print("#295 recipient missing; diagnostics yield INCOMPLETE, never PASS", flush=True)
+          PY
+            echo "result295=INCOMPLETE" >> "$GITHUB_OUTPUT"
+            cat eval-real-book-295-out/result-295.json
+            exit 0
+          fi
+          set +e
+          python3 scripts/run_real_book_production_selection_295.py \
+            --main-sha "$EXACT_SHA" \
+            --out-dir eval-real-book-295-out \
+            --recipient "$AA_EVAL_RECIPIENT"
+          status=$?
+          set -e
+          echo "#295 production-selection exit status: $status"
+          if [ ! -f eval-real-book-295-out/result-295.json ]; then
+            python3 - <<'PY'
+          import json
+          import os
+          out = "eval-real-book-295-out/result-295.json"
+          payload = {"result": "INCOMPLETE", "reason": "runner produced no result-295.json", "main_sha": os.environ.get("EXACT_SHA", ""), "issue": 295}
+          open(out, "w", encoding="utf-8").write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print("#295 runner produced no result file; synthesized deterministic INCOMPLETE", flush=True)
+          PY
+            status=2
+          fi
+          cat eval-real-book-295-out/result-295.json
+          if [ "$status" -eq 0 ]; then echo "result295=PASS" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 1 ]; then echo "result295=FAIL" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 2 ]; then echo "result295=INCOMPLETE" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 3 ]; then echo "result295=STALE" >> "$GITHUB_OUTPUT"; fi
+          if [ "$status" -eq 75 ]; then echo "result295=INCOMPLETE" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+
+      - name: Guard #295 encrypted-only upload (never plaintext book text)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f eval-real-book-295-out/result-295.json
+          if python3 -c "import json; assert json.load(open('eval-real-book-295-out/result-295.json'))['result'] == 'INCOMPLETE'"; then
+            echo "#295 INCOMPLETE run: protected bundle/summary may be absent; marker still published"
+          else
+            test -f eval-real-book-295-out/real-book-production-selection-295-protected.tar.zst.age
+            test -f eval-real-book-295-out/real-book-production-selection-295-protected.tar.zst.age.sha256
+            test -f eval-real-book-295-out/real-book-production-selection-295-summary.json
+          fi
+          if ls eval-real-book-295-out/*.json | xargs grep -l '"exact_text"' 2>/dev/null; then
+            echo "#295 protected exact text outside the encrypted bundle" >&2
+            exit 1
+          fi
+          if grep -R "AA_BOOK_AGE_IDENTITY" eval-real-book-295-out/ 2>/dev/null; then
+            echo "#295 secret material in outputs" >&2
+            exit 1
+          fi
+          echo "#295 encrypted-only upload guard passed"
+
+      - name: Upload #295 encrypted protected artifact (source text stays encrypted)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-real-book-production-selection-295-protected-encrypted
+          path: |
+            eval-real-book-295-out/real-book-production-selection-295-protected.tar.zst.age
+            eval-real-book-295-out/real-book-production-selection-295-protected.tar.zst.age.sha256
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload #295 compact public summary (metrics only, no book text)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-real-book-production-selection-295-summary
+          path: |
+            eval-real-book-295-out/real-book-production-selection-295-summary.json
+            eval-real-book-295-out/result-295.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Publish idempotent #295 premerge marker (exact PR-head SHA)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const testedSha = '${{ needs.resolve.outputs.exact_sha }}';
+            const runId = `${context.runId}`;
+            let status = {};
+            try {
+              status = JSON.parse(fs.readFileSync('eval-real-book-295-out/result-295.json', 'utf8'));
+            } catch (error) {
+              core.setFailed(`#295 result file unreadable: ${error.message}`);
+              return;
+            }
+            if (status.reason_code === 'OPENCODE_429_RESTART_REQUIRED') {
+              core.notice('#295 429 recovery checkpoint published; final #295 marker waits for the fresh-runner continuation.');
+              return;
+            }
+            const result = status.result || 'INCOMPLETE';
+            if (!['PASS', 'FAIL', 'INCOMPLETE', 'STALE'].includes(result)) {
+              core.setFailed(`#295 invalid deterministic result: ${result}`);
+              return;
+            }
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo, ref: 'heads/main',
+            });
+            const currentMain = (mainRef.object.sha || '').trim();
+            // A non-main SHA is premerge validation evidence only; it never
+            // counts as an exact-main Contract PASS.
+            const scope = (currentMain === testedSha) ? 'exact-main' : 'premerge-pr-head';
+            const markerRe = /aa-real-book-production-selection-295-result\s+issue=295\s+sha=([0-9a-f]{40})\s+result=(PASS|FAIL|INCOMPLETE|STALE)\s+scope=(\S+?)\s+run=(\S+?)\s*-->/;
+            let duplicate = false;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: 295, per_page: 100 },
+            )) {
+              for (const c of comments) {
+                const assoc = c.author_association || '';
+                const isTrusted = (c.user && c.user.type === 'Bot') || ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+                if (!isTrusted) continue;
+                const m = (c.body || '').match(markerRe);
+                if (m && m[1] === testedSha && m[2] === result) {
+                  duplicate = true;
+                  break;
+                }
+              }
+              if (duplicate) break;
+            }
+            const marker = `<!-- aa-real-book-production-selection-295-result issue=295 sha=${testedSha} result=${result} scope=${scope} run=${runId} -->`;
+            if (!duplicate) {
+              const body = `${marker}\n\n#295 production-selector diagnostics: ${result} at ${testedSha} (${scope}; main=${currentMain}). ` +
+                `Production aretrieve_with_semantic_selection path with real OpenCode selector; metrics-only summary in artifacts. ` +
+                `A non-main SHA is premerge evidence only and never an exact-main Contract PASS.`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: 295, body,
+              });
+            } else {
+              core.notice('#295 identical SHA+result already marked; no duplicate posted.');
+            }
+
       - name: Revalidate exact SHA after run
         if: always()
         continue-on-error: true
