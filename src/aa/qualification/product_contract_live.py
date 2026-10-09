@@ -2287,8 +2287,19 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 started = time.perf_counter()
                 api.pending_updates.append(raw)
                 deadline = loop.time() + 150.0
+                last_progress_tick = loop.time()
                 while len(api.sent_texts) <= before and loop.time() < deadline:
                     await asyncio.sleep(0.02)
+                    if loop.time() - last_progress_tick >= 20.0:
+                        # Heartbeat distinguishes a slow live model from a
+                        # stalled Actions worker without logging any text.
+                        print(
+                            f"Gate C scenario {position}/{len(scenarios)} "
+                            f"family={family} phase=awaiting-delivery "
+                            f"elapsed_s={round(time.perf_counter() - started)}",
+                            flush=True,
+                        )
+                        last_progress_tick = loop.time()
                 if len(api.sent_texts) <= before:
                     failed.append(f"live-delivery-{family}-timeout")
                     scenario_diagnostics.append(
@@ -2487,6 +2498,20 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             "family": family,
                             "delivery_timeout": False,
                             "delivery_latency_ms": round(elapsed * 1000, 1),
+                            "stage_latency_ms": {
+                                stage: round(float(snapshot.get(field, 0) or 0), 1)
+                                for stage, field in (
+                                    ("planner", "planner_latency_ms"),
+                                    ("retrieval", "retrieval_latency_ms"),
+                                    ("answer", "answer_latency_ms"),
+                                    ("verifier", "verifier_latency_ms"),
+                                )
+                                if isinstance(snapshot.get(field), (int, float))
+                            },
+                            "verified_book_units": int(snapshot.get("verified_book_units", 0) or 0),
+                            "verifier_unavailable_units": int(
+                                snapshot.get("verifier_unavailable_units", 0) or 0
+                            ),
                             "planner_outcome": str(snapshot.get("planner_outcome", ""))[:48],
                             "retrieval_outcome": str(snapshot.get("retrieval_outcome", ""))[:48],
                             "verifier_outcome": str(snapshot.get("verifier_outcome", ""))[:48],
