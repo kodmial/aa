@@ -40,7 +40,6 @@ from typing import Any
 
 from aa.conversation.meta import is_meta_capability_request
 from aa.conversation.output_limits import (
-    ENVELOPE_FALLBACK_REPLY,
     HARD_CHARS,
     HARD_WORDS,
     MAX_COMPACT_REGENERATIONS,
@@ -110,10 +109,6 @@ MAX_SEND_ATTEMPTS = 3
 SEND_RETRY_DELAYS = (0.5, 1.0)
 MAX_EVIDENCE_CHUNKS = 8
 MAX_READ_PER_TURN = 6
-
-FAIL_CLOSED_REPLY = (
-    "Не могу дать обоснованный ответ по имеющимся отрывкам книги. Попробуйте уточнить вопрос."
-)
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
@@ -1296,11 +1291,14 @@ def compact_grounded_response(response: GroundedResponse) -> GroundedResponse:
     if not kept:
         raise TurnFailed("output-envelope", "no complete unit fits the hard envelope")
     compacted_text = " ".join(item.text for item in kept)
-    if compact_text_to_envelope(response.text) == ENVELOPE_FALLBACK_REPLY:
-        # String-level compaction agrees nothing beyond the fallback fits;
-        # unit-level kept prefix is still authoritative when it passes.
+    try:
+        compact_text_to_envelope(response.text)
+    except ValueError:
+        # String-level compaction agrees nothing fits beyond complete
+        # units; unit-level kept prefix is still authoritative when it
+        # passes.
         if not envelope_passes(compacted_text):
-            raise TurnFailed("output-envelope", "no complete unit fits the hard envelope")
+            raise TurnFailed("output-envelope", "no complete unit fits the hard envelope")  # noqa: B904
     logger.info(
         "grounded response compacted to envelope",
         extra={
@@ -1874,7 +1872,6 @@ async def run_trivial_turn(
 __all__ = [
     "AGENT_NAME",
     "COVERAGE_SCHEMA_VERSION",
-    "FAIL_CLOSED_REPLY",
     "MAX_EVIDENCE_CHUNKS",
     "MAX_PLANNER_ATTEMPTS",
     "MAX_REGENERATIONS",

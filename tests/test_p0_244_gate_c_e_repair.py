@@ -50,8 +50,6 @@ from aa.conversation.planner_node import (
 from aa.conversation.prompt_builder import ANSWER_MAX_PASSAGE_CHARS
 from aa.conversation.turn_pipeline import (
     ANSWER_DRAFT_ATTEMPT_BUDGET_S,
-    NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_VARIANTS,
     TURN_END_TO_END_BUDGET_S,
     run_v2_answer_turn,
 )
@@ -180,7 +178,9 @@ async def test_grounded_turn_still_serves_with_narrowed_window() -> None:
         upstream_latency_ms=0.0,
     )
     assert outcome["telemetry"]["answer_outcome"] == "served"
-    assert outcome["text"] not in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY)
+    from aa.conversation.failures import is_service_error as _ise244
+
+    assert not _ise244(outcome["text"])
 
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 

@@ -46,14 +46,11 @@ from aa.control.readiness import (
     validate_category,
 )
 from aa.control.runtime_control import RuntimeController
+from aa.conversation.failures import SERVICE_ERROR_REPLY, is_service_error
 from aa.conversation.graph_runtime import GraphRuntimeError, GraphTurnRuntime
 from aa.conversation.output_limits import (
     compact_text_to_envelope,
     envelope_passes,
-)
-from aa.conversation.turn_pipeline import (
-    NATURAL_CLARIFICATION_REPLY,
-    select_retry_reply,
 )
 from aa.corpus.context import CorpusContext
 from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError
@@ -101,7 +98,11 @@ logger = logging.getLogger("aa.app")
 
 _START_REPLY = "Бот готов. Напишите сообщение."
 _NEW_REPLY = "Новая беседа начата."
-_TEMPORARY_ERROR_REPLY = "Не удалось обработать сообщение. Попробуйте ещё раз."
+# Issue #301: typed unsuccessful outcomes surface here as a clearly
+# identified service error, never as synthetic AA conversation. This
+# text carries the service-error marker so qualifiers/tests never
+# count it as a substantive answer.
+_TEMPORARY_ERROR_REPLY = SERVICE_ERROR_REPLY
 _BUSY_REPLY = "Сейчас много сообщений. Попробуйте ещё раз через минуту."
 
 # Explicit runtime lifecycle states (issue #145). READY is published only
@@ -1092,9 +1093,12 @@ class Application:
         answered as ordinary conversational turns here; the dispatcher owns
         the real ``/new`` control event that clears thread state.
 
-        Internal failures stay internal: provider/retrieval failures yield a
-        natural Russian continuation/clarification, never mechanics and
-        never a technical fail-closed reply.
+        Internal failures stay internal and are typed unsuccessful
+        outcomes: provider/retrieval/verifier/timeout failures return
+        the clearly marked service-error signal (never synthetic AA
+        conversation and never a substantive answer). Every normal
+        user-facing chat output is composed by the AA model from the
+        user message and conversational state (issue #301).
 
         Only lengths and routing decisions are logged, never message bodies.
         Ordinary replies are confined to the #83 hard Telegram envelope per
@@ -1124,50 +1128,45 @@ class Application:
         if not self._graph_runtime or not self._graph_runtime.running:
             await self._ensure_graph_runtime()
         assert self._graph_runtime is not None
-        fallback_used = False
+        service_error = False
         try:
             reply = await self._graph_runtime.run_turn(chat_id, text)
         except OpenCodeRateLimitError:
             raise
         except GraphRuntimeError as exc:
-            logger.warning("graph turn used natural fallback", extra={"category": exc.category})
-            reply = select_retry_reply(text)
-            fallback_used = True
+            logger.warning("graph turn failed as typed outcome", extra={"category": exc.category})
+            reply = SERVICE_ERROR_REPLY
+            service_error = True
         except OpenCodeError:
-            logger.warning("graph turn used natural fallback")
-            reply = select_retry_reply(text)
-            fallback_used = True
+            logger.warning("graph turn failed as typed outcome")
+            reply = SERVICE_ERROR_REPLY
+            service_error = True
         except ValueError:
             raise
         except Exception:
-            logger.warning("graph turn used natural fallback")
-            reply = select_retry_reply(text)
-            fallback_used = True
+            logger.warning("graph turn failed as typed outcome")
+            reply = SERVICE_ERROR_REPLY
+            service_error = True
         if not reply.strip():
-            reply = NATURAL_CLARIFICATION_REPLY
-            fallback_used = True
+            reply = SERVICE_ERROR_REPLY
+            service_error = True
         # Final outbound safety guard (#252, defense in depth): the turn
         # pipeline already certifies its drafts, but no text reaches
         # Telegram without passing the outbound gate here either. A
-        # harmful reply is replaced by the transparent
-        # safe-unavailability reply, never delivered, never logged.
+        # harmful reply is never delivered: the turn fails as a typed
+        # service-error outcome (never a canned conversational reply).
         try:
-            from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY, is_outbound_safe
+            from aa.safety.outbound import is_outbound_safe
 
-            if reply.strip() and not is_outbound_safe(reply):
+            if reply.strip() and not is_service_error(reply) and not is_outbound_safe(reply):
                 logger.info("outbound safety blocked delivery", extra={"fallback_used": True})
-                reply = SAFE_UNAVAILABLE_REPLY
-                fallback_used = True
+                reply = SERVICE_ERROR_REPLY
+                service_error = True
         except Exception:
             logger.warning("outbound safety gate error: failing closed", exc_info=True)
-            try:
-                from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _SAFE_FALLBACK_REPLY
-
-                reply = _SAFE_FALLBACK_REPLY
-            except Exception:
-                reply = NATURAL_CLARIFICATION_REPLY
-            fallback_used = True
-        is_clarification = reply.strip() == NATURAL_CLARIFICATION_REPLY
+            reply = SERVICE_ERROR_REPLY
+            service_error = True
+        is_service = is_service_error(reply)
         # Privacy-safe stage snapshot first: a verified split answer must
         # bypass single-message compaction (delivery splits it below).
         try:
@@ -1176,7 +1175,7 @@ class Application:
         except Exception:
             stage = {}
             thread = ""
-        allow_split = bool(stage.get("transport_split")) and not fallback_used
+        allow_split = bool(stage.get("transport_split")) and not service_error and not is_service
         if allow_split:
             try:
                 from aa.conversation.output_limits import (
@@ -1216,8 +1215,9 @@ class Application:
             extra={
                 "latency_ms": round(total_ms, 1),
                 "reply_len": len(fitted),
-                "fallback_used": fallback_used or is_clarification,
-                "is_clarification": is_clarification,
+                "fallback_used": service_error or is_service,
+                "is_clarification": False,
+                "is_service_error": is_service,
                 "planner_outcome": str(stage.get("planner_outcome", "unknown")),
                 "retrieval_outcome": str(stage.get("retrieval_outcome", "unknown")),
                 "answer_outcome": str(stage.get("answer_outcome", "unknown")),
@@ -1234,11 +1234,16 @@ class Application:
         The turn pipeline already applies compact regeneration upstream;
         this is the final deterministic guard so every path served here
         satisfies the same cap. Only lengths are logged on compaction,
-        never message text.
+        never message text. An un-fittable payload is a typed
+        unsuccessful outcome surfaced as the marked service error.
         """
         if envelope_passes(reply):
             return reply
-        compacted = compact_text_to_envelope(reply)
+        try:
+            compacted = compact_text_to_envelope(reply)
+        except ValueError:
+            logger.info("application reply un-fittable; service error used")
+            return SERVICE_ERROR_REPLY
         logger.info("application reply compacted to envelope")
         return compacted
 

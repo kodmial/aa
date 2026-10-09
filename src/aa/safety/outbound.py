@@ -35,16 +35,6 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("aa.safety.outbound")
 
-# Neutral safe-unavailability reply for the outbound path (kodmial/aa#300).
-# Context-independent temporary-inability notice: it never asserts what
-# the user asked (in particular it never claims the user asked to test
-# themselves by drinking), carries no substantive book claim (so it needs
-# no verifier provenance), stays short and inside the #83 envelope, and
-# is distinct from the generic clarification so Gate C never counts it as
-# a completed grounded answer. The drink-to-test refusal itself is a
-# model-generated safe draft on explicit requests, never this fallback.
-SAFE_UNAVAILABLE_REPLY = "Сейчас не могу подготовить надёжный ответ. Попробуйте ещё раз чуть позже."
-
 # Bounded outbound recovery attempts after a harmful draft is blocked.
 OUTBOUND_SAFETY_MAX_REPAIRS = 2
 
@@ -355,7 +345,6 @@ def is_outbound_safe(response_text: str) -> bool:
 __all__ = [
     "OUTBOUND_SAFETY_MAX_REPAIRS",
     "SAFE_RECOVERY_INSTRUCTION",
-    "SAFE_UNAVAILABLE_REPLY",
     "OutboundSafetyVerdict",
     "classify_outbound_safety",
     "is_outbound_safe",

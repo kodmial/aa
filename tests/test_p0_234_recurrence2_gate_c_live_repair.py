@@ -129,9 +129,10 @@ async def test_duplicate_retrieval_still_regenerates_from_existing_pack(
         retrieval_index=object(),
         initial_query_count=12,
     )
+    from aa.conversation.failures import is_service_error as _ise234
+
     assert outcome["text"] == _GROUNDED
-    assert outcome["text"].strip() != pipeline.NATURAL_CLARIFICATION_REPLY
-    assert outcome["text"].strip() != pipeline.NATURAL_RETRY_REPLY
+    assert not _ise234(outcome["text"].strip())
     assert int(outcome["rounds"]) >= 1
     telemetry = dict(outcome.get("telemetry", {}))
     assert int(telemetry.get("answer_rounds", 0)) >= 2
@@ -203,17 +204,10 @@ async def test_regen_partial_support_serves_narrowed_instead_of_retry() -> None:
     # subset) or the turn failed explicitly; it must never serve the
     # all-glue draft as a helpful success nor the exact generic fallback
     # when verified material exists.
+    from aa.conversation.failures import is_service_error as _ise234b
+
     assert outcome["text"] != "Привет! Рад, что ты написал."
-    if outcome["text"].strip() in (
-        pipeline.NATURAL_CLARIFICATION_REPLY,
-        pipeline.NATURAL_RETRY_REPLY,
-    ):
-        telemetry = dict(outcome.get("telemetry", {}))
-        assert telemetry.get("answer_outcome") in (
-            "adequacy-failed",
-            "adequacy-repair-failed",
-            "clarification",
-        )
+    assert not _ise234b(outcome["text"].strip())
 
 
 def test_no_exact_live_question_special_cases() -> None:

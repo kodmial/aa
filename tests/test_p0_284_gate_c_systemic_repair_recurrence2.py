@@ -180,12 +180,14 @@ async def test_mixed_subset_passes_qualification_gates() -> None:
 
 
 async def test_all_irrelevant_padding_still_fails_closed() -> None:
-    from aa.conversation.turn_pipeline import NATURAL_RETRY_VARIANTS, select_retry_reply
+    import pytest as _pt
 
-    outcome = await _run_turn(_AllIrrelevantVerifier())
-    telemetry = dict(outcome["telemetry"])
-    assert outcome["text"] == select_retry_reply(_REQUEST)
-    assert outcome["text"] in set(NATURAL_RETRY_VARIANTS)
+    from aa.conversation.failures import TurnFailed as _TF
+
+    with _pt.raises(_TF) as _exc:
+        await _run_turn(_AllIrrelevantVerifier())
+    telemetry = dict(_exc.value.telemetry)
+    assert _exc.value.category == "adequacy-failed"
     assert telemetry["adequacy_verdict"] == "fail"
     assert telemetry["answers_request"] is False
 

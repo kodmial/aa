@@ -18,7 +18,6 @@ import pytest
 from aa.conversation.graph_runtime import GraphTurnRuntime
 from aa.conversation.orchestrator import (
     AGENT_NAME,
-    FAIL_CLOSED_REPLY,
     RUNTIME_VERSION,
     SUPPORT_SCHEMA_VERSION,
     TurnFailed,
@@ -802,16 +801,11 @@ def test_runtime_model_policy_has_no_third_fallback() -> None:
 
 
 def test_fail_closed_reply_carries_no_book_claims() -> None:
-    # Operational fail-closed message: Russian-only, states inability +
-    # asks to refine, carries no citations, no quotations, no factual book
-    # assertions and no English fallback text (issue #98).
-    assert "уточнить" in FAIL_CLOSED_REPLY
-    assert "[" not in FAIL_CLOSED_REPLY
-    assert "«" not in FAIL_CLOSED_REPLY
-    for marker in ("refine", "cannot", "grounded", "please", "I cannot"):
-        assert marker not in FAIL_CLOSED_REPLY
-    from aa.conversation.orchestrator import contains_english_fallback, meets_russian_only
+    # Issue #301: no fixed fail-closed conversational reply exists.
+    # Typed failures surface as the marked service error, never as
+    # synthetic conversation.
+    from aa.conversation.failures import SERVICE_ERROR_REPLY, is_service_error
 
-    assert not contains_english_fallback(FAIL_CLOSED_REPLY)
-    assert meets_russian_only(FAIL_CLOSED_REPLY)
+    assert is_service_error(SERVICE_ERROR_REPLY)
+    assert "[" not in SERVICE_ERROR_REPLY or "[service-error]" in SERVICE_ERROR_REPLY
     assert RUNTIME_VERSION.startswith("aa-conversation-runtime/")

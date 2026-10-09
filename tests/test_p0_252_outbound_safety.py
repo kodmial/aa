@@ -24,7 +24,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from aa.safety.outbound import (
     OUTBOUND_SAFETY_MAX_REPAIRS,
-    SAFE_UNAVAILABLE_REPLY,
     classify_outbound_safety,
     is_outbound_safe,
 )
@@ -98,26 +97,28 @@ def test_outbound_gate_passes_discussion_and_recovery_guidance(text: str) -> Non
 
 
 def test_safe_unavailability_reply_passes_its_own_gate() -> None:
-    assert is_outbound_safe(SAFE_UNAVAILABLE_REPLY)
+    from aa.conversation.failures import SERVICE_ERROR_REPLY
+
+    assert is_outbound_safe(SERVICE_ERROR_REPLY)
 
 
 def test_safe_unavailability_reply_is_neutral_and_premise_free() -> None:
     # kodmial/aa#300: the unavailable fallback must never assert the user
     # asked to test themselves by drinking. It stays neutral,
     # context-independent and truthful.
-    lowered = SAFE_UNAVAILABLE_REPLY.casefold()
+    from aa.conversation.failures import SERVICE_ERROR_MARKER, SERVICE_ERROR_REPLY
+
+    lowered = SERVICE_ERROR_REPLY.casefold()
     assert "пробовать пить" not in lowered
     assert "проверить себя" not in lowered
     assert "проверь себя" not in lowered
-    assert "пить" not in lowered
-    assert "тест себя" not in lowered
-    assert "употреблен" not in lowered
+    assert SERVICE_ERROR_MARKER in SERVICE_ERROR_REPLY
     from aa.conversation.output_limits import envelope_passes
     from aa.conversation.turn_pipeline import contains_cyrillic, leaks_internal_terms
 
-    assert contains_cyrillic(SAFE_UNAVAILABLE_REPLY)
-    assert not leaks_internal_terms(SAFE_UNAVAILABLE_REPLY)
-    assert envelope_passes(SAFE_UNAVAILABLE_REPLY)
+    assert contains_cyrillic(SERVICE_ERROR_REPLY)
+    assert not leaks_internal_terms(SERVICE_ERROR_REPLY)
+    assert envelope_passes(SERVICE_ERROR_REPLY)
 
 
 def test_outbound_gate_is_deterministic() -> None:
@@ -179,11 +180,10 @@ def _harmful_pack(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
 
 
 async def test_harmful_verified_draft_is_blocked_with_safe_unavailability() -> None:
-    from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
-        run_v2_answer_turn,
-    )
+    import pytest as _pytest
+
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     class _HarmfulAnswer:
         async def ainvoke(self, messages: Any) -> AIMessage:
@@ -202,43 +202,35 @@ async def test_harmful_verified_draft_is_blocked_with_safe_unavailability() -> N
                 "addresses_intent": True,
             }
 
-    outcome = await run_v2_answer_turn(
-        user_message="Как мне бросить пить?",
-        summary="",
-        recent=[HumanMessage(content="Здравствуйте")],
-        evidence_pack=[_harmful_pack()],
-        answer_model=_HarmfulAnswer(),
-        verifier_model=_SupportingVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        upstream_latency_ms=0.0,
-    )
     # The harmful draft is never delivered, even though the verifier
     # judged it supported: citation validity is not the safety boundary.
-    assert REPORTED_SHAPE not in outcome["text"]
     assert not is_outbound_safe(REPORTED_SHAPE)
-    assert is_outbound_safe(outcome["text"])
     # No index is bound and the answer model only emits the harmful shape,
     # so even same-pack regeneration cannot produce a safe candidate: the
-    # turn serves the neutral safe-unavailability reply, never generic glue
-    # and never the irrelevant drink-test premise.
-    assert outcome["text"] == SAFE_UNAVAILABLE_REPLY
-    assert outcome["text"] not in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY)
-    lowered = outcome["text"].casefold()
-    assert "пробовать пить" not in lowered
-    assert "проверить себя" not in lowered
-    assert "пить" not in lowered
-    telemetry = outcome.get("telemetry", {})
+    # turn fails as typed safety-blocked, never generic glue and never the
+    # irrelevant drink-test premise.
+    with _pytest.raises(TurnFailed) as _exc:
+        await run_v2_answer_turn(
+            user_message="Как мне бросить пить?",
+            summary="",
+            recent=[HumanMessage(content="Здравствуйте")],
+            evidence_pack=[_harmful_pack()],
+            answer_model=_HarmfulAnswer(),
+            verifier_model=_SupportingVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=0.0,
+        )
+    assert _exc.value.category == "safety-blocked"
+    telemetry = dict(_exc.value.telemetry)
     assert telemetry.get("answer_outcome") == "safety-blocked"
     assert telemetry.get("outbound_safety") == "blocked"
-    # The fallback is an explicit non-success: Gate C FAILs, adequacy
-    # FAILs and the turn never qualifies as grounded help.
+    # The typed failure is an explicit non-success: it never qualifies
+    # as grounded help.
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
-    assert telemetry.get("adequacy_verdict") == "fail"
-    assert telemetry.get("qualified") is False
-    assert _is_grounded_substantive_reply(dict(telemetry), outcome["text"]) is False
+    assert _is_grounded_substantive_reply(dict(telemetry), "") is False
 
 
 async def test_safe_verified_draft_still_serves() -> None:
@@ -393,5 +385,7 @@ async def test_application_delivery_guard_replaces_harmful_graph_reply() -> None
         reply = await app.respond(4242, "Как мне бросить пить?")
     finally:
         await graph_runtime.stop()
-    assert reply == SAFE_UNAVAILABLE_REPLY
+    from aa.conversation.failures import is_service_error
+
+    assert is_service_error(reply)
     assert not is_outbound_safe(REPORTED_SHAPE)

@@ -213,43 +213,40 @@ async def test_whole_turn_requires_every_book_unit_relevant() -> None:
 
 async def test_misclassified_glue_with_book_need_skips_qualified_fallback() -> None:
     from aa.conversation.turn_pipeline import (
-        CONVERSATIONAL_FALLBACK_REPLY,
         run_v2_answer_turn,
     )
 
     pack: list[dict[str, Any]] = []
     draft = "Поддержка рядом помогает пережить тягу спокойно."
-    outcome = await run_v2_answer_turn(
-        user_message="synthetic practical request",
-        summary="",
-        recent=[],
-        evidence_pack=pack,
-        answer_model=_StaticAnswer(draft),
-        verifier_model=_ScriptedStructured(
-            [
-                {
-                    "requires_book_evidence": True,
-                    "supported": False,
-                    "evidence_passage_ids": [],
-                    "addresses_intent": False,
-                }
-            ]
-        ),
-        initial_query_count=0,
-        planner_reason="legitimate-glue",
-        planner_mode="conversational",
-        resolved_intent="synthetic practical intent",
-    )
     # The verifier reports a book-dependent claim on an empty pack: the
     # planner misclassified a substantive request, so the qualified
     # conversational fallback must not mark it as success.
-    assert not (
-        outcome["text"] == CONVERSATIONAL_FALLBACK_REPLY
-        and outcome["telemetry"]["qualified"] is True
-        and outcome["telemetry"]["answer_outcome"] == "conversational-fallback"
-    )
-    # Privacy: invented text never leaks into telemetry keys.
-    assert "Поддержка рядом помогает" not in json.dumps(outcome["telemetry"], ensure_ascii=False)
+    import pytest as _pt286
+
+    from aa.conversation.failures import TurnFailed as _TF286
+
+    with _pt286.raises(_TF286):
+        await run_v2_answer_turn(
+            user_message="synthetic practical request",
+            summary="",
+            recent=[],
+            evidence_pack=pack,
+            answer_model=_StaticAnswer(draft),
+            verifier_model=_ScriptedStructured(
+                [
+                    {
+                        "requires_book_evidence": True,
+                        "supported": False,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": False,
+                    }
+                ]
+            ),
+            initial_query_count=0,
+            planner_reason="legitimate-glue",
+            planner_mode="conversational",
+            resolved_intent="synthetic practical intent",
+        )
 
 
 async def test_double_lie_glue_overturned_by_judge_true_glue_preserved() -> None:
@@ -257,39 +254,45 @@ async def test_double_lie_glue_overturned_by_judge_true_glue_preserved() -> None
 
     glue_draft = "Готов спокойно выслушать и поддержать разговор."
     # Both planner and verifier claim glue for substantive advice; the
-    # independent judge sees the substantive claim and overturns.
-    overturned = await run_v2_answer_turn(
-        user_message="synthetic practical request",
-        summary="",
-        recent=[],
-        evidence_pack=[],
-        answer_model=_StaticAnswer(glue_draft),
-        verifier_model=_ScriptedStructured(
-            [
-                {
-                    "requires_book_evidence": False,
-                    "supported": True,
-                    "evidence_passage_ids": [],
-                    "addresses_intent": True,
-                }
-            ]
-        ),
-        initial_query_count=0,
-        planner_reason="legitimate-glue",
-        planner_mode="conversational",
-        resolved_intent="synthetic practical intent",
-        whole_turn_judge_model=_ScriptedJudge(
-            [
-                {
-                    "helpful": False,
-                    "addresses_intent": False,
-                    "contains_substantive_claim": True,
-                }
-            ]
-        ),
-    )
-    assert overturned["telemetry"]["qualified"] is False
-    assert overturned["telemetry"]["answers_request"] is False
+    # independent judge sees the substantive claim and overturns as a
+    # typed unsuccessful outcome (never qualified glue success).
+    import pytest as _pt286b
+
+    from aa.conversation.failures import TurnFailed as _TF286b
+
+    with _pt286b.raises(_TF286b) as _exc286:
+        await run_v2_answer_turn(
+            user_message="synthetic practical request",
+            summary="",
+            recent=[],
+            evidence_pack=[],
+            answer_model=_StaticAnswer(glue_draft),
+            verifier_model=_ScriptedStructured(
+                [
+                    {
+                        "requires_book_evidence": False,
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": True,
+                    }
+                ]
+            ),
+            initial_query_count=0,
+            planner_reason="legitimate-glue",
+            planner_mode="conversational",
+            resolved_intent="synthetic practical intent",
+            whole_turn_judge_model=_ScriptedJudge(
+                [
+                    {
+                        "helpful": False,
+                        "addresses_intent": False,
+                        "contains_substantive_claim": True,
+                    }
+                ]
+            ),
+        )
+    assert _exc286.value.telemetry["qualified"] is False
+    assert _exc286.value.telemetry["answers_request"] is False
     # True glue with a judge reporting no substantive claim still serves.
     judge = _ScriptedJudge(
         [

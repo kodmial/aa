@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from aa.app import Application
 from aa.config import Settings
-from aa.conversation.meta import META_CAPABILITY_REPLY, is_meta_capability_request
+from aa.conversation.failures import SERVICE_ERROR_MARKER, is_service_error
+from aa.conversation.meta import is_meta_capability_request
 from aa.conversation.orchestrator import (
-    contains_english_fallback,
     is_substantive,
-    meets_russian_only,
 )
 from aa.conversation.output_limits import envelope_passes
 from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
@@ -36,9 +35,11 @@ def test_fixture_covers_required_classes_and_known_failures() -> None:
 
 
 def test_known_meta_failures_are_conversational_not_grounded() -> None:
+    # Issue #301: deterministic lexical capability routing is retired;
+    # the model resolves meta intent generatively. The boundary probe
+    # classifies meta-capability fixtures as conversational by class.
     for text in ("А что ты можешь?", "Тогда зачем ты?"):
-        assert is_meta_capability_request(text) is True
-        assert is_substantive(text) is False
+        assert is_meta_capability_request(text) is False
         assert observe_path(next(c for c in load_fixture() if c.utterance == text)) == (
             "conversational"
         )
@@ -53,10 +54,12 @@ def test_known_broad_failure_takes_grounded_path() -> None:
 
 
 def test_meta_capability_reply_is_deterministic_russian() -> None:
-    assert meets_russian_only(META_CAPABILITY_REPLY) is True
-    assert not contains_english_fallback(META_CAPABILITY_REPLY)
-    assert envelope_passes(META_CAPABILITY_REPLY) is True
-    assert "[" not in META_CAPABILITY_REPLY
+    # Issue #301: no fixed capability reply exists. The typed service
+    # error is the only fixed user-visible string on this boundary, and
+    # it is marked as non-conversation.
+    assert SERVICE_ERROR_MARKER.strip()
+    assert is_service_error(SERVICE_ERROR_MARKER) is True
+    assert fail_closed_reply_is_valid() is True
 
 
 async def test_app_serves_meta_without_grounded_or_model_work() -> None:

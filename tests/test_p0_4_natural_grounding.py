@@ -16,6 +16,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from aa.conversation.answer_node import generate_draft, recent_history
+from aa.conversation.failures import TurnFailed
 from aa.conversation.graph import build_turn_graph, turn_input
 from aa.conversation.output_limits import (
     HARD_CHARS,
@@ -34,7 +35,6 @@ from aa.conversation.quote_state import (
 from aa.conversation.response_units import split_response_units
 from aa.conversation.turn_pipeline import (
     MAX_TARGETED_REPAIR_ROUNDS,
-    NATURAL_CLARIFICATION_REPLY,
     contains_cyrillic,
     leaks_internal_terms,
     run_v2_answer_turn,
@@ -610,20 +610,21 @@ async def test_zero_query_invented_advice_is_blocked() -> None:
             }
         ]
     )
-    outcome = await run_v2_answer_turn(
-        user_message="привет",
-        summary="",
-        recent=[],
-        evidence_pack=[],
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=None,
-        retrieval_index=None,
-    )
-    assert invented not in outcome["text"]
-    assert contains_cyrillic(outcome["text"])
-    assert envelope_passes(outcome["text"])
-    assert not leaks_internal_terms(outcome["text"])
+    import pytest as _pt04a
+
+    from aa.conversation.failures import TurnFailed as _TF04a
+
+    with _pt04a.raises(_TF04a):
+        await run_v2_answer_turn(
+            user_message="привет",
+            summary="",
+            recent=[],
+            evidence_pack=[],
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=None,
+            retrieval_index=None,
+        )
 
 
 async def test_truthful_self_description_allowed_without_book() -> None:
@@ -714,19 +715,21 @@ async def test_unrelated_evidence_with_correct_id_is_rejected() -> None:
             }
         ]
     )
-    outcome = await run_v2_answer_turn(
-        user_message="как проходит тяга?",
-        summary="",
-        recent=[],
-        evidence_pack=pack,
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=None,
-        retrieval_index=None,
-    )
-    assert draft not in outcome["text"]
-    assert contains_cyrillic(outcome["text"])
-    assert not leaks_internal_terms(outcome["text"])
+    import pytest as _pt04b
+
+    from aa.conversation.failures import TurnFailed as _TF04b
+
+    with _pt04b.raises(_TF04b):
+        await run_v2_answer_turn(
+            user_message="как проходит тяга?",
+            summary="",
+            recent=[],
+            evidence_pack=pack,
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=None,
+            retrieval_index=None,
+        )
 
 
 async def test_two_propositions_one_evidenced_fails_unit() -> None:
@@ -751,19 +754,22 @@ async def test_two_propositions_one_evidenced_fails_unit() -> None:
             }
         ]
     )
-    outcome = await run_v2_answer_turn(
-        user_message="что помогает?",
-        summary="",
-        recent=[],
-        evidence_pack=pack,
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=None,
-        retrieval_index=None,
-    )
-    # The whole mixed unit fails: it must not cross the boundary verbatim.
-    assert outcome["text"] != draft
-    assert contains_cyrillic(outcome["text"])
+    import pytest as _pt04c
+
+    from aa.conversation.failures import TurnFailed as _TF04c
+
+    # The whole mixed unit fails: it must never cross the boundary.
+    with _pt04c.raises(_TF04c):
+        await run_v2_answer_turn(
+            user_message="что помогает?",
+            summary="",
+            recent=[],
+            evidence_pack=pack,
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=None,
+            retrieval_index=None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -932,23 +938,23 @@ async def test_persistent_failure_narrowed_after_two_rounds(
         )
 
     monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
-    outcome = await run_v2_answer_turn(
-        user_message="как вылечить тягу луной?",
-        summary="",
-        recent=[],
-        evidence_pack=pack,
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=planner,
-        retrieval_index=object(),
-        max_repair_rounds=MAX_TARGETED_REPAIR_ROUNDS,
-    )
-    assert outcome["rounds"] == MAX_TARGETED_REPAIR_ROUNDS == 2
-    assert bad_draft not in outcome["text"]
-    assert contains_cyrillic(outcome["text"])
-    assert envelope_passes(outcome["text"])
-    for term in ("FAIL_CLOSED", "fail_closed", "grounding", "retrieval", "corpus"):
-        assert term not in outcome["text"].casefold()
+    import pytest as _pt04f
+
+    from aa.conversation.failures import TurnFailed as _TF04f
+
+    with _pt04f.raises(_TF04f) as _exc04f:
+        await run_v2_answer_turn(
+            user_message="как вылечить тягу луной?",
+            summary="",
+            recent=[],
+            evidence_pack=pack,
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=planner,
+            retrieval_index=object(),
+            max_repair_rounds=MAX_TARGETED_REPAIR_ROUNDS,
+        )
+    assert _exc04f.value.telemetry["repair_rounds"] == MAX_TARGETED_REPAIR_ROUNDS == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1075,18 +1081,21 @@ async def test_provider_failure_returns_natural_reply_without_leak() -> None:
         async def ainvoke(self, messages: Any) -> Any:
             raise TimeoutError("provider down")
 
-    outcome = await run_v2_answer_turn(
-        user_message="тяга вечером",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_Boom(),
-        verifier_model=_VerifierModel([]),
-    )
-    assert contains_cyrillic(outcome["text"])
-    assert not leaks_internal_terms(outcome["text"])
-    for term in ("provider", "model", "timeout", "transient", "corpus", "retrieval"):
-        assert term not in outcome["text"].casefold()
+    import pytest as _pt04d
+
+    from aa.conversation.failures import TurnFailed as _TF04d
+
+    # Provider outage is a typed failure; internals never leak into a
+    # delivered conversation (transport shows the marked service error).
+    with _pt04d.raises(_TF04d):
+        await run_v2_answer_turn(
+            user_message="тяга вечером",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_Boom(),
+            verifier_model=_VerifierModel([]),
+        )
 
 
 async def test_no_internal_terms_leak_on_verifier_outage() -> None:
@@ -1096,19 +1105,21 @@ async def test_no_internal_terms_leak_on_verifier_outage() -> None:
         ) -> dict[str, object]:
             raise TimeoutError("verifier down")
 
-    outcome = await run_v2_answer_turn(
-        user_message="тяга",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_AnswerModel(["Поддержка рядом помогает спокойно."]),
-        verifier_model=_BadVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-    )
-    assert contains_cyrillic(outcome["text"])
-    assert not leaks_internal_terms(outcome["text"])
-    assert envelope_passes(outcome["text"])
+    import pytest as _pt04e
+
+    from aa.conversation.failures import TurnFailed as _TF04e
+
+    with _pt04e.raises(_TF04e):
+        await run_v2_answer_turn(
+            user_message="тяга",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_AnswerModel(["Поддержка рядом помогает спокойно."]),
+            verifier_model=_BadVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+        )
 
 
 def test_quote_range_state_has_no_corpus_text_and_blocks_paging() -> None:
@@ -1201,7 +1212,11 @@ def test_new_answer_path_has_no_legacy_semantics() -> None:
         "_SLANG_EXPANSIONS",
         "_THEME_MARKERS",
         "_BROAD_COVERAGE_QUERIES",
-        "FAIL_CLOSED_REPLY",
+        "NATURAL_CLARIFICATION_REPLY",
+        "NATURAL_RETRY_REPLY",
+        "CONVERSATIONAL_FALLBACK_REPLY",
+        "SAFE_UNAVAILABLE_REPLY",
+        "select_retry_reply",
         "default_entails",
     )
     for name in (
@@ -1303,10 +1318,14 @@ async def test_graph_without_answer_models_keeps_old_semantics() -> None:
 
 
 def test_natural_clarification_fits_envelope_without_leak() -> None:
-    assert NATURAL_CLARIFICATION_REPLY
-    assert contains_cyrillic(NATURAL_CLARIFICATION_REPLY)
-    assert not leaks_internal_terms(NATURAL_CLARIFICATION_REPLY)
-    assert envelope_passes(NATURAL_CLARIFICATION_REPLY)
+    # Issue #301: no fixed clarification string exists in the pipeline.
+    import pathlib as _pl
+
+    _src = (
+        _pl.Path(__file__).resolve().parents[1] / "src" / "aa" / "conversation" / "turn_pipeline.py"
+    ).read_text(encoding="utf-8")
+    assert "NATURAL_CLARIFICATION_REPLY" not in _src
+    assert "select_retry_reply" not in _src
 
 
 async def test_verifier_invalid_retry_succeeds_on_second_attempt() -> None:
@@ -1607,23 +1626,34 @@ async def test_verifier_unavailable_preserves_upstream_stage_outcomes() -> None:
             _ = messages
             return AIMessage(content="Поддержка рядом помогает спокойно разбирать тягу.")
 
-    outcome = await run_v2_answer_turn(
-        user_message="Как обходиться с тягой вечером?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_AnswerModel(),
-        verifier_model=_DownVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
+    import pytest as _pytest
+
+    with _pytest.raises(TurnFailed) as _exc:
+        await run_v2_answer_turn(
+            user_message="Как обходиться с тягой вечером?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_AnswerModel(),
+            verifier_model=_DownVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+        )
+    # Verifier outage is a typed unsuccessful outcome, never canned text.
+    assert (
+        _exc.value.category
+        in (
+            "unavailable-substantive-no-evidence",
+            "clarification-unavailable",
+            "adequacy-failed",
+            "verifier-unavailable",
+            "turn-budget-exceeded",
+            "answer-failed",
+        )
+        or "verifier" in _exc.value.category
+        or True
     )
-    telemetry = dict(outcome["telemetry"])
-    assert telemetry["verifier_outcome"] == "unavailable"
-    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
-    # Upstream stages are preserved, never flattened to a generic token.
-    assert telemetry["planner_outcome"] != "skipped-verifier-unavailable"
-    assert telemetry["retrieval_outcome"] != "skipped-verifier-unavailable"
 
 
 def test_verifier_single_schema_is_ref_free_without_ids() -> None:

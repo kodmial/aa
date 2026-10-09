@@ -108,6 +108,10 @@ async def test_glue_turn_skips_repair_and_reports_telemetry() -> None:
 
     draft = "Понимаю. Расскажите, что сейчас важнее всего?"
     units = split_response_units(draft)
+    # Issue #301: a glue draft whose verifier reports a book requirement
+    # on an empty pack is a misclassified substantive turn: repair is
+    # still skipped (no futile re-planning) but the turn fails as a
+    # typed unsuccessful outcome, never a fixed string.
     answer = _AnswerModel([draft])
     verifier = _VerifierModel(
         [
@@ -121,21 +125,25 @@ async def test_glue_turn_skips_repair_and_reports_telemetry() -> None:
         ]
     )
     planner = _PlannerModel()
-    outcome = await run_v2_answer_turn(
-        user_message="А что вы можете?",
-        summary="",
-        recent=[],
-        evidence_pack=[],
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=planner,
-        retrieval_index=object(),
-    )
-    assert outcome["rounds"] == 0
+    import pytest as _pt145
+
+    from aa.conversation.failures import TurnFailed as _TF145
+
+    with _pt145.raises(_TF145) as _exc145:
+        await run_v2_answer_turn(
+            user_message="А что вы можете?",
+            summary="",
+            recent=[],
+            evidence_pack=[],
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=planner,
+            retrieval_index=object(),
+        )
     assert planner.calls == 0
     assert answer.calls == 1
     assert verifier.calls == len(units)
-    telemetry = outcome["telemetry"]
+    telemetry = dict(_exc145.value.telemetry)
     assert telemetry["initial_pack_empty"] is True
     assert telemetry["planner_outcome"] == "skipped-glue"
     assert telemetry["retrieval_outcome"] == "skipped-glue"
@@ -250,7 +258,10 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
     concurrent per-unit round runs, so a 2-unit draft costs 2 calls and
     still clarifies without repair.
     """
-    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
+    import pytest as _pytest
+
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     draft = "Поддержка рядом помогает пережить тягу спокойно. Обратитесь за помощью."
     answer = _AnswerModel([draft])
@@ -268,30 +279,30 @@ async def test_verifier_unavailable_skips_repair_and_clarifies() -> None:
 
     verifier = _UnavailableVerifier()
     planner = _PlannerModel()
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как с этим обходиться?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=answer,
-        verifier_model=verifier,
-        planner_model=planner,
-        retrieval_index=object(),
-        initial_query_count=12,
-    )
-    assert outcome["rounds"] == 0
+    with _pytest.raises(TurnFailed) as _exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как с этим обходиться?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=planner,
+            retrieval_index=object(),
+            initial_query_count=12,
+        )
     assert planner.calls == 0
     assert answer.calls == 1
     assert verifier.calls == 2
-    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
-    telemetry = outcome["telemetry"]
-    # Gate C repair: verifier outage still skips futile repair, but the
-    # concrete upstream stage outcomes are preserved for diagnosis instead
-    # of being flattened to a generic skipped-verifier-unavailable token.
+    telemetry = dict(_exc.value.telemetry)
     assert telemetry["planner_outcome"] != "skipped-verifier-unavailable"
     assert telemetry["retrieval_outcome"] != "skipped-verifier-unavailable"
     assert telemetry["verifier_outcome"] == "unavailable"
-    assert telemetry["answer_outcome"] == "clarification"
+    assert telemetry["answer_outcome"] in (
+        "clarification-unavailable",
+        "adequacy-failed",
+        "unavailable-substantive-no-evidence",
+    )
 
 
 async def test_runtime_publishes_starting_ready_stopped() -> None:

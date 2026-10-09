@@ -222,17 +222,22 @@ async def test_binding_repair_budget_skips_replan_on_slow_turn(
                 "addresses_intent": False,
             }
 
-    outcome = await pipeline.run_v2_answer_turn(
-        user_message="Вечером тяжело пережить тягу, как обходиться?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_entry()],
-        answer_model=_AlwaysUnsupportedAnswer(),
-        verifier_model=_AlwaysUnsupportedVerifier(),
-        planner_model=object(),
-        retrieval_index=object(),
-        initial_query_count=12,
-    )
-    telemetry = outcome["telemetry"]
+    import pytest as _pt269
+
+    from aa.conversation.failures import TurnFailed as _TF269
+
+    with _pt269.raises(_TF269) as _exc269:
+        await pipeline.run_v2_answer_turn(
+            user_message="Вечером тяжело пережить тягу, как обходиться?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_entry()],
+            answer_model=_AlwaysUnsupportedAnswer(),
+            verifier_model=_AlwaysUnsupportedVerifier(),
+            planner_model=object(),
+            retrieval_index=object(),
+            initial_query_count=12,
+        )
+    telemetry = dict(_exc269.value.telemetry)
     assert telemetry["repair_budget_exceeded"] is True
     assert telemetry["repair_rounds"] == 0

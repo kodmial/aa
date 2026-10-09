@@ -581,7 +581,8 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
 
         _check("13-grounding-boundary-present", hasattr(verifier_mod, "__name__"))
 
-        # 14-15: bounded retry yields natural fallback, never mechanics.
+        # 14-15: provider outage is a typed unsuccessful outcome with a
+        # clearly marked service error, never synthetic AA conversation.
         async def _boom(thread: str, text: str) -> str:
             raise RuntimeError("provider down")
 
@@ -596,10 +597,12 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
         )
         await boom_app.start()
         try:
+            from aa.conversation.failures import is_service_error as _is_svc
+
             fallback = await boom_app.respond(910006, "тяга вечером")
             _check(
                 "14-15-bounded-retry-natural",
-                bool(contains_cyrillic(fallback)) and not leaks_internal_terms(fallback),
+                bool(_is_svc(fallback)) and not _is_grounded_substantive_reply({}, fallback),
             )
         finally:
             await boom_app.stop()
@@ -1510,15 +1513,14 @@ def _is_direct_meta_reply(
     planner/verifier/adequacy telemetry, never from clarification cue tables,
     sentence-shape heuristics, or keyword intent rules.
     """
+    from aa.conversation.failures import is_service_error
     from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
         contains_cyrillic,
         leaks_internal_terms,
     )
 
     cleaned = (reply or "").strip()
-    if not cleaned or cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+    if not cleaned or is_service_error(cleaned):
         return False
     if not contains_cyrillic(cleaned) or leaks_internal_terms(cleaned):
         return False
@@ -1573,27 +1575,23 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
     ``verified_book_units > 0``. No prompt, reply or corpus text enters
     telemetry; only booleans/counts travel outward.
     """
-    from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
-    )
+    from aa.conversation.failures import is_service_error
 
     cleaned = (reply or "").strip()
     if not cleaned:
         return False
+    if is_service_error(cleaned):
+        return False
     # Outbound safety (#252) is independent of book-grounding: an
     # authentic book-supported excerpt that advises drinking as a
-    # self-test must FAIL even with verified_book_units > 0. The
-    # safe-unavailability reply is transparent, never grounded help.
+    # self-test must FAIL even with verified_book_units > 0. Typed
+    # safety-blocked failures surface as the marked service error,
+    # never as grounded help.
     try:
-        from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY, is_outbound_safe
+        from aa.safety.outbound import is_outbound_safe
     except Exception:
         return False
-    if cleaned == SAFE_UNAVAILABLE_REPLY:
-        return False
     if not is_outbound_safe(cleaned):
-        return False
-    if cleaned in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
         return False
     # Only mechanical output guards live here. Semantic helpfulness and
     # relevance come from the production planner/verifier/adequacy telemetry,
@@ -2019,6 +2017,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
 
         from aa.app import Application
         from aa.config import Settings
+        from aa.conversation.failures import is_service_error
         from aa.conversation.model_adapter import (
             ANSWER_AGENT_V2,
             PLANNER_AGENT_V2,
@@ -2028,8 +2027,6 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         )
         from aa.conversation.output_limits import envelope_passes
         from aa.conversation.turn_pipeline import (
-            NATURAL_CLARIFICATION_REPLY,
-            NATURAL_RETRY_VARIANTS,
             contains_cyrillic,
             leaks_internal_terms,
         )
@@ -2503,11 +2500,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         relevant_for_scenario = bool(continuation_semantic)
                         continuation_output_ok = (
                             reply.strip()
-                            and reply.strip()
-                            not in {
-                                NATURAL_CLARIFICATION_REPLY,
-                                *NATURAL_RETRY_VARIANTS,
-                            }
+                            and not is_service_error(reply.strip())
                             and not _is_service_link_only_text(reply)
                             and not _is_quote_only_text(reply)
                         )
@@ -2632,17 +2625,13 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 if bool(step_judge_metrics.get("judge_overrode_telemetry", False)):
                     judge_overrides += 1
                 step_relevant = bool(step_relevant and step_judged)
-                step_ok = bool(step_reply_2.strip()) and step_reply_2.strip() not in {
-                    NATURAL_CLARIFICATION_REPLY,
-                    *NATURAL_RETRY_VARIANTS,
-                }
+                step_ok = bool(step_reply_2.strip()) and not is_service_error(step_reply_2.strip())
                 _check("live-step-continuity-second-grounded", bool(step_grounded))
                 _check("live-step-continuity-second-relevant", bool(step_relevant))
                 _check("live-step-continuity-second-judge-helpful", bool(step_judged))
                 _check(
                     "live-step-continuity-no-fallback",
-                    step_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
-                    and step_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
+                    not is_service_error(step_reply_2.strip()),
                 )
                 _ = step_ok
                 # kodmial/aa#286 three-turn control in the same chat: an
@@ -2693,8 +2682,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     _check("live-step-third-judge-helpful", bool(step_judged_3))
                     _check(
                         "live-step-third-no-fallback",
-                        step_reply_3.strip() != NATURAL_CLARIFICATION_REPLY
-                        and step_reply_3.strip() not in set(NATURAL_RETRY_VARIANTS),
+                        not is_service_error(step_reply_3.strip()),
                     )
 
             # Short admission plus typo variant: brief personal disclosures
@@ -2754,8 +2742,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 )
                 _check(
                     "live-short-admission-no-fallback",
-                    short_reply_2.strip() != NATURAL_CLARIFICATION_REPLY
-                    and short_reply_2.strip() not in set(NATURAL_RETRY_VARIANTS),
+                    not is_service_error(short_reply_2.strip()),
                 )
             typo_reply = await _send_raw_text(922102, "Пад вечер тянеет выпить, че делать", 931013)
             if typo_reply is None:
@@ -2795,8 +2782,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 _check("live-typo-variant-judge-helpful", bool(typo_judged))
                 _check(
                     "live-typo-variant-no-fallback",
-                    typo_reply.strip() != NATURAL_CLARIFICATION_REPLY
-                    and typo_reply.strip() not in set(NATURAL_RETRY_VARIANTS),
+                    not is_service_error(typo_reply.strip()),
                 )
 
             # Context switch in the same chat stays helpful, never a bare
@@ -2847,11 +2833,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 _check(
                     "live-context-switch-helpful",
                     bool(switch_telemetry_relevant and switch_judged)
-                    and switch_reply.strip()
-                    not in {
-                        NATURAL_CLARIFICATION_REPLY,
-                        *NATURAL_RETRY_VARIANTS,
-                    },
+                    and not is_service_error(switch_reply.strip()),
                 )
             # Negative controls compare each irrelevant reply against its
             # own prompt instead of mirroring the adequacy verdict alone.
@@ -2991,11 +2973,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 or judge_calls >= 5,
             )
 
-            non_answer_fallbacks = {
-                NATURAL_CLARIFICATION_REPLY,
-                *NATURAL_RETRY_VARIANTS,
-            }
-            collapsed_count = sum(1 for item in replies if item.strip() in non_answer_fallbacks)
+            collapsed_count = sum(1 for item in replies if is_service_error(item.strip()))
             # Hash-based answer variety is never evidence of helpfulness.
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
             _check(
@@ -3315,9 +3293,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "independent_judge_agent": "aa-judge-v2",
         "independent_judge_models": _judge_models,
         "independent_judge_limitation": _LIMIT,
-        "clarification_count": sum(
-            1 for item in replies if item.strip() == NATURAL_CLARIFICATION_REPLY
-        )
+        "clarification_count": sum(1 for item in replies if is_service_error(item.strip()))
         if "replies" in locals()
         else 0,
         "non_answer_fallback_count": collapsed_count,
