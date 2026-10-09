@@ -3128,6 +3128,15 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     except Exception:
         _judge_helpful = 0
     try:
+        _judge_unavailable = int(judge_unavailable_count)
+        _judge_failures = {
+            str(category)[:64]: int(count)
+            for category, count in judge_failure_categories.items()
+        }
+    except Exception:
+        _judge_unavailable = 0
+        _judge_failures = {}
+    try:
         _judge_over = int(judge_overrides)
     except Exception:
         _judge_over = 0
@@ -3146,8 +3155,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "independent_judge_calls": _judge_calls,
         "independent_judge_helpful": _judge_helpful,
-        "independent_judge_unavailable": int(judge_unavailable_count),
-        "independent_judge_failure_categories": dict(judge_failure_categories),
+        "independent_judge_unavailable": _judge_unavailable,
+        "independent_judge_failure_categories": _judge_failures,
         "independent_judge_overrides": _judge_over,
         "independent_judge_agent": "aa-judge-v2",
         "independent_judge_models": _judge_models,
