@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-IMAGE_RE = re.compile(r"ghcr\\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}")
+IMAGE_RE = re.compile(r"ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}")
 ZERO = "0" * 64
 
 
@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         "        run: |\n"
         "          set -euo pipefail\n"
         "          python scripts/verify_runtime_image.py --pins-only\n"
-        "          test \\"$(git rev-parse HEAD)\\" = \\"${{ github.sha }}\\"\n"
+        "          test $(git rev-parse HEAD) = ${{ github.sha }}\n"
     )
     hot_gate = (
         "      - name: Verify image hot path and external model cache\n"
