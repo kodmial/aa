@@ -76,7 +76,7 @@ class EvidencePassage:
 # checksum/quote/cite gates and verifier verdicts still use full exact
 # text, so grounding strictness is unchanged. Turn-independent, never an
 # exact-question special case.
-ANSWER_MAX_PASSAGE_CHARS = 500
+ANSWER_MAX_PASSAGE_CHARS = 0  # Deprecated compatibility constant; passage text is never clipped.
 
 ANSWER_MAX_MESSAGE_CHARS = 500
 
@@ -142,7 +142,7 @@ def render_turn_context(
     lines.append("<book_evidence>")
     if passages:
         for passage in passages:
-            display = _display_answer_text(passage.text, limit=ANSWER_MAX_PASSAGE_CHARS)
+            display = passage.text  # Preserve entire canonical evidence passage.
             lines.append(
                 f"<passage id={_xml_quoteattr(passage.passage_id)} "
                 f"source={_xml_quoteattr(passage.source)} "
