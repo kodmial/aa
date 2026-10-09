@@ -444,10 +444,8 @@ def split_text_to_envelope_segments(text: str) -> list[str]:
         if not current:
             # Single complete unit exceeds the envelope: never cut inside.
             raise ValueError("single complete unit exceeds the transport envelope")
-        while current and not _markdown_balanced(" ".join(current)):
-            current.pop()
-        if not current:
-            raise ValueError("cannot balance a transport segment")
+        if not _markdown_balanced(" ".join(current)):
+            raise ValueError("cannot balance a transport segment without dropping verified units")
         segments.append(" ".join(current))
         if len(segments) >= MAX_TRANSPORT_SEGMENTS:
             raise ValueError("verified answer needs more transport segments than budgeted")
@@ -455,10 +453,8 @@ def split_text_to_envelope_segments(text: str) -> list[str]:
         if not _prefix_fits(unit):
             raise ValueError("single complete unit exceeds the transport envelope")
     if current:
-        while current and not _markdown_balanced(" ".join(current)):
-            current.pop()
-        if not current:
-            raise ValueError("cannot balance a transport segment")
+        if not _markdown_balanced(" ".join(current)):
+            raise ValueError("cannot balance a transport segment without dropping verified units")
         segments.append(" ".join(current))
     if not segments:
         raise ValueError("no transport segments produced")

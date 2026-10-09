@@ -939,6 +939,13 @@ class Application:
             await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=text))
 
         # Verified-split delivery: sequential segments, same content.
+        # The splitter raises ValueError for quote/segment/single-unit
+        # guard violations; that path must never resend the raw
+        # over-envelope payload below. Only verified envelope-passing
+        # segments split; everything else uses the fitted single message.
+        from aa.conversation.output_limits import MAX_TRANSPORT_SEGMENTS as _MAX_SEGMENTS
+
+        verified_segments: list[str] | None = None
         try:
             stage: dict[str, object] = {}
             if self._graph_runtime is not None:
@@ -948,29 +955,46 @@ class Application:
                 except Exception:
                     stage = {}
             if bool(stage.get("transport_split")):
-                from aa.conversation.output_limits import split_text_to_envelope_segments
+                from aa.conversation.output_limits import (
+                    split_text_to_envelope_segments as _split_text,
+                )
 
-                segments = split_text_to_envelope_segments(reply)
-                if 1 < len(segments) <= 4:
-                    for segment in segments:
-                        await _send_single(segment)
-                    elapsed_ms = (_time.perf_counter() - started) * 1000.0
-                    logger.info(
-                        "telegram delivery done",
-                        extra={
-                            "delivery_outcome": "sent-split",
-                            "delivery_latency_ms": round(elapsed_ms, 1),
-                            "reply_len": len(reply),
-                            "segments": len(segments),
-                        },
-                    )
-                    return
-        except TelegramApiError:
-            logger.warning("telegram split delivery failed; fallback path used")
+                _candidate = _split_text(reply)
+                if 1 < len(_candidate) <= _MAX_SEGMENTS:
+                    verified_segments = _candidate
         except Exception:
-            pass
+            verified_segments = None
+        if verified_segments is not None:
+            _sent_count = 0
+            try:
+                for _segment in verified_segments:
+                    await _send_single(_segment)
+                    _sent_count += 1
+                elapsed_ms = (_time.perf_counter() - started) * 1000.0
+                logger.info(
+                    "telegram delivery done",
+                    extra={
+                        "delivery_outcome": "sent-split",
+                        "delivery_latency_ms": round(elapsed_ms, 1),
+                        "reply_len": len(reply),
+                        "segments": len(verified_segments),
+                    },
+                )
+                return
+            except TelegramApiError:
+                if _sent_count > 0:
+                    # Partial split already delivered: resending the full
+                    # reply would duplicate user-visible messages.
+                    logger.warning("telegram split delivery partial; full resend skipped")
+                    return
+                logger.warning("telegram split delivery failed; fallback path used")
+            except Exception:
+                if _sent_count > 0:
+                    logger.warning("telegram split delivery partial; full resend skipped")
+                    return
+                pass
         try:
-            await _send_single(reply)
+            await _send_single(self._fit_envelope(reply))
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.info(
                 "telegram delivery done",

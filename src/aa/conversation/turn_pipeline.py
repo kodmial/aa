@@ -750,6 +750,7 @@ async def run_v2_answer_turn(
     # and model-free here (the retrieval layer already applied the same
     # promotion); a dedicated selection-model pass may reorder again
     # upstream without ever pruning before budgeting.
+    _pack_order = "fused"
     try:
         from aa.conversation.semantic_selection import order_pack_semantically as _order_pack
 
@@ -758,8 +759,22 @@ async def run_v2_answer_turn(
             pack = _order_pack(
                 pack, resolved_intent=_order_intent, conversation_context=str(summary or "")
             )
-    except Exception:
-        pass
+            _pack_order = "semantic"
+            logger.debug(
+                "evidence pack semantically ordered",
+                extra={"passages": len(pack)},
+            )
+        else:
+            logger.debug(
+                "evidence pack semantic reorder skipped; fused order kept",
+                extra={"pack_empty": not pack, "intent_empty": not _order_intent},
+            )
+    except Exception as exc:
+        _pack_order = "fused-fallback"
+        logger.debug(
+            "evidence pack semantic reorder failed; fused order kept",
+            extra={"category": type(exc).__name__},
+        )
     initial_pack_empty = not pack
     initial_pack_passages = len(pack)
     _query_hint = int(initial_query_count) if isinstance(initial_query_count, int) else 0
@@ -841,6 +856,7 @@ async def run_v2_answer_turn(
         "evidence_window_omitted_generation": 0,
         "evidence_window_omitted_verifier": 0,
         "semantic_selection_applied": bool(initial_pack_passages > 0),
+        "pack_order": _pack_order,
         "semantic_deep_rank_promoted": False,
         "adequacy_verdict": "unknown",
         "failure_category": "",
