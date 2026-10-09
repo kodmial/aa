@@ -1886,6 +1886,7 @@ async def assess_live_helpfulness_with_judge_metrics(
         "judge_limitation": JUDGE_INDEPENDENCE_LIMITATION,
     }
     if not cleaned_prompt or not cleaned_reply or not isinstance(snapshot, dict) or not snapshot:
+        metrics["judge_failure_category"] = "missing-turn-telemetry"
         return False, metrics
     telemetry_signal = _assess_live_relevance(
         cleaned_prompt, snapshot, cleaned_reply, context=str(context or "")
@@ -3018,6 +3019,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     for models in served_models_by_agent.values()
                     for model in models
                 ),
+            )
+            # The semantic oracle must NEVER silently downgrade to a
+            # weaker fallback. The book verifier already uses this same
+            # primary-only transport, and all live judge results are
+            # invalid as independent proof if a fallback served.
+            judge_served = served_models_by_agent.get(WHOLE_TURN_JUDGE_AGENT_V2, [])
+            _check(
+                "live-independent-judge-primary-only",
+                bool(judge_served)
+                and all(model == settings.opencode_model for model in judge_served),
             )
             # Exact verifier pin (kodmial/aa#202): requested verifier
             # model == served verifier model == Muse Spark. Space Bunny
