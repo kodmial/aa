@@ -22,7 +22,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import BaseMessage
 
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.failures import TurnFailed
@@ -1498,6 +1498,7 @@ async def run_v2_answer_turn(
                     "rounds": 0,
                     "recent_quote_ranges": recent_ranges,
                     "telemetry": dict(telemetry),
+                    "evidence_pack": list(pack),
                 }
         _finish_telemetry()
         raise TurnFailed(
@@ -1947,6 +1948,7 @@ async def run_v2_answer_turn(
                             recent_ranges, ranges_from_pack(pack)
                         ),
                         "telemetry": dict(telemetry),
+                        "evidence_pack": list(pack),
                     }
                 telemetry["verifier_unavailable_units"] = _pad_saved_unavailable
                 telemetry["verifier_outcome"] = _pad_saved_outcome
@@ -2137,6 +2139,7 @@ async def run_v2_answer_turn(
                                                 recent_ranges, ranges_from_pack(pack)
                                             ),
                                             "telemetry": dict(telemetry),
+                                            "evidence_pack": list(pack),
                                         }
                     else:
                         telemetry["failure_category"] = _FAIL_REPAIR
@@ -2215,6 +2218,7 @@ async def run_v2_answer_turn(
                                             recent_ranges, ranges_from_pack(pack)
                                         ),
                                         "telemetry": dict(telemetry),
+                                        "evidence_pack": list(pack),
                                     }
                 else:
                     _mark_turn_budget_exceeded()
@@ -2291,6 +2295,7 @@ async def run_v2_answer_turn(
                                     recent_ranges, ranges_from_pack(pack)
                                 ),
                                 "telemetry": dict(telemetry),
+                                "evidence_pack": list(pack),
                             }
                 telemetry["answer_outcome"] = "adequacy-repair-failed"
                 telemetry["failure_category"] = str(
@@ -2785,6 +2790,7 @@ async def run_v2_answer_turn(
                             recent_ranges, ranges_from_pack(pack)
                         ),
                         "telemetry": dict(telemetry),
+                        "evidence_pack": list(pack),
                     }
             telemetry["answer_outcome"] = "safety-blocked"
             if not str(telemetry.get("failure_category", "") or "").strip():
@@ -2835,6 +2841,7 @@ async def run_v2_answer_turn(
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
             "telemetry": dict(telemetry),
+            "evidence_pack": list(pack),
             "segments": list(transport_segments) if transport_segments is not None else [final],
         }
 
@@ -2940,6 +2947,7 @@ async def run_v2_answer_turn(
             "rounds": rounds,
             "recent_quote_ranges": list(recent_ranges),
             "telemetry": dict(telemetry),
+            "evidence_pack": list(pack),
         }
 
     # Repair budget exhausted: narrow to supported material, serve honest
@@ -3032,6 +3040,7 @@ async def run_v2_answer_turn(
             "rounds": rounds,
             "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
             "telemetry": dict(telemetry),
+            "evidence_pack": list(pack),
         }
     if narrowed and (not envelope_passes(narrowed)):
         try:
@@ -3068,6 +3077,7 @@ async def run_v2_answer_turn(
                 "rounds": rounds,
                 "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
                 "telemetry": dict(telemetry),
+                "evidence_pack": list(pack),
             }
     if _end_to_end_elapsed_s() > _effective_turn_budget_s():
         # End-to-end guard: no verified supported material exists and
@@ -3114,6 +3124,7 @@ async def run_v2_answer_turn(
                 "rounds": rounds,
                 "recent_quote_ranges": recent_ranges,
                 "telemetry": dict(telemetry),
+                "evidence_pack": list(pack),
             }
     telemetry["answer_outcome"] = "clarification-unavailable"
     if not str(telemetry.get("failure_category", "") or "").strip():
@@ -3301,25 +3312,37 @@ async def answer_pipeline_node(
         # Privacy-safe stage telemetry travels in orchestration state only;
         # it carries counts/latencies/outcomes, never user or evidence text.
         retry_state["turn_telemetry"] = telemetry
-    # Persist the served assistant reply into LangGraph thread memory so
-    # the next turn's planner/answer/verifier resolve follow-ups, ellipsis
-    # and topic continuity against the full conversation (prior user AND
-    # assistant turns), not user turns alone. Without this, a terse
-    # follow-up ("why is this important?", "what should I do with this?")
-    # loses its antecedent: the planner resolves a generic intent,
-    # retrieval drifts, adequacy fails and the turn collapses to a retry
-    # fallback (Gate C live-continuation-helpful + generic-collapse).
-    # The HumanMessage input is already merged by the runtime; only the
-    # assistant reply is appended here. History stays role-correct and
-    # token-bounded by the existing memory/answer windows.
+    # The exact evidence bundle actually used (including repair/recovery)
+    # travels back into LangGraph state here, not merely inside a local
+    # return structure. The finalizer digests this same pack (kodmial/aa#304).
     served_text = str(outcome["text"])
+    served_pack = [
+        dict(item) for item in (outcome.get("evidence_pack", []) or []) if isinstance(item, dict)
+    ]
+    if not served_pack:
+        served_pack = [
+            dict(item) for item in state.get("evidence_pack", []) if isinstance(item, dict)
+        ]
+    # Serialized unit texts let the finalizer bind the exact delivered
+    # text to stored claim verdicts by verbatim text (renumbering-safe),
+    # so narrowing/compaction subsets verify without borrowed verdicts.
+    served_unit_texts: list[dict[str, Any]] = []
+    try:
+        for unit in outcome.get("units", []) or []:
+            unit_id = str(getattr(unit, "unit_id", ""))
+            unit_text = str(getattr(unit, "text", ""))
+            if unit_id and unit_text:
+                served_unit_texts.append({"unit_id": unit_id, "text": unit_text})
+    except Exception:
+        served_unit_texts = []
     return {
         "draft_response": served_text,
         "final_response": served_text,
+        "evidence_pack": served_pack,
         "grounding_result": dict(outcome["verification"]),
         "retry_state": retry_state,
         "recent_quote_ranges": list(outcome["recent_quote_ranges"]),
-        "messages": [AIMessage(content=served_text)],
+        "response_unit_texts": served_unit_texts,
     }
 
 

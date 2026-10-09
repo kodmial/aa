@@ -134,7 +134,23 @@ async def test_answer_pipeline_node_persists_assistant_reply() -> None:
         retrieval_index=None,
     )
     assert result["final_response"] == reply_text
-    stored = result["messages"]
+    # kodmial/aa#304: the answer node stages the exact candidate plus the
+    # actually used evidence bundle; only finalize_answer_node persists
+    # the AIMessage into thread memory after successful certification.
+    assert "messages" not in result
+    assert result["evidence_pack"] == pack
+    assert result["response_unit_texts"]
+
+    from aa.conversation.finalization import finalize_answer_node
+
+    staged = dict(result)
+    staged["messages"] = [HumanMessage(content="frozen-278-marker-alpha turn")]
+    staged["route"] = "normal"
+    staged["current_user_message"] = "frozen-278-marker-alpha turn"
+    staged["conversation_summary"] = ""
+    staged["resolved_intent"] = "frozen-278-marker-alpha intent"
+    finalized = await finalize_answer_node(staged)
+    stored = finalized["messages"]
     assert len(stored) == 1
     assert isinstance(stored[0], AIMessage)
     assert str(stored[0].content) == reply_text

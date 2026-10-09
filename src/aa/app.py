@@ -887,10 +887,61 @@ class Application:
         failure logs only categories/sizes and returns ``False`` so
         the caller sends the byte-identical answer as text.
         The presentation routing signal is ephemeral and never logged.
+
+        Transport acknowledgment seam (#304 for #312): successful
+        ``sendVoice`` records a confirmed ``sendVoice`` receipt while a
+        TTS-fallback-to-text records the voice attempt as failed and
+        leaves text delivery receipts to ``_send_text_reply``. Telegram
+        failure/partial delivery never claims full voice acceptance.
         """
+        import uuid as _voice_uuid
+
+        def _record_voice(status: str, channel: str) -> None:
+            try:
+                if self._graph_runtime is None:
+                    return
+                from aa.conversation.finalization import sha256_text as _vsha
+
+                thread = self._graph_runtime.thread_id(incoming.chat_id)
+                cert_store = self._graph_runtime.last_certificate_for_thread(thread)
+                stored_certificate = (
+                    cert_store.get("certificate", {}) if isinstance(cert_store, dict) else {}
+                )
+                certificate_id = (
+                    str(stored_certificate.get("certificate_id", ""))
+                    if isinstance(stored_certificate, dict)
+                    else ""
+                )
+                try:
+                    digest = _vsha(reply)
+                except Exception:
+                    digest = ""
+                self._graph_runtime.record_delivery_receipts(
+                    thread,
+                    [
+                        {
+                            "turn_id": thread,
+                            "certificate_id": certificate_id,
+                            "final_sha256": digest,
+                            "segment_index": 0,
+                            "segment_count": 1,
+                            "char_start": 0,
+                            "char_end": len(reply),
+                            "utf8_start": 0,
+                            "utf8_end": len(reply.encode("utf-8")),
+                            "status": status,
+                            "channel": channel,
+                            "retry_id": _voice_uuid.uuid4().hex,
+                        }
+                    ],
+                )
+            except Exception:
+                pass
+
         pipeline = self._tts_pipeline
         if pipeline is None or not self.tts_available:
             logger.info("voice reply fallback to text")
+            _record_voice("failed", "sendVoice")
             return False
         voice = self._resolve_voice_for_turn(voice_presentation)
         if voice not in (DEFAULT_VOICE, "eugene"):
@@ -902,12 +953,14 @@ class Application:
                 "voice reply synthesis failed; fallback to text",
                 extra={"category": exc.category},
             )
+            _record_voice("failed", "sendVoice")
             return False
         except Exception:
             logger.warning(
                 "voice reply synthesis failed; fallback to text",
                 extra={"category": "tts-failed"},
             )
+            _record_voice("failed", "sendVoice")
             return False
         try:
             await self.transport.send_voice(
@@ -915,79 +968,217 @@ class Application:
             )
         except (TelegramApiError, TelegramEnvelopeError):
             logger.warning("voice reply delivery failed; fallback to text")
+            _record_voice("failed", "sendVoice")
             return False
         except Exception:
             logger.warning("voice reply delivery failed; fallback to text")
+            _record_voice("failed", "sendVoice")
             return False
         logger.info("voice reply delivered")
+        _record_voice("confirmed", "sendVoice")
         return True
 
-    async def _send_text_reply(self, incoming: TelegramIncoming, reply: str) -> None:
-        """Deliver one bounded text reply with envelope fallback handling.
+    async def _send_text_reply(
+        self, incoming: TelegramIncoming, reply: str
+    ) -> list[dict[str, Any]]:
+        """Deliver one certified reply and return serializable receipts.
 
-        Issue #295: a fully verified complete answer that exceeds one
-        envelope is delivered as sequential envelope-passing segments with
-        identical content (voice synthesizes the same full text). Only a
-        turn whose stage telemetry carries ``transport_split`` may split;
-        every other over-envelope payload keeps the single-message
-        fail-closed path below. Each segment is guarded per message.
+        Certification is not delivery (#304 seam for #312): the exact
+        certified text travels byte-for-byte; transport splitting happens
+        after semantic finalization with order/text preservation proof.
+        Each segment yields a ``DeliveryReceipt`` dict (confirmed/failed/
+        unknown, ``sendMessage`` channel, retry identity). Partial sends
+        never resend the full reply as complete history: an explicit
+        retry signal follows instead. Service-error signals and emergency
+        control replies bypass certification with their own typed policy.
         """
         import time as _time
+        import uuid as _uuid
 
         started = _time.perf_counter()
+        receipts: list[dict[str, Any]] = []
+
+        def _record(receipts_in: list[dict[str, Any]]) -> None:
+            try:
+                if self._graph_runtime is not None:
+                    thread = self._graph_runtime.thread_id(incoming.chat_id)
+                    self._graph_runtime.record_delivery_receipts(thread, receipts_in)
+            except Exception:
+                pass
 
         async def _send_single(text: str) -> None:
             await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=text))
 
-        # Verified-split delivery: sequential segments, same content.
-        # The splitter raises ValueError for quote/segment/single-unit
-        # guard violations; that path must never resend the raw
-        # over-envelope payload below. Only verified envelope-passing
-        # segments split; everything else uses the fitted single message.
-        from aa.conversation.output_limits import MAX_TRANSPORT_SEGMENTS as _MAX_SEGMENTS
+        # Service-error and control replies are typed non-answers with
+        # their own policy; they never consume a book certificate.
+        if is_service_error(reply):
+            try:
+                await _send_single(reply)
+            except (TelegramApiError, TelegramEnvelopeError):
+                logger.warning("service-error signal delivery failed")
+            except Exception:
+                logger.warning("service-error signal delivery failed")
+            turn_id = ""
+            try:
+                if self._graph_runtime is not None:
+                    turn_id = self._graph_runtime.thread_id(incoming.chat_id)
+            except Exception:
+                turn_id = ""
+            receipt = {
+                "turn_id": turn_id,
+                "certificate_id": "",
+                "final_sha256": "",
+                "segment_index": 0,
+                "segment_count": 1,
+                "char_start": 0,
+                "char_end": len(reply),
+                "utf8_start": 0,
+                "utf8_end": len(reply.encode("utf-8")),
+                "status": "unknown",
+                "channel": "sendMessage",
+                "retry_id": _uuid.uuid4().hex,
+            }
+            receipts.append(receipt)
+            _record(receipts)
+            return receipts
 
-        verified_segments: list[str] | None = None
+        # Certified path: mechanically re-verify digests before send; any
+        # post-certification mutation fails closed without delivery.
+        certificate_id = ""
+        turn_id = ""
         try:
+            from aa.conversation.finalization import (
+                build_delivery_receipts as _build_receipts,
+            )
+            from aa.conversation.finalization import (
+                normalize_answer_text as _normalize,
+            )
+            from aa.conversation.finalization import (
+                sha256_text as _sha,
+            )
+            from aa.conversation.finalization import (
+                split_certified_text as _split_certified,
+            )
+
+            normalized = _normalize(reply)
+            if normalized != reply:
+                logger.warning("telegram delivery blocked: post-cert mutation")
+                try:
+                    await _send_single(SERVICE_ERROR_REPLY)
+                except Exception:
+                    pass
+                return receipts
             stage: dict[str, object] = {}
+            cert_store: dict[str, Any] = {}
             if self._graph_runtime is not None:
                 try:
-                    thread = self._graph_runtime.thread_id(incoming.chat_id)
-                    stage = self._graph_runtime.last_telemetry_for_thread(thread)
+                    turn_id = self._graph_runtime.thread_id(incoming.chat_id)
+                    stage = self._graph_runtime.last_telemetry_for_thread(turn_id)
+                    cert_store = self._graph_runtime.last_certificate_for_thread(turn_id)
                 except Exception:
                     stage = {}
-            if bool(stage.get("transport_split")):
-                from aa.conversation.output_limits import (
-                    split_text_to_envelope_segments as _split_text,
-                )
+                    cert_store = {}
+            _ = stage
+            stored_candidate = cert_store.get("candidate", {})
+            stored_certificate = cert_store.get("certificate", {})
+            has_certificate = (
+                isinstance(stored_candidate, dict)
+                and isinstance(stored_certificate, dict)
+                and bool(stored_certificate.get("answer_sha256", ""))
+            )
+            if not has_certificate:
+                # Explicitly classified protocol/service/command/emergency
+                # control path (no book certificate by design): typed
+                # policy handling, never a certified book answer. Send
+                # single-message with the transport envelope guard and a
+                # control receipt (empty certificate id).
+                try:
+                    from aa.conversation.output_limits import envelope_passes as _ctrl_env
 
-                _candidate = _split_text(reply)
-                if 1 < len(_candidate) <= _MAX_SEGMENTS:
-                    verified_segments = _candidate
-        except Exception:
-            verified_segments = None
-        if verified_segments is not None:
-            _sent_count = 0
+                    if not bool(_ctrl_env(reply)):
+                        logger.warning("control reply blocked by envelope guard")
+                        try:
+                            await _send_single(SERVICE_ERROR_REPLY)
+                        except Exception:
+                            pass
+                        return receipts
+                    await _send_single(reply)
+                    status = "confirmed"
+                except (TelegramApiError, TelegramEnvelopeError):
+                    logger.warning("control reply delivery failed")
+                    status = "failed"
+                except Exception:
+                    logger.warning("control reply delivery failed")
+                    status = "failed"
+                receipts.append(
+                    {
+                        "turn_id": turn_id,
+                        "certificate_id": "",
+                        "final_sha256": "",
+                        "segment_index": 0,
+                        "segment_count": 1,
+                        "char_start": 0,
+                        "char_end": len(reply),
+                        "utf8_start": 0,
+                        "utf8_end": len(reply.encode("utf-8")),
+                        "status": status,
+                        "channel": "sendMessage",
+                        "retry_id": _uuid.uuid4().hex,
+                    }
+                )
+                _record(receipts)
+                return receipts
             try:
-                for _segment in verified_segments:
-                    await _send_single(_segment)
-                    _sent_count += 1
+                certificate_id = str(stored_certificate.get("certificate_id", ""))
+                if _sha(normalized) != str(stored_certificate.get("answer_sha256", "")):
+                    logger.warning("telegram delivery blocked: stale certificate")
+                    try:
+                        await _send_single(SERVICE_ERROR_REPLY)
+                    except Exception:
+                        pass
+                    return receipts
+            except Exception:
+                pass
+            segments = _split_certified(normalized)
+            pending = _build_receipts(
+                certified_text=normalized,
+                segments=segments,
+                certificate_id=certificate_id,
+                turn_id=turn_id,
+                channel="sendMessage",
+                retry_id=_uuid.uuid4().hex,
+                status="unknown",
+            )
+            sent_count = 0
+            try:
+                for segment in segments:
+                    await _send_single(segment)
+                    sent_count += 1
+                confirmed = [
+                    {**item, "status": "confirmed"}
+                    for item in [r.model_dump(mode="json") for r in pending]
+                ]
+                receipts.extend(confirmed)
+                _record(receipts)
                 elapsed_ms = (_time.perf_counter() - started) * 1000.0
                 logger.info(
                     "telegram delivery done",
                     extra={
-                        "delivery_outcome": "sent-split",
+                        "delivery_outcome": "sent-split" if len(segments) > 1 else "sent",
                         "delivery_latency_ms": round(elapsed_ms, 1),
                         "reply_len": len(reply),
-                        "segments": len(verified_segments),
+                        "segments": len(segments),
                     },
                 )
-                return
-            except TelegramApiError:
-                if _sent_count > 0:
-                    # Partial split already delivered: resending the full
-                    # reply would duplicate user-visible messages. Emit an
-                    # explicit retry signal so the user does not mistake the
-                    # prefix for the complete verified answer (issue #295).
+                return receipts
+            except (TelegramApiError, TelegramEnvelopeError) as exc:
+                failed = [
+                    {**item, "status": ("confirmed" if i < sent_count else "failed")}
+                    for i, item in enumerate([r.model_dump(mode="json") for r in pending])
+                ]
+                receipts.extend(failed)
+                _record(receipts)
+                if sent_count > 0:
                     logger.warning("telegram split delivery partial; full resend skipped")
                     try:
                         await self.transport.send(
@@ -995,10 +1186,17 @@ class Application:
                         )
                     except Exception:
                         logger.warning("telegram split partial error-signal delivery failed")
-                    return
-                logger.warning("telegram split delivery failed; fallback path used")
+                    return receipts
+                logger.warning("telegram delivery failed", extra={"category": type(exc).__name__})
+                return receipts
             except Exception:
-                if _sent_count > 0:
+                failed = [
+                    {**item, "status": ("confirmed" if i < sent_count else "unknown")}
+                    for i, item in enumerate([r.model_dump(mode="json") for r in pending])
+                ]
+                receipts.extend(failed)
+                _record(receipts)
+                if sent_count > 0:
                     logger.warning("telegram split delivery partial; full resend skipped")
                     try:
                         await self.transport.send(
@@ -1006,29 +1204,15 @@ class Application:
                         )
                     except Exception:
                         logger.warning("telegram split partial error-signal delivery failed")
-                    return
-                pass
-        try:
-            await _send_single(self._fit_envelope(reply))
-            elapsed_ms = (_time.perf_counter() - started) * 1000.0
-            logger.info(
-                "telegram delivery done",
-                extra={
-                    "delivery_outcome": "sent",
-                    "delivery_latency_ms": round(elapsed_ms, 1),
-                    "reply_len": len(reply),
-                },
-            )
-        except TelegramEnvelopeError:
-            logger.warning("telegram outbound reply blocked by envelope guard")
+                    return receipts
+                return receipts
+        except Exception:
+            logger.warning("telegram delivery blocked: certification error")
             try:
-                await self.transport.send(
-                    TelegramReply(chat_id=incoming.chat_id, text=_TEMPORARY_ERROR_REPLY)
-                )
-            except TelegramApiError:
-                logger.warning("telegram fallback reply delivery failed")
-        except TelegramApiError:
-            logger.warning("telegram outbound send failed")
+                await _send_single(SERVICE_ERROR_REPLY)
+            except Exception:
+                pass
+            return receipts
 
     def _turn_index(self) -> HybridIndex:
         """Open (once) the RU-first hybrid index or fail closed.
@@ -1175,37 +1359,79 @@ class Application:
         except Exception:
             stage = {}
             thread = ""
-        allow_split = bool(stage.get("transport_split")) and not service_error and not is_service
-        if allow_split:
+        # Delivery-gate re-verification (#304): the exact text returned by
+        # the runtime must match its certificate. Never strip/clip/
+        # substitute after certification; stale or missing certificates
+        # fail closed to the typed service error (never a borrowed
+        # verdict, never silent shortening).
+        if not service_error and not is_service:
             try:
-                from aa.conversation.output_limits import (
-                    MAX_TRANSPORT_SEGMENTS as _MAX_SEG,
-                )
-                from aa.conversation.output_limits import (
-                    aggregate_quote_chars as _agg_q,
-                )
-                from aa.conversation.output_limits import (
-                    envelope_passes as _env_pass,
-                )
-                from aa.conversation.output_limits import (
-                    split_text_to_envelope_segments as _split,
-                )
+                from aa.conversation.finalization import sha256_text as _sha_text
 
-                _segs = _split(reply)
-                if (
-                    1 < len(_segs) <= _MAX_SEG
-                    and all(_env_pass(seg) for seg in _segs)
-                    and _agg_q(reply) <= 300
-                ):
+                cert_store: dict[str, Any] = {}
+                try:
+                    if thread:
+                        cert_store = self._graph_runtime.last_certificate_for_thread(thread)
+                except Exception:
+                    cert_store = {}
+                stored_certificate = cert_store.get("certificate", {})
+                if not isinstance(stored_certificate, dict) or not stored_certificate:
+                    logger.warning("app delivery blocked: missing certificate")
+                    reply = SERVICE_ERROR_REPLY
+                    service_error = True
+                    is_service = True
+                elif _sha_text(reply) != str(stored_certificate.get("answer_sha256", "")):
+                    logger.warning("app delivery blocked: stale certificate")
+                    reply = SERVICE_ERROR_REPLY
+                    service_error = True
+                    is_service = True
+                else:
+                    whole = stored_certificate.get("whole_answer_verdict", {})
+                    if isinstance(whole, dict):
+                        if not (
+                            bool(whole.get("supported", False))
+                            and bool(whole.get("coverage_ok", False))
+                            and bool(whole.get("conditions_preserved", False))
+                            and bool(whole.get("quote_ok", False))
+                        ):
+                            logger.warning("app delivery blocked: negative certificate")
+                            reply = SERVICE_ERROR_REPLY
+                            service_error = True
+                            is_service = True
+            except Exception:
+                logger.warning("app delivery blocked: certificate error")
+                reply = SERVICE_ERROR_REPLY
+                service_error = True
+                is_service = True
+        if is_service or service_error:
+            fitted = reply
+        else:
+            # Certified text travels byte-for-byte. Single-message
+            # envelope payloads pass through; multi-message verified
+            # answers split deterministically at the transport boundary
+            # with preservation proof. Anything else fails closed to the
+            # typed service error: no post-verification shortening,
+            # trimming, substitution or replay with a borrowed verdict.
+            try:
+                from aa.conversation.finalization import split_certified_text as _split_cert
+                from aa.conversation.output_limits import envelope_passes as _env
+
+                if bool(_env(reply)):
                     fitted = reply
                 else:
-                    fitted = self._fit_envelope(reply)
-                    allow_split = False
+                    segments = _split_cert(reply)
+                    if len(segments) > 1:
+                        fitted = reply
+                    else:
+                        logger.warning("app delivery blocked: envelope exceeded")
+                        fitted = SERVICE_ERROR_REPLY
+                        service_error = True
+                        is_service = True
             except Exception:
-                fitted = self._fit_envelope(reply)
-                allow_split = False
-        else:
-            fitted = self._fit_envelope(reply)
+                logger.warning("app delivery blocked: envelope/split guard")
+                fitted = SERVICE_ERROR_REPLY
+                service_error = True
+                is_service = True
         total_ms = (_time.perf_counter() - turn_started) * 1000.0
         # Privacy-safe turn telemetry: stage outcomes come from the graph
         # runtime snapshot (counts/latencies/outcomes only); this log
