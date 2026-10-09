@@ -16,6 +16,10 @@
 # docs/aa-runtime-image.md for the measured decision); they keep flowing
 # through the locked actions/cache + checksum-verified prefetch path.
 FROM --platform=linux/amd64 python:3.12-slim-bookworm
+# Associate the GHCR package with the AA repo so GITHUB_TOKEN pull grants
+# can be inherited by the verified workflow container.
+LABEL org.opencontainers.image.source="https://github.com/kodmial/aa" \\
+      org.opencontainers.image.description="AA reusable environment only; no application code or private data"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
