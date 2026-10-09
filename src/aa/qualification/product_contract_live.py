@@ -1831,15 +1831,22 @@ def build_live_whole_turn_judge(client: Any, settings: Any) -> Any:
     from aa.conversation.model_adapter import OpenCodeChatModel
     from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
 
+    # Grounding verifier uses Muse Spark without a Space Bunny fallback.
+    # The independent quality judge must have the same minimum model
+    # capability. In run 37884099275 the evaluator silently served Space
+    # Bunny for 16/17 invocations and overturned eight production verdicts.
+    # An unavailable primary is a visible fail-closed qualification blocker,
+    # NOT a fabricated semantic negative returned by a weaker model.
+    # Omit the wire agent just as build_verifier_model does: the logical
+    # audit identity, fresh session and independent system prompt remain.
     primary = str(getattr(settings, "opencode_model", "") or "")
-    fallback = str(getattr(settings, "opencode_fallback_model", "") or "")
-    base = OpenCodeChatModel(
+    return OpenCodeChatModel(
         client,
-        agent="aa-live-qualification-base",
+        agent=WHOLE_TURN_JUDGE_AGENT_V2,
         primary_model=primary,
-        fallback_model=fallback,
+        fallback_model="",
+        transport_agent="",
     )
-    return base.with_agent(WHOLE_TURN_JUDGE_AGENT_V2)
 
 
 async def assess_live_helpfulness_with_judge_metrics(
@@ -1879,6 +1886,7 @@ async def assess_live_helpfulness_with_judge_metrics(
         "judge_limitation": JUDGE_INDEPENDENCE_LIMITATION,
     }
     if not cleaned_prompt or not cleaned_reply or not isinstance(snapshot, dict) or not snapshot:
+        metrics["judge_failure_category"] = "missing-turn-telemetry"
         return False, metrics
     telemetry_signal = _assess_live_relevance(
         cleaned_prompt, snapshot, cleaned_reply, context=str(context or "")
@@ -1898,7 +1906,8 @@ async def assess_live_helpfulness_with_judge_metrics(
     except OpenCodeRateLimitError:
         # Preserve the caller's fresh-runner 429 recovery contract.
         raise
-    except Exception:
+    except Exception as exc:
+        metrics["judge_failure_category"] = type(exc).__name__[:64]
         return False, metrics
     metrics["judge_helpful"] = bool(judgement.helpful)
     metrics["judge_available"] = bool(judgement.available)
@@ -1939,6 +1948,10 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     typing_sends = 0
     heartbeat_continuity_failures = 0
     stage_snapshots: list[dict[str, Any]] = []
+    # Closed-vocabulary, text-free per-scenario diagnostic evidence. Without
+    # this, a 25-minute Gate C collapses 18 different failures into one
+    # fingerprint and automated repair has no actionable root cause.
+    scenario_diagnostics: list[dict[str, Any]] = []
     served_models_by_agent: dict[str, list[str]] = {}
     voice_readiness: dict[str, Any] = {
         "voice_available": False,
@@ -2248,6 +2261,17 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             prior_by_chat: dict[int, list[str]] = {}
             scenario_deliveries = 0
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
+                # These logs contain only scenario identifiers, never the
+                # Telegram input, delivered text or canonical-book passage.
+                print(
+                    f"Gate C scenario {position}/{len(scenarios)} family={family} phase=start",
+                    flush=True,
+                )
+                active_judge_metrics: dict[str, Any] = {}
+                snapshot: dict[str, Any] = {}
+                grounded_for_scenario: bool | None = None
+                relevant_for_scenario: bool | None = None
+                helpful_for_scenario: bool | None = None
                 prior_prompts = list(prior_by_chat.get(chat_id, []))
                 before = len(api.sent_texts)
                 before_typing = api.chat_actions
@@ -2264,10 +2288,33 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 started = time.perf_counter()
                 api.pending_updates.append(raw)
                 deadline = loop.time() + 150.0
+                last_progress_tick = loop.time()
                 while len(api.sent_texts) <= before and loop.time() < deadline:
                     await asyncio.sleep(0.02)
+                    if loop.time() - last_progress_tick >= 20.0:
+                        # Heartbeat distinguishes a slow live model from a
+                        # stalled Actions worker without logging any text.
+                        print(
+                            f"Gate C scenario {position}/{len(scenarios)} "
+                            f"family={family} phase=awaiting-delivery "
+                            f"elapsed_s={round(time.perf_counter() - started)}",
+                            flush=True,
+                        )
+                        last_progress_tick = loop.time()
                 if len(api.sent_texts) <= before:
                     failed.append(f"live-delivery-{family}-timeout")
+                    scenario_diagnostics.append(
+                        {
+                            "scenario_index": position,
+                            "family": family,
+                            "delivery_timeout": True,
+                        }
+                    )
+                    print(
+                        f"Gate C scenario {position}/{len(scenarios)} "
+                        f"family={family} phase=delivery-timeout",
+                        flush=True,
+                    )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
                     continue
                 _check(
@@ -2307,7 +2354,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     _check(f"live-typing-heartbeat-{family}", heartbeat_ok)
                     if not heartbeat_ok:
                         heartbeat_continuity_failures += 1
-                    snapshot: dict[str, Any] = {}
+                    snapshot = {}
                     try:
                         graph = app.graph_runtime
                         if graph is not None:
@@ -2330,6 +2377,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         # background-as-substitute-for-guidance cannot pass
                         # on telemetry alone.
                         grounded = _is_grounded_substantive_reply(snapshot, reply)
+                        grounded_for_scenario = bool(grounded)
                         # Model/rubric relevance: the production semantic
                         # verifier already resolved follow-ups, ellipsis
                         # and topic shifts against conversation state.
@@ -2343,6 +2391,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             reply,
                             context="\n".join(prior_prompts[-2:]),
                         )
+                        relevant_for_scenario = bool(relevant)
                         _check(f"live-book-grounding-{family}-{position}", bool(grounded))
                         _check(
                             f"live-answer-relevance-{family}-{position}",
@@ -2379,6 +2428,8 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         )
                         helpful = bool(grounded and relevant and judged_helpful)
                         book_grounded_successes += int(helpful)
+                        helpful_for_scenario = bool(judged_helpful)
+                        active_judge_metrics = dict(judge_metrics)
                     if family == "meta-capability":
                         # Meta gets a direct natural RU answer without a
                         # false identity and without an evasive template.
@@ -2422,6 +2473,9 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                         if bool(continuation_judge_metrics.get("judge_overrode_telemetry", False)):
                             judge_overrides += 1
                         continuation_semantic = bool(continuation_semantic and judged_continuation)
+                        helpful_for_scenario = bool(judged_continuation)
+                        active_judge_metrics = dict(continuation_judge_metrics)
+                        relevant_for_scenario = bool(continuation_semantic)
                         continuation_output_ok = (
                             reply.strip()
                             and reply.strip()
@@ -2436,6 +2490,48 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                             f"live-continuation-helpful-{family}-{position}",
                             bool(continuation_semantic and continuation_output_ok),
                         )
+                    # Fixed-vocabulary outcome codes and numbers only:
+                    # evidence identifies the broken pipeline stage without
+                    # exposing dialog text, prompts or excerpts.
+                    scenario_diagnostics.append(
+                        {
+                            "scenario_index": position,
+                            "family": family,
+                            "delivery_timeout": False,
+                            "delivery_latency_ms": round(elapsed * 1000, 1),
+                            "stage_latency_ms": {
+                                stage: round(float(snapshot.get(field, 0) or 0), 1)
+                                for stage, field in (
+                                    ("planner", "planner_latency_ms"),
+                                    ("retrieval", "retrieval_latency_ms"),
+                                    ("answer", "answer_latency_ms"),
+                                    ("verifier", "verifier_latency_ms"),
+                                )
+                                if isinstance(snapshot.get(field), (int, float))
+                            },
+                            "verified_book_units": int(snapshot.get("verified_book_units", 0) or 0),
+                            "verifier_unavailable_units": int(
+                                snapshot.get("verifier_unavailable_units", 0) or 0
+                            ),
+                            "planner_outcome": str(snapshot.get("planner_outcome", ""))[:48],
+                            "retrieval_outcome": str(snapshot.get("retrieval_outcome", ""))[:48],
+                            "verifier_outcome": str(snapshot.get("verifier_outcome", ""))[:48],
+                            "production_outcome": str(snapshot.get("answer_outcome", ""))[:48],
+                            "grounded": grounded_for_scenario,
+                            "relevant": relevant_for_scenario,
+                            "judge_helpful": helpful_for_scenario,
+                            "judge_available": active_judge_metrics.get("judge_available"),
+                            "judge_failure_category": str(
+                                active_judge_metrics.get("judge_failure_category", "")
+                            )[:64],
+                        }
+                    )
+                    print(
+                        f"Gate C scenario {position}/{len(scenarios)} family={family} "
+                        f"phase=completed latency_ms={round(elapsed * 1000)} "
+                        f"outcome={str(snapshot.get('answer_outcome', 'none'))[:48]}",
+                        flush=True,
+                    )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
 
             # Multi-turn regression families (kodmial/aa#259): raw Telegram
@@ -2924,6 +3020,16 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                     for model in models
                 ),
             )
+            # The semantic oracle must NEVER silently downgrade to a
+            # weaker fallback. The book verifier already uses this same
+            # primary-only transport, and all live judge results are
+            # invalid as independent proof if a fallback served.
+            judge_served = served_models_by_agent.get(WHOLE_TURN_JUDGE_AGENT_V2, [])
+            _check(
+                "live-independent-judge-primary-only",
+                bool(judge_served)
+                and all(model == settings.opencode_model for model in judge_served),
+            )
             # Exact verifier pin (kodmial/aa#202): requested verifier
             # model == served verifier model == Muse Spark. Space Bunny
             # must never be recorded as serving aa-verifier-v2. An absent
@@ -3196,6 +3302,7 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "heartbeat_continuity_failures": heartbeat_continuity_failures,
         "served_models_by_agent": served_models_by_agent,
         "stage_snapshots_count": len(stage_snapshots),
+        "scenario_diagnostics": scenario_diagnostics,
         "stage_outcome_counts": _count_stage_outcomes(stage_snapshots),
         "stage_latency_ms": stage_latency_ms,
         "repair_metrics": repair_metrics,
