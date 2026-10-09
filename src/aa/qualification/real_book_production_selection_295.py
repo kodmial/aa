@@ -236,9 +236,12 @@ async def run_production_selection_turn(
         deep16 = True
     if max_rank > DEEP_RANK_GT5 and not deep5:
         deep5 = True
-    selector_available = selection_model is not None
-    # Heuristic fallback is observable: no model bound means fallback was used.
-    fallback_used = selection_model is None
+    # Binding a model object alone does NOT prove that it responded. The
+    # production selector can catch provider/schema errors and use a lexical
+    # fallback. Read provenance emitted by the actual selection invocation.
+    model_used = _m("selection_selection_model_used", "selection_model_used", default=False)
+    selector_available = bool(selection_model is not None and model_used)
+    fallback_used = not selector_available
     oracle_hit: bool | None
     if not oracle_sections:
         oracle_hit = None
@@ -300,6 +303,10 @@ def decide_status_295(
         raise RealBookRetrievalError("failure count must be >= 0")
     if failures > 0:
         return "FAIL"
+    # A successful-looking deep rank from heuristic fallback is not proof
+    # that the OpenCode model actually selected anything on the real book.
+    if any(not t.selector_available or t.fallback_used for t in turns):
+        return "INCOMPLETE"
     decisive = [
         t
         for t in turns
