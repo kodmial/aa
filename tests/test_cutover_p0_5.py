@@ -568,8 +568,11 @@ def test_legacy_semantic_router_not_invoked() -> None:
     for snippet in (
         "is_substantive",
         "is_meta_capability_request",
-        "META_CAPABILITY_REPLY",
-        "FAIL_CLOSED_REPLY",
+        "NATURAL_CLARIFICATION_REPLY",
+        "NATURAL_RETRY_REPLY",
+        "CONVERSATIONAL_FALLBACK_REPLY",
+        "SAFE_UNAVAILABLE_REPLY",
+        "select_retry_reply",
         "meets_russian_only",
         "TurnRunner",
         "run_trivial_turn",

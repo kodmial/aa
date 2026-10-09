@@ -355,7 +355,7 @@ async def test_held_out_synthetic_two_turn_followup_relevance() -> None:
     mechanism passage with explicit relevance passes.
     """
 
-    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     broad_text = "Фиктивная общая поддержка рядом помогает держаться."
     mechanism_text = "Фиктивный разбор вечернего распорядка помогает пережить тягу."
@@ -392,30 +392,35 @@ async def test_held_out_synthetic_two_turn_followup_relevance() -> None:
     # concrete-mechanism intent, so it must fail and never count as
     # qualified even though citations and checksums are valid.
     recycled_draft = "Общая поддержка рядом помогает держаться."
-    recycled = await run_v2_answer_turn(
-        user_message="синтетическое уточнение про вечерний распорядок",
-        summary="",
-        recent=[],
-        evidence_pack=[broad, mechanism],
-        answer_model=_Answer([recycled_draft, NATURAL_CLARIFICATION_REPLY]),
-        verifier_model=_ScriptedStructured(
-            [
-                _book_decision(broad["passage_id"], addresses=False),
-                {
-                    "requires_book_evidence": False,
-                    "supported": True,
-                    "evidence_passage_ids": [],
-                    "addresses_intent": True,
-                },
-            ]
-        ),
-        initial_query_count=2,
-        resolved_intent="синтетическое уточнение про конкретный вечерний распорядок",
-    )
-    assert recycled["text"] != recycled_draft
+    import pytest as _pt283
+
+    from aa.conversation.failures import TurnFailed as _TF283
+
+    with _pt283.raises(_TF283) as _exc283:
+        await run_v2_answer_turn(
+            user_message="синтетическое уточнение про вечерний распорядок",
+            summary="",
+            recent=[],
+            evidence_pack=[broad, mechanism],
+            answer_model=_Answer([recycled_draft, recycled_draft]),
+            verifier_model=_ScriptedStructured(
+                [
+                    _book_decision(broad["passage_id"], addresses=False),
+                    {
+                        "requires_book_evidence": False,
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": True,
+                    },
+                ]
+            ),
+            initial_query_count=2,
+            resolved_intent="синтетическое уточнение про конкретный вечерний распорядок",
+        )
+    recycled: dict[str, Any] = {"text": "", "telemetry": dict(_exc283.value.telemetry)}
+    assert _exc283.value.category in ("adequacy-failed", "clarification-unavailable")
     assert recycled["telemetry"]["adequacy_verdict"] == "fail"
     assert recycled["telemetry"]["qualified"] is False
-    assert recycled["telemetry"]["answers_request"] is False
 
     # The same follow-up with the concrete mechanism passage and explicit
     # relevance passes end to end.

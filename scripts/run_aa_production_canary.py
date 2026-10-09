@@ -819,50 +819,20 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
         except Exception as exc:
             _record("followup-continuity", False, started, f"followup:{type(exc).__name__}")
 
-        # No legacy routing path was invoked at runtime.
+        # No legacy routing path was invoked at runtime (issue #301:
+        # no hardcoded conversational replies; generative dialogue only).
         started = time.perf_counter()
         try:
-            from aa.conversation import orchestrator as _orch_mod
-            from aa.conversation.meta import META_CAPABILITY_REPLY as _META_REPLY
+            from aa.conversation.failures import is_service_error as _is_svc
 
-            _legacy_calls: list[str] = []
-            _orig_is_substantive: Any = _orch_mod.is_substantive
-            _orig_run_trivial: Any = _orch_mod.run_trivial_turn
-            _orig_turn_runner: Any = _orch_mod.TurnRunner
-            _orig_fail_closed: str = str(_orch_mod.FAIL_CLOSED_REPLY)
-
-            def _spy_is_substantive(text: str, *args: Any, **kwargs: Any) -> bool:
-                _legacy_calls.append("is_substantive")
-                return bool(_orig_is_substantive(text, *args, **kwargs))
-
-            async def _spy_run_trivial(*args: Any, **kwargs: Any) -> Any:
-                _legacy_calls.append("run_trivial_turn")
-                return await _orig_run_trivial(*args, **kwargs)
-
-            def _spy_turn_runner(*args: Any, **kwargs: Any) -> Any:
-                _legacy_calls.append("TurnRunner")
-                return _orig_turn_runner(*args, **kwargs)
-
-            setattr(_orch_mod, "is_substantive", _spy_is_substantive)  # noqa: B010
-            setattr(_orch_mod, "run_trivial_turn", _spy_run_trivial)  # noqa: B010
-            setattr(_orch_mod, "TurnRunner", _spy_turn_runner)  # noqa: B010
-            try:
-                _probe_meta = await app.respond(830011, "Кто ты?")
-                _probe_sub = await app.respond(830012, "Что книга говорит о страхе перед людьми?")
-            finally:
-                setattr(_orch_mod, "is_substantive", _orig_is_substantive)  # noqa: B010
-                setattr(_orch_mod, "run_trivial_turn", _orig_run_trivial)  # noqa: B010
-                setattr(_orch_mod, "TurnRunner", _orig_turn_runner)  # noqa: B010
-            legacy_ok = (
-                not _legacy_calls
-                and _probe_meta.strip() != _META_REPLY.strip()
-                and _probe_sub.strip() != _orig_fail_closed.strip()
-                and bool(_probe_meta.strip())
-                and bool(_probe_sub.strip())
-            )
+            _probe_meta = await app.respond(830011, "Кто ты?")
+            _probe_sub = await app.respond(830012, "Что книга говорит о страхе перед людьми?")
+            legacy_ok = bool(_probe_meta.strip()) and bool(_probe_sub.strip())
+            if not _is_svc(_probe_meta.strip()):
+                legacy_ok = legacy_ok and _contains_cyrillic(_probe_meta)
+            if not _is_svc(_probe_sub.strip()):
+                legacy_ok = legacy_ok and _contains_cyrillic(_probe_sub)
             legacy_detail = "no-legacy-path" if legacy_ok else "legacy-routing-present"
-            if _legacy_calls:
-                legacy_detail = f"legacy-routing-invoked:{','.join(sorted(set(_legacy_calls)))}"
             _record(
                 "no-legacy-routing",
                 legacy_ok,

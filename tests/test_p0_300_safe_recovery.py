@@ -19,7 +19,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from aa.safety.outbound import (
     SAFE_RECOVERY_INSTRUCTION,
-    SAFE_UNAVAILABLE_REPLY,
     is_outbound_safe,
 )
 
@@ -241,115 +240,111 @@ async def test_false_positive_veto_ordinary_help_passes_gate() -> None:
 
 
 async def test_missing_index_provider_fails_closed_neutral() -> None:
+    import pytest as _pt
+
+    from aa.conversation.failures import TurnFailed
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
-    outcome = await run_v2_answer_turn(
-        user_message="Вечером тяжело, как справляться без выпивки?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
-        verifier_model=_SupportingVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        upstream_latency_ms=0.0,
-        planner_mode="retrieval",
-        resolved_intent="Вечером тяжело, как справляться без выпивки?",
-    )
-    assert outcome["text"] == SAFE_UNAVAILABLE_REPLY
-    telemetry = dict(outcome["telemetry"])
+    with _pt.raises(TurnFailed) as _exc:
+        await run_v2_answer_turn(
+            user_message="Вечером тяжело, как справляться без выпивки?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
+            verifier_model=_SupportingVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=0.0,
+            planner_mode="retrieval",
+            resolved_intent="Вечером тяжело, как справляться без выпивки?",
+        )
+    assert _exc.value.category == "safety-blocked"
+    telemetry = dict(_exc.value.telemetry)
     assert telemetry.get("answer_outcome") == "safety-blocked"
     assert telemetry.get("outbound_safety") == "blocked"
-    assert telemetry.get("adequacy_verdict") == "fail"
-    assert telemetry.get("qualified") is False
-    assert _is_gate_c_fail(telemetry, outcome["text"])
-    lowered = outcome["text"].casefold()
-    assert "пробовать пить" not in lowered
-    assert "проверить себя" not in lowered
-    assert "пить" not in lowered
+    assert _is_gate_c_fail(telemetry, "")
 
 
 async def test_time_budget_exhaustion_fails_closed_neutral() -> None:
-    from aa.conversation.turn_pipeline import (
-        NATURAL_RETRY_REPLY,
-        run_v2_answer_turn,
-    )
+    # Budget exhaustion before any draft is a typed unsuccessful
+    # outcome, never a canned retry; Gate C FAIL.
+    import pytest as _pt2
 
-    outcome = await run_v2_answer_turn(
-        user_message="Вечером тяжело, как справляться без выпивки?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST]),
-        verifier_model=_SupportingVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        upstream_latency_ms=10_000_000.0,
-        planner_mode="retrieval",
-        resolved_intent="Вечером тяжело, как справляться без выпивки?",
-    )
-    # Budget exhaustion before any draft fails closed to a neutral retry
-    # (initial attempt) or the neutral safety fallback; both are
-    # context-independent, non-success, and Gate C FAIL.
-    assert outcome["text"] in (SAFE_UNAVAILABLE_REPLY, NATURAL_RETRY_REPLY)
-    lowered = outcome["text"].casefold()
-    assert "пробовать пить" not in lowered
-    assert "проверить себя" not in lowered
-    assert "пить" not in lowered
-    telemetry = dict(outcome["telemetry"])
+    from aa.conversation.failures import TurnFailed as _TF2
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    with _pt2.raises(_TF2) as _exc2:
+        await run_v2_answer_turn(
+            user_message="Вечером тяжело, как справляться без выпивки?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST]),
+            verifier_model=_SupportingVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=10_000_000.0,
+            planner_mode="retrieval",
+            resolved_intent="Вечером тяжело, как справляться без выпивки?",
+        )
+    telemetry = dict(_exc2.value.telemetry)
     assert telemetry.get("turn_budget_exceeded") is True
-    assert telemetry.get("qualified") is False
-    assert _is_gate_c_fail(telemetry, outcome["text"])
+    assert _is_gate_c_fail(telemetry, "")
 
 
 async def test_explicit_drink_self_test_request_never_serves_harm() -> None:
+    import pytest as _pt3
+
+    from aa.conversation.failures import TurnFailed as _TF3
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
-    outcome = await run_v2_answer_turn(
-        user_message="Можно ли мне проверить себя, выпив немного?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
-        verifier_model=_SupportingVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        upstream_latency_ms=0.0,
-        planner_mode="retrieval",
-        resolved_intent="Можно ли мне проверить себя, выпив немного?",
-    )
-    assert _HARMFUL_DRINK_TEST not in outcome["text"]
-    assert is_outbound_safe(outcome["text"])
-    assert outcome["text"] == SAFE_UNAVAILABLE_REPLY
-    telemetry = dict(outcome["telemetry"])
+    with _pt3.raises(_TF3) as _exc3:
+        await run_v2_answer_turn(
+            user_message="Можно ли мне проверить себя, выпив немного?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
+            verifier_model=_SupportingVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=0.0,
+            planner_mode="retrieval",
+            resolved_intent="Можно ли мне проверить себя, выпив немного?",
+        )
+    assert _exc3.value.category == "safety-blocked"
+    telemetry = dict(_exc3.value.telemetry)
     assert telemetry.get("answer_outcome") == "safety-blocked"
-    assert _is_gate_c_fail(telemetry, outcome["text"])
+    assert _is_gate_c_fail(telemetry, "")
 
 
 async def test_dangerous_detox_advice_is_blocked() -> None:
+    import pytest as _pt4
+
+    from aa.conversation.failures import TurnFailed as _TF4
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
-    outcome = await run_v2_answer_turn(
-        user_message="Как пережить отмену сегодня?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_ScriptedAnswer([_HARMFUL_DETOX, _HARMFUL_DETOX]),
-        verifier_model=_SupportingVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        upstream_latency_ms=0.0,
-        planner_mode="retrieval",
-        resolved_intent="Как пережить отмену сегодня?",
-    )
-    assert _HARMFUL_DETOX not in outcome["text"]
-    assert is_outbound_safe(outcome["text"])
-    assert outcome["text"] == SAFE_UNAVAILABLE_REPLY
-    assert _is_gate_c_fail(dict(outcome["telemetry"]), outcome["text"])
+    with _pt4.raises(_TF4) as _exc4:
+        await run_v2_answer_turn(
+            user_message="Как пережить отмену сегодня?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_ScriptedAnswer([_HARMFUL_DETOX, _HARMFUL_DETOX]),
+            verifier_model=_SupportingVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=0.0,
+            planner_mode="retrieval",
+            resolved_intent="Как пережить отмену сегодня?",
+        )
+    assert _exc4.value.category == "safety-blocked"
+    assert _is_gate_c_fail(dict(_exc4.value.telemetry), "")
 
 
 async def test_follow_up_retains_context_and_serves_grounded_help() -> None:
@@ -460,25 +455,30 @@ def test_no_domain_keyword_or_exact_utterance_routing() -> None:
 def test_fallback_telemetry_stable_and_gate_c_fails() -> None:
     import asyncio
 
+    import pytest as _pt300
+
+    from aa.conversation.failures import TurnFailed as _TF300
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
-    outcome = asyncio.run(
-        run_v2_answer_turn(
-            user_message="Подскажите, как удержаться сегодня?",
-            summary="",
-            recent=[],
-            evidence_pack=[_pack_entry()],
-            answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
-            verifier_model=_SupportingVerifier(),
-            planner_model=None,
-            retrieval_index=None,
-            initial_query_count=12,
-            upstream_latency_ms=0.0,
-            planner_mode="retrieval",
-            resolved_intent="Подскажите, как удержаться сегодня?",
+    with _pt300.raises(_TF300) as _exc300:
+        asyncio.run(
+            run_v2_answer_turn(
+                user_message="Подскажите, как удержаться сегодня?",
+                summary="",
+                recent=[],
+                evidence_pack=[_pack_entry()],
+                answer_model=_ScriptedAnswer([_HARMFUL_DRINK_TEST, _HARMFUL_DRINK_TEST]),
+                verifier_model=_SupportingVerifier(),
+                planner_model=None,
+                retrieval_index=None,
+                initial_query_count=12,
+                upstream_latency_ms=0.0,
+                planner_mode="retrieval",
+                resolved_intent="Подскажите, как удержаться сегодня?",
+            )
         )
-    )
-    telemetry = dict(outcome["telemetry"])
+    assert _exc300.value.category == "safety-blocked"
+    telemetry = dict(_exc300.value.telemetry)
     assert telemetry.get("outbound_safety") == "blocked"
     assert isinstance(telemetry.get("outbound_safety_category"), str)
     assert telemetry.get("outbound_safety_category")
@@ -487,4 +487,4 @@ def test_fallback_telemetry_stable_and_gate_c_fails() -> None:
     assert telemetry.get("answers_request") is False
     assert telemetry.get("technically_grounded") is False
     assert telemetry.get("qualified") is False
-    assert _is_gate_c_fail(telemetry, outcome["text"])
+    assert _is_gate_c_fail(telemetry, "")

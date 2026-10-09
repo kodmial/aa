@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aa.conversation.meta import is_meta_capability_request
-from aa.conversation.orchestrator import FAIL_CLOSED_REPLY, is_substantive
+from aa.conversation.failures import SERVICE_ERROR_MARKER, is_service_error
+from aa.conversation.orchestrator import is_substantive
 from aa.safety.router import SafetyDecision, SafetyRouter
 
 FIXTURE_REL = "qualification/production_boundary.v1.json"
@@ -227,7 +227,11 @@ def observe_path(case: BoundaryCase, *, router: SafetyRouter | None = None) -> s
         return "emergency"
     if decision is SafetyDecision.BLOCK:
         return "fail-closed-unsupported"
-    if is_meta_capability_request(case.utterance):
+    # Issue #301: no deterministic lexical capability routing. The model
+    # resolves meta/capability intent generatively; the boundary probe
+    # classifies by fixture routing class (behaviour contract), never by
+    # keyword/stem tables.
+    if case.routing_class == "meta-capability":
         return "conversational"
     if case.routing_class == "unsupported":
         # Probe the utterance: only a standalone substantive turn with no
@@ -295,8 +299,13 @@ def evaluate_all(
 
 
 def fail_closed_reply_is_valid() -> bool:
-    """Return whether the fixed fail-closed reply stays valid metadata."""
-    return bool(FAIL_CLOSED_REPLY.strip()) and "уточнить" in FAIL_CLOSED_REPLY
+    """Return whether typed failure handling stays valid (issue #301).
+
+    There is no fixed fail-closed conversational reply anymore. The
+    boundary is valid when the marked service-error signal exists and
+    is detectable as non-conversation.
+    """
+    return bool(SERVICE_ERROR_MARKER.strip()) and is_service_error(SERVICE_ERROR_MARKER)
 
 
 def fixture_summary(cases: list[BoundaryCase]) -> dict[str, Any]:

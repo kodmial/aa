@@ -12,7 +12,6 @@ from aa.safety.emergency import (
 from aa.safety.outbound import (
     OUTBOUND_SAFETY_MAX_REPAIRS,
     SAFE_RECOVERY_INSTRUCTION,
-    SAFE_UNAVAILABLE_REPLY,
     OutboundSafetyVerdict,
     classify_outbound_safety,
     is_outbound_safe,
@@ -30,7 +29,6 @@ __all__ = [
     "EMERGENCY_RESPONSE_RU",
     "OUTBOUND_SAFETY_MAX_REPAIRS",
     "SAFE_RECOVERY_INSTRUCTION",
-    "SAFE_UNAVAILABLE_REPLY",
     "UNSAFE_RESPONSE_PATTERNS",
     "EmergencyCategory",
     "EmergencyClassification",

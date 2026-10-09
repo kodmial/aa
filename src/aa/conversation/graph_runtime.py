@@ -44,7 +44,7 @@ TurnDelegate = Callable[[str, str], Awaitable[str]]
 
 
 class GraphRuntimeError(ValueError):
-    """Deterministic runtime failure (mapped to a natural reply upstream)."""
+    """Deterministic runtime failure (typed unsuccessful turn outcome)."""
 
     def __init__(self, category: str, detail: str = "") -> None:
         super().__init__(f"graph runtime failed [{category}]" + (f": {detail}" if detail else ""))

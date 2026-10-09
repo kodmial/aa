@@ -68,8 +68,6 @@ from aa.conversation.turn_pipeline import (
     ANSWER_DRAFT_ATTEMPT_BUDGET_S,
     ANSWER_FAST_RETRY_MAX_HISTORY,
     ANSWER_FAST_RETRY_MAX_PASSAGES,
-    NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_VARIANTS,
     run_v2_answer_turn,
 )
 from aa.opencode.errors import OpenCodeRateLimitError
@@ -195,23 +193,25 @@ async def test_answer_attempt_timeout_uses_fast_minimal_retry(
 
     _ = _VerifyPass
     pack = [_pack_dict()]
+    from aa.conversation.failures import TurnFailed as _TF8
+
     started = time.perf_counter()
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=pack,
-        answer_model=_HangOnceThenServe(),
-        verifier_model=_VerifierServes(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-    )
+    with __import__("pytest").raises(_TF8) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=pack,
+            answer_model=_HangOnceThenServe(),
+            verifier_model=_VerifierServes(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+        )
     elapsed = time.perf_counter() - started
     assert elapsed < 5.0
-    assert outcome["text"] in NATURAL_RETRY_VARIANTS
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["answer_rounds"] == 1
+    assert exc.value.category == "answer-failed"
+    assert exc.value.telemetry["answer_rounds"] == 1
 
 
 async def test_answer_double_timeout_serves_retry_not_clarification(
@@ -228,21 +228,23 @@ async def test_answer_double_timeout_serves_retry_not_clarification(
             await asyncio.sleep(60.0)
             raise AssertionError("must time out")
 
+    from aa.conversation.failures import TurnFailed as _TF8b
+
     started = time.perf_counter()
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=_AlwaysHang(),
-        verifier_model=_AlwaysHang(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-    )
+    with __import__("pytest").raises(_TF8b) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=_AlwaysHang(),
+            verifier_model=_AlwaysHang(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+        )
     assert time.perf_counter() - started < 5.0
-    assert outcome["text"] in NATURAL_RETRY_VARIANTS
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
+    assert exc.value.category == "answer-failed"
 
 
 async def test_answer_429_propagates_for_runner_retire() -> None:

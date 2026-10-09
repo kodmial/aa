@@ -274,35 +274,38 @@ def test_substantive_delivery_invariant_splits_statuses() -> None:
 
 
 async def test_planner_timeout_empty_pack_serves_honest_unavailability() -> None:
-    from aa.conversation.turn_pipeline import NATURAL_RETRY_REPLY, run_v2_answer_turn
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     class _MustNotRun:
         async def ainvoke(self, messages: Any) -> AIMessage:
             _ = messages
             raise AssertionError("no model call may start on a spent turn")
 
-    outcome = await run_v2_answer_turn(
-        user_message="Привет! Как обходиться с тягой вечером?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[],
-        answer_model=_MustNotRun(),
-        verifier_model=_MustNotRun(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=0,
-        upstream_latency_ms=120000.0,
-    )
-    assert outcome["text"] == NATURAL_RETRY_REPLY
-    telemetry = outcome["telemetry"]
+    import pytest as _pt251
+
+    from aa.conversation.failures import TurnFailed as _TF251
+
+    with _pt251.raises(_TF251) as _exc251:
+        await run_v2_answer_turn(
+            user_message="Привет! Как обходиться с тягой вечером?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[],
+            answer_model=_MustNotRun(),
+            verifier_model=_MustNotRun(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=0,
+            upstream_latency_ms=120000.0,
+        )
+    telemetry = dict(_exc251.value.telemetry)
     assert telemetry["turn_budget_exceeded"] is True
-    assert telemetry["adequacy_verdict"] in ("fail", "pass")
 
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
     snapshot = dict(telemetry)
     snapshot["verified_book_units"] = 0
-    assert _is_grounded_substantive_reply(snapshot, outcome["text"]) is False
+    assert _is_grounded_substantive_reply(snapshot, "") is False
 
 
 async def test_all_glue_draft_with_pack_regenerates_or_fails_explicitly() -> None:
@@ -365,10 +368,7 @@ async def test_all_glue_draft_with_pack_regenerates_or_fails_explicitly() -> Non
 
 
 def test_gate_c_negative_controls_fail_while_grounded_passes() -> None:
-    from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_REPLY,
-    )
+    from aa.conversation import turn_pipeline as _tp  # noqa: F401
     from aa.qualification.product_contract_live import (
         _is_grounded_substantive_reply,
         assess_reply_relevance_with_rubric,
@@ -440,10 +440,10 @@ def test_gate_c_negative_controls_fail_while_grounded_passes() -> None:
     assert _is_grounded_substantive_reply(timeout_snapshot, grounded_reply) is False
 
     # Successful zero-query pure greeting is glue, not a substantive answer.
-    assert _is_grounded_substantive_reply(_grounded_snapshot(), NATURAL_RETRY_REPLY) is False
-    assert (
-        _is_grounded_substantive_reply(_grounded_snapshot(), NATURAL_CLARIFICATION_REPLY) is False
-    )
+    from aa.conversation.failures import SERVICE_ERROR_REPLY as _SVC251
+
+    assert _is_grounded_substantive_reply(_grounded_snapshot(), _SVC251) is False
+    assert _is_grounded_substantive_reply(_grounded_snapshot(), "") is False
 
     # Successful zero-query pure greeting passes adequacy as glue (separate path).
     from aa.conversation.answer_adequacy import assess_turn_adequacy

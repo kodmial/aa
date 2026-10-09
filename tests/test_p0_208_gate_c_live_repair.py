@@ -315,7 +315,9 @@ async def test_repair_budget_exceeded_skips_repair_and_narrows(
     assert outcome["rounds"] == 0
     assert planner.calls == 0
     assert outcome["telemetry"]["repair_budget_exceeded"] is True
-    assert outcome["text"] != turn_pipeline_module.NATURAL_CLARIFICATION_REPLY
+    from aa.conversation.failures import is_service_error as _ise
+
+    assert not _ise(outcome["text"])
     assert good_text.split()[0] in outcome["text"]
 
 

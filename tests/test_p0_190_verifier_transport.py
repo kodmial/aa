@@ -243,7 +243,6 @@ async def test_partial_verifier_failure_preserves_verified_units() -> None:
 
 async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() -> None:
     from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
         run_v2_answer_turn,
     )
 
@@ -261,8 +260,10 @@ async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() ->
         verifier_model=_PartiallyUnavailableVerifier(),
         initial_query_count=1,
     )
+    from aa.conversation.failures import is_service_error
+
     assert outcome["text"] == "Поддержка рядом помогает."
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
+    assert not is_service_error(outcome["text"])
     # Breaker kodmial/aa#290: the served narrowed subset excludes the
     # unavailable unit, so its telemetry describes the served subset (no
     # unavailable, passed adequacy) rather than the discarded draft.
@@ -275,7 +276,7 @@ async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() ->
 
 
 async def test_partial_verifier_failure_does_not_serve_glue_only_for_substantive_turn() -> None:
-    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     class _Answer:
         async def ainvoke(self, messages: Any) -> str:
@@ -296,17 +297,21 @@ async def test_partial_verifier_failure_does_not_serve_glue_only_for_substantive
                 }
             raise OpenCodeTransientError("fixture verifier transport failure")
 
-    outcome = await run_v2_answer_turn(
-        user_message="что делать?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_Answer(),
-        verifier_model=_GlueOnlyVerifier(),
-        initial_query_count=1,
-    )
-    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["verifier_outcome"] == "partial-unavailable"
+    import pytest as _pt
+
+    from aa.conversation.failures import TurnFailed as _TF
+
+    with _pt.raises(_TF) as _exc:
+        await run_v2_answer_turn(
+            user_message="что делать?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_Answer(),
+            verifier_model=_GlueOnlyVerifier(),
+            initial_query_count=1,
+        )
+    assert _exc.value.telemetry.get("verifier_outcome") == "partial-unavailable"
 
 
 async def test_provider_429_propagates_with_bounded_round() -> None:

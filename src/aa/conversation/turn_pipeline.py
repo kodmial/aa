@@ -25,6 +25,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage
 
 from aa.conversation.answer_node import generate_draft, recent_history
+from aa.conversation.failures import TurnFailed
 from aa.conversation.output_limits import (
     HARD_CHARS,
     HARD_WORDS,
@@ -204,43 +205,14 @@ def _effective_repair_budget_s() -> float:
     return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
 
 
-NATURAL_CLARIFICATION_REPLY = (
-    "Расскажите чуть подробнее, что сейчас важнее всего? "
-    "Помогу разобрать конкретную ситуацию и ближайшие шаги."
-)
-
-NATURAL_RETRY_REPLY = (
-    "Сейчас не удалось надёжно проверить ответ по книге "
-    "«Анонимные алкоголики». Пожалуйста, попробуйте ещё раз позже."
-)
-
-# A technical/non-grounded fallback is never a successful AA response.
-# Earlier hash-selected variants existed solely to pass the diversity
-# floor despite returning no supported book content. Do not vary or
-# count an unverified service message as an answered user request.
-NATURAL_RETRY_VARIANTS: tuple[str, ...] = (NATURAL_RETRY_REPLY,)
-
-# Deterministic claim-free conversational fallback (kodmial/aa#284).
-#
-# Architecture-level delivery contract for planner-certified
-# conversational turns only (model-resolved ``mode == "conversational"``
-# with zero queries and an empty Evidence Pack): when the single
-# draft/verify attempt for such a turn cannot produce a verifier verdict
-# (transient verifier outage, validation failure, or unsupported glue
-# draft), the turn is served with this static claim-free reply instead
-# of collapsing to the generic clarification/retry templates.
-#
-# The text carries no substantive external claim by construction (a
-# truthful assistant-capability statement plus an invitation to
-# continue), so no book passage is required and per-claim grounding
-# holds vacuously. It is served only on this boundary, never for
-# substantive turns, and it still passes the envelope, language, leak,
-# quote-budget and outbound-safety gates. Turn-independent, never an
-# exact-question special case.
-CONVERSATIONAL_FALLBACK_REPLY = (
-    "Я помощник и готов поддержать разговор: "
-    "расскажите, что сейчас происходит, и разберём это вместе."
-)
+# Issue #301: no hardcoded AA conversational replies. Model/provider /
+# retrieval / timeout / verifier failures are typed unsuccessful
+# outcomes (:class:`TurnFailed`), never synthetic successful AA
+# conversation. Greeting, identity/capabilities, clarification,
+# follow-up, disambiguation and safety-recovered answers are composed
+# by the AA model from the user message and conversational state; only
+# the transport boundary may emit the clearly marked service-error
+# signal (never a substantive answer).
 
 # Outbound-safety recovery uses the same generic semantic fallback as any
 # other retrieval need: the resolved intent plus bounded conversation
@@ -301,10 +273,51 @@ def safety_candidate_fingerprint(text: str) -> str:
     return _fingerprint(text)
 
 
-def select_retry_reply(user_message: str) -> str:
-    """Return a truthful brief unqualified status, never synthetic support."""
-    del user_message
-    return NATURAL_RETRY_REPLY
+async def generate_dialogue_reply(
+    *,
+    user_message: str,
+    summary: str,
+    recent: list[Any],
+    answer_model: Any,
+) -> str | None:
+    """Generate one model-composed dialogue reply with no book evidence.
+
+    Issue #301: greeting, identity/capabilities, clarification,
+    follow-up and disambiguation are composed by the AA model from the
+    user message and conversational state, never from a fixed string.
+    The same generation contract is used (empty Evidence Pack, live
+    request verbatim last); the caller still enforces envelope,
+    language, leak, quote-budget and outbound-safety gates. Returns
+    ``None`` when the model cannot produce a usable candidate (typed
+    failure upstream, never a canned substitute).
+    """
+    from aa.conversation.answer_node import generate_draft
+
+    cleaned = " ".join(str(user_message or "").split()).strip()
+    if not cleaned or answer_model is None:
+        return None
+    try:
+        candidate = await generate_draft(
+            model=answer_model,
+            recent=list(recent or []),
+            summary=str(summary or ""),
+            passages=[],
+            user_message=cleaned,
+        )
+    except Exception:
+        return None
+    text = str(candidate or "").strip()
+    if not text:
+        return None
+    if not contains_cyrillic(text) or leaks_internal_terms(text):
+        return None
+    if not envelope_passes(text):
+        return None
+    if aggregate_quote_chars(text) > QUOTE_BUDGET_CHARS:
+        return None
+    if not certify_outbound_safety(text):
+        return None
+    return text
 
 
 # Supplementary repair context label shared by all focused-regeneration
@@ -1335,22 +1348,27 @@ async def run_v2_answer_turn(
     if draft is None:
         telemetry["answer_outcome"] = "failed"
         telemetry["verifier_outcome"] = "skipped"
-        _record_adequacy(
-            reply_text=select_retry_reply(user_message),
-            verification_state=grounding_result_to_state(None),
-        )
         if _proven_glue:
-            telemetry["adequacy_verdict"] = _ADEQ_PASS
-            telemetry["answers_request"] = True
+            _dialogue = await generate_dialogue_reply(
+                user_message=user_message,
+                summary=summary,
+                recent=list(recent or []),
+                answer_model=answer_model,
+            )
+            if _dialogue is not None:
+                _finish_telemetry()
+                return {
+                    "text": _dialogue,
+                    "units": [],
+                    "verification": grounding_result_to_state(None),
+                    "rounds": 0,
+                    "recent_quote_ranges": recent_ranges,
+                    "telemetry": dict(telemetry),
+                }
         _finish_telemetry()
-        return {
-            "text": select_retry_reply(user_message),
-            "units": [],
-            "verification": grounding_result_to_state(None),
-            "rounds": 0,
-            "recent_quote_ranges": recent_ranges,
-            "telemetry": dict(telemetry),
-        }
+        raise TurnFailed(
+            "answer-failed", "answer model produced no draft", telemetry=dict(telemetry)
+        )
 
     def _verifier_round_budget() -> float | None:
         """Remaining end-to-end slice for one verifier round.
@@ -1369,26 +1387,16 @@ async def run_v2_answer_turn(
         return max(0.0, remaining)
 
     def _retry_outcome(*, verifier_outcome: str) -> dict[str, Any]:
-        """Serve the natural retry reply (never the generic clarification)."""
+        """Fail the turn as a typed unsuccessful outcome (never canned text)."""
         telemetry["verifier_outcome"] = verifier_outcome
-        _record_adequacy(
-            reply_text=select_retry_reply(user_message),
-            verification_state=grounding_result_to_state(None),
-        )
-        if _proven_glue:
-            telemetry["adequacy_verdict"] = _ADEQ_PASS
-            telemetry["answers_request"] = True
-        elif not str(telemetry.get("failure_category", "") or "").strip():
+        if not str(telemetry.get("failure_category", "") or "").strip():
             telemetry["failure_category"] = _FAIL_BUDGET
         _finish_telemetry()
-        return {
-            "text": select_retry_reply(user_message),
-            "units": [],
-            "verification": grounding_result_to_state(None),
-            "rounds": 0,
-            "recent_quote_ranges": recent_ranges,
-            "telemetry": dict(telemetry),
-        }
+        raise TurnFailed(
+            verifier_outcome or "verifier-unavailable",
+            "verifier round skipped",
+            telemetry=dict(telemetry),
+        )
 
     telemetry["answer_outcome"] = "draft-ok"
     verifier_slice = _verifier_round_budget()
@@ -1841,16 +1849,15 @@ async def run_v2_answer_turn(
                         telemetry["technically_grounded"] = False
                         telemetry["qualified"] = False
                         _finish_telemetry()
-                        return {
-                            "text": select_retry_reply(user_message),
-                            "units": units,
-                            "verification": grounding_result_to_state(result),
-                            "rounds": rounds,
-                            "recent_quote_ranges": recent_ranges,
-                            "telemetry": dict(telemetry),
-                        }
+                        raise TurnFailed(
+                            "glue-substantive-overturn",
+                            "judge overturned glue",
+                            telemetry=dict(telemetry),
+                        )
                 else:
                     _mark_turn_budget_exceeded()
+            except TurnFailed:
+                raise
             except Exception as exc:
                 logger.info(
                     "v2 whole-turn glue judge failed closed",
@@ -2087,22 +2094,13 @@ async def run_v2_answer_turn(
                                 "telemetry": dict(telemetry),
                             }
                 telemetry["answer_outcome"] = "adequacy-repair-failed"
-                _record_adequacy(
-                    reply_text=select_retry_reply(user_message),
-                    verification_state=grounding_result_to_state(result),
-                )
                 telemetry["failure_category"] = str(
                     telemetry.get("failure_category", "") or _FAIL_REPAIR
                 )
                 _finish_telemetry()
-                return {
-                    "text": select_retry_reply(user_message),
-                    "units": units,
-                    "verification": grounding_result_to_state(result),
-                    "rounds": rounds,
-                    "recent_quote_ranges": recent_ranges,
-                    "telemetry": dict(telemetry),
-                }
+                raise TurnFailed(
+                    "adequacy-repair-failed", "adequacy repair failed", telemetry=dict(telemetry)
+                )
         final = current_draft
         # Serial-paging guard: a continuation after a prior quote must not
         # page adjacent canonical ranges verbatim.
@@ -2113,19 +2111,11 @@ async def run_v2_answer_turn(
             if narrowed_paging and contains_cyrillic(narrowed_paging):
                 final = narrowed_paging
             else:
-                final = NATURAL_CLARIFICATION_REPLY
                 telemetry["answer_outcome"] = "paging-guard"
                 _finish_telemetry()
-                return {
-                    "text": final,
-                    "units": units,
-                    "verification": grounding_result_to_state(result),
-                    "rounds": rounds,
-                    "recent_quote_ranges": merge_recent_ranges(
-                        recent_ranges, ranges_from_pack(pack)
-                    ),
-                    "telemetry": dict(telemetry),
-                }
+                raise TurnFailed(
+                    "paging-guard", "adjacent paging blocked", telemetry=dict(telemetry)
+                )
         transport_segments: list[str] | None = None
         if not envelope_passes(final):
             # Issue #295: a fully verified grounded complete answer keeps
@@ -2196,9 +2186,20 @@ async def run_v2_answer_turn(
                         "v2 envelope regeneration skipped for live-SLO budget",
                         extra={"rounds": rounds},
                     )
-                    final = compact_supported_to_envelope(units, result, text=final)
+                    try:
+                        final = compact_supported_to_envelope(units, result, text=final)
+                    except ValueError:
+                        telemetry["answer_outcome"] = "envelope-exceeded"
+                        _finish_telemetry()
+                        raise TurnFailed(  # noqa: B904
+                            "envelope-exceeded", "no envelope fit", telemetry=dict(telemetry)
+                        )
                     if not envelope_passes(final):
-                        final = NATURAL_CLARIFICATION_REPLY
+                        telemetry["answer_outcome"] = "envelope-exceeded"
+                        _finish_telemetry()
+                        raise TurnFailed(
+                            "envelope-exceeded", "no envelope fit", telemetry=dict(telemetry)
+                        )
                 else:
                     # At most one compact regeneration from the same pack.
                     compact_hint = compact_retry_instruction(
@@ -2215,9 +2216,24 @@ async def run_v2_answer_turn(
                                 extra={"rounds": rounds},
                             )
                             _mark_turn_budget_exceeded()
-                            final = compact_supported_to_envelope(units, result, text=final)
+                            try:
+                                final = compact_supported_to_envelope(units, result, text=final)
+                            except ValueError:
+                                telemetry["answer_outcome"] = "envelope-exceeded"
+                                _finish_telemetry()
+                                raise TurnFailed(  # noqa: B904
+                                    "envelope-exceeded",
+                                    "no envelope fit",
+                                    telemetry=dict(telemetry),
+                                )
                             if not envelope_passes(final):
-                                final = NATURAL_CLARIFICATION_REPLY
+                                telemetry["answer_outcome"] = "envelope-exceeded"
+                                _finish_telemetry()
+                                raise TurnFailed(
+                                    "envelope-exceeded",
+                                    "no envelope fit",
+                                    telemetry=dict(telemetry),
+                                )
                         else:
                             (
                                 second_units,
@@ -2236,26 +2252,67 @@ async def run_v2_answer_turn(
                                     )
                                     units, result = second_units, second_result
                                     if not envelope_passes(final) or not contains_cyrillic(final):
-                                        final = NATURAL_CLARIFICATION_REPLY
+                                        telemetry["answer_outcome"] = "envelope-exceeded"
+                                        _finish_telemetry()
+                                        raise TurnFailed(
+                                            "envelope-exceeded",
+                                            "no envelope fit",
+                                            telemetry=dict(telemetry),
+                                        )
                             else:
-                                final = compact_supported_to_envelope(units, result, text=final)
+                                try:
+                                    final = compact_supported_to_envelope(units, result, text=final)
+                                except ValueError:
+                                    telemetry["answer_outcome"] = "envelope-exceeded"
+                                    _finish_telemetry()
+                                    raise TurnFailed(  # noqa: B904
+                                        "envelope-exceeded",
+                                        "no envelope fit",
+                                        telemetry=dict(telemetry),
+                                    )
                                 if not envelope_passes(final):
-                                    final = NATURAL_CLARIFICATION_REPLY
+                                    telemetry["answer_outcome"] = "envelope-exceeded"
+                                    _finish_telemetry()
+                                    raise TurnFailed(
+                                        "envelope-exceeded",
+                                        "no envelope fit",
+                                        telemetry=dict(telemetry),
+                                    )
                     else:
-                        final = compact_supported_to_envelope(units, result, text=final)
+                        try:
+                            final = compact_supported_to_envelope(units, result, text=final)
+                        except ValueError:
+                            telemetry["answer_outcome"] = "envelope-exceeded"
+                            _finish_telemetry()
+                            raise TurnFailed(
+                                "envelope-exceeded", "no envelope fit", telemetry=dict(telemetry)
+                            ) from None
                         if not envelope_passes(final):
-                            final = NATURAL_CLARIFICATION_REPLY
+                            telemetry["answer_outcome"] = "envelope-exceeded"
+                            _finish_telemetry()
+                            raise TurnFailed(
+                                "envelope-exceeded", "no envelope fit", telemetry=dict(telemetry)
+                            ) from None
         # Quote-budget deterministic guard.
         # (Verified split answers already satisfied the aggregate budget
         # before splitting; splitting never bypasses it.)
         if aggregate_quote_chars(final) > QUOTE_BUDGET_CHARS:
-            compacted = compact_text_to_envelope(final)
+            try:
+                compacted = compact_text_to_envelope(final)
+            except ValueError:
+                telemetry["answer_outcome"] = "quote-budget-exceeded"
+                _finish_telemetry()
+                raise TurnFailed("quote-budget-exceeded", "quote budget", telemetry=dict(telemetry))  # noqa: B904
             if envelope_passes(compacted) and contains_cyrillic(compacted):
                 final = compacted
             else:
-                final = NATURAL_CLARIFICATION_REPLY
+                telemetry["answer_outcome"] = "quote-budget-exceeded"
+                _finish_telemetry()
+                raise TurnFailed("quote-budget-exceeded", "quote budget", telemetry=dict(telemetry))
         if not contains_cyrillic(final) or leaks_internal_terms(final):
-            final = NATURAL_CLARIFICATION_REPLY
+            telemetry["answer_outcome"] = "language-guard"
+            _finish_telemetry()
+            raise TurnFailed("language-guard", "language or leak guard", telemetry=dict(telemetry))
         # Mandatory outbound safety gate (#252): independent of
         # book-grounding. An authentic book-supported draft that advises
         # drinking still fails here and is never delivered. A blocked
@@ -2264,11 +2321,10 @@ async def run_v2_answer_turn(
         # short safe book-supported answer, and verify units plus safety
         # again. Only a genuinely unavailable recovery falls back to the
         # transparent safe-unavailability reply (never generic glue).
-        if final != NATURAL_CLARIFICATION_REPLY and not certify_outbound_safety(final):
+        if not certify_outbound_safety(final):
             from aa.safety.outbound import (
                 OUTBOUND_SAFETY_MAX_REPAIRS,
                 SAFE_RECOVERY_INSTRUCTION,
-                SAFE_UNAVAILABLE_REPLY,
             )
 
             blocked_cat = outbound_safety_category(final)
@@ -2510,29 +2566,14 @@ async def run_v2_answer_turn(
                         "telemetry": dict(telemetry),
                     }
             telemetry["answer_outcome"] = "safety-blocked"
-            # The neutral fallback is never a successful grounded answer:
-            # record its adequacy explicitly so it fails closed (Gate C
-            # FAIL, qualified False) instead of carrying a stale verdict.
-            _record_adequacy(
-                reply_text=SAFE_UNAVAILABLE_REPLY,
-                verification_state=grounding_result_to_state(None),
-            )
-            if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
-                telemetry["adequacy_verdict"] = _ADEQ_FAIL
             if not str(telemetry.get("failure_category", "") or "").strip():
                 telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
             telemetry["answers_request"] = False
             telemetry["technically_grounded"] = False
             telemetry["qualified"] = False
             _finish_telemetry()
-            return {
-                "text": SAFE_UNAVAILABLE_REPLY,
-                "units": [],
-                "verification": grounding_result_to_state(None),
-                "rounds": rounds,
-                "recent_quote_ranges": list(recent_ranges),
-                "telemetry": dict(telemetry),
-            }
+            raise TurnFailed("safety-blocked", "no safe recovery", telemetry=dict(telemetry))
         telemetry["outbound_safety"] = "pass"
         # Whole-turn adequacy on the served candidate (kodmial/aa#251):
         # identifiers alone never prove relevance. A substantive turn that
@@ -2544,16 +2585,15 @@ async def run_v2_answer_turn(
             telemetry["answer_outcome"] = "adequacy-failed"
             if not str(telemetry.get("failure_category", "") or "").strip():
                 telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
             _finish_telemetry()
-            return {
-                "text": select_retry_reply(user_message),
-                "units": units,
-                "verification": _served_state,
-                "rounds": rounds,
-                "recent_quote_ranges": recent_ranges,
-                "telemetry": dict(telemetry),
-            }
-        if transport_segments is not None and final != NATURAL_CLARIFICATION_REPLY:
+            raise TurnFailed(
+                "adequacy-failed", "served candidate inadequate", telemetry=dict(telemetry)
+            )
+        if transport_segments is not None:
             # Preserve the split verdict: the complete verified answer is
             # served across sequential transport segments (delivery splits
             # deterministically); adequacy below judges the full text so no
@@ -2562,9 +2602,7 @@ async def run_v2_answer_turn(
             telemetry["transport_split"] = True
             telemetry["transport_segments"] = len(transport_segments)
         else:
-            telemetry["answer_outcome"] = (
-                "served" if final != NATURAL_CLARIFICATION_REPLY else "clarification"
-            )
+            telemetry["answer_outcome"] = "served"
             if transport_segments is None:
                 telemetry.setdefault("transport_split", False)
                 telemetry.setdefault("transport_segments", 1)
@@ -2579,17 +2617,15 @@ async def run_v2_answer_turn(
             "segments": list(transport_segments) if transport_segments is not None else [final],
         }
 
-    # Conversational delivery contract (kodmial/aa#284, hardened
-    # kodmial/aa#286 item 5): a planner-certified conversational turn
-    # (model-resolved conversational mode with zero queries,
-    # legitimate-glue reason and an empty Evidence Pack) whose single
-    # draft/verify attempt produced no verifier verdict is served with
-    # the deterministic claim-free conversational fallback instead of
-    # collapsing to clarification/retry. The fallback carries no
-    # substantive claim by construction, so per-claim grounding holds
-    # vacuously; it still passes the envelope, language, leak,
-    # quote-budget and outbound-safety gates. Substantive turns never
-    # enter this boundary and keep the existing fail-closed collapse.
+    # Conversational delivery (issue #301): a planner-certified
+    # conversational turn (model-resolved conversational mode with zero
+    # queries, legitimate-glue reason and an empty Evidence Pack) whose
+    # single draft/verify attempt produced no verifier verdict is served
+    # with one model-composed dialogue reply (empty evidence, live
+    # request verbatim), never a fixed string. The candidate still
+    # passes the envelope, language, leak, quote-budget and
+    # outbound-safety gates inside generate_dialogue_reply. Substantive
+    # turns never enter this boundary and fail as typed outcomes.
     # A verifier that reports any book-required unit proves the planner
     # misclassified a book-dependent request: such a turn must not be
     # marked successful via this fallback even when the pack is empty.
@@ -2604,11 +2640,6 @@ async def run_v2_answer_turn(
         and not passed
         and not _verifier_claims_book
         and _effective_reason == "legitimate-glue"
-        and contains_cyrillic(CONVERSATIONAL_FALLBACK_REPLY)
-        and not leaks_internal_terms(CONVERSATIONAL_FALLBACK_REPLY)
-        and envelope_passes(CONVERSATIONAL_FALLBACK_REPLY)
-        and aggregate_quote_chars(CONVERSATIONAL_FALLBACK_REPLY) <= QUOTE_BUDGET_CHARS
-        and certify_outbound_safety(CONVERSATIONAL_FALLBACK_REPLY)
     ):
         if whole_turn_judge_model is not None:
             try:
@@ -2642,28 +2673,47 @@ async def run_v2_answer_turn(
                         telemetry["technically_grounded"] = False
                         telemetry["qualified"] = False
                         _finish_telemetry()
-                        return {
-                            "text": select_retry_reply(user_message),
-                            "units": units,
-                            "verification": grounding_result_to_state(result),
-                            "rounds": rounds,
-                            "recent_quote_ranges": recent_ranges,
-                            "telemetry": dict(telemetry),
-                        }
+                        raise TurnFailed(
+                            "fallback-substantive-overturn",
+                            "judge withheld fallback",
+                            telemetry=dict(telemetry),
+                        )
+            except TurnFailed:
+                raise
             except Exception as exc:
                 logger.info(
                     "v2 fallback judge failed closed",
                     extra={"category": type(exc).__name__},
                 )
+        _dialogue_fallback = await generate_dialogue_reply(
+            user_message=user_message,
+            summary=summary,
+            recent=list(recent or []),
+            answer_model=answer_model,
+        )
+        if _dialogue_fallback is None:
+            telemetry["answer_outcome"] = "conversational-generation-failed"
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
+            _finish_telemetry()
+            raise TurnFailed(
+                "conversational-generation-failed",
+                "no dialogue candidate",
+                telemetry=dict(telemetry),
+            )
         telemetry["outbound_safety"] = "pass"
-        telemetry["answer_outcome"] = "conversational-fallback"
+        telemetry["answer_outcome"] = "conversational-generated"
         telemetry["adequacy_verdict"] = _ADEQ_PASS
         telemetry["answers_request"] = True
         telemetry["technically_grounded"] = False
         telemetry["qualified"] = True
         _finish_telemetry()
         return {
-            "text": CONVERSATIONAL_FALLBACK_REPLY,
+            "text": _dialogue_fallback,
             "units": [],
             "verification": grounding_result_to_state(None),
             "rounds": rounds,
@@ -2691,31 +2741,17 @@ async def run_v2_answer_turn(
         # repair budget is already exhausted here, so an unsafe narrowing
         # falls back to the transparent safe-unavailability reply.
         if not certify_outbound_safety(narrowed):
-            from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _NARROW_SAFE_REPLY
-
             telemetry["outbound_safety"] = "blocked"
             telemetry["outbound_safety_category"] = outbound_safety_category(narrowed)
             telemetry["answer_outcome"] = "safety-blocked"
-            _record_adequacy(
-                reply_text=_NARROW_SAFE_REPLY,
-                verification_state=grounding_result_to_state(None),
-            )
-            if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
-                telemetry["adequacy_verdict"] = _ADEQ_FAIL
             if not str(telemetry.get("failure_category", "") or "").strip():
                 telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
             telemetry["answers_request"] = False
             telemetry["technically_grounded"] = False
             telemetry["qualified"] = False
             _finish_telemetry()
-            return {
-                "text": _NARROW_SAFE_REPLY,
-                "units": [],
-                "verification": grounding_result_to_state(None),
-                "rounds": rounds,
-                "recent_quote_ranges": list(recent_ranges),
-                "telemetry": dict(telemetry),
-            }
+            raise TurnFailed("safety-blocked", "narrowed unsafe", telemetry=dict(telemetry))
         telemetry["outbound_safety"] = "pass"
         telemetry["answer_outcome"] = "narrowed-supported"
         # Narrowing preserves verified supported material when part of the
@@ -2742,15 +2778,12 @@ async def run_v2_answer_turn(
             telemetry["answer_outcome"] = "adequacy-failed"
             if not str(telemetry.get("failure_category", "") or "").strip():
                 telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
             _finish_telemetry()
-            return {
-                "text": select_retry_reply(user_message),
-                "units": units,
-                "verification": grounding_result_to_state(result),
-                "rounds": rounds,
-                "recent_quote_ranges": recent_ranges,
-                "telemetry": dict(telemetry),
-            }
+            raise TurnFailed("adequacy-failed", "narrowed inadequate", telemetry=dict(telemetry))
         _finish_telemetry()
         return {
             "text": narrowed,
@@ -2761,7 +2794,12 @@ async def run_v2_answer_turn(
             "telemetry": dict(telemetry),
         }
     if narrowed and (not envelope_passes(narrowed)):
-        compacted = compact_text_to_envelope(narrowed)
+        try:
+            compacted = compact_text_to_envelope(narrowed)
+        except ValueError:
+            telemetry["answer_outcome"] = "envelope-exceeded"
+            _finish_telemetry()
+            raise TurnFailed("envelope-exceeded", "narrowed overflow", telemetry=dict(telemetry))  # noqa: B904
         if (
             envelope_passes(compacted)
             and contains_cyrillic(compacted)
@@ -2769,31 +2807,17 @@ async def run_v2_answer_turn(
             and aggregate_quote_chars(compacted) <= QUOTE_BUDGET_CHARS
         ):
             if not certify_outbound_safety(compacted):
-                from aa.safety.outbound import SAFE_UNAVAILABLE_REPLY as _COMPACT_SAFE_REPLY
-
                 telemetry["outbound_safety"] = "blocked"
                 telemetry["outbound_safety_category"] = outbound_safety_category(compacted)
                 telemetry["answer_outcome"] = "safety-blocked"
-                _record_adequacy(
-                    reply_text=_COMPACT_SAFE_REPLY,
-                    verification_state=grounding_result_to_state(None),
-                )
-                if str(telemetry.get("adequacy_verdict", "") or "").strip() != _ADEQ_FAIL:
-                    telemetry["adequacy_verdict"] = _ADEQ_FAIL
                 if not str(telemetry.get("failure_category", "") or "").strip():
                     telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
                 telemetry["answers_request"] = False
                 telemetry["technically_grounded"] = False
                 telemetry["qualified"] = False
                 _finish_telemetry()
-                return {
-                    "text": _COMPACT_SAFE_REPLY,
-                    "units": [],
-                    "verification": grounding_result_to_state(None),
-                    "rounds": rounds,
-                    "recent_quote_ranges": list(recent_ranges),
-                    "telemetry": dict(telemetry),
-                }
+                raise TurnFailed("safety-blocked", "compacted unsafe", telemetry=dict(telemetry))
             telemetry["outbound_safety"] = "pass"
             telemetry["answer_outcome"] = "narrowed-compacted"
             _finish_telemetry()
@@ -2806,65 +2830,60 @@ async def run_v2_answer_turn(
                 "telemetry": dict(telemetry),
             }
     if _end_to_end_elapsed_s() > _effective_turn_budget_s():
-        # End-to-end guard (recurrence 10): no verified supported
-        # material exists, but the turn already spent its whole budget.
-        # Clarifying here would add the recurrence-10 generic collapse
-        # on top of the SLO breach (slow rounds clarify after grinding
-        # the full verifier budget). Serve the natural retry reply
-        # instead: it carries no substantive claim (grounding-safe),
-        # is distinct from the generic clarification (no-collapse and
-        # diversity preserved), and costs no further model call. Fast
-        # turns keep the historical clarification path below, so
-        # genuine grounding gaps still ask for detail.
+        # End-to-end guard: no verified supported material exists and
+        # the turn already spent its whole budget. Fail as a typed
+        # unsuccessful outcome (no further model call, no canned text).
         logger.info(
-            "v2 slow turn serves retry instead of clarification",
+            "v2 slow turn fails as typed outcome",
             extra={"category": "turn-budget-fallback"},
         )
         _mark_turn_budget_exceeded()
         telemetry["answer_outcome"] = "retry-turn-budget"
         _finish_telemetry()
-        return {
-            "text": select_retry_reply(user_message),
-            "units": units,
-            "verification": grounding_result_to_state(result),
-            "rounds": rounds,
-            "recent_quote_ranges": recent_ranges,
-            "telemetry": dict(telemetry),
-        }
-    if not _proven_glue and not pack:
-        # Substantive request without any book evidence: explicit honest
-        # unavailability, never plausible generic help (kodmial/aa#251).
-        # Turns with a non-empty pack but failed verification keep the
-        # historical clarification path so verifier-outage semantics stay
-        # stable; Gate C still counts them as ungrounded failures.
-        telemetry["answer_outcome"] = "unavailable-substantive-no-evidence"
-        _record_adequacy(
-            reply_text=select_retry_reply(user_message),
-            verification_state=grounding_result_to_state(result),
+        raise TurnFailed(
+            "turn-budget-exceeded", "end-to-end budget spent", telemetry=dict(telemetry)
         )
+    if not _proven_glue and not pack:
+        # Substantive request without any book evidence: typed
+        # unsuccessful outcome, never plausible generic help.
+        telemetry["answer_outcome"] = "unavailable-substantive-no-evidence"
+        if not str(telemetry.get("failure_category", "") or "").strip():
+            telemetry["failure_category"] = _FAIL_REPAIR
+        telemetry["adequacy_verdict"] = _ADEQ_FAIL
+        telemetry["answers_request"] = False
+        telemetry["technically_grounded"] = False
+        telemetry["qualified"] = False
         _finish_telemetry()
-        return {
-            "text": select_retry_reply(user_message),
-            "units": units,
-            "verification": grounding_result_to_state(result),
-            "rounds": rounds,
-            "recent_quote_ranges": recent_ranges,
-            "telemetry": dict(telemetry),
-        }
-    telemetry["answer_outcome"] = "clarification"
-    _record_adequacy(
-        reply_text=NATURAL_CLARIFICATION_REPLY,
-        verification_state=grounding_result_to_state(result),
-    )
+        raise TurnFailed(
+            "unavailable-substantive-no-evidence", "no book evidence", telemetry=dict(telemetry)
+        )
+    if _proven_glue and not _verifier_claims_book:
+        _dialogue_tail = await generate_dialogue_reply(
+            user_message=user_message,
+            summary=summary,
+            recent=list(recent or []),
+            answer_model=answer_model,
+        )
+        if _dialogue_tail is not None:
+            telemetry["answer_outcome"] = "conversational-generated"
+            _finish_telemetry()
+            return {
+                "text": _dialogue_tail,
+                "units": units,
+                "verification": grounding_result_to_state(result),
+                "rounds": rounds,
+                "recent_quote_ranges": recent_ranges,
+                "telemetry": dict(telemetry),
+            }
+    telemetry["answer_outcome"] = "clarification-unavailable"
+    if not str(telemetry.get("failure_category", "") or "").strip():
+        telemetry["failure_category"] = _FAIL_REPAIR
+    telemetry["adequacy_verdict"] = _ADEQ_FAIL
+    telemetry["answers_request"] = False
+    telemetry["technically_grounded"] = False
+    telemetry["qualified"] = False
     _finish_telemetry()
-    return {
-        "text": NATURAL_CLARIFICATION_REPLY,
-        "units": units,
-        "verification": grounding_result_to_state(result),
-        "rounds": rounds,
-        "recent_quote_ranges": recent_ranges,
-        "telemetry": dict(telemetry),
-    }
+    raise TurnFailed("clarification-unavailable", "no verified answer", telemetry=dict(telemetry))
 
 
 async def answer_pipeline_node(
@@ -2884,13 +2903,9 @@ async def answer_pipeline_node(
         return {}
     user_message = str(state.get("current_user_message", ""))
     if not user_message.strip():
-        return {
-            "draft_response": NATURAL_CLARIFICATION_REPLY,
-            "final_response": NATURAL_CLARIFICATION_REPLY,
-            "grounding_result": grounding_result_to_state(None),
-            "retry_state": {"answer_rounds": 0},
-            "messages": [AIMessage(content=NATURAL_CLARIFICATION_REPLY)],
-        }
+        from aa.conversation.graph_runtime import GraphRuntimeError as _EmptyTurnError
+
+        raise _EmptyTurnError("empty-turn", "refusing an empty turn")
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
     _search_queries = state.get("search_queries", [])
     _initial_query_count = len(_search_queries) if isinstance(_search_queries, list) else 0
@@ -3075,18 +3090,16 @@ __all__ = [
     "ANSWER_GENERATION_MAX_PASSAGES",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
-    "CONVERSATIONAL_FALLBACK_REPLY",
-    "NATURAL_CLARIFICATION_REPLY",
-    "NATURAL_RETRY_REPLY",
-    "NATURAL_RETRY_VARIANTS",
     "OUTBOUND_RECOVERY_QUERIES",
     "TURN_ANSWER_MIN_SLICE_S",
     "TURN_END_TO_END_BUDGET_S",
     "TURN_REPAIR_TIME_BUDGET_S",
     "TURN_VERIFIER_MIN_SLICE_S",
+    "TurnFailed",
     "anchored_adequacy_regen_prompt",
     "anchored_repair_focus",
     "build_safety_recovery_queries",
+    "generate_dialogue_reply",
     "safety_candidate_fingerprint",
     "safety_recovery_request",
     "answer_pipeline_node",
@@ -3106,7 +3119,6 @@ __all__ = [
     "narrowed_grounding_state",
     "outbound_safety_category",
     "run_v2_answer_turn",
-    "select_retry_reply",
     "strip_adjacent_quotes",
     "unsupported_unit_texts",
 ]

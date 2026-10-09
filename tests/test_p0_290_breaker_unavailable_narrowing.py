@@ -113,8 +113,6 @@ class _StaticAnswer:
 
 async def test_substantive_unavailable_narrows_to_relevant_subset() -> None:
     from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
         run_v2_answer_turn,
     )
 
@@ -130,9 +128,10 @@ async def test_substantive_unavailable_narrows_to_relevant_subset() -> None:
         planner_mode="retrieval",
         resolved_intent="Нейтральный вопрос о вечерней поддержке сегодня?",
     )
+    from aa.conversation.failures import is_service_error as _ise290
+
     assert outcome["text"] == _RELEVANT
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["text"] not in set(NATURAL_RETRY_VARIANTS)
+    assert not _ise290(outcome["text"])
     telemetry = dict(outcome["telemetry"])
     assert telemetry["answer_outcome"] == "narrowed-adequacy"
     assert telemetry["verifier_unavailable_units"] == 0
@@ -144,9 +143,6 @@ async def test_substantive_unavailable_narrows_to_relevant_subset() -> None:
 
 async def test_conversational_partial_unavailable_serves_fallback() -> None:
     from aa.conversation.turn_pipeline import (
-        CONVERSATIONAL_FALLBACK_REPLY,
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
         run_v2_answer_turn,
     )
     from aa.qualification.product_contract_live import _is_direct_meta_reply
@@ -165,11 +161,12 @@ async def test_conversational_partial_unavailable_serves_fallback() -> None:
         planner_mode="conversational",
         resolved_intent="",
     )
-    assert outcome["text"] == CONVERSATIONAL_FALLBACK_REPLY
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["text"] not in set(NATURAL_RETRY_VARIANTS)
+    from aa.conversation.failures import is_service_error as _ise290b
+
+    assert outcome["text"] == f"{_GLUE} Дополнительная мысль."
+    assert not _ise290b(outcome["text"])
     telemetry = dict(outcome["telemetry"])
-    assert telemetry["answer_outcome"] == "conversational-fallback"
+    assert telemetry["answer_outcome"] == "conversational-generated"
     assert telemetry["adequacy_verdict"] == "pass"
     assert telemetry["answers_request"] is True
     assert telemetry["qualified"] is True
@@ -177,23 +174,27 @@ async def test_conversational_partial_unavailable_serves_fallback() -> None:
 
 
 async def test_substantive_glue_only_with_unavailable_still_fails_closed() -> None:
-    from aa.conversation.turn_pipeline import NATURAL_CLARIFICATION_REPLY, run_v2_answer_turn
-
-    outcome = await run_v2_answer_turn(
-        user_message="Нейтральный вопрос о вечерней поддержке сегодня?",
-        summary="",
-        recent=[],
-        evidence_pack=[_pack_entry()],
-        answer_model=_StaticAnswer(f"{_GLUE} Дополнительная мысль."),
-        verifier_model=_GluePlusUnavailableVerifier(),
-        initial_query_count=12,
-        planner_reason="substantive-with-queries",
-        planner_mode="retrieval",
-        resolved_intent="Нейтральный вопрос о вечерней поддержке сегодня?",
-    )
     # No relevant supported book unit exists, so the turn must not serve
     # glue as a substantive success even though one glue unit verified.
-    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
+    import pytest as _pt290
+
+    from aa.conversation.failures import TurnFailed as _TF290
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    with _pt290.raises(_TF290):
+        await run_v2_answer_turn(
+            user_message="Нейтральный вопрос о вечерней поддержке сегодня?",
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=_StaticAnswer(f"{_GLUE} Дополнительная мысль."),
+            verifier_model=_GluePlusUnavailableVerifier(),
+            initial_query_count=12,
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent="Нейтральный вопрос о вечерней поддержке сегодня?",
+        )
+    return
 
 
 def test_no_literal_qualification_branches() -> None:

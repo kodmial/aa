@@ -64,9 +64,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from aa.conversation.turn_pipeline import (
     ANSWER_DRAFT_ATTEMPT_BUDGET_S,
-    NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_REPLY,
-    NATURAL_RETRY_VARIANTS,
     TURN_ANSWER_MIN_SLICE_S,
     TURN_END_TO_END_BUDGET_S,
     TURN_VERIFIER_MIN_SLICE_S,
@@ -115,29 +112,27 @@ async def test_slow_upstream_skips_answer_and_serves_retry() -> None:
             _ = messages
             raise AssertionError("no model call may start on a spent turn")
 
+    from aa.conversation.failures import TurnFailed as _TF10a
+
     started = time.perf_counter()
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=_MustNotRun(),
-        verifier_model=_MustNotRun(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        # Temporary quality-first SLO: end-to-end budget is 105s (< 120s
-        # hard SLO), so a spent turn needs upstream past 105s (was 35s
-        # under the old 27s budget).
-        upstream_latency_ms=110000.0,
-    )
+    with __import__("pytest").raises(_TF10a) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=_MustNotRun(),
+            verifier_model=_MustNotRun(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=110000.0,
+        )
     assert time.perf_counter() - started < 5.0
-    assert outcome["text"] in NATURAL_RETRY_VARIANTS
-    assert outcome["text"] == NATURAL_RETRY_REPLY
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["turn_budget_exceeded"] is True
-    assert outcome["telemetry"]["answer_rounds"] == 0
-    assert outcome["telemetry"]["verifier_outcome"] == "skipped"
+    assert exc.value.category == "answer-failed"
+    assert exc.value.telemetry["turn_budget_exceeded"] is True
+    assert exc.value.telemetry["answer_rounds"] == 0
+    assert exc.value.telemetry["verifier_outcome"] == "skipped"
 
 
 async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
@@ -159,29 +154,26 @@ async def test_slow_upstream_plus_answer_skips_verifier_round() -> None:
             _ = (prompt, system, schema, retry_count)
             raise AssertionError("doomed verifier round must not start")
 
+    from aa.conversation.failures import TurnFailed as _TF10b
+
     answer = _InstantAnswer()
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=answer,
-        verifier_model=_MustNotVerify(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        # Temporary quality-first SLO: 105s end-to-end budget. Upstream
-        # 103s leaves ~2s remaining: the answer still runs (1s min
-        # slice) but the verifier round cannot usefully start (3s min
-        # slice), so it skips to retry. Was 25s under the old 27s budget.
-        upstream_latency_ms=103000.0,
-    )
+    with __import__("pytest").raises(_TF10b) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=answer,
+            verifier_model=_MustNotVerify(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=103000.0,
+        )
     assert answer.calls == 1
-    assert outcome["text"] in NATURAL_RETRY_VARIANTS
-    assert outcome["text"] == NATURAL_RETRY_REPLY
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["turn_budget_exceeded"] is True
-    assert outcome["telemetry"]["verifier_outcome"] == "skipped-turn-budget"
+    assert exc.value.category == "skipped-turn-budget"
+    assert exc.value.telemetry["turn_budget_exceeded"] is True
+    assert exc.value.telemetry["verifier_outcome"] == "skipped-turn-budget"
 
 
 async def test_verifier_receives_reduced_remaining_budget(
@@ -257,7 +249,9 @@ async def test_verifier_receives_reduced_remaining_budget(
     assert captured["units"] == 1
     assert captured["turn_budget_s"] is not None
     assert 3.0 < float(captured["turn_budget_s"]) < 40.0
-    assert outcome["text"] not in (NATURAL_RETRY_REPLY, NATURAL_CLARIFICATION_REPLY)
+    from aa.conversation.failures import is_service_error as _ise10
+
+    assert not _ise10(outcome["text"])
     assert outcome["telemetry"]["turn_budget_exceeded"] is False
 
 
@@ -291,22 +285,23 @@ async def test_slow_turn_unsupported_serves_retry_not_clarification(
                 "addresses_intent": False,
             }
 
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=_InstantAnswer(),
-        verifier_model=_SlowUnsupportedVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-    )
-    assert outcome["telemetry"]["verifier_outcome"] == "unsupported"
-    assert outcome["text"] in NATURAL_RETRY_VARIANTS
-    assert outcome["text"] == NATURAL_RETRY_REPLY
-    assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["turn_budget_exceeded"] is True
+    from aa.conversation.failures import TurnFailed as _TF10c
+
+    with __import__("pytest").raises(_TF10c) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=_InstantAnswer(),
+            verifier_model=_SlowUnsupportedVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+        )
+    assert exc.value.telemetry["verifier_outcome"] == "unsupported"
+    assert exc.value.category == "turn-budget-exceeded"
+    assert exc.value.telemetry["turn_budget_exceeded"] is True
 
 
 async def test_fast_turn_unsupported_still_clarifies() -> None:
@@ -329,20 +324,23 @@ async def test_fast_turn_unsupported_still_clarifies() -> None:
                 "addresses_intent": False,
             }
 
-    outcome = await run_v2_answer_turn(
-        user_message="К вечеру тянет выпить, как быть?",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=_InstantAnswer(),
-        verifier_model=_FastUnsupportedVerifier(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-    )
-    assert outcome["telemetry"]["verifier_outcome"] == "unsupported"
-    assert outcome["text"] == NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["turn_budget_exceeded"] is False
+    from aa.conversation.failures import TurnFailed as _TF10d
+
+    with __import__("pytest").raises(_TF10d) as exc:
+        await run_v2_answer_turn(
+            user_message="К вечеру тянет выпить, как быть?",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=_InstantAnswer(),
+            verifier_model=_FastUnsupportedVerifier(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+        )
+    assert exc.value.telemetry["verifier_outcome"] == "unsupported"
+    assert exc.value.category == "clarification-unavailable"
+    assert exc.value.telemetry["turn_budget_exceeded"] is False
 
 
 async def test_answer_429_still_propagates_with_upstream() -> None:

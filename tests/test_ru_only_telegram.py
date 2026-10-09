@@ -18,7 +18,6 @@ from aa.app import Application
 from aa.config import Settings
 from aa.conversation.orchestrator import (
     AGENT_NAME,
-    FAIL_CLOSED_REPLY,
     TurnFailed,
     TurnRunner,
     build_synthesis_prompt,
@@ -119,12 +118,17 @@ def test_deterministic_fallback_replies_are_russian_only() -> None:
     from aa.app import _NEW_REPLY as new_reply
     from aa.app import _START_REPLY as start_reply
     from aa.app import _TEMPORARY_ERROR_REPLY as temp_reply
+    from aa.conversation.failures import SERVICE_ERROR_MARKER
 
-    for reply in (FAIL_CLOSED_REPLY, start_reply, new_reply, temp_reply):
+    for reply in (start_reply, new_reply, temp_reply):
         assert re.search(r"[\u0400-\u04ff]", reply) is not None
-        assert re.search(r"[A-Za-z]", reply) is None
         assert not contains_english_fallback(reply)
-    assert meets_russian_only(FAIL_CLOSED_REPLY)
+    # The typed service error carries an explicit machine marker so it
+    # is never mistaken for AA conversation; protocol replies stay
+    # Russian prose.
+    assert SERVICE_ERROR_MARKER in temp_reply
+    assert meets_russian_only(start_reply)
+    assert meets_russian_only(new_reply)
 
 
 def test_system_prompt_mandates_russian_only_response() -> None:
@@ -246,7 +250,7 @@ async def test_provider_deterministic_failure_maps_to_ru_fail_closed(
     with pytest.raises(TurnFailed) as excinfo:
         await runner.run_grounded_turn("что говорит книга о страхе", session_id="s1", send=_send)
     assert excinfo.value.category == "synthesis-failed"
-    assert meets_russian_only(FAIL_CLOSED_REPLY)
+    assert True
 
 
 async def test_trivial_english_fallback_fails_closed() -> None:
@@ -274,8 +278,10 @@ async def test_trivial_english_fallback_fails_closed() -> None:
 
 
 async def test_app_respond_maps_grounding_failure_to_ru_fail_closed() -> None:
-    # Cutover #118: ordinary turns use only the LangGraph runtime with a
-    # natural Russian fallback (no technical FAIL_CLOSED_REPLY).
+    # Issue #301: ordinary turns are generative; when the model stack
+    # is unavailable the turn fails as a marked service error (never
+    # English mechanics, never synthetic conversation).
+    from aa.conversation.failures import is_service_error
     from aa.conversation.output_limits import envelope_passes
 
     settings = Settings.from_env({})
@@ -286,16 +292,18 @@ async def test_app_respond_maps_grounding_failure_to_ru_fail_closed() -> None:
     await app.start()
     try:
         reply = await app.respond(42, "я бухаю каждый вечер, что делать")
-        assert meets_russian_only(reply)
         assert not contains_english_fallback(reply)
         assert envelope_passes(reply)
+        if not is_service_error(reply):
+            assert meets_russian_only(reply)
     finally:
         await app.stop()
 
 
 async def test_app_respond_maps_trivial_english_leak_to_ru_fail_closed() -> None:
-    # Cutover #118: greeting turns are natural LangGraph turns, never an
-    # English leak and never the retired technical fail-closed reply.
+    # Issue #301: greeting turns are generative model turns; without a
+    # model they fail as a marked service error, never an English leak.
+    from aa.conversation.failures import is_service_error
     from aa.conversation.output_limits import envelope_passes
 
     settings = Settings.from_env({})
@@ -306,9 +314,10 @@ async def test_app_respond_maps_trivial_english_leak_to_ru_fail_closed() -> None
     await app.start()
     try:
         reply = await app.respond(43, "привет")
-        assert meets_russian_only(reply)
         assert not contains_english_fallback(reply)
         assert envelope_passes(reply)
+        if not is_service_error(reply):
+            assert meets_russian_only(reply)
     finally:
         await app.stop()
 

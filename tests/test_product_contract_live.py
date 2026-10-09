@@ -431,10 +431,7 @@ def test_privacy_guard_allows_numeric_answer_stage_metrics() -> None:
 
 def test_gate_c_rejects_bookless_retry_diversity() -> None:
     """Different generic replies must never qualify as book-grounded help."""
-    from aa.conversation.turn_pipeline import (
-        NATURAL_CLARIFICATION_REPLY,
-        NATURAL_RETRY_VARIANTS,
-    )
+    from aa.conversation.failures import SERVICE_ERROR_REPLY
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
     verified = {
@@ -484,7 +481,7 @@ def test_gate_c_rejects_bookless_retry_diversity() -> None:
         assert not _is_grounded_substantive_reply(
             {**verified, **false_flag}, "Проверенный ответ по книге."
         )
-    for retry in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY):
+    for retry in (SERVICE_ERROR_REPLY, ""):
         assert not _is_grounded_substantive_reply(verified, retry)
 
     assert not _is_grounded_substantive_reply(

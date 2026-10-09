@@ -44,10 +44,7 @@ from __future__ import annotations
 
 import pathlib
 
-from aa.conversation.turn_pipeline import (
-    NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_REPLY,
-)
+from aa.conversation import turn_pipeline as _tp  # noqa: F401
 from aa.qualification.product_contract_live import (
     _is_direct_meta_reply,
     _is_grounded_substantive_reply,
@@ -137,12 +134,14 @@ def test_narrowed_brief_grounded_answer_passes() -> None:
 
 def test_forced_generic_retry_fails_despite_counts() -> None:
     snapshot = _grounded_snapshot()
-    assert _is_grounded_substantive_reply(snapshot, NATURAL_RETRY_REPLY) is False
+    from aa.conversation.failures import SERVICE_ERROR_REPLY as _SVC246
+
+    assert _is_grounded_substantive_reply(snapshot, _SVC246) is False
 
 
 def test_forced_clarification_fails_despite_counts() -> None:
     snapshot = _grounded_snapshot()
-    assert _is_grounded_substantive_reply(snapshot, NATURAL_CLARIFICATION_REPLY) is False
+    assert _is_grounded_substantive_reply(snapshot, "") is False
 
 
 def test_avoiding_clarification_fails() -> None:
@@ -291,14 +290,11 @@ def test_direct_meta_reply_fails_closed_without_verdict() -> None:
 
 
 def test_evasive_meta_template_fails() -> None:
-    # The exact evasive template never counts as a direct meta reply,
+    # A marked service error never counts as a direct meta reply,
     # even when counts look positive.
-    assert (
-        _is_direct_meta_reply(
-            NATURAL_CLARIFICATION_REPLY, snapshot=dict(_passing_semantic_snapshot())
-        )
-        is False
-    )
+    from aa.conversation.failures import SERVICE_ERROR_REPLY as _SVC246B
+
+    assert _is_direct_meta_reply(_SVC246B, snapshot=dict(_passing_semantic_snapshot())) is False
     # A short clarification question is refused via the semantic verdict,
     # not via a handcrafted clarification-cue table (#268).
     assert (

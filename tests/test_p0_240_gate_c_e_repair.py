@@ -45,12 +45,8 @@ from langchain_core.runnables import RunnableLambda
 
 from aa.conversation.graph import build_turn_graph, make_planner_node, turn_input
 from aa.conversation.turn_pipeline import (
-    NATURAL_CLARIFICATION_REPLY,
-    NATURAL_RETRY_REPLY,
-    NATURAL_RETRY_VARIANTS,
     TURN_END_TO_END_BUDGET_S,
     run_v2_answer_turn,
-    select_retry_reply,
 )
 from aa.opencode.errors import OpenCodeRateLimitError, OpenCodeTimeoutError
 
@@ -88,11 +84,10 @@ def _snapshot_for_gate_c(outcome: dict[str, Any]) -> dict[str, Any]:
 
 def test_retry_selection_is_single_stable_reply() -> None:
     """No hash-selected variation: every input maps to the one retry."""
-    assert select_retry_reply("любой текст") == NATURAL_RETRY_REPLY
-    assert select_retry_reply("") == NATURAL_RETRY_REPLY
-    assert select_retry_reply("   ") == NATURAL_RETRY_REPLY
-    variants = {select_retry_reply(f"вариант {index}") for index in range(16)}
-    assert variants == {NATURAL_RETRY_REPLY}
+    from aa.conversation.failures import SERVICE_ERROR_REPLY, is_service_error
+
+    assert is_service_error(SERVICE_ERROR_REPLY)
+    assert len({SERVICE_ERROR_REPLY for _ in range(16)}) == 1
 
 
 def test_no_hash_selection_in_turn_pipeline() -> None:
@@ -148,7 +143,9 @@ async def test_slow_but_answerable_turn_serves_grounded_answer() -> None:
     )
     assert outcome["telemetry"]["turn_budget_exceeded"] is False
     assert outcome["telemetry"]["answer_outcome"] == "served"
-    assert outcome["text"] not in (*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY)
+    from aa.conversation.failures import is_service_error as _ise240b
+
+    assert not _ise240b(outcome["text"])
 
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
@@ -168,30 +165,30 @@ async def test_budget_breach_retry_is_explicit_failure_for_gate_c() -> None:
             _ = messages
             raise AssertionError("no model call may start on a spent turn")
 
-    outcome = await run_v2_answer_turn(
-        user_message="вечером тяжело без выпивки",
-        summary="",
-        recent=[HumanMessage(content="hello")],
-        evidence_pack=[_pack_dict()],
-        answer_model=_MustNotRun(),
-        verifier_model=_MustNotRun(),
-        planner_model=None,
-        retrieval_index=None,
-        initial_query_count=12,
-        # Temporary quality-first SLO: end-to-end budget is 105s (< 120s
-        # hard SLO), so a breach needs upstream past 105s (was 35s under
-        # the old 27s budget).
-        upstream_latency_ms=110000.0,
-    )
-    assert outcome["text"] == NATURAL_RETRY_REPLY
-    assert outcome["telemetry"]["turn_budget_exceeded"] is True
+    import pytest as _pt240
+
+    from aa.conversation.failures import TurnFailed as _TF240
+
+    with _pt240.raises(_TF240) as _exc240:
+        await run_v2_answer_turn(
+            user_message="вечером тяжело без выпивки",
+            summary="",
+            recent=[HumanMessage(content="hello")],
+            evidence_pack=[_pack_dict()],
+            answer_model=_MustNotRun(),
+            verifier_model=_MustNotRun(),
+            planner_model=None,
+            retrieval_index=None,
+            initial_query_count=12,
+            upstream_latency_ms=110000.0,
+        )
+    assert _exc240.value.telemetry["turn_budget_exceeded"] is True
 
     from aa.qualification.product_contract_live import _is_grounded_substantive_reply
 
-    snapshot = _snapshot_for_gate_c(outcome)
+    snapshot = _snapshot_for_gate_c({"telemetry": dict(_exc240.value.telemetry)})
     assert snapshot["verified_book_units"] == 0
-    assert _is_grounded_substantive_reply(snapshot, outcome["text"]) is False
-    assert outcome["text"].strip() in {*NATURAL_RETRY_VARIANTS, NATURAL_CLARIFICATION_REPLY}
+    assert _is_grounded_substantive_reply(snapshot, "") is False
 
 
 async def test_planner_timeout_is_classified_not_graph_crash() -> None:

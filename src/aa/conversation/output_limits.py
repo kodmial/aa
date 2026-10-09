@@ -66,10 +66,6 @@ back to clarification instead of unbounded paging.
 
 MAX_COMPACT_REGENERATIONS = 1
 
-ENVELOPE_FALLBACK_REPLY = (
-    "Ответ получился слишком длинным. Скажите, какая часть для вас сейчас важнее?"
-)
-
 _QUOTED_SPAN_RE = re.compile(r"[«\"„“]([^«»\"\n]{1,2000})[»\"”]")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?!\s*\[)|(?<=\])\s+|\n+")
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:#[A-Za-z0-9_:.\-]+)?)\]")
@@ -368,15 +364,16 @@ def compact_text_to_envelope(text: str) -> str:
     ``<= 900`` graphemes, ``<= 130`` words, and ``<= 300`` quoted
     characters. Never cuts inside a quotation, Markdown construct, URL,
     or combining sequence because cuts happen only at unit boundaries.
-    Falls back to :data:`ENVELOPE_FALLBACK_REPLY` when even the first
-    unit cannot fit or balance cannot be restored.
+    Raises :class:`ValueError` (typed unsuccessful outcome) when even the
+    first unit cannot fit or balance cannot be restored; callers fail
+    the turn as a typed failure instead of serving canned conversation.
     """
     if _prefix_fits(text) and _markdown_balanced(text):
         return text
     units = _split_compaction_units(text)
     if not units:
         logger.info("output compaction applied", extra={"category": "empty-fallback"})
-        return ENVELOPE_FALLBACK_REPLY
+        raise ValueError("no complete units fit the transport envelope")
     kept: list[str] = []
     for unit in units:
         candidate = " ".join([*kept, unit]) if kept else unit
@@ -387,7 +384,7 @@ def compact_text_to_envelope(text: str) -> str:
         kept.pop()
     if not kept:
         logger.info("output compaction applied", extra={"category": "first-unit-overflow"})
-        return ENVELOPE_FALLBACK_REPLY
+        raise ValueError("no complete unit fits the transport envelope")
     compacted = " ".join(kept)
     logger.info(
         "output compaction applied",
@@ -419,10 +416,9 @@ def split_text_to_envelope_segments(text: str) -> list[str]:
       :class:`ValueError` when ``aggregate_quote_chars(text)`` exceeds
       :data:`QUOTE_BUDGET_CHARS`;
     - at most :data:`MAX_TRANSPORT_SEGMENTS` segments; :class:`ValueError`
-      when more would be needed (caller falls back to clarification);
-    - a single complete unit that alone exceeds the envelope yields
-      :data:`ENVELOPE_FALLBACK_REPLY` handling by the caller (here raised
-      as :class:`ValueError` so no mid-unit cut is ever produced).
+      when more would be needed (caller fails the turn as typed failure);
+    - a single complete unit that alone exceeds the envelope raises
+      :class:`ValueError` so no mid-unit cut is ever produced.
 
     Only lengths/categories are logged, never text.
     """
@@ -493,7 +489,6 @@ def validate_outbound_text(text: str) -> None:
 
 __all__ = [
     "DEFAULT_GENERATION_BUDGET_TOKENS",
-    "ENVELOPE_FALLBACK_REPLY",
     "HARD_CHARS",
     "HARD_WORDS",
     "MAX_COMPACT_REGENERATIONS",

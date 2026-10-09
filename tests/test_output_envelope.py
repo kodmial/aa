@@ -26,7 +26,6 @@ from aa.app import Application
 from aa.config import Settings
 from aa.conversation.orchestrator import (
     AGENT_NAME,
-    FAIL_CLOSED_REPLY,
     TurnDiagnostics,
     TurnRunner,
     build_grounded_response,
@@ -41,7 +40,6 @@ from aa.conversation.orchestrator import (
 )
 from aa.conversation.output_limits import (
     DEFAULT_GENERATION_BUDGET_TOKENS,
-    ENVELOPE_FALLBACK_REPLY,
     HARD_CHARS,
     HARD_WORDS,
     QUOTE_BUDGET_CHARS,
@@ -885,18 +883,19 @@ async def test_message_boundary_carries_no_silent_token_cap() -> None:
 
 def test_fixed_operational_replies_fit_envelope() -> None:
     from aa.app import _NEW_REPLY, _START_REPLY, _TEMPORARY_ERROR_REPLY
-
-    assert "The answer" not in ENVELOPE_FALLBACK_REPLY
-    assert "Tell me" not in ENVELOPE_FALLBACK_REPLY
+    from aa.conversation.failures import SERVICE_ERROR_REPLY, is_service_error
 
     for text in (
-        FAIL_CLOSED_REPLY,
-        ENVELOPE_FALLBACK_REPLY,
         _START_REPLY,
         _NEW_REPLY,
         _TEMPORARY_ERROR_REPLY,
     ):
         assert envelope_passes(text), text[:60]
+    assert is_service_error(_TEMPORARY_ERROR_REPLY)
+    assert is_service_error(SERVICE_ERROR_REPLY)
+    with pathlib.Path("src/aa/conversation/output_limits.py").open(encoding="utf-8") as _f:
+        _src = _f.read()
+    assert "ENVELOPE_FALLBACK_REPLY" not in _src
 
 
 async def test_enforce_grounded_envelope_reuses_evidence_without_new_claims(
