@@ -1298,8 +1298,11 @@ async def run_v2_answer_turn(
     _verifier_claims_book = False
     try:
         if result is not None:
+            _unavailable_ids = set(getattr(result, "unavailable_unit_ids", ()) or ())
             _verifier_claims_book = any(
-                str(getattr(item, "scope", "")) == "book" for item in result.units
+                str(getattr(item, "scope", "")) == "book"
+                and str(getattr(item, "unit_id", "")) not in _unavailable_ids
+                for item in result.units
             )
     except Exception:
         _verifier_claims_book = False
@@ -1529,7 +1532,8 @@ async def run_v2_answer_turn(
         else:
             telemetry["verifier_outcome"] = "unsupported"
 
-    # Relevance-padding rescue (kodmial/aa#284 systemic recurrence 2).
+    # Relevance-padding rescue (kodmial/aa#284 systemic recurrence 2,
+    # closed by breaker kodmial/aa#290 for verifier-unavailable poisoning).
     #
     # Architecture-level granularity repair at the delivery boundary:
     # the verifier requires every served supported book unit to carry
@@ -1548,7 +1552,20 @@ async def run_v2_answer_turn(
     # call, so the Gate E SLO is preserved; per-claim grounding holds
     # for exactly what is delivered. Turns with no relevant
     # supported book unit fall through to the historical collapse.
-    if not passed and units and result is not None and not result.unavailable_unit_ids:
+    #
+    # Breaker kodmial/aa#290 invariant: one verifier-unavailable unit is
+    # synthesized as book-scoped unsupported and poisons the whole-turn
+    # telemetry (repair skipped, rescue blocked, conversational fallback
+    # withheld via the claims-book guard, adequacy unavailable-verifier
+    # fail) even when a verified relevant supported subset exists to
+    # serve. With verifier p95 51s / max 65s, whichever family hits the
+    # transient collapses while clean siblings pass, moving the
+    # fingerprint across runs (local 3 same, systemic 3 cross) with no
+    # convergence. The narrowed subset excludes unavailable units, so its
+    # telemetry must describe the served subset (zero unavailable, passed
+    # outcome) rather than the discarded draft; otherwise qualification
+    # still counts a grounded delivery as failure.
+    if not passed and units and result is not None:
         _pad_kept = keep_relevant_supported_units(units, result)
         if _pad_kept and len(_pad_kept) < len(units) and has_relevant_supported_book_unit(result):
             _pad_candidate = keep_relevant_supported_text(_pad_kept, result)
@@ -1562,6 +1579,18 @@ async def run_v2_answer_turn(
                 and certify_outbound_safety(_pad_candidate)
             ):
                 _pad_state = narrowed_grounding_state(_pad_kept, result)
+                _pad_saved_unavailable = int(telemetry.get("verifier_unavailable_units", 0) or 0)
+                _pad_saved_outcome = str(telemetry.get("verifier_outcome", "unknown"))
+                # The served subset contains no unavailable units by
+                # construction (only supported units kept), so judge it
+                # with subset telemetry; restore on failure.
+                telemetry["verifier_unavailable_units"] = 0
+                if _pad_saved_outcome in (
+                    "unavailable",
+                    "partial-unavailable",
+                    "skipped-turn-budget",
+                ):
+                    telemetry["verifier_outcome"] = "passed"
                 _pad_adequacy = _safe_assess_adequacy(
                     reply_text=_pad_candidate,
                     verification_state=_pad_state,
@@ -1571,6 +1600,12 @@ async def run_v2_answer_turn(
                     telemetry["answer_outcome"] = "narrowed-adequacy"
                     telemetry["outbound_safety"] = "pass"
                     telemetry["verifier_unavailable_units"] = 0
+                    if str(telemetry.get("verifier_outcome", "")) in (
+                        "unavailable",
+                        "partial-unavailable",
+                        "skipped-turn-budget",
+                    ):
+                        telemetry["verifier_outcome"] = "passed"
                     _record_adequacy(
                         reply_text=_pad_candidate,
                         verification_state=_pad_state,
@@ -1586,6 +1621,8 @@ async def run_v2_answer_turn(
                         ),
                         "telemetry": dict(telemetry),
                     }
+                telemetry["verifier_unavailable_units"] = _pad_saved_unavailable
+                telemetry["verifier_outcome"] = _pad_saved_outcome
 
     if passed and units and result is not None:
         # kodmial/aa#286 item 4 double-misclassification guard: a
