@@ -263,8 +263,14 @@ async def test_partial_verifier_failure_narrows_instead_of_generic_collapse() ->
     )
     assert outcome["text"] == "Поддержка рядом помогает."
     assert outcome["text"] != NATURAL_CLARIFICATION_REPLY
-    assert outcome["telemetry"]["verifier_outcome"] == "partial-unavailable"
-    assert outcome["telemetry"]["verifier_unavailable_units"] == 1
+    # Breaker kodmial/aa#290: the served narrowed subset excludes the
+    # unavailable unit, so its telemetry describes the served subset (no
+    # unavailable, passed adequacy) rather than the discarded draft.
+    assert outcome["telemetry"]["answer_outcome"] == "narrowed-adequacy"
+    assert outcome["telemetry"]["verifier_outcome"] == "passed"
+    assert outcome["telemetry"]["verifier_unavailable_units"] == 0
+    assert outcome["telemetry"]["adequacy_verdict"] == "pass"
+    assert outcome["telemetry"]["qualified"] is True
     assert outcome["telemetry"]["repair_rounds"] == 0
 
 
