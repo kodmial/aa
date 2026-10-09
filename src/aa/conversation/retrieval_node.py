@@ -282,7 +282,13 @@ async def aretrieve_with_semantic_selection(
         _ordered_fallback = sorted(
             _diverse_fallback, key=lambda item: item.fused_score, reverse=True
         )
-        sections_map = {cid: getattr(index.chunks[cid], "section", "") for cid in index.chunks}
+        # Section lookup stays bounded to the fallback candidates instead
+        # of iterating the whole index on every fallback turn.
+        sections_map: dict[str, str] = {}
+        for _item in _ordered_fallback:
+            _record = index.chunks.get(_item.chunk_id)
+            if _record is not None:
+                sections_map[_item.chunk_id] = str(getattr(_record, "section", "") or "")
         winners = select_top_candidates(
             _ordered_fallback,
             top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS),

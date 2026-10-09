@@ -941,7 +941,11 @@ def retrieve_evidence(
             _scored.sort(key=lambda triple: (-triple[0], triple[1]))
             winners = [candidate for _, _, candidate in _scored]
             semantic_promoted = any(score > 0 for score, _, _ in _scored)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "v2 evidence semantic promotion failed; using RRF order",
+                extra={"category": type(exc).__name__},
+            )
             semantic_promoted = False
     expanded = expand_small_to_big(index, winners, neighbor_window=active.neighbor_window)
     selected, total = select_passages_under_budget(

@@ -66,8 +66,28 @@ MAX_PACK_PASSAGES = 20
 # evidence window). A passage's completeness is a source-fidelity invariant,
 # independent of answer latency or qualification thresholds.
 # Retained only for backwards import compatibility; zero means no
-# generation-stage passage-count cap.
+# generation-stage passage-count cap. Consume only via an explicit
+# ``<= 0`` check (as in ``assess_evidence_window_coverage``) or
+# :func:`apply_answer_generation_window`: never ``pack[:CONST]``
+# (``pack[:0]`` is empty) or ``if CONST`` (``bool(0)`` is False).
 ANSWER_GENERATION_MAX_PASSAGES = 0
+
+
+def apply_answer_generation_window(
+    pack: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the generation window for an Evidence Pack.
+
+    A non-positive cap means the whole pack reaches generation with full
+    text; a positive cap preserves legacy bounded slicing for
+    observability. Centralizes the ``<= 0 means uncapped`` rule so callers
+    never rely on ``pack[:CAP]`` or truthiness, both of which invert for
+    ``0``.
+    """
+    if int(ANSWER_GENERATION_MAX_PASSAGES) <= 0:
+        return pack
+    return pack[: int(ANSWER_GENERATION_MAX_PASSAGES)]
+
 
 # Bounded single answer-draft attempt (Gate C+E live repair,
 # kodmial/aa#217 recurrence 9 on exact main 922dd07 run 37720236046:
@@ -1091,7 +1111,7 @@ async def run_v2_answer_turn(
         not an arbitrary top-N cutoff in answer generation.
         """
         del wider  # Backwards-compatible repair caller; no narrower window.
-        return active_pack
+        return apply_answer_generation_window(active_pack)
 
     async def _draft_with_pack(
         active_pack: list[dict[str, Any]], prompt_text: str, *, wider: bool = False
@@ -2812,6 +2832,7 @@ __all__ = [
     "anchored_adequacy_regen_prompt",
     "anchored_repair_focus",
     "answer_pipeline_node",
+    "apply_answer_generation_window",
     "certify_outbound_safety",
     "compact_supported_to_envelope",
     "contains_cyrillic",
