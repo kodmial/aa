@@ -1,82 +1,92 @@
-# AA prebuilt runtime image (issue #298)
+# Prebuilt AA dependency runtime (issue #298)
 
-## What it is
+## Separation of code and environment
 
-`docker/Dockerfile.aa-runtime` builds a reproducible Linux amd64 /
-Python 3.12 job-runtime image published to `ghcr.io/kodmial/aa-runtime`
-and consumed by `.github/workflows/aa-runtime.yml` **only by immutable
-digest** (`docker/aa-runtime.digest`). It replaces repeated installation
-of ffmpeg/Opus, the full Python dependency resolve (Torch, sherpa-onnx,
-ONNXRuntime, retrieval stack), and the OpenCode curl install on every
-bounded bot session.
+`docker/Dockerfile.aa-runtime` builds the reusable Linux/amd64 environment
+(Python 3.12, native runtime Python libraries, ffmpeg/Opus, pinned OpenCode).
+It does **not** embed AA application code, prompts, private book text, data,
+secrets, session state, or public model weight blobs.
 
-The exact AA application source is never frozen into the image: the
-runtime workflow checks out exact main and installs the project with
-`pip install -e . --no-deps` (seconds) on top of the pinned dependency
-layer.
+The image build context is **only `./docker`**, restricted by
+`docker/.dockerignore` to `Dockerfile.aa-runtime` and
+`opencode.version`. Do not switch context to the repository root.
+At bot startup `actions/checkout` supplies the exact current AA SHA;
+`pip install -e . --no-deps` connects its code to prebuilt dependencies.
+The runtime verifies that SHA and refuses an untrusted or missing image.
 
-## Model distribution decision (measured)
+## Public models and sensitive source data
 
-Public model weights are intentionally **not baked** into the image.
-They keep flowing through the locked `actions/cache` + checksum-verified
-prefetch path (`corpus/embedding.lock.json`, `corpus/voice.lock.json`):
+E5, GigaAM, Silero and the presentation classifier stay outside the base
+environment image and use content-addressed Actions caches and lockfile
+identity checks. A cache hit avoids model download; a miss downloads and
+validates before the bot can become READY. A cache miss must not return a
+false PASS. Measure cold/hot image pulls alongside model restore/download,
+then decide whether separate model layers would improve *total* startup.
+Do not assert that all model caches are already warm. Review the actual
+model licenses before redistributing model weights in any future image.
 
-- E5 embedding snapshot (~1.1 GB), GigaAM large INT8 (~1-2 GB), Silero
-  TTS (~0.1 GB), and the presentation classifier would bloat every image
-  pull by gigabytes, dwarfing the dependency/tooling layers (~2-3 GB
-  total) and slowing cold start more than the cache path on hosted
-  runners (registry bandwidth, disk/IO, GHCR pull limits).
-- `actions/cache` restores are content-addressed by exact revision locks
-  with `--check-only` prune-and-redownload semantics, so the validated
-  hot path performs **zero downloads** while a cold miss rebuilds
-  deterministically within bounds.
-- Baking weights into independent Docker layers was evaluated and
-  rejected for now: it couples large binary churn to the dependency
-  layer cache, complicates license redistribution review per asset, and
-  risks caching private material. Revisit only with measured cold-pull
-  numbers showing a net win.
+Book/corpus plaintext, keys, decrypted retrieval indexes, user messages,
+Telegram audio and sessions never enter Docker build context or image layers.
+The existing encrypted derived-retrieval cache remains a separate runtime
+artifact and must be validated after restore.
 
-Before/after timing is reported by `scripts/verify_runtime_image.py`
-(timings_ms), the image workflow step summary (image size, digest,
-provenance), and the existing voice/prefetch summaries
-(downloaded_bytes vs hit). No speed claim is valid without those three.
+## Safe two-stage activation
 
-## Rebuild
+**Stage A — build without affecting existing bot sessions:**
 
-Push to `main` touching the Dockerfile, `docker/opencode.version`,
-`pyproject.toml`, model locks, or the image workflow triggers
-`.github/workflows/aa-runtime-image.yml`, which builds with BuildKit
-registry-layer caching, validates (ffmpeg/libopus, native imports,
-pinned OpenCode, secret scan, provenance), pushes by digest, and runs a
-fresh-runner canary that never starts a Telegram poller. Pull requests
-build and validate without pushing. Owner-only `workflow_dispatch`
-is available for prewarming.
+1. PR CI builds an image locally and MUST pass native Python import, OpenCode,
+   and codec smoke checks. It publishes nothing and does not start Telegram.
+2. After the PR merges, trusted `main` push builds using Buildx registry
+   layer cache, publishes `ghcr.io/kodmial/aa-runtime:sha-<commit>`, and
+   records an immutable `sha256:...` image digest. No mutable `:latest`
+   tag is used by the bot.
+3. A **separate GitHub-hosted runner** pulls the image by digest and runs the
+   canary with no Telegram poller and no private secrets. An image failing
+   canary cannot be activated.
 
-## Digest promotion
+**Stage B — automatic, reviewed promotion:**
 
-1. Wait for the image workflow canary on exact main to pass.
-2. Copy the published digest from the step summary or the
-   `aa-runtime-image-digest` artifact.
-3. Run `python scripts/promote_runtime_image.py --digest sha256:<hex> --apply`
-   to update `docker/aa-runtime.digest` and the `aa-runtime.yml`
-   container pin together.
-4. Commit as one change; CI must pass.
+4. Following a successful image canary, the workflow (using the existing
+   `TAP_PAT` required for PR-triggered CI) runs
+   `scripts/promote_runtime_image.py --digest sha256:<digest> --apply`.
+   It creates a separate normal PR updating both
+   `docker/aa-runtime.digest` and `aa-runtime.yml` together. No direct
+   writes to protected `main`.
+5. CI and automated review must pass before that PR merges. Until this
+   stage merges, the **old ubuntu-latest AA runtime is unchanged** and
+   `/run` continues to work.
+6. Promotion removes repeated setup-python and uses the prebuilt package
+   layer, but still validates a synthetic ffmpeg encode/decode, OpenCode
+   pin, current AA checkout, native dependencies and external model identity.
+   The existing fixed 5h campaign and single-poller guard are unchanged.
+7. A changed dependency manifest during canary triggers a fresh main image
+   build rather than promoting stale bytes. Repeated promotion dispatches
+   reuse an already open promotion PR for the same digest.
 
-## Rollback
+## Rollback and failure behavior
 
-One commit: delete the `container:` block from
-`.github/workflows/aa-runtime.yml` to return to the legacy
-`ubuntu-latest` runner. The apt-get, full pip install, and OpenCode
-curl branches remain as the bounded cold-miss path, so rollback needs
-no other edits. A missing/inaccessible image or digest mismatch fails
-the job at container creation before any poller starts (never READY,
-never a duplicate poller).
+The live job uses the image **only by immutable digest**. A revoked/inaccessible
+GHCR package or image mismatch fails before starting OpenCode/Telegram;
+it must not emit READY or open a second Telegram poller. Revert the activation
+PR to restore the earlier `ubuntu-latest` job; the dependency installation
+cold path remains available. Existing sessions cannot have their image
+changed mid-flight.
 
-## Safety
+The image build needs `packages: write`, and the runtime needs
+`packages: read` plus GHCR credentials. To generate a CI-triggering
+promotion PR, the workflow needs `TAP_PAT`; if absent it must fail clearly,
+not pretend that the image is activated.
 
-No Telegram token, PAT, provider token, age identity, canonical EN/RU
-plaintext, decrypted retrieval index/corpus, chats, voice/PCM/OGG,
-transcripts, generated responses, or user/session data enters the build
-context, layers, logs, or public caches (`docker/.dockerignore` plus
-the workflow secret scan). Encrypted derived retrieval keeps its
-verified content-addressed cache/restore path.
+## Measurement and completion
+
+A published image digest and successful dependency canary prove only
+infrastructure readiness, not Product Contract Gate C/F PASS. Record
+the complete elapsed time from `/run` to an authoritative `READY` marker
+for both legacy and digest-based runtime, including image pull, public model
+cache restore and corpus preparation. State measured values and cache hit/miss
+conditions; do not invent performance improvements.
+
+An owner can invoke `AA runtime image build/publish` manually to rebuild
+from trusted main. Rebuild on dependency/tool/lock changes; ordinary edits
+to AA conversation code are loaded by `checkout`, not by rebuilding
+the image.
