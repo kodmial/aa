@@ -117,11 +117,74 @@
       "source_id": "aarussia-online",
       "source_url": "https://aarussia.ru/online-groups/",
       "timezone": "Asia/Vladivostok"
+    },
+    {
+      "group_id": "g-blg-edinstvo",
+      "name": "Edinstvo",
+      "country": "RU",
+      "region": "Amur region",
+      "city": "Blagoveshchensk",
+      "place_id": "place-blagoveshchensk-city",
+      "format": "in_person",
+      "address": "Blagoveshchensk, public venue listed on the official directory page",
+      "timezone": "Asia/Yakutsk",
+      "access": "open",
+      "source_id": "region-amur",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "record_type": "group_listing"
+    },
+    {
+      "group_id": "g-arkh-istok",
+      "name": "Istok",
+      "country": "RU",
+      "region": "Arkhangelsk region",
+      "city": "Arkhangelsk",
+      "place_id": "place-arkhangelsk-city",
+      "format": "in_person",
+      "address": "Arkhangelsk, public venue listed on the official directory page",
+      "timezone": "Europe/Moscow",
+      "access": "open",
+      "source_id": "region-arkhangelsk",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "record_type": "group_listing"
+    },
+    {
+      "group_id": "g-bel-12",
+      "name": "12",
+      "country": "RU",
+      "region": "Belgorod region",
+      "city": "Belgorod",
+      "place_id": "place-belgorod-city",
+      "format": "in_person",
+      "address": "Belgorod, public venue listed on the official directory page",
+      "timezone": "Europe/Moscow",
+      "access": "unknown",
+      "source_id": "region-belgorod",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "record_type": "group_listing"
+    },
+    {
+      "group_id": "g-online-partizan",
+      "name": "Partizan Online",
+      "country": "RU",
+      "region": null,
+      "city": null,
+      "place_id": null,
+      "format": "online",
+      "online_url": "https://aarussia.ru/online-groups/",
+      "timezone": "Europe/Moscow",
+      "access": "open",
+      "source_id": "aarussia-online",
+      "source_url": "https://aarussia.ru/online-groups/",
+      "record_type": "online_group_link"
     }
   ],
   "places": [
     {
-      "aliases": ["moskva", "москва"],
+      "aliases": [
+        "moskva",
+        "москва"
+      ],
       "coverage_kind": "verified_groups",
       "display_name": "Moscow",
       "place_id": "place-moscow-city",
@@ -131,7 +194,14 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["spb", "спб", "sankt-peterburg", "санкт петербург", "санкт-петербург", "питер"],
+      "aliases": [
+        "spb",
+        "спб",
+        "sankt-peterburg",
+        "санкт петербург",
+        "санкт-петербург",
+        "питер"
+      ],
       "coverage_kind": "verified_groups",
       "display_name": "Saint Petersburg",
       "place_id": "place-spb-city",
@@ -141,7 +211,11 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["ekaterinburg", "екатеринбург", "екб"],
+      "aliases": [
+        "ekaterinburg",
+        "екатеринбург",
+        "екб"
+      ],
       "coverage_kind": "verified_groups",
       "display_name": "Yekaterinburg",
       "place_id": "place-yekaterinburg-city",
@@ -151,7 +225,11 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["novosibirsk", "новосибирск", "нск"],
+      "aliases": [
+        "novosibirsk",
+        "новосибирск",
+        "нск"
+      ],
       "coverage_kind": "directory_only",
       "display_name": "Novosibirsk",
       "place_id": "place-novosibirsk-city",
@@ -161,7 +239,10 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["kazan", "казань"],
+      "aliases": [
+        "kazan",
+        "казань"
+      ],
       "coverage_kind": "verified_groups",
       "display_name": "Kazan",
       "place_id": "place-kazan-city",
@@ -171,7 +252,10 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["kirov", "киров"],
+      "aliases": [
+        "kirov",
+        "киров"
+      ],
       "coverage_kind": "directory_only",
       "display_name": "Kirov",
       "place_id": "place-kirov-kirovskaya",
@@ -181,7 +265,10 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["kirov", "киров"],
+      "aliases": [
+        "kirov",
+        "киров"
+      ],
       "coverage_kind": "directory_only",
       "display_name": "Kirov",
       "place_id": "place-kirov-kaluzhskaya",
@@ -191,7 +278,10 @@
       "source_id": "aarussia-russiagroups"
     },
     {
-      "aliases": ["vladivostok", "владивосток"],
+      "aliases": [
+        "vladivostok",
+        "владивосток"
+      ],
       "coverage_kind": "directory_only",
       "display_name": "Vladivostok",
       "place_id": "place-vladivostok-city",
@@ -199,6 +289,45 @@
       "region_hint": "Primorsky region",
       "region_id": "region-primorsky",
       "source_id": "aarussia-russiagroups"
+    },
+    {
+      "place_id": "place-blagoveshchensk-city",
+      "display_name": "Blagoveshchensk",
+      "place_type": "city",
+      "region_id": "region-amur",
+      "region_hint": "Amur region",
+      "aliases": [
+        "blagoveshchensk",
+        "благовещенск"
+      ],
+      "coverage_kind": "verified_groups",
+      "source_id": "region-amur"
+    },
+    {
+      "place_id": "place-arkhangelsk-city",
+      "display_name": "Arkhangelsk",
+      "place_type": "city",
+      "region_id": "region-arkhangelsk",
+      "region_hint": "Arkhangelsk region",
+      "aliases": [
+        "arkhangelsk",
+        "архангельск"
+      ],
+      "coverage_kind": "verified_groups",
+      "source_id": "region-arkhangelsk"
+    },
+    {
+      "place_id": "place-belgorod-city",
+      "display_name": "Belgorod",
+      "place_type": "city",
+      "region_id": "region-belgorod",
+      "region_hint": "Belgorod region",
+      "aliases": [
+        "belgorod",
+        "белгород"
+      ],
+      "coverage_kind": "verified_groups",
+      "source_id": "region-belgorod"
     }
   ],
   "region_links": [
@@ -281,6 +410,36 @@
       "source_id": "region-primorsky",
       "support": "navigation-only",
       "url": "https://aarussia.ru/aagroups/russiagroups/"
+    },
+    {
+      "link_id": "rl-amur",
+      "region_id": "region-amur",
+      "region_name": "Amur region",
+      "display_name": "Amur region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "source_id": "region-amur",
+      "support": "navigation-only",
+      "record_type": "region_directory_link"
+    },
+    {
+      "link_id": "rl-arkhangelsk",
+      "region_id": "region-arkhangelsk",
+      "region_name": "Arkhangelsk region",
+      "display_name": "Arkhangelsk region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "source_id": "region-arkhangelsk",
+      "support": "navigation-only",
+      "record_type": "region_directory_link"
+    },
+    {
+      "link_id": "rl-belgorod",
+      "region_id": "region-belgorod",
+      "region_name": "Belgorod region",
+      "display_name": "Belgorod region AA directory",
+      "url": "https://aarussia.ru/aagroups/russiagroups/",
+      "source_id": "region-belgorod",
+      "support": "navigation-only",
+      "record_type": "region_directory_link"
     }
   ],
   "schema_version": 1,
@@ -500,6 +659,134 @@
       "weekdays": [
         2
       ]
+    },
+    {
+      "slot_id": "s-blg-edinstvo-mon-1900",
+      "group_id": "g-blg-edinstvo",
+      "format": "in_person",
+      "recurrence": "weekly",
+      "weekdays": [
+        0
+      ],
+      "start_local": "19:00",
+      "end_local": null,
+      "timezone": "Asia/Yakutsk",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "open",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
+    },
+    {
+      "slot_id": "s-blg-edinstvo-wed-1900",
+      "group_id": "g-blg-edinstvo",
+      "format": "in_person",
+      "recurrence": "weekly",
+      "weekdays": [
+        2
+      ],
+      "start_local": "19:00",
+      "end_local": null,
+      "timezone": "Asia/Yakutsk",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "open",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
+    },
+    {
+      "slot_id": "s-blg-edinstvo-fri-1900",
+      "group_id": "g-blg-edinstvo",
+      "format": "in_person",
+      "recurrence": "weekly",
+      "weekdays": [
+        4
+      ],
+      "start_local": "19:00",
+      "end_local": null,
+      "timezone": "Asia/Yakutsk",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "open",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
+    },
+    {
+      "slot_id": "s-arkh-istok-sun-1900",
+      "group_id": "g-arkh-istok",
+      "format": "in_person",
+      "recurrence": "weekly",
+      "weekdays": [
+        6
+      ],
+      "start_local": "19:00",
+      "end_local": null,
+      "timezone": "Europe/Moscow",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "open",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
+    },
+    {
+      "slot_id": "s-bel-12-daily-1830",
+      "group_id": "g-bel-12",
+      "format": "in_person",
+      "recurrence": "daily",
+      "weekdays": [],
+      "start_local": "18:30",
+      "end_local": null,
+      "timezone": "Europe/Moscow",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "unknown",
+      "source_url": "https://aarussia.ru/aagroups/russiagroups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
+    },
+    {
+      "slot_id": "s-online-partizan-daily-2000",
+      "group_id": "g-online-partizan",
+      "format": "online",
+      "recurrence": "daily",
+      "weekdays": [],
+      "start_local": "20:00",
+      "end_local": null,
+      "timezone": "Europe/Moscow",
+      "date": null,
+      "month_week": null,
+      "month_weekday": null,
+      "valid_from": null,
+      "valid_until": null,
+      "cancellations": [],
+      "access": "open",
+      "source_url": "https://aarussia.ru/online-groups/",
+      "schedule_verified_at": "2026-10-05T12:00:00+00:00",
+      "parsing_status": "verified"
     }
   ]
 }
