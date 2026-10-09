@@ -20,10 +20,12 @@ permissions:
   # Cache save needs write; restore needs read. Runtime itself stays read-only
   # except for the privacy-safe completion report posted to control issue #31
   # (run id, duration, outcome and counters only; never message text,
-  # prompts, corpus dumps or credentials).
+  # prompts, corpus dumps or credentials). packages: read pulls the private
+  # prebuilt GHCR runtime image (issue #298).
   actions: write
   contents: read
   issues: write
+  packages: read
 
 # Issue #6 concurrency: there is never a second active poller for the same
 # bot token. Overlapping dispatches serialize here (never replace the
@@ -41,6 +43,9 @@ jobs:
     # 330-minute job timeout stays below the 6-hour hosted-runner ceiling so
     # Telegram/OpenCode cleanup always has headroom.
     timeout-minutes: 330
+    # Image promotion occurs only after the trusted GHCR build and its
+    # fresh-runner canary validate a real immutable digest. Until promotion,
+    # keep the existing hosted-runner path so /run remains operational.
     steps:
       - name: Reject duplicate runtime
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -227,11 +232,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Issue #298 hot path: inside the prebuilt image ffmpeg with
+          # libopus is already present, so this is a seconds-long smoke.
+          # The apt-get branch is the bounded cold-miss path for the legacy
+          # runner only (rollback) and never runs unbounded resolves twice.
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
           fi
           ffmpeg -version | sed -n '1p'
+          ffmpeg -hide_banner -h encoder=libopus 2>&1 | grep -q libopus
           # Exercise the actual OGG/Opus encoder and Telegram ASR PCM decoder.
           # This is a codec smoke test; it never uses or stores user audio.
           tmpdir="$(mktemp -d)"
@@ -246,9 +256,37 @@ jobs:
           echo "AA voice codec smoke: OGG/Opus encode/decode PASS"
 
       - name: Install worker
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+          set -euo pipefail
+          # Issue #298 hot path: the image already carries the pinned
+          # dependency layer; only the exact checked-out application source
+          # is installed (seconds, no resolution). The full install is the
+          # bounded cold-miss path for the legacy runner.
+          # The gate checks exact pinned versions from pyproject.toml (not
+          # mere importability) so a stale prebuilt image falls back to the
+          # full install instead of failing later, mirroring the pinned
+          # OpenCode version check below.
+          if python - <<'PY' 2>/dev/null; then
+            import importlib.metadata
+            import tomllib
+            from pathlib import Path
+            pins = {}
+            for dep in tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]:
+                name, sep, version = dep.partition("==")
+                if sep:
+                    pins[name.strip().lower().replace("_", "-")] = version.strip()
+            for dist, mod in (("torch", "torch"), ("sherpa-onnx", "sherpa_onnx"), ("onnxruntime", "onnxruntime"), ("faiss-cpu", "faiss")):
+                want = pins[dist]
+                got = importlib.metadata.version(dist)
+                assert got == want, f"{dist} {got} != pinned {want}"
+                __import__(mod)
+          PY
+            pip install -e . --no-deps
+          else
+            python -m pip install --upgrade pip
+            pip install -e .
+          fi
 
       - name: Prefetch pinned embedding model
         continue-on-error: true
@@ -362,9 +400,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Issue #298 hot path: skip the curl install when the prebuilt
+          # image already ships the pinned OpenCode from
+          # docker/opencode.version.
+          want="$(cat docker/opencode.version)"
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -qF "$want"; then
+            echo "OpenCode $want already present (prebuilt image hot path)."
+            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
-              bash -s -- --version 1.18.34; then
+              bash -s -- --version "$want"; then
               echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
               exit 0
             fi

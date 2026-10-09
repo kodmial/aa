@@ -1,0 +1,5 @@
+# Only immutable build-environment inputs are sent to BuildKit.
+# The AA source, corpus, user data and secrets are never build inputs.
+*
+!Dockerfile.aa-runtime
+!opencode.version
