@@ -286,9 +286,9 @@ jobs:
             echo "::error::Main moved during promotion checkout; refusing stale PR."
             exit 1
           fi
-          if [[ "$checked" != "$GITHUB_SHA" ]] && ! git diff --quiet "$GITHUB_SHA" "$checked" -- \\
-            docker/Dockerfile.aa-runtime docker/.dockerignore docker/opencode.version \\
-            pyproject.toml corpus/embedding.lock.json corpus/voice.lock.json \\
+          if [[ "$checked" != "$GITHUB_SHA" ]] && ! git diff --quiet "$GITHUB_SHA" "$checked" -- \
+            docker/Dockerfile.aa-runtime docker/.dockerignore docker/opencode.version \
+            pyproject.toml corpus/embedding.lock.json corpus/voice.lock.json \
             scripts/verify_runtime_image.py .github/workflows/aa-runtime-image.yml; then
             echo "::warning::Image inputs advanced; dispatching one fresh main image build."
             gh workflow run aa-runtime-image.yml --ref main
