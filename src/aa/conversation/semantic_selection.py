@@ -277,9 +277,9 @@ def validate_semantic_selection(
             raise SemanticSelectionError(f"selection cites unknown candidate {chunk_id!r}")
         seen.add(chunk_id)
         cleaned.append(chunk_id)
-    if not cleaned:
-        raise SemanticSelectionError("semantic selection selected no candidates")
     cleaned = cleaned[:MAX_SELECTED_CHUNKS]
+    if not cleaned and not bool(selection.need_more_detail):
+        raise SemanticSelectionError("semantic selection selected no candidates")
     followups: list[str] = []
     for raw in selection.followup_queries:
         query = " ".join(str(raw or "").split()).strip()

@@ -57,6 +57,8 @@ def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[s
                 "char_start": passage.char_start,
                 "char_end": passage.char_end,
                 "text_sha256": passage.text_sha256,
+                "source_sha256": passage.source_sha256,
+                "corpus_version": pack.corpus_version,
             }
         )
         for chunk_id in passage.child_chunk_ids:
@@ -70,6 +72,8 @@ def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[s
                     "char_start": passage.char_start,
                     "char_end": passage.char_end,
                     "text_sha256": passage.text_sha256,
+                    "source_sha256": passage.source_sha256,
+                    "corpus_version": pack.corpus_version,
                 }
             )
     return hits, pack_dicts
@@ -224,6 +228,13 @@ async def aretrieve_with_semantic_selection(
     )
     sel_ms = (time.perf_counter() - sel_started) * 1000.0
     winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
+    # Observable retrieval stages: discovery alone never blocks later
+    # consideration. Only ids the model actually previewed/read are
+    # excluded from follow-up promotion; a rank-66 candidate that was
+    # discovered but never previewed stays eligible.
+    discovered_ids = [item.chunk_id for item in broad_sorted if item.chunk_id in fused]
+    previewed_ids = [preview.chunk_id for preview in previews]
+    previewed_set = set(previewed_ids)
     # One bounded targeted follow-up when the selector reports weak/unknown
     # relevance: a focused additional search that must add genuinely new
     # chunk ids (never a silent regeneration on the same top prefixes).
@@ -244,9 +255,11 @@ async def aretrieve_with_semantic_selection(
                 f_fused, f_pool = fuse_query_pool(
                     f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
                 )
-                seen = {w.chunk_id for w in winners} | set(fused.keys())
-                # Genuinely new evidence first: ids absent from the first
-                # broad pool, best-first, bounded.
+                seen = {w.chunk_id for w in winners} | previewed_set
+                # Genuinely new evidence first: ids the model never
+                # previewed/read, best-first, bounded. Discovered-only ids
+                # (returned by the first retrieval but outside the preview
+                # window) remain promotable here.
                 fresh = sorted(
                     (
                         cand
@@ -263,9 +276,18 @@ async def aretrieve_with_semantic_selection(
                     winners.append(cand)
                     fused[cand.chunk_id] = cand
                     followup_added += 1
-            except Exception:
+            except Exception as exc:
+                from aa.opencode.errors import OpenCodeRateLimitError as _FollowupRateLimit
+
+                if isinstance(exc, (_FollowupRateLimit, asyncio.CancelledError)):
+                    raise
                 followup_added = 0
-    if not winners:
+    explicit_empty_followup = bool(
+        getattr(selection, "_used_model", False)
+        and not selection.selected_chunk_ids
+        and bool(selection.need_more_detail)
+    )
+    if not winners and not explicit_empty_followup:
         # Fail-safe bounded fallback (never empty silent success): top RRF
         # winners in fused order. Reached only when selection yields nothing
         # usable; deep ranks stay reachable via the previews above on retry.
@@ -323,6 +345,7 @@ async def aretrieve_with_semantic_selection(
     except Exception:
         _diverse_unique = 0
 
+    read_ids = [w.chunk_id for w in winners]
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
         "primary_query_digest": _digest(cleaned[0]),
@@ -339,6 +362,9 @@ async def aretrieve_with_semantic_selection(
         "semantic_selection_model": selection_model is not None,
         "semantic_promoted": True,
         "followup_added": followup_added,
+        "discovered_ids": list(discovered_ids),
+        "previewed_ids": list(previewed_ids),
+        "read_ids": list(read_ids),
         "neighbor_window": active.neighbor_window,
         "expanded_passages": len(expanded),
         "selected_passages": len(selected),
