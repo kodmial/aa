@@ -264,6 +264,8 @@ async def judge_whole_turn(
         "You are an independent whole-turn response-quality judge. "
         "Return exactly the required strict boolean JSON decision."
     )
+    from aa.opencode.errors import OpenCodeRateLimitError
+
     try:
         structured = getattr(model, "ainvoke_structured", None)
         if callable(structured):
@@ -275,6 +277,8 @@ async def judge_whole_turn(
                     retry_count=WHOLE_TURN_JUDGE_MAX_ATTEMPTS,
                 )
                 decision = validate_whole_turn_decision(raw)
+            except OpenCodeRateLimitError:
+                raise
             except Exception:
                 text_invoke = getattr(model, "_ainvoke_text", None) or getattr(
                     model, "ainvoke", None
@@ -304,8 +308,6 @@ async def judge_whole_turn(
             text_reply = content if isinstance(content, str) else str(content)
             decision = validate_whole_turn_decision(parse_whole_turn_text_decision(text_reply))
     except Exception as exc:
-        from aa.opencode.errors import OpenCodeRateLimitError
-
         # A rate limit requires fresh-runner checkpoint recovery, not a
         # fabricated negative semantic verdict. Keep the 429 lifecycle.
         if isinstance(exc, OpenCodeRateLimitError):
