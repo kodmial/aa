@@ -98,10 +98,30 @@ def check_pins() -> list[str]:
         errors.append("Dockerfile must verify ffmpeg libopus support")
     if "ffmpeg" not in docker_text.lower():
         errors.append("Dockerfile must install ffmpeg")
+    # Build from docker/ only: an allowlisted minimal context is stronger
+    # than excluding private paths from the repository-root build context.
+    ignore = ROOT / "docker" / ".dockerignore"
+    try:
+        ignore_lines = {line.strip() for line in ignore.read_text(encoding="utf-8").splitlines()}
+    except OSError as exc:
+        errors.append(f"image context ignore file unreadable: {exc}")
+        ignore_lines = set()
+    if not {"*", "!Dockerfile.aa-runtime", "!opencode.version"}.issubset(ignore_lines):
+        errors.append("image context must allowlist only Dockerfile and opencode.version")
+    image_workflow = ROOT / ".github" / "workflows" / "aa-runtime-image.yml"
+    try:
+        image_text = image_workflow.read_text(encoding="utf-8")
+        if "context: ./docker" not in image_text:
+            errors.append("Docker build context must be ./docker (not repository root)")
+    except OSError as exc:
+        errors.append(f"image workflow unreadable: {exc}")
+    copy_lines = [line.strip() for line in docker_text.splitlines()
+                  if line.strip().startswith(("COPY ", "ADD "))]
+    if copy_lines != ["COPY opencode.version /opt/aa/opencode.version"]:
+        errors.append("image must copy only the pinned OpenCode version, never AA source")
     for forbidden in FORBIDDEN_DOCKER_COPY:
-        for line in docker_text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("COPY") and forbidden in stripped:
+        for line in copy_lines:
+            if forbidden in line:
                 errors.append(f"Dockerfile must not COPY {forbidden}")
     return errors
 
@@ -109,29 +129,30 @@ def check_pins() -> list[str]:
 def check_digest_wiring(*, allow_placeholder: bool) -> list[str]:
     errors: list[str] = []
     try:
-        digest_line = DIGEST_FILE.read_text(encoding="utf-8").strip().splitlines()
-    except OSError as exc:
-        return [f"digest file unreadable: {exc}"]
-    digest = digest_line[-1].strip() if digest_line else ""
-    if not DIGEST_RE.match(digest):
-        errors.append(f"digest file malformed: {digest!r}")
-        return errors
-    if digest.endswith(":" + ZERO_DIGEST) and not allow_placeholder:
-        errors.append("digest file still holds the pre-promotion placeholder")
-    try:
+        digest_lines = DIGEST_FILE.read_text(encoding="utf-8").strip().splitlines()
+        digest = digest_lines[-1].strip() if digest_lines else ""
         workflow_text = RUNTIME_WORKFLOW.read_text(encoding="utf-8")
     except OSError as exc:
-        return errors + [f"aa-runtime.yml unreadable: {exc}"]
-    if "ghcr.io/kodmial/aa-runtime@sha256:" not in workflow_text:
-        errors.append("aa-runtime.yml is not pinned to the GHCR runtime image")
-    elif digest not in workflow_text and ZERO_DIGEST not in workflow_text:
-        errors.append("aa-runtime.yml container pin does not match digest file")
-    if "container:" not in workflow_text or "credentials:" not in workflow_text:
-        errors.append("aa-runtime.yml must use container.credentials for GHCR pull")
-    if "packages: read" not in workflow_text:
-        errors.append("aa-runtime.yml must grant packages: read for GHCR pull")
+        return [f"runtime image staging metadata unavailable: {exc}"]
+    if not DIGEST_RE.fullmatch(digest):
+        return [f"digest file malformed: {digest!r}"]
+    placeholder = digest.endswith(":" + ZERO_DIGEST)
+    container_active = "\\n    container:\\n" in workflow_text
+    if placeholder:
+        # First-stage implementation must *not* turn on a nonexistent image.
+        if container_active:
+            errors.append("unpublished placeholder image must never activate the runtime container")
+        if not allow_placeholder:
+            errors.append("image not yet published/promoted")
+    else:
+        if not container_active:
+            errors.append("validated digest exists but AA job is not using it")
+        if digest not in workflow_text:
+            errors.append("runtime container digest differs from promoted digest record")
+        if "credentials:" not in workflow_text or "packages: read" not in workflow_text:
+            errors.append("runtime image job lacks GHCR read credentials")
     if "group: aa-bot-runtime" not in workflow_text:
-        errors.append("aa-runtime.yml must keep the no-duplicate-poller concurrency group")
+        errors.append("AA must keep the single-poller concurrency group")
     return errors
 
 
@@ -278,11 +299,8 @@ def main(argv: list[str] | None = None) -> int:
 
     timings: dict[str, int] = {}
     errors = check_pins()
-    errors += check_digest_wiring(allow_placeholder=args.allow_placeholder_digest or args.canary)
-    if args.canary:
-        # Canary runs inside the freshly pulled image: digest placeholder is
-        # irrelevant because the image reference itself is the digest under test.
-        errors = [e for e in errors if "placeholder" not in e and "container pin" not in e]
+    if not args.canary:
+        errors += check_digest_wiring(allow_placeholder=args.allow_placeholder_digest)
     if errors:
         print(json.dumps({"status": "fail", "errors": errors}, sort_keys=True))
         return 1
@@ -293,7 +311,11 @@ def main(argv: list[str] | None = None) -> int:
     errors += check_head_match()
     # Identity checks only: --check-only never downloads and prunes nothing
     # except stale local content; the bounded download path stays in workflow.
-    errors += run_check_only_prefetch()
+    # Fresh-runner image canary intentionally has no cached public model data.
+    # Missing model caches are not a defect in the dependency image itself;
+    # the real runtime restores and validates those separately.
+    if not args.canary:
+        errors += run_check_only_prefetch()
     payload: dict[str, object] = {"status": "pass" if not errors else "fail", "timings_ms": timings}
     if errors:
         payload["errors"] = errors
