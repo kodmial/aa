@@ -196,18 +196,49 @@ def check_exact_quotes(
     units: Sequence[ResponseUnitDraft],
     result: GroundingResult,
     passages: Sequence[dict[str, Any]],
+    answer_text: str | None = None,
 ) -> GroundingResult:
     """Fail closed when a supported verdict quotes text not in cited passages.
 
-    Quoted spans use the deterministic quote-span detector. A non-empty
-    quoted span in a supported unit must appear verbatim in at least one
-    cited exact passage for its unit; otherwise the draft cannot cross the
-    product boundary. Unsupported units are already blocked and narrowed
-    away, so their quotes are irrelevant. Turn-independent, never an
-    exact-question special case.
-    """
-    from aa.conversation.output_limits import extract_quoted_spans
+    Whole-answer exact-quotation checking (kodmial/aa#308): quoted spans
+    are extracted from the complete actual candidate BEFORE sentence
+    segmentation via the canonical parser, so multi-sentence quotations
+    crossing sentence boundaries, paragraphs and newlines validate as ONE
+    entire span against a specific exact contiguous canonical source
+    range. Changed negation, one substituted word or a fabricated second
+    sentence fails because the entire span must appear verbatim in the
+    cited passages. Unmatched/dangling quotations never silently pass.
+    Unsupported units are already blocked and narrowed away, so their
+    quotes are irrelevant. Turn-independent, never an exact-question
+    special case.
 
+    ``answer_text`` is the actual candidate the units were split from;
+    unit ``char_start``/``char_end`` offsets are candidate-relative, so
+    newlines and spacing survive exactly. Without it the joined unit
+    texts are used (whitespace-normalized fallback for legacy callers).
+    """
+    from aa.conversation.quote_provenance import (
+        anchor_book_span,
+        extract_answer_quotes,
+        origin_for_verdict,
+    )
+
+    # The full candidate is the actual draft text when supplied: sentence
+    # splitting must not fragment a quotation before validation. Offsets
+    # below are candidate-relative; per-unit overlap is resolved through
+    # the unit spans.
+    candidate = (
+        answer_text if isinstance(answer_text, str) else " ".join(unit.text for unit in units)
+    )
+    extraction = extract_answer_quotes(candidate)
+    if extraction.dangling:
+        verdict_by_id = {verdict.unit_id: verdict for verdict in result.units}
+        for unit in units:
+            verdict = verdict_by_id.get(unit.unit_id)
+            if verdict is not None and verdict.supported:
+                raise VerifierValidationError(
+                    f"unit {unit.unit_id!r} carries unmatched quotation; failing closed"
+                )
     by_id = _pack_index(passages)
     verdict_by_id = {verdict.unit_id: verdict for verdict in result.units}
     for unit in units:
@@ -216,26 +247,112 @@ def check_exact_quotes(
             raise VerifierValidationError(f"missing verdict for {unit.unit_id!r}")
         if not verdict.supported:
             continue
-        spans = [span for span in extract_quoted_spans(unit.text) if span.strip()]
-        if not spans:
+        origin = origin_for_verdict(verdict)
+        # User-attributed quotations are proven against the HumanMessage
+        # index in check_quote_origins, never here against book passages.
+        if origin == "user_report":
+            continue
+        if origin in ("assistant_capability", "conversation_glue", "safety_override"):
+            continue
+        spans = [span.span_text for span in extraction.spans if span.span_text.strip()]
+        # Only spans overlapping this unit's slice of the candidate are
+        # this unit's responsibility. With the actual candidate, unit
+        # offsets are candidate-relative and exact; otherwise fall back
+        # to locating unit texts in the joined candidate.
+        unit_spans: list[str] = []
+        use_offsets = isinstance(answer_text, str)
+        if use_offsets:
+            try:
+                ustart, uend = int(unit.char_start), int(unit.char_end)
+                if not (0 <= ustart < uend <= len(candidate)):
+                    use_offsets = False
+            except (TypeError, ValueError):
+                use_offsets = False
+        if use_offsets:
+            for span in extraction.spans:
+                if span.answer_char_start < uend and span.answer_char_end > ustart:
+                    if span.span_text.strip():
+                        unit_spans.append(span.span_text)
+        else:
+            try:
+                cursor = 0
+                positions: list[tuple[str, int, int]] = []
+                for item in units:
+                    start = candidate.find(item.text, cursor)
+                    if start < 0:
+                        break
+                    positions.append((item.unit_id, start, start + len(item.text)))
+                    cursor = start + len(item.text)
+                own = next((pos for pos in positions if pos[0] == unit.unit_id), None)
+                if own is not None:
+                    _, ustart, uend = own
+                    for span in extraction.spans:
+                        if span.answer_char_start < uend and span.answer_char_end > ustart:
+                            if span.span_text.strip():
+                                unit_spans.append(span.span_text)
+                else:
+                    from aa.conversation.output_limits import (
+                        extract_quoted_spans as _legacy_spans,
+                    )
+
+                    unit_spans = [s for s in _legacy_spans(unit.text) if s.strip()]
+            except (ValueError, AttributeError):
+                unit_spans = [s for s in spans if s and s in unit.text]
+        if not unit_spans:
             continue
         cited_texts: list[str] = []
-        for cited in verdict.evidence_passage_ids:
+        cited_ids = [str(item) for item in verdict.evidence_passage_ids if str(item).strip()]
+        cited_entries: list[dict[str, Any]] = []
+        for cited in cited_ids:
             entry = by_id.get(cited)
             if entry is not None:
                 cited_texts.append(str(entry.get("text", "")))
+                cited_entries.append(entry)
         # Quotes in non-book units without cited passages cannot be
         # proven exact: they fail closed as well.
         if not cited_texts:
             raise VerifierValidationError(
                 f"unit {unit.unit_id!r} quotes text without cited exact passages"
             )
-        for span in spans:
-            if not any(span in candidate for candidate in cited_texts):
+        for span_text in unit_spans:
+            anchor = anchor_book_span(span_text, list(passages), cited_passage_ids=cited_ids)
+            if anchor is None:
                 raise VerifierValidationError(
                     f"unit {unit.unit_id!r} quotes text absent from cited passages"
                 )
     return result
+
+
+def check_quote_origins(
+    *,
+    answer: str,
+    units: Sequence[ResponseUnitDraft],
+    result: GroundingResult,
+    passages: Sequence[dict[str, Any]],
+    recent: Sequence[Any] | None = None,
+    user_message: str = "",
+) -> Any:
+    """Fail closed on unattributed or misattributed quotations (kodmial/aa#308).
+
+    Runs the candidate-level quote/origin certification over the entire
+    actual answer candidate: complete balanced spans with exact
+    answer/source offsets plus the typed ``origin`` / ``origin_ref``
+    contract. Returns the serializable :class:`AnswerQuoteCertificate`
+    for #304's ``AnswerCandidate`` / ``VerificationCertificate``.
+    """
+    from aa.conversation.quote_provenance import (
+        build_user_message_index,
+        certify_answer_candidate,
+    )
+
+    user_index = build_user_message_index(list(recent or []), user_message)
+    return certify_answer_candidate(
+        answer=answer,
+        units=units,
+        verdicts=result.units,
+        passages=[dict(item) for item in passages if isinstance(item, dict)],
+        user_index=user_index,
+    )
 
 
 def _reply_structured_content(reply: object) -> object:
@@ -669,7 +786,14 @@ def _tolerant_json_loads(candidate: str) -> object:
 # these keys decide a verdict; unknown envelope keys are discarded by
 # parse_text_json_decision (never trusted, never bound).
 _DECISION_KEYS: frozenset[str] = frozenset(
-    {"requires_book_evidence", "supported", "evidence_passage_ids", "addresses_intent"}
+    {
+        "requires_book_evidence",
+        "supported",
+        "evidence_passage_ids",
+        "addresses_intent",
+        "claim_origin",
+        "origin_ref",
+    }
 )
 
 
@@ -808,6 +932,18 @@ def build_single_unit_text(
         "A unit that needs book evidence but cites no passage is unsupported.",
         "Cite only passage ids listed in <book_evidence> in evidence_passage_ids; "
         "passages are numbered p1..pN, cite those short ids.",
+        "Classify the unit origin in claim_origin: book_claim for any substantive "
+        "external claim needing book support; user_report ONLY for attributed "
+        "statements or verbatim quotes of what the user demonstrably wrote in "
+        "a concrete human message (never infer causes, motives, diagnosis, "
+        "efficacy, or advice, and never upgrade a summary or an assistant "
+        "message into a user quote); assistant_capability only for truthful "
+        "identity or capability statements grounded in stable system "
+        "instructions (never user instructions); conversation_glue only for "
+        "pure glue with no substantive assertion; safety_override only for "
+        "an explicit safety-policy outcome. A mixed unit containing a new "
+        "book claim plus user repetition is book_claim, never user_report. "
+        "A quote mark alone never decides the origin.",
         "Set addresses_intent true only when the unit addresses the user's "
         "context-resolved intent described in <resolved_intent>. An irrelevant "
         "but perfectly grounded unit must set addresses_intent false. Judge "
@@ -883,6 +1019,18 @@ def coerce_single_verdict(
     even when the unit is book-supported with valid citations. Support
     never implies relevance; an omitted relevance verdict is never
     upgraded into PASS.
+
+    Claim-origin attribution (kodmial/aa#308): the model-led ``claim_origin``
+    classification is bound here and validated deterministically
+    downstream in :func:`check_quote_origins`. A quote mark alone never
+    sets the origin: ``book_claim`` requires book evidence,
+    ``user_report`` must not require book evidence and must not cite book
+    passages (its trusted referent is a HumanMessage slice validated by
+    offsets, never an assistant message or a summary). Mixed units hiding
+    a new book claim inside a user report fail closed downstream; a
+    contradictory transport decision (``user_report`` with
+    ``requires_book_evidence=true``, or ``book_claim`` with
+    ``requires_book_evidence=false``) fails closed here.
     """
     if isinstance(data, dict) and "addresses_intent" not in data:
         raise VerifierValidationError("verifier decision missing addresses_intent")
@@ -905,12 +1053,33 @@ def coerce_single_verdict(
     # was still validated above, so no omitted verdict can pass through here.
     if scope != "book":
         addresses = True if bool(decision.supported) else addresses
+    raw_origin = getattr(decision, "claim_origin", None)
+    origin = str(raw_origin).strip() if isinstance(raw_origin, str) and raw_origin else ""
+    if not origin:
+        origin = "book_claim" if bool(decision.requires_book_evidence) else "conversation_glue"
+    if origin == "book_claim" and not bool(decision.requires_book_evidence):
+        raise VerifierValidationError("book_claim origin requires book evidence")
+    if origin == "user_report" and bool(decision.requires_book_evidence):
+        raise VerifierValidationError("user_report origin must not require book evidence")
+    if origin == "user_report" and list(decision.evidence_passage_ids):
+        raise VerifierValidationError("user_report origin must not cite book passages")
+    raw_ref = getattr(decision, "origin_ref", None)
+    origin_ref: dict[str, object] = dict(raw_ref) if isinstance(raw_ref, dict) else {}
+    if origin == "user_report" and origin_ref:
+        kind = str(origin_ref.get("kind", "") or "")
+        if kind and kind != "user_message":
+            raise VerifierValidationError("user_report origin_ref must be a user message")
+        role = str(origin_ref.get("role", "") or "")
+        if role and role != "human":
+            raise VerifierValidationError("user_report origin_ref must be human role")
     return UnitVerdict(
         unit_id=unit_id,
         scope=scope,
         supported=bool(decision.supported),
         evidence_passage_ids=resolved,
         addresses_intent=addresses,
+        origin=origin,  # type: ignore[arg-type]
+        origin_ref=origin_ref,
     )
 
 
@@ -1217,6 +1386,8 @@ async def _verify_per_unit_concurrent(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    recent: Sequence[Any] | None = None,
+    answer_text: str | None = None,
 ) -> GroundingResult:
     """Verify each unit concurrently with the unified decision schema.
 
@@ -1325,6 +1496,7 @@ async def _verify_per_unit_concurrent(
                 scope="book",
                 supported=False,
                 evidence_passage_ids=[],
+                origin="book_claim",
             )
         )
         logger.info(
@@ -1352,7 +1524,23 @@ async def _verify_per_unit_concurrent(
     pack_ids = set(_pack_index(passages).keys())
     check_passage_checksums(passages)
     check_cited_passage_ids(result, pack_ids=pack_ids)
-    check_exact_quotes(units=units, result=result, passages=passages)
+    check_exact_quotes(units=units, result=result, passages=passages, answer_text=answer_text)
+    # Candidate-level quote/origin certification (kodmial/aa#308): the
+    # entire actual current answer candidate is checked through this
+    # existing reachable path with exact answer/source offsets and
+    # durable provenance. #304 later moves the check to the single
+    # delivery boundary and rechecks after every textual modification.
+    candidate_text = (
+        answer_text if isinstance(answer_text, str) else " ".join(unit.text for unit in units)
+    )
+    check_quote_origins(
+        answer=candidate_text,
+        units=units,
+        result=result,
+        passages=passages,
+        recent=recent,
+        user_message=user_message,
+    )
     return result
 
 
@@ -1365,6 +1553,8 @@ async def run_verifier(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    recent: Sequence[Any] | None = None,
+    answer_text: str | None = None,
 ) -> GroundingResult:
     """Invoke the hidden verifier once per unit, concurrently.
 
@@ -1386,6 +1576,8 @@ async def run_verifier(
         resolved_intent=resolved_intent,
         user_message=user_message,
         conversation_context=conversation_context,
+        recent=recent,
+        answer_text=answer_text,
     )
     logger.info("verifier output accepted", extra={"units": len(units)})
     return result
@@ -1404,6 +1596,7 @@ __all__ = [
     "check_cited_passage_ids",
     "check_exact_quotes",
     "check_passage_checksums",
+    "check_quote_origins",
     "clear_verifier_capability_cache",
     "coerce_single_verdict",
     "display_id_map_for_window",

@@ -21,6 +21,27 @@ from pydantic import BaseModel, Field, StrictBool
 
 ScopeName = Literal["book", "product_meta", "conversation_glue"]
 
+ClaimOrigin = Literal[
+    "book_claim",
+    "user_report",
+    "assistant_capability",
+    "conversation_glue",
+    "safety_override",
+]
+"""Typed claim/quote provenance contract (kodmial/aa#308).
+
+- ``book_claim``: substantive AA/book claim, requires actual canonical
+  book support and citations;
+- ``user_report``: attributed statement or verbatim quote demonstrably
+  found in a concrete HumanMessage; never introduces inference about
+  causes, motives, diagnosis, efficacy, or advice;
+- ``assistant_capability``: truthful system/product capability grounded
+  only in authoritative product instructions;
+- ``conversation_glue``: no independent substantive assertion;
+- ``safety_override``: explicit allowed safety-policy outcome, not a
+  book-grounded claim.
+"""
+
 # Internal non-book scope derived when the model reports
 # ``requires_book_evidence=false``. Both pure conversation glue and
 # truthful assistant identity/capability statements map here; neither
@@ -37,12 +58,23 @@ class UnitDecision(BaseModel):
     Every field requires an explicit strict boolean: a missing, null, or
     wrong-type ``addresses_intent`` fails closed even when the unit is
     book-supported with valid citations. Support never implies relevance.
+
+    ``claim_origin`` carries the model-led semantic origin classification
+    (kodmial/aa#308). It is optional on the wire so older providers stay
+    parseable; when absent AA code derives the origin deterministically
+    from ``requires_book_evidence`` (true -> ``book_claim``, false ->
+    ``conversation_glue``) and the deterministic provenance gate binds
+    it to offsets and roles. ``origin_ref`` is extensible provenance for
+    the origin (user message slice, book anchor, capability source, or
+    policy marker); a quote mark alone never sets the origin.
     """
 
     requires_book_evidence: bool
     supported: bool
     evidence_passage_ids: list[str] = Field(default_factory=list)
     addresses_intent: StrictBool
+    claim_origin: ClaimOrigin | None = None
+    origin_ref: dict[str, object] = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
 
@@ -55,6 +87,8 @@ class UnitVerdict(BaseModel):
     supported: bool
     evidence_passage_ids: list[str] = Field(default_factory=list)
     addresses_intent: bool = Field(default=False)
+    origin: ClaimOrigin = "conversation_glue"
+    origin_ref: dict[str, object] = Field(default_factory=dict)
 
 
 class GroundingResult(BaseModel):
@@ -98,6 +132,14 @@ def verifier_single_json_schema() -> dict[str, object]:
                 "items": {"type": "string"},
             },
             "addresses_intent": {"type": "boolean"},
+            # kodmial/aa#308: optional model-led claim-origin hint plus
+            # extensible origin_ref provenance. Kept intentionally
+            # enum-free: the provider-facing hint stays minimal/robust
+            # across weak fallback paths, while AA code strictly
+            # validates the closed origin vocabulary via Pydantic
+            # (fail closed on unknown origins).
+            "claim_origin": {"type": "string"},
+            "origin_ref": {"type": "object"},
         },
         "required": [
             "requires_book_evidence",
@@ -205,6 +247,7 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
 
 
 __all__ = [
+    "ClaimOrigin",
     "GroundingResult",
     "NON_BOOK_SCOPE",
     "ScopeName",

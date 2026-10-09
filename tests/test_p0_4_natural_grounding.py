@@ -1501,7 +1501,9 @@ def test_verifier_user_text_repeats_closed_contract() -> None:
     assert "scope" not in user_text
     assert "all_required_supported" not in user_text
     assert "product_meta" not in user_text
-    assert "conversation_glue" not in user_text
+    # kodmial/aa#308: the payload teaches the claim-origin taxonomy, so
+    # the origin vocabulary is present by contract (never unit ids).
+    assert "claim_origin" in user_text
 
 
 def test_verifier_normalizes_weak_provider_formatting() -> None:
@@ -1661,11 +1663,15 @@ def test_verifier_single_schema_is_ref_free_without_ids() -> None:
     assert "scope" not in dumped
     assert "all_required_supported" not in dumped
     props = cast(dict[str, Any], schema["properties"])
+    # kodmial/aa#308: optional model-led claim-origin hint plus
+    # extensible origin_ref provenance; required keys unchanged.
     assert set(props) == {
         "requires_book_evidence",
         "supported",
         "evidence_passage_ids",
         "addresses_intent",
+        "claim_origin",
+        "origin_ref",
     }
     assert schema["required"] == [
         "requires_book_evidence",
@@ -1687,7 +1693,9 @@ def test_verifier_single_text_has_no_id_copying() -> None:
     assert "u1" not in text
     assert "all_required_supported" not in text
     assert "product_meta" not in text
-    assert "conversation_glue" not in text
+    # kodmial/aa#308: the payload teaches the claim-origin taxonomy, so
+    # the origin vocabulary is present by contract (never unit ids).
+    assert "claim_origin" in text
     assert "requires_book_evidence" in text
 
 

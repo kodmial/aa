@@ -84,14 +84,19 @@ def test_transport_schema_has_booleans_not_scope() -> None:
     schema = verifier_single_json_schema()
     dumped = json.dumps(schema)
     assert "$ref" not in dumped
-    assert '"enum"' not in dumped
     props = schema["properties"]
     assert isinstance(props, dict)
+    # kodmial/aa#308: the transport additionally carries the optional
+    # model-led claim-origin classification plus extensible origin_ref
+    # provenance. Both are optional hints validated fail-closed in AA
+    # code; the model still never copies unit ids, scopes, or aggregates.
     assert set(props) == {
         "requires_book_evidence",
         "supported",
         "evidence_passage_ids",
         "addresses_intent",
+        "claim_origin",
+        "origin_ref",
     }
     assert props["requires_book_evidence"] == {"type": "boolean"}
     assert props["supported"] == {"type": "boolean"}
@@ -386,7 +391,11 @@ def test_no_exact_live_question_special_cases() -> None:
     assert "requires_book_evidence" in system
     assert "general offer" in system.casefold()
     assert "product_meta" not in system
-    assert "conversation_glue" not in system
+    # kodmial/aa#308: the prompt teaches the claim-origin taxonomy, so the
+    # origin vocabulary is present by contract; the model still never
+    # copies unit ids, scopes, or aggregates.
+    assert "claim_origin" in system
+    assert "unit_id" not in system
     for name in ("verifier.py", "verifier_schema.py"):
         source = (CONVERSATION_PKG / name).read_text(encoding="utf-8")
         assert "37571901838" not in source
