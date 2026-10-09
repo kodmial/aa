@@ -117,6 +117,14 @@ def test_no_deep_rank_decisive_case_is_incomplete_never_pass() -> None:
         == "INCOMPLETE"
     )
     assert decide_status_295(stale=False, incomplete=False, failures=0, turns=[]) == "INCOMPLETE"
+    # The model object may be bound but fail internally and select lexically:
+    # it is not acceptable evidence that the actual OpenCode selector worked.
+    assert decide_status_295(
+        stale=False,
+        incomplete=False,
+        failures=0,
+        turns=[_demo_diag(selector_available=False, fallback_used=True)],
+    ) == "INCOMPLETE"
     assert (
         decide_status_295(stale=False, incomplete=False, failures=0, turns=[_demo_diag()]) == "PASS"
     )
