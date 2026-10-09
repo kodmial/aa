@@ -39,7 +39,7 @@ def test_digest_file_and_runtime_pin_are_immutable_and_consistent() -> None:
     digest = lines[-1].strip()
     assert re.fullmatch(r"ghcr\\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}", digest)
     workflow = _read(WORKFLOWS / "aa-runtime.yml")
-    container_active = "\\n    container:\\n" in workflow
+    container_active = "\n    container:\n" in workflow
     placeholder = digest.endswith(":" + "0" * 64)
     if placeholder:
         # A PR that points production to a nonexistent image must NEVER merge.
