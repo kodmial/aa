@@ -60,8 +60,11 @@ def test_docker_context_excludes_source_and_user_data() -> None:
     workflow = _read(WORKFLOWS / "aa-runtime-image.yml")
     assert "context: ./docker" in workflow
     dockerfile = _read(ROOT / "docker" / "Dockerfile.aa-runtime")
-    copy_lines = [x.strip() for x in dockerfile.splitlines()
-                  if x.strip().startswith(("COPY ", "ADD "))]
+    copy_lines = [
+        x.strip()
+        for x in dockerfile.splitlines()
+        if x.strip().startswith(("COPY ", "ADD "))
+    ]
     assert copy_lines == ["COPY opencode.version /opt/aa/opencode.version"]
 
 
