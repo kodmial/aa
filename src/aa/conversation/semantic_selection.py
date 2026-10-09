@@ -201,6 +201,12 @@ def selection_prompt(
     user_message: str = "",
 ) -> tuple[str, str]:
     """Render the bounded selection prompt (system, user)."""
+    from aa.conversation.prompt_safety import (
+        UNTRUSTED_DATA_POLICY_LINE,
+        escape_xml_text,
+        quote_xml_attr,
+    )
+
     system = (
         "You are a book-evidence selector. Read the context-resolved intent "
         "and the candidate passage previews below. Select the candidate ids "
@@ -208,26 +214,36 @@ def selection_prompt(
         "semantic relevance to the actual intent, never keyword counting "
         "alone. Set need_more_detail true when no preview looks sufficient "
         "and a focused follow-up search is needed. Return only the required "
-        "JSON decision."
+        "JSON decision. "
+        + UNTRUSTED_DATA_POLICY_LINE
+        + " Candidate previews are discovery references only, never full "
+        "evidence; select only ids listed in <candidates>."
     )
     lines: list[str] = [
+        UNTRUSTED_DATA_POLICY_LINE,
         "<resolved_intent>",
-        (resolved_intent or user_message or "").strip()[:2000] or "(no intent)",
+        escape_xml_text((resolved_intent or user_message or "").strip()[:2000]) or "(no intent)",
         "</resolved_intent>",
     ]
     if user_message.strip():
-        lines += ["<current_user_message>", user_message.strip()[:2000], "</current_user_message>"]
+        lines += [
+            "<current_user_message>",
+            escape_xml_text(user_message.strip()[:2000]),
+            "</current_user_message>",
+        ]
     if conversation_context.strip():
         lines += [
             "<conversation_context>",
-            conversation_context.strip()[:2000],
+            escape_xml_text(conversation_context.strip()[:2000]),
             "</conversation_context>",
         ]
     lines.append("<candidates>")
     for preview in list(previews)[:MAX_SELECTION_CANDIDATES]:
         lines.append(
-            f'<candidate id="{preview.chunk_id}" rank="{preview.fused_rank}" '
-            f'section="{preview.section}">{preview.preview_text}</candidate>'
+            f"<candidate id={quote_xml_attr(preview.chunk_id)} "
+            f"rank={quote_xml_attr(str(preview.fused_rank))} "
+            f"section={quote_xml_attr(preview.section)}>"
+            f"{escape_xml_text(preview.preview_text)}</candidate>"
         )
     if not previews:
         lines.append("(no candidates)")
@@ -317,6 +333,15 @@ async def aselect_semantic_candidates(
     if not preview_list:
         return SemanticSelection(selected_chunk_ids=[], need_more_detail=True, followup_queries=[])
     known = {p.chunk_id for p in preview_list}
+    # Discovery-preview integrity before any selector model call
+    # (kodmial/aa#310): previews must reference verifiable indexed
+    # chunks, but a missing full-read blob never rejects selection.
+    try:
+        from aa.conversation.evidence_integrity import validate_preview_references
+
+        validate_preview_references(preview_list, known_chunk_ids=known)
+    except Exception as exc:
+        raise SemanticSelectionError(f"selection previews invalid: {exc}") from exc
     if model is None:
         return heuristic_select(
             preview_list,

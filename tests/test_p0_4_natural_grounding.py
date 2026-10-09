@@ -341,16 +341,19 @@ def test_verifier_rejects_book_without_evidence_and_unknown_passage() -> None:
     units = split_response_units("Тяга проходит быстро.")
     pack = [_pack_entry()]
     pack_ids = {str(pack[0]["passage_id"])}
-    no_evidence = coerce_single_verdict(
-        {
-            "requires_book_evidence": True,
-            "supported": True,
-            "evidence_passage_ids": [],
-            "addresses_intent": True,
-        },
-        unit_id="u1",
-    )
-    assert no_evidence.scope == "book"
+    # kodmial/aa#310: a supported book claim with empty citations fails at
+    # the decision boundary itself, before any aggregate is computed (it
+    # can never be rescued by the cite gate or by no-book flags).
+    with pytest.raises(VerifierValidationError):
+        coerce_single_verdict(
+            {
+                "requires_book_evidence": True,
+                "supported": True,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+            },
+            unit_id="u1",
+        )
     with pytest.raises(VerifierValidationError):
         check_cited_passage_ids(
             validate_grounding_result(

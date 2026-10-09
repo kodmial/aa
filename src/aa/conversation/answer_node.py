@@ -16,6 +16,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 
+from aa.conversation.evidence_integrity import validate_book_pack_for_model_use
 from aa.conversation.prompt_builder import EvidencePassage, build_answer_messages
 from aa.conversation.retrieval_node import state_passages_to_prompt
 from aa.conversation.v2_prompts import load_aa_agent_system_v2
@@ -69,6 +70,20 @@ async def generate_draft(
     """
     if not user_message.strip():
         raise ValueError("refusing to generate an answer without a user message")
+    # Structural integrity before any answer model call (kodmial/aa#310):
+    # relied-upon passages must carry real identities and text. Full
+    # checksum/source/version/range validation runs on the stored pack
+    # dicts upstream (generate_draft_from_state / turn pipeline); an
+    # empty list is the legitimate no-book path and passes.
+    for passage in list(passages or []):
+        if not isinstance(passage.passage_id, str) or not passage.passage_id.strip():
+            raise ValueError("answer evidence has missing passage_id")
+        if not isinstance(passage.text, str) or not passage.text:
+            raise ValueError("answer evidence has missing text")
+        if not isinstance(passage.source, str) or not passage.source.strip():
+            raise ValueError("answer evidence has missing source")
+        if not isinstance(passage.section, str) or not passage.section.strip():
+            raise ValueError("answer evidence has missing section")
     system_text = load_aa_agent_system_v2()
     messages = build_answer_messages(
         recent=list(recent),
@@ -97,6 +112,10 @@ async def generate_draft_from_state(
     summary = str(state.get("conversation_summary", ""))
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
     pack_dicts = [item for item in state.get("evidence_pack", []) if isinstance(item, dict)]
+    # Authoritative pack integrity before any answer model call: missing
+    # checksum/source/version/section/range or wrong hash fails here,
+    # never as a skipped passage. Empty pack (glue) passes.
+    validate_book_pack_for_model_use(pack_dicts)
     passages = state_passages_to_prompt(pack_dicts)
     return await generate_draft(
         model=model,
