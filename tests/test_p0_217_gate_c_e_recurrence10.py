@@ -83,6 +83,8 @@ def _pack_dict(passage_id: str = "chapter-3#exp0000") -> dict[str, Any]:
         "char_start": 0,
         "char_end": len(text),
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_sha256": "s" * 64,
+        "corpus_version": "r" * 64,
     }
 
 
