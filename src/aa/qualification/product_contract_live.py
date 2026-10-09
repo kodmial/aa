@@ -1863,6 +1863,7 @@ async def assess_live_helpfulness_with_judge_metrics(
         combine_telemetry_with_judge,
         judge_whole_turn,
     )
+    from aa.opencode.errors import OpenCodeRateLimitError
 
     cleaned_prompt = str(prompt or "").strip()
     cleaned_reply = str(reply or "").strip()
@@ -1894,6 +1895,9 @@ async def assess_live_helpfulness_with_judge_metrics(
             context=str(context or ""),
             model=judge_model,
         )
+    except OpenCodeRateLimitError:
+        # Preserve the caller's fresh-runner 429 recovery contract.
+        raise
     except Exception:
         return False, metrics
     metrics["judge_helpful"] = bool(judgement.helpful)
