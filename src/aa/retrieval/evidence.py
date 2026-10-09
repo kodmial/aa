@@ -116,6 +116,10 @@ class EvidenceError(ValueError):
     """Raised when the evidence pipeline cannot serve a request (fails closed)."""
 
 
+class EvidenceIntegrityError(EvidenceError):
+    """Same stable passage id maps to different bytes/content (fails closed)."""
+
+
 @dataclass(frozen=True)
 class RetrievalConfig:
     """Tunable retrieval/evidence parameters (recorded in metadata/evals)."""
@@ -160,6 +164,75 @@ def _sha256_text(text: str) -> str:
 
 def _short_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_passage_id(
+    *,
+    source_sha256: str,
+    section_id: str,
+    char_start: int,
+    char_end: int,
+    text_sha256: str,
+) -> str:
+    """Return the stable identity for one exact passage (never positional).
+
+    Derived only from source provenance plus the exact range/content
+    (``source_sha256``, ``section_id``, ``char_start``, ``char_end``,
+    ``text_sha256``), so two searches over the same canonical source
+    reproduce the same id while two different ranges never collide.
+    Request-local ``p1..pN`` aliases may exist in prompts only and are
+    never persistent identities.
+    """
+    section = str(section_id or "unknown-section")
+    src = str(source_sha256 or "")
+    src_short = src[:12] if src else "nosrc"
+    txt = str(text_sha256 or "")
+    txt_short = txt[:16] if txt else "notext"
+    try:
+        start = int(char_start)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        end = int(char_end)
+    except (TypeError, ValueError):
+        end = 0
+    return f"{section}#{src_short}:{start}-{end}:{txt_short}"
+
+
+def check_passage_id_consistency(
+    passage_id: str,
+    existing: dict[str, object],
+    incoming: dict[str, object],
+) -> None:
+    """Fail closed when one stable id maps to different content.
+
+    Compares exact text, ``text_sha256``, range and source provenance;
+    any mismatch raises :class:`EvidenceIntegrityError` instead of
+    silently keeping the older passage.
+    """
+    for key in ("text", "text_sha256", "char_start", "char_end", "source_sha256"):
+        old = existing.get(key) if isinstance(existing, dict) else None
+        new = incoming.get(key) if isinstance(incoming, dict) else None
+        if old is None or new is None:
+            continue
+        if old != new:
+            raise EvidenceIntegrityError(
+                f"stable passage id collision with different content: {passage_id!r} ({key})"
+            )
+
+
+def enrich_pack_provenance(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    """Fill missing provenance on a deduplicated pack entry (in place).
+
+    Only backfills empty provenance slots from the duplicate; never
+    overwrites present values and never invents content.
+    """
+    for provenance_key in ("source_sha256", "corpus_version"):
+        try:
+            if not existing.get(provenance_key) and incoming.get(provenance_key):
+                existing[provenance_key] = incoming.get(provenance_key)
+        except AttributeError:
+            continue
 
 
 def validate_planner_queries(queries: object) -> list[str]:
@@ -609,7 +682,6 @@ def expand_small_to_big(
         merged = collapsed
     passages: list[EvidencePassageData] = []
     passage_ranks: list[int] = []
-    seq = 0
     for section_id, window in merged:
         members = sorted(
             window,
@@ -649,21 +721,30 @@ def expand_small_to_big(
             ends = [index.chunks[item].char_end for item in run]
             window_ranks = [rank_of[cid] for cid in window if cid in rank_of]
             run_best = min(window_ranks) if window_ranks else max(rank_of.values(), default=0) + 1
+            start = min(starts)
+            end = max(ends)
+            text_hash = _sha256_text(exact_text)
+            stable_id = stable_passage_id(
+                source_sha256=first.source_sha256,
+                section_id=section_id,
+                char_start=start,
+                char_end=end,
+                text_sha256=text_hash,
+            )
             passages.append(
                 EvidencePassageData(
-                    passage_id=f"{section_id}#exp{seq:04d}",
+                    passage_id=stable_id,
                     exact_text=exact_text,
                     source_id=first.source_id,
                     section_id=section_id,
                     child_chunk_ids=tuple(run),
-                    char_start=min(starts),
-                    char_end=max(ends),
-                    text_sha256=_sha256_text(exact_text),
+                    char_start=start,
+                    char_end=end,
+                    text_sha256=text_hash,
                     source_sha256=first.source_sha256,
                 )
             )
             passage_ranks.append(run_best)
-            seq += 1
     # Highest-value (best fused order) passages first. Each run inherits
     # the best fused position of its merged window, so neighbor-only runs
     # (no direct winner) still order deterministically.
@@ -705,7 +786,13 @@ def select_passages_under_budget(
         if record is None:
             return None
         return EvidencePassageData(
-            passage_id=f"{record.section}#atom-{cid.split(':')[-1]}",
+            passage_id=stable_passage_id(
+                source_sha256=record.source_sha256,
+                section_id=record.section,
+                char_start=record.char_start,
+                char_end=record.char_end,
+                text_sha256=record.text_sha256,
+            ),
             exact_text=record.text,
             source_id=record.source_id,
             section_id=record.section,
@@ -1144,9 +1231,13 @@ __all__ = [
     "clear_query_vector_cache",
     "query_vector_cache_info",
     "EvidenceError",
+    "EvidenceIntegrityError",
     "EvidencePack",
     "EvidencePassageData",
     "RetrievalConfig",
+    "check_passage_id_consistency",
+    "enrich_pack_provenance",
+    "stable_passage_id",
     "dedup_and_diversify",
     "empty_evidence_pack",
     "expand_small_to_big",
