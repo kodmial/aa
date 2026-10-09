@@ -40,36 +40,36 @@ def main(argv: list[str] | None = None) -> int:
         print("runtime missing GHCR read permission", file=sys.stderr)
         return 1
 
-    container_anchor = "    timeout-minutes: 330\\n"
+    container_anchor = "    timeout-minutes: 330\n"
     checkout_anchor = (
-        "      - name: Checkout repository\\n"
-        "        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\\n"
+        "      - name: Checkout repository\n"
+        "        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
     )
-    runtime_anchor = "      - name: Build and validate AA knowledge runtime\\n"
-    setup_start = "      - name: Set up Python 3.12\\n"
-    setup_end = "      - name: Compute public cache keys\\n"
+    runtime_anchor = "      - name: Build and validate AA knowledge runtime\n"
+    setup_start = "      - name: Set up Python 3.12\n"
+    setup_end = "      - name: Compute public cache keys\n"
     image_block = (
-        "    container:\\n"
-        f"      image: {image_ref}\\n"
-        "      credentials:\\n"
-        "        username: ${{ github.actor }}\\n"
-        "        password: ${{ secrets.GITHUB_TOKEN }}\\n"
+        "    container:\n"
+        f"      image: {image_ref}\n"
+        "      credentials:\n"
+        "        username: ${{ github.actor }}\n"
+        "        password: ${{ secrets.GITHUB_TOKEN }}\n"
     )
     preflight = (
-        "      - name: Validate promoted dependency-image provenance\\n"
-        "        shell: bash\\n"
-        "        run: |\\n"
-        "          set -euo pipefail\\n"
-        "          python scripts/verify_runtime_image.py --pins-only\\n"
-        "          test \\"$(git rev-parse HEAD)\\" = \\"${{ github.sha }}\\"\\n"
+        "      - name: Validate promoted dependency-image provenance\n"
+        "        shell: bash\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          python scripts/verify_runtime_image.py --pins-only\n"
+        "          test \\"$(git rev-parse HEAD)\\" = \\"${{ github.sha }}\\"\n"
     )
     hot_gate = (
-        "      - name: Verify image hot path and external model cache\\n"
-        "        shell: bash\\n"
-        "        run: python scripts/verify_runtime_image.py\\n\\n"
+        "      - name: Verify image hot path and external model cache\n"
+        "        shell: bash\n"
+        "        run: python scripts/verify_runtime_image.py\n\n"
     )
 
-    if "\\n    container:\\n" in workflow:
+    if "\n    container:\n" in workflow:
         match = IMAGE_RE.search(workflow)
         if match is None:
             print("existing container has no valid digest", file=sys.stderr)
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("dry-run pass; use --apply only after the image canary passed")
         return 0
-    DIGEST_FILE.write_text(image_ref + "\\n", encoding="utf-8")
+    DIGEST_FILE.write_text(image_ref + "\n", encoding="utf-8")
     RUNTIME_WORKFLOW.write_text(new_workflow, encoding="utf-8")
     print("activation files updated; open a PR, run CI/review and merge before /run")
     return 0
