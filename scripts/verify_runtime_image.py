@@ -137,7 +137,7 @@ def check_digest_wiring(*, allow_placeholder: bool) -> list[str]:
     if not DIGEST_RE.fullmatch(digest):
         return [f"digest file malformed: {digest!r}"]
     placeholder = digest.endswith(":" + ZERO_DIGEST)
-    container_active = "\\n    container:\\n" in workflow_text
+    container_active = "\n    container:\n" in workflow_text
     if placeholder:
         # First-stage implementation must *not* turn on a nonexistent image.
         if container_active:
