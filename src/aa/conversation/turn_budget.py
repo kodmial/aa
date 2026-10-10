@@ -342,6 +342,20 @@ async def await_model_under_turn_budget(
         _rate_limit_types = ()
     try:
         result = await asyncio.wait_for(coro, timeout=timeout_s)
+    except _rate_limit_types:
+        # Dedicated 429 path: OpenCodeRateLimitError is a plain Exception
+        # (never a TimeoutError), so it must be caught before the timeout
+        # handlers below. Recorded as provider_429 and never converted to
+        # exhaustion; always propagates for runner lifecycle recovery.
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        budget.record_stage(
+            stage=STAGE_PROVIDER_429,
+            ok=False,
+            latency_ms=elapsed_ms,
+            category="rate-limit",
+            id_digest=id_digest,
+        )
+        raise
     except asyncio.CancelledError as exc:
         if not isinstance(exc, TimeoutError):
             raise
@@ -362,15 +376,6 @@ async def await_model_under_turn_budget(
         ) from exc
     except TimeoutError as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        if _rate_limit_types and isinstance(exc, _rate_limit_types):
-            budget.record_stage(
-                stage=STAGE_PROVIDER_429,
-                ok=False,
-                latency_ms=elapsed_ms,
-                category="rate-limit",
-                id_digest=id_digest,
-            )
-            raise
         budget.record_stage(
             stage=stage,
             ok=False,
@@ -385,16 +390,10 @@ async def await_model_under_turn_budget(
             allocated_s=timeout_s,
             remaining_ms=budget.remaining_ms(),
         ) from exc
-    except Exception as exc:
-        if _rate_limit_types and isinstance(exc, _rate_limit_types):
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            budget.record_stage(
-                stage=STAGE_PROVIDER_429,
-                ok=False,
-                latency_ms=elapsed_ms,
-                category="rate-limit",
-                id_digest=id_digest,
-            )
+    except Exception:
+        # Any other provider failure propagates untouched (the dedicated
+        # 429 branch above already handled rate limits); coverage maps it
+        # to conservative uncovered, never fake sufficiency.
         raise
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     budget.record_stage(
@@ -537,10 +536,12 @@ async def run_local_retrieval_bounded(
                 # double-count; the callback owns the decrement now.
                 pass
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    try:
-        worker_in_flight = not future.done()
-    except Exception:
-        worker_in_flight = False
+    # Success holds the worker result, so no thread work remains in
+    # flight. Report False explicitly: deriving this from future.done()
+    # is unsound in general (a cancelled waiter wrapper can read done
+    # while the sync thread still runs), and the timeout path above
+    # already reports True unconditionally for that reason.
+    worker_in_flight = False
     try:
         slow = float(elapsed_ms) > float(diagnostic_ms)
     except (TypeError, ValueError):

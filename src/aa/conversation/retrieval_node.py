@@ -132,16 +132,24 @@ def _effective_turn_budget_ms() -> float:
 
 
 async def _await_under_interactive_deadline(
-    coro_factory: Any, started: float, *, per_call_cap_s: float
+    coro_factory: Any,
+    started: float,
+    *,
+    per_call_cap_s: float,
+    upstream_spent_s: float = 0.0,
 ) -> Any:
     """Legacy bounded await (compatibility shim over the turn budget).
 
     Historically bounded one await by ``min(per_call_cap_s,
     remaining_5s)``. Since #335 the local 5s value is diagnostic-only;
-    this shim bounds by the remaining end-to-end turn budget instead so
-    genuinely successful sequential semantic coverage is never forcibly
-    exhausted by the RRF threshold. ``Cancelled`` and provider 429
-    always propagate and are never converted to exhaustion.
+    this shim bounds by ``min(per_call_cap_s, remaining_turn - reserve,
+    provider_ceiling)`` so genuinely successful sequential semantic
+    coverage is never forcibly exhausted by the RRF threshold, while a
+    legacy call can never consume the answer/verifier reserve either.
+    ``upstream_spent_s`` folds already-paid planner wall clock into the
+    remaining turn budget (graph passes ``retry_state.planner_latency``).
+    ``Cancelled`` and provider 429 always propagate and are never
+    converted to exhaustion.
     """
     from aa.conversation.turn_budget import (
         DOWNSTREAM_MIN_RESERVE_S as _reserve_s,
@@ -165,7 +173,11 @@ async def _await_under_interactive_deadline(
     except Exception:
         elapsed_s = 0.0
     try:
-        remaining_s = max(0.0, float(_turn_s) - elapsed_s)
+        upstream_s = max(0.0, float(upstream_spent_s))
+    except (TypeError, ValueError):
+        upstream_s = 0.0
+    try:
+        remaining_s = max(0.0, float(_turn_s) - elapsed_s - upstream_s)
     except Exception:
         remaining_s = 0.0
     try:
@@ -190,6 +202,17 @@ async def _await_under_interactive_deadline(
     coro = coro_factory() if callable(coro_factory) else coro_factory
     try:
         return await asyncio.wait_for(coro, timeout=timeout_s)
+    except asyncio.CancelledError as exc:
+        # Genuine waiter cancellation propagates untouched; only a
+        # cancellation that is also a TimeoutError (legacy wait_for
+        # behaviour) maps to the typed budget timeout.
+        if isinstance(exc, TimeoutError):
+            raise _InteractiveBudgetTimeout("turn deadline exceeded") from exc
+        raise
+    except OpenCodeRateLimitError:
+        # Provider 429 always propagates for runner lifecycle recovery;
+        # never converted to a latency-budget timeout.
+        raise
     except TimeoutError as exc:
         raise _InteractiveBudgetTimeout("turn deadline exceeded") from exc
 
