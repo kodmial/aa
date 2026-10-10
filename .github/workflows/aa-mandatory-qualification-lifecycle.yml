@@ -1,0 +1,174 @@
+name: AA mandatory qualification lifecycle
+
+# Observable idempotent post-merge trigger for the mandatory exact-main
+# qualification protocol (issue #336).
+#
+# Context: implementation PRs #333/#334 merged and GitHub auto-closed
+# #331/#332 while mandatory exact-main Gate B/C/E evidence had not been
+# posted on #7. A merge or green CI is never qualification.
+#
+# This workflow reuses the existing Continuum machine relation
+# <!-- automation-qualification: #7 --> plus automation:qualifying and the
+# repository-owned AA self-proving A-F workflow. It creates no second
+# scheduler: all decisions come from the pure module
+# src/aa/qualification/mandatory_lifecycle.py (admission validation,
+# non-closing PR references, immutable capability/#7/SHA/contract tuple,
+# idempotent dispatch, orphaned-lease recovery, trusted result gating,
+# #290 breaker preservation). Product Contract #110 stays immutable.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request_target:
+    types: [closed]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      required_sha:
+        description: "Exact current main SHA to qualify (defaults to current main)"
+        required: false
+        type: string
+      capability:
+        description: "Capability issue number carrying automation-qualification: #7"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: aa-mandatory-qualification-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    # Wake only on merged PRs, main pushes, trusted #7 result comments, or
+    # manual relay. Unrelated issue comments stay cheap skips.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.merged == true) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.number == 7 &&
+       contains(github.event.comment.body, 'continuum-qualification-result'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.required_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify exact current main identity
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          checked_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main --depth=1
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$checked_sha" != "$current_main" && "${{ github.event_name }}" == "push" ]]; then
+            echo "::error::Refusing stale reconciliation: checked=$checked_sha current-main=$current_main"
+            exit 1
+          fi
+          echo "sha=$current_main" >> "$GITHUB_OUTPUT"
+          echo "exact current main: $current_main" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reconcile mandatory qualification dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_SHA: ${{ steps.sha.outputs.sha }}
+          MANUAL_CAPABILITY: ${{ inputs.capability }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Collect open capabilities declaring the mandatory relation and
+          # the trusted #7 dispatch/result history, then reconcile each
+          # through the pure lifecycle module (idempotent, fail-closed).
+          open_json="$(gh issue list --state open --limit 200 --json number,body)"
+          caps="$(python - "$open_json" <<'PY'
+          import json, sys
+          sys.path.insert(0, "src")
+          from aa.qualification.mandatory_lifecycle import parse_automation_qualification
+          issues = json.loads(sys.argv[1])
+          wanted = []
+          for item in issues:
+              try:
+                  number = int(item.get("number", 0))
+              except (TypeError, ValueError):
+                  continue
+              if parse_automation_qualification(str(item.get("body", ""))) == 7:
+                  wanted.append(number)
+          print(" ".join(str(n) for n in sorted(wanted)))
+          PY
+          )"
+          if [[ -n "${MANUAL_CAPABILITY:-}" ]]; then
+            caps="$MANUAL_CAPABILITY"
+          fi
+          echo "mandatory capabilities: ${caps:-none}" >> "$GITHUB_STEP_SUMMARY"
+          comments_json="$(gh issue view 7 --comments --json comments --jq .comments)"
+          printf '%s' "$comments_json" > /tmp/mq-comments.json
+          python - <<'PY'
+          import json, os
+          raw = json.load(open("/tmp/mq-comments.json", encoding="utf-8"))
+          slim = [
+              {
+                  "body": str(c.get("body", "")),
+                  "association": str(c.get("authorAssociation", "")),
+                  "login": str((c.get("author") or {}).get("login", "")),
+              }
+              for c in raw
+          ]
+          json.dump(slim, open("/tmp/mq-comments-slim.json", "w", encoding="utf-8"))
+          PY
+          labels_json="$(gh issue view 7 --json labels --jq '.labels | map(.name)')"
+          has_label="$(python - "$labels_json" <<'PY'
+          import json, sys
+          print("yes" if "automation:in-progress" in json.loads(sys.argv[1]) else "no")
+          PY
+          )"
+          active_run="false"
+          if gh run list --workflow aa-self-proving-qualification.yml \
+               --status in_progress --limit 1 --json databaseId --jq '.[0].databaseId' \
+               2>/dev/null | grep -qE '[0-9]+'; then
+            active_run="true"
+          fi
+          label_flag=""
+          if [[ "$has_label" == "yes" ]]; then
+            label_flag="--has-in-progress-label"
+          fi
+          run_flag=""
+          if [[ "$active_run" == "true" ]]; then
+            run_flag="--has-active-run"
+          fi
+          # shellcheck disable=SC2086
+          for cap in ${caps:-}; do
+            echo "--- capability #$cap ---" >> "$GITHUB_STEP_SUMMARY"
+            # shellcheck disable=SC2086
+            python scripts/reconcile_mandatory_qualification.py \
+              --capability "$cap" \
+              --sha "$CURRENT_SHA" \
+              --comments-file /tmp/mq-comments-slim.json \
+              $label_flag $run_flag \
+              --lease-age-s 0 \
+              --post >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ -z "${caps:-}" ]]; then
+            python scripts/reconcile_mandatory_qualification.py \
+              --sha "$CURRENT_SHA" \
+              --comments-file /tmp/mq-comments-slim.json \
+              $label_flag $run_flag \
+              --lease-age-s 0 >> "$GITHUB_STEP_SUMMARY"
+          fi
