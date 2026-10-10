@@ -79,6 +79,13 @@ class GraphTurnRuntime:
         # Privacy-safe per-turn stage telemetry (counts/latencies/outcomes
         # only). Keyed by thread digest; never holds user or evidence text.
         self._last_telemetry: dict[str, dict[str, Any]] = {}
+        # Last certified candidate/certificate per thread (digests + outcome
+        # only for telemetry; full candidate text stays in graph state).
+        # Delivery receipts distinguish provisional-certified graph memory
+        # from acknowledged Telegram acceptance (#304 seam, #312 owns
+        # quote-history mutation).
+        self._last_certificates: dict[str, dict[str, Any]] = {}
+        self._last_receipts: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def running(self) -> bool:
@@ -163,21 +170,90 @@ class GraphTurnRuntime:
                 raise GraphRuntimeError("delegate-failed", type(exc).__name__) from exc
             if not isinstance(reply, str) or not reply.strip():
                 raise GraphRuntimeError("empty-reply", "delegate returned no text")
+            # Delegate/test seam certification (#304): even the in-memory
+            # delegate produces a serializable candidate/certificate so the
+            # application boundary enforces the same digest gate. Delegate
+            # turns carry no book evidence (clarification kind) and still
+            # pass safety/envelope/presentation certification.
+            try:
+                from aa.conversation.finalization import AnswerCandidate as _DCandidate
+                from aa.conversation.finalization import (
+                    certify_candidate as _DCertify,
+                )
+                from aa.conversation.finalization import (
+                    context_digest_for_turn as _DContext,
+                )
+                from aa.conversation.finalization import (
+                    normalize_answer_text as _DNormalize,
+                )
+
+                normalized_reply = _DNormalize(reply)
+                delegate_context = _DContext(
+                    question=cleaned,
+                    resolved_intent=cleaned,
+                    summary="",
+                    recent_texts=[],
+                )
+                delegate_candidate = _DCandidate(
+                    text=normalized_reply,
+                    evidence_bundle=[],
+                    context_digest=delegate_context,
+                    outcome_kind="clarification",
+                )
+                try:
+                    delegate_certificate = _DCertify(
+                        candidate=delegate_candidate,
+                        grounding_result=None,
+                        question=cleaned,
+                        resolved_intent=cleaned,
+                        summary="",
+                        recent_messages=[],
+                    )
+                except Exception as exc:
+                    # Fail closed: an uncertifiable delegate reply is
+                    # never delivered, appended to history, or masked
+                    # with a synthesized negative certificate.
+                    raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
+                try:
+                    from aa.conversation.finalization import (
+                        verify_certificate as _DVerify,
+                    )
+
+                    _DVerify(
+                        candidate=delegate_candidate,
+                        certificate=delegate_certificate,
+                    )
+                except GraphRuntimeError:
+                    raise
+                except Exception as exc:
+                    raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
+                try:
+                    self._last_certificates[thread] = {
+                        "candidate": delegate_candidate.model_dump(mode="json"),
+                        "certificate": delegate_certificate.model_dump(mode="json"),
+                    }
+                except Exception:
+                    pass
+            except GraphRuntimeError:
+                raise
+            except Exception as exc:
+                raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
             async with self._lock:
                 history.append(cleaned)
-                history.append(reply.strip())
+                history.append(normalized_reply)
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.info(
                 "graph turn completed",
-                extra={"reply_len": len(reply.strip()), "latency_ms": round(elapsed_ms, 1)},
+                extra={"reply_len": len(normalized_reply), "latency_ms": round(elapsed_ms, 1)},
             )
-            return reply.strip()
+            return normalized_reply
         graph = self._graph
         if graph is None:
             raise GraphRuntimeError("not-started", "graph runtime has no compiled graph")
         # Never attribute a previous turn's grounding telemetry to a later
         # turn that crashes or is converted to an application fallback.
         self._last_telemetry.pop(thread, None)
+        self._last_certificates.pop(thread, None)
         started = _time.perf_counter()
         try:
             result = await self._invoke_graph(graph, thread, cleaned)
@@ -196,19 +272,93 @@ class GraphTurnRuntime:
                 raise
             raise GraphRuntimeError("graph-failed", type(exc).__name__) from exc
         elapsed_ms = (_time.perf_counter() - started) * 1000.0
-        final = str(result.get("final_response", "") or result.get("draft_response", ""))
-        if not final.strip():
+        final_raw = result.get("final_response", "") or result.get("draft_response", "")
+        if not isinstance(final_raw, str) or not final_raw.strip():
             raise GraphRuntimeError("empty-reply", "graph returned no text")
-        self._record_stage_telemetry(thread, result, elapsed_ms, len(final.strip()))
+        # Single delivery gate enforcement (kodmial/aa#304): the compiled
+        # graph must certify the exact normalized text against the exact
+        # evidence/context digests before send. Stale or missing
+        # certificates reject delivery fail-closed and never enter history
+        # as qualified answers. No .strip()/clipping/substitution after
+        # certification: the certified text travels byte-for-byte.
+        try:
+            from aa.conversation.finalization import (
+                AnswerCandidate as _Candidate,
+            )
+            from aa.conversation.finalization import (
+                VerificationCertificate as _Certificate,
+            )
+            from aa.conversation.finalization import (
+                normalize_answer_text as _normalize,
+            )
+            from aa.conversation.finalization import (
+                verify_certificate as _verify_cert,
+            )
+
+            candidate_raw = result.get("answer_candidate", None)
+            certificate_raw = result.get("verification_certificate", None)
+            if str(result.get("route", "normal")) != "normal":
+                # Control route (command/blocked/emergency): finalize
+                # returns no book candidate/certificate by design, so the
+                # book-certification gate must not reject it here. Control
+                # text still requires a non-empty reply and never consumes
+                # a book certificate.
+                if not isinstance(final_raw, str) or not final_raw.strip():
+                    raise GraphRuntimeError("empty-reply", "graph returned no text")
+                final = final_raw
+                try:
+                    self._last_certificates.pop(thread, None)
+                except Exception:
+                    pass
+                self._record_stage_telemetry(thread, result, elapsed_ms, len(final))
+                logger.info(
+                    "graph turn completed",
+                    extra={
+                        "reply_len": len(final),
+                        "latency_ms": round(elapsed_ms, 1),
+                        "route": str(result.get("route", "normal")),
+                    },
+                )
+                return final
+            if not isinstance(candidate_raw, dict) or not isinstance(certificate_raw, dict):
+                raise GraphRuntimeError("uncertified-reply", "missing delivery certificate")
+            candidate = _Candidate.model_validate(candidate_raw)
+            certificate = _Certificate.model_validate(certificate_raw)
+            pack_raw = result.get("evidence_pack", [])
+            pack = (
+                [dict(item) for item in pack_raw if isinstance(item, dict)]
+                if isinstance(pack_raw, list)
+                else []
+            )
+            _verify_cert(candidate=candidate, certificate=certificate, evidence_pack=pack)
+            # The graph's final_response must be the certified text exactly;
+            # a borrowed verdict for mutated text fails closed here.
+            if _normalize(final_raw) != candidate.text or final_raw != candidate.text:
+                raise GraphRuntimeError(
+                    "stale-certificate", "final text mutated after certification"
+                )
+            final = candidate.text
+            try:
+                self._last_certificates[thread] = {
+                    "candidate": candidate.model_dump(mode="json"),
+                    "certificate": certificate.model_dump(mode="json"),
+                }
+            except Exception:
+                pass
+        except GraphRuntimeError:
+            raise
+        except Exception as exc:
+            raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
+        self._record_stage_telemetry(thread, result, elapsed_ms, len(final))
         logger.info(
             "graph turn completed",
             extra={
-                "reply_len": len(final.strip()),
+                "reply_len": len(final),
                 "latency_ms": round(elapsed_ms, 1),
                 "route": str(result.get("route", "normal")),
             },
         )
-        return final.strip()
+        return final
 
     def _record_stage_telemetry(
         self, thread: str, result: dict[str, Any], total_ms: float, reply_len: int
@@ -336,6 +486,26 @@ class GraphTurnRuntime:
     def last_telemetry_for_thread(self, thread: str) -> dict[str, Any]:
         """Return the last privacy-safe stage snapshot for ``thread``."""
         return dict(self._last_telemetry.get(thread, {}))
+
+    def last_certificate_for_thread(self, thread: str) -> dict[str, Any]:
+        """Return the last certified candidate/certificate for ``thread``."""
+        return dict(self._last_certificates.get(thread, {}))
+
+    def last_receipts_for_thread(self, thread: str) -> list[dict[str, Any]]:
+        """Return the last transport receipts for ``thread`` (provisional vs ack)."""
+        return [dict(item) for item in self._last_receipts.get(thread, [])]
+
+    def record_delivery_receipts(self, thread: str, receipts: list[dict[str, Any]]) -> None:
+        """Persist transport acknowledgments without mutating certified text.
+
+        Graph/checkpointer memory stays provisional-certified until Telegram
+        confirms; receipts record confirmed/failed/unknown per segment so a
+        partially delivered reply is never presented as complete history.
+        """
+        try:
+            self._last_receipts[thread] = [dict(item) for item in (receipts or [])]
+        except Exception:
+            pass
 
     async def _invoke_graph(self, graph: Any, thread: str, text: str) -> dict[str, Any]:
         from langchain_core.messages import HumanMessage

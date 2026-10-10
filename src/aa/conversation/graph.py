@@ -377,9 +377,18 @@ def build_turn_graph(
                 retrieval_config=retrieval_config,
             )
 
+        from aa.conversation.finalization import finalize_answer_node as _finalize
+
         builder.add_node("answer", _answer)
+        # Single mandatory delivery gate (kodmial/aa#304): every
+        # conversational output traverses finalization after candidate
+        # construction and before history insertion/delivery. Only
+        # explicitly classified command/blocked/emergency control paths
+        # bypass it via the gate route (typed policy, never book answers).
+        builder.add_node("finalize", _finalize)
         builder.add_edge(retrieval_node_name, "answer")
-        builder.add_edge("answer", END)
+        builder.add_edge("answer", "finalize")
+        builder.add_edge("finalize", END)
     else:
         builder.add_edge(retrieval_node_name, END)
     return builder.compile(checkpointer=checkpointer)

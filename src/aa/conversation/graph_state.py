@@ -36,6 +36,11 @@ class TurnState(TypedDict, total=False):
     planner_invoked: bool
     route: str
     recent_quote_ranges: list[dict[str, Any]]
+    answer_candidate: dict[str, Any]
+    verification_certificate: dict[str, Any]
+    delivery_status: str
+    delivery_receipts: list[dict[str, Any]]
+    response_unit_texts: list[dict[str, Any]]
 
 
 NORMAL_ROUTE = "normal"
