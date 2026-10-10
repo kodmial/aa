@@ -546,9 +546,16 @@ async def test_weak_relevance_triggers_targeted_followup_that_changes_evidence(
             selection_model=_WeakModel(),
         )
         assert pack.passages
-        assert pack.retrieval_metadata.get("followup_added", 0) >= 0
+        # The weak first selection requests more detail with a genuinely new
+        # follow-up query, so the coverage loop must run at least one
+        # follow-up search that surfaces fresh unread evidence (``>= 0``
+        # would prove nothing: it passes even when the follow-up never ran).
+        assert pack.retrieval_metadata.get("followup_added", 0) >= 1
+        assert pack.retrieval_metadata.get("loop_searches", 0) >= 1
+        assert len(pack.retrieval_metadata.get("discovered_ids", [])) > 0
+        assert len(pack.retrieval_metadata.get("read_ids", [])) > 0
         # Bounded: selection still caps winners, pack stays budgeted.
-        assert pack.retrieval_metadata.get("selected_winners", 0) <= 20
+        assert 1 <= pack.retrieval_metadata.get("selected_winners", 0) <= 20
     finally:
         close_hybrid_index(index)
 
