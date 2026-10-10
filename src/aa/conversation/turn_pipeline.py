@@ -1745,6 +1745,10 @@ async def run_v2_answer_turn(
                     else:
                         telemetry["retrieval_outcome"] = "empty-after-recovery"
                 except Exception as exc:
+                    from aa.opencode.errors import OpenCodeRateLimitError as _RecoveryRateLimit
+
+                    if isinstance(exc, (_RecoveryRateLimit, asyncio.CancelledError)):
+                        raise
                     logger.info(
                         "v2 empty-pack recovery failed",
                         extra={"category": type(exc).__name__},
@@ -2045,6 +2049,12 @@ async def run_v2_answer_turn(
         )
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
+    # Bounded repair progression (#331): repair retrieval must not repeat
+    # an identical query set. A duplicate re-plan fingerprint means the
+    # next full select/read/assess loop would redo demonstrably redundant
+    # sequential work, so it is skipped without a provider call; the
+    # existing-pack regen below still gets its bounded chance.
+    seen_repair_query_sets: set[frozenset[str]] = set()
     while not passed and rounds < max_repair_rounds and repair_allowed:
         if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
             telemetry["repair_budget_exceeded"] = True
@@ -2110,10 +2120,44 @@ async def run_v2_answer_turn(
             telemetry["planner_query_count"] = len(queries)
             telemetry["planner_outcome"] = "replanned" if queries else "empty-replan"
         except Exception as exc:
+            from aa.opencode.errors import OpenCodeRateLimitError as _ReplanRateLimit
+
+            if isinstance(exc, (_ReplanRateLimit, asyncio.CancelledError)):
+                raise
             logger.info("v2 targeted re-plan failed", extra={"category": type(exc).__name__})
             telemetry["planner_outcome"] = "failed"
             break
         if not queries:
+            break
+        # Skip demonstrably repeated repair retrieval: normalized
+        # duplicate query sets (stable query identity, not counts) would
+        # re-run the same select/read/assess work with no new canonical
+        # range, expansion, or need. Record and stop without provider
+        # work; downstream narrowing still applies.
+        try:
+            _repair_fps = frozenset(
+                " ".join(str(q).split()).casefold() for q in queries if str(q).strip()
+            )
+        except Exception:
+            _repair_fps = frozenset()
+        if _repair_fps and _repair_fps in seen_repair_query_sets:
+            telemetry["retrieval_outcome"] = "skipped-duplicate-repair"
+            logger.info(
+                "v2 repair retrieval skipped for duplicate queries",
+                extra={"rounds": rounds},
+            )
+            break
+        if _repair_fps:
+            seen_repair_query_sets.add(_repair_fps)
+        # Deadline accounting: no repair retrieval starts when the
+        # remaining end-to-end slice cannot usefully serve one round.
+        # Uses the existing verifier minimum slice, not a new threshold.
+        if _remaining_budget_s() < TURN_VERIFIER_MIN_SLICE_S:
+            logger.info(
+                "v2 repair retrieval skipped for end-to-end budget",
+                extra={"rounds": rounds},
+            )
+            _mark_turn_budget_exceeded()
             break
         try:
             from aa.retrieval.evidence import RetrievalConfig
@@ -2163,6 +2207,10 @@ async def run_v2_answer_turn(
             telemetry["retrieval_passages"] = len(new_dicts)
             telemetry["retrieval_outcome"] = "repaired" if new_dicts else "empty"
         except Exception as exc:
+            from aa.opencode.errors import OpenCodeRateLimitError as _RepairRateLimit
+
+            if isinstance(exc, (_RepairRateLimit, asyncio.CancelledError)):
+                raise
             logger.info("v2 targeted retrieval failed", extra={"category": type(exc).__name__})
             telemetry["retrieval_outcome"] = "failed"
             break
