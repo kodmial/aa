@@ -150,6 +150,16 @@ def evidence_digest_for_pack(pack: list[dict[str, Any]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def canonical_digest_for_state(state: Any) -> str:
+    """Return the canonical #305 digest carried by graph state, if present."""
+    try:
+        from aa.conversation.conversation_context import context_digest_from_state as _digest
+
+        return str(_digest(state) or "")
+    except Exception:
+        return ""
+
+
 def build_context_snapshot(
     *,
     question: str,
@@ -157,18 +167,21 @@ def build_context_snapshot(
     summary: str,
     recent_texts: list[str],
 ) -> dict[str, Any]:
-    """Build the provisional deterministic context snapshot (pre-#305).
+    """Build the deterministic context snapshot (legacy fallback).
 
-    #305 replaces this assembly with one canonical ``ResolvedTurn``
-    object without weakening the certificate invariant. Only
+    The canonical #305 path (``ResolvedTurn``/``ConversationContext``)
+    is authoritative whenever state carries it; this legacy snapshot
+    remains only for direct callers without canonical state. Only
     privacy-safe digests travel in the certificate; raw text never
     leaves this snapshot except through the digest.
     """
-    cleaned_recent = [str(item)[:1200] for item in (recent_texts or []) if str(item).strip()]
+    from aa.conversation.conversation_context import truncate_preserving_tail as _tail
+
+    cleaned_recent = [_tail(str(item), 1200) for item in (recent_texts or []) if str(item).strip()]
     snapshot = {
         "question": " ".join(str(question or "").split()),
         "resolved_intent": " ".join(str(resolved_intent or "").split()),
-        "summary": str(summary or "")[:2000],
+        "summary": _tail(str(summary or ""), 2000),
         "recent": cleaned_recent[-8:],
         "snapshot_version": "turn-context-snapshot/1",
     }
@@ -464,7 +477,7 @@ def certify_candidate(
         validate_book_pack_for_model_use(pack)
     except Exception as exc:
         raise FinalizationError("evidence-integrity", str(exc)[:200]) from exc
-    expected_context = context_digest_for_turn(
+    legacy_expected = context_digest_for_turn(
         question=question,
         resolved_intent=resolved_intent,
         summary=summary,
@@ -474,7 +487,24 @@ def certify_candidate(
             if isinstance(item, BaseMessage)
         ],
     )
-    if candidate.context_digest != expected_context:
+    # Canonical #305 path: the candidate may carry the single canonical
+    # digest (conversation only, intent bound separately). Accept it when
+    # it matches the canonical snapshot rebuilt from the same inputs;
+    # otherwise require the legacy snapshot. Any other value fails closed.
+    canonical_expected = ""
+    try:
+        from aa.conversation.conversation_context import build_conversation_context as _cc_build
+        from aa.conversation.conversation_context import context_digest_for_canonical as _cc_digest
+
+        _cc_obj = _cc_build(
+            [item for item in (recent_messages or []) if isinstance(item, BaseMessage)],
+            str(summary or ""),
+            str(question or ""),
+        )
+        canonical_expected = str(_cc_digest(_cc_obj) or "")
+    except Exception:
+        canonical_expected = ""
+    if candidate.context_digest not in {legacy_expected, canonical_expected} - {""}:
         raise FinalizationError("context-mismatch", "context snapshot changed after certification")
     evidence_digest = evidence_digest_for_pack(pack)
     answer_sha = sha256_text(normalized)
@@ -841,7 +871,13 @@ def candidate_from_state(
 ) -> tuple[
     AnswerCandidate, dict[str, Any] | None, str, str, str, list[BaseMessage], list[dict[str, Any]]
 ]:
-    """Build the exact candidate from live graph state (no transient objects)."""
+    """Build the exact candidate from live graph state (no transient objects).
+
+    The canonical #305 digest (single ``ConversationContext``/``ResolvedTurn``)
+    is authoritative whenever present; the legacy snapshot remains only for
+    direct callers. A mismatch between stage snapshots fails closed at
+    certification, never silently certifying another context.
+    """
     question = str(state.get("current_user_message", "") or "")
     resolved_intent = str(state.get("resolved_intent", "") or "")
     if not resolved_intent.strip():
@@ -851,22 +887,42 @@ def candidate_from_state(
             resolved_intent = str(retry_d.get("resolved_intent", "") or "")
         except Exception:
             resolved_intent = ""
+    try:
+        from aa.conversation.conversation_context import resolved_turn_from_state as _rt_state
+
+        _rt = _rt_state(state)
+        if _rt is not None and str(_rt.resolved_intent or "").strip():
+            resolved_intent = str(_rt.resolved_intent)
+    except Exception:
+        pass
     summary = str(state.get("conversation_summary", "") or "")
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
     pack = [dict(item) for item in state.get("evidence_pack", []) if isinstance(item, dict)]
     raw_text = str(state.get("final_response", "") or state.get("draft_response", "") or "")
     normalized = normalize_answer_text(raw_text)
-    recent_texts = [
-        str(getattr(item, "content", "")) for item in messages if isinstance(item, BaseMessage)
-    ]
-    # Keep only human/assistant text slices for the digest.
-    recent_cleaned = [text for text in recent_texts if text.strip()]
-    context_digest = context_digest_for_turn(
-        question=question,
-        resolved_intent=resolved_intent or question,
-        summary=summary,
-        recent_texts=recent_cleaned,
-    )
+    canonical = canonical_digest_for_state(state)
+    if canonical:
+        # Fail closed on divergent stage snapshots: the resolved turn and
+        # the direct digest must agree before certification.
+        try:
+            from aa.conversation.conversation_context import assert_same_context_digest as _assert
+
+            _assert(state, stage="finalizer")
+        except ValueError as exc:
+            raise FinalizationError("context-mismatch", str(exc)[:200]) from exc
+        context_digest = canonical
+    else:
+        recent_texts = [
+            str(getattr(item, "content", "")) for item in messages if isinstance(item, BaseMessage)
+        ]
+        # Keep only human/assistant text slices for the digest.
+        recent_cleaned = [text for text in recent_texts if text.strip()]
+        context_digest = context_digest_for_turn(
+            question=question,
+            resolved_intent=resolved_intent or question,
+            summary=summary,
+            recent_texts=recent_cleaned,
+        )
     grounding: dict[str, Any] | None = None
     raw_grounding = state.get("grounding_result", None)
     if isinstance(raw_grounding, dict):
@@ -955,6 +1011,7 @@ __all__ = [
     "build_context_snapshot",
     "build_delivery_receipts",
     "candidate_from_state",
+    "canonical_digest_for_state",
     "certify_candidate",
     "context_digest_for_turn",
     "evaluate_whole_answer",

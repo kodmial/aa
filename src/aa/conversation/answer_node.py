@@ -62,11 +62,14 @@ async def generate_draft(
     passages: list[EvidencePassage],
     user_message: str,
     safety_policy: str = "",
+    resolved_intent: str = "",
+    conversation_context: dict[str, Any] | None = None,
 ) -> str:
     """Generate one natural grounded Russian draft from the Evidence Pack.
 
     ``safety_policy`` is a separate control block (kodmial/aa#300), never
-    merged into ``user_message``; empty for ordinary drafts.
+    merged into ``user_message``; empty for ordinary drafts. The canonical
+    resolved intent travels explicitly alongside the verbatim user message.
     """
     if not user_message.strip():
         raise ValueError("refusing to generate an answer without a user message")
@@ -92,6 +95,8 @@ async def generate_draft(
         user_message=user_message,
         system_prompt=system_text,
         safety_policy=safety_policy,
+        resolved_intent=resolved_intent,
+        conversation_context=conversation_context,
     )
     reply = await model.ainvoke(messages)
     text = _reply_text(reply).strip()
@@ -107,7 +112,16 @@ async def generate_draft_from_state(
     model: Any,
     user_message_override: str | None = None,
 ) -> str:
-    """Generate one draft directly from graph state passages."""
+    """Generate one draft directly from graph state passages.
+
+    Consumes the canonical resolved turn (intent + context + digest) when
+    present so the generator proves the same bytes as the selector and
+    verifier; legacy state falls back to raw summary/recent.
+    """
+    from aa.conversation.conversation_context import assert_same_context_digest as _assert_digest
+    from aa.conversation.conversation_context import resolved_turn_from_state as _rt_state
+
+    _assert_digest(state, stage="generator")
     current = str(user_message_override or state.get("current_user_message", ""))
     summary = str(state.get("conversation_summary", ""))
     messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
@@ -117,6 +131,19 @@ async def generate_draft_from_state(
     # never as a skipped passage. Empty pack (glue) passes.
     validate_book_pack_for_model_use(pack_dicts)
     passages = state_passages_to_prompt(pack_dicts)
+    resolved = _rt_state(state)
+    resolved_intent = str(resolved.resolved_intent) if resolved is not None else ""
+    if not resolved_intent.strip():
+        resolved_intent = str(state.get("resolved_intent", "") or "")
+    canonical: dict[str, Any] | None = None
+    if resolved is not None and resolved.conversation_context:
+        canonical = dict(resolved.conversation_context)
+    else:
+        try:
+            raw = state.get("conversation_context", None)
+            canonical = dict(raw) if isinstance(raw, dict) else None
+        except Exception:
+            canonical = None
     return await generate_draft(
         model=model,
         recent=recent_history(
@@ -125,6 +152,8 @@ async def generate_draft_from_state(
         summary=summary,
         passages=passages,
         user_message=current,
+        resolved_intent=resolved_intent,
+        conversation_context=canonical,
     )
 
 

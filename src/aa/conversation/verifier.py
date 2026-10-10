@@ -926,6 +926,7 @@ def build_single_unit_text(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    context_digest: str = "",
 ) -> str:
     """Render the minimal single-unit verifier payload (no id copying).
 
@@ -978,14 +979,23 @@ def build_single_unit_text(
         "</response_unit>",
         "<book_evidence>",
     ]
+    from aa.conversation.conversation_context import truncate_preserving_tail as _tail
+
     if user_message.strip():
         lines.append("<current_user_message>")
+        # Live request travels verbatim; the shared tail-preserving budget
+        # applies only to the bounded conversation view, never as a secret
+        # first-N clip of the live turn.
         lines.append(_escape(user_message))
         lines.append("</current_user_message>")
     if conversation_context.strip():
         lines.append("<conversation_context>")
-        lines.append(_escape(conversation_context[:2000]))
+        # Shared canonical budget with tail preservation: trailing
+        # conditions/referents survive and omissions stay traceable.
+        lines.append(_escape(_tail(conversation_context.strip(), 2000)))
         lines.append("</conversation_context>")
+    if str(context_digest or "").strip():
+        lines.append(f"<context_digest>{_escape(str(context_digest).strip())}</context_digest>")
     lines.append(UNTRUSTED_DATA_POLICY_LINE)
     window = list(passages)
     if window:
@@ -1135,6 +1145,7 @@ async def _verify_single_unit(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    context_digest: str = "",
     _prefer_text_snapshot: bool | None = None,
 ) -> UnitVerdict:
     """Verify exactly one unit with the minimal boolean decision schema.
@@ -1208,6 +1219,7 @@ async def _verify_single_unit(
         resolved_intent=resolved_intent,
         user_message=user_message,
         conversation_context=conversation_context,
+        context_digest=context_digest,
     )
     window = list(passages)
     short_to_full = display_id_map_for_window(window)
@@ -1440,6 +1452,7 @@ async def _verify_per_unit_concurrent(
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
     answer_text: str | None = None,
+    context_digest: str = "",
 ) -> GroundingResult:
     """Verify each unit concurrently with the unified decision schema.
 
@@ -1467,6 +1480,7 @@ async def _verify_per_unit_concurrent(
                 resolved_intent=resolved_intent,
                 user_message=user_message,
                 conversation_context=conversation_context,
+                context_digest=context_digest,
                 _prefer_text_snapshot=prefer_text_snapshot,
             )
         )
@@ -1604,6 +1618,7 @@ async def run_verifier(
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
     answer_text: str | None = None,
+    context_digest: str = "",
 ) -> GroundingResult:
     """Invoke the hidden verifier once per unit, concurrently.
 
@@ -1632,6 +1647,7 @@ async def run_verifier(
         conversation_context=conversation_context,
         recent=recent,
         answer_text=answer_text,
+        context_digest=context_digest,
     )
     logger.info("verifier output accepted", extra={"units": len(units)})
     return result

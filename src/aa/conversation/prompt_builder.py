@@ -21,6 +21,7 @@ later generation task owns the answer node itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
@@ -95,12 +96,15 @@ ANSWER_TRUNCATION_SUFFIX_FORMAT = "... [truncated {omitted} chars omitted]"
 
 
 def _display_answer_text(value: object, *, limit: int) -> str:
-    """Bound one display string for answer generation with a marker."""
+    """Bound one display string for answer generation with a marker.
+
+    Uses the shared tail-preserving truncation so trailing conditions and
+    referents survive; short texts travel byte-identical.
+    """
+    from aa.conversation.conversation_context import truncate_preserving_tail as _tail
+
     text = value if isinstance(value, str) else ""
-    if len(text) <= limit:
-        return text
-    omitted = len(text) - limit
-    return text[:limit] + ANSWER_TRUNCATION_SUFFIX_FORMAT.format(omitted=omitted)
+    return _tail(text, limit)
 
 
 def _escape_text(value: str) -> str:
@@ -114,13 +118,16 @@ def render_turn_context(
     passages: list[EvidencePassage],
     user_message: str,
     safety_policy: str = "",
+    resolved_intent: str = "",
 ) -> str:
     """Render the current-turn structured context payload (user role).
 
-    ``<user_message>`` is always last so the real request stays
-    structurally unambiguous. ``safety_policy`` travels as a separate
-    ``<safety_policy>`` control block (kodmial/aa#300), never merged into
-    ``<user_message>`` or any retrieval query.
+    ``<resolved_intent>`` travels explicitly alongside the verbatim
+    ``<user_message>`` (which stays unchanged and last) so the generator
+    resolves pronouns/corrections from the planner's canonical intent
+    without reinterpreting the request. ``safety_policy`` travels as a
+    separate ``<safety_policy>`` control block (kodmial/aa#300), never
+    merged into ``<user_message>`` or any retrieval query.
     """
     from aa.conversation.output_limits import (
         DEFAULT_GENERATION_BUDGET_TOKENS,
@@ -161,6 +168,10 @@ def render_turn_context(
         lines.append("<safety_policy>")
         lines.append(_escape_text(safety_policy.strip()))
         lines.append("</safety_policy>")
+    if str(resolved_intent or "").strip():
+        lines.append("<resolved_intent>")
+        lines.append(_escape_text(str(resolved_intent).strip()))
+        lines.append("</resolved_intent>")
     lines.append("<user_message>")
     lines.append(_escape_text(user_message))
     lines.append("</user_message>")
@@ -175,24 +186,62 @@ def build_answer_messages(
     user_message: str,
     system_prompt: str | None = None,
     safety_policy: str = "",
+    resolved_intent: str = "",
+    conversation_context: dict[str, Any] | None = None,
 ) -> list[BaseMessage]:
     """Assemble the full answer-node model input in contract order.
 
-    Recent history keeps message count and order (full history still sent
-    for pronoun/ellipsis resolution); only per-message characters are
-    display-bounded with an explicit marker. The live user message travels
-    untruncated inside the structured payload.
+    History uses the shared canonical relevance-preserving window: the
+    most recent messages in order plus older topic-relevant messages
+    promoted by generic lexical overlap (no domain tables), so topic
+    returns beyond the window stay resolvable. Per-message characters use
+    tail-preserving truncation with an explicit marker. The live user
+    message travels untruncated inside the structured payload alongside
+    the explicit resolved intent.
     """
     system_text = system_prompt or load_aa_agent_system_v2()
     assembled: list[BaseMessage] = [SystemMessage(content=system_text)]
-    # History-count bound (recurrence 8): keep order, keep the most
-    # recent window only. Older turns stay reachable via the running
-    # summary carried in the structured payload.
-    windowed = list(
-        recent[-ANSWER_MAX_HISTORY_MESSAGES:]
-        if len(recent) > ANSWER_MAX_HISTORY_MESSAGES
-        else recent
-    )
+    # Canonical relevance-preserving window (#305): recent window plus
+    # promoted older topic-relevant messages from the shared context when
+    # available; legacy most-recent slicing otherwise.
+    windowed: list[BaseMessage] = list(recent or [])
+    if conversation_context is not None:
+        try:
+            from aa.conversation.conversation_context import select_relevant_history as _select
+
+            selected = _select(
+                conversation_context,
+                resolved_intent=str(resolved_intent or ""),
+                max_messages=ANSWER_MAX_HISTORY_MESSAGES,
+            )
+            if selected:
+                by_id: dict[str, BaseMessage] = {}
+                for message in windowed:
+                    mid = str(getattr(message, "id", "") or "")
+                    if mid:
+                        by_id[mid] = message
+                rebuilt: list[BaseMessage] = []
+                for entry in selected:
+                    match = by_id.get(str(entry.message_id or ""))
+                    if match is not None:
+                        rebuilt.append(match)
+                    else:
+                        # Canonical entry without a live message object:
+                        # reconstruct a role-correct message so the bytes
+                        # match the shared canonical view.
+                        if entry.role == "user":
+                            rebuilt.append(HumanMessage(content=entry.text))
+                        else:
+                            rebuilt.append(AIMessage(content=entry.text))
+                if rebuilt:
+                    windowed = rebuilt
+            elif len(windowed) > ANSWER_MAX_HISTORY_MESSAGES:
+                windowed = windowed[-ANSWER_MAX_HISTORY_MESSAGES:]
+        except Exception:
+            if len(windowed) > ANSWER_MAX_HISTORY_MESSAGES:
+                windowed = windowed[-ANSWER_MAX_HISTORY_MESSAGES:]
+    elif len(windowed) > ANSWER_MAX_HISTORY_MESSAGES:
+        windowed = windowed[-ANSWER_MAX_HISTORY_MESSAGES:]
     for message in windowed:
         if message.type == "human":
             content = message.content
@@ -213,6 +262,7 @@ def build_answer_messages(
                 passages=passages,
                 user_message=user_message,
                 safety_policy=safety_policy,
+                resolved_intent=resolved_intent,
             )
         )
     )

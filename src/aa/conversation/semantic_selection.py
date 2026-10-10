@@ -199,6 +199,7 @@ def selection_prompt(
     resolved_intent: str,
     conversation_context: str = "",
     user_message: str = "",
+    context_digest: str = "",
 ) -> tuple[str, str]:
     """Render the bounded selection prompt (system, user)."""
     from aa.conversation.prompt_safety import (
@@ -219,22 +220,26 @@ def selection_prompt(
         + " Candidate previews are discovery references only, never full "
         "evidence; select only ids listed in <candidates>."
     )
+    # Shared canonical view: the upstream canonical model view is already
+    # bounded, so these bytes travel verbatim. No independent per-stage
+    # re-truncation while claiming the same ``context_digest``: the digest
+    # must attest to the exact bytes sent to the model.
     lines: list[str] = [
         UNTRUSTED_DATA_POLICY_LINE,
         "<resolved_intent>",
-        escape_xml_text((resolved_intent or user_message or "").strip()[:2000]) or "(no intent)",
+        escape_xml_text((resolved_intent or user_message or "").strip()) or "(no intent)",
         "</resolved_intent>",
     ]
     if user_message.strip():
         lines += [
             "<current_user_message>",
-            escape_xml_text(user_message.strip()[:2000]),
+            escape_xml_text(user_message.strip()),
             "</current_user_message>",
         ]
     if conversation_context.strip():
         lines += [
             "<conversation_context>",
-            escape_xml_text(conversation_context.strip()[:2000]),
+            escape_xml_text(conversation_context.strip()),
             "</conversation_context>",
         ]
     lines.append("<candidates>")
@@ -248,6 +253,10 @@ def selection_prompt(
     if not previews:
         lines.append("(no candidates)")
     lines.append("</candidates>")
+    if str(context_digest or "").strip():
+        lines.append(
+            f"<context_digest>{escape_xml_text(str(context_digest).strip())}</context_digest>"
+        )
     lines.append(
         "Return ONLY a JSON object with exactly these keys: "
         '{"selected_chunk_ids": array of strings, '
@@ -322,6 +331,7 @@ async def aselect_semantic_candidates(
     user_message: str = "",
     model: Any | None = None,
     known_chunk_ids: set[str] | None = None,
+    context_digest: str = "",
 ) -> SemanticSelection:
     """Model-driven selection with deterministic fallback (bounded).
 
@@ -363,6 +373,7 @@ async def aselect_semantic_candidates(
         resolved_intent=resolved_intent,
         conversation_context=conversation_context,
         user_message=user_message,
+        context_digest=context_digest,
     )
     try:
         structured = getattr(model, "ainvoke_structured", None)

@@ -111,14 +111,38 @@ def make_memory_node(
         from aa.conversation.memory import needs_compaction
 
         try:
-            if not needs_compaction(messages, trigger_tokens=memory_config.trigger_tokens):
+            below_trigger = not needs_compaction(
+                messages, trigger_tokens=memory_config.trigger_tokens
+            )
+        except Exception:
+            below_trigger = False
+        if below_trigger:
+            # Proactive continuity (#305): summarize before useful history
+            # falls out of the usable window, not only at the 120k global
+            # threshold. Uses model-context pressure (keep window) and
+            # message-count pressure; LangMem stays the only memory store.
+            try:
+                from aa.conversation.conversation_context import (
+                    needs_proactive_summary as _proactive,
+                )
+
+                summary_now = str(state.get("conversation_summary", "") or "")
+                if not _proactive(
+                    messages,
+                    summary=summary_now,
+                    keep_tokens=memory_config.keep_tokens,
+                ):
+                    logger.info(
+                        "v2 memory ensured",
+                        extra={"compacted": False, "fast_path": True},
+                    )
+                    return {}
+            except Exception:
                 logger.info(
                     "v2 memory ensured",
                     extra={"compacted": False, "fast_path": True},
                 )
                 return {}
-        except Exception:
-            pass
         previous = str(state.get("conversation_summary", ""))
         context = dict(state.get("context", {}) or {})
         running = running_summary_from_state(summary_text=previous, context=context)
@@ -149,6 +173,35 @@ def make_memory_node(
         return update
 
     return ensure_memory
+
+
+def make_context_node() -> Any:
+    """Build the single canonical context assembly node (#305).
+
+    Runs exactly once after managed memory and before the planner. All
+    downstream stages consume this object (or the planner's resolved turn
+    bound to it); no stage reassembles an independent context string.
+    """
+
+    async def build_canonical_context(state: TurnState) -> dict[str, Any]:
+        from aa.conversation.conversation_context import build_conversation_context as _build
+        from aa.conversation.conversation_context import context_digest_for_canonical as _digest
+
+        messages = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
+        summary = str(state.get("conversation_summary", "") or "")
+        user_message = str(state.get("current_user_message", "") or "")
+        try:
+            context = _build(messages, summary, user_message)
+        except Exception:
+            return {}
+        digest = _digest(context)
+        logger.info("v2 canonical context built", extra={"messages": len(context.messages)})
+        return {
+            "conversation_context": context.model_dump(mode="json"),
+            "context_digest": digest,
+        }
+
+    return build_canonical_context
 
 
 def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]) -> Any:
@@ -194,9 +247,15 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.warning("v2 planner failed closed", extra={"category": "planner-invalid"})
             # Invalid semantic output is never conversational glue. Use the
-            # generic retrieval fallback from the raw turn plus bounded
-            # managed context, just as for provider/timeout failures.
+            # generic retrieval fallback from the raw turn plus the shared
+            # canonical context, just as for provider/timeout failures.
             try:
+                from aa.conversation.conversation_context import build_resolved_turn as _f_build
+                from aa.conversation.conversation_context import (
+                    conversation_context_from_state as _f_cc,
+                )
+                from aa.conversation.conversation_context import needs_from_plan as _f_needs_fn
+
                 _summary = str(state.get("conversation_summary", "") or "")
                 _recent_raw: list[str] = []
                 for _msg in list(state.get("messages", []) or [])[-4:]:
@@ -210,7 +269,40 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _fallback = []
-            return {
+            try:
+                _f_cc_obj = _f_cc(state)
+                if _f_cc_obj is None:
+                    from aa.conversation.conversation_context import (
+                        build_conversation_context as _f_build_cc,
+                    )
+
+                    _f_cc_obj = _f_build_cc(
+                        [
+                            item
+                            for item in state.get("messages", [])
+                            if isinstance(item, BaseMessage)
+                        ],
+                        str(state.get("conversation_summary", "") or ""),
+                        str(state.get("current_user_message", "")),
+                    )
+                _f_intent = str(state.get("current_user_message", ""))
+                _f_needs_list = _f_needs_fn(_f_intent, list(_fallback))
+                _f_turn = _f_build(
+                    user_message=_f_intent,
+                    resolved_intent=_f_intent,
+                    context=_f_cc_obj,
+                    information_needs=_f_needs_list,
+                    planner_mode="retrieval",
+                    search_queries=list(_fallback),
+                )
+                _f_turn_d = _f_turn.model_dump(mode="json")
+                _f_digest = str(_f_turn.context_digest)
+                _f_needs_d = [item.model_dump(mode="json") for item in _f_needs_list]
+            except Exception:
+                _f_turn_d = {}
+                _f_digest = str(state.get("context_digest", "") or "")
+                _f_needs_d = []
+            _f_update: dict[str, Any] = {
                 "search_queries": list(_fallback),
                 "planner_invoked": True,
                 "planner_mode": "retrieval",
@@ -224,6 +316,11 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_mode": "retrieval",
                 },
             }
+            if _f_turn_d:
+                _f_update["resolved_turn"] = _f_turn_d
+                _f_update["information_needs"] = _f_needs_d
+                _f_update["context_digest"] = _f_digest
+            return _f_update
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError as _PlannerRateLimit
 
@@ -241,8 +338,8 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             logger.warning("v2 planner failed closed", extra={"category": outcome})
             from aa.conversation.answer_adequacy import planner_reason_for as _error_reason_for
 
-            # Generic semantic retrieval fallback: raw turn plus bounded
-            # recent conversation; never reinterpreted as glue.
+            # Generic semantic retrieval fallback: raw turn plus the shared
+            # canonical context; never reinterpreted as glue.
             try:
                 _error_summary = str(state.get("conversation_summary", "") or "")
                 _error_recent: list[str] = []
@@ -257,7 +354,46 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _error_fallback = []
-            return {
+            try:
+                from aa.conversation.conversation_context import build_resolved_turn as _e_build
+                from aa.conversation.conversation_context import (
+                    conversation_context_from_state as _e_cc,
+                )
+                from aa.conversation.conversation_context import needs_from_plan as _e_needs_fn
+
+                _e_cc_obj = _e_cc(state)
+                if _e_cc_obj is None:
+                    from aa.conversation.conversation_context import (
+                        build_conversation_context as _e_build_cc,
+                    )
+
+                    _e_cc_obj = _e_build_cc(
+                        [
+                            item
+                            for item in state.get("messages", [])
+                            if isinstance(item, BaseMessage)
+                        ],
+                        str(state.get("conversation_summary", "") or ""),
+                        str(state.get("current_user_message", "")),
+                    )
+                _e_intent = str(state.get("current_user_message", ""))
+                _e_needs_list = _e_needs_fn(_e_intent, list(_error_fallback))
+                _e_turn = _e_build(
+                    user_message=_e_intent,
+                    resolved_intent=_e_intent,
+                    context=_e_cc_obj,
+                    information_needs=_e_needs_list,
+                    planner_mode="retrieval",
+                    search_queries=list(_error_fallback),
+                )
+                _e_turn_d = _e_turn.model_dump(mode="json")
+                _e_digest = str(_e_turn.context_digest)
+                _e_needs_d = [item.model_dump(mode="json") for item in _e_needs_list]
+            except Exception:
+                _e_turn_d = {}
+                _e_digest = str(state.get("context_digest", "") or "")
+                _e_needs_d = []
+            _e_update: dict[str, Any] = {
                 "search_queries": list(_error_fallback),
                 "planner_invoked": True,
                 "planner_mode": "retrieval",
@@ -271,6 +407,11 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_mode": "retrieval",
                 },
             }
+            if _e_turn_d:
+                _e_update["resolved_turn"] = _e_turn_d
+                _e_update["information_needs"] = _e_needs_d
+                _e_update["context_digest"] = _e_digest
+            return _e_update
 
     return run_hidden_planner
 
@@ -337,6 +478,7 @@ def build_turn_graph(
         "ensure_memory",
         make_memory_node(summary_model=resolved_summary, memory_config=resolved_config),
     )
+    builder.add_node("build_context", make_context_node())
     builder.add_node("planner", make_planner_node(planner_model=planner_model))
     if retrieval_index is None:
         builder.add_node("retrieval_stub", retrieval_stub_node)
@@ -362,7 +504,8 @@ def build_turn_graph(
     builder.add_conditional_edges(
         "gate", _route_after_gate, {NORMAL_ROUTE: "ensure_memory", END: END}
     )
-    builder.add_edge("ensure_memory", "planner")
+    builder.add_edge("ensure_memory", "build_context")
+    builder.add_edge("build_context", "planner")
     builder.add_edge("planner", retrieval_node_name)
     if answer_model is not None and verifier_model is not None:
         from aa.conversation.turn_pipeline import answer_pipeline_node
@@ -422,6 +565,7 @@ __all__ = [
     "build_turn_graph",
     "gate_node",
     "is_application_command",
+    "make_context_node",
     "make_memory_node",
     "make_planner_node",
     "retrieval_stub_node",
