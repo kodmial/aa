@@ -66,12 +66,34 @@ class _InteractiveBudgetTimeout(TimeoutError):
     """One bounded model/retriever await exceeded the interactive deadline."""
 
 
+def _effective_interactive_budget_ms() -> float:
+    """Tightest applicable interactive budget (retrieval-node + evidence).
+
+    Reads the retrieval-node module constant so a node-level override
+    takes effect, while still honoring a tightened evidence-level budget
+    (both names are patched in tests). The smaller value wins so
+    remaining-budget and per-call-cap logic cannot diverge.
+    """
+    candidates: list[float] = []
+    try:
+        candidates.append(float(INTERACTIVE_LATENCY_BUDGET_MS))
+    except Exception:
+        pass
+    try:
+        from aa.retrieval import evidence as _evidence_mod
+
+        candidates.append(float(_evidence_mod.INTERACTIVE_LATENCY_BUDGET_MS))
+    except Exception:
+        pass
+    if not candidates:
+        return 0.0
+    return min(candidates)
+
+
 def _remaining_interactive_ms(started: float) -> float:
     """Remaining interactive retrieval budget in milliseconds."""
     try:
-        from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS as _budget
-
-        return float(_budget) - (time.perf_counter() - started) * 1000.0
+        return float(_effective_interactive_budget_ms()) - (time.perf_counter() - started) * 1000.0
     except Exception:
         return 0.0
 
@@ -129,6 +151,55 @@ def _preview_identity(previews: Any) -> str:
         return ""
 
 
+def _is_cached_expansion_valid(index: Any, winner_cid: str, cached: Any) -> bool:
+    """Checksum-validate a cached expanded range against the live index.
+
+    Content-addressed safety: the cached ``exact_text`` must checksum to
+    its stored ``text_sha256``, the winner must belong to the cached
+    child set, and the concatenation of the live child texts must equal
+    the cached exact text (checksum equality). Any neighbor change thus
+    invalidates the hit instead of serving a stale adjacent range.
+    """
+    try:
+        exact_text = str(getattr(cached, "exact_text", "") or "")
+        cached_hash = str(getattr(cached, "text_sha256", "") or "")
+        if not exact_text or not cached_hash:
+            return False
+        if hashlib.sha256(exact_text.encode("utf-8")).hexdigest() != cached_hash:
+            return False
+        child_ids = [str(c) for c in list(getattr(cached, "child_chunk_ids", ()) or ())]
+        if not child_ids:
+            record = index.chunks.get(winner_cid)
+            if record is None:
+                return False
+            live_text = str(getattr(record, "text", "") or "")
+            live_hash = str(getattr(record, "text_sha256", "") or "")
+            return bool(live_text == exact_text and live_hash == cached_hash)
+        if winner_cid not in child_ids:
+            return False
+        chunks = getattr(index, "chunks", None)
+        if chunks is None:
+            return False
+        parts: list[str] = []
+        for child_id in child_ids:
+            record = chunks.get(child_id)
+            if record is None:
+                return False
+            live_text = str(getattr(record, "text", "") or "")
+            live_hash = str(getattr(record, "text_sha256", "") or "")
+            if not live_text or not live_hash:
+                return False
+            if hashlib.sha256(live_text.encode("utf-8")).hexdigest() != live_hash:
+                return False
+            parts.append(live_text)
+        live_exact = "".join(parts)
+        if live_exact != exact_text:
+            return False
+        return bool(hashlib.sha256(live_exact.encode("utf-8")).hexdigest() == cached_hash)
+    except Exception:
+        return False
+
+
 def _cached_expand_small_to_big(index: Any, winners: Any, *, neighbor_window: int) -> list[Any]:
     """Expand winners reusing validated cached canonical ranges where safe.
 
@@ -162,10 +233,7 @@ def _cached_expand_small_to_big(index: Any, winners: Any, *, neighbor_window: in
         cached = _EXPANDED_READ_CACHE.get(key)
         if cached is not None:
             try:
-                record = index.chunks.get(cid)
-                if record is not None and str(getattr(record, "text", "")) in str(
-                    getattr(cached, "exact_text", "")
-                ):
+                if _is_cached_expansion_valid(index, cid, cached):
                     out[pos] = cached
                     hits += 1
                     continue
@@ -190,8 +258,6 @@ def _cached_expand_small_to_big(index: Any, winners: Any, *, neighbor_window: in
                 cid = ""
             options = fresh_by_child.get(cid, [])
             chosen = options[0] if options else None
-            if chosen is None and fresh:
-                chosen = fresh[0]
             out[pos] = chosen
             if chosen is not None and cid:
                 try:
@@ -659,9 +725,9 @@ async def aretrieve_with_semantic_selection(
         truncation, no skipped semantic checks on the fast path.
         """
         try:
-            from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS as _budget
-
-            return (time.perf_counter() - started) * 1000.0 > float(_budget)
+            return (time.perf_counter() - started) * 1000.0 > float(
+                _effective_interactive_budget_ms()
+            )
         except Exception:
             return False
 
