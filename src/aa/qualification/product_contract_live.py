@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import resource
@@ -37,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from aa.opencode.errors import OpenCodeRateLimitError
+
+logger = logging.getLogger("aa.qualification.product_contract_live")
 
 RESULT_ISSUE = 7
 CAPABILITY_ISSUE = 6
@@ -673,6 +676,66 @@ async def run_message_lane(repo_root: Path | None = None) -> LaneResult:
 # Lane 2: Telegram transport/concurrency lane (scenarios 25-32)
 # ---------------------------------------------------------------------------
 
+LIVE_PROBE_TEXT = "AA live transport probe 332 (automated qualification; no action needed)."
+
+
+async def _probe_live_delivery(token: str, peer_chat_id: int) -> str:
+    """Send one probe message to the live peer and classify the ack.
+
+    Uses the exact production ``PollingTelegramTransport.send`` path without
+    starting polling (no ``getUpdates``, no update stealing). Returns
+    ``"confirmed"`` only when the Bot API returns an integer message id for
+    the full probe text, ``"unknown"`` when the ack carries no message id,
+    and ``"failed"`` when delivery raises. Only counts/categories are
+    logged, never the peer id or message text.
+    """
+    from aa.telegram.startup_probe import confirm_full_delivery
+    from aa.telegram.transport import PollingTelegramTransport, TelegramReply
+
+    transport = PollingTelegramTransport(
+        token=(token or "").strip(),
+        poll_timeout_seconds=0,
+        retry_base_delay_seconds=0.05,
+        retry_max_delay_seconds=0.5,
+    )
+    try:
+        message_id = await asyncio.wait_for(
+            transport.send(TelegramReply(chat_id=int(peer_chat_id), text=LIVE_PROBE_TEXT)),
+            timeout=45.0,
+        )
+    except TimeoutError:
+        logger.warning("live delivery probe timed out")
+        return "failed"
+    except Exception as exc:
+        from aa.telegram.startup_probe import categorize_startup_exception
+
+        logger.warning(
+            "live delivery probe failed",
+            extra={"category": categorize_startup_exception(exc)},
+        )
+        return "failed"
+    if not isinstance(message_id, int):
+        logger.warning("live delivery probe ack unknown")
+        return "unknown"
+    from aa.conversation.finalization import normalize_answer_text, sha256_text
+
+    normalized = normalize_answer_text(LIVE_PROBE_TEXT)
+    ok, _ = confirm_full_delivery(
+        LIVE_PROBE_TEXT,
+        [
+            {
+                "status": "confirmed",
+                "final_sha256": sha256_text(normalized),
+                "char_start": 0,
+                "char_end": len(normalized),
+            }
+        ],
+    )
+    if not ok:
+        return "failed"
+    logger.info("live delivery probe confirmed")
+    return "confirmed"
+
 
 async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
     """Execute scenarios 25-32 with live timing on production transport code."""
@@ -857,19 +920,80 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
             root_logger.removeHandler(handler)
         captured = handler_stream.getvalue()
         _check("32-log-privacy", secret not in captured and "32337" not in captured)
-        # Real Bot API typing stream: live only with a configured token.
+        # Real Telegram startup proof (issue #332): dial the Bot API through
+        # the exact production transport when a token is configured. Offline
+        # runs stay fail-closed INCOMPLETE with a typed external dependency;
+        # a configured token that cannot bootstrap is an honest FAIL, never
+        # a mock PASS. The probe runs the bootstrap handshake only (getMe ->
+        # deleteWebhook -> setMyCommands, no getUpdates), so it never steals
+        # updates from a concurrently running production poller; live-poll
+        # evidence stays owned by Gate D. Delivery confirmation additionally
+        # requires a configured live peer plus explicit send authorization;
+        # without it the lane records the exact missing external dependency
+        # and stays INCOMPLETE instead of inventing verified live evidence.
+        live_transport_category = "environment-secrets"
+        live_transport_status = "blocked"
+        live_bootstrap_verified = False
+        live_peer_configured = False
+        live_send_authorized = False
+        live_external_dependency = ""
         token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-        if token:
-            from aa.telegram.transport import PollingTelegramTransport
-
-            try:
-                probe = PollingTelegramTransport(token=token)
-                _ = probe
-                incomplete.append("real-telegram-typing-stream-not-dialed-in-qualification")
-            except Exception:
-                failed.append("real-telegram-typing-stream")
-        else:
+        if not token:
             incomplete.append("real-telegram-typing-stream-requires-token")
+            live_external_dependency = "EXTERNAL_TELEGRAM_TOKEN_UNAVAILABLE"
+        else:
+            from aa.telegram.startup_probe import (
+                EXTERNAL_PEER_DEPENDENCY,
+                live_delivery_peer_from_env,
+            )
+            from aa.telegram.startup_probe import (
+                live_send_authorized as _live_send_authorized,
+            )
+            from aa.telegram.startup_probe import (
+                probe_telegram_startup as _probe_startup,
+            )
+
+            outcome = None
+            try:
+                outcome = await asyncio.wait_for(
+                    _probe_startup(token, start_polling=False), timeout=45.0
+                )
+            except TimeoutError:
+                failed.append("real-telegram-startup-timeout")
+                live_transport_category = "transport-network-failure"
+                live_transport_status = "failed"
+            except Exception:
+                failed.append("real-telegram-startup-harness")
+                live_transport_category = "qualifier-artifact-collector"
+                live_transport_status = "failed"
+            if outcome is not None:
+                live_transport_category = outcome.category
+                live_transport_status = outcome.status
+                live_bootstrap_verified = bool(outcome.bootstrap_verified)
+                if outcome.status == "ready":
+                    passed.append("real-telegram-startup-ready")
+                    peer = live_delivery_peer_from_env()
+                    live_peer_configured = peer is not None
+                    live_send_authorized = _live_send_authorized()
+                    if peer is None:
+                        incomplete.append("live-telegram-delivery-peer-missing")
+                        live_external_dependency = EXTERNAL_PEER_DEPENDENCY
+                    elif not live_send_authorized:
+                        incomplete.append("live-telegram-send-not-authorized")
+                        live_external_dependency = EXTERNAL_PEER_DEPENDENCY
+                    else:
+                        delivery_ok = await _probe_live_delivery(token, peer)
+                        if delivery_ok == "confirmed":
+                            passed.append("real-telegram-delivery-confirmed")
+                        elif delivery_ok == "unknown":
+                            failed.append("real-telegram-delivery-unknown")
+                        else:
+                            failed.append("real-telegram-delivery-failed")
+                elif outcome.status == "blocked":
+                    incomplete.append(f"live-telegram-startup-blocked-{outcome.category}")
+                    live_external_dependency = "EXTERNAL_TELEGRAM_STARTUP_BLOCKED"
+                else:
+                    failed.append(f"real-telegram-startup-{outcome.category}")
     finally:
         await app.stop()
 
@@ -892,6 +1016,17 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
         "real_telegram_token_configured": bool(
             (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
         ),
+        # Issue #332 honest transport acceptance: the live sublane reports
+        # its typed startup/delivery outcome (categories only, never secrets
+        # or peer ids). Live-poll ownership stays with Gate D; the lane
+        # proves the bootstrap handshake and fails closed on the exact
+        # missing external dependency.
+        "live_transport_status": live_transport_status,
+        "live_transport_category": live_transport_category,
+        "live_transport_bootstrap_verified": live_bootstrap_verified,
+        "live_delivery_peer_configured": live_peer_configured,
+        "live_delivery_send_authorized": live_send_authorized,
+        "live_external_dependency": live_external_dependency,
         "opencode_token_usage_by_agent": token_usage_by_agent,
     }
     if failed:

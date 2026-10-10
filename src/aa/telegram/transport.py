@@ -87,6 +87,14 @@ class TelegramAuthError(TelegramApiError):
     """Invalid/revoked bot token. Startup must fail closed."""
 
 
+class TelegramConflictError(TelegramApiError):
+    """Another poller/webhook owns getUpdates (HTTP 409). Startup blocked."""
+
+
+class TelegramRateLimitedError(TelegramApiError):
+    """Telegram reports too many requests (HTTP 429). Back off and retry."""
+
+
 @dataclass(frozen=True)
 class TelegramUpdate:
     """A minimal inbound chat update (transport-neutral)."""
@@ -524,10 +532,15 @@ def _translate_http_error(exc: urllib.error.HTTPError) -> TelegramApiError:
         except json.JSONDecodeError:
             description = ""
     code = error_code if error_code is not None else exc.code
-    if code == 401 or "unauthorized" in description.lower():
+    lowered = description.lower()
+    if code == 401 or "unauthorized" in lowered:
         return TelegramAuthError("telegram unauthorized: invalid bot token")
-    suffix = f": {description}" if description else ""
-    return TelegramApiError(f"telegram http error {code}{suffix}")
+    detail = f": {description}" if description else ""
+    if code == 409 or "conflict" in lowered or "another webhook" in lowered:
+        return TelegramConflictError(f"telegram polling conflict (409){detail}")
+    if code == 429 or "too many requests" in lowered or "rate limit" in lowered:
+        return TelegramRateLimitedError(f"telegram rate limited (429){detail}")
+    return TelegramApiError(f"telegram http error {code}{detail}")
 
 
 def _translate_envelope(method: str, envelope: Any) -> Any:
@@ -536,10 +549,13 @@ def _translate_envelope(method: str, envelope: Any) -> Any:
     if not envelope.get("ok"):
         error_code = envelope.get("error_code")
         description = envelope.get("description", "")
-        if error_code == 401 or (
-            isinstance(description, str) and "unauthorized" in description.lower()
-        ):
+        lowered = description.lower() if isinstance(description, str) else ""
+        if error_code == 401 or "unauthorized" in lowered:
             raise TelegramAuthError("telegram unauthorized: invalid bot token")
+        if error_code == 409 or "conflict" in lowered:
+            raise TelegramConflictError(f"telegram {method} polling conflict (409)")
+        if error_code == 429 or "too many requests" in lowered or "rate limit" in lowered:
+            raise TelegramRateLimitedError(f"telegram {method} rate limited (429)")
         raise TelegramApiError(f"telegram {method} failed: {description}")
     return envelope.get("result")
 
