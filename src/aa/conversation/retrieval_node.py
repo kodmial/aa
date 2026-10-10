@@ -42,25 +42,64 @@ from aa.retrieval.index import HybridIndex, logical_chunk_id
 logger = logging.getLogger("aa.conversation.retrieval_node")
 
 
-def pack_to_state(pack: EvidencePack) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _provenance_lists(
+    child_ids: list[str],
+    *,
+    child_query_map: dict[str, list[str]] | None = None,
+    child_need_map: dict[str, list[str]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Union stable query/need ids for one passage's children (#311)."""
+    queries: list[str] = []
+    needs: list[str] = []
+    seen_q: set[str] = set()
+    seen_n: set[str] = set()
+    for cid in child_ids:
+        for qid in list((child_query_map or {}).get(cid, []) or []):
+            clean = str(qid or "").strip()
+            if clean and clean not in seen_q:
+                seen_q.add(clean)
+                queries.append(clean)
+        for nid in list((child_need_map or {}).get(cid, []) or []):
+            clean = str(nid or "").strip()
+            if clean and clean not in seen_n:
+                seen_n.add(clean)
+                needs.append(clean)
+    queries.sort(key=lambda q: int(q[1:]) if len(q) > 1 and q[1:].isdigit() else 0)
+    needs.sort()
+    return queries, needs
+
+
+def pack_to_state(
+    pack: EvidencePack,
+    *,
+    child_query_map: dict[str, list[str]] | None = None,
+    child_need_map: dict[str, list[str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Map an Evidence Pack to graph state payloads (exact text + provenance)."""
     hits: list[dict[str, Any]] = []
     pack_dicts: list[dict[str, Any]] = []
     for passage in pack.passages:
-        pack_dicts.append(
-            {
-                "passage_id": passage.passage_id,
-                "text": passage.exact_text,
-                "source_id": passage.source_id,
-                "section_id": passage.section_id,
-                "child_chunk_ids": list(passage.child_chunk_ids),
-                "char_start": passage.char_start,
-                "char_end": passage.char_end,
-                "text_sha256": passage.text_sha256,
-                "source_sha256": passage.source_sha256,
-                "corpus_version": pack.corpus_version,
-            }
+        child_ids = list(passage.child_chunk_ids)
+        query_ids, need_ids = _provenance_lists(
+            child_ids, child_query_map=child_query_map, child_need_map=child_need_map
         )
+        entry: dict[str, Any] = {
+            "passage_id": passage.passage_id,
+            "text": passage.exact_text,
+            "source_id": passage.source_id,
+            "section_id": passage.section_id,
+            "child_chunk_ids": child_ids,
+            "char_start": passage.char_start,
+            "char_end": passage.char_end,
+            "text_sha256": passage.text_sha256,
+            "source_sha256": passage.source_sha256,
+            "corpus_version": pack.corpus_version,
+        }
+        if query_ids:
+            entry["query_ids"] = query_ids
+        if need_ids:
+            entry["need_ids"] = need_ids
+        pack_dicts.append(entry)
         for chunk_id in passage.child_chunk_ids:
             hits.append(
                 {
@@ -198,6 +237,31 @@ def selection_context_digest(state: TurnState) -> str:
         return ""
 
 
+async def _coerce_needs_for_selection(
+    information_needs: Any | None,
+) -> list[Any]:
+    """Normalize information needs to a list of models/dicts (no fabrication)."""
+    if not information_needs:
+        return []
+    try:
+        from aa.conversation.conversation_context import InformationNeed as _Need
+    except Exception:
+        return []
+    out: list[Any] = []
+    for entry in list(information_needs):
+        try:
+            if isinstance(entry, _Need):
+                if str(entry.need_id or "").strip() and str(entry.text or "").strip():
+                    out.append(entry)
+            elif isinstance(entry, dict) and str(entry.get("need_id", "") or "").strip():
+                validated = _Need.model_validate(entry)
+                if str(validated.text or "").strip():
+                    out.append(validated)
+        except Exception:
+            continue
+    return out
+
+
 async def aretrieve_with_semantic_selection(
     index: HybridIndex,
     queries: list[str],
@@ -208,6 +272,8 @@ async def aretrieve_with_semantic_selection(
     user_message: str = "",
     selection_model: Any | None = None,
     context_digest: str = "",
+    information_needs: Any | None = None,
+    query_need_map: Any | None = None,
 ) -> EvidencePack:
     """Run broad hybrid retrieval with model-driven selection before budgeting.
 
@@ -220,8 +286,18 @@ async def aretrieve_with_semantic_selection(
     top-N caps never irreversibly hide candidates before selection. No
     second-stage BGE; generic token-overlap is fallback/discovery ordering
     only, never semantic authority when a model is bound.
+
+    Issue #311: previews preserve per-query and per-information-need
+    exposure through a bounded need-aware strategy (per-need
+    representation plus remaining global relevance) within
+    ``MAX_SELECTION_CANDIDATES``. Provenance
+    ``candidate -> query_ids -> need_ids`` survives fusion, previews,
+    selection, follow-ups and state serialization; unmapped stays
+    unmapped and budget exhaustion reports uncovered, never fake success.
     """
     from aa.retrieval.evidence import (
+        candidate_need_provenance,
+        candidate_query_provenance,
         expand_small_to_big,
         fuse_query_pool,
         run_branch_searches,
@@ -238,6 +314,28 @@ async def aretrieve_with_semantic_selection(
 
         corpus = str(index.metadata.get("ru_artifact_sha256", ""))
         return empty_evidence_pack(corpus_version=corpus)
+    needs_for_selection = await _coerce_needs_for_selection(information_needs)
+    try:
+        from aa.conversation.conversation_context import build_query_need_map as _build_map
+        from aa.conversation.conversation_context import validate_query_need_map as _validate_map
+
+        if query_need_map is not None:
+            try:
+                query_map_models = _validate_map(query_need_map)
+            except Exception:
+                query_map_models = _build_map(cleaned, needs_for_selection)
+        else:
+            query_map_models = _build_map(cleaned, needs_for_selection)
+    except Exception:
+        query_map_models = []
+    query_map_dicts: list[dict[str, Any]] = []
+    for entry in list(query_map_models or []):
+        try:
+            query_map_dicts.append(
+                {"query_id": str(entry.query_id), "need_ids": list(entry.need_ids or [])}
+            )
+        except Exception:
+            continue
     started = time.perf_counter()
     ranked_lists, per_query_ids = await asyncio.to_thread(
         run_branch_searches, index, cleaned, branch_top_k=active.branch_top_k
@@ -257,29 +355,43 @@ async def aretrieve_with_semantic_selection(
         MAX_SELECTED_CHUNKS,
         MAX_SELECTION_CANDIDATES,
         aselect_semantic_candidates,
-        preview_candidates,
+        assess_need_preview_coverage,
+        select_need_aware_previews,
         selection_telemetry,
+        serialize_preview_coverage,
     )
 
+    candidate_query_map = candidate_query_provenance(per_query_ids)
+    candidate_need_map = candidate_need_provenance(candidate_query_map, query_map_dicts)
     broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
     fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
     in_index = [cid for cid, _ in fused_ordered if cid in index.chunks]
     texts = {cid: getattr(index.chunks[cid], "text", "") for cid in in_index}
     sections = {cid: getattr(index.chunks[cid], "section", "") for cid in in_index}
     sources = {cid: getattr(index.chunks[cid], "source_id", "") for cid in in_index}
-    previews = preview_candidates(
+    previews = select_need_aware_previews(
         fused_ordered=fused_ordered,
         texts=texts,
         sections=sections,
         sources=sources,
+        candidate_query_map=candidate_query_map,
+        candidate_need_map=candidate_need_map,
+        information_needs=needs_for_selection,
         limit=MAX_SELECTION_CANDIDATES,
     )
+    try:
+        preview_statuses, _unmapped_previews = assess_need_preview_coverage(
+            previews, needs_for_selection
+        )
+    except Exception:
+        preview_statuses = []
     sel_started = time.perf_counter()
     # Provider 429 propagates (runner retire/checkpoint resume); other
     # model failures fall back to the bounded heuristic inside the selector.
     # Pre-model preview gate verifies against this independent fused/index
     # ground truth, never against the previews themselves.
     known_chunk_ids = {cid for cid in fused if cid in index.chunks}
+    known_need_ids = {s.need_id for s in preview_statuses} or None
     selection = await aselect_semantic_candidates(
         previews,
         resolved_intent=resolved_intent,
@@ -288,7 +400,42 @@ async def aretrieve_with_semantic_selection(
         model=selection_model,
         known_chunk_ids=known_chunk_ids,
         context_digest=context_digest,
+        information_needs=needs_for_selection,
+        known_need_ids=known_need_ids,
     )
+    # Conservative coverage close-out (#311): budget exhaustion or no
+    # selected evidence for a need reports uncovered and requests further
+    # discovery rather than fake selection success. Only #306 full-read
+    # assessment can mark sufficiency.
+    try:
+        preview_by_id = {p.chunk_id: p for p in previews}
+        selected_need_ids: set[str] = set()
+        for cid in list(selection.selected_chunk_ids or []):
+            preview = preview_by_id.get(cid)
+            if preview is not None:
+                for nid in list(preview.need_ids or ()):
+                    selected_need_ids.add(str(nid))
+        uncovered_set = {str(nid) for nid in list(selection.uncovered_need_ids or [])}
+        augmented = False
+        for status in preview_statuses:
+            if not status.represented or status.need_id not in selected_need_ids:
+                if status.need_id not in uncovered_set:
+                    uncovered_set.add(status.need_id)
+                    augmented = True
+        if augmented:
+            used_model = bool(getattr(selection, "_used_model", False))
+            selection = type(selection)(
+                selected_chunk_ids=list(selection.selected_chunk_ids or []),
+                need_more_detail=True,
+                followup_queries=list(selection.followup_queries or []),
+                uncovered_need_ids=sorted(uncovered_set),
+            )
+            try:
+                selection._used_model = used_model
+            except Exception:
+                pass
+    except Exception:
+        pass
     sel_ms = (time.perf_counter() - sel_started) * 1000.0
     winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
     # Observable retrieval stages: discovery alone never blocks later
@@ -301,7 +448,13 @@ async def aretrieve_with_semantic_selection(
     # One bounded targeted follow-up when the selector reports weak/unknown
     # relevance: a focused additional search that must add genuinely new
     # chunk ids (never a silent regeneration on the same top prefixes).
+    # Follow-ups reuse the same typed query->need mapping seam (#311):
+    # they are attributed to the uncovered needs that triggered them,
+    # never via lexical guessing, so #306 can expand with the same map.
     followup_added = 0
+    followup_need_ids: list[str] = sorted(
+        {str(nid) for nid in list(selection.uncovered_need_ids or []) if str(nid).strip()}
+    )
     if selection.need_more_detail:
         followups = list(selection.followup_queries[:MAX_FOLLOWUP_QUERIES])
         if not followups and resolved_intent.strip():
@@ -338,6 +491,8 @@ async def aretrieve_with_semantic_selection(
                         break
                     winners.append(cand)
                     fused[cand.chunk_id] = cand
+                    if followup_need_ids:
+                        candidate_need_map[cand.chunk_id] = list(followup_need_ids)
                     followup_added += 1
             except Exception as exc:
                 from aa.opencode.errors import OpenCodeRateLimitError as _FollowupRateLimit
@@ -390,9 +545,18 @@ async def aretrieve_with_semantic_selection(
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     try:
-        telemetry = selection_telemetry(previews=previews, selection=selection, latency_ms=sel_ms)
+        telemetry = selection_telemetry(
+            previews=previews,
+            selection=selection,
+            latency_ms=sel_ms,
+            information_needs=needs_for_selection,
+        )
     except Exception:
         telemetry = {}
+    try:
+        preview_map_serialized = serialize_preview_coverage(previews, selection)
+    except Exception:
+        preview_map_serialized = []
     from aa.retrieval.evidence import _short_digest as _digest
     from aa.retrieval.evidence import dedup_and_diversify as _dedup_meta
 
@@ -409,6 +573,18 @@ async def aretrieve_with_semantic_selection(
         _diverse_unique = 0
 
     read_ids = [w.chunk_id for w in winners]
+    try:
+        need_ids_ordered = [s.need_id for s in preview_statuses]
+    except Exception:
+        need_ids_ordered = []
+    query_need_serialized: list[dict[str, Any]] = []
+    for entry in list(query_map_models or []):
+        try:
+            query_need_serialized.append(
+                {"query_id": str(entry.query_id), "need_ids": list(entry.need_ids or [])}
+            )
+        except Exception:
+            continue
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
         "primary_query_digest": _digest(cleaned[0]),
@@ -425,9 +601,23 @@ async def aretrieve_with_semantic_selection(
         "semantic_selection_model": selection_model is not None,
         "semantic_promoted": True,
         "followup_added": followup_added,
+        "followup_need_ids": list(followup_need_ids),
         "discovered_ids": list(discovered_ids),
         "previewed_ids": list(previewed_ids),
         "read_ids": list(read_ids),
+        "information_need_ids": list(need_ids_ordered),
+        "query_need_map": query_need_serialized,
+        "preview_coverage": [
+            {
+                "need_id": s.need_id,
+                "previewed_count": s.previewed_count,
+                "best_fused_rank": s.best_fused_rank,
+                "represented": s.represented,
+            }
+            for s in preview_statuses
+        ],
+        "selection_preview_map": preview_map_serialized,
+        "uncovered_need_ids": list(selection.uncovered_need_ids or []),
         "neighbor_window": active.neighbor_window,
         "expanded_passages": len(expanded),
         "selected_passages": len(selected),
@@ -503,6 +693,35 @@ async def retrieval_node(
     started = time.perf_counter()
     resolved_intent, conversation_context, user_message = _selection_context_from_state(state)
     canonical_digest = selection_context_digest(state)
+    # Recover the typed information needs + trusted query->need map (#311)
+    # from the canonical resolved turn; unresolvable stays unmapped and
+    # triggers conservative discovery downstream, never fake coverage.
+    state_needs: Any | None = None
+    state_query_map: Any | None = None
+    try:
+        from aa.conversation.conversation_context import query_need_map_from_state as _qmap_state
+        from aa.conversation.conversation_context import resolved_turn_from_state as _rt_state
+
+        _rt = _rt_state(state)
+        if _rt is not None:
+            state_needs = [
+                item.model_dump(mode="json") for item in list(_rt.information_needs or [])
+            ]
+            state_query_map = [
+                item.model_dump(mode="json") for item in list(_rt.query_need_map or [])
+            ]
+        else:
+            raw_needs = state.get("information_needs", [])
+            state_needs = list(raw_needs) if isinstance(raw_needs, list) else []
+            state_query_map = list(_qmap_state(state)) or None
+            if state_query_map is not None:
+                try:
+                    state_query_map = [item.model_dump(mode="json") for item in state_query_map]
+                except Exception:
+                    state_query_map = None
+    except Exception:
+        state_needs = None
+        state_query_map = None
     if selection_model is not None:
         # Model-driven path: broad candidates -> LLM selection -> exact
         # full fetch -> budgeting. Provider 429 propagates for checkpoint
@@ -518,6 +737,8 @@ async def retrieval_node(
                 user_message=user_message,
                 selection_model=selection_model,
                 context_digest=canonical_digest,
+                information_needs=state_needs,
+                query_need_map=state_query_map,
             )
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError as _SelRateLimit
@@ -547,7 +768,32 @@ async def retrieval_node(
         )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
-    hits, pack_dicts = pack_to_state(pack)
+    try:
+        _meta = dict(pack.retrieval_metadata or {})
+        _preview_map = _meta.get("selection_preview_map", [])
+        _child_query: dict[str, list[str]] = {}
+        _child_need: dict[str, list[str]] = {}
+        if isinstance(_preview_map, list):
+            for entry in _preview_map:
+                if not isinstance(entry, dict):
+                    continue
+                cid = str(entry.get("chunk_id", "") or "").strip()
+                if not cid:
+                    continue
+                qids = [str(q) for q in list(entry.get("query_ids", []) or []) if str(q).strip()]
+                nids = [str(n) for n in list(entry.get("need_ids", []) or []) if str(n).strip()]
+                if qids:
+                    _child_query[cid] = qids
+                if nids:
+                    _child_need[cid] = nids
+        # Follow-up winners carry need attribution via the same typed map.
+        for f_need in list(_meta.get("followup_need_ids", []) or []):
+            _ = f_need
+        hits, pack_dicts = pack_to_state(
+            pack, child_query_map=_child_query or None, child_need_map=_child_need or None
+        )
+    except Exception:
+        hits, pack_dicts = pack_to_state(pack)
     if over_budget:
         logger.warning(
             "v2 retrieval over interactive budget",

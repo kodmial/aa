@@ -298,10 +298,15 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 _f_turn_d = _f_turn.model_dump(mode="json")
                 _f_digest = str(_f_turn.context_digest)
                 _f_needs_d = [item.model_dump(mode="json") for item in _f_needs_list]
+                try:
+                    _f_qmap_d = list(_f_turn_d.get("query_need_map", []) or [])
+                except Exception:
+                    _f_qmap_d = []
             except Exception:
                 _f_turn_d = {}
                 _f_digest = str(state.get("context_digest", "") or "")
                 _f_needs_d = []
+                _f_qmap_d = []
             _f_update: dict[str, Any] = {
                 "search_queries": list(_fallback),
                 "planner_invoked": True,
@@ -319,6 +324,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             if _f_turn_d:
                 _f_update["resolved_turn"] = _f_turn_d
                 _f_update["information_needs"] = _f_needs_d
+                _f_update["query_need_map"] = _f_qmap_d
                 _f_update["context_digest"] = _f_digest
             return _f_update
         except Exception as exc:
@@ -389,10 +395,15 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 _e_turn_d = _e_turn.model_dump(mode="json")
                 _e_digest = str(_e_turn.context_digest)
                 _e_needs_d = [item.model_dump(mode="json") for item in _e_needs_list]
+                try:
+                    _e_qmap_d = list(_e_turn_d.get("query_need_map", []) or [])
+                except Exception:
+                    _e_qmap_d = []
             except Exception:
                 _e_turn_d = {}
                 _e_digest = str(state.get("context_digest", "") or "")
                 _e_needs_d = []
+                _e_qmap_d = []
             _e_update: dict[str, Any] = {
                 "search_queries": list(_error_fallback),
                 "planner_invoked": True,
@@ -410,6 +421,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             if _e_turn_d:
                 _e_update["resolved_turn"] = _e_turn_d
                 _e_update["information_needs"] = _e_needs_d
+                _e_update["query_need_map"] = _e_qmap_d
                 _e_update["context_digest"] = _e_digest
             return _e_update
 

@@ -710,6 +710,9 @@ async def planner_node(
         build_conversation_context as _build_cc,
     )
     from aa.conversation.conversation_context import (
+        build_query_need_map as _build_qmap,
+    )
+    from aa.conversation.conversation_context import (
         build_resolved_turn as _build_turn,
     )
     from aa.conversation.conversation_context import (
@@ -753,6 +756,14 @@ async def planner_node(
     else:
         plan = await run_planner(user_message, model=model, summary=summary, recent=recent)
     needs = _needs_from_plan(str(plan.resolved_intent), list(plan.queries))
+    try:
+        planner_links = list(plan.query_need_ids) if plan.query_need_ids is not None else None
+    except Exception:
+        planner_links = None
+    try:
+        query_need_map = _build_qmap(list(plan.queries), needs, planner_links=planner_links)
+    except Exception:
+        query_need_map = _build_qmap(list(plan.queries), needs)
     if canonical is None:
         try:
             canonical = (
@@ -773,6 +784,7 @@ async def planner_node(
         information_needs=needs,
         planner_mode=str(plan.mode),
         search_queries=list(plan.queries),
+        query_need_map=query_need_map,
     )
     update: dict[str, Any] = {
         "search_queries": list(plan.queries),
@@ -781,6 +793,7 @@ async def planner_node(
         "resolved_intent": str(plan.resolved_intent),
         "resolved_turn": resolved.model_dump(mode="json"),
         "information_needs": [item.model_dump(mode="json") for item in needs],
+        "query_need_map": [item.model_dump(mode="json") for item in query_need_map],
         "context_digest": str(resolved.context_digest),
     }
     if canonical_dict is not None and not state.get("conversation_context"):

@@ -218,7 +218,15 @@ def test_planner_dedupes_whitespace_case_duplicates() -> None:
 
 
 def test_planner_schema_has_only_queries_field() -> None:
-    assert set(QueryPlan.model_fields) == {"mode", "resolved_intent", "queries"}
+    # #311 adds one optional trusted query->need mapping parallel to
+    # queries; the required structural contract stays mode/resolved_intent
+    # /queries and the mapping defaults to None (structural derivation).
+    assert set(QueryPlan.model_fields) == {
+        "mode",
+        "resolved_intent",
+        "queries",
+        "query_need_ids",
+    }
     assert MIN_NONEMPTY_QUERIES == 1
     assert MAX_QUERIES == 16
 

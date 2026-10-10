@@ -28,6 +28,7 @@ class TurnState(TypedDict, total=False):
     conversation_context: dict[str, Any]
     resolved_turn: dict[str, Any]
     information_needs: list[dict[str, Any]]
+    query_need_map: list[dict[str, Any]]
     context_digest: str
     retrieval_hits: list[dict[str, Any]]
     evidence_pack: list[dict[str, Any]]

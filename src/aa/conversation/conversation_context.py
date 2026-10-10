@@ -105,6 +105,26 @@ class InformationNeed(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class QueryNeedMapping(BaseModel):
+    """Trusted planner-side association of one query to semantic needs (#311).
+
+    ``query_id`` is stable for the current resolved turn (``q1``..``qN``
+    in plan order) so graph replay and follow-up searches can reference
+    it. ``need_ids`` lists the semantic ``InformationNeed`` ids this
+    query serves (many-to-many: a query may serve several needs and a
+    need may be served by several queries). An empty ``need_ids`` means
+    ``unknown/unmapped``: the mapping could not be resolved and must
+    trigger conservative extra discovery/selection, never silent
+    coverage. Carrying an id never claims the need is fulfilled.
+    """
+
+    query_id: str = Field(min_length=1)
+    query_text: str = Field(default="")
+    need_ids: list[str] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
 class ResolvedTurn(BaseModel):
     """Serializable planner output bound to one canonical context."""
 
@@ -112,6 +132,7 @@ class ResolvedTurn(BaseModel):
     resolved_intent: str = ""
     conversation_context: dict[str, Any] = Field(default_factory=dict)
     information_needs: list[InformationNeed] = Field(default_factory=list)
+    query_need_map: list[QueryNeedMapping] = Field(default_factory=list)
     context_digest: str = Field(min_length=1)
     planner_mode: str = ""
     search_queries: list[str] = Field(default_factory=list)
@@ -276,6 +297,161 @@ def needs_from_plan(resolved_intent: str, queries: list[str]) -> list[Informatio
     return needs
 
 
+def _normalize_plan_text(text: str) -> str:
+    """Normalize one plan text for exact-identity matching (no fuzzy lexical)."""
+    return " ".join(str(text or "").split()).strip().casefold()
+
+
+def build_query_need_map(
+    queries: list[str],
+    needs: list[InformationNeed],
+    *,
+    planner_links: list[list[str]] | None = None,
+) -> list[QueryNeedMapping]:
+    """Build the explicit trusted query-to-need association (#311).
+
+    When ``planner_links`` (the planner model's own parallel mapping) is
+    supplied and structurally valid, it is used after dropping unknown
+    need ids (never fabricating). Otherwise the mapping derives
+    structurally from plan order via exact normalized identity against
+    the needs built by :func:`needs_from_plan`: a query maps to the
+    need carrying the identical normalized text. This is provenance,
+    not fuzzy lexical overlap, chapter-name or quota guessing.
+    Unresolvable queries map to ``[]`` (unknown/unmapped) and must
+    trigger conservative extra discovery downstream.
+    """
+    cleaned: list[str] = []
+    for raw in list(queries or []):
+        text = " ".join(str(raw or "").split()).strip()
+        if text:
+            cleaned.append(text)
+    need_ids: set[str] = set()
+    for need in list(needs or []):
+        try:
+            nid = str(need.need_id or "").strip()
+        except Exception:
+            continue
+        if nid:
+            need_ids.add(nid)
+    if planner_links is not None and len(planner_links) == len(cleaned) and need_ids:
+        out: list[QueryNeedMapping] = []
+        for pos, (query_text, links) in enumerate(zip(cleaned, planner_links, strict=True)):
+            kept: list[str] = []
+            seen: set[str] = set()
+            for raw_need in list(links or []):
+                nid = str(raw_need or "").strip()
+                if not nid or nid in seen or nid not in need_ids:
+                    continue
+                seen.add(nid)
+                kept.append(nid)
+            out.append(
+                QueryNeedMapping(
+                    query_id=f"q{pos + 1}",
+                    query_text=query_text,
+                    need_ids=kept,
+                )
+            )
+        return out
+    text_to_need: dict[str, str] = {}
+    for need in list(needs or []):
+        try:
+            key = _normalize_plan_text(need.text)
+            nid = str(need.need_id or "").strip()
+        except Exception:
+            continue
+        if key and nid and key not in text_to_need:
+            text_to_need[key] = nid
+    mapped: list[QueryNeedMapping] = []
+    for pos, query_text in enumerate(cleaned):
+        target = text_to_need.get(_normalize_plan_text(query_text), "")
+        need_list = [target] if target and target in need_ids else []
+        mapped.append(
+            QueryNeedMapping(
+                query_id=f"q{pos + 1}",
+                query_text=query_text,
+                need_ids=need_list,
+            )
+        )
+    return mapped
+
+
+def validate_query_need_map(raw: object) -> list[QueryNeedMapping]:
+    """Validate one serialized query-to-need map (fail-closed, no fabrication)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("query_need_map must be a list")
+    out: list[QueryNeedMapping] = []
+    seen_ids: set[str] = set()
+    for entry in raw:
+        if isinstance(entry, QueryNeedMapping):
+            item = entry
+        elif isinstance(entry, dict):
+            item = QueryNeedMapping.model_validate(entry)
+        else:
+            raise ValueError("query_need_map entry is not a mapping")
+        if item.query_id in seen_ids:
+            raise ValueError(f"duplicate query_id {item.query_id!r}")
+        seen_ids.add(item.query_id)
+        cleaned_needs: list[str] = []
+        seen_needs: set[str] = set()
+        for nid in list(item.need_ids or []):
+            clean = str(nid or "").strip()
+            if not clean or clean in seen_needs:
+                continue
+            seen_needs.add(clean)
+            cleaned_needs.append(clean)
+        out.append(
+            QueryNeedMapping(
+                query_id=item.query_id,
+                query_text=str(item.query_text or ""),
+                need_ids=cleaned_needs,
+            )
+        )
+    return out
+
+
+def query_need_map_from_state(state: Any) -> list[QueryNeedMapping]:
+    """Recover the query-to-need map from graph state, if present."""
+    try:
+        resolved = resolved_turn_from_state(state)
+    except Exception:
+        resolved = None
+    if resolved is not None and list(resolved.query_need_map or []):
+        return list(resolved.query_need_map)
+    try:
+        raw = state.get("query_need_map", None)
+    except Exception:
+        return []
+    if isinstance(raw, list) and raw:
+        try:
+            return validate_query_need_map(raw)
+        except Exception:
+            return []
+    return []
+
+
+def candidate_need_ids_for_queries(
+    query_ids: list[str],
+    query_map: list[QueryNeedMapping],
+) -> list[str]:
+    """Return the union need ids for candidate query ids (many-to-many kept)."""
+    wanted = {str(qid or "").strip() for qid in list(query_ids or []) if str(qid or "").strip()}
+    if not wanted:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in list(query_map or []):
+        if entry.query_id not in wanted:
+            continue
+        for nid in list(entry.need_ids or []):
+            clean = str(nid or "").strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                out.append(clean)
+    return out
+
+
 def build_resolved_turn(
     *,
     user_message: str,
@@ -284,17 +460,23 @@ def build_resolved_turn(
     information_needs: list[InformationNeed] | None = None,
     planner_mode: str = "",
     search_queries: list[str] | None = None,
+    query_need_map: list[QueryNeedMapping] | None = None,
 ) -> ResolvedTurn:
     """Bind one planner decision to its canonical context with a digest."""
     digest = context_digest_for_canonical(context)
+    needs = list(information_needs or [])
+    queries = list(search_queries or [])
+    if query_need_map is None:
+        query_need_map = build_query_need_map(queries, needs)
     return ResolvedTurn(
         user_message=str(user_message or ""),
         resolved_intent=" ".join(str(resolved_intent or "").split()),
         conversation_context=context.model_dump(mode="json"),
-        information_needs=list(information_needs or []),
+        information_needs=needs,
+        query_need_map=list(query_need_map),
         context_digest=digest,
         planner_mode=str(planner_mode or ""),
-        search_queries=list(search_queries or []),
+        search_queries=queries,
     )
 
 
@@ -534,11 +716,14 @@ __all__ = [
     "ConversationContext",
     "ConversationMessage",
     "InformationNeed",
+    "QueryNeedMapping",
     "ReferenceStatus",
     "ResolvedTurn",
     "assert_same_context_digest",
     "build_conversation_context",
+    "build_query_need_map",
     "build_resolved_turn",
+    "candidate_need_ids_for_queries",
     "canonical_model_view",
     "canonical_snapshot",
     "context_digest_for_canonical",
@@ -546,7 +731,9 @@ __all__ = [
     "conversation_context_from_state",
     "needs_from_plan",
     "needs_proactive_summary",
+    "query_need_map_from_state",
     "resolved_turn_from_state",
     "select_relevant_history",
     "truncate_preserving_tail",
+    "validate_query_need_map",
 ]
