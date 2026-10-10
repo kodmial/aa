@@ -333,18 +333,26 @@ def _possibly_intervals(receipts: list[dict[str, Any]]) -> list[tuple[int, int]]
     return out
 
 
-def _intersect_length(
+def _intersect_lengths(
     span_start: int, span_end: int, intervals: list[tuple[int, int]]
-) -> tuple[int, int] | None:
-    """Intersect one answer span with delivered intervals (first overlap)."""
-    best: tuple[int, int] | None = None
+) -> list[tuple[int, int]]:
+    """Intersect one answer span with delivered intervals (all overlaps)."""
+    hits: list[tuple[int, int]] = []
     for start, end in intervals:
         overlap_start = max(span_start, start)
         overlap_end = min(span_end, end)
         if overlap_end > overlap_start:
-            if best is None or overlap_start < best[0]:
-                best = (overlap_start, overlap_end)
-    return best
+            hits.append((overlap_start, overlap_end))
+    hits.sort()
+    return hits
+
+
+def _intersect_length(
+    span_start: int, span_end: int, intervals: list[tuple[int, int]]
+) -> tuple[int, int] | None:
+    """Intersect one answer span with delivered intervals (first overlap)."""
+    hits = _intersect_lengths(span_start, span_end, intervals)
+    return hits[0] if hits else None
 
 
 def ranges_from_delivered_quotes(
@@ -491,8 +499,8 @@ def delivered_ranges_for_receipts(
         source_end = int(entry.get("char_end", 0))
         if span_len <= 0 or source_end <= source_start:
             continue
-        confirmed_hit = _intersect_length(answer_start, answer_end, confirmed_intervals)
-        if confirmed_hit is not None:
+        confirmed_hits = _intersect_lengths(answer_start, answer_end, confirmed_intervals)
+        for confirmed_hit in confirmed_hits:
             delivered_prefix = max(0, confirmed_hit[1] - answer_start)
             delivered_prefix = min(delivered_prefix, span_len)
             # Contiguous delivered prefix from the span start: a confirmed
@@ -515,8 +523,8 @@ def delivered_ranges_for_receipts(
             # remainder; the safety record below covers it without
             # claiming it as confirmed.
             _ = delivered_prefix
-        possibly_hit = _intersect_length(answer_start, answer_end, possibly_intervals)
-        if possibly_hit is not None and confirmed_hit is None:
+        possibly_hits = _intersect_lengths(answer_start, answer_end, possibly_intervals)
+        for possibly_hit in possibly_hits:
             overlap_start_offset = max(0, possibly_hit[0] - answer_start)
             overlap_len = possibly_hit[1] - possibly_hit[0]
             mapped_start = source_start + overlap_start_offset
@@ -651,8 +659,7 @@ def delivered_ranges_from_candidate(
                     origins.append(origin)
                 else:
                     origins.append("conversation_glue")
-            effective = "book_claim" if "book_claim" in origins else (origins[0] if origins else "")
-            if effective != "book_claim":
+            if not origins or any(origin != "book_claim" for origin in origins):
                 continue
             cited: list[str] = []
             for unit in overlapped:
@@ -678,10 +685,10 @@ def delivered_ranges_from_candidate(
             source_len = len(span_text)
             if source_len <= 0:
                 continue
-            confirmed_hit = _intersect_length(
+            confirmed_hits = _intersect_lengths(
                 span.answer_char_start, span.answer_char_end, confirmed_intervals
             )
-            if confirmed_hit is not None:
+            for confirmed_hit in confirmed_hits:
                 overlap_start = max(0, confirmed_hit[0] - span.answer_char_start)
                 overlap_len = confirmed_hit[1] - confirmed_hit[0]
                 mapped_start = anchor.source_char_start + overlap_start
@@ -706,11 +713,10 @@ def delivered_ranges_from_candidate(
                     normalized = _normalize_range(record)
                     if normalized is not None:
                         confirmed.append(normalized)
-                continue
-            possibly_hit = _intersect_length(
+            possibly_hits = _intersect_lengths(
                 span.answer_char_start, span.answer_char_end, possibly_intervals
             )
-            if possibly_hit is not None:
+            for possibly_hit in possibly_hits:
                 overlap_start = max(0, possibly_hit[0] - span.answer_char_start)
                 overlap_len = possibly_hit[1] - possibly_hit[0]
                 mapped_start = anchor.source_char_start + overlap_start

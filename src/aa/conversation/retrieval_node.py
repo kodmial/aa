@@ -1290,17 +1290,8 @@ def selection_route_from_metadata(metadata: dict[str, Any]) -> str:
         raw = dict(metadata or {})
     except Exception:
         return "selection_unavailable"
-    if (
-        str(raw.get("selection_route", "") or "")
-        in (
-            "model_selection",
-            "lexical_fallback",
-            "selection_unavailable",
-            "not_requested",
-        )
-        and str(raw.get("coverage_status", "") or "") == "not_requested"
-    ):
-        return str(raw["selection_route"])
+    if str(raw.get("coverage_status", "") or "") == "not_requested":
+        return "not_requested"
     model_used = raw.get("selection_model_used", raw.get("selection_selection_model_used", False))
     fallback_used = raw.get(
         "selection_fallback_used", raw.get("selection_selection_fallback_used", False)
