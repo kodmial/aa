@@ -477,7 +477,7 @@ def test_gate_f_fail_closed_negatives(tmp_path: Path) -> None:
     missing = json.loads((tmp_path / "empty-out" / "result.json").read_text(encoding="utf-8"))
     assert missing["result"] == "BLOCKED"
     assert missing["blocking_gate"] == "A"
-    assert missing["failed_gates"] == ["A"]
+    assert missing["failed_gates"] == ["A", "B", "C", "D", "E"]
 
 
 def test_gate_f_forged_artifact_fails_closed(tmp_path: Path) -> None:

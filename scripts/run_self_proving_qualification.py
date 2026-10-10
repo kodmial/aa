@@ -1937,7 +1937,11 @@ def _combine_ab_verdict(
             detail = first_fail.detail
         # Missing-asset proof gaps are BLOCKED, never disguised semantic FAIL.
         if any(item.status == "BLOCKED" and "missing" in item.detail.lower() for item in subchecks):
-            blocked_missing = next(item for item in subchecks if item.status == "BLOCKED")
+            blocked_missing = next(
+                item
+                for item in subchecks
+                if item.status == "BLOCKED" and "missing" in item.detail.lower()
+            )
             return GateEvidence(
                 gate=python_evidence.gate,
                 status="BLOCKED",
@@ -2031,6 +2035,8 @@ def _try_reuse_ab_evidence(
     SHA/run/fingerprints (single authoritative verdict, zero second
     invocation); ``None`` when no usable artifact exists.
     """
+    if not product or not runtime:
+        return None
     filename = GATE_EVIDENCE_FILES.get(gate)
     if filename is None:
         return None
@@ -2072,6 +2078,86 @@ def _write_failure_matrix(
                 "failed_gates": failed_gates_for_verdict(verdict),
                 "root_components": root_components_for_verdict(verdict),
                 "failures": failures,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_fail_closed_blocked(
+    out_dir: Path,
+    *,
+    expected: str,
+    run_id: str,
+    blocking: str,
+    failed: list[str],
+    roots: list[str],
+    error: str,
+    failures: list[dict[str, Any]] | None = None,
+) -> None:
+    """Overwrite result/summary/matrix with a fail-closed BLOCKED verdict.
+
+    Every BLOCKED return in the Gate F reducer must leave no stale PASS/FAIL
+    outputs behind for downstream consumers to reuse.
+    """
+    marker = build_result_marker(sha=expected, status="BLOCKED", run=run_id)
+    entries = list(failures) if failures else []
+    (out_dir / "self-proving-summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aa-self-proving-verdict/2",
+                "sha": expected,
+                "status": "BLOCKED",
+                "product_fingerprint": "",
+                "runtime_fingerprint": "",
+                "blocking_gate": blocking,
+                "failed_gates": failed,
+                "root_components": roots,
+                "run_id": run_id,
+                "gates": [],
+                "failures": entries,
+                "marker": marker,
+                "error": error[:160],
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "result": "BLOCKED",
+                "main_sha": expected,
+                "run_id": run_id,
+                "blocking_gate": blocking,
+                "failed_gates": failed,
+                "root_components": roots,
+                "marker": marker,
+                "gates": [],
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "failure-matrix.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aa-self-proving-failure-matrix/1",
+                "sha": expected,
+                "run_id": run_id,
+                "blocking_gate": blocking,
+                "failed_gates": failed,
+                "root_components": roots,
+                "failures": entries,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -2329,6 +2415,15 @@ def reduce_final_from_evidence_dir(
                 )
             except SelfProvingError as exc:
                 print(f"self-proving Gate F BLOCKED: {exc}", file=sys.stderr)
+                _write_fail_closed_blocked(
+                    out_dir,
+                    expected=expected,
+                    run_id=run_id,
+                    blocking="A",
+                    failed=["A"],
+                    roots=["A:evidence-invalid:unknown"],
+                    error=str(exc),
+                )
                 return EXIT_BLOCKED
             return _write_verdict_outputs(
                 out_dir,
@@ -2341,75 +2436,91 @@ def reduce_final_from_evidence_dir(
         first_missing = next(gate for gate in ("A", "B", "C", "D", "E") if gate in load_errors)
         load_exc = load_errors[first_missing]
         print(f"self-proving Gate F BLOCKED: {load_exc}", file=sys.stderr)
-        blocking = first_missing
-        marker = build_result_marker(sha=expected, status="BLOCKED", run=run_id)
-        failed = [first_missing]
-        roots = [f"{first_missing}:evidence-invalid:unknown"]
-        (out_dir / "self-proving-summary.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": "aa-self-proving-verdict/2",
-                    "sha": expected,
-                    "status": "BLOCKED",
-                    "product_fingerprint": "",
-                    "runtime_fingerprint": "",
-                    "blocking_gate": blocking,
-                    "failed_gates": failed,
-                    "root_components": roots,
-                    "run_id": run_id,
-                    "gates": [],
-                    "failures": [],
-                    "marker": marker,
-                    "error": str(load_exc)[:160],
-                },
-                sort_keys=True,
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        # blocking_gate is the first failed gate (human summary); failed_gates
+        # names every independently failed gate: each unloadable artifact plus
+        # any loaded artifact that is non-PASS or part of a
+        # fingerprint-disagreement/unknown set.
+        order = ("A", "B", "C", "D", "E")
+        products_seen = {str(loaded[gate].get("product_fingerprint", "")) for gate in loaded}
+        runtimes_seen = {str(loaded[gate].get("runtime_fingerprint", "")) for gate in loaded}
+        fingerprints_disagree = bool(loaded) and (
+            len(products_seen) != 1
+            or len(runtimes_seen) != 1
+            or not next(iter(products_seen))
+            or not next(iter(runtimes_seen))
         )
-        (out_dir / "result.json").write_text(
-            json.dumps(
-                {
-                    "result": "BLOCKED",
-                    "main_sha": expected,
-                    "run_id": run_id,
-                    "blocking_gate": blocking,
-                    "failed_gates": failed,
-                    "root_components": roots,
-                    "marker": marker,
-                    "gates": [],
-                },
-                sort_keys=True,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        _write_failure_matrix(
+        failed: list[str] = []
+        for gate in order:
+            if gate in load_errors:
+                failed.append(gate)
+            elif gate in loaded:
+                status = str(loaded[gate].get("status", "")).upper()
+                if fingerprints_disagree or status != "PASS":
+                    failed.append(gate)
+        if not failed:
+            failed = [first_missing]
+        blocking = failed[0]
+        roots: list[str] = []
+        for gate in failed:
+            if gate in load_errors:
+                roots.append(f"{gate}:evidence-invalid:unknown")
+            else:
+                payload = loaded[gate]
+                raw_category = (
+                    payload.get("failure_category", "") or payload.get("status", "") or "unknown"
+                )
+                category = str(raw_category).strip() or "unknown"
+                component = str(payload.get("component", "") or "unknown").strip() or "unknown"
+                roots.append(f"{gate}:{category}:{component}")
+        failures: list[dict[str, Any]] = []
+        for gate in failed:
+            if gate not in loaded:
+                continue
+            try:
+                report = failure_report_for_gate(evidence_to_gate_evidence(loaded[gate]))
+            except SelfProvingError:
+                continue
+            entry = report.to_dict()
+            entry["repair_fingerprint"] = repair_fingerprint(report)
+            failures.append(entry)
+        _write_fail_closed_blocked(
             out_dir,
             expected=expected,
             run_id=run_id,
-            verdict=decide_final_verdict(
-                [],
-                current_sha=expected,
-                product_fingerprint="0" * 64,
-                runtime_fingerprint="1" * 64,
-                run_id=run_id,
-            ),
-            failures=[],
+            blocking=blocking,
+            failed=failed,
+            roots=roots,
+            error=str(load_exc),
+            failures=failures,
         )
         return EXIT_BLOCKED
     products = {str(loaded[gate].get("product_fingerprint", "")) for gate in loaded}
     runtimes = {str(loaded[gate].get("runtime_fingerprint", "")) for gate in loaded}
     if len(products) != 1 or len(runtimes) != 1:
         print("self-proving Gate F BLOCKED: gate fingerprint mismatch", file=sys.stderr)
+        _write_fail_closed_blocked(
+            out_dir,
+            expected=expected,
+            run_id=run_id,
+            blocking="A",
+            failed=["A"],
+            roots=["A:evidence-invalid:unknown"],
+            error="gate fingerprint mismatch",
+        )
         return EXIT_BLOCKED
     product = next(iter(products))
     runtime = next(iter(runtimes))
     if not product or not runtime:
         print("self-proving Gate F BLOCKED: gate fingerprints unknown", file=sys.stderr)
+        _write_fail_closed_blocked(
+            out_dir,
+            expected=expected,
+            run_id=run_id,
+            blocking="A",
+            failed=["A"],
+            roots=["A:evidence-invalid:unknown"],
+            error="gate fingerprints unknown",
+        )
         return EXIT_BLOCKED
     try:
         evidences = [evidence_to_gate_evidence(loaded[gate]) for gate in ("A", "B", "C", "D", "E")]
@@ -2422,6 +2533,15 @@ def reduce_final_from_evidence_dir(
         )
     except SelfProvingError as exc:
         print(f"self-proving Gate F BLOCKED: {exc}", file=sys.stderr)
+        _write_fail_closed_blocked(
+            out_dir,
+            expected=expected,
+            run_id=run_id,
+            blocking="A",
+            failed=["A"],
+            roots=["A:evidence-invalid:unknown"],
+            error=str(exc),
+        )
         return EXIT_BLOCKED
     return _write_verdict_outputs(
         out_dir, expected=expected, run_id=run_id, verdict=verdict, product=product, runtime=runtime
