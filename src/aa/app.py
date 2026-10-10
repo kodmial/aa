@@ -53,6 +53,7 @@ from aa.conversation.output_limits import (
     envelope_passes,
 )
 from aa.corpus.context import CorpusContext
+from aa.meeting_invitation.service import MeetingService
 from aa.opencode.errors import OpenCodeError, OpenCodeRateLimitError
 from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, OpenCodeRuntime
 from aa.retrieval.index import HybridIndex, open_hybrid_index
@@ -104,6 +105,10 @@ _NEW_REPLY = "Новая беседа начата."
 # count it as a substantive answer.
 _TEMPORARY_ERROR_REPLY = SERVICE_ERROR_REPLY
 _BUSY_REPLY = "Сейчас много сообщений. Попробуйте ещё раз через минуту."
+# Issue #327: the voluntary meeting offer text (allowed UI/protocol string).
+# It is sent only through the model-gated offer_meeting() helper, never
+# as an automatic footer on certified answers.
+_MEETING_OFFER_TEXT = "Если хочешь, могу помочь найти собрание. Это добровольно."
 
 
 def _is_allowed_control_reply(text: str) -> bool:
@@ -257,6 +262,10 @@ class Application:
             max_concurrent_turns=settings.max_concurrent_turns,
             per_chat_queue_size=settings.per_chat_queue_size,
         )
+        # Meeting wizard flows (issue #327): one live flow per chat, kept
+        # for the worker lifetime. A restart rotates callback secrets and
+        # generations, so former buttons fail inert as stale.
+        self.meetings = MeetingService()
         self._wire_transport_handlers()
 
     @property
@@ -703,6 +712,16 @@ class Application:
             await self.dispatcher.submit(incoming)
         except ChatQueueFullError:
             logger.warning("chat queue full; backpressure reply")
+            if incoming.is_callback and incoming.callback_id:
+                # Callback-only busy/retry notice: no false consent or
+                # decline state, keyboard stays active for another tap.
+                try:
+                    await self.transport.answer_callback(str(incoming.callback_id))
+                except (TelegramApiError, TelegramEnvelopeError):
+                    logger.warning("callback backpressure acknowledgement failed")
+                except Exception:
+                    logger.warning("callback backpressure acknowledgement failed")
+                return
             try:
                 await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_BUSY_REPLY))
             except (TelegramApiError, TelegramEnvelopeError):
@@ -715,9 +734,12 @@ class Application:
         LangGraph runtime as the single conversational path. ``/new``
         clears only that chat's graph thread state inside the same
         serialization, so it cannot interleave with an older turn for the
-        same chat.
+        same chat. Callback button presses never invoke the model.
         """
         try:
+            if incoming.is_callback:
+                await self._handle_callback_update(incoming)
+                return
             if incoming.command == "start":
                 await self._handle_start_command(incoming)
                 return
@@ -740,6 +762,55 @@ class Application:
     async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_START_REPLY))
 
+    async def offer_meeting(self, chat_id: int) -> bool:
+        """Send one voluntary meeting offer with two buttons (model-gated).
+
+        Callers invoke this only after a book-certified relevant turn and
+        a positive policy decision; this method never decides relevance
+        itself and never inspects message text. Delivery binds the offer:
+        only a confirmed send activates the keyboard.
+        """
+        try:
+            flow = self.meetings.begin_offer(int(chat_id))
+        except Exception:
+            return False
+        try:
+            sent_id = await self.transport.send(
+                TelegramReply(chat_id=int(chat_id), text=_MEETING_OFFER_TEXT, reply_markup=None)
+            )
+        except Exception:
+            try:
+                self.meetings.confirm_offer_delivery(int(chat_id), -1, "failed")
+            except Exception:
+                pass
+            _ = flow
+            return False
+        if sent_id is None:
+            try:
+                self.meetings.confirm_offer_delivery(int(chat_id), -1, "failed")
+            except Exception:
+                pass
+            return False
+        try:
+            result = self.meetings.activate_offer(int(chat_id), int(sent_id))
+        except Exception:
+            return False
+        try:
+            await self.transport.edit_reply_markup(
+                int(chat_id), int(sent_id), dict(result.keyboard)
+            )
+        except Exception:
+            try:
+                self.meetings.confirm_offer_delivery(int(chat_id), int(sent_id), "failed")
+            except Exception:
+                pass
+            return False
+        try:
+            self.meetings.confirm_offer_delivery(int(chat_id), int(sent_id), "confirmed")
+        except Exception:
+            return False
+        return True
+
     async def _handle_new_command(self, incoming: TelegramIncoming) -> None:
         try:
             runtime = self._graph_runtime
@@ -748,6 +819,10 @@ class Application:
             # Local metrics generation advances; the graph thread holds the
             # authoritative conversation memory.
             self.sessions.reset(incoming.chat_id)
+            try:
+                self.meetings.handle_new(incoming.chat_id)
+            except Exception:
+                pass
             reply = _NEW_REPLY
         except OpenCodeError:
             logger.warning("telegram new-session reset failed")
@@ -757,6 +832,55 @@ class Application:
             reply = _TEMPORARY_ERROR_REPLY
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=reply))
 
+    async def _handle_callback_update(self, incoming: TelegramIncoming) -> None:
+        """Process one wizard button press with zero model calls."""
+        if incoming.callback_inaccessible or not incoming.callback_data:
+            return
+        try:
+            outcome = self.meetings.handle_callback(
+                int(incoming.chat_id),
+                int(incoming.sender_id if incoming.sender_id is not None else incoming.chat_id),
+                int(incoming.callback_message_id)
+                if incoming.callback_message_id is not None
+                else int(incoming.message_id),
+                str(incoming.callback_data),
+            )
+        except Exception:
+            logger.warning("meeting callback handling failed")
+            return
+        if outcome.stale or outcome.duplicate or not outcome.accepted:
+            return
+        try:
+            if outcome.remove_keyboard and incoming.callback_message_id is not None:
+                await self.transport.edit_reply_markup(
+                    int(incoming.chat_id), int(incoming.callback_message_id), None
+                )
+            elif outcome.edit_keyboard is not None and incoming.callback_message_id is not None:
+                await self.transport.edit_reply_markup(
+                    int(incoming.chat_id),
+                    int(incoming.callback_message_id),
+                    dict(outcome.edit_keyboard),
+                )
+            if outcome.send_text is not None and outcome.send_text.strip():
+                sent_id = await self.transport.send(
+                    TelegramReply(
+                        chat_id=int(incoming.chat_id),
+                        text=outcome.send_text,
+                        reply_markup=dict(outcome.send_keyboard)
+                        if outcome.send_keyboard is not None
+                        else None,
+                    )
+                )
+                if sent_id is not None:
+                    try:
+                        self.meetings.note_sent_message(int(incoming.chat_id), int(sent_id))
+                    except Exception:
+                        pass
+        except (TelegramApiError, TelegramEnvelopeError):
+            logger.warning("meeting callback UI delivery failed")
+        except Exception:
+            logger.warning("meeting callback UI delivery failed")
+
     async def _handle_telegram_update(self, incoming: TelegramIncoming) -> None:
         """Process one private text update and always emit a bounded reply.
 
@@ -765,6 +889,39 @@ class Application:
         ordinary conversational path; this transport layer never sends a
         user message to OpenCode directly.
         """
+        try:
+            wizard = self.meetings.handle_text(int(incoming.chat_id), str(incoming.text))
+        except Exception:
+            wizard = None
+        if wizard is not None and wizard.handled:
+            try:
+                if wizard.send_text is not None and wizard.send_text.strip():
+                    sent_id = await self.transport.send(
+                        TelegramReply(
+                            chat_id=int(incoming.chat_id),
+                            text=str(wizard.send_text),
+                            reply_markup=dict(wizard.send_keyboard)
+                            if wizard.send_keyboard is not None
+                            else None,
+                        )
+                    )
+                    if sent_id is not None:
+                        try:
+                            self.meetings.note_sent_message(int(incoming.chat_id), int(sent_id))
+                        except Exception:
+                            pass
+                if wizard.edit_keyboard is not None:
+                    flow = self.meetings.flow_for(int(incoming.chat_id))
+                    bound = flow.bound_message_id if flow is not None else None
+                    if bound is not None:
+                        await self.transport.edit_reply_markup(
+                            int(incoming.chat_id), int(bound), dict(wizard.edit_keyboard)
+                        )
+            except (TelegramApiError, TelegramEnvelopeError):
+                logger.warning("meeting city UI delivery failed")
+            except Exception:
+                logger.warning("meeting city UI delivery failed")
+            return
         await self._respond_and_deliver(incoming, text=incoming.text, want_voice=False)
 
     async def _handle_voice_update(self, incoming: TelegramIncoming) -> None:
@@ -818,6 +975,35 @@ class Application:
         # Ephemeral only: a per-turn local, never stored in sessions/history.
         # ``want_voice`` selects the delivery format only (sendVoice vs
         # sendMessage); the conversational computation is identical.
+        # A voice transcript may answer a pending city question: route it
+        # through the offline wizard first with zero model calls. Directory
+        # results still arrive as text/buttons, never as spoken URLs.
+        try:
+            wizard = self.meetings.handle_text(int(incoming.chat_id), str(transcript))
+        except Exception:
+            wizard = None
+        if wizard is not None and wizard.handled:
+            try:
+                if wizard.send_text is not None and wizard.send_text.strip():
+                    sent_id = await self.transport.send(
+                        TelegramReply(
+                            chat_id=int(incoming.chat_id),
+                            text=str(wizard.send_text),
+                            reply_markup=dict(wizard.send_keyboard)
+                            if wizard.send_keyboard is not None
+                            else None,
+                        )
+                    )
+                    if sent_id is not None:
+                        try:
+                            self.meetings.note_sent_message(int(incoming.chat_id), int(sent_id))
+                        except Exception:
+                            pass
+            except (TelegramApiError, TelegramEnvelopeError):
+                logger.warning("meeting city UI delivery failed")
+            except Exception:
+                logger.warning("meeting city UI delivery failed")
+            return
         await self._respond_and_deliver(
             incoming, text=transcript, want_voice=True, voice_presentation=presentation
         )
