@@ -1,0 +1,279 @@
+{
+  "gate_a": [
+    {
+      "check_id": "a-exact-sha",
+      "executable_check": "scripts/run_self_proving_qualification.py:_gate_a sha match",
+      "input": "git rev-parse HEAD + expected main SHA",
+      "owner": "gate-a",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-exact-sha]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-clean-tree",
+      "executable_check": "runner _gate_a dirty-tree scan + workflow sha step",
+      "input": "git status --porcelain (ignored output dirs excluded)",
+      "owner": "gate-a",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-clean-tree]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-product-fingerprint",
+      "executable_check": "product_fingerprint.compute_product_fingerprint 64-hex",
+      "input": "repository product fingerprint material",
+      "owner": "gate-a",
+      "proof_artifact": "gate-A-evidence.json:product_fingerprint",
+      "status": "active"
+    },
+    {
+      "check_id": "a-runtime-fingerprint",
+      "executable_check": "scripts/run_self_proving_qualification.py:_runtime_fingerprint 64-hex",
+      "input": "runtime model/agent policy material",
+      "owner": "gate-a",
+      "proof_artifact": "gate-A-evidence.json:runtime_fingerprint",
+      "status": "active"
+    },
+    {
+      "check_id": "a-model-policy",
+      "executable_check": "aa.config defaults identity (agent/model/fallback distinct)",
+      "input": "Settings.from_env agent/model/fallback policy",
+      "owner": "gate-a",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-model-policy]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-aa-check",
+      "executable_check": "scripts/verify.sh: python3 -m aa --check",
+      "input": "production entrypoint",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-aa-check]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-pytest",
+      "executable_check": "scripts/verify.sh: python3 -m pytest -q",
+      "input": "full unit suite",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-pytest]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-ruff-check",
+      "executable_check": "scripts/verify.sh: python3 -m ruff check .",
+      "input": "repository tree",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-ruff-check]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-ruff-format",
+      "executable_check": "scripts/verify.sh: python3 -m ruff format --check .",
+      "input": "repository tree",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-ruff-format]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-mypy",
+      "executable_check": "scripts/verify.sh: python3 -m mypy src tests",
+      "input": "src + tests",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-mypy]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-contract-qualification",
+      "executable_check": "scripts/verify_product_contract_qualification.py --require-active",
+      "input": "product contract fixtures",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-contract-qualification]",
+      "status": "active"
+    },
+    {
+      "check_id": "a-shell-runtime-qualification",
+      "executable_check": "scripts/verify_runtime_qualification.py",
+      "input": "runtime fixtures",
+      "owner": "gate-a-shell",
+      "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-runtime-qualification]",
+      "status": "active"
+    }
+  ],
+  "gate_b": [
+    {
+      "check_id": "b-shell-restore-canonical",
+      "executable_check": "scripts/restore_canonical.py --no-network-fallback (+ --lang ru)",
+      "input": "pinned RU/EN corpus artifacts",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-restore-canonical]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-shell-corpus-structure",
+      "executable_check": "scripts/build_corpus_structure.py",
+      "input": "restored canonical corpus",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-corpus-structure]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-shell-prefetch-public",
+      "executable_check": "scripts/prefetch_public_assets.py",
+      "input": "pinned public model assets",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-prefetch-public]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-shell-prefetch-voice",
+      "executable_check": "scripts/prefetch_voice_assets.py",
+      "input": "pinned voice assets",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-prefetch-voice]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-shell-build-index",
+      "executable_check": "scripts/build_retrieval_index.py --backend e5",
+      "input": "restored corpus + pinned E5 model",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-build-index]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-shell-pytest",
+      "executable_check": "pytest 8 deterministic component suites (workflow Gate B step)",
+      "input": "deterministic component suites",
+      "owner": "gate-b-shell",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-shell-pytest]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-planner-cardinality",
+      "executable_check": "scripts/run_self_proving_qualification.py:_gate_b planner cardinality",
+      "input": "QueryPlan 12-query valid + 17-query oversize",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-planner-cardinality]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-planner-shape",
+      "executable_check": "runner _gate_b planner shape / RRF-only",
+      "input": "RetrievalConfig + evidence module wiring",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-planner-shape]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-corpus-restore",
+      "executable_check": "runner _gate_b corpus-restore layout",
+      "input": "corpus/embedding.lock.json + corpus/ + generated artifacts",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-corpus-restore]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-bm25-index",
+      "executable_check": "runner _gate_b bm25-index open/search",
+      "input": "production lexical index (RAM-resident SQLite FTS)",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-bm25-index]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-e5-faiss-index",
+      "executable_check": "runner _gate_b e5-faiss-index identity/search",
+      "input": "pinned E5 FAISS production dense index",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-e5-faiss-index]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-retrieval-rrf",
+      "executable_check": "scripts/run_self_proving_qualification.py:_gate_b fused-hit evidence",
+      "input": "12 production RU queries over hybrid index",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-retrieval-rrf]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-small-to-big",
+      "executable_check": "runner _gate_b canonical provenance",
+      "input": "fused retrieval hits",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-small-to-big]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-grounding",
+      "executable_check": "runner _gate_b check_grounding accept/reject",
+      "input": "supported + unsupported exact-source claims",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-grounding]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-verifier",
+      "executable_check": "runner _gate_b validate_grounding_result",
+      "input": "valid + incomplete grounding verdicts",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-verifier]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-output-envelope",
+      "executable_check": "runner _gate_b envelope accept/reject/compact",
+      "input": "short + overflow + compacted replies",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-output-envelope]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-memory-fifo",
+      "executable_check": "runner _gate_b memory/FIFO determinism",
+      "input": "thread mapping + query vector cache bounds",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-memory-fifo]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-concurrency",
+      "executable_check": "runner _gate_b dispatcher start/stop",
+      "input": "ChatTurnDispatcher lifecycle",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-concurrency]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-safety",
+      "executable_check": "runner _gate_b SafetyRouter BLOCK/ALLOW",
+      "input": "empty + ordinary utterances",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-safety]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-voice-fixture",
+      "executable_check": "scripts/run_self_proving_qualification.py:_gate_b voice lock load",
+      "input": "corpus/voice.lock.json",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-voice-fixture]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-voice-cache",
+      "executable_check": "runner _gate_b voice-cache/resource",
+      "input": "VoicePresentationClassifier + resource usage",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-voice-cache]",
+      "status": "active"
+    },
+    {
+      "check_id": "b-resource",
+      "executable_check": "scripts/run_self_proving_qualification.py:_gate_b ru_maxrss readable",
+      "input": "process resource usage",
+      "owner": "gate-b-python",
+      "proof_artifact": "gate-B-evidence.json:subchecks[b-resource]",
+      "status": "active"
+    }
+  ],
+  "schema_version": "aa-gate-ab-coverage/1"
+}
