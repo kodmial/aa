@@ -143,8 +143,23 @@ async def _await_under_interactive_deadline(
     exhausted by the RRF threshold. ``Cancelled`` and provider 429
     always propagate and are never converted to exhaustion.
     """
+    from aa.conversation.turn_budget import (
+        DOWNSTREAM_MIN_RESERVE_S as _reserve_s,
+    )
+    from aa.conversation.turn_budget import (
+        MIN_MODEL_SLICE_S as _min_slice_s,
+    )
+    from aa.conversation.turn_budget import (
+        PROVIDER_REQUEST_TIMEOUT_S as _provider_ceiling_s,
+    )
     from aa.conversation.turn_budget import TURN_END_TO_END_BUDGET_S as _turn_s
 
+    try:
+        cap_s = float(per_call_cap_s)
+    except (TypeError, ValueError):
+        cap_s = SELECTION_PER_CALL_BUDGET_S
+    if not cap_s > 0:
+        cap_s = SELECTION_PER_CALL_BUDGET_S
     try:
         elapsed_s = max(0.0, time.perf_counter() - float(started))
     except Exception:
@@ -153,11 +168,28 @@ async def _await_under_interactive_deadline(
         remaining_s = max(0.0, float(_turn_s) - elapsed_s)
     except Exception:
         remaining_s = 0.0
-    if remaining_s <= 0:
+    try:
+        reserve_s = max(0.0, float(_reserve_s))
+    except (TypeError, ValueError):
+        reserve_s = 5.0
+    alloc_s = remaining_s - reserve_s
+    if alloc_s <= 0:
         raise _InteractiveBudgetTimeout("turn budget already spent")
+    try:
+        ceiling_s = max(0.0, float(_provider_ceiling_s))
+    except (TypeError, ValueError):
+        ceiling_s = 120.0
+    try:
+        floor_s = max(0.0, float(_min_slice_s))
+    except (TypeError, ValueError):
+        floor_s = 0.05
+    timeout_s = min(cap_s, alloc_s, ceiling_s)
+    if timeout_s <= 0:
+        raise _InteractiveBudgetTimeout("turn budget already spent")
+    timeout_s = max(floor_s, timeout_s)
     coro = coro_factory() if callable(coro_factory) else coro_factory
     try:
-        return await asyncio.wait_for(coro, timeout=remaining_s)
+        return await asyncio.wait_for(coro, timeout=timeout_s)
     except TimeoutError as exc:
         raise _InteractiveBudgetTimeout("turn deadline exceeded") from exc
 

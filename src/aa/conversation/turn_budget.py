@@ -335,25 +335,17 @@ async def await_model_under_turn_budget(
     started = time.perf_counter()
     coro = coro_factory() if callable(coro_factory) else coro_factory
     try:
-        result = await asyncio.wait_for(coro, timeout=timeout_s)
-    except (asyncio.CancelledError, TimeoutError) as exc:
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        if isinstance(exc, asyncio.CancelledError) and not isinstance(exc, TimeoutError):
-            raise
-        try:
-            from aa.opencode.errors import OpenCodeRateLimitError as _RateLimit
+        from aa.opencode.errors import OpenCodeRateLimitError as _RateLimitCls
 
-            if isinstance(exc, _RateLimit):
-                budget.record_stage(
-                    stage=STAGE_PROVIDER_429,
-                    ok=False,
-                    latency_ms=elapsed_ms,
-                    category="rate-limit",
-                    id_digest=id_digest,
-                )
-                raise
-        except ImportError:
-            pass
+        _rate_limit_types: Any = (_RateLimitCls,)
+    except ImportError:
+        _rate_limit_types = ()
+    try:
+        result = await asyncio.wait_for(coro, timeout=timeout_s)
+    except asyncio.CancelledError as exc:
+        if not isinstance(exc, TimeoutError):
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         budget.record_stage(
             stage=stage,
             ok=False,
@@ -368,6 +360,42 @@ async def await_model_under_turn_budget(
             allocated_s=timeout_s,
             remaining_ms=budget.remaining_ms(),
         ) from exc
+    except TimeoutError as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if _rate_limit_types and isinstance(exc, _rate_limit_types):
+            budget.record_stage(
+                stage=STAGE_PROVIDER_429,
+                ok=False,
+                latency_ms=elapsed_ms,
+                category="rate-limit",
+                id_digest=id_digest,
+            )
+            raise
+        budget.record_stage(
+            stage=stage,
+            ok=False,
+            latency_ms=elapsed_ms,
+            category="deadline-exceeded",
+            id_digest=id_digest,
+        )
+        raise ProviderSemanticTimeout(
+            "semantic provider call exceeded turn deadline",
+            stage=stage,
+            elapsed_ms=elapsed_ms,
+            allocated_s=timeout_s,
+            remaining_ms=budget.remaining_ms(),
+        ) from exc
+    except Exception as exc:
+        if _rate_limit_types and isinstance(exc, _rate_limit_types):
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            budget.record_stage(
+                stage=STAGE_PROVIDER_429,
+                ok=False,
+                latency_ms=elapsed_ms,
+                category="rate-limit",
+                id_digest=id_digest,
+            )
+        raise
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     budget.record_stage(
         stage=stage,
@@ -449,7 +477,13 @@ async def run_local_retrieval_bounded(
     global _LOCAL_WORKER_ACTIVE, _LOCAL_WAITERS, _LOCAL_WAITER_TIMEOUTS
     loop = asyncio.get_running_loop()
     with _LOCAL_LOCK:
-        queued = int(_LOCAL_WORKER_ACTIVE + _LOCAL_WAITERS)
+        # _LOCAL_WORKER_ACTIVE counts submitted-but-not-reaped executor
+        # items (running + executor-queued); _LOCAL_WAITERS counts
+        # asyncio waiters still attached. Each admitted call increments
+        # both, so summing them double-counts one call as two and would
+        # reject any concurrent second call. Admit on the worker count
+        # alone: at most one running worker plus one queued item.
+        queued = int(_LOCAL_WORKER_ACTIVE)
         if queued >= 2:
             raise LocalRetrievalTimeout(
                 "local retrieval admission bound exceeded",
@@ -459,7 +493,13 @@ async def run_local_retrieval_bounded(
         _LOCAL_WORKER_ACTIVE += 1
         _LOCAL_WAITERS += 1
     started = time.perf_counter()
-    future = loop.run_in_executor(_LOCAL_EXECUTOR, functools.partial(func, *args, **kwargs))
+    try:
+        future = loop.run_in_executor(_LOCAL_EXECUTOR, functools.partial(func, *args, **kwargs))
+    except Exception:
+        with _LOCAL_LOCK:
+            _LOCAL_WORKER_ACTIVE = max(0, _LOCAL_WORKER_ACTIVE - 1)
+            _LOCAL_WAITERS = max(0, _LOCAL_WAITERS - 1)
+        raise
     try:
         future.add_done_callback(_worker_done_callback)
     except Exception:
@@ -475,10 +515,10 @@ async def run_local_retrieval_bounded(
         timed_out = True
         with _LOCAL_LOCK:
             _LOCAL_WAITER_TIMEOUTS += 1
-        try:
-            worker_in_flight = not future.done()
-        except Exception:
-            worker_in_flight = True
+        # Waiter expiry never cancels sync thread work: the worker stays
+        # in flight until its done-callback reaps it, even if the
+        # asyncio wrapper future reports done/cancelled.
+        worker_in_flight = True
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         # Do not claim cancellation: the sync thread keeps running; its
         # done-callback reaps the worker slot. Detach the waiter only.
