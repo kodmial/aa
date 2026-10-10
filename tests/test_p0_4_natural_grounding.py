@@ -849,9 +849,13 @@ async def test_single_unsupported_claim_triggers_targeted_repair(
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
+    # #306: repair retrieval traverses the shared async read/coverage loop.
+    async def _fake_retrieve(
+        index: Any, queries: object, *, config: Any = None, **kwargs: Any
+    ) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
+        _ = (index, queries, config, kwargs)
         text = second_pack_entry["text"]
         passage = EvidencePassageData(
             passage_id=second_pack_entry["passage_id"],
@@ -868,7 +872,10 @@ async def test_single_unsupported_claim_triggers_targeted_repair(
             passages=(passage,), total_tokens=10, corpus_version="v", retrieval_metadata={}
         )
 
-    monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
+    from aa.conversation import retrieval_node as retrieval_node_mod
+
+    monkeypatch.setattr(retrieval_node_mod, "aretrieve_with_semantic_selection", _fake_retrieve)
+    _ = evidence_mod
     outcome = await run_v2_answer_turn(
         user_message="что помогает при тяге?",
         summary="",
@@ -926,9 +933,13 @@ async def test_persistent_failure_narrowed_after_two_rounds(
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
+    # #306: repair retrieval traverses the shared async read/coverage loop.
+    async def _fake_retrieve(
+        index: Any, queries: object, *, config: Any = None, **kwargs: Any
+    ) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
+        _ = (index, config, kwargs)
         text = "Фиктивная другая поддержка рядом."
         passage = EvidencePassageData(
             passage_id=f"chapter-3#extra{len(str(queries))}",
@@ -945,7 +956,10 @@ async def test_persistent_failure_narrowed_after_two_rounds(
             passages=(passage,), total_tokens=10, corpus_version="v", retrieval_metadata={}
         )
 
-    monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
+    from aa.conversation import retrieval_node as retrieval_node_mod
+
+    monkeypatch.setattr(retrieval_node_mod, "aretrieve_with_semantic_selection", _fake_retrieve)
+    _ = evidence_mod
     import pytest as _pt04f
 
     from aa.conversation.failures import TurnFailed as _TF04f

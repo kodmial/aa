@@ -208,9 +208,13 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
 
     from aa.retrieval import evidence as evidence_mod
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
+    # #306: repair retrieval traverses the shared async read/coverage loop.
+    async def _fake_retrieve(
+        index: Any, queries: object, *, config: Any = None, **kwargs: Any
+    ) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
+        _ = (index, queries, config, kwargs)
         text = "Фиктивная поддержка рядом помогает пережить тягу спокойно."
         passage = EvidencePassageData(
             passage_id="chapter-3#exp0001",
@@ -229,8 +233,11 @@ async def test_substantive_turn_still_repairs_with_evidence() -> None:
 
     import pytest
 
+    from aa.conversation import retrieval_node as retrieval_node_mod
+
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
+    monkeypatch.setattr(retrieval_node_mod, "aretrieve_with_semantic_selection", _fake_retrieve)
+    _ = evidence_mod
     try:
         outcome = await run_v2_answer_turn(
             user_message="что помогает при тяге?",

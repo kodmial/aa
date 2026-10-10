@@ -397,14 +397,29 @@ def test_rank66_followup_stays_reachable_with_needs(monkeypatch: Any) -> None:
     monkeypatch.setattr(evidence_mod, "fuse_query_pool", _fake_fuse)
 
     class _EmptyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def ainvoke_structured(
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 1
         ) -> dict[str, object]:
             _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            if self.calls <= 1:
+                return {
+                    "selected_chunk_ids": [],
+                    "need_more_detail": True,
+                    "followup_queries": ["уточняющий запрос про тягу"],
+                }
+            # #306: follow-up candidates are semantically reconsidered,
+            # never appended by rank. The surfaced decisive candidate is
+            # selected only after a fresh read of its preview.
+            target_id = records[65].chunk_id
+            assert target_id in prompt
             return {
-                "selected_chunk_ids": [],
-                "need_more_detail": True,
-                "followup_queries": ["уточняющий запрос про тягу"],
+                "selected_chunk_ids": [target_id],
+                "need_more_detail": False,
+                "followup_queries": [],
             }
 
     needs = needs_from_plan("трезвый утренний разбор тяги", ["первый запрос"])
@@ -478,6 +493,32 @@ async def test_actual_prompt_selection_covers_both_needs(monkeypatch: Any) -> No
             self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int
         ) -> object:
             _ = (system, schema, retry_count)
+            if "<passages>" in prompt and "<original_request>" in prompt:
+                # #306 full-read coverage assessment over exact passages:
+                # judge every need against the passages actually read,
+                # citing the served passage ids (never previews).
+                import re as _re
+
+                ids = _re.findall(r'<passage id="([^"]+)"', prompt)
+                assert ids
+                return {
+                    "needs": [
+                        {
+                            "need_id": "need-1",
+                            "covered": True,
+                            "supporting_passage_ids": ids[:1],
+                            "supporting_quote": "",
+                            "missing": "",
+                        },
+                        {
+                            "need_id": "need-2",
+                            "covered": True,
+                            "supporting_passage_ids": ids[-1:],
+                            "supporting_quote": "",
+                            "missing": "",
+                        },
+                    ]
+                }
             seen["prompt"] = prompt
             assert "chapter-7:ru:b0001" in prompt
             assert "need-1" in prompt and "need-2" in prompt
