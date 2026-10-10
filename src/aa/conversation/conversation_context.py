@@ -478,6 +478,49 @@ def assert_same_context_digest(state: Any, *, stage: str) -> str:
         stored_direct = ""
     if stored_direct and stored_direct != canonical:
         raise ValueError(f"context digest mismatch at {stage}")
+    # Recompute from the embedded bytes fail-closed: a consistently
+    # tampered pair of claimed digests must not pass while the actual
+    # context bytes hash to a different value.
+    try:
+        resolved = resolved_turn_from_state(state)
+    except Exception:
+        resolved = None
+    if resolved is not None:
+        try:
+            embedded: Any = resolved.conversation_context
+        except Exception:
+            embedded = None
+        if isinstance(embedded, dict) and embedded:
+            recomputed = context_digest_for_canonical(embedded)
+            if recomputed != str(resolved.context_digest or ""):
+                raise ValueError(f"context digest mismatch at {stage}")
+            if recomputed != canonical:
+                raise ValueError(f"context digest mismatch at {stage}")
+        elif isinstance(embedded, ConversationContext):
+            recomputed = context_digest_for_canonical(embedded)
+            if recomputed != str(resolved.context_digest or ""):
+                raise ValueError(f"context digest mismatch at {stage}")
+            if recomputed != canonical:
+                raise ValueError(f"context digest mismatch at {stage}")
+    elif isinstance(stored_turn, dict):
+        raw_ctx = stored_turn.get("conversation_context", None)
+        raw_digest = str(stored_turn.get("context_digest", "") or "")
+        if isinstance(raw_ctx, dict) and raw_ctx and raw_digest:
+            recomputed_raw = context_digest_for_canonical(raw_ctx)
+            if recomputed_raw != raw_digest or recomputed_raw != canonical:
+                raise ValueError(f"context digest mismatch at {stage}")
+    try:
+        raw_context: Any = state.get("conversation_context", None)
+    except Exception:
+        raw_context = None
+    if isinstance(raw_context, dict) and raw_context:
+        recomputed_top = context_digest_for_canonical(raw_context)
+        if recomputed_top != canonical:
+            raise ValueError(f"context digest mismatch at {stage}")
+    elif isinstance(raw_context, ConversationContext):
+        recomputed_top = context_digest_for_canonical(raw_context)
+        if recomputed_top != canonical:
+            raise ValueError(f"context digest mismatch at {stage}")
     return canonical
 
 

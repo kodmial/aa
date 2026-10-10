@@ -220,28 +220,26 @@ def selection_prompt(
         + " Candidate previews are discovery references only, never full "
         "evidence; select only ids listed in <candidates>."
     )
-    from aa.conversation.conversation_context import truncate_preserving_tail as _tail
-
-    # Shared canonical view: one tail-preserving budget applied upstream,
-    # never an independent first-N clip per stage. The shared helper keeps
-    # trailing conditions/referents while keeping omissions traceable.
+    # Shared canonical view: the upstream canonical model view is already
+    # bounded, so these bytes travel verbatim. No independent per-stage
+    # re-truncation while claiming the same ``context_digest``: the digest
+    # must attest to the exact bytes sent to the model.
     lines: list[str] = [
         UNTRUSTED_DATA_POLICY_LINE,
         "<resolved_intent>",
-        escape_xml_text(_tail((resolved_intent or user_message or "").strip(), 2000))
-        or "(no intent)",
+        escape_xml_text((resolved_intent or user_message or "").strip()) or "(no intent)",
         "</resolved_intent>",
     ]
     if user_message.strip():
         lines += [
             "<current_user_message>",
-            escape_xml_text(_tail(user_message.strip(), 2000)),
+            escape_xml_text(user_message.strip()),
             "</current_user_message>",
         ]
     if conversation_context.strip():
         lines += [
             "<conversation_context>",
-            escape_xml_text(_tail(conversation_context.strip(), 2000)),
+            escape_xml_text(conversation_context.strip()),
             "</conversation_context>",
         ]
     lines.append("<candidates>")

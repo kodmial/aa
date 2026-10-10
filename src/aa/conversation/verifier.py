@@ -926,6 +926,7 @@ def build_single_unit_text(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    context_digest: str = "",
 ) -> str:
     """Render the minimal single-unit verifier payload (no id copying).
 
@@ -993,6 +994,8 @@ def build_single_unit_text(
         # conditions/referents survive and omissions stay traceable.
         lines.append(_escape(_tail(conversation_context.strip(), 2000)))
         lines.append("</conversation_context>")
+    if str(context_digest or "").strip():
+        lines.append(f"<context_digest>{_escape(str(context_digest).strip())}</context_digest>")
     lines.append(UNTRUSTED_DATA_POLICY_LINE)
     window = list(passages)
     if window:
@@ -1142,6 +1145,7 @@ async def _verify_single_unit(
     resolved_intent: str = "",
     user_message: str = "",
     conversation_context: str = "",
+    context_digest: str = "",
     _prefer_text_snapshot: bool | None = None,
 ) -> UnitVerdict:
     """Verify exactly one unit with the minimal boolean decision schema.
@@ -1215,6 +1219,7 @@ async def _verify_single_unit(
         resolved_intent=resolved_intent,
         user_message=user_message,
         conversation_context=conversation_context,
+        context_digest=context_digest,
     )
     window = list(passages)
     short_to_full = display_id_map_for_window(window)
@@ -1475,6 +1480,7 @@ async def _verify_per_unit_concurrent(
                 resolved_intent=resolved_intent,
                 user_message=user_message,
                 conversation_context=conversation_context,
+                context_digest=context_digest,
                 _prefer_text_snapshot=prefer_text_snapshot,
             )
         )
@@ -1631,7 +1637,6 @@ async def run_verifier(
         validate_book_pack_for_model_use(passages)
     except EvidencePackIntegrityError as exc:
         raise VerifierValidationError(f"evidence integrity failure: {exc}") from exc
-    _ = context_digest
     result = await _verify_per_unit_concurrent(
         units,
         passages,
