@@ -1,11 +1,22 @@
 name: AA mandatory qualification lifecycle
 
 # Observable idempotent post-merge trigger for the mandatory exact-main
-# qualification protocol (issue #336).
+# qualification protocol (issues #336/#345).
 #
 # Context: implementation PRs #333/#334 merged and GitHub auto-closed
 # #331/#332 while mandatory exact-main Gate B/C/E evidence had not been
 # posted on #7. A merge or green CI is never qualification.
+#
+# Issue #345 hardening (ARG_MAX crash, job 114191294436): this workflow
+# never passes large GitHub JSON through CLI argv, environment variables,
+# or single shell command substitutions. Open issues are fetched with REST
+# pagination into an ephemeral chmod-600 JSONL file, #7 comments with REST
+# --paginate into a second chmod-600 file, and Python loads both from files
+# with bounded streaming. Dispatch is shared per SHA: exactly one
+# authoritative A-F run per SHA/config generation covers every waiting
+# capability, recorded separately. A scheduled cron wake-up retries
+# infrastructure failures on the same SHA without requiring a new source
+# change and without an infinite mutation loop.
 #
 # This workflow reuses the existing Continuum machine relation
 # <!-- automation-qualification: #7 --> plus automation:qualifying and the
@@ -13,8 +24,8 @@ name: AA mandatory qualification lifecycle
 # scheduler: all decisions come from the pure module
 # src/aa/qualification/mandatory_lifecycle.py (admission validation,
 # non-closing PR references, immutable capability/#7/SHA/contract tuple,
-# idempotent dispatch, orphaned-lease recovery, trusted result gating,
-# #290 breaker preservation). Product Contract #110 stays immutable.
+# shared idempotent dispatch, orphaned-lease recovery, trusted result
+# gating, #290 breaker preservation). Product Contract #110 stays immutable.
 
 on:
   push:
@@ -34,6 +45,12 @@ on:
         description: "Capability issue number carrying automation-qualification: #7"
         required: false
         type: string
+  schedule:
+    # Deterministic infrastructure recovery: an already merged capability
+    # must not rely on a new source change as its only wake-up. Retries an
+    # infra-failed dispatch on the same SHA once repaired; bounded by the
+    # pure module (retry budget + #290 breaker), never an infinite loop.
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: read
@@ -46,16 +63,18 @@ concurrency:
 
 jobs:
   reconcile:
-    # Wake only on merged PRs, main pushes, trusted #7 result comments, or
-    # manual relay. Unrelated issue comments stay cheap skips.
+    # Wake on merged PRs, main pushes, trusted #7 result comments, manual
+    # relay, or scheduled infra recovery. Unrelated issue comments stay
+    # cheap skips. Scheduled runs always reconcile.
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'pull_request_target' &&
-       github.event.pull_request.merged == true) ||
+        github.event.pull_request.merged == true) ||
       (github.event_name == 'issue_comment' &&
-       github.event.issue.number == 7 &&
-       contains(github.event.comment.body, 'continuum-qualification-result'))
+        github.event.issue.number == 7 &&
+        contains(github.event.comment.body, 'continuum-qualification-result'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -86,89 +105,144 @@ jobs:
           echo "sha=$current_main" >> "$GITHUB_OUTPUT"
           echo "exact current main: $current_main" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Reconcile mandatory qualification dispatch
+      - name: Collect paginated open-issue inventory (ARG_MAX-safe)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No large JSON in argv/env/command substitution: page through the
+          # REST issues API and append slim records to a chmod-600 JSONL file.
+          # Pull-request objects are excluded downstream by the pure module.
+          rm -f /tmp/mq-inventory.jsonl /tmp/mq-page.json
+          : > /tmp/mq-inventory.jsonl
+          chmod 600 /tmp/mq-inventory.jsonl
+          repo="${{ github.repository }}"
+          page=1
+          total=0
+          while true; do
+            if ! gh api "repos/${repo}/issues?state=open&per_page=100&page=${page}" \
+              > /tmp/mq-page.json; then
+              echo "::error::Inventory page ${page} unavailable; failing closed (no truncation)"
+              exit 1
+            fi
+            count="$(jq 'length' /tmp/mq-page.json)"
+            if [[ "$count" == "0" ]]; then
+              break
+            fi
+            # Slim to number/body/PR marker only; bodies stay in the file, never in argv.
+            jq -c '.[] | {number, body, pull_request: (.pull_request // null), html_url}' \
+              /tmp/mq-page.json >> /tmp/mq-inventory.jsonl
+            total=$((total + count))
+            if [[ "$count" -lt 100 ]]; then
+              break
+            fi
+            page=$((page + 1))
+            if [[ "$page" -gt 100 ]]; then
+              echo "::error::Inventory pagination guard tripped; failing closed"
+              exit 1
+            fi
+          done
+          chmod 600 /tmp/mq-inventory.jsonl
+          echo "inventory issues fetched: $total (pages: $page)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect full tracker history (paginated)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Full #7 comment history via REST pagination (beyond 100/300/500),
+          # slimmed to body/association/login. Author association is preserved
+          # so forged untrusted PASS markers never count.
+          rm -f /tmp/mq-comments-raw.jsonl /tmp/mq-comments-slim.json /tmp/mq-cpage.json
+          : > /tmp/mq-comments-raw.jsonl
+          chmod 600 /tmp/mq-comments-raw.jsonl
+          repo="${{ github.repository }}"
+          page=1
+          total=0
+          while true; do
+            if ! gh api "repos/${repo}/issues/7/comments?per_page=100&page=${page}" \
+              > /tmp/mq-cpage.json; then
+              echo "::error::Tracker comment page ${page} unavailable; failing closed (never empty history)"
+              exit 1
+            fi
+            count="$(jq 'length' /tmp/mq-cpage.json)"
+            if [[ "$count" == "0" ]]; then
+              break
+            fi
+            jq -c '.[] | {body, association: (.author_association // ""), login: (.user.login // "")}' \
+              /tmp/mq-cpage.json >> /tmp/mq-comments-raw.jsonl
+            total=$((total + count))
+            if [[ "$count" -lt 100 ]]; then
+              break
+            fi
+            page=$((page + 1))
+            if [[ "$page" -gt 100 ]]; then
+              echo "::error::Comment pagination guard tripped; failing closed"
+              exit 1
+            fi
+          done
+          python3 - <<'PY'
+          import json
+          rows = []
+          with open("/tmp/mq-comments-raw.jsonl", encoding="utf-8") as handle:
+              for line in handle:
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          with open("/tmp/mq-comments-slim.json", "w", encoding="utf-8") as handle:
+              json.dump(rows, handle)
+          PY
+          chmod 600 /tmp/mq-comments-slim.json /tmp/mq-comments-raw.jsonl
+          echo "tracker comments fetched: $total (pages: $page)" >> "$GITHUB_STEP_SUMMARY"
+          # Small scalar signals only: label set and live-run presence.
+          gh api "repos/${repo}/issues/7" --jq '[.labels[].name] | join(",")' \
+            > /tmp/mq-labels.txt
+          chmod 600 /tmp/mq-labels.txt
+          gh run list --workflow aa-self-proving-qualification.yml \
+            --status in_progress --limit 5 \
+            --json databaseId,headSha,conclusion,status \
+            > /tmp/mq-runs.json || echo '[]' > /tmp/mq-runs.json
+          chmod 600 /tmp/mq-runs.json
+
+      - name: Reconcile shared qualification dispatch (single claimant)
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT_SHA: ${{ steps.sha.outputs.sha }}
           MANUAL_CAPABILITY: ${{ inputs.capability }}
-        shell: bash
         run: |
           set -euo pipefail
-          # Collect open capabilities declaring the mandatory relation and
-          # the trusted #7 dispatch/result history, then reconcile each
-          # through the pure lifecycle module (idempotent, fail-closed).
-          open_json="$(gh issue list --state open --limit 200 --json number,body)"
-          caps="$(python - "$open_json" <<'PY'
-          import json, sys
-          sys.path.insert(0, "src")
-          from aa.qualification.mandatory_lifecycle import parse_automation_qualification
-          issues = json.loads(sys.argv[1])
-          wanted = []
-          for item in issues:
-              try:
-                  number = int(item.get("number", 0))
-              except (TypeError, ValueError):
-                  continue
-              if parse_automation_qualification(str(item.get("body", ""))) == 7:
-                  wanted.append(number)
-          print(" ".join(str(n) for n in sorted(wanted)))
-          PY
-          )"
-          if [[ -n "${MANUAL_CAPABILITY:-}" ]]; then
-            caps="$MANUAL_CAPABILITY"
-          fi
-          echo "mandatory capabilities: ${caps:-none}" >> "$GITHUB_STEP_SUMMARY"
-          comments_json="$(gh issue view 7 --comments --json comments --jq .comments)"
-          printf '%s' "$comments_json" > /tmp/mq-comments.json
-          python - <<'PY'
-          import json, os
-          raw = json.load(open("/tmp/mq-comments.json", encoding="utf-8"))
-          slim = [
-              {
-                  "body": str(c.get("body", "")),
-                  "association": str(c.get("authorAssociation", "")),
-                  "login": str((c.get("author") or {}).get("login", "")),
-              }
-              for c in raw
-          ]
-          json.dump(slim, open("/tmp/mq-comments-slim.json", "w", encoding="utf-8"))
-          PY
-          labels_json="$(gh issue view 7 --json labels --jq '.labels | map(.name)')"
-          has_label="$(python - "$labels_json" <<'PY'
-          import json, sys
-          print("yes" if "automation:in-progress" in json.loads(sys.argv[1]) else "no")
-          PY
-          )"
-          active_run="false"
-          if gh run list --workflow aa-self-proving-qualification.yml \
-               --status in_progress --limit 1 --json databaseId --jq '.[0].databaseId' \
-               2>/dev/null | grep -qE '[0-9]+'; then
-            active_run="true"
-          fi
+          # Single shared invocation: exactly one authoritative A-F run per
+          # SHA/config generation. The concurrency group above makes this
+          # step the single claimant; the pure module reuses an existing
+          # dispatch/active lease instead of minting a second run.
           label_flag=""
-          if [[ "$has_label" == "yes" ]]; then
+          if grep -q "automation:in-progress" /tmp/mq-labels.txt 2>/dev/null; then
             label_flag="--has-in-progress-label"
           fi
           run_flag=""
-          if [[ "$active_run" == "true" ]]; then
+          run_sha=""
+          if jq -e 'length > 0' /tmp/mq-runs.json >/dev/null 2>&1; then
             run_flag="--has-active-run"
+            run_sha="$(jq -r '.[0].headSha // ""' /tmp/mq-runs.json)"
+          fi
+          manual_args=""
+          if [[ -n "${MANUAL_CAPABILITY:-}" ]]; then
+            manual_args="--capabilities ${MANUAL_CAPABILITY}"
           fi
           # shellcheck disable=SC2086
-          for cap in ${caps:-}; do
-            echo "--- capability #$cap ---" >> "$GITHUB_STEP_SUMMARY"
-            # shellcheck disable=SC2086
-            python scripts/reconcile_mandatory_qualification.py \
-              --capability "$cap" \
-              --sha "$CURRENT_SHA" \
-              --comments-file /tmp/mq-comments-slim.json \
-              $label_flag $run_flag \
-              --lease-age-s 0 \
-              --post >> "$GITHUB_STEP_SUMMARY"
-          done
-          if [[ -z "${caps:-}" ]]; then
-            python scripts/reconcile_mandatory_qualification.py \
-              --sha "$CURRENT_SHA" \
-              --comments-file /tmp/mq-comments-slim.json \
-              $label_flag $run_flag \
-              --lease-age-s 0 >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python scripts/reconcile_mandatory_qualification.py \
+            --sha "$CURRENT_SHA" \
+            --inventory-file /tmp/mq-inventory.jsonl \
+            --comments-file /tmp/mq-comments-slim.json \
+            ${label_flag} ${run_flag} \
+            --run-sha "$run_sha" \
+            --lease-age-s 0 \
+            --record-file /tmp/mq-record.json \
+            ${manual_args} \
+            --post >> "$GITHUB_STEP_SUMMARY"
+          echo "--- dispatch record (privacy-safe) ---" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/mq-record.json >> "$GITHUB_STEP_SUMMARY"
+          chmod 600 /tmp/mq-record.json
