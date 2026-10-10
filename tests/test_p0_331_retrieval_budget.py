@@ -296,6 +296,7 @@ async def test_slow_selector_is_deadline_bounded_with_typed_failure(monkeypatch:
 
     import aa.conversation.retrieval_node as retrieval_node_mod
     from aa.conversation.retrieval_node import aretrieve_with_semantic_selection
+    from aa.conversation.turn_budget import new_turn_budget
 
     retrieval_node_mod.clear_canonical_read_cache()
     first = _record("chapter-1:ru:first", start=0, text="Начало про утренний разбор.")
@@ -305,9 +306,10 @@ async def test_slow_selector_is_deadline_bounded_with_typed_failure(monkeypatch:
         [{first.chunk_id: _fused(first.chunk_id, 50.0)}],
         [[first.chunk_id]],
     )
-    monkeypatch.setattr(retrieval_node_mod, "INTERACTIVE_LATENCY_BUDGET_MS", 120.0)
-    monkeypatch.setattr(retrieval_node_mod, "SELECTION_PER_CALL_BUDGET_S", 0.05)
-    monkeypatch.setattr(retrieval_node_mod, "COVERAGE_PER_CALL_BUDGET_S", 0.05)
+    # kodmial/aa#335: the bound is the remaining end-to-end turn budget
+    # (6s deadline, 5s provider tail), never the 5s local RRF diagnostic.
+    _ = monkeypatch
+    tight_budget = new_turn_budget(deadline_s=6.0)
     model = _ScriptedModel(selections=[], markers={"need-1": "НЕДОСТИЖИМЫЙ-МАРКЕР"}, delay_s=5.0)
     started = _time.perf_counter()
     pack = await aretrieve_with_semantic_selection(
@@ -319,14 +321,16 @@ async def test_slow_selector_is_deadline_bounded_with_typed_failure(monkeypatch:
         selection_model=model,
         information_needs=[{"need_id": "need-1", "text": "утренний разбор"}],
         max_iterations=3,
+        turn_budget=tight_budget,
     )
     elapsed = _time.perf_counter() - started
     metadata = dict(pack.retrieval_metadata or {})
     assert metadata.get("coverage_status") == "exhausted"
     assert metadata.get("coverage_exhaustion_reason") == "latency-budget"
+    assert metadata.get("typed_stage") == "provider_semantic_timeout"
     assert metadata.get("coverage_all_covered") is False
     # Bounded: wall time far below the 5s provider tail, single attempt.
-    assert elapsed < 2.0
+    assert elapsed < 4.0
     assert model.calls <= 1
     assert int(metadata.get("loop_model_calls", 0)) <= 1
 

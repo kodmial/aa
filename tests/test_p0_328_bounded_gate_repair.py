@@ -5,8 +5,9 @@
   false book requirement, even for long dialogue replies. Any book
   unit or non-empty pack still takes the strong answer path.
 - Retrieval read/coverage loop stops issuing further model-backed
-  iterations once the interactive budget is spent and returns a typed
-  exhausted outcome (never fake coverage).
+  iterations once the turn deadline is spent and returns a typed
+  exhausted outcome (never fake coverage). The 5s local RRF value is
+  diagnostic only (kodmial/aa#335).
 """
 
 from __future__ import annotations
@@ -282,6 +283,7 @@ async def test_retrieval_loop_stops_after_interactive_budget_with_typed_exhausti
 ) -> None:
     import aa.retrieval.evidence as evidence_mod
     from aa.conversation.retrieval_node import aretrieve_with_semantic_selection
+    from aa.conversation.turn_budget import new_turn_budget
 
     first = _record("chapter-1:ru:first", start=0, text="Начало про утренний разбор.")
     second = _record("chapter-2:ru:second", start=0, text="Продолжение без ответа.")
@@ -329,7 +331,12 @@ async def test_retrieval_loop_stops_after_interactive_budget_with_typed_exhausti
         ],
         markers={"need-1": "НЕДОСТИЖИМЫЙ-МАРКЕР"},
     )
-    monkeypatch.setattr(evidence_mod, "INTERACTIVE_LATENCY_BUDGET_MS", 0.0)
+    # kodmial/aa#335: the turn deadline (not the 5s local RRF
+    # diagnostic) bounds further iterations. A nearly-spent turn budget
+    # stops the loop with typed exhaustion instead of grinding.
+    _ = monkeypatch
+    _ = evidence_mod
+    tight_budget = new_turn_budget(deadline_s=0.12)
     try:
         pack = await aretrieve_with_semantic_selection(
             index,
@@ -340,6 +347,7 @@ async def test_retrieval_loop_stops_after_interactive_budget_with_typed_exhausti
             selection_model=model,
             information_needs=[{"need_id": "need-1", "text": "утренний разбор"}],
             max_iterations=3,
+            turn_budget=tight_budget,
         )
     finally:
         pass

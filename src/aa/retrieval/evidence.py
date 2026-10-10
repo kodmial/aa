@@ -86,6 +86,11 @@ MAX_PER_SECTION = 6
 NEIGHBOR_WINDOW = 2
 # Interactive Telegram budget for one warm retrieval turn. The RRF-only
 # RAM path is expected to serve well within this budget.
+# Diagnostic/instrumentation target for the local index stage only
+# (kodmial/aa#335): semantic LLM selection and full-book coverage reads
+# are bounded by the graph-owned end-to-end turn budget instead; a slow
+# local stage reports ``latency_over_budget`` but never exhausts adequate
+# model evidence on its own.
 INTERACTIVE_LATENCY_BUDGET_MS = 5000.0
 
 # Cross-turn E5 query-vector cache (latency optimization for the 5s

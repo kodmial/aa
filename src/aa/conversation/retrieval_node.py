@@ -33,6 +33,23 @@ from typing import Any
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
+from aa.conversation.turn_budget import (
+    LOCAL_RRF_DIAGNOSTIC_BUDGET_MS,
+    STAGE_COVERAGE_INSUFFICIENT,
+    STAGE_LOCAL_RETRIEVAL_SLOW,
+    STAGE_PROVIDER_429,
+    STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+    LocalRetrievalTimeout,
+    ProviderSemanticTimeout,
+    TurnBudget,
+    TurnBudgetExpired,
+    await_model_under_turn_budget,
+    hash_ids,
+    local_worker_info,
+    new_turn_budget,
+    run_local_retrieval_bounded,
+    turn_budget_from_state,
+)
 from aa.opencode.errors import OpenCodeRateLimitError
 from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
@@ -43,13 +60,11 @@ from aa.retrieval.index import HybridIndex, logical_chunk_id
 
 logger = logging.getLogger("aa.conversation.retrieval_node")
 
-# Bounded per-model-call slice of the interactive retrieval budget
-# (kodmial/aa#331): one slow selector/coverage provider call must not
-# consume the whole turn. Each call is bounded by the smaller of this
-# cap and the remaining interactive budget; expiry yields a typed
-# ``exhausted/latency-budget`` outcome, never a retry loop or fake
-# coverage. Reuses the existing selection-attempt scale (8s), not a new
-# product threshold.
+# Legacy per-model-call slice (kodmial/aa#331, superseded by #335).
+# Kept for import compatibility only: semantic selector/coverage awaits
+# are now bounded by the remaining end-to-end turn budget owned by the
+# compiled graph (see :mod:`aa.conversation.turn_budget`), never by a
+# fixed 8s cutoff. Do not use these for new timeout logic.
 SELECTION_PER_CALL_BUDGET_S = 8.0
 COVERAGE_PER_CALL_BUDGET_S = 8.0
 
@@ -63,17 +78,25 @@ _EXPANDED_READ_CACHE: dict[tuple[str, int], Any] = {}
 
 
 class _InteractiveBudgetTimeout(TimeoutError):
-    """One bounded model/retriever await exceeded the interactive deadline."""
+    """One bounded model/retriever await exceeded its deadline (legacy alias).
+
+    Kept for compatibility with callers that catch the #331 error shape;
+    new code raises the typed :mod:`aa.conversation.turn_budget` errors
+    (:class:`ProviderSemanticTimeout`, :class:`TurnBudgetExpired`,
+    :class:`LocalRetrievalTimeout`) and converts them to the same typed
+    ``exhausted/latency-budget`` outcome.
+    """
 
 
 def _effective_interactive_budget_ms() -> float:
-    """Tightest applicable interactive budget (retrieval-node + evidence).
+    """Local RRF diagnostic target in milliseconds (diagnostic only).
 
-    Reads the retrieval-node module constant so a node-level override
-    takes effect, while still honoring a tightened evidence-level budget
-    (both names are patched in tests). The smaller value wins so
-    remaining-budget and per-call-cap logic cannot diverge.
+    Mirrors ``evidence.INTERACTIVE_LATENCY_BUDGET_MS`` (5s warm local
+    RRF-only RAM target). This is instrumentation for the local index
+    stage, never a deadline for network LLM selection or semantic
+    full-book coverage; model awaits use the turn budget instead.
     """
+
     candidates: list[float] = []
     try:
         candidates.append(float(INTERACTIVE_LATENCY_BUDGET_MS))
@@ -86,44 +109,80 @@ def _effective_interactive_budget_ms() -> float:
     except Exception:
         pass
     if not candidates:
-        return 0.0
+        return float(LOCAL_RRF_DIAGNOSTIC_BUDGET_MS)
     return min(candidates)
 
 
 def _remaining_interactive_ms(started: float) -> float:
-    """Remaining interactive retrieval budget in milliseconds."""
+    """Remaining local-diagnostic budget in milliseconds (diagnostic only)."""
     try:
         return float(_effective_interactive_budget_ms()) - (time.perf_counter() - started) * 1000.0
     except Exception:
         return 0.0
 
 
+def _effective_turn_budget_ms() -> float:
+    """Real turn deadline in milliseconds (model/loop awaits use this)."""
+    try:
+        from aa.conversation.turn_budget import TURN_END_TO_END_BUDGET_S as _turn_s
+
+        return float(_turn_s) * 1000.0
+    except Exception:
+        return 105000.0
+
+
 async def _await_under_interactive_deadline(
     coro_factory: Any, started: float, *, per_call_cap_s: float
 ) -> Any:
-    """Await one provider/retriever coroutine under the interactive deadline.
+    """Legacy bounded await (compatibility shim over the turn budget).
 
-    ``coro_factory`` is a zero-argument callable producing the awaitable,
-    invoked only after the budget check so an already-spent budget never
-    creates an un-awaited coroutine. The timeout is the smaller of
-    ``per_call_cap_s`` and the remaining interactive budget, so a slow
-    provider tail fails fast to a typed exhausted outcome instead of
-    grinding sequential calls. The underlying await is cancelled on
-    expiry so no provider work continues after the turn is irrecoverably
-    timed out. ``Cancelled`` and provider 429 always propagate for runner
-    retire/resume and are never converted to exhaustion.
+    Historically bounded one await by ``min(per_call_cap_s,
+    remaining_5s)``. Since #335 the local 5s value is diagnostic-only;
+    this shim bounds by the remaining end-to-end turn budget instead so
+    genuinely successful sequential semantic coverage is never forcibly
+    exhausted by the RRF threshold. ``Cancelled`` and provider 429
+    always propagate and are never converted to exhaustion.
     """
-    remaining_ms = _remaining_interactive_ms(started)
-    if remaining_ms <= 0:
-        raise _InteractiveBudgetTimeout("interactive budget already spent")
-    timeout_s = min(float(per_call_cap_s), remaining_ms / 1000.0)
-    if timeout_s <= 0:
-        raise _InteractiveBudgetTimeout("interactive budget already spent")
+    from aa.conversation.turn_budget import TURN_END_TO_END_BUDGET_S as _turn_s
+
+    try:
+        elapsed_s = max(0.0, time.perf_counter() - float(started))
+    except Exception:
+        elapsed_s = 0.0
+    try:
+        remaining_s = max(0.0, float(_turn_s) - elapsed_s)
+    except Exception:
+        remaining_s = 0.0
+    if remaining_s <= 0:
+        raise _InteractiveBudgetTimeout("turn budget already spent")
     coro = coro_factory() if callable(coro_factory) else coro_factory
     try:
-        return await asyncio.wait_for(coro, timeout=timeout_s)
+        return await asyncio.wait_for(coro, timeout=remaining_s)
     except TimeoutError as exc:
-        raise _InteractiveBudgetTimeout("interactive deadline exceeded") from exc
+        raise _InteractiveBudgetTimeout("turn deadline exceeded") from exc
+
+
+async def _await_model_under_turn_deadline(
+    coro_factory: Any,
+    budget: TurnBudget,
+    *,
+    stage: str = STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+    id_digest: str = "",
+) -> Any:
+    """Await one semantic model call under the remaining turn budget.
+
+    Thin wrapper over :func:`await_model_under_turn_budget` that also
+    converts the typed turn-budget errors to the legacy
+    :class:`_InteractiveBudgetTimeout` shape at loop boundaries where
+    historic call sites catch it. ``Cancelled`` and provider 429 always
+    propagate (recorded as ``provider_429`` inside the budget).
+    """
+    try:
+        return await await_model_under_turn_budget(
+            coro_factory, budget, stage=stage, id_digest=id_digest
+        )
+    except (ProviderSemanticTimeout, TurnBudgetExpired) as exc:
+        raise _InteractiveBudgetTimeout(str(exc)) from exc
 
 
 def _preview_identity(previews: Any) -> str:
@@ -519,6 +578,89 @@ async def _coerce_needs_for_selection(
     return out
 
 
+def _percentile_ms(values: list[float], pct: float) -> float:
+    """Return the ``pct`` percentile of duration samples (ms, privacy-safe)."""
+    if not values:
+        return 0.0
+    try:
+        ordered = sorted(float(v) for v in values)
+    except (TypeError, ValueError):
+        return 0.0
+    rank = min(len(ordered) - 1, max(0, int(round((float(pct) / 100.0) * (len(ordered) - 1)))))
+    return float(ordered[rank])
+
+
+def _exhausted_pack_for_local_timeout(
+    *,
+    index: Any,
+    cleaned: list[str],
+    active: Any,
+    started: float,
+    budget: TurnBudget,
+    need_id_order: list[str],
+    need_digest: str,
+    local_retrieval_ms: float,
+    local_retrieval_slow: bool,
+    local_worker_in_flight: bool,
+    progress_events: list[str],
+) -> EvidencePack:
+    """Build the typed exhausted pack when local discovery cannot serve."""
+    from aa.retrieval.evidence import _short_digest as _digest
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    try:
+        corpus = str(index.metadata.get("ru_artifact_sha256", ""))
+    except Exception:
+        corpus = ""
+    metadata: dict[str, Any] = {
+        "planner_query_count": len(cleaned),
+        "primary_query_digest": _digest(cleaned[0]) if cleaned else "",
+        "retrieval_backend": "rrf-only/1+semantic-selection+coverage-loop",
+        "retrieval_loop": "discover/select_for_reading/read_exact/assess_coverage",
+        "turn_deadline_s": float(budget.deadline_s),
+        "turn_elapsed_ms": round(elapsed_ms, 3),
+        "turn_remaining_ms": round(budget.remaining_ms(), 3),
+        "turn_budget_snapshot": budget.snapshot(),
+        "local_retrieval_ms": round(float(local_retrieval_ms), 3),
+        "local_retrieval_diagnostic_ms": float(LOCAL_RRF_DIAGNOSTIC_BUDGET_MS),
+        "local_retrieval_slow": bool(local_retrieval_slow),
+        "local_worker_in_flight": bool(local_worker_in_flight),
+        "local_worker": local_worker_info(),
+        "latency_ms": round(elapsed_ms, 3),
+        "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
+        "latency_over_budget": bool(local_retrieval_slow),
+        "coverage_status": "exhausted",
+        "coverage_exhausted": True,
+        "coverage_all_covered": False,
+        "coverage_used_model": False,
+        "coverage_missing_need_ids": list(need_id_order or []),
+        "coverage_per_need": [],
+        "coverage_exhaustion_reason": "latency-budget",
+        "typed_stage": STAGE_LOCAL_RETRIEVAL_SLOW,
+        "need_id_digest": need_digest,
+        "loop_iterations": 0,
+        "loop_expansions": 0,
+        "loop_searches": 0,
+        "loop_model_calls": 0,
+        "loop_progress_events": list(progress_events or []),
+        "loop_deadline_stops": 1,
+        "provider_call_durations_ms": [],
+        "provider_p50_ms": 0.0,
+        "provider_p95_ms": 0.0,
+        "provider_max_ms": 0.0,
+    }
+    logger.info(
+        "v2 evidence local discovery waiter timeout (worker_in_flight=%s)",
+        bool(local_worker_in_flight),
+    )
+    return EvidencePack(
+        passages=(),
+        total_tokens=0,
+        corpus_version=corpus,
+        retrieval_metadata=metadata,
+    )
+
+
 async def aretrieve_with_semantic_selection(
     index: HybridIndex,
     queries: list[str],
@@ -534,14 +676,24 @@ async def aretrieve_with_semantic_selection(
     coverage_model: Any | None = None,
     repair_hint: str = "",
     max_iterations: int = 3,
+    turn_budget: TurnBudget | None = None,
+    upstream_latency_ms: float = 0.0,
 ) -> EvidencePack:
-    """Run broad hybrid retrieval as one read/coverage loop (#306).
+    """Run broad hybrid retrieval as one read/coverage loop (#306, #335).
 
     Issue #295: the genuinely broad BM25+E5/RRF pool (including fused rank
     >16) is exposed as discovery previews; an LLM selects pertinent
     candidates against the real context-resolved intent; exact complete
     canonical passages (+neighbors, provenance preserved) are fetched only
     for the validated selection.
+
+    Issue #335: the 5s warm-local-RRF diagnostic is instrumentation for
+    the local index stage only. Semantic selector/coverage model awaits
+    are bounded by the remaining end-to-end turn budget owned by the
+    compiled graph (105s turn deadline with downstream answer/verifier
+    reserve), never by ``min(8s, remaining_5s)``. A 0.4s local retrieval
+    plus 4s selector plus 4s coverage (total far below the turn bound)
+    is never forcibly exhausted by the local threshold.
 
     Issue #311: previews preserve per-query and per-information-need
     exposure through a bounded need-aware strategy. Provenance
@@ -652,9 +804,83 @@ async def aretrieve_with_semantic_selection(
     )
 
     started = time.perf_counter()
+    # ---- turn budget (#335): owned by the compiled graph, shared by all
+    # stages. Direct calls start a fresh 105s turn budget; graph calls pass
+    # one with upstream planner cost folded in. Model awaits below use the
+    # remaining end-to-end budget, never the 5s local diagnostic.
+    budget = turn_budget
+    if budget is None:
+        try:
+            budget = new_turn_budget(upstream_latency_ms=upstream_latency_ms)
+        except Exception:
+            budget = new_turn_budget()
+    need_digest = ""
+    try:
+        need_digest = hash_ids(list(need_id_order or []))
+    except Exception:
+        need_digest = ""
     # ---- discover (initial): broad hybrid pool, no truncation before selection.
-    ranked_lists, per_query_ids = await asyncio.to_thread(
-        run_branch_searches, index, cleaned, branch_top_k=active.branch_top_k
+    # Local RRF runs on the bounded single-worker executor: the 5s value is
+    # a diagnostic slow flag only (noncancelable thread work is never
+    # "cancelled" by a waiter timeout; worker-in-flight is reported
+    # truthfully). The waiter itself is bounded by the remaining turn
+    # budget so a wedged thread still fails fast to typed exhaustion.
+    local_diagnostic_ms = _effective_interactive_budget_ms()
+    local_retrieval_ms = 0.0
+    local_retrieval_slow = False
+    local_worker_in_flight = False
+    try:
+        _local_wait_s: float = budget.remaining_s()
+        if not _local_wait_s > 0:
+            raise TurnBudgetExpired("turn deadline already spent")
+        _branch_out, _local_report = await run_local_retrieval_bounded(
+            run_branch_searches,
+            index,
+            cleaned,
+            branch_top_k=active.branch_top_k,
+            timeout_s=_local_wait_s,
+            diagnostic_ms=local_diagnostic_ms,
+        )
+        ranked_lists, per_query_ids = _branch_out
+        local_retrieval_ms = float(_local_report.elapsed_ms)
+        local_retrieval_slow = bool(_local_report.slow)
+        local_worker_in_flight = bool(_local_report.worker_in_flight)
+    except (LocalRetrievalTimeout, TurnBudgetExpired) as exc:
+        try:
+            local_worker_in_flight = bool(getattr(exc, "worker_in_flight", True))
+        except Exception:
+            local_worker_in_flight = True
+        try:
+            local_retrieval_ms = float(getattr(exc, "elapsed_ms", 0.0) or 0.0)
+        except Exception:
+            local_retrieval_ms = 0.0
+        local_retrieval_slow = bool(local_retrieval_ms > local_diagnostic_ms)
+        budget.record_stage(
+            stage=STAGE_LOCAL_RETRIEVAL_SLOW,
+            ok=False,
+            latency_ms=local_retrieval_ms,
+            category="waiter-timeout",
+            id_digest=need_digest,
+        )
+        return _exhausted_pack_for_local_timeout(
+            index=index,
+            cleaned=cleaned,
+            active=active,
+            started=started,
+            budget=budget,
+            need_id_order=list(need_id_order or []),
+            need_digest=need_digest,
+            local_retrieval_ms=local_retrieval_ms,
+            local_retrieval_slow=local_retrieval_slow,
+            local_worker_in_flight=local_worker_in_flight,
+            progress_events=["local-retrieval-deadline-stop"],
+        )
+    budget.record_stage(
+        stage=STAGE_LOCAL_RETRIEVAL_SLOW,
+        ok=not local_retrieval_slow,
+        latency_ms=local_retrieval_ms,
+        category="slow" if local_retrieval_slow else "served",
+        id_digest=need_digest,
     )
     fused, pool_ids = fuse_query_pool(
         ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
@@ -694,6 +920,8 @@ async def aretrieve_with_semantic_selection(
     last_preview_statuses: list[Any] = []
     last_verdict: Any = None
     sel_ms_total = 0.0
+    cov_ms_total = 0.0
+    provider_durations_ms: list[float] = []
     model_calls = 0
     expansions = 0
     searches = 0
@@ -701,6 +929,7 @@ async def aretrieve_with_semantic_selection(
     followup_need_ids: list[str] = []
     coverage_status = "exhausted"
     exhaustion_reason = "no-iterations"
+    typed_stage = ""
     read_ids: list[str] = []
     previewed_ids_all: list[str] = []
     previewed_set_all: set[str] = set()
@@ -712,30 +941,35 @@ async def aretrieve_with_semantic_selection(
     forbidden_echoes = [repair_hint_clean] if repair_hint_clean else []
 
     def _interactive_budget_exceeded() -> bool:
-        """Whether the retrieval loop already spent the interactive budget.
+        """Whether the retrieval loop already spent the turn deadline (#335).
 
-        Gate E root repair: the shared read/coverage loop previously ran
-        up to three iterations (≈8 model calls) regardless of wall-clock
-        cost, producing the observed retrieval p95 ≈76s on the slow free
-        provider. The first discover/select/read/assess pair always runs
-        (model-driven semantic coverage preserved); further
-        expand/search_more iterations stop once the interactive budget
-        is spent and return a typed ``exhausted`` outcome with the
-        best-effort pack instead of grinding. No fake coverage, no
-        truncation, no skipped semantic checks on the fast path.
+        The shared read/coverage loop previously stopped further
+        expand/search_more iterations once the 5s local RRF diagnostic was
+        spent. Since #335 the gate is the remaining end-to-end turn budget
+        owned by the graph: the first discover/select/read/assess pair
+        always runs (model-driven semantic coverage preserved); further
+        iterations stop once the turn deadline is spent and return a typed
+        ``exhausted`` outcome with the best-effort pack instead of
+        grinding. No fake coverage, no truncation, no skipped semantic
+        checks on the fast path. The 5s local value stays a diagnostic
+        slow flag only.
         """
         try:
-            return (time.perf_counter() - started) * 1000.0 > float(
-                _effective_interactive_budget_ms()
-            )
+            return bool(budget.is_expired())
         except Exception:
             return False
+
+    def _turn_budget_exceeded() -> bool:
+        """Alias for the graph-owned turn-deadline check."""
+        return _interactive_budget_exceeded()
 
     for iteration in range(bounded_iterations):
         if iteration > 0 and _interactive_budget_exceeded():
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
-            progress_events.append("interactive-budget-stop")
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
+            progress_events.append("turn-budget-stop")
+            deadline_stops += 1
             break
         # ---- select_for_reading over the combined discovered pool.
         broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
@@ -784,7 +1018,7 @@ async def aretrieve_with_semantic_selection(
         known_chunk_ids = {cid for cid in fused if cid in index.chunks}
         known_need_ids = {s.need_id for s in preview_statuses} or None
         try:
-            selection = await _await_under_interactive_deadline(
+            selection = await _await_model_under_turn_deadline(
                 functools.partial(
                     aselect_semantic_candidates,
                     previews,
@@ -797,14 +1031,26 @@ async def aretrieve_with_semantic_selection(
                     information_needs=needs_for_selection,
                     known_need_ids=known_need_ids,
                 ),
-                started,
-                per_call_cap_s=SELECTION_PER_CALL_BUDGET_S,
+                budget,
+                stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                id_digest=need_digest,
             )
         except _InteractiveBudgetTimeout:
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
             progress_events.append("selection-deadline-stop")
+            deadline_stops += 1
             break
+        except OpenCodeRateLimitError:
+            budget.record_stage(
+                stage=STAGE_PROVIDER_429,
+                ok=False,
+                latency_ms=(time.perf_counter() - sel_started) * 1000.0,
+                category="rate-limit",
+                id_digest=need_digest,
+            )
+            raise
         model_calls += 1
         # Conservative close-out (#311): unrepresented/unselected needs
         # report uncovered; only full-read assessment can mark sufficiency.
@@ -838,7 +1084,9 @@ async def aretrieve_with_semantic_selection(
         except Exception:
             pass
         last_selection = selection
-        sel_ms_total += (time.perf_counter() - sel_started) * 1000.0
+        sel_ms = (time.perf_counter() - sel_started) * 1000.0
+        sel_ms_total += sel_ms
+        provider_durations_ms.append(sel_ms)
         try:
             for map_entry in serialize_preview_coverage(previews, selection):
                 cid = str(map_entry.get("chunk_id", ""))
@@ -931,12 +1179,14 @@ async def aretrieve_with_semantic_selection(
         # ---- assess_coverage over the full exact budgeted pack.
         # need_more_detail=false never proves sufficiency: only this
         # full-read verdict can mark ready. Bounded by the remaining
-        # interactive deadline so a slow coverage tail fails fast to a
+        # end-to-end turn budget so a slow coverage tail fails fast to a
         # typed exhausted outcome instead of grinding; 429/cancel
-        # propagate, never swallowed.
+        # propagate, never swallowed. An exhausted (timed-out) model call
+        # can never pass as sufficient book evidence.
+        cov_started = time.perf_counter()
         if coverage_assessor is not None:
             try:
-                verdict = await _await_under_interactive_deadline(
+                verdict = await _await_model_under_turn_deadline(
                     functools.partial(
                         aassess_coverage,
                         list(selected),
@@ -945,15 +1195,29 @@ async def aretrieve_with_semantic_selection(
                         model=coverage_assessor,
                         repair_hint=repair_hint_clean,
                     ),
-                    started,
-                    per_call_cap_s=COVERAGE_PER_CALL_BUDGET_S,
+                    budget,
+                    stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                    id_digest=need_digest,
                 )
             except _InteractiveBudgetTimeout:
                 coverage_status = "exhausted"
                 exhaustion_reason = "latency-budget"
+                typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
                 progress_events.append("coverage-deadline-stop")
                 deadline_stops += 1
                 break
+            except OpenCodeRateLimitError:
+                budget.record_stage(
+                    stage=STAGE_PROVIDER_429,
+                    ok=False,
+                    latency_ms=(time.perf_counter() - cov_started) * 1000.0,
+                    category="rate-limit",
+                    id_digest=need_digest,
+                )
+                raise
+            cov_ms = (time.perf_counter() - cov_started) * 1000.0
+            cov_ms_total += cov_ms
+            provider_durations_ms.append(cov_ms)
             model_calls += 1
         else:
             verdict = conservative_uncovered_verdict(needs_for_selection)
@@ -1086,7 +1350,8 @@ async def aretrieve_with_semantic_selection(
                 )
                 if coverage_assessor is not None and not _interactive_budget_exceeded():
                     try:
-                        regrown_verdict = await _await_under_interactive_deadline(
+                        _regrown_started = time.perf_counter()
+                        regrown_verdict = await _await_model_under_turn_deadline(
                             functools.partial(
                                 aassess_coverage,
                                 list(regrown_selected),
@@ -1095,22 +1360,28 @@ async def aretrieve_with_semantic_selection(
                                 model=coverage_assessor,
                                 repair_hint=repair_hint_clean,
                             ),
-                            started,
-                            per_call_cap_s=COVERAGE_PER_CALL_BUDGET_S,
+                            budget,
+                            stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                            id_digest=need_digest,
                         )
                     except _InteractiveBudgetTimeout:
                         regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
-                        progress_events.append("interactive-budget-skip-reassess")
+                        progress_events.append("turn-budget-skip-reassess")
                         deadline_stops += 1
+                    except OpenCodeRateLimitError:
+                        raise
                     else:
+                        _regrown_ms = (time.perf_counter() - _regrown_started) * 1000.0
+                        cov_ms_total += _regrown_ms
+                        provider_durations_ms.append(_regrown_ms)
                         model_calls += 1
                 elif coverage_assessor is not None:
-                    # Interactive budget spent: keep the grown exact
+                    # Turn budget spent: keep the grown exact
                     # passages but do not issue another model call.
                     # Coverage stays conservatively uncovered (typed
                     # exhausted downstream), never fake-covered.
                     regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
-                    progress_events.append("interactive-budget-skip-reassess")
+                    progress_events.append("turn-budget-skip-reassess")
                 else:
                     regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
                 regrown_covered = [
@@ -1157,7 +1428,9 @@ async def aretrieve_with_semantic_selection(
         if _interactive_budget_exceeded():
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
-            progress_events.append("interactive-budget-stop-search")
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
+            progress_events.append("turn-budget-stop-search")
+            deadline_stops += 1
             break
         # ---- search_more: bounded follow-up, then semantic
         # reconsideration next iteration (never rank-only append).
@@ -1216,22 +1489,53 @@ async def aretrieve_with_semantic_selection(
             )
             all_queries.append(query_text)
         try:
-            remaining_ms = _remaining_interactive_ms(started)
-            if remaining_ms <= 0:
-                raise _InteractiveBudgetTimeout("interactive budget already spent")
-            f_ranked, f_per_ids = await asyncio.wait_for(
-                asyncio.to_thread(
-                    run_branch_searches, index, followups, branch_top_k=active.branch_top_k
-                ),
-                timeout=max(0.05, remaining_ms / 1000.0),
+            # Follow-up hybrid search runs on the same bounded local
+            # worker: the waiter is bounded by the remaining turn budget
+            # (never the 5s diagnostic), and a waiter expiry reports
+            # worker-in-flight truthfully without claiming the sync thread
+            # was cancelled.
+            _followup_wait_s = budget.remaining_s()
+            if not _followup_wait_s > 0:
+                raise _InteractiveBudgetTimeout("turn budget already spent")
+            _followup_out, _followup_report = await run_local_retrieval_bounded(
+                run_branch_searches,
+                index,
+                followups,
+                branch_top_k=active.branch_top_k,
+                timeout_s=_followup_wait_s,
+                diagnostic_ms=local_diagnostic_ms,
             )
+            f_ranked, f_per_ids = _followup_out
+            if bool(_followup_report.slow):
+                local_retrieval_slow = True
+                budget.record_stage(
+                    stage=STAGE_LOCAL_RETRIEVAL_SLOW,
+                    ok=False,
+                    latency_ms=float(_followup_report.elapsed_ms),
+                    category="slow",
+                    id_digest=need_digest,
+                )
+            if bool(_followup_report.worker_in_flight):
+                local_worker_in_flight = True
             f_fused, _f_pool = fuse_query_pool(
                 f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
             )
         except _InteractiveBudgetTimeout:
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
-            progress_events.append("interactive-budget-stop-search")
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
+            progress_events.append("turn-budget-stop-search")
+            deadline_stops += 1
+            break
+        except (LocalRetrievalTimeout, TurnBudgetExpired) as exc:
+            try:
+                local_worker_in_flight = bool(getattr(exc, "worker_in_flight", True))
+            except Exception:
+                local_worker_in_flight = True
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            typed_stage = STAGE_LOCAL_RETRIEVAL_SLOW
+            progress_events.append("local-retrieval-deadline-stop")
             deadline_stops += 1
             break
         except Exception as exc:
@@ -1401,12 +1705,51 @@ async def aretrieve_with_semantic_selection(
         exhaustion_reason = "coverage-incomplete"
     if coverage_status == "ready":
         exhaustion_reason = ""
+        typed_stage = ""
+    elif not typed_stage:
+        # Default typed stage for exhausted outcomes without a deadline
+        # stop: insufficient coverage (never a fake sufficient verdict).
+        typed_stage = STAGE_COVERAGE_INSUFFICIENT
+    if coverage_status == "exhausted" and exhaustion_reason == "latency-budget" and not typed_stage:
+        typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
     try:
         from aa.corpus.budget import estimate_text_tokens as _estimate
 
         token_estimate = sum(_estimate(str(getattr(p, "exact_text", "") or "")) for p in selected)
     except Exception:
         token_estimate = int(total)
+    try:
+        _source_ids = sorted(
+            {
+                str(getattr(p, "source_id", "") or "")
+                for p in selected
+                if str(getattr(p, "source_id", "") or "")
+            }
+        )
+        source_digest = hash_ids(_source_ids)
+    except Exception:
+        source_digest = ""
+    try:
+        _turn_remaining_ms = float(budget.remaining_ms())
+    except Exception:
+        _turn_remaining_ms = 0.0
+    try:
+        _turn_deadline_s = float(budget.deadline_s)
+    except Exception:
+        _turn_deadline_s = 105.0
+    try:
+        _budget_snapshot = budget.snapshot()
+    except Exception:
+        _budget_snapshot = {}
+    provider_histogram = {
+        "provider_call_durations_ms": [round(float(v), 3) for v in provider_durations_ms[:16]],
+        "provider_p50_ms": round(_percentile_ms(provider_durations_ms, 50), 3),
+        "provider_p95_ms": round(_percentile_ms(provider_durations_ms, 95), 3),
+        "provider_max_ms": round(max(provider_durations_ms) if provider_durations_ms else 0.0, 3),
+        "provider_call_count": int(len(provider_durations_ms)),
+        "selection_latency_ms": round(float(sel_ms_total), 3),
+        "coverage_latency_ms": round(float(cov_ms_total), 3),
+    }
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
         "primary_query_digest": _digest(cleaned[0]),
@@ -1460,6 +1803,19 @@ async def aretrieve_with_semantic_selection(
         "latency_ms": elapsed_ms,
         "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
         "latency_over_budget": elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS,
+        "turn_deadline_s": _turn_deadline_s,
+        "turn_elapsed_ms": round(elapsed_ms, 3),
+        "turn_remaining_ms": round(_turn_remaining_ms, 3),
+        "turn_over_budget": elapsed_ms > _turn_deadline_s * 1000.0,
+        "turn_budget_snapshot": _budget_snapshot,
+        "local_retrieval_ms": round(float(local_retrieval_ms), 3),
+        "local_retrieval_diagnostic_ms": float(LOCAL_RRF_DIAGNOSTIC_BUDGET_MS),
+        "local_retrieval_slow": bool(local_retrieval_slow),
+        "local_worker_in_flight": bool(local_worker_in_flight),
+        "local_worker": local_worker_info(),
+        "typed_stage": typed_stage,
+        "need_id_digest": need_digest,
+        "source_id_digest": source_digest,
         "coverage_status": coverage_status,
         "coverage_exhausted": bool(coverage_status == "exhausted"),
         "coverage_all_covered": bool(coverage_all_covered),
@@ -1477,6 +1833,7 @@ async def aretrieve_with_semantic_selection(
         "loop_deadline_stops": int(deadline_stops),
         "loop_preview_dedup": len(preview_identities_seen),
     }
+    metadata.update(provider_histogram)
     metadata.update({f"selection_{k}": v for k, v in telemetry.items()})
     logger.info(
         "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d coverage=%s",
@@ -1532,6 +1889,23 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "latency_ms",
         "latency_budget_ms",
         "latency_over_budget",
+        "turn_deadline_s",
+        "turn_elapsed_ms",
+        "turn_remaining_ms",
+        "turn_over_budget",
+        "local_retrieval_ms",
+        "local_retrieval_diagnostic_ms",
+        "local_retrieval_slow",
+        "local_worker_in_flight",
+        "typed_stage",
+        "need_id_digest",
+        "source_id_digest",
+        "provider_p50_ms",
+        "provider_p95_ms",
+        "provider_max_ms",
+        "provider_call_count",
+        "selection_latency_ms",
+        "coverage_latency_ms",
         "coverage_status",
         "coverage_exhausted",
         "coverage_all_covered",
@@ -1555,10 +1929,14 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "coverage_missing_need_ids",
         "loop_progress_events",
         "loop_fingerprints",
+        "provider_call_durations_ms",
     ):
         value = raw.get(key, [])
         if isinstance(value, list):
-            safe[key] = [str(item) for item in value if str(item).strip()][:128]
+            if key == "provider_call_durations_ms":
+                safe[key] = [float(item) for item in value if isinstance(item, (int, float))][:16]
+            else:
+                safe[key] = [str(item) for item in value if str(item).strip()][:128]
     query_map = raw.get("query_need_map", [])
     if isinstance(query_map, list):
         safe["query_need_map"] = [
@@ -1644,6 +2022,50 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         safe["selection_per_need_selected"] = {
             str(key): int(value or 0) for key, value in per_need.items() if str(key).strip()
         }
+    worker = raw.get("local_worker", None)
+    if isinstance(worker, dict):
+        safe["local_worker"] = {
+            str(key): int(value)
+            for key, value in worker.items()
+            if isinstance(value, (int, float, bool))
+        }
+    snapshot = raw.get("turn_budget_snapshot", None)
+    if isinstance(snapshot, dict):
+        try:
+            stages = snapshot.get("stages", [])
+            safe_stages: list[dict[str, Any]] = []
+            if isinstance(stages, list):
+                for entry in stages[:32]:
+                    if not isinstance(entry, dict):
+                        continue
+                    stage_name = str(entry.get("stage", ""))
+                    if stage_name not in (
+                        "local_retrieval_slow",
+                        "provider_semantic_timeout",
+                        "provider_429",
+                        "coverage_insufficient",
+                        "verifier_timeout",
+                        "transport_unconfirmed",
+                    ):
+                        continue
+                    safe_stages.append(
+                        {
+                            "stage": stage_name,
+                            "ok": bool(entry.get("ok", False)),
+                            "latency_ms": float(entry.get("latency_ms", 0.0) or 0.0),
+                            "category": str(entry.get("category", ""))[:64],
+                            "id_digest": str(entry.get("id_digest", ""))[:32],
+                            "remaining_ms": float(entry.get("remaining_ms", 0.0) or 0.0),
+                        }
+                    )
+            safe["turn_budget_snapshot"] = {
+                "deadline_s": float(snapshot.get("deadline_s", 0.0) or 0.0),
+                "elapsed_ms": float(snapshot.get("elapsed_ms", 0.0) or 0.0),
+                "remaining_ms": float(snapshot.get("remaining_ms", 0.0) or 0.0),
+                "stages": safe_stages,
+            }
+        except Exception:
+            pass
     safe["selection_route"] = selection_route_from_metadata(raw)
     return safe
 
@@ -1700,12 +2122,13 @@ async def retrieval_node(
 ) -> dict[str, Any]:
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
-    Runs the shared read/coverage loop on the RAM-resident index. The
-    per-turn wall-clock latency against
-    ``INTERACTIVE_LATENCY_BUDGET_MS`` is measured and propagated in
-    state (``retrieval_latency_ms``/``retrieval_over_budget``) for
-    observability. Only counts and latencies are logged, never prompts
-    or user text.
+    Runs the shared read/coverage loop on the RAM-resident index under
+    the graph-owned end-to-end turn budget (#335). The per-turn
+    wall-clock latency against ``INTERACTIVE_LATENCY_BUDGET_MS`` is kept
+    as the local-RRF diagnostic slow flag
+    (``retrieval_latency_ms``/``retrieval_over_budget``) for
+    observability; it never deadlines semantic model coverage. Only
+    counts and latencies are logged, never prompts or user text.
 
     Model-driven semantic selection runs over genuinely broad hybrid
     candidates (including fused rank >16) BEFORE winner/pack budgeting;
@@ -1785,7 +2208,12 @@ async def retrieval_node(
     # Provider 429 propagates for checkpoint recovery; any other failure
     # inside the loop already degrades to conservative uncovered rather
     # than an empty silent success, so no legacy rank-only fallback runs
-    # here.
+    # here. The graph-owned turn budget (planner cost folded in) bounds
+    # semantic model awaits; the 5s local value stays diagnostic only.
+    try:
+        graph_budget = turn_budget_from_state(state)
+    except Exception:
+        graph_budget = new_turn_budget()
     pack = await aretrieve_with_semantic_selection(
         index,
         queries,
@@ -1798,6 +2226,7 @@ async def retrieval_node(
         context_digest=canonical_digest,
         information_needs=state_needs,
         query_need_map=state_query_map,
+        turn_budget=graph_budget,
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
@@ -1885,6 +2314,7 @@ def make_retrieval_node(
 __all__ = [
     "COVERAGE_PER_CALL_BUDGET_S",
     "SELECTION_PER_CALL_BUDGET_S",
+    "_InteractiveBudgetTimeout",
     "aretrieve_with_semantic_selection",
     "clear_canonical_read_cache",
     "make_retrieval_node",
