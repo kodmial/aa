@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "annotation_shape": {
+        "material_constraints": 1,
+        "prohibited_conclusions": 1,
+        "required_meanings": 2,
+        "required_subquestions": 2
+      },
+      "case_id": "307-heldout-01",
+      "multi_turn": false,
+      "paraphrase_group": "g-morning-review"
+    },
+    {
+      "annotation_shape": {
+        "material_constraints": 1,
+        "prohibited_conclusions": 1,
+        "required_meanings": 2,
+        "required_subquestions": 2
+      },
+      "case_id": "307-heldout-02",
+      "multi_turn": true,
+      "paraphrase_group": "g-morning-review"
+    },
+    {
+      "annotation_shape": {
+        "material_constraints": 1,
+        "prohibited_conclusions": 1,
+        "required_meanings": 1,
+        "required_subquestions": 1
+      },
+      "case_id": "307-heldout-03",
+      "multi_turn": false,
+      "paraphrase_group": "g-evening-support"
+    },
+    {
+      "annotation_shape": {
+        "material_constraints": 1,
+        "prohibited_conclusions": 1,
+        "required_meanings": 2,
+        "required_subquestions": 2
+      },
+      "case_id": "307-heldout-04",
+      "multi_turn": true,
+      "paraphrase_group": "g-two-part-safety"
+    }
+  ],
+  "issue": 307,
+  "note": "Metadata only. Hidden reference annotations (required meanings, constraints, forbidden conclusions) live outside the repository and are never sent to production planner/generator/verifier. Exact book text and oracle conclusions are not embedded here.",
+  "schema_version": "aa-book-fidelity-307-rubric/1",
+  "target_issue": 7
+}
