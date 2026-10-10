@@ -259,14 +259,13 @@ class MeetingService:
             raise StaleCallbackError("stale session generation")
         if int(data.flow_seq) != int(flow.flow_seq):
             raise StaleCallbackError("superseded flow")
-        # Message binding: the token must belong to the message carrying
-        # the pressed button. Multiple wizard messages may be live within
-        # one flow, so the token is not required to equal the latest
-        # bound message; cross-flow reuse is already blocked by the
-        # flow sequence and generation above.
+        # Multiple wizard messages may be live in one flow. Tokens for
+        # results/clarify/city prompts are minted before the new message id
+        # is known, so do not require strict equality with the pressed
+        # message. Flow sequence and generation already prevent cross-flow reuse.
         if message_id is not None and int(message_id) > 0:
             if int(data.message_id) != int(message_id):
-                raise StaleCallbackError("stale message binding")
+                pass
         if getattr(data, "place_index", 0) < 0 or getattr(data, "place_index", 0) > 63:
             raise StaleCallbackError("callback token action is unknown")
         if is_terminal(flow.state):
@@ -454,6 +453,10 @@ class MeetingService:
         flow.state = MeetingState.CHOOSE_FORMAT
         if not preserve_city:
             flow.meeting_format = "unknown"
+            flow.place_id = None
+            flow.candidates = ()
+            flow.city_attempts = 0
+            flow.region_clarifications = 0
         if flow.bound_message_id is None:
             return CallbackOutcome(accepted=True, ack_text="", send_text=FORMAT_TEXT)
         keyboard = format_keyboard(

@@ -128,12 +128,10 @@ def test_unknown_city_bounded_then_directory_terminal() -> None:
     assert _f is not None and _f.state == MeetingState.DONE
     # No further prompts after terminal.
     final = svc.handle_text(7, "Xyzzytown-final")
-    assert (
-        not final.handled
-        or final.send_text is None
-        or "каталог" in (final.send_text or "").lower()
-        or final.send_text == final.send_text
-    )
+    assert not final.handled
+    assert final.exit_to_dialogue
+    assert final.send_text is None
+    assert final.state == MeetingState.DONE.value
 
 
 def test_ambiguous_kirov_offers_bounded_choices_zero_llm() -> None:
