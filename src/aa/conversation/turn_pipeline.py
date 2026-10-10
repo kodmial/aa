@@ -41,9 +41,7 @@ from aa.conversation.output_limits import (
 )
 from aa.conversation.quote_state import (
     is_adjacent_to_recent,
-    merge_recent_ranges,
     pack_pages_recent,
-    ranges_from_pack,
 )
 from aa.conversation.response_units import (
     ResponseUnitDraft,
@@ -1126,6 +1124,7 @@ async def run_v2_answer_turn(
     conversation_context: dict[str, Any] | None = None,
     resolved_turn: dict[str, Any] | None = None,
     context_digest: str | None = None,
+    selection_events: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -1333,6 +1332,68 @@ async def run_v2_answer_turn(
         _proven_glue = bool(_mode == "conversational" and _query_hint == 0)
     _trace_id = str(turn_trace_id or _new_trace_id())
 
+    # Truthful selection route (#312): derived exclusively from executed
+    # selection events, never from pack size or heuristic ordering. A
+    # nonempty pack with only the local lexical discovery hint reports
+    # ``lexical_fallback``; an empty/no-run stage reports
+    # ``selection_unavailable``/``not_requested``. Only a real selector
+    # model verdict yields ``model_selection``.
+    _selection_events: dict[str, Any] = (
+        dict(selection_events) if isinstance(selection_events, dict) else {}
+    )
+    if _selection_events:
+        try:
+            from aa.conversation.retrieval_node import (
+                selection_route_from_metadata as _route_from_events,
+            )
+
+            _selection_route = _route_from_events(_selection_events)
+        except Exception:
+            _selection_route = "selection_unavailable"
+    elif initial_pack_empty and (_proven_glue or _query_hint == 0):
+        _selection_route = "not_requested"
+    elif initial_pack_empty:
+        _selection_route = "selection_unavailable"
+    else:
+        _selection_route = "lexical_fallback"
+    _semantic_applied = bool(_selection_route == "model_selection")
+    if _selection_route == "model_selection":
+        _truthful_pack_order = "model_selection"
+    elif _selection_route == "lexical_fallback":
+        _truthful_pack_order = "lexical_fallback"
+    else:
+        _truthful_pack_order = _selection_route
+    _deep_promoted = False
+    try:
+        if _semantic_applied and bool(_selection_events.get("selection_deep_rank_gt16", False)):
+            _deep_promoted = True
+    except Exception:
+        _deep_promoted = False
+    try:
+        from aa.conversation.finalization import evidence_digest_for_pack as _pack_digest_fn
+
+        _pack_digest = _pack_digest_fn(pack)
+    except Exception:
+        _pack_digest = ""
+    _evidence_source_ids: list[str] = []
+    try:
+        seen_sources: set[str] = set()
+        for item in pack:
+            sid = str(item.get("source_id", "") or "")
+            if sid and sid not in seen_sources:
+                seen_sources.add(sid)
+                _evidence_source_ids.append(sid)
+        _evidence_source_ids = sorted(_evidence_source_ids)[:16]
+    except Exception:
+        _evidence_source_ids = []
+
+    def _event_count(name: str) -> int:
+        try:
+            value = _selection_events.get(name, [])
+            return len(value) if isinstance(value, list) else 0
+        except Exception:
+            return 0
+
     telemetry: dict[str, Any] = {
         "planner_outcome": "skipped-initial",
         "planner_latency_ms": 0.0,
@@ -1356,9 +1417,22 @@ async def run_v2_answer_turn(
         "answer_generation_window": initial_pack_passages,
         "evidence_window_omitted_generation": 0,
         "evidence_window_omitted_verifier": 0,
-        "semantic_selection_applied": bool(initial_pack_passages > 0),
-        "pack_order": _pack_order,
-        "semantic_deep_rank_promoted": False,
+        "semantic_selection_applied": _semantic_applied,
+        "pack_order": _truthful_pack_order,
+        "selection_route": _selection_route,
+        "lexical_pack_hint": _pack_order,
+        "semantic_deep_rank_promoted": _deep_promoted,
+        "evidence_discovered": _event_count("discovered_ids"),
+        "evidence_previewed": _event_count("previewed_ids"),
+        "evidence_read": _event_count("read_ids"),
+        "evidence_selected_in_pack": initial_pack_passages,
+        "evidence_used_in_answer": 0,
+        "evidence_quoted_to_user": 0,
+        "evidence_delivered": "pending-delivery",
+        "pack_digest": _pack_digest,
+        "evidence_source_ids": list(_evidence_source_ids),
+        "coverage_status": str(_selection_events.get("coverage_status", "unknown") or "unknown"),
+        "delivery_outcome": "provisional-certified",
         "adequacy_verdict": "unknown",
         "failure_category": "",
         "answers_request": False,
@@ -1503,6 +1577,36 @@ async def run_v2_answer_turn(
         telemetry["turn_budget_exceeded"] = True
         telemetry["repair_budget_exceeded"] = True
 
+    def _sync_evidence_lifecycle() -> None:
+        """Sync per-stage evidence counts from the executed path (no text)."""
+        try:
+            telemetry["evidence_selected_in_pack"] = len(pack)
+            telemetry["retrieval_passages"] = len(pack)
+        except Exception:
+            pass
+        try:
+            current_result = result  # noqa: F821 - bound later in the turn
+        except NameError:
+            return
+        try:
+            if current_result is None:
+                telemetry["evidence_used_in_answer"] = 0
+                return
+            used = 0
+            for verdict in list(getattr(current_result, "units", []) or []):
+                try:
+                    if str(getattr(verdict, "scope", "")) == "book" and bool(
+                        getattr(verdict, "supported", False)
+                    ):
+                        ids = list(getattr(verdict, "evidence_passage_ids", []) or [])
+                        if [pid for pid in ids if str(pid).strip()]:
+                            used += 1
+                except Exception:
+                    continue
+            telemetry["evidence_used_in_answer"] = int(used)
+        except Exception:
+            pass
+
     def _finish_telemetry() -> None:
         telemetry["total_latency_ms"] = round((time.perf_counter() - turn_started) * 1000.0, 1)
         try:
@@ -1513,6 +1617,37 @@ async def run_v2_answer_turn(
             telemetry["evidence_window_omitted_generation"] = 0
             telemetry["evidence_window_omitted_verifier"] = 0
             telemetry["retrieval_passages"] = len(pack)
+        except Exception:
+            pass
+        try:
+            _sync_evidence_lifecycle()
+        except Exception:
+            pass
+        # Consistency assertion: historical flags derive exclusively
+        # from executed selection events, never from pack size.
+        try:
+            route_now = str(telemetry.get("selection_route", ""))
+            applied_now = bool(telemetry.get("semantic_selection_applied", False))
+            if applied_now != (route_now == "model_selection"):
+                telemetry["semantic_selection_applied"] = bool(route_now == "model_selection")
+            order_now = str(telemetry.get("pack_order", ""))
+            if route_now == "model_selection" and order_now != "model_selection":
+                telemetry["pack_order"] = "model_selection"
+            elif route_now in ("lexical_fallback", "selection_unavailable", "not_requested"):
+                if order_now not in (
+                    "lexical_fallback",
+                    "selection_unavailable",
+                    "not_requested",
+                ):
+                    telemetry["pack_order"] = route_now
+        except Exception:
+            pass
+        # Graph completion is provisional certification, never delivery
+        # acknowledgment (#312): confirmed delivery arrives only via
+        # transport receipts.
+        try:
+            telemetry["evidence_delivered"] = "pending-delivery"
+            telemetry["delivery_outcome"] = "provisional-certified"
         except Exception:
             pass
 
@@ -2261,9 +2396,7 @@ async def run_v2_answer_turn(
                         "units": _pad_kept,
                         "verification": _pad_state,
                         "rounds": rounds,
-                        "recent_quote_ranges": merge_recent_ranges(
-                            recent_ranges, ranges_from_pack(pack)
-                        ),
+                        "recent_quote_ranges": list(recent_ranges),
                         "telemetry": dict(telemetry),
                         "evidence_pack": list(pack),
                     }
@@ -2452,9 +2585,7 @@ async def run_v2_answer_turn(
                                             "units": _regen_kept,
                                             "verification": _rn_state,
                                             "rounds": rounds,
-                                            "recent_quote_ranges": merge_recent_ranges(
-                                                recent_ranges, ranges_from_pack(pack)
-                                            ),
+                                            "recent_quote_ranges": list(recent_ranges),
                                             "telemetry": dict(telemetry),
                                             "evidence_pack": list(pack),
                                         }
@@ -2531,9 +2662,7 @@ async def run_v2_answer_turn(
                                         "units": _part_kept,
                                         "verification": _pn_state,
                                         "rounds": rounds,
-                                        "recent_quote_ranges": merge_recent_ranges(
-                                            recent_ranges, ranges_from_pack(pack)
-                                        ),
+                                        "recent_quote_ranges": list(recent_ranges),
                                         "telemetry": dict(telemetry),
                                         "evidence_pack": list(pack),
                                     }
@@ -2608,9 +2737,7 @@ async def run_v2_answer_turn(
                                 "units": _narrow_kept,
                                 "verification": _narrow_state,
                                 "rounds": rounds,
-                                "recent_quote_ranges": merge_recent_ranges(
-                                    recent_ranges, ranges_from_pack(pack)
-                                ),
+                                "recent_quote_ranges": list(recent_ranges),
                                 "telemetry": dict(telemetry),
                                 "evidence_pack": list(pack),
                             }
@@ -3121,9 +3248,7 @@ async def run_v2_answer_turn(
                         "units": recovered["units"],
                         "verification": _safe_state,
                         "rounds": rounds,
-                        "recent_quote_ranges": merge_recent_ranges(
-                            recent_ranges, ranges_from_pack(pack)
-                        ),
+                        "recent_quote_ranges": list(recent_ranges),
                         "telemetry": dict(telemetry),
                         "evidence_pack": list(pack),
                     }
@@ -3155,6 +3280,10 @@ async def run_v2_answer_turn(
             raise TurnFailed(
                 "adequacy-failed", "served candidate inadequate", telemetry=dict(telemetry)
             )
+        try:
+            telemetry["evidence_quoted_to_user"] = int(_served_book_quotes(final))
+        except Exception:
+            telemetry["evidence_quoted_to_user"] = 0
         if transport_segments is not None:
             # Preserve the split verdict: the complete verified answer is
             # served across sequential transport segments (delivery splits
@@ -3174,7 +3303,7 @@ async def run_v2_answer_turn(
             "units": units,
             "verification": grounding_result_to_state(result),
             "rounds": rounds,
-            "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+            "recent_quote_ranges": list(recent_ranges),
             "telemetry": dict(telemetry),
             "evidence_pack": list(pack),
             "segments": list(transport_segments) if transport_segments is not None else [final],
@@ -3373,7 +3502,7 @@ async def run_v2_answer_turn(
             "units": units,
             "verification": grounding_result_to_state(result),
             "rounds": rounds,
-            "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+            "recent_quote_ranges": list(recent_ranges),
             "telemetry": dict(telemetry),
             "evidence_pack": list(pack),
         }
@@ -3410,7 +3539,7 @@ async def run_v2_answer_turn(
                 "units": units,
                 "verification": grounding_result_to_state(result),
                 "rounds": rounds,
-                "recent_quote_ranges": merge_recent_ranges(recent_ranges, ranges_from_pack(pack)),
+                "recent_quote_ranges": list(recent_ranges),
                 "telemetry": dict(telemetry),
                 "evidence_pack": list(pack),
             }
@@ -3550,6 +3679,13 @@ async def answer_pipeline_node(
         _ctx_digest = str(state.get("context_digest", "") or "")
     except Exception:
         _ctx_digest = ""
+    try:
+        _selection_events_raw = state.get("retrieval_metadata", None)
+        _selection_events_d = (
+            dict(_selection_events_raw) if isinstance(_selection_events_raw, dict) else None
+        )
+    except Exception:
+        _selection_events_d = None
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -3574,6 +3710,7 @@ async def answer_pipeline_node(
         conversation_context=_canonical_ctx_d,
         resolved_turn=_resolved_turn_d,
         context_digest=_ctx_digest or None,
+        selection_events=_selection_events_d,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot

@@ -1123,6 +1123,210 @@ async def aretrieve_with_semantic_selection(
     )
 
 
+def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return a privacy-safe selection/coverage snapshot (no text).
+
+    Carries only the executed-path event records: stable chunk/passage
+    ids, fused ranks, per-need ids, digests, counts, latencies and the
+    truthful ``selection_route``. Any embedded preview/excerpt text is
+    stripped so telemetry never persists book or user content.
+    """
+    safe: dict[str, Any] = {}
+    try:
+        raw = dict(metadata or {})
+    except Exception:
+        return {}
+    for key in (
+        "planner_query_count",
+        "branch_lists",
+        "branch_top_k",
+        "rrf_k",
+        "pool_cap",
+        "fused_unique",
+        "pool_unique",
+        "diverse_unique",
+        "top_child_cap",
+        "selected_winners",
+        "retrieval_backend",
+        "retrieval_loop",
+        "semantic_selection_model",
+        "semantic_promoted",
+        "followup_added",
+        "neighbor_window",
+        "expanded_passages",
+        "selected_passages",
+        "budget_tokens",
+        "total_tokens",
+        "latency_ms",
+        "latency_budget_ms",
+        "latency_over_budget",
+        "coverage_status",
+        "coverage_exhausted",
+        "coverage_all_covered",
+        "coverage_used_model",
+        "coverage_exhaustion_reason",
+        "loop_iterations",
+        "loop_expansions",
+        "loop_searches",
+        "loop_model_calls",
+        "loop_token_estimate",
+    ):
+        if key in raw and isinstance(raw[key], (str, int, float, bool)):
+            safe[key] = raw[key]
+    for key in (
+        "discovered_ids",
+        "previewed_ids",
+        "read_ids",
+        "information_need_ids",
+        "followup_need_ids",
+        "uncovered_need_ids",
+        "coverage_missing_need_ids",
+        "loop_progress_events",
+        "loop_fingerprints",
+    ):
+        value = raw.get(key, [])
+        if isinstance(value, list):
+            safe[key] = [str(item) for item in value if str(item).strip()][:128]
+    query_map = raw.get("query_need_map", [])
+    if isinstance(query_map, list):
+        safe["query_need_map"] = [
+            {
+                "query_id": str(entry.get("query_id", "")),
+                "need_ids": [str(nid) for nid in list(entry.get("need_ids", []) or [])],
+            }
+            for entry in query_map
+            if isinstance(entry, dict)
+        ][:32]
+    preview_coverage = raw.get("preview_coverage", [])
+    if isinstance(preview_coverage, list):
+        safe["preview_coverage"] = [
+            {
+                "need_id": str(entry.get("need_id", "")),
+                "previewed_count": int(entry.get("previewed_count", 0) or 0),
+                "represented": bool(entry.get("represented", False)),
+            }
+            for entry in preview_coverage
+            if isinstance(entry, dict)
+        ][:32]
+    preview_map = raw.get("selection_preview_map", [])
+    if isinstance(preview_map, list):
+        safe["selection_preview_map"] = [
+            {
+                "chunk_id": str(entry.get("chunk_id", "")),
+                "fused_rank": int(entry.get("fused_rank", 0) or 0),
+                "query_ids": [str(q) for q in list(entry.get("query_ids", []) or [])],
+                "need_ids": [str(n) for n in list(entry.get("need_ids", []) or [])],
+                "selected": bool(entry.get("selected", False)),
+            }
+            for entry in preview_map
+            if isinstance(entry, dict)
+        ][:64]
+    coverage_per_need = raw.get("coverage_per_need", [])
+    if isinstance(coverage_per_need, list):
+        safe["coverage_per_need"] = [
+            {
+                "need_id": str(entry.get("need_id", "")),
+                "covered": bool(entry.get("covered", False)),
+                "passage_ids": [
+                    str(pid) for pid in list(entry.get("passage_ids", []) or []) if str(pid)
+                ][:12],
+            }
+            for entry in coverage_per_need
+            if isinstance(entry, dict)
+        ][:16]
+    for key in (
+        "selection_candidates",
+        "selection_selected",
+        "selection_max_rank",
+        "selection_need_more",
+        "selection_followups",
+        "selection_latency_ms",
+        "selection_model_used",
+        "selection_fallback_used",
+        "selection_need_count",
+        "selection_need_represented",
+        "selection_unmapped_previews",
+        "selection_unmapped_selected",
+    ):
+        for candidate in (key, f"selection_{key}"):
+            if candidate in raw and isinstance(raw[candidate], (int, float, bool)):
+                safe[key] = raw[candidate]
+                break
+    for key in (
+        "selection_digest",
+        "selection_deep_rank_gt5",
+        "selection_deep_rank_gt16",
+        "selection_need_unrepresented",
+        "selection_uncovered_need_ids",
+    ):
+        for candidate in (key, f"selection_{key}"):
+            if candidate in raw:
+                value = raw[candidate]
+                if isinstance(value, (str, bool, list)):
+                    safe[key] = value
+                break
+    per_need = raw.get(
+        "selection_per_need_selected", raw.get("selection_selection_per_need_selected")
+    )
+    if isinstance(per_need, dict):
+        safe["selection_per_need_selected"] = {
+            str(key): int(value or 0) for key, value in per_need.items() if str(key).strip()
+        }
+    safe["selection_route"] = selection_route_from_metadata(raw)
+    return safe
+
+
+def selection_route_from_metadata(metadata: dict[str, Any]) -> str:
+    """Derive the truthful selection route from executed-path events.
+
+    ``model_selection`` only when the selector model actually ran
+    (``selection_model_used`` true); ``lexical_fallback`` when previews
+    were discovered but the heuristic path served them;
+    ``selection_unavailable`` when retrieval ran but produced no usable
+    selection; ``not_requested`` when no retrieval was requested.
+    Never inferred from pack size or heuristic ordering.
+    """
+    try:
+        raw = dict(metadata or {})
+    except Exception:
+        return "selection_unavailable"
+    if (
+        str(raw.get("selection_route", "") or "")
+        in (
+            "model_selection",
+            "lexical_fallback",
+            "selection_unavailable",
+            "not_requested",
+        )
+        and str(raw.get("coverage_status", "") or "") == "not_requested"
+    ):
+        return str(raw["selection_route"])
+    model_used = raw.get("selection_model_used", raw.get("selection_selection_model_used", False))
+    fallback_used = raw.get(
+        "selection_fallback_used", raw.get("selection_selection_fallback_used", False)
+    )
+    try:
+        if bool(model_used):
+            return "model_selection"
+    except Exception:
+        pass
+    try:
+        if bool(fallback_used):
+            return "lexical_fallback"
+    except Exception:
+        pass
+    discovered = raw.get("discovered_ids", [])
+    previewed = raw.get("previewed_ids", [])
+    has_discovery = (isinstance(discovered, list) and len(discovered) > 0) or (
+        isinstance(previewed, list) and len(previewed) > 0
+    )
+    if has_discovery:
+        return "lexical_fallback"
+    if str(raw.get("coverage_status", "") or "") == "not_requested":
+        return "not_requested"
+    return "selection_unavailable"
+
+
 async def retrieval_node(
     state: TurnState,
     *,
@@ -1169,6 +1373,16 @@ async def retrieval_node(
             "evidence_pack": [],
             "retrieval_latency_ms": 0.0,
             "retrieval_over_budget": False,
+            "retrieval_metadata": sanitize_retrieval_metadata(
+                {
+                    "retrieval_backend": "rrf-only/1+semantic-selection+coverage-loop",
+                    "selection_route": "not_requested",
+                    "discovered_ids": [],
+                    "previewed_ids": [],
+                    "read_ids": [],
+                    "coverage_status": "not_requested",
+                }
+            ),
         }
     active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
@@ -1270,11 +1484,16 @@ async def retrieval_node(
             "over_budget": over_budget,
         },
     )
+    try:
+        retrieval_metadata = sanitize_retrieval_metadata(dict(pack.retrieval_metadata or {}))
+    except Exception:
+        retrieval_metadata = {}
     return {
         "retrieval_hits": hits,
         "evidence_pack": pack_dicts,
         "retrieval_latency_ms": elapsed_ms,
         "retrieval_over_budget": over_budget,
+        "retrieval_metadata": retrieval_metadata,
     }
 
 
@@ -1305,6 +1524,8 @@ __all__ = [
     "make_retrieval_node",
     "pack_to_state",
     "retrieval_node",
+    "sanitize_retrieval_metadata",
     "selection_context_digest",
+    "selection_route_from_metadata",
     "state_passages_to_prompt",
 ]

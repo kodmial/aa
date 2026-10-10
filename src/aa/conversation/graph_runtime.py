@@ -339,9 +339,15 @@ class GraphTurnRuntime:
                 )
             final = candidate.text
             try:
+                stored_texts = result.get("response_unit_texts", [])
                 self._last_certificates[thread] = {
                     "candidate": candidate.model_dump(mode="json"),
                     "certificate": certificate.model_dump(mode="json"),
+                    "response_unit_texts": [
+                        dict(item) for item in stored_texts if isinstance(item, dict)
+                    ]
+                    if isinstance(stored_texts, list)
+                    else [],
                 }
             except Exception:
                 pass
@@ -460,6 +466,31 @@ class GraphTurnRuntime:
                 "runtime_sha": _runtime_sha or "unknown",
                 "total_latency_ms": round(total_ms, 1),
                 "reply_len": int(reply_len),
+                # Truthful selection route (#312): provisional graph
+                # telemetry never claims delivery. ``last_telemetry`` is
+                # not a delivery acknowledgment; confirmed delivery lives
+                # only in transport receipts.
+                "selection_route": str(
+                    embedded_d.get("selection_route", embedded_d.get("pack_order", "unknown"))
+                    or "unknown"
+                ),
+                "semantic_selection_applied": bool(
+                    embedded_d.get("semantic_selection_applied", False)
+                ),
+                "pack_order": str(embedded_d.get("pack_order", "unknown") or "unknown"),
+                "coverage_status": str(embedded_d.get("coverage_status", "unknown") or "unknown"),
+                "pack_digest": str(embedded_d.get("pack_digest", "") or ""),
+                "evidence_discovered": int(embedded_d.get("evidence_discovered", 0) or 0),
+                "evidence_previewed": int(embedded_d.get("evidence_previewed", 0) or 0),
+                "evidence_read": int(embedded_d.get("evidence_read", 0) or 0),
+                "evidence_selected_in_pack": int(
+                    embedded_d.get("evidence_selected_in_pack", pack_count) or 0
+                ),
+                "evidence_used_in_answer": int(embedded_d.get("evidence_used_in_answer", 0) or 0),
+                "evidence_quoted_to_user": int(embedded_d.get("evidence_quoted_to_user", 0) or 0),
+                "evidence_delivered": "pending-delivery",
+                "delivery_outcome": "provisional-certified",
+                "delivery_status": str(result.get("delivery_status", "provisional-certified")),
             }
             self._last_telemetry[thread] = snapshot
             logger.info(
@@ -520,12 +551,112 @@ class GraphTurnRuntime:
             raise GraphRuntimeError("graph-failed", "graph returned no state")
         return dict(result)
 
+    def commit_confirmed_delivery(self, thread: str) -> list[dict[str, Any]]:
+        """Commit receipt-confirmed book quotes (no text, idempotent).
+
+        Reads the last certified candidate/certificate plus transport
+        receipts for ``thread`` and returns the delivered quote ranges
+        to persist. Never derives delivery from graph success or
+        telemetry alone: empty receipts or missing certificates commit
+        nothing. Failed/unknown segments yield only a
+        ``possibly-delivered`` safety record, never confirmed history.
+        """
+        try:
+            cert_store = self._last_certificates.get(thread, {})
+            receipts = self._last_receipts.get(thread, [])
+            if not isinstance(cert_store, dict) or not receipts:
+                return []
+            candidate = cert_store.get("candidate", {})
+            certificate = cert_store.get("certificate", {})
+            if not isinstance(candidate, dict) or not isinstance(certificate, dict):
+                return []
+            candidate_text = str(candidate.get("text", "") or "")
+            evidence_bundle = candidate.get("evidence_bundle", [])
+            pack = (
+                [dict(item) for item in evidence_bundle if isinstance(item, dict)]
+                if isinstance(evidence_bundle, list)
+                else []
+            )
+            raw_verdicts = certificate.get("claim_verdicts", [])
+            verdicts = (
+                [dict(item) for item in raw_verdicts if isinstance(item, dict)]
+                if isinstance(raw_verdicts, list)
+                else []
+            )
+            stored_texts: list[dict[str, Any]] = []
+            try:
+                maybe_texts = cert_store.get("response_unit_texts", [])
+                if isinstance(maybe_texts, list):
+                    stored_texts = [dict(item) for item in maybe_texts if isinstance(item, dict)]
+            except Exception:
+                stored_texts = []
+            certificate_id = str(certificate.get("certificate_id", "") or "")
+            from aa.conversation.quote_state import delivered_ranges_from_candidate
+
+            confirmed, possibly = delivered_ranges_from_candidate(
+                certified_text=candidate_text,
+                evidence_pack=pack,
+                claim_verdicts=verdicts,
+                stored_unit_texts=stored_texts or None,
+                receipts=[dict(item) for item in receipts if isinstance(item, dict)],
+                certificate_id=certificate_id,
+            )
+            return [*confirmed, *possibly]
+        except Exception:
+            return []
+
+    async def apply_delivery_commit(self, thread: str) -> list[dict[str, Any]]:
+        """Persist receipt-confirmed quotes into checkpointer state.
+
+        Computes :meth:`commit_confirmed_delivery` and merges it into
+        the thread's ``recent_quote_ranges`` via ``aupdate_state`` when
+        a compiled graph is bound. Idempotent: replays deduplicate and
+        session reset clears history. Returns the committed ranges.
+        """
+        from aa.conversation.quote_state import merge_recent_ranges
+
+        committed = self.commit_confirmed_delivery(thread)
+        if not committed:
+            return []
+        graph = self._graph
+        if graph is None:
+            return committed
+        try:
+            config = {"configurable": {"thread_id": thread}}
+            try:
+                snapshot = await graph.aget_state(config)
+                current_raw = snapshot.values.get("recent_quote_ranges", [])
+            except Exception:
+                try:
+                    snapshot = graph.get_state(config)
+                    current_raw = snapshot.values.get("recent_quote_ranges", [])
+                except Exception:
+                    current_raw = []
+            current = [dict(item) for item in (current_raw or []) if isinstance(item, dict)]
+            merged = merge_recent_ranges(current, committed)
+            try:
+                await graph.aupdate_state(config, {"recent_quote_ranges": merged})
+            except Exception:
+                try:
+                    graph.update_state(config, {"recent_quote_ranges": merged})
+                except Exception:
+                    pass
+            return committed
+        except Exception:
+            return committed
+
     async def clear_chat(self, chat_id: int) -> None:
         """Clear only that chat's LangGraph conversation state (``/new``)."""
         thread = self.thread_id(chat_id)
         if self._delegate is not None:
             async with self._lock:
                 self._histories.pop(thread, None)
+            try:
+                self._last_telemetry.pop(thread, None)
+                self._last_certificates.pop(thread, None)
+                self._last_receipts.pop(thread, None)
+            except Exception:
+                pass
             logger.info("graph thread cleared")
             return
         saver = self._checkpointer

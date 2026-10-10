@@ -443,6 +443,14 @@ async def retrieval_stub_node(state: TurnState) -> dict[str, Any]:
         "evidence_pack": [],
         "retrieval_latency_ms": 0.0,
         "retrieval_over_budget": False,
+        "retrieval_metadata": {
+            "retrieval_backend": "stub/no-index",
+            "selection_route": "not_requested",
+            "discovered_ids": [],
+            "previewed_ids": [],
+            "read_ids": [],
+            "coverage_status": "not_requested",
+        },
     }
 
 
