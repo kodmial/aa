@@ -173,6 +173,14 @@ jobs:
             cp "$RESTORE_DIR/runtime-status.json" self-proving-out/runtime-status.json
             echo "restored Gate D runtime evidence"
           fi
+          # Unified Gate A/B evidence (issue #339): restore already-published
+          # validated artifacts so a resumed runner reuses the single
+          # authoritative verdict instead of re-executing the gate.
+          if compgen -G "$RESTORE_DIR/gate-[A-E]-evidence.json" > /dev/null; then
+            mkdir -p self-proving-out
+            cp "$RESTORE_DIR"/gate-[A-E]-evidence.json self-proving-out/
+            echo "restored validated Gate evidence artifacts"
+          fi
 
       - name: Gate A - static/build
         id: gate-a
@@ -190,9 +198,19 @@ jobs:
           # Exact SHA + clean tree verified above; canonical restore
           # metadata/fingerprints, unit/type/lint, and prompt/config/model/
           # retrieval fingerprint consistency run here fail-closed.
-          bash scripts/verify.sh
-          python scripts/verify_product_contract_qualification.py --require-active
-          python scripts/verify_runtime_qualification.py
+          # Unified Gate A evidence (issue #339): the shell checks below run
+          # exactly once; their outcome plus the python trust-boundary checks
+          # publish ONE authoritative gate-A-evidence.json artifact. Gate F
+          # consumes that artifact read-only and never re-executes Gate A.
+          gate_a_shell=pass
+          bash scripts/verify.sh || gate_a_shell=fail
+          python scripts/verify_product_contract_qualification.py --require-active || gate_a_shell=fail
+          python scripts/verify_runtime_qualification.py || gate_a_shell=fail
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --emit-gate A --shell-a-status "$gate_a_shell" \
+            --shell-a-detail "workflow-gate-a-shell-$gate_a_shell"
           mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
           echo "A" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-A.done"
 
@@ -215,22 +233,33 @@ jobs:
           # small-to-big, grounding/verifier and output envelope, memory/FIFO/
           # concurrency/safety, voice fixtures/cache/resource checks. Failures
           # attribute to a concrete component, never a generic PASS.
-          python scripts/restore_canonical.py --no-network-fallback
-          python scripts/restore_canonical.py --lang ru --no-network-fallback
-          python scripts/build_corpus_structure.py
+          # Unified Gate B evidence (issue #339): the shell bootstrap/tests
+          # below run exactly once; their outcome plus the python component
+          # checks publish ONE authoritative gate-B-evidence.json artifact
+          # (B FAIL on shell failure, BLOCKED on missing assets). Gate F
+          # consumes that artifact read-only and never re-executes Gate B.
+          gate_b_shell=pass
+          python scripts/restore_canonical.py --no-network-fallback || gate_b_shell=fail
+          python scripts/restore_canonical.py --lang ru --no-network-fallback || gate_b_shell=fail
+          python scripts/build_corpus_structure.py || gate_b_shell=fail
           # Gate B must exercise the production dense substrate, never the
           # hermetic hashing fallback. Public model prefetch is allowed here;
           # a missing/unloadable pinned model is a qualification failure.
-          python scripts/prefetch_public_assets.py
+          python scripts/prefetch_public_assets.py || gate_b_shell=fail
           # Voice is part of the Product Contract too. Qualification must
           # provision and verify the pinned GigaAM/Silero/presentation assets
           # rather than leaving the voice lane permanently INCOMPLETE.
-          python scripts/prefetch_voice_assets.py
-          python scripts/build_retrieval_index.py --backend e5
+          python scripts/prefetch_voice_assets.py || gate_b_shell=fail
+          python scripts/build_retrieval_index.py --backend e5 || gate_b_shell=fail
           python -m pytest -q tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py \
             tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py \
             tests/test_output_envelope.py tests/test_sessions_safety_control.py \
-            tests/test_telegram_concurrency.py tests/test_idempotent_dispatch.py
+            tests/test_telegram_concurrency.py tests/test_idempotent_dispatch.py || gate_b_shell=fail
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --emit-gate B --shell-b-status "$gate_b_shell" \
+            --shell-b-detail "workflow-gate-b-shell-$gate_b_shell"
           mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
           echo "B" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-B.done"
 
@@ -553,7 +582,10 @@ jobs:
           # End-to-end and per-stage latency p50/p95 from Gate C evidence.
           # Gate E consumes the trusted live measurements independently of
           # Gate C's functional verdict and Gate D's network-readiness result.
-          # The runner computes the whole A-E summary and therefore returns
+          # The runner reuses the already-published Gate A/B evidence
+          # artifacts (issue #339, zero second invocation) and evaluates only
+          # C/D/E fresh, publishing their evidence for the read-only Gate F.
+          # It therefore returns
           # non-zero when Gate C is already known FAIL. Gate E must not inherit
           # that functional verdict: consume the same trusted latency evidence
           # and exit strictly from Gate E below. Preserve runner lifecycle
@@ -634,12 +666,37 @@ jobs:
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
           # so a stale final verdict can never be reused after resume.
-          # PASS only if A-E PASS for the exact same current main SHA with
-          # matching product/runtime fingerprints. No stale reuse, no manual
+          # Gate F is a pure deterministic reducer (issue #339): it consumes
+          # only the already-produced, validated gate evidence artifacts
+          # (Gate A/B published exactly once by their shell steps; C/D/E
+          # published by the runner) with matching SHA/run/digests. It
+          # performs no corpus restore, provider calls, index builds, or
+          # component re-evaluation. No stale reuse, no manual
           # override. INCOMPLETE/missing/stale/mocked-only = FAIL/BLOCKED.
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}"
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --final-only
+
+      - name: Upload per-gate evidence and failure matrix
+        # Privacy-safe full per-gate evidence (issue #339): atomic validated
+        # A-E artifacts plus the typed failure matrix for the final verdict.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-evidence-${{ github.run_attempt }}
+          path: |
+            self-proving-out/gate-A-evidence.json
+            self-proving-out/gate-B-evidence.json
+            self-proving-out/gate-C-evidence.json
+            self-proving-out/gate-D-evidence.json
+            self-proving-out/gate-E-evidence.json
+            self-proving-out/failure-matrix.json
+            self-proving-out/self-proving-summary.json
+            self-proving-out/result.json
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
       - name: Stage gate checkpoints for resume
         # Mirror ephemeral RUNNER_TEMP checkpoints into the workspace so the
@@ -662,6 +719,11 @@ jobs:
           fi
           if [[ -f self-proving-out/runtime-status.json ]]; then
             cp self-proving-out/runtime-status.json "$STAGE_DIR/runtime-status.json"
+          fi
+          # Unified Gate evidence (issue #339): persist validated A-E
+          # artifacts across 429 runner retire so resume reuses them.
+          if compgen -G "self-proving-out/gate-[A-E]-evidence.json" > /dev/null; then
+            cp self-proving-out/gate-[A-E]-evidence.json "$STAGE_DIR"/
           fi
           echo "staged privacy-safe gate checkpoints/evidence for resume:"
           find "$STAGE_DIR" -maxdepth 2 -type f -print || true
@@ -821,6 +883,16 @@ jobs:
               const failed = productFailures[0] || (
                 transientBlocked ? null : gates.find(g => g.status !== 'PASS')
               );
+              // Typed authoritative failure list (issue #339): the read-only
+              // Gate F reducer publishes ALL independently failed gates plus
+              // typed root components. Automated repair consumes this list,
+              // never the alphabetical-first blocking gate alone.
+              const typedFailedGates = Array.isArray(summary.failed_gates)
+                ? summary.failed_gates.map(gate => String(gate || '')).filter(Boolean)
+                : [];
+              const typedRoots = Array.isArray(summary.root_components)
+                ? summary.root_components.map(root => String(root || '')).filter(Boolean)
+                : [];
               blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
               if (failed) {
                 const normalized = normalizedFailureCategory(
@@ -1193,6 +1265,8 @@ jobs:
               `Blocking gate: \`${blocking}\``,
               `Component: \`${component}\``,
               `All proven product failures: \`${stableFailures.join(', ')}\``,
+              `Failed gates (typed): \`${(typedFailedGates.length ? typedFailedGates : [blocking]).join(', ')}\``,
+              `Root components (typed): \`${(typedRoots.length ? typedRoots : [component]).join(', ')}\``,
               `Main SHA: \`${sha}\``,
               `Run id: \`${runId}\``,
               `Repair fingerprint: \`${fingerprint}\``,
