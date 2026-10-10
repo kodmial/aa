@@ -200,14 +200,23 @@ def test_empty_selection_without_justification_rejected() -> None:
 
 
 def test_full_pack_displaces_irrelevant_with_relevant() -> None:
+    # #306: per-need associations (not lexical overlap) drive budgeted
+    # survival. The fresh passage carries the represented need while the
+    # old pack carries none, so round-robin keeps it at the boundary.
     intent = "трезвый утренний разбор тяги поддержка"
     old = [
         _pack_dict(f"old-{index}", f"Неотносящийся текст про погоду номер {index}.")
         for index in range(MAX_PACK_PASSAGES)
     ]
     fresh_text = "Трезвый утренний разбор тяги и поддержка рядом."
-    fresh = [_pack_dict("new-relevant", fresh_text)]
-    merged = merge_pack_dicts(old, fresh, resolved_intent=intent, conversation_context="")
+    fresh = [_pack_dict("new-relevant", fresh_text, need_ids=["need-1"])]
+    merged = merge_pack_dicts(
+        old,
+        fresh,
+        resolved_intent=intent,
+        conversation_context="",
+        information_needs=[{"need_id": "need-1", "text": intent}],
+    )
     ids = {item["passage_id"] for item in merged}
     assert "new-relevant" in ids
     assert len(merged) <= MAX_PACK_PASSAGES
@@ -226,6 +235,35 @@ class _EmptyModel:
             "selected_chunk_ids": [],
             "need_more_detail": True,
             "followup_queries": list(self._followups),
+        }
+
+
+class _EmptyThenSelectModel:
+    """#306 loop semantics: empty first selection requests a follow-up,
+    then semantically reconsiders the surfaced candidate (never a
+    rank-only append)."""
+
+    def __init__(self, followups: list[str], target: str) -> None:
+        self._followups = list(followups)
+        self._target = target
+        self.calls = 0
+
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 1
+    ) -> dict[str, object]:
+        _ = (prompt, system, schema, retry_count)
+        self.calls += 1
+        if self.calls <= 1:
+            return {
+                "selected_chunk_ids": [],
+                "need_more_detail": True,
+                "followup_queries": list(self._followups),
+            }
+        assert self._target in prompt
+        return {
+            "selected_chunk_ids": [self._target],
+            "need_more_detail": False,
+            "followup_queries": [],
         }
 
 
@@ -291,7 +329,7 @@ async def _run_rank66_promotion(monkeypatch: Any) -> EvidencePack:
         resolved_intent="трезвый утренний разбор тяги",
         conversation_context="",
         user_message="разобрать тягу",
-        selection_model=_EmptyModel(["уточняющий запрос про тягу"]),
+        selection_model=_EmptyThenSelectModel(["уточняющий запрос про тягу"], target),
     )
     return pack
 
@@ -305,7 +343,12 @@ def test_rank66_unseen_candidate_promoted_on_followup(monkeypatch: Any) -> None:
     discovered = pack.retrieval_metadata["discovered_ids"]
     previewed = pack.retrieval_metadata["previewed_ids"]
     read = pack.retrieval_metadata["read_ids"]
-    assert len(previewed) == 64
+    # #306 loop: the first preview window holds 64 ids; the follow-up
+    # round reconsiders the surfaced candidate in a fresh preview, so the
+    # accumulated preview set grows by exactly the promoted id
+    # (chapter-1:ru:c0065 carries the decisive passage in the fixture).
+    assert len(previewed) >= 64
+    assert "chapter-1:ru:c0065" in previewed
     assert len(discovered) >= 64
     assert set(previewed) < set(discovered) or len(discovered) > len(previewed)
     assert read, "read ids must be observable"

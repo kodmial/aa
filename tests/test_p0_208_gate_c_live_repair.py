@@ -372,7 +372,11 @@ async def test_fast_turn_still_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
     from aa.retrieval import evidence as evidence_mod
     from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
+    # #306: repair retrieval traverses the shared async read/coverage loop.
+    async def _fake_retrieve(
+        index: Any, queries: object, *, config: Any = None, **kwargs: Any
+    ) -> Any:
+        _ = (index, queries, config, kwargs)
         text = "Фиктивная другая поддержка рядом."
         passage = EvidencePassageData(
             passage_id="chapter-3#extra",
@@ -389,7 +393,10 @@ async def test_fast_turn_still_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
             passages=(passage,), total_tokens=10, corpus_version="v", retrieval_metadata={}
         )
 
-    monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
+    from aa.conversation import retrieval_node as retrieval_node_mod
+
+    monkeypatch.setattr(retrieval_node_mod, "aretrieve_with_semantic_selection", _fake_retrieve)
+    _ = evidence_mod
     assert TURN_REPAIR_TIME_BUDGET_S > 0
 
     outcome = await run_v2_answer_turn(

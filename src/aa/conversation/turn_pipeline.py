@@ -732,7 +732,7 @@ def merge_pack_dicts(
     information_needs: Any | None = None,
     need_ids_by_passage: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge new exact passages with coverage-aware budgeting (#311).
+    """Merge new exact passages with coverage-aware budgeting (#311, #306).
 
     All eligible old and new candidates are unioned first (stable-id
     dedup with integrity failure on same-id/different-content, never a
@@ -743,15 +743,16 @@ def merge_pack_dicts(
     displace an older irrelevant one in an already full pack instead of
     being rejected for insertion order.
 
-    Ordering inside this function is a lexical fallback (generic token
-    overlap via :func:`order_pack_semantically`), never an LLM semantic
-    verdict. When typed ``information_needs`` (plus per-passage need
-    associations carried on the pack dicts or via
-    ``need_ids_by_passage``) are available, budgeting preserves
-    per-need representation round-robin so a second need's sole relevant
-    passage survives the budget boundary even with lower lexical
-    overlap; without need provenance the legacy lexical order applies.
-    Provenance and all stored passage fields are preserved verbatim.
+    Per-need associations (#311) drive budgeting round-robin so a second
+    need's sole relevant passage survives the budget boundary even with
+    lower lexical overlap. Generic token overlap via
+    :func:`order_pack_semantically` is only an explicitly named
+    lexical discovery hint for observability and never orders the
+    budgeted selection, let alone constitutes ``assess_coverage`` or
+    model-based re-selection (#306). After budgeting, representation is
+    validated so no represented need silently loses all evidence to the
+    budget boundary. Provenance and all stored passage fields are
+    preserved verbatim.
     """
     from aa.corpus.budget import RETRIEVED_PASSAGES_BUDGET_TOKENS, estimate_text_tokens
     from aa.retrieval.evidence import check_passage_id_consistency, enrich_pack_provenance
@@ -798,18 +799,27 @@ def merge_pack_dicts(
             except Exception:
                 continue
     pool = [combined[key] for key in order]
+    # Lexical discovery hint only (#306): generic token overlap is
+    # computed for observability and explicitly never orders the
+    # budgeted selection. Budgeting below follows insertion order plus
+    # per-need round-robin, never lexical authority.
     context = f"{resolved_intent or ''} {conversation_context or ''}".strip()
+    lexical_hint_order: list[str] = []
     if context:
         try:
-            from aa.conversation.semantic_selection import order_pack_semantically
+            from aa.conversation.semantic_selection import (
+                order_pack_semantically as _lexical_discovery_hint,
+            )
 
-            pool = order_pack_semantically(
+            _hinted = _lexical_discovery_hint(
                 pool,
                 resolved_intent=str(resolved_intent or ""),
                 conversation_context=str(conversation_context or ""),
             )
+            lexical_hint_order = [str(item.get("passage_id", "")) for item in _hinted]
         except Exception:
-            pool = [combined[key] for key in order]
+            lexical_hint_order = []
+    _ = lexical_hint_order
     # Coverage-aware budgeting: when need provenance exists, interleave
     # per-need best-first so each represented need keeps exposure at the
     # budget boundary; remaining slots fill in pool order.
@@ -887,6 +897,39 @@ def merge_pack_dicts(
             continue
         selected.append(item)
         total += need
+    # Post-budget representation validation (#306): a need represented
+    # in the combined pool must not silently lose all evidence at the
+    # budget boundary. Drops from an already-validated expansion fail
+    # closed downstream (uncovered need, never fake coverage); the
+    # warning here keeps the boundary observable.
+    try:
+        pool_needs: dict[str, int] = {}
+        for item in pool:
+            raw = item.get("need_ids", [])
+            ids = (
+                [str(n).strip() for n in list(raw) if str(n or "").strip()]
+                if isinstance(raw, list)
+                else []
+            )
+            for nid in ids:
+                pool_needs[nid] = pool_needs.get(nid, 0) + 1
+        kept_needs: set[str] = set()
+        for item in selected:
+            raw = item.get("need_ids", [])
+            ids = (
+                [str(n).strip() for n in list(raw) if str(n or "").strip()]
+                if isinstance(raw, list)
+                else []
+            )
+            kept_needs.update(ids)
+        dropped = sorted(nid for nid in pool_needs if nid not in kept_needs)
+        if dropped:
+            logger.info(
+                "evidence merge dropped need representation at budget boundary",
+                extra={"dropped_need_ids": dropped, "kept": len(selected)},
+            )
+    except Exception:
+        pass
     return selected
 
 
@@ -1153,25 +1196,28 @@ async def run_v2_answer_turn(
         from aa.conversation.failures import TurnFailed as _PackTurnFailed
 
         raise _PackTurnFailed("evidence-integrity", f"evidence pack invalid: {exc}") from exc
-    # Lexical-fallback ordering over the broad Evidence Pack (issue
-    # #295 heuristic, #311 provenance): reorder by generic intent
-    # relevance without dropping any passage, so decisive deep-ranked
-    # material surfaces for generation and verification while the full
-    # pack stays available. Deterministic and model-free here (the
-    # retrieval layer already applied the same promotion); a dedicated
-    # selection-model pass may reorder again upstream without ever
-    # pruning before budgeting. This is a lexical fallback, never a
-    # model semantic verdict (#311/#312).
+    # Lexical discovery-hint ordering over the broad Evidence Pack
+    # (issue #295 heuristic, #311 provenance, #306 discovery-only):
+    # reorder by generic intent relevance without dropping any passage,
+    # so decisive deep-ranked material surfaces for generation and
+    # verification while the full pack stays available. Deterministic
+    # and model-free here (the retrieval layer already applied the same
+    # promotion); a dedicated selection-model pass may reorder again
+    # upstream without ever pruning before budgeting. This is explicitly
+    # a lexical discovery hint, never a model semantic verdict and never
+    # coverage authority (#306).
     _pack_order = "fused"
     try:
-        from aa.conversation.semantic_selection import order_pack_semantically as _order_pack
+        from aa.conversation.semantic_selection import (
+            order_pack_semantically as _lexical_discovery_hint_order,
+        )
 
         _order_intent = str(resolved_intent or "").strip() or " ".join(user_message.split()).strip()
         if pack and _order_intent:
-            pack = _order_pack(
+            pack = _lexical_discovery_hint_order(
                 pack, resolved_intent=_order_intent, conversation_context=str(summary or "")
             )
-            _pack_order = "lexical_fallback"
+            _pack_order = "lexical_discovery_hint"
             logger.debug(
                 "evidence pack lexically reordered",
                 extra={"passages": len(pack)},
@@ -1501,20 +1547,45 @@ async def run_v2_answer_turn(
                 _recovery_queries = []
             if _recovery_queries:
                 try:
-                    from aa.retrieval.evidence import (
-                        RetrievalConfig,
-                        retrieve_evidence_for_recovery,
-                    )
+                    from aa.retrieval.evidence import RetrievalConfig
 
                     _active_cfg = (
                         retrieval_config if retrieval_config is not None else RetrievalConfig()
                     )
-                    _rec_started = time.perf_counter()
-                    _rec_pack = retrieve_evidence_for_recovery(
-                        retrieval_index, _recovery_queries, config=_active_cfg
+                    # One shared async read/coverage loop (#306): the
+                    # empty-pack recovery traverses the same
+                    # discover/select/read/assess/expand/search_more
+                    # mechanism as normal and safety repair retrieval, not
+                    # a legacy synchronous rank-only bypass. The genuine
+                    # user request stays the retrieval intent; no control
+                    # instruction travels here.
+                    _rec_needs: Any = None
+                    _rec_qmap: Any = None
+                    try:
+                        if isinstance(resolved_turn, dict):
+                            raw_needs = resolved_turn.get("information_needs", None)
+                            _rec_needs = list(raw_needs) if isinstance(raw_needs, list) else None
+                            raw_qmap = resolved_turn.get("query_need_map", None)
+                            _rec_qmap = list(raw_qmap) if isinstance(raw_qmap, list) else None
+                    except Exception:
+                        _rec_needs, _rec_qmap = None, None
+                    from aa.conversation.retrieval_node import (
+                        aretrieve_with_semantic_selection as _shared_recovery_retrieve,
                     )
                     from aa.conversation.retrieval_node import pack_to_state as _pack_state
 
+                    _rec_started = time.perf_counter()
+                    _rec_pack = await _shared_recovery_retrieve(
+                        retrieval_index,
+                        list(_recovery_queries),
+                        config=_active_cfg,
+                        resolved_intent=_resolved_request,
+                        conversation_context=_conversation_context,
+                        user_message=user_message,
+                        selection_model=planner_model,
+                        information_needs=_rec_needs,
+                        query_need_map=_rec_qmap,
+                    )
                     _, _rec_dicts = _pack_state(_rec_pack)
                     telemetry["retrieval_latency_ms"] = round(
                         float(telemetry.get("retrieval_latency_ms", 0.0) or 0.0)
@@ -1527,6 +1598,7 @@ async def run_v2_answer_turn(
                             _rec_dicts,
                             resolved_intent=_resolved_intent,
                             conversation_context=_conversation_context,
+                            information_needs=_rec_needs,
                         )
                         telemetry["retrieval_passages"] = len(pack)
                         telemetry["retrieval_outcome"] = "recovered"
@@ -1862,7 +1934,15 @@ async def run_v2_answer_turn(
         if planner_model is None or retrieval_index is None:
             telemetry["planner_outcome"] = "skipped-no-planner"
             break
-        focus = anchored_repair_focus(user_message, missing)
+        # Request isolation (#306, carried forward from #300 safety
+        # separation to ordinary repair): the planner re-queries the
+        # ORIGINAL live request plus the canonical context only.
+        # Unsupported draft claims and control instructions never become
+        # the planner input or a search query. Missing texts travel only
+        # to answer-regeneration prompts (supplementary first, live
+        # request last via anchored_repair_focus) and as a supplementary
+        # coverage hint, never as intent.
+        repair_search_input = user_message
         try:
             from aa.conversation.planner_node import run_planner as _run_planner
 
@@ -1872,7 +1952,7 @@ async def run_v2_answer_turn(
             # Scripted test doubles may predate the canonical parameter.
             try:
                 plan = await _run_planner(
-                    focus,
+                    repair_search_input,
                     model=planner_model,
                     summary=summary,
                     recent=recent,
@@ -1884,7 +1964,7 @@ async def run_v2_answer_turn(
                 ) and "unexpected keyword" not in str(_planner_type_error):
                     raise
                 plan = await _run_planner(
-                    focus, model=planner_model, summary=summary, recent=recent
+                    repair_search_input, model=planner_model, summary=summary, recent=recent
                 )
             queries = list(plan.queries)
             telemetry["planner_latency_ms"] = round(
@@ -1901,23 +1981,44 @@ async def run_v2_answer_turn(
         if not queries:
             break
         try:
-            from aa.retrieval.evidence import RetrievalConfig, retrieve_evidence
+            from aa.retrieval.evidence import RetrievalConfig
 
             active_config = retrieval_config if retrieval_config is not None else RetrievalConfig()
             retrieval_started = time.perf_counter()
-            # Focused additional search (issue #295): repair retrieval
-            # carries the resolved intent for bounded semantic promotion
-            # so a decisive deep-ranked passage surfaces instead of
-            # regenerating on the same misleading top prefixes.
-            new_pack = retrieve_evidence(
-                retrieval_index,
-                queries,
-                config=active_config,
-                resolved_intent=_resolved_intent,
-                conversation_context=_conversation_context,
+            # One shared async read/coverage loop (#306): ordinary repair
+            # retrieval traverses the same
+            # discover/select/read/assess/expand/search_more mechanism as
+            # normal, safety and empty-pack recovery retrieval. The
+            # original resolved request stays the retrieval intent;
+            # unsupported draft claims travel only as a supplementary
+            # coverage hint (sanitized, never a query), so a decisive
+            # deep-ranked passage surfaces instead of regenerating on
+            # the same misleading top prefixes.
+            _repair_needs: Any = None
+            try:
+                if isinstance(resolved_turn, dict):
+                    raw_needs = resolved_turn.get("information_needs", None)
+                    _repair_needs = list(raw_needs) if isinstance(raw_needs, list) else None
+            except Exception:
+                _repair_needs = None
+            _repair_hint = " | ".join(text for text in missing if text.strip())[:800]
+            from aa.conversation.retrieval_node import (
+                aretrieve_with_semantic_selection as _shared_repair_retrieve,
             )
             from aa.conversation.retrieval_node import pack_to_state as _pack_to_state
 
+            new_pack = await _shared_repair_retrieve(
+                retrieval_index,
+                queries,
+                config=active_config,
+                resolved_intent=_resolved_request,
+                conversation_context=_conversation_context,
+                user_message=user_message,
+                selection_model=planner_model,
+                information_needs=_repair_needs,
+                query_need_map=None,
+                repair_hint=_repair_hint,
+            )
             _, new_dicts = _pack_to_state(new_pack)
             telemetry["retrieval_latency_ms"] = round(
                 float(telemetry["retrieval_latency_ms"])
@@ -1989,6 +2090,7 @@ async def run_v2_answer_turn(
             new_dicts,
             resolved_intent=_resolved_intent,
             conversation_context=_conversation_context,
+            information_needs=_repair_needs,
         )
         if len(merged) == len(pack):
             # Same duplicate-retrieval collapse as above: the pack already
@@ -2877,10 +2979,7 @@ async def run_v2_answer_turn(
                     if _recovery_attempts >= 2 * OUTBOUND_SAFETY_MAX_REPAIRS:
                         break
                     try:
-                        from aa.retrieval.evidence import (
-                            RetrievalConfig,
-                            retrieve_evidence,
-                        )
+                        from aa.retrieval.evidence import RetrievalConfig
 
                         active_config = (
                             retrieval_config if retrieval_config is not None else RetrievalConfig()
@@ -2895,17 +2994,37 @@ async def run_v2_answer_turn(
                             break
                         # Safety invariant: policy wording never enters a
                         # semantic query (checked in tests, never logged).
-                        fresh = retrieve_evidence(
-                            retrieval_index,
-                            list(_safety_queries),
-                            config=active_config,
-                            resolved_intent=_resolved_intent,
-                            conversation_context=_conversation_context,
+                        # One shared async read/coverage loop (#306): safety
+                        # recovery traverses the same
+                        # discover/select/read/assess/expand/search_more
+                        # mechanism as normal and ordinary repair retrieval.
+                        _safety_needs: Any = None
+                        try:  # noqa: SIM105
+                            if isinstance(resolved_turn, dict):
+                                raw_needs = resolved_turn.get("information_needs", None)
+                                _safety_needs = (
+                                    list(raw_needs) if isinstance(raw_needs, list) else None
+                                )
+                        except Exception:
+                            _safety_needs = None
+                        from aa.conversation.retrieval_node import (
+                            aretrieve_with_semantic_selection as _shared_safety_retrieve,
                         )
                         from aa.conversation.retrieval_node import (
                             pack_to_state as _pack_to_state,
                         )
 
+                        fresh = await _shared_safety_retrieve(
+                            retrieval_index,
+                            list(_safety_queries),
+                            config=active_config,
+                            resolved_intent=_recovery_request,
+                            conversation_context=_conversation_context,
+                            user_message=user_message,
+                            selection_model=planner_model,
+                            information_needs=_safety_needs,
+                            query_need_map=None,
+                        )
                         _, fresh_dicts = _pack_to_state(fresh)
                     except Exception:
                         break
@@ -2915,6 +3034,7 @@ async def run_v2_answer_turn(
                             fresh_dicts,
                             resolved_intent=_resolved_intent,
                             conversation_context=_conversation_context,
+                            information_needs=_safety_needs,
                         )
                         # Novel evidence is a bonus, never a requirement:
                         # regenerate even when nothing new arrived (the

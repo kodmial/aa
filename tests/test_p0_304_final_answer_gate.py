@@ -209,9 +209,13 @@ async def test_repair_propagates_new_evidence_bundle(monkeypatch: pytest.MonkeyP
         ]
     )
 
-    def _fake_retrieve(index: Any, queries: object, *, config: Any = None, **kwargs: Any) -> Any:
+    # #306: repair retrieval traverses the shared async read/coverage loop.
+    async def _fake_retrieve(
+        index: Any, queries: object, *, config: Any = None, **kwargs: Any
+    ) -> Any:
         from aa.retrieval.evidence import EvidencePack, EvidencePassageData
 
+        _ = (index, queries, config, kwargs)
         passage = EvidencePassageData(
             passage_id=second_entry["passage_id"],
             exact_text=second_entry["text"],
@@ -227,7 +231,10 @@ async def test_repair_propagates_new_evidence_bundle(monkeypatch: pytest.MonkeyP
             passages=(passage,), total_tokens=10, corpus_version="v", retrieval_metadata={}
         )
 
-    monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fake_retrieve)
+    from aa.conversation import retrieval_node as retrieval_node_mod
+
+    monkeypatch.setattr(retrieval_node_mod, "aretrieve_with_semantic_selection", _fake_retrieve)
+    _ = evidence_mod
     outcome = await run_v2_answer_turn(
         user_message="что помогает при тяге?",
         summary="",

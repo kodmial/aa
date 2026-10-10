@@ -35,7 +35,6 @@ from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
     EvidencePack,
     RetrievalConfig,
-    retrieve_evidence,
 )
 from aa.retrieval.index import HybridIndex, logical_chunk_id
 
@@ -274,27 +273,50 @@ async def aretrieve_with_semantic_selection(
     context_digest: str = "",
     information_needs: Any | None = None,
     query_need_map: Any | None = None,
+    coverage_model: Any | None = None,
+    repair_hint: str = "",
+    max_iterations: int = 3,
 ) -> EvidencePack:
-    """Run broad hybrid retrieval with model-driven selection before budgeting.
+    """Run broad hybrid retrieval as one read/coverage loop (#306).
 
     Issue #295: the genuinely broad BM25+E5/RRF pool (including fused rank
     >16) is exposed as discovery previews; an LLM selects pertinent
     candidates against the real context-resolved intent; exact complete
     canonical passages (+neighbors, provenance preserved) are fetched only
-    for the validated selection; one bounded targeted follow-up search
-    genuinely changes the evidence when relevance is weak/unknown. Earlier
-    top-N caps never irreversibly hide candidates before selection. No
-    second-stage BGE; generic token-overlap is fallback/discovery ordering
-    only, never semantic authority when a model is bound.
+    for the validated selection.
 
     Issue #311: previews preserve per-query and per-information-need
-    exposure through a bounded need-aware strategy (per-need
-    representation plus remaining global relevance) within
-    ``MAX_SELECTION_CANDIDATES``. Provenance
+    exposure through a bounded need-aware strategy. Provenance
     ``candidate -> query_ids -> need_ids`` survives fusion, previews,
-    selection, follow-ups and state serialization; unmapped stays
-    unmapped and budget exhaustion reports uncovered, never fake success.
+    selection, follow-ups and state serialization.
+
+    Issue #306: preview selection decides **what to read**, never whether
+    the book suffices. Every iteration runs ``select_for_reading`` over
+    the combined discovered pool, ``read_exact`` of full canonical
+    passages, and ``assess_coverage`` of every information need against
+    the full exact text (conditions/qualifiers preserved, supporting
+    spans verified as substrings). Uncovered needs trigger ``expand``
+    around already-read ranges or ``search_more`` followed by fresh
+    semantic selection (never rank-only appends). Progress is semantic
+    (newly read relevant context or a newly closed need); novel
+    irrelevant ids alone never count. The loop is bounded with
+    repeated-state detection; exhaustion keeps the best-effort pack
+    with typed ``coverage_status=exhausted`` and uncovered needs and
+    never converts insufficient evidence into a supported answer.
+    Lexical overlap guides discovery only and never marks sufficiency.
     """
+    from aa.conversation.coverage_loop import (
+        MAX_COVERAGE_EXPANSIONS,
+        MAX_COVERAGE_SEARCHES,
+        STATE_ASSESS_COVERAGE,
+        STATE_READ_EXACT,
+        STATE_SELECT_FOR_READING,
+        aassess_coverage,
+        conservative_uncovered_verdict,
+        expand_read_ranges,
+        loop_fingerprint,
+        sanitize_followup_queries,
+    )
     from aa.retrieval.evidence import (
         candidate_need_provenance,
         candidate_query_provenance,
@@ -336,20 +358,32 @@ async def aretrieve_with_semantic_selection(
             )
         except Exception:
             continue
-    started = time.perf_counter()
-    ranked_lists, per_query_ids = await asyncio.to_thread(
-        run_branch_searches, index, cleaned, branch_top_k=active.branch_top_k
-    )
-    fused, pool_ids = fuse_query_pool(
-        ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
-    )
-    # Discovery previews use the broad fused pool directly; per-section
-    # diversity caps are applied only to fallback/budgeting after selection.
-    # Broad discovery previews BEFORE any per-section diversity truncation
-    # or top-N winner budgeting (issue #295). The genuinely broad fused
-    # pool (global RRF order, exact-ID dedup only, ranks >16 included) is
-    # shown to the LLM; diversity caps apply only to fallback/budgeting
-    # after the model has selected.
+    # The original request stays primary and isolated: repair/safety
+    # control text travels only as a supplementary hint to coverage
+    # assessment, never as intent or as a search query.
+    original_request = " ".join(str(resolved_intent or "").split()).strip()
+    if not original_request:
+        original_request = " ".join(str(user_message or "").split()).strip()
+    repair_hint_clean = " ".join(str(repair_hint or "").split()).strip()
+    coverage_assessor = coverage_model if coverage_model is not None else selection_model
+    try:
+        need_id_order = [
+            str(getattr(item, "need_id", "") or "").strip()
+            for item in list(needs_for_selection or [])
+            if str(getattr(item, "need_id", "") or "").strip()
+        ]
+    except Exception:
+        need_id_order = []
+    if not need_id_order:
+        try:
+            need_id_order = [
+                str(item.get("need_id", "") or "").strip()
+                for item in list(needs_for_selection or [])
+                if isinstance(item, dict) and str(item.get("need_id", "") or "").strip()
+            ]
+        except Exception:
+            need_id_order = []
+
     from aa.conversation.semantic_selection import (
         MAX_FOLLOWUP_QUERIES,
         MAX_SELECTED_CHUNKS,
@@ -357,204 +391,566 @@ async def aretrieve_with_semantic_selection(
         aselect_semantic_candidates,
         assess_need_preview_coverage,
         select_need_aware_previews,
-        selection_telemetry,
         serialize_preview_coverage,
     )
 
+    started = time.perf_counter()
+    # ---- discover (initial): broad hybrid pool, no truncation before selection.
+    ranked_lists, per_query_ids = await asyncio.to_thread(
+        run_branch_searches, index, cleaned, branch_top_k=active.branch_top_k
+    )
+    fused, pool_ids = fuse_query_pool(
+        ranked_lists, per_query_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+    )
     candidate_query_map = candidate_query_provenance(per_query_ids)
     candidate_need_map = candidate_need_provenance(candidate_query_map, query_map_dicts)
-    broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
-    fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
-    in_index = [cid for cid, _ in fused_ordered if cid in index.chunks]
-    texts = {cid: getattr(index.chunks[cid], "text", "") for cid in in_index}
-    sections = {cid: getattr(index.chunks[cid], "section", "") for cid in in_index}
-    sources = {cid: getattr(index.chunks[cid], "source_id", "") for cid in in_index}
-    previews = select_need_aware_previews(
-        fused_ordered=fused_ordered,
-        texts=texts,
-        sections=sections,
-        sources=sources,
-        candidate_query_map=candidate_query_map,
-        candidate_need_map=candidate_need_map,
-        information_needs=needs_for_selection,
-        limit=MAX_SELECTION_CANDIDATES,
-    )
-    try:
-        preview_statuses, _unmapped_previews = assess_need_preview_coverage(
-            previews, needs_for_selection
+    all_queries: list[str] = list(cleaned)
+    sent_query_fingerprints: set[str] = set()
+    for query_text in all_queries:
+        sent_query_fingerprints.add(
+            __import__("hashlib")
+            .sha256(" ".join(query_text.split()).casefold().encode("utf-8"))
+            .hexdigest()[:16]
         )
-    except Exception:
-        preview_statuses = []
-    sel_started = time.perf_counter()
-    # Provider 429 propagates (runner retire/checkpoint resume); other
-    # model failures fall back to the bounded heuristic inside the selector.
-    # Pre-model preview gate verifies against this independent fused/index
-    # ground truth, never against the previews themselves.
-    known_chunk_ids = {cid for cid in fused if cid in index.chunks}
-    known_need_ids = {s.need_id for s in preview_statuses} or None
-    selection = await aselect_semantic_candidates(
-        previews,
-        resolved_intent=resolved_intent,
-        conversation_context=conversation_context,
-        user_message=user_message,
-        model=selection_model,
-        known_chunk_ids=known_chunk_ids,
-        context_digest=context_digest,
-        information_needs=needs_for_selection,
-        known_need_ids=known_need_ids,
-    )
-    # Conservative coverage close-out (#311): budget exhaustion or no
-    # selected evidence for a need reports uncovered and requests further
-    # discovery rather than fake selection success. Only #306 full-read
-    # assessment can mark sufficiency.
+
+    # ---- bounded read/coverage loop state.
+    read_child_set: set[str] = set()
+    read_child_order: list[str] = []
+    cumulative_expanded: dict[str, Any] = {}
+    cumulative_expanded_order: list[str] = []
+    covered_need_ids: set[str] = set()
+    cited_passage_ids: set[str] = set()
+    progress_events: list[str] = []
+    fingerprints: list[str] = []
+    fingerprint_set: set[str] = set()
+    preview_map_merged: dict[str, dict[str, Any]] = {}
+    discovered_first: list[str] = []
     try:
-        preview_by_id = {p.chunk_id: p for p in previews}
-        selected_need_ids: set[str] = set()
-        for cid in list(selection.selected_chunk_ids or []):
-            preview = preview_by_id.get(cid)
-            if preview is not None:
-                for nid in list(preview.need_ids or ()):
-                    selected_need_ids.add(str(nid))
-        uncovered_set = {str(nid) for nid in list(selection.uncovered_need_ids or [])}
-        augmented = False
-        for status in preview_statuses:
-            if not status.represented or status.need_id not in selected_need_ids:
-                if status.need_id not in uncovered_set:
-                    uncovered_set.add(status.need_id)
-                    augmented = True
-        if augmented:
-            used_model = bool(getattr(selection, "_used_model", False))
-            selection = type(selection)(
-                selected_chunk_ids=list(selection.selected_chunk_ids or []),
-                need_more_detail=True,
-                followup_queries=list(selection.followup_queries or []),
-                uncovered_need_ids=sorted(uncovered_set),
-            )
-            try:
-                selection._used_model = used_model
-            except Exception:
-                pass
+        broad_sorted_first = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
+        discovered_first = [item.chunk_id for item in broad_sorted_first if item.chunk_id in fused]
     except Exception:
-        pass
-    sel_ms = (time.perf_counter() - sel_started) * 1000.0
-    winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
-    # Observable retrieval stages: discovery alone never blocks later
-    # consideration. Only ids the model actually previewed/read are
-    # excluded from follow-up promotion; a rank-66 candidate that was
-    # discovered but never previewed stays eligible.
-    discovered_ids = [item.chunk_id for item in broad_sorted if item.chunk_id in fused]
-    previewed_ids = [preview.chunk_id for preview in previews]
-    previewed_set = set(previewed_ids)
-    # One bounded targeted follow-up when the selector reports weak/unknown
-    # relevance: a focused additional search that must add genuinely new
-    # chunk ids (never a silent regeneration on the same top prefixes).
-    # Follow-ups reuse the same typed query->need mapping seam (#311):
-    # they are attributed to the uncovered needs that triggered them,
-    # never via lexical guessing, so #306 can expand with the same map.
-    followup_added = 0
-    followup_need_ids: list[str] = sorted(
-        {str(nid) for nid in list(selection.uncovered_need_ids or []) if str(nid).strip()}
-    )
-    if selection.need_more_detail:
-        followups = list(selection.followup_queries[:MAX_FOLLOWUP_QUERIES])
-        if not followups and resolved_intent.strip():
-            followups = [" ".join(resolved_intent.split())[:500]]
+        discovered_first = []
+    last_previews: list[Any] = []
+    last_selection: Any = None
+    last_preview_statuses: list[Any] = []
+    last_verdict: Any = None
+    sel_ms_total = 0.0
+    model_calls = 0
+    expansions = 0
+    searches = 0
+    followup_added_total = 0
+    followup_need_ids: list[str] = []
+    coverage_status = "exhausted"
+    exhaustion_reason = "no-iterations"
+    read_ids: list[str] = []
+    previewed_ids_all: list[str] = []
+    previewed_set_all: set[str] = set()
+    selected: list[Any] = []
+    total = 0
+    expanded: list[Any] = []
+
+    bounded_iterations = max(1, min(int(max_iterations or 1), 5))
+    forbidden_echoes = [repair_hint_clean] if repair_hint_clean else []
+
+    for iteration in range(bounded_iterations):
+        # ---- select_for_reading over the combined discovered pool.
+        broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
+        fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
+        in_index = [cid for cid, _ in fused_ordered if cid in index.chunks]
+        texts = {cid: getattr(index.chunks[cid], "text", "") for cid in in_index}
+        sections = {cid: getattr(index.chunks[cid], "section", "") for cid in in_index}
+        sources = {cid: getattr(index.chunks[cid], "source_id", "") for cid in in_index}
+        previews = select_need_aware_previews(
+            fused_ordered=fused_ordered,
+            texts=texts,
+            sections=sections,
+            sources=sources,
+            candidate_query_map=candidate_query_map,
+            candidate_need_map=candidate_need_map,
+            information_needs=needs_for_selection,
+            limit=MAX_SELECTION_CANDIDATES,
+        )
+        last_previews = list(previews)
+        for seen_preview in previews:
+            if seen_preview.chunk_id not in previewed_set_all:
+                previewed_set_all.add(seen_preview.chunk_id)
+                previewed_ids_all.append(seen_preview.chunk_id)
         try:
-            followups = validate_recovery_queries(followups)
+            preview_statuses, _unmapped = assess_need_preview_coverage(
+                previews, needs_for_selection
+            )
         except Exception:
-            followups = []
-        if followups:
+            preview_statuses = []
+        last_preview_statuses = list(preview_statuses)
+        sel_started = time.perf_counter()
+        known_chunk_ids = {cid for cid in fused if cid in index.chunks}
+        known_need_ids = {s.need_id for s in preview_statuses} or None
+        selection = await aselect_semantic_candidates(
+            previews,
+            resolved_intent=original_request,
+            conversation_context=conversation_context,
+            user_message=user_message,
+            model=selection_model,
+            known_chunk_ids=known_chunk_ids,
+            context_digest=context_digest,
+            information_needs=needs_for_selection,
+            known_need_ids=known_need_ids,
+        )
+        model_calls += 1
+        # Conservative close-out (#311): unrepresented/unselected needs
+        # report uncovered; only full-read assessment can mark sufficiency.
+        try:
+            preview_by_id = {p.chunk_id: p for p in previews}
+            selected_need_ids: set[str] = set()
+            for cid in list(selection.selected_chunk_ids or []):
+                preview = preview_by_id.get(cid)
+                if preview is not None:
+                    for nid in list(preview.need_ids or ()):
+                        selected_need_ids.add(str(nid))
+            uncovered_set = {str(nid) for nid in list(selection.uncovered_need_ids or [])}
+            augmented = False
+            for status in preview_statuses:
+                if not status.represented or status.need_id not in selected_need_ids:
+                    if status.need_id not in uncovered_set:
+                        uncovered_set.add(status.need_id)
+                        augmented = True
+            if augmented:
+                used_model = bool(getattr(selection, "_used_model", False))
+                selection = type(selection)(
+                    selected_chunk_ids=list(selection.selected_chunk_ids or []),
+                    need_more_detail=True,
+                    followup_queries=list(selection.followup_queries or []),
+                    uncovered_need_ids=sorted(uncovered_set),
+                )
+                try:
+                    selection._used_model = used_model
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        last_selection = selection
+        sel_ms_total += (time.perf_counter() - sel_started) * 1000.0
+        try:
+            for map_entry in serialize_preview_coverage(previews, selection):
+                cid = str(map_entry.get("chunk_id", ""))
+                if cid and cid not in preview_map_merged:
+                    preview_map_merged[cid] = dict(map_entry)
+                elif cid:
+                    merged_entry = dict(preview_map_merged[cid])
+                    if bool(map_entry.get("selected", False)):
+                        merged_entry["selected"] = True
+                    preview_map_merged[cid] = merged_entry
+        except Exception:
+            pass
+        followup_need_ids = sorted(
+            {str(nid) for nid in list(selection.uncovered_need_ids or []) if str(nid).strip()}
+        )
+        winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
+        explicit_empty_followup = bool(
+            getattr(selection, "_used_model", False)
+            and not selection.selected_chunk_ids
+            and bool(selection.need_more_detail)
+        )
+        if not winners and not explicit_empty_followup:
+            # Fail-safe bounded fallback (never empty silent success).
+            # Diversity caps apply here only, never to discovery previews.
+            from aa.retrieval.evidence import dedup_and_diversify as _dedup
+
+            _diverse_fallback = _dedup(
+                index,
+                pool_ids,
+                fused,
+                pool_cap=active.pool_cap,
+                max_per_section=active.max_per_section,
+            )
+            _ordered_fallback = sorted(
+                _diverse_fallback, key=lambda item: item.fused_score, reverse=True
+            )
+            sections_map: dict[str, str] = {}
+            for _item in _ordered_fallback:
+                _record = index.chunks.get(_item.chunk_id)
+                if _record is not None:
+                    sections_map[_item.chunk_id] = str(getattr(_record, "section", "") or "")
+            winners = select_top_candidates(
+                _ordered_fallback,
+                top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS),
+                sections=sections_map,
+            )
+        # ---- read_exact: full canonical passages for newly selected ids.
+        new_winners = [w for w in winners if w.chunk_id not in read_child_set]
+        if new_winners:
+            newly_expanded = await asyncio.to_thread(
+                expand_small_to_big, index, new_winners, neighbor_window=active.neighbor_window
+            )
+            for passage in newly_expanded:
+                pid = str(getattr(passage, "passage_id", "") or "")
+                if pid and pid not in cumulative_expanded:
+                    cumulative_expanded[pid] = passage
+                    cumulative_expanded_order.append(pid)
+            for w in new_winners:
+                if w.chunk_id not in read_child_set:
+                    read_child_set.add(w.chunk_id)
+                    read_child_order.append(w.chunk_id)
+        # Budget the cumulative exact reads (atomic passages; priority
+        # winners degrade to exact child chunks rather than truncating).
+        ordered_cumulative = [cumulative_expanded[pid] for pid in cumulative_expanded_order]
+        if ordered_cumulative:
+            selected, total = select_passages_under_budget(
+                ordered_cumulative,
+                budget_tokens=active.budget_tokens,
+                index=index,
+                priority_child_ids=tuple(read_child_order),
+            )
+            expanded = list(ordered_cumulative)
+        else:
+            selected, total = [], 0
+            expanded = []
+        read_ids = list(read_child_order)
+        # ---- assess_coverage over the full exact budgeted pack.
+        # need_more_detail=false never proves sufficiency: only this
+        # full-read verdict can mark ready.
+        if coverage_assessor is not None:
+            verdict = await aassess_coverage(
+                list(selected),
+                needs_for_selection,
+                original_request=original_request,
+                model=coverage_assessor,
+                repair_hint=repair_hint_clean,
+            )
+            model_calls += 1
+        else:
+            verdict = conservative_uncovered_verdict(needs_for_selection)
+        last_verdict = verdict
+        # Semantic progress: newly closed needs or newly cited relevant
+        # passages count; novel irrelevant ids alone never do.
+        newly_covered = [
+            item.need_id
+            for item in list(verdict.needs or [])
+            if item.covered and item.need_id not in covered_need_ids
+        ]
+        newly_cited = [
+            pid
+            for item in list(verdict.needs or [])
+            for pid in list(item.passage_ids or [])
+            if pid and pid not in cited_passage_ids
+        ]
+        progressed = False
+        if newly_covered:
+            progressed = True
+            for nid in newly_covered:
+                covered_need_ids.add(nid)
+                progress_events.append(f"need-covered:{nid}")
+        if newly_cited:
+            progressed = True
+            for pid in newly_cited:
+                cited_passage_ids.add(pid)
+            progress_events.append(f"cited:{len(newly_cited)}-passages")
+        # Repeated action/state detection over semantic state (unmet
+        # needs, passages/ranges read, action and candidate identity).
+        try:
+            read_ranges = [
+                f"{str(getattr(cumulative_expanded[pid], 'char_start', 0))}-"
+                f"{str(getattr(cumulative_expanded[pid], 'char_end', 0))}"
+                for pid in cumulative_expanded_order
+            ]
+        except Exception:
+            read_ranges = []
+        try:
+            candidate_identity = "|".join(list(selection.selected_chunk_ids or []))
+        except Exception:
+            candidate_identity = ""
+        fingerprint = loop_fingerprint(
+            read_passage_ids=sorted(cumulative_expanded_order),
+            read_ranges=read_ranges,
+            uncovered_need_ids=sorted(str(n) for n in list(verdict.missing_need_ids or [])),
+            action=f"{STATE_SELECT_FOR_READING}/{STATE_READ_EXACT}/{STATE_ASSESS_COVERAGE}",
+            candidate_identity=candidate_identity,
+        )
+        fingerprints.append(fingerprint)
+        repeated = fingerprint in fingerprint_set
+        fingerprint_set.add(fingerprint)
+        # Vacuous coverage (no typed needs, model-free assessment) with
+        # an explicit selection follow-up request honors a bounded
+        # discovery round (#303 follow-up semantics) instead of closing
+        # ready; exhaustion below stays typed.
+        honor_selection_followup = False
+        try:
+            _more_requested = bool(getattr(selection, "need_more_detail", False))
+            _more_raw = list(getattr(selection, "followup_queries", []) or [])
+        except Exception:
+            _more_requested, _more_raw = False, []
+        if (
+            _more_requested
+            and _more_raw
+            and not need_id_order
+            and not verdict.used_model
+            and searches < MAX_COVERAGE_SEARCHES
+        ):
+            _more_sanitized = sanitize_followup_queries(
+                _more_raw,
+                seen_fingerprints=set(sent_query_fingerprints),
+                forbidden_texts=forbidden_echoes,
+                max_queries=MAX_FOLLOWUP_QUERIES,
+            )
+            honor_selection_followup = bool(_more_sanitized)
+        coverage_ready = bool(
+            verdict.all_covered
+            and (verdict.used_model or not need_id_order)
+            and not honor_selection_followup
+        )
+        if coverage_ready:
+            coverage_status = "ready"
+            exhaustion_reason = ""
+            break
+        if repeated and not progressed:
+            coverage_status = "exhausted"
+            exhaustion_reason = "repeated-state"
+            break
+        if iteration >= bounded_iterations - 1:
+            coverage_status = "exhausted"
+            exhaustion_reason = "iteration-budget"
+            break
+        # Decide expand vs search_more for the next round.
+        uncovered_now = [str(n) for n in list(verdict.missing_need_ids or [])]
+        if not uncovered_now and not honor_selection_followup:
+            coverage_status = "ready"
+            exhaustion_reason = ""
+            break
+        expanded_this_round = False
+        if expansions < MAX_COVERAGE_EXPANSIONS and read_child_order:
             try:
-                f_ranked, f_per_ids = await asyncio.to_thread(
-                    run_branch_searches, index, followups, branch_top_k=active.branch_top_k
+                grown = await asyncio.to_thread(
+                    expand_read_ranges,
+                    index,
+                    list(read_child_order),
+                    neighbor_window=active.neighbor_window,
+                    extra_step=1,
                 )
-                f_fused, f_pool = fuse_query_pool(
-                    f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+            except Exception:
+                grown = []
+            added = 0
+            for passage in grown or []:
+                pid = str(getattr(passage, "passage_id", "") or "")
+                if pid and pid not in cumulative_expanded:
+                    cumulative_expanded[pid] = passage
+                    cumulative_expanded_order.append(pid)
+                    added += 1
+            if added:
+                expansions += 1
+                expanded_this_round = True
+                # Re-budget and re-assess the grown pack before any new
+                # search: adjacent context may close coverage with no new ID.
+                regrown_ordered = [cumulative_expanded[pid] for pid in cumulative_expanded_order]
+                regrown_selected, regrown_total = select_passages_under_budget(
+                    regrown_ordered,
+                    budget_tokens=active.budget_tokens,
+                    index=index,
+                    priority_child_ids=tuple(read_child_order),
                 )
-                seen = {w.chunk_id for w in winners} | previewed_set
-                # Genuinely new evidence first: ids the model never
-                # previewed/read, best-first, bounded. Discovered-only ids
-                # (returned by the first retrieval but outside the preview
-                # window) remain promotable here.
-                fresh = sorted(
-                    (
-                        cand
-                        for cid, cand in f_fused.items()
-                        if cid not in seen and cid in index.chunks
-                    ),
-                    key=lambda item: item.fused_score,
-                    reverse=True,
-                )[:8]
-                followup_added = 0
-                for cand in fresh:
-                    if len(winners) >= MAX_SELECTED_CHUNKS + 8:
-                        break
-                    winners.append(cand)
-                    fused[cand.chunk_id] = cand
-                    if followup_need_ids:
-                        candidate_need_map[cand.chunk_id] = list(followup_need_ids)
-                    followup_added += 1
-            except Exception as exc:
-                from aa.opencode.errors import OpenCodeRateLimitError as _FollowupRateLimit
+                if coverage_assessor is not None:
+                    regrown_verdict = await aassess_coverage(
+                        list(regrown_selected),
+                        needs_for_selection,
+                        original_request=original_request,
+                        model=coverage_assessor,
+                        repair_hint=repair_hint_clean,
+                    )
+                    model_calls += 1
+                else:
+                    regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
+                regrown_covered = [
+                    item.need_id
+                    for item in list(regrown_verdict.needs or [])
+                    if item.covered and item.need_id not in covered_need_ids
+                ]
+                regrown_cited = [
+                    pid
+                    for item in list(regrown_verdict.needs or [])
+                    for pid in list(item.passage_ids or [])
+                    if pid and pid not in cited_passage_ids
+                ]
+                if regrown_covered or regrown_cited:
+                    progressed = True
+                    for nid in regrown_covered:
+                        covered_need_ids.add(nid)
+                        progress_events.append(f"expand-need-covered:{nid}")
+                    for pid in regrown_cited:
+                        cited_passage_ids.add(pid)
+                    if regrown_cited:
+                        progress_events.append(f"expand-cited:{len(regrown_cited)}-passages")
+                selected, total = regrown_selected, regrown_total
+                expanded = list(regrown_ordered)
+                last_verdict = regrown_verdict
+                if regrown_verdict.all_covered and (
+                    regrown_verdict.used_model or not need_id_order
+                ):
+                    coverage_status = "ready"
+                    exhaustion_reason = ""
+                    break
+                # Useful expansion without new IDs still counts as
+                # progress: continue rather than stagnating.
+                if regrown_covered or regrown_cited:
+                    continue
+        if expanded_this_round and not progressed:
+            # Expansion added ranges but no coverage gain; fall through
+            # to search_more below rather than stalling.
+            pass
+        if searches >= MAX_COVERAGE_SEARCHES or model_calls >= 8:
+            coverage_status = "exhausted"
+            exhaustion_reason = "search-budget"
+            break
+        # ---- search_more: bounded follow-up, then semantic
+        # reconsideration next iteration (never rank-only append).
+        raw_followups = list(selection.followup_queries[:MAX_FOLLOWUP_QUERIES])
+        if not raw_followups and uncovered_now:
+            # Coverage-driven fallback (#306): the selector was
+            # confidently wrong (need_more_detail=false, no follow-ups)
+            # yet full-read coverage still misses needs. Derive one
+            # bounded follow-up per uncovered need from the typed need
+            # texts (never from draft claims or policy wording), marked
+            # for deeper detail so the normalized string differs from
+            # the already-sent plan.
+            for nid in uncovered_now:
+                need_text = ""
+                try:
+                    for entry in list(needs_for_selection or []):
+                        if isinstance(entry, dict):
+                            cand_id = str(entry.get("need_id", "") or "").strip()
+                            cand_text = str(entry.get("text", "") or "")
+                        else:
+                            cand_id = str(getattr(entry, "need_id", "") or "").strip()
+                            cand_text = str(getattr(entry, "text", "") or "")
+                        if cand_id == nid and cand_text.strip():
+                            need_text = " ".join(cand_text.split())
+                            break
+                except Exception:
+                    need_text = ""
+                if not need_text:
+                    need_text = original_request
+                candidate = " ".join(f"{need_text} подробнее".split()).strip()
+                if candidate:
+                    raw_followups.append(candidate[:500])
+                if len(raw_followups) >= MAX_FOLLOWUP_QUERIES:
+                    break
+        try:
+            validated_followups = validate_recovery_queries(raw_followups)
+        except Exception:
+            validated_followups = []
+        followups = sanitize_followup_queries(
+            validated_followups,
+            seen_fingerprints=set(sent_query_fingerprints),
+            forbidden_texts=forbidden_echoes,
+            max_queries=MAX_FOLLOWUP_QUERIES,
+        )
+        if not followups:
+            coverage_status = "exhausted"
+            exhaustion_reason = "no-followup-queries" if not progressed else "iteration-budget"
+            if progressed and exhaustion_reason == "no-followup-queries":
+                exhaustion_reason = "iteration-budget"
+            break
+        for query_text in followups:
+            sent_query_fingerprints.add(
+                __import__("hashlib")
+                .sha256(" ".join(query_text.split()).casefold().encode("utf-8"))
+                .hexdigest()[:16]
+            )
+            all_queries.append(query_text)
+        try:
+            f_ranked, f_per_ids = await asyncio.to_thread(
+                run_branch_searches, index, followups, branch_top_k=active.branch_top_k
+            )
+            f_fused, _f_pool = fuse_query_pool(
+                f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
+            )
+        except Exception as exc:
+            from aa.opencode.errors import OpenCodeRateLimitError as _FollowupRateLimit
 
-                if isinstance(exc, (_FollowupRateLimit, asyncio.CancelledError)):
-                    raise
-                followup_added = 0
-    explicit_empty_followup = bool(
-        getattr(selection, "_used_model", False)
-        and not selection.selected_chunk_ids
-        and bool(selection.need_more_detail)
-    )
-    if not winners and not explicit_empty_followup:
-        # Fail-safe bounded fallback (never empty silent success): top RRF
-        # winners in fused order. Reached only when selection yields nothing
-        # usable; deep ranks stay reachable via the previews above on retry.
-        # Diversity caps apply here only, never to discovery previews above.
-        from aa.retrieval.evidence import dedup_and_diversify as _dedup
+            if isinstance(exc, (_FollowupRateLimit, asyncio.CancelledError)):
+                raise
+            coverage_status = "exhausted"
+            exhaustion_reason = "search-failed"
+            break
+        # Merge follow-up discoveries into the combined pool with the
+        # same typed query->need seam (attributed to the uncovered needs
+        # that triggered them, never via lexical guessing).
+        new_query_base = len(query_map_dicts)
+        for pos, _query_text in enumerate(followups):
+            query_map_dicts.append(
+                {"query_id": f"q{new_query_base + pos + 1}", "need_ids": list(uncovered_now)}
+            )
+        fresh_new = 0
+        for cid, cand in f_fused.items():
+            if cid not in index.chunks:
+                continue
+            # Follow-up evidence re-ranks genuinely: a candidate the new
+            # search scores higher is promoted monotonically (never
+            # demoted), so the next semantic selection reconsiders it on
+            # fresh evidence rather than a stale first-round rank. The
+            # selector still decides what to read; rank never appends.
+            # Follow-up evidence re-ranks genuinely: a candidate the new
+            # search scores higher is promoted monotonically (never
+            # demoted), so the next semantic selection reconsiders it on
+            # fresh evidence rather than a stale first-round rank. The
+            # selector still decides what to read; rank never appends.
+            previous = fused.get(cid)
+            if previous is None:
+                fused[cid] = cand
+                promoted = True
+            elif cand.fused_score > previous.fused_score:
+                fused[cid] = cand
+                promoted = True
+            else:
+                promoted = False
+            # A follow-up surfaces a candidate with genuinely new or
+            # up-ranked evidence that is still unread -- including one
+            # discovered earlier but outside the preview window
+            # (rank-66), now promoted for semantic reconsideration.
+            # Merely re-listing an already-read id never counts.
+            if promoted and cid not in read_child_set:
+                fresh_new += 1
+            # Provenance for newly discovered candidates follows the new
+            # query ids through the trusted map.
+            new_qids = [f"q{new_query_base + pos + 1}" for pos in range(len(followups))]
+            bucket_q = list(candidate_query_map.get(cid, []))
+            for qid in new_qids:
+                if qid not in bucket_q:
+                    bucket_q.append(qid)
+            candidate_query_map[cid] = bucket_q
+        candidate_need_map = candidate_need_provenance(candidate_query_map, query_map_dicts)
+        searches += 1
+        if fresh_new:
+            followup_added_total += fresh_new
+        # Many new IDs with no improved coverage is not progress: the
+        # next iteration's selection/read/assess decides; merely seeing
+        # them never counts here.
+        continue
 
-        _diverse_fallback = _dedup(
-            index,
-            pool_ids,
-            fused,
-            pool_cap=active.pool_cap,
-            max_per_section=active.max_per_section,
-        )
-        _ordered_fallback = sorted(
-            _diverse_fallback, key=lambda item: item.fused_score, reverse=True
-        )
-        # Section lookup stays bounded to the fallback candidates instead
-        # of iterating the whole index on every fallback turn.
-        sections_map: dict[str, str] = {}
-        for _item in _ordered_fallback:
-            _record = index.chunks.get(_item.chunk_id)
-            if _record is not None:
-                sections_map[_item.chunk_id] = str(getattr(_record, "section", "") or "")
-        winners = select_top_candidates(
-            _ordered_fallback,
-            top_cap=min(active.top_child_cap, MAX_SELECTED_CHUNKS),
-            sections=sections_map,
-        )
-    expanded = await asyncio.to_thread(
-        expand_small_to_big, index, winners, neighbor_window=active.neighbor_window
-    )
-    selected, total = select_passages_under_budget(
-        expanded,
-        budget_tokens=active.budget_tokens,
-        index=index,
-        priority_child_ids=tuple(w.chunk_id for w in winners),
-    )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     try:
-        telemetry = selection_telemetry(
-            previews=previews,
-            selection=selection,
-            latency_ms=sel_ms,
+        from aa.conversation.semantic_selection import selection_telemetry as _telemetry
+
+        telemetry = _telemetry(
+            previews=last_previews,
+            selection=last_selection
+            if last_selection is not None
+            else type(
+                "Empty",
+                (),
+                {
+                    "selected_chunk_ids": [],
+                    "need_more_detail": True,
+                    "followup_queries": [],
+                    "uncovered_need_ids": [],
+                    "_used_model": False,
+                },
+            )(),
+            latency_ms=sel_ms_total,
             information_needs=needs_for_selection,
         )
     except Exception:
         telemetry = {}
     try:
-        preview_map_serialized = serialize_preview_coverage(previews, selection)
+        preview_map_serialized = list(preview_map_merged.values())
     except Exception:
         preview_map_serialized = []
     from aa.retrieval.evidence import _short_digest as _digest
@@ -571,20 +967,76 @@ async def aretrieve_with_semantic_selection(
         _diverse_unique = len(_diverse_meta)
     except Exception:
         _diverse_unique = 0
-
-    read_ids = [w.chunk_id for w in winners]
     try:
-        need_ids_ordered = [s.need_id for s in preview_statuses]
+        need_ids_ordered = [s.need_id for s in last_preview_statuses]
     except Exception:
-        need_ids_ordered = []
+        need_ids_ordered = list(need_id_order)
     query_need_serialized: list[dict[str, Any]] = []
-    for entry in list(query_map_models or []):
+    for map_dict in list(query_map_dicts or []):
         try:
             query_need_serialized.append(
-                {"query_id": str(entry.query_id), "need_ids": list(entry.need_ids or [])}
+                {
+                    "query_id": str(map_dict.get("query_id", "")),
+                    "need_ids": list(map_dict.get("need_ids", []) or []),
+                }
             )
         except Exception:
             continue
+    # Final coverage snapshot over the served pack (narrowing-aware: the
+    # verdict below was assessed on the budgeted pack, so a condition
+    # lost to child-chunk degradation already reads as uncovered).
+    final_missing: list[str] = []
+    final_per_need: list[dict[str, Any]] = []
+    coverage_used_model = False
+    coverage_all_covered = False
+    try:
+        final_verdict = last_verdict
+        if final_verdict is not None:
+            coverage_used_model = bool(getattr(final_verdict, "used_model", False))
+            coverage_all_covered = bool(getattr(final_verdict, "all_covered", False))
+            missing_raw = list(getattr(final_verdict, "missing_need_ids", []) or [])
+            final_missing = [str(n) for n in missing_raw]
+            for item in list(getattr(final_verdict, "needs", []) or []):
+                try:
+                    final_per_need.append(
+                        {
+                            "need_id": str(getattr(item, "need_id", "")),
+                            "covered": bool(getattr(item, "covered", False)),
+                            "passage_ids": [
+                                str(p) for p in list(getattr(item, "passage_ids", []) or [])
+                            ],
+                            "anchors": [
+                                {
+                                    "passage_id": str(getattr(a, "passage_id", "")),
+                                    "source_id": str(getattr(a, "source_id", "")),
+                                    "section_id": str(getattr(a, "section_id", "")),
+                                    "char_start": int(getattr(a, "char_start", 0) or 0),
+                                    "char_end": int(getattr(a, "char_end", 0) or 0),
+                                }
+                                for a in list(getattr(item, "anchors", []) or [])
+                            ],
+                            "supporting_spans": [
+                                str(s)[:200]
+                                for s in list(getattr(item, "supporting_spans", []) or [])
+                            ],
+                            "missing": str(getattr(item, "missing", "") or "")[:300],
+                        }
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    if coverage_status == "ready" and not coverage_all_covered:
+        coverage_status = "exhausted"
+        exhaustion_reason = "coverage-incomplete"
+    if coverage_status == "ready":
+        exhaustion_reason = ""
+    try:
+        from aa.corpus.budget import estimate_text_tokens as _estimate
+
+        token_estimate = sum(_estimate(str(getattr(p, "exact_text", "") or "")) for p in selected)
+    except Exception:
+        token_estimate = int(total)
     metadata: dict[str, Any] = {
         "planner_query_count": len(cleaned),
         "primary_query_digest": _digest(cleaned[0]),
@@ -596,14 +1048,15 @@ async def aretrieve_with_semantic_selection(
         "pool_unique": len(pool_ids),
         "diverse_unique": _diverse_unique,
         "top_child_cap": active.top_child_cap,
-        "selected_winners": len(winners),
-        "retrieval_backend": "rrf-only/1+semantic-selection",
+        "selected_winners": len(read_child_order),
+        "retrieval_backend": "rrf-only/1+semantic-selection+coverage-loop",
+        "retrieval_loop": "discover/select_for_reading/read_exact/assess_coverage",
         "semantic_selection_model": selection_model is not None,
         "semantic_promoted": True,
-        "followup_added": followup_added,
+        "followup_added": followup_added_total,
         "followup_need_ids": list(followup_need_ids),
-        "discovered_ids": list(discovered_ids),
-        "previewed_ids": list(previewed_ids),
+        "discovered_ids": list(discovered_first),
+        "previewed_ids": list(previewed_ids_all),
         "read_ids": list(read_ids),
         "information_need_ids": list(need_ids_ordered),
         "query_need_map": query_need_serialized,
@@ -614,10 +1067,21 @@ async def aretrieve_with_semantic_selection(
                 "best_fused_rank": s.best_fused_rank,
                 "represented": s.represented,
             }
-            for s in preview_statuses
+            for s in last_preview_statuses
         ],
         "selection_preview_map": preview_map_serialized,
-        "uncovered_need_ids": list(selection.uncovered_need_ids or []),
+        "uncovered_need_ids": list(
+            dict.fromkeys(
+                [
+                    str(n)
+                    for n in list(
+                        (last_selection.uncovered_need_ids if last_selection is not None else [])
+                        or []
+                    )
+                ]
+                + list(final_missing)
+            )
+        ),
         "neighbor_window": active.neighbor_window,
         "expanded_passages": len(expanded),
         "selected_passages": len(selected),
@@ -626,15 +1090,30 @@ async def aretrieve_with_semantic_selection(
         "latency_ms": elapsed_ms,
         "latency_budget_ms": INTERACTIVE_LATENCY_BUDGET_MS,
         "latency_over_budget": elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS,
+        "coverage_status": coverage_status,
+        "coverage_exhausted": bool(coverage_status == "exhausted"),
+        "coverage_all_covered": bool(coverage_all_covered),
+        "coverage_used_model": bool(coverage_used_model),
+        "coverage_missing_need_ids": list(final_missing),
+        "coverage_per_need": final_per_need,
+        "coverage_exhaustion_reason": exhaustion_reason,
+        "loop_iterations": len(fingerprints),
+        "loop_expansions": expansions,
+        "loop_searches": searches,
+        "loop_model_calls": model_calls,
+        "loop_token_estimate": token_estimate,
+        "loop_progress_events": list(progress_events),
+        "loop_fingerprints": list(fingerprints),
     }
     metadata.update({f"selection_{k}": v for k, v in telemetry.items()})
     logger.info(
-        "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d",
+        "v2 evidence queries=%d pool=%d winners=%d passages=%d tokens=%d coverage=%s",
         len(cleaned),
-        len(previews),
-        len(winners),
+        len(last_previews),
+        len(read_child_order),
         len(selected),
         total,
+        coverage_status,
     )
     return EvidencePack(
         passages=tuple(selected),
@@ -650,20 +1129,22 @@ async def retrieval_node(
     index: HybridIndex,
     config: RetrievalConfig | None = None,
     selection_model: Any | None = None,
+    coverage_model: Any | None = None,
 ) -> dict[str, Any]:
     """LangGraph retrieval node: queries to hits plus Evidence Pack.
 
-    Runs the RRF-only pipeline in a worker thread on the RAM-resident index.
-    The per-turn wall-clock latency against
+    Runs the shared read/coverage loop on the RAM-resident index. The
+    per-turn wall-clock latency against
     ``INTERACTIVE_LATENCY_BUDGET_MS`` is measured and propagated in
     state (``retrieval_latency_ms``/``retrieval_over_budget``) for
     observability. Only counts and latencies are logged, never prompts
     or user text.
 
-    When ``selection_model`` is bound, model-driven semantic selection runs
-    over genuinely broad hybrid candidates (including fused rank >16)
-    BEFORE winner/pack budgeting; otherwise the bounded heuristic promotion
-    inside :func:`retrieve_evidence` applies.
+    Model-driven semantic selection runs over genuinely broad hybrid
+    candidates (including fused rank >16) BEFORE winner/pack budgeting;
+    without a model the bounded heuristic discovery applies and coverage
+    stays conservatively uncovered (lexical signals never decide
+    sufficiency).
     """
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
@@ -722,50 +1203,25 @@ async def retrieval_node(
     except Exception:
         state_needs = None
         state_query_map = None
-    if selection_model is not None:
-        # Model-driven path: broad candidates -> LLM selection -> exact
-        # full fetch -> budgeting. Provider 429 propagates for checkpoint
-        # recovery; any other selection failure falls back to the bounded
-        # heuristic pipeline below (never an empty silent success).
-        try:
-            pack = await aretrieve_with_semantic_selection(
-                index,
-                queries,
-                config=active_config,
-                resolved_intent=resolved_intent,
-                conversation_context=conversation_context,
-                user_message=user_message,
-                selection_model=selection_model,
-                context_digest=canonical_digest,
-                information_needs=state_needs,
-                query_need_map=state_query_map,
-            )
-        except Exception as exc:
-            from aa.opencode.errors import OpenCodeRateLimitError as _SelRateLimit
-
-            if isinstance(exc, (_SelRateLimit, asyncio.CancelledError)):
-                raise
-            logger.info(
-                "v2 retrieval selection failed; heuristic pipeline used",
-                extra={"category": type(exc).__name__},
-            )
-            pack = await asyncio.to_thread(
-                retrieve_evidence,
-                index,
-                queries,
-                config=active_config,
-                resolved_intent=resolved_intent,
-                conversation_context=conversation_context,
-            )
-    else:
-        pack = await asyncio.to_thread(
-            retrieve_evidence,
-            index,
-            queries,
-            config=active_config,
-            resolved_intent=resolved_intent,
-            conversation_context=conversation_context,
-        )
+    # One shared async discover/select/read/assess/expand/search_more
+    # mechanism for every path (normal, repair, safety, no-evidence).
+    # Provider 429 propagates for checkpoint recovery; any other failure
+    # inside the loop already degrades to conservative uncovered rather
+    # than an empty silent success, so no legacy rank-only fallback runs
+    # here.
+    pack = await aretrieve_with_semantic_selection(
+        index,
+        queries,
+        config=active_config,
+        resolved_intent=resolved_intent,
+        conversation_context=conversation_context,
+        user_message=user_message,
+        selection_model=selection_model,
+        coverage_model=coverage_model if coverage_model is not None else selection_model,
+        context_digest=canonical_digest,
+        information_needs=state_needs,
+        query_need_map=state_query_map,
+    )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
     try:
@@ -827,13 +1283,18 @@ def make_retrieval_node(
     index: HybridIndex,
     config: RetrievalConfig | None = None,
     selection_model: Any | None = None,
+    coverage_model: Any | None = None,
 ) -> Any:
     """Build the evidence retrieval node bound to one RAM-resident index."""
     active_config = config if config is not None else RetrievalConfig()
 
     async def run_evidence_retrieval(state: TurnState) -> dict[str, Any]:
         return await retrieval_node(
-            state, index=index, config=active_config, selection_model=selection_model
+            state,
+            index=index,
+            config=active_config,
+            selection_model=selection_model,
+            coverage_model=coverage_model if coverage_model is not None else selection_model,
         )
 
     return run_evidence_retrieval

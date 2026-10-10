@@ -159,15 +159,20 @@ async def test_repair_replan_focus_stays_anchored_to_live_request(
 
     monkeypatch.setattr("aa.conversation.planner_node.run_planner", _fake_planner)
 
-    def _fake_retrieve(index: Any, queries: Any, *, config: Any = None, **kwargs: Any) -> Any:
-        _ = (index, queries, config)
+    # #306: repair retrieval traverses the shared async read/coverage
+    # loop; the test seam is the shared mechanism, not the legacy sync
+    # rank-only bypass.
+    async def _fake_retrieve(index: Any, queries: Any, *, config: Any = None, **kwargs: Any) -> Any:
+        _ = (index, queries, config, kwargs)
 
         class _Pack:
             pass
 
         return _Pack()
 
-    monkeypatch.setattr("aa.retrieval.evidence.retrieve_evidence", _fake_retrieve)
+    monkeypatch.setattr(
+        "aa.conversation.retrieval_node.aretrieve_with_semantic_selection", _fake_retrieve
+    )
 
     def _fake_pack_to_state(pack: Any) -> tuple[Any, list[dict[str, Any]]]:
         _ = pack
