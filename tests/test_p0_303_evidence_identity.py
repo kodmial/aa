@@ -350,11 +350,7 @@ def test_rank66_unseen_candidate_promoted_on_followup(monkeypatch: Any) -> None:
     assert len(previewed) >= 64
     assert "chapter-1:ru:c0065" in previewed
     assert len(discovered) >= 64
-    assert (
-        set(previewed) < set(discovered)
-        or len(discovered) > len(previewed)
-        or "chapter-1:ru:c0065" in previewed
-    )
+    assert set(previewed) < set(discovered) or len(discovered) > len(previewed)
     assert read, "read ids must be observable"
     texts = " ".join(passage.exact_text for passage in pack.passages)
     assert "Решающий отрывок" in texts
