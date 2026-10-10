@@ -25,12 +25,15 @@ expansion -> pack``.
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import logging
 import time
 from typing import Any
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
+from aa.opencode.errors import OpenCodeRateLimitError
 from aa.retrieval.evidence import (
     INTERACTIVE_LATENCY_BUDGET_MS,
     EvidencePack,
@@ -39,6 +42,261 @@ from aa.retrieval.evidence import (
 from aa.retrieval.index import HybridIndex, logical_chunk_id
 
 logger = logging.getLogger("aa.conversation.retrieval_node")
+
+# Bounded per-model-call slice of the interactive retrieval budget
+# (kodmial/aa#331): one slow selector/coverage provider call must not
+# consume the whole turn. Each call is bounded by the smaller of this
+# cap and the remaining interactive budget; expiry yields a typed
+# ``exhausted/latency-budget`` outcome, never a retry loop or fake
+# coverage. Reuses the existing selection-attempt scale (8s), not a new
+# product threshold.
+SELECTION_PER_CALL_BUDGET_S = 8.0
+COVERAGE_PER_CALL_BUDGET_S = 8.0
+
+# Bounded canonical read cache (kodmial/aa#331): exact expanded
+# passages keyed by stable child id + neighbor window. Content is
+# content-addressed (checksum validated on hit); the cache only avoids
+# re-expanding the same canonical range within/between turns. Bounded
+# FIFO so memory stays flat; keys never carry user text.
+_READ_CACHE_MAX = 512
+_EXPANDED_READ_CACHE: dict[tuple[str, int], Any] = {}
+
+
+class _InteractiveBudgetTimeout(TimeoutError):
+    """One bounded model/retriever await exceeded the interactive deadline."""
+
+
+def _effective_interactive_budget_ms() -> float:
+    """Tightest applicable interactive budget (retrieval-node + evidence).
+
+    Reads the retrieval-node module constant so a node-level override
+    takes effect, while still honoring a tightened evidence-level budget
+    (both names are patched in tests). The smaller value wins so
+    remaining-budget and per-call-cap logic cannot diverge.
+    """
+    candidates: list[float] = []
+    try:
+        candidates.append(float(INTERACTIVE_LATENCY_BUDGET_MS))
+    except Exception:
+        pass
+    try:
+        from aa.retrieval import evidence as _evidence_mod
+
+        candidates.append(float(_evidence_mod.INTERACTIVE_LATENCY_BUDGET_MS))
+    except Exception:
+        pass
+    if not candidates:
+        return 0.0
+    return min(candidates)
+
+
+def _remaining_interactive_ms(started: float) -> float:
+    """Remaining interactive retrieval budget in milliseconds."""
+    try:
+        return float(_effective_interactive_budget_ms()) - (time.perf_counter() - started) * 1000.0
+    except Exception:
+        return 0.0
+
+
+async def _await_under_interactive_deadline(
+    coro_factory: Any, started: float, *, per_call_cap_s: float
+) -> Any:
+    """Await one provider/retriever coroutine under the interactive deadline.
+
+    ``coro_factory`` is a zero-argument callable producing the awaitable,
+    invoked only after the budget check so an already-spent budget never
+    creates an un-awaited coroutine. The timeout is the smaller of
+    ``per_call_cap_s`` and the remaining interactive budget, so a slow
+    provider tail fails fast to a typed exhausted outcome instead of
+    grinding sequential calls. The underlying await is cancelled on
+    expiry so no provider work continues after the turn is irrecoverably
+    timed out. ``Cancelled`` and provider 429 always propagate for runner
+    retire/resume and are never converted to exhaustion.
+    """
+    remaining_ms = _remaining_interactive_ms(started)
+    if remaining_ms <= 0:
+        raise _InteractiveBudgetTimeout("interactive budget already spent")
+    timeout_s = min(float(per_call_cap_s), remaining_ms / 1000.0)
+    if timeout_s <= 0:
+        raise _InteractiveBudgetTimeout("interactive budget already spent")
+    coro = coro_factory() if callable(coro_factory) else coro_factory
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except TimeoutError as exc:
+        raise _InteractiveBudgetTimeout("interactive deadline exceeded") from exc
+
+
+def _preview_identity(previews: Any) -> str:
+    """Stable identity for one preview set (candidates + ranks + need seam).
+
+    Covers chunk ids, fused ranks and the trusted need seam only. The
+    planner query ids (``q1..qN`` positions) are deliberately excluded:
+    re-attributing the same candidates to a new query id without any
+    new candidate, rank change, or need association is not progress and
+    must not justify another sequential selector call. A genuinely new
+    deep-ranked candidate, a re-rank, or a changed need seam changes the
+    identity and continues.
+    """
+    try:
+        parts: list[str] = []
+        for preview in list(previews or []):
+            cid = str(getattr(preview, "chunk_id", "") or "")
+            rank = str(getattr(preview, "fused_rank", "") or "")
+            nids = ",".join(sorted(str(n) for n in list(getattr(preview, "need_ids", ()) or ())))
+            if cid:
+                parts.append(f"{cid}@{rank}[{nids}]")
+        parts.sort()
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _is_cached_expansion_valid(index: Any, winner_cid: str, cached: Any) -> bool:
+    """Checksum-validate a cached expanded range against the live index.
+
+    Content-addressed safety: the cached ``exact_text`` must checksum to
+    its stored ``text_sha256``, the winner must belong to the cached
+    child set, and the concatenation of the live child texts must equal
+    the cached exact text (checksum equality). Any neighbor change thus
+    invalidates the hit instead of serving a stale adjacent range.
+    """
+    try:
+        exact_text = str(getattr(cached, "exact_text", "") or "")
+        cached_hash = str(getattr(cached, "text_sha256", "") or "")
+        if not exact_text or not cached_hash:
+            return False
+        if hashlib.sha256(exact_text.encode("utf-8")).hexdigest() != cached_hash:
+            return False
+        child_ids = [str(c) for c in list(getattr(cached, "child_chunk_ids", ()) or ())]
+        if not child_ids:
+            record = index.chunks.get(winner_cid)
+            if record is None:
+                return False
+            live_text = str(getattr(record, "text", "") or "")
+            live_hash = str(getattr(record, "text_sha256", "") or "")
+            return bool(live_text == exact_text and live_hash == cached_hash)
+        if winner_cid not in child_ids:
+            return False
+        chunks = getattr(index, "chunks", None)
+        if chunks is None:
+            return False
+        parts: list[str] = []
+        for child_id in child_ids:
+            record = chunks.get(child_id)
+            if record is None:
+                return False
+            live_text = str(getattr(record, "text", "") or "")
+            live_hash = str(getattr(record, "text_sha256", "") or "")
+            if not live_text or not live_hash:
+                return False
+            if hashlib.sha256(live_text.encode("utf-8")).hexdigest() != live_hash:
+                return False
+            parts.append(live_text)
+        live_exact = "".join(parts)
+        if live_exact != exact_text:
+            return False
+        return bool(hashlib.sha256(live_exact.encode("utf-8")).hexdigest() == cached_hash)
+    except Exception:
+        return False
+
+
+def _cached_expand_small_to_big(index: Any, winners: Any, *, neighbor_window: int) -> list[Any]:
+    """Expand winners reusing validated cached canonical ranges where safe.
+
+    Cache key is the stable child chunk id plus the neighbor window; a
+    hit is returned only after the cached exact text still checksums
+    against the live index record, so a changed corpus never serves a
+    stale range. Misses delegate to the canonical expansion and are
+    stored under a bounded FIFO. Provenance and exact text stay
+    canonical; this only avoids recomputing the same range twice.
+    """
+    from aa.retrieval.evidence import expand_small_to_big as _expand
+
+    window = int(neighbor_window)
+    winners_list = list(winners or [])
+    if not winners_list:
+        return []
+    uncached: list[Any] = []
+    uncached_pos: list[int] = []
+    out: list[Any | None] = [None] * len(winners_list)
+    hits = 0
+    for pos, winner in enumerate(winners_list):
+        try:
+            cid = str(getattr(winner, "chunk_id", "") or "")
+        except Exception:
+            cid = ""
+        if not cid:
+            uncached.append(winner)
+            uncached_pos.append(pos)
+            continue
+        key = (cid, window)
+        cached = _EXPANDED_READ_CACHE.get(key)
+        if cached is not None:
+            try:
+                if _is_cached_expansion_valid(index, cid, cached):
+                    out[pos] = cached
+                    hits += 1
+                    continue
+            except Exception:
+                pass
+        uncached.append(winner)
+        uncached_pos.append(pos)
+    _ = hits
+    if uncached:
+        fresh = _expand(index, uncached, neighbor_window=window)
+        fresh_by_child: dict[str, list[Any]] = {}
+        for passage in fresh:
+            try:
+                for cid in list(getattr(passage, "child_chunk_ids", ()) or ()):
+                    fresh_by_child.setdefault(str(cid), []).append(passage)
+            except Exception:
+                continue
+        for winner, pos in zip(uncached, uncached_pos, strict=True):
+            try:
+                cid = str(getattr(winner, "chunk_id", "") or "")
+            except Exception:
+                cid = ""
+            options = fresh_by_child.get(cid, [])
+            chosen = options[0] if options else None
+            out[pos] = chosen
+            if chosen is not None and cid:
+                try:
+                    key = (cid, window)
+                    if key not in _EXPANDED_READ_CACHE:
+                        while len(_EXPANDED_READ_CACHE) >= _READ_CACHE_MAX:
+                            _EXPANDED_READ_CACHE.pop(next(iter(_EXPANDED_READ_CACHE)))
+                        _EXPANDED_READ_CACHE[key] = chosen
+                except Exception:
+                    pass
+    merged: dict[str, Any] = {}
+    order: list[str] = []
+    for item in list(out):
+        if item is None:
+            continue
+        try:
+            pid = str(getattr(item, "passage_id", "") or "")
+        except Exception:
+            continue
+        if pid and pid not in merged:
+            merged[pid] = item
+            order.append(pid)
+    # Preserve canonical expansion order for genuinely new ranges while
+    # reusing cached identities above; fall back to fresh order when the
+    # cache path cannot reconstruct it.
+    try:
+        fresh_ids = [str(getattr(p, "passage_id", "") or "") for p in fresh]  # noqa: F821
+        ordered = [merged[pid] for pid in fresh_ids if pid in merged]
+        for pid in order:
+            if pid not in fresh_ids:
+                ordered.append(merged[pid])
+        return ordered
+    except Exception:
+        return [merged[pid] for pid in order]
+
+
+def clear_canonical_read_cache() -> None:
+    """Drop cached canonical expansions (tests/tooling only)."""
+    _EXPANDED_READ_CACHE.clear()
 
 
 def _provenance_lists(
@@ -320,7 +578,6 @@ async def aretrieve_with_semantic_selection(
     from aa.retrieval.evidence import (
         candidate_need_provenance,
         candidate_query_provenance,
-        expand_small_to_big,
         fuse_query_pool,
         run_branch_searches,
         select_passages_under_budget,
@@ -423,6 +680,8 @@ async def aretrieve_with_semantic_selection(
     progress_events: list[str] = []
     fingerprints: list[str] = []
     fingerprint_set: set[str] = set()
+    preview_identities_seen: set[str] = set()
+    deadline_stops = 0
     preview_map_merged: dict[str, dict[str, Any]] = {}
     discovered_first: list[str] = []
     try:
@@ -466,9 +725,9 @@ async def aretrieve_with_semantic_selection(
         truncation, no skipped semantic checks on the fast path.
         """
         try:
-            from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS as _budget
-
-            return (time.perf_counter() - started) * 1000.0 > float(_budget)
+            return (time.perf_counter() - started) * 1000.0 > float(
+                _effective_interactive_budget_ms()
+            )
         except Exception:
             return False
 
@@ -507,20 +766,45 @@ async def aretrieve_with_semantic_selection(
         except Exception:
             preview_statuses = []
         last_preview_statuses = list(preview_statuses)
+        # Bounded progression (#331): an identical preview set (same
+        # candidate ids, ranks and need seam) cannot produce new reading
+        # progress. Issuing another selector model call over byte-identical
+        # previews is demonstrably redundant sequential work, so stop
+        # without a call; a new deep-ranked candidate or a changed seam
+        # changes the identity and continues. Never a fixed-count cap.
+        preview_identity = _preview_identity(previews)
+        if preview_identity and preview_identity in preview_identities_seen:
+            coverage_status = "exhausted"
+            exhaustion_reason = "repeated-state"
+            progress_events.append("preview-unchanged-skip")
+            break
+        if preview_identity:
+            preview_identities_seen.add(preview_identity)
         sel_started = time.perf_counter()
         known_chunk_ids = {cid for cid in fused if cid in index.chunks}
         known_need_ids = {s.need_id for s in preview_statuses} or None
-        selection = await aselect_semantic_candidates(
-            previews,
-            resolved_intent=original_request,
-            conversation_context=conversation_context,
-            user_message=user_message,
-            model=selection_model,
-            known_chunk_ids=known_chunk_ids,
-            context_digest=context_digest,
-            information_needs=needs_for_selection,
-            known_need_ids=known_need_ids,
-        )
+        try:
+            selection = await _await_under_interactive_deadline(
+                functools.partial(
+                    aselect_semantic_candidates,
+                    previews,
+                    resolved_intent=original_request,
+                    conversation_context=conversation_context,
+                    user_message=user_message,
+                    model=selection_model,
+                    known_chunk_ids=known_chunk_ids,
+                    context_digest=context_digest,
+                    information_needs=needs_for_selection,
+                    known_need_ids=known_need_ids,
+                ),
+                started,
+                per_call_cap_s=SELECTION_PER_CALL_BUDGET_S,
+            )
+        except _InteractiveBudgetTimeout:
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            progress_events.append("selection-deadline-stop")
+            break
         model_calls += 1
         # Conservative close-out (#311): unrepresented/unselected needs
         # report uncovered; only full-read assessment can mark sufficiency.
@@ -602,11 +886,24 @@ async def aretrieve_with_semantic_selection(
                 sections=sections_map,
             )
         # ---- read_exact: full canonical passages for newly selected ids.
+        # Canonical reads reuse the validated read cache where the same
+        # stable range was already expanded; a new range or wider window
+        # is genuine progress and is read fully.
         new_winners = [w for w in winners if w.chunk_id not in read_child_set]
         if new_winners:
-            newly_expanded = await asyncio.to_thread(
-                expand_small_to_big, index, new_winners, neighbor_window=active.neighbor_window
-            )
+            try:
+                newly_expanded = await asyncio.to_thread(
+                    _cached_expand_small_to_big,
+                    index,
+                    new_winners,
+                    neighbor_window=active.neighbor_window,
+                )
+            except Exception:
+                from aa.retrieval.evidence import expand_small_to_big as _expand_direct
+
+                newly_expanded = await asyncio.to_thread(
+                    _expand_direct, index, new_winners, neighbor_window=active.neighbor_window
+                )
             for passage in newly_expanded:
                 pid = str(getattr(passage, "passage_id", "") or "")
                 if pid and pid not in cumulative_expanded:
@@ -633,15 +930,30 @@ async def aretrieve_with_semantic_selection(
         read_ids = list(read_child_order)
         # ---- assess_coverage over the full exact budgeted pack.
         # need_more_detail=false never proves sufficiency: only this
-        # full-read verdict can mark ready.
+        # full-read verdict can mark ready. Bounded by the remaining
+        # interactive deadline so a slow coverage tail fails fast to a
+        # typed exhausted outcome instead of grinding; 429/cancel
+        # propagate, never swallowed.
         if coverage_assessor is not None:
-            verdict = await aassess_coverage(
-                list(selected),
-                needs_for_selection,
-                original_request=original_request,
-                model=coverage_assessor,
-                repair_hint=repair_hint_clean,
-            )
+            try:
+                verdict = await _await_under_interactive_deadline(
+                    functools.partial(
+                        aassess_coverage,
+                        list(selected),
+                        needs_for_selection,
+                        original_request=original_request,
+                        model=coverage_assessor,
+                        repair_hint=repair_hint_clean,
+                    ),
+                    started,
+                    per_call_cap_s=COVERAGE_PER_CALL_BUDGET_S,
+                )
+            except _InteractiveBudgetTimeout:
+                coverage_status = "exhausted"
+                exhaustion_reason = "latency-budget"
+                progress_events.append("coverage-deadline-stop")
+                deadline_stops += 1
+                break
             model_calls += 1
         else:
             verdict = conservative_uncovered_verdict(needs_for_selection)
@@ -773,14 +1085,25 @@ async def aretrieve_with_semantic_selection(
                     priority_child_ids=tuple(read_child_order),
                 )
                 if coverage_assessor is not None and not _interactive_budget_exceeded():
-                    regrown_verdict = await aassess_coverage(
-                        list(regrown_selected),
-                        needs_for_selection,
-                        original_request=original_request,
-                        model=coverage_assessor,
-                        repair_hint=repair_hint_clean,
-                    )
-                    model_calls += 1
+                    try:
+                        regrown_verdict = await _await_under_interactive_deadline(
+                            functools.partial(
+                                aassess_coverage,
+                                list(regrown_selected),
+                                needs_for_selection,
+                                original_request=original_request,
+                                model=coverage_assessor,
+                                repair_hint=repair_hint_clean,
+                            ),
+                            started,
+                            per_call_cap_s=COVERAGE_PER_CALL_BUDGET_S,
+                        )
+                    except _InteractiveBudgetTimeout:
+                        regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
+                        progress_events.append("interactive-budget-skip-reassess")
+                        deadline_stops += 1
+                    else:
+                        model_calls += 1
                 elif coverage_assessor is not None:
                     # Interactive budget spent: keep the grown exact
                     # passages but do not issue another model call.
@@ -893,16 +1216,26 @@ async def aretrieve_with_semantic_selection(
             )
             all_queries.append(query_text)
         try:
-            f_ranked, f_per_ids = await asyncio.to_thread(
-                run_branch_searches, index, followups, branch_top_k=active.branch_top_k
+            remaining_ms = _remaining_interactive_ms(started)
+            if remaining_ms <= 0:
+                raise _InteractiveBudgetTimeout("interactive budget already spent")
+            f_ranked, f_per_ids = await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_branch_searches, index, followups, branch_top_k=active.branch_top_k
+                ),
+                timeout=max(0.05, remaining_ms / 1000.0),
             )
             f_fused, _f_pool = fuse_query_pool(
                 f_ranked, f_per_ids, rrf_k=active.rrf_k, pool_cap=active.pool_cap
             )
+        except _InteractiveBudgetTimeout:
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            progress_events.append("interactive-budget-stop-search")
+            deadline_stops += 1
+            break
         except Exception as exc:
-            from aa.opencode.errors import OpenCodeRateLimitError as _FollowupRateLimit
-
-            if isinstance(exc, (_FollowupRateLimit, asyncio.CancelledError)):
+            if isinstance(exc, (OpenCodeRateLimitError, asyncio.CancelledError)):
                 raise
             coverage_status = "exhausted"
             exhaustion_reason = "search-failed"
@@ -1141,6 +1474,8 @@ async def aretrieve_with_semantic_selection(
         "loop_token_estimate": token_estimate,
         "loop_progress_events": list(progress_events),
         "loop_fingerprints": list(fingerprints),
+        "loop_deadline_stops": int(deadline_stops),
+        "loop_preview_dedup": len(preview_identities_seen),
     }
     metadata.update({f"selection_{k}": v for k, v in telemetry.items()})
     logger.info(
@@ -1548,7 +1883,10 @@ def make_retrieval_node(
 
 
 __all__ = [
+    "COVERAGE_PER_CALL_BUDGET_S",
+    "SELECTION_PER_CALL_BUDGET_S",
     "aretrieve_with_semantic_selection",
+    "clear_canonical_read_cache",
     "make_retrieval_node",
     "pack_to_state",
     "retrieval_node",
