@@ -594,12 +594,26 @@ def check_delivery_receipts(
     # The confirmed intervals must jointly cover the whole text.
     try:
         total = len(normalized)
-        covered = 0
+        intervals: list[tuple[int, int]] = []
         for item in sorted(confirmed, key=lambda entry: int(entry.get("char_start", 0) or 0)):
             start = int(item.get("char_start", 0) or 0)
             end = int(item.get("char_end", 0) or 0)
+            start = max(0, start)
+            end = min(total, end)
             if end > start:
-                covered += end - start
+                intervals.append((start, end))
+        covered = 0
+        cursor_start = -1
+        cursor_end = -1
+        for start, end in intervals:
+            if start > cursor_end:
+                if cursor_end > cursor_start:
+                    covered += cursor_end - cursor_start
+                cursor_start, cursor_end = start, end
+            else:
+                cursor_end = max(cursor_end, end)
+        if cursor_end > cursor_start:
+            covered += cursor_end - cursor_start
         if covered < total:
             return False, "incomplete-delivery"
     except Exception:
@@ -1035,7 +1049,10 @@ def decide_status_307(
         return "INCOMPLETE"
     if not case_results:
         return "INCOMPLETE"
-    if any(not item.passed for item in case_results if item.case_id.endswith("positive-faithful")):
+    positives = [item for item in case_results if item.case_id.endswith("positive-faithful")]
+    if not positives:
+        return "INCOMPLETE"
+    if any(not item.passed for item in positives):
         return "FAIL"
     return "PASS"
 

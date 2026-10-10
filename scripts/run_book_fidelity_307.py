@@ -71,6 +71,43 @@ def _file_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _prerequisite_digest(path: Path) -> tuple[str, bool]:
+    """Fail-closed digest for a required live prerequisite file."""
+    try:
+        if not path.is_file():
+            return "absent", False
+        if path.stat().st_size <= 0:
+            return "absent", False
+        return _file_sha(path), True
+    except Exception:
+        return "absent", False
+
+
+def _expert_review_completed(path: Path | None) -> bool:
+    """Fail-closed expert-review gate: require substantive evidence.
+
+    A touched empty (or whitespace-only / trivial) file proves no human
+    reading, so it must not count as a completed expert review.
+    """
+    if path is None:
+        return False
+    try:
+        candidate = Path(path)
+    except Exception:
+        return False
+    try:
+        if not candidate.is_file():
+            return False
+        if candidate.stat().st_size <= 0:
+            return False
+        text = candidate.read_text(encoding="utf-8", errors="strict").strip()
+    except Exception:
+        return False
+    if len(text) < 32:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Trusted #307 independent book-fidelity qualification."
@@ -158,10 +195,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # ---- live + human-review gates (never mocked to PASS) ----
-    live_decisive = os.environ.get("AA_307_LIVE_DECISIVE", "") == "1"
-    expert_review_completed = (
-        bool(args.expert_review_evidence) and Path(args.expert_review_evidence).is_file()
+    # Fail-closed prerequisites: PASS additionally requires the real
+    # canonical corpus manifest and the benchmark rubric to exist with
+    # substantive content. Missing prerequisites force INCOMPLETE via
+    # live_decisive=False (reason live-prerequisites-absent), never PASS.
+    corpus_sha, corpus_ok = _prerequisite_digest(ROOT / "corpus/canonical.ru.manifest.json")
+    benchmark_sha, benchmark_ok = _prerequisite_digest(
+        ROOT / "qualification/ru_book_fidelity_307.v1.json"
     )
+    prerequisites_ok = corpus_ok and benchmark_ok
+    live_decisive = os.environ.get("AA_307_LIVE_DECISIVE", "") == "1" and prerequisites_ok
+    expert_review_completed = _expert_review_completed(args.expert_review_evidence)
     incomplete = False
     reason = ""
     if failures:
@@ -175,7 +219,16 @@ def main(argv: list[str] | None = None) -> int:
             expert_review_completed=expert_review_completed,
             live_decisive=live_decisive,
         )
-        if status == "INCOMPLETE" and not live_decisive:
+        # Defense in depth: PASS is unreachable without real prerequisites,
+        # substantive expert evidence, and a decisive live run.
+        if status == "PASS" and not (
+            prerequisites_ok and expert_review_completed and live_decisive
+        ):
+            status = "INCOMPLETE"
+        if status == "INCOMPLETE" and not prerequisites_ok:
+            reason = "live-prerequisites-absent"
+            incomplete = True
+        elif status == "INCOMPLETE" and not live_decisive:
             reason = "live-prerequisites-absent"
             incomplete = True
         elif status == "INCOMPLETE" and not expert_review_completed:
@@ -183,21 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             incomplete = True
 
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
-    corpus_sha = "absent"
-    benchmark_sha = "absent"
     retrieval_sha = "absent"
     config_sha = "absent"
-    for rel, slot in (
-        ("corpus/canonical.ru.manifest.json", "corpus"),
-        ("qualification/ru_book_fidelity_307.v1.json", "benchmark"),
-    ):
-        path = ROOT / rel
-        if path.is_file():
-            digest = _file_sha(path)
-            if slot == "corpus":
-                corpus_sha = digest
-            else:
-                benchmark_sha = digest
     retrieval_path = ROOT / "src" / "aa" / "qualification" / "book_fidelity_307.py"
     if retrieval_path.is_file():
         retrieval_sha = _file_sha(retrieval_path)
