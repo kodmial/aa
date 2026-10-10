@@ -1719,6 +1719,26 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
         return False
     if snapshot.get("qualified") is not True:
         return False
+    # No fabricated semantic selection (#312): a heuristic
+    # ``lexical_fallback``/unavailable pack must never pass as model
+    # selection. Historical ``pack_order=semantic`` without an executed
+    # model route is rejected, and ``semantic_selection_applied`` is
+    # accepted only with ``selection_route == "model_selection"``.
+    try:
+        route = str(snapshot.get("selection_route", "") or "").strip()
+        pack_order = str(snapshot.get("pack_order", "") or "").strip()
+        applied = snapshot.get("semantic_selection_applied", False)
+        if pack_order == "semantic":
+            return False
+        if pack_order == "model_selection" and route != "model_selection":
+            return False
+        if applied is True and route != "model_selection":
+            return False
+    except Exception:
+        return False
+    # Delivery is proven by the real sent Telegram text passed as
+    # ``reply`` above, never by a telemetry flag alone (#312): graph
+    # success / provisional certification is not acknowledgment.
     return True
 
 

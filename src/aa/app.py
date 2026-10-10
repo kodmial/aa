@@ -1100,6 +1100,15 @@ class Application:
             return False
         logger.info("voice reply delivered")
         _record_voice("confirmed", "sendVoice")
+        # Voice/text equivalence (#312): the certified spoken text counts
+        # as delivered once via sendVoice; a later text fallback never
+        # double-counts it.
+        try:
+            if self._graph_runtime is not None:
+                thread = self._graph_runtime.thread_id(incoming.chat_id)
+                await self._graph_runtime.apply_delivery_commit(thread)
+        except Exception:
+            pass
         return True
 
     async def _send_text_reply(
@@ -1127,6 +1136,17 @@ class Application:
                 if self._graph_runtime is not None:
                     thread = self._graph_runtime.thread_id(incoming.chat_id)
                     self._graph_runtime.record_delivery_receipts(thread, receipts_in)
+            except Exception:
+                pass
+
+        async def _commit_confirmed_quotes() -> None:
+            """Persist receipt-confirmed book quotes (best-effort, never fails delivery)."""
+            try:
+                runtime = self._graph_runtime
+                if runtime is None:
+                    return
+                thread = runtime.thread_id(incoming.chat_id)
+                await runtime.apply_delivery_commit(thread)
             except Exception:
                 pass
 
@@ -1326,6 +1346,7 @@ class Application:
                 ]
                 receipts.extend(confirmed)
                 _record(receipts)
+                await _commit_confirmed_quotes()
                 elapsed_ms = (_time.perf_counter() - started) * 1000.0
                 logger.info(
                     "telegram delivery done",
@@ -1344,6 +1365,7 @@ class Application:
                 ]
                 receipts.extend(failed)
                 _record(receipts)
+                await _commit_confirmed_quotes()
                 if sent_count > 0:
                     logger.warning("telegram split delivery partial; full resend skipped")
                     try:
@@ -1362,6 +1384,7 @@ class Application:
                 ]
                 receipts.extend(failed)
                 _record(receipts)
+                await _commit_confirmed_quotes()
                 if sent_count > 0:
                     logger.warning("telegram split delivery partial; full resend skipped")
                     try:

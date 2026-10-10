@@ -1154,7 +1154,22 @@ def test_quote_range_state_has_no_corpus_text_and_blocks_paging() -> None:
     assert recent
     for entry in recent:
         assert "text" not in entry
-        assert set(entry) <= {"passage_id", "source_id", "section_id", "char_start", "char_end"}
+        assert "preview_text" not in entry
+        assert set(entry) <= {
+            "passage_id",
+            "passage_ids",
+            "source_id",
+            "section_id",
+            "source_sha256",
+            "corpus_version",
+            "char_start",
+            "char_end",
+            "delivery_status",
+            "certificate_id",
+            "span_text_sha256",
+            "answer_char_start",
+            "answer_char_end",
+        }
     adjacent = _pack_entry(
         passage_id="chapter-1#exp0001", section_id="chapter-1", char_start=200, char_end=400
     )

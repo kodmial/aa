@@ -34,6 +34,7 @@ class TurnState(TypedDict, total=False):
     evidence_pack: list[dict[str, Any]]
     retrieval_latency_ms: float
     retrieval_over_budget: bool
+    retrieval_metadata: dict[str, Any]
     draft_response: str
     final_response: str
     grounding_result: dict[str, Any]
