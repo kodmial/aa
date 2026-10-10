@@ -111,8 +111,53 @@ def state_passages_to_prompt(pack_dicts: list[dict[str, Any]]) -> list[EvidenceP
 def _selection_context_from_state(state: TurnState) -> tuple[str, str, str]:
     """Extract resolved intent, conversation context and user message.
 
-    Bounded windows only; callers never log the returned text.
+    Consumes the single canonical ``ResolvedTurn``/``ConversationContext``
+    when present so the selector proves the same bytes and digest as the
+    planner, generator and verifier. Legacy ad-hoc assembly remains only
+    for direct calls without canonical state. Callers never log the
+    returned text.
     """
+    try:
+        from aa.conversation.conversation_context import assert_same_context_digest as _assert
+        from aa.conversation.conversation_context import canonical_model_view as _view
+        from aa.conversation.conversation_context import conversation_context_from_state as _cc
+        from aa.conversation.conversation_context import resolved_turn_from_state as _rt
+
+        _assert(state, stage="selector")
+        resolved = _rt(state)
+        canonical = _cc(state)
+        if resolved is not None or canonical is not None:
+            view_source = (
+                resolved.conversation_context
+                if resolved is not None and resolved.conversation_context
+                else (canonical.model_dump(mode="json") if canonical is not None else {})
+            )
+            view = _view(view_source) if view_source else {"combined": "", "user_message": ""}
+            intent = ""
+            if resolved is not None and str(resolved.resolved_intent or "").strip():
+                intent = str(resolved.resolved_intent)
+            else:
+                try:
+                    retry = state.get("retry_state", {})
+                    retry_d = dict(retry) if isinstance(retry, dict) else {}
+                    intent = str(
+                        retry_d.get("resolved_intent", state.get("resolved_intent", "")) or ""
+                    )
+                except Exception:
+                    intent = str(state.get("resolved_intent", "") or "")
+            if not intent.strip():
+                intent = str(state.get("current_user_message", "") or "")
+            user_message = ""
+            if resolved is not None and str(resolved.user_message or "").strip():
+                user_message = str(resolved.user_message)
+            else:
+                user_message = str(state.get("current_user_message", "") or "")
+            context = str(view.get("combined", "") or "")
+            return intent, context, user_message
+    except ValueError:
+        raise
+    except Exception:
+        pass
     try:
         retry = state.get("retry_state", {})
         retry_d = dict(retry) if isinstance(retry, dict) else {}
@@ -129,16 +174,28 @@ def _selection_context_from_state(state: TurnState) -> tuple[str, str, str]:
     try:
         from langchain_core.messages import BaseMessage as _BM
 
+        from aa.conversation.conversation_context import truncate_preserving_tail as _tail
+
         recent_texts: list[str] = []
         for item in list(state.get("messages", []) or [])[-6:]:
             if isinstance(item, _BM):
                 content = getattr(item, "content", "")
                 if isinstance(content, str) and content.strip():
-                    recent_texts.append(content.strip()[:1200])
-        context = " ".join([summary.strip(), *recent_texts[-6:]]).strip()[:4000]
+                    recent_texts.append(_tail(content.strip(), 1200))
+        context = _tail(" ".join([summary.strip(), *recent_texts[-6:]]).strip(), 4000)
     except Exception:
         context = str(summary or "")[:4000]
     return intent, context, user_message
+
+
+def selection_context_digest(state: TurnState) -> str:
+    """Return the canonical digest the selector must prove (empty if legacy)."""
+    try:
+        from aa.conversation.conversation_context import context_digest_from_state as _digest
+
+        return str(_digest(state) or "")
+    except Exception:
+        return ""
 
 
 async def aretrieve_with_semantic_selection(
@@ -150,6 +207,7 @@ async def aretrieve_with_semantic_selection(
     conversation_context: str = "",
     user_message: str = "",
     selection_model: Any | None = None,
+    context_digest: str = "",
 ) -> EvidencePack:
     """Run broad hybrid retrieval with model-driven selection before budgeting.
 
@@ -229,6 +287,7 @@ async def aretrieve_with_semantic_selection(
         user_message=user_message,
         model=selection_model,
         known_chunk_ids=known_chunk_ids,
+        context_digest=context_digest,
     )
     sel_ms = (time.perf_counter() - sel_started) * 1000.0
     winners = [fused[cid] for cid in selection.selected_chunk_ids if cid in fused]
@@ -443,6 +502,7 @@ async def retrieval_node(
     active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
     resolved_intent, conversation_context, user_message = _selection_context_from_state(state)
+    canonical_digest = selection_context_digest(state)
     if selection_model is not None:
         # Model-driven path: broad candidates -> LLM selection -> exact
         # full fetch -> budgeting. Provider 429 propagates for checkpoint
@@ -457,6 +517,7 @@ async def retrieval_node(
                 conversation_context=conversation_context,
                 user_message=user_message,
                 selection_model=selection_model,
+                context_digest=canonical_digest,
             )
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError as _SelRateLimit
@@ -537,5 +598,6 @@ __all__ = [
     "make_retrieval_node",
     "pack_to_state",
     "retrieval_node",
+    "selection_context_digest",
     "state_passages_to_prompt",
 ]

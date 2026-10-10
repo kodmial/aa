@@ -978,13 +978,20 @@ def build_single_unit_text(
         "</response_unit>",
         "<book_evidence>",
     ]
+    from aa.conversation.conversation_context import truncate_preserving_tail as _tail
+
     if user_message.strip():
         lines.append("<current_user_message>")
+        # Live request travels verbatim; the shared tail-preserving budget
+        # applies only to the bounded conversation view, never as a secret
+        # first-N clip of the live turn.
         lines.append(_escape(user_message))
         lines.append("</current_user_message>")
     if conversation_context.strip():
         lines.append("<conversation_context>")
-        lines.append(_escape(conversation_context[:2000]))
+        # Shared canonical budget with tail preservation: trailing
+        # conditions/referents survive and omissions stay traceable.
+        lines.append(_escape(_tail(conversation_context.strip(), 2000)))
         lines.append("</conversation_context>")
     lines.append(UNTRUSTED_DATA_POLICY_LINE)
     window = list(passages)
@@ -1440,6 +1447,7 @@ async def _verify_per_unit_concurrent(
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
     answer_text: str | None = None,
+    context_digest: str = "",
 ) -> GroundingResult:
     """Verify each unit concurrently with the unified decision schema.
 
@@ -1604,6 +1612,7 @@ async def run_verifier(
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
     answer_text: str | None = None,
+    context_digest: str = "",
 ) -> GroundingResult:
     """Invoke the hidden verifier once per unit, concurrently.
 
@@ -1622,6 +1631,7 @@ async def run_verifier(
         validate_book_pack_for_model_use(passages)
     except EvidencePackIntegrityError as exc:
         raise VerifierValidationError(f"evidence integrity failure: {exc}") from exc
+    _ = context_digest
     result = await _verify_per_unit_concurrent(
         units,
         passages,
@@ -1632,6 +1642,7 @@ async def run_verifier(
         conversation_context=conversation_context,
         recent=recent,
         answer_text=answer_text,
+        context_digest=context_digest,
     )
     logger.info("verifier output accepted", extra={"units": len(units)})
     return result

@@ -844,6 +844,7 @@ async def _verify_draft(
     user_message: str = "",
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
+    context_digest: str = "",
 ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
     """Split and verify one draft; never raises verification errors.
 
@@ -863,20 +864,50 @@ async def _verify_draft(
     if not contains_cyrillic(draft) or leaks_internal_terms(draft):
         logger.info("v2 draft failed language/leak guard")
         return units, None, False
-    try:
-        if turn_budget_s is None:
-            result = await run_verifier(
+
+    async def _invoke_verifier() -> Any:
+        # Backward-compatible: scripted test doubles may predate the
+        # canonical digest parameter; retry without it on TypeError.
+        try:
+            if turn_budget_s is None:
+                return await run_verifier(
+                    units,
+                    pack_dicts,
+                    model=verifier_model,
+                    resolved_intent=resolved_intent,
+                    user_message=user_message,
+                    conversation_context=conversation_context,
+                    recent=recent,
+                    answer_text=draft,
+                    context_digest=context_digest,
+                )
+            return await run_verifier(
                 units,
                 pack_dicts,
                 model=verifier_model,
+                turn_budget_s=turn_budget_s,
                 resolved_intent=resolved_intent,
                 user_message=user_message,
                 conversation_context=conversation_context,
                 recent=recent,
                 answer_text=draft,
+                context_digest=context_digest,
             )
-        else:
-            result = await run_verifier(
+        except TypeError as exc:
+            if "context_digest" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+            if turn_budget_s is None:
+                return await run_verifier(
+                    units,
+                    pack_dicts,
+                    model=verifier_model,
+                    resolved_intent=resolved_intent,
+                    user_message=user_message,
+                    conversation_context=conversation_context,
+                    recent=recent,
+                    answer_text=draft,
+                )
+            return await run_verifier(
                 units,
                 pack_dicts,
                 model=verifier_model,
@@ -887,6 +918,9 @@ async def _verify_draft(
                 recent=recent,
                 answer_text=draft,
             )
+
+    try:
+        result = await _invoke_verifier()
     except (VerifierValidationError, ValueError) as exc:
         # Per-unit only verifier (kodmial/aa#190): run_verifier performs
         # exactly one concurrent per-unit round of minimal boolean
@@ -937,6 +971,9 @@ async def run_v2_answer_turn(
     planner_mode: str | None = None,
     resolved_intent: str | None = None,
     whole_turn_judge_model: Any | None = None,
+    conversation_context: dict[str, Any] | None = None,
+    resolved_turn: dict[str, Any] | None = None,
+    context_digest: str | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -1078,17 +1115,60 @@ async def run_v2_answer_turn(
         )
     except Exception:
         _resolved_request = user_message
-    # Preserved multi-turn context (issue #295): wider per-message and
-    # context windows so short follow-ups, referents, topic shifts and
-    # sufficient original dialogue survive; managed LangGraph/LangMem
-    # compaction upstream still bounds genuine model-context pressure.
-    # Voice and text share this context pipeline per #294.
-    _recent_texts: list[str] = []
-    for _msg in list(recent or []):
-        _content = getattr(_msg, "content", "")
-        if isinstance(_content, str) and _content.strip():
-            _recent_texts.append(_content.strip()[:1200])
-    _conversation_context = " ".join([summary.strip(), *_recent_texts[-8:]]).strip()[:4000]
+    # Canonical shared view (#305): planner, selector, generator, repair
+    # and verifier consume the same resolved-turn bytes and digest. The
+    # canonical context (when supplied by the graph) is authoritative;
+    # legacy ad-hoc assembly remains only for direct calls. Tail-preserving
+    # truncation keeps end-of-message conditions; no stage secretly clips
+    # first-N while claiming the same digest.
+    _canonical_source: dict[str, Any] | None = None
+    if isinstance(resolved_turn, dict) and resolved_turn.get("conversation_context"):
+        try:
+            _canonical_source = dict(resolved_turn["conversation_context"])
+        except Exception:
+            _canonical_source = None
+    elif isinstance(conversation_context, dict) and conversation_context.get("snapshot_version"):
+        _canonical_source = dict(conversation_context)
+    _canonical_digest = str(context_digest or "")
+    if not _canonical_digest and isinstance(resolved_turn, dict):
+        _canonical_digest = str(resolved_turn.get("context_digest", "") or "")
+    if _canonical_source is not None:
+        try:
+            from aa.conversation.conversation_context import canonical_model_view as _cc_view
+            from aa.conversation.conversation_context import (
+                truncate_preserving_tail as _cc_tail,
+            )
+
+            _view = _cc_view(_canonical_source)
+            _conversation_context = str(_view.get("combined", "") or "")
+            _recent_texts = [
+                line for line in str(_view.get("conversation", "")).splitlines() if line.strip()
+            ]
+            # Resolve the canonical intent for downstream prompts.
+            if (
+                isinstance(resolved_turn, dict)
+                and str(resolved_turn.get("resolved_intent", "")).strip()
+            ):
+                _resolved_intent = " ".join(str(resolved_turn["resolved_intent"]).split()).strip()
+                try:
+                    _resolved_request = _effective_request_fn(
+                        resolved_intent=_resolved_intent, user_message=user_message
+                    )
+                except Exception:
+                    _resolved_request = user_message
+        except Exception:
+            _canonical_source = None
+    if _canonical_source is None:
+        from aa.conversation.conversation_context import truncate_preserving_tail as _cc_tail
+
+        _recent_texts = []
+        for _msg in list(recent or []):
+            _content = getattr(_msg, "content", "")
+            if isinstance(_content, str) and _content.strip():
+                _recent_texts.append(_cc_tail(_content.strip(), 1200))
+        _conversation_context = _cc_tail(
+            " ".join([summary.strip(), *_recent_texts[-8:]]).strip(), 4000
+        )
     # Schema-only glue decision: conversational mode with zero queries.
     try:
         _proven_glue = bool(_is_conversational(mode=_mode, query_count=_query_hint))
@@ -1129,6 +1209,7 @@ async def run_v2_answer_turn(
         "qualified": False,
         "turn_trace_id": _trace_id,
         "runtime_sha": _runtime_sha(),
+        "context_digest": _canonical_digest,
     }
 
     def _record_adequacy(
@@ -1295,11 +1376,13 @@ async def run_v2_answer_turn(
         ) or (initial_query_count is None or _query_hint == 0)
         if _needs_recovery:
             try:
-                _recovery_recent: list[str] = []
+                from aa.conversation.conversation_context import truncate_preserving_tail as _r_tail
+
+                _recovery_recent = []
                 for _msg in list(recent or [])[-2:]:
                     _content = getattr(_msg, "content", "")
                     if isinstance(_content, str) and _content.strip():
-                        _recovery_recent.append(_content.strip()[:200])
+                        _recovery_recent.append(_r_tail(_content.strip(), 200))
                 _recovery_queries = _build_recovery(
                     user_message, summary=summary, recent=_recovery_recent
                 )
@@ -1409,6 +1492,8 @@ async def run_v2_answer_turn(
                 passages=passages,
                 user_message=prompt_text,
                 safety_policy=safety_policy,
+                resolved_intent=_resolved_intent,
+                conversation_context=_canonical_source,
             )
             text = (
                 await draft_call
@@ -1472,6 +1557,7 @@ async def run_v2_answer_turn(
                 user_message=user_message,
                 conversation_context=_conversation_context,
                 recent=list(recent or []),
+                context_digest=_canonical_digest,
             )
         finally:
             telemetry["verifier_latency_ms"] = round(
@@ -1670,7 +1756,25 @@ async def run_v2_answer_turn(
             from aa.conversation.planner_node import run_planner as _run_planner
 
             repair_started = time.perf_counter()
-            plan = await _run_planner(focus, model=planner_model, summary=summary, recent=recent)
+            # Repair re-planning consumes the same canonical context, never
+            # a divergent reassembly, so corrections stay resolvable.
+            # Scripted test doubles may predate the canonical parameter.
+            try:
+                plan = await _run_planner(
+                    focus,
+                    model=planner_model,
+                    summary=summary,
+                    recent=recent,
+                    conversation_context=_canonical_source,
+                )
+            except TypeError as _planner_type_error:
+                if "conversation_context" not in str(
+                    _planner_type_error
+                ) and "unexpected keyword" not in str(_planner_type_error):
+                    raise
+                plan = await _run_planner(
+                    focus, model=planner_model, summary=summary, recent=recent
+                )
             queries = list(plan.queries)
             telemetry["planner_latency_ms"] = round(
                 float(telemetry["planner_latency_ms"])
@@ -3198,6 +3302,23 @@ async def answer_pipeline_node(
         _prior_trace = ""
         _prior_mode = str(state.get("planner_mode", "retrieval") or "retrieval")
         _prior_intent = str(state.get("resolved_intent", "") or "")
+    try:
+        _canonical_ctx = state.get("conversation_context", None)
+        _canonical_ctx_d = dict(_canonical_ctx) if isinstance(_canonical_ctx, dict) else None
+    except Exception:
+        _canonical_ctx_d = None
+    try:
+        _resolved_turn_raw = state.get("resolved_turn", None)
+        if isinstance(_resolved_turn_raw, dict):
+            _resolved_turn_d = dict(_resolved_turn_raw)
+        else:
+            _resolved_turn_d = None
+    except Exception:
+        _resolved_turn_d = None
+    try:
+        _ctx_digest = str(state.get("context_digest", "") or "")
+    except Exception:
+        _ctx_digest = ""
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -3219,6 +3340,9 @@ async def answer_pipeline_node(
         planner_mode=_prior_mode or None,
         resolved_intent=_prior_intent or None,
         whole_turn_judge_model=whole_turn_judge_model,
+        conversation_context=_canonical_ctx_d,
+        resolved_turn=_resolved_turn_d,
+        context_digest=_ctx_digest or None,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot

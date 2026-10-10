@@ -119,14 +119,16 @@ def _diagnostic_no_turn_limits() -> bool:
 
 
 def _display_message_text(value: object) -> str:
-    """Bound one history message display text for the planner prompt."""
+    """Bound one history message display text for the planner prompt.
+
+    Uses the shared tail-preserving truncation so a trailing
+    condition/referent survives; short texts travel byte-identical and the
+    marker keeps omissions traceable.
+    """
+    from aa.conversation.conversation_context import truncate_preserving_tail as _tail_truncate
+
     text = value if isinstance(value, str) else ""
-    if len(text) <= PLANNER_MAX_MESSAGE_CHARS:
-        return text
-    omitted = len(text) - PLANNER_MAX_MESSAGE_CHARS
-    return text[:PLANNER_MAX_MESSAGE_CHARS] + PLANNER_TRUNCATION_SUFFIX_FORMAT.format(
-        omitted=omitted
-    )
+    return _tail_truncate(text, PLANNER_MAX_MESSAGE_CHARS)
 
 
 def query_plan_json_schema() -> dict[str, Any]:
@@ -216,6 +218,7 @@ def build_planner_messages(
     user_message: str,
     summary: str,
     recent: list[BaseMessage],
+    conversation_context: dict[str, Any] | None = None,
 ) -> list[BaseMessage]:
     """Assemble the planner model input (never stored in user history).
 
@@ -224,6 +227,11 @@ def build_planner_messages(
     instructions are embedded. All dynamic content travels through the
     shared safe serializer (kodmial/aa#310) as untrusted data: it cannot
     terminate blocks, create elements, or impersonate roles.
+
+    When the canonical ``conversation_context`` is supplied (the #305
+    production path), history/summary render from that single shared view
+    so every stage proves the same bytes and digest; the legacy
+    ``summary``/``recent`` arguments stay as a fallback for direct calls.
     """
     from aa.conversation.prompt_safety import (
         UNTRUSTED_DATA_POLICY_LINE,
@@ -233,14 +241,42 @@ def build_planner_messages(
     system_text = load_planner_system_v2()
     lines: list[str] = [UNTRUSTED_DATA_POLICY_LINE]
     summary_text = _render_context_value(summary)
+    recent_items: list[BaseMessage] = list(recent or [])
+    if conversation_context is not None:
+        try:
+            from aa.conversation.conversation_context import canonical_model_view as _view
+
+            view = _view(conversation_context)
+            if view.get("summary", "").strip():
+                summary_text = view["summary"]
+            # Canonical history already carries roles; parse it back into
+            # lines without re-clipping (the view is the shared budget).
+            canonical_lines = [
+                line for line in view.get("conversation", "").splitlines() if line.strip()
+            ]
+            if canonical_lines:
+                lines.append("Conversation context (continuity only, not evidence):")
+                lines.append("<conversation_context>")
+                lines.append(escape_xml_text(summary_text.strip() or "(no prior conversation)"))
+                lines.append(escape_xml_text("\n".join(canonical_lines)))
+                lines.append("</conversation_context>")
+                lines.append("<current_user_message>")
+                lines.append(escape_xml_text(view.get("user_message", user_message)))
+                lines.append("</current_user_message>")
+                return [
+                    SystemMessage(content=system_text),
+                    HumanMessage(content="\n".join(lines)),
+                ]
+        except Exception:
+            pass
     if summary_text.strip():
         lines.append("Conversation context (continuity only, not evidence):")
         lines.append("<conversation_context>")
         lines.append(escape_xml_text(summary_text.strip()))
         lines.append("</conversation_context>")
-    if recent:
+    if recent_items:
         lines.append("Recent messages:")
-        for message in recent:
+        for message in recent_items:
             role = "user" if message.type == "human" else "assistant"
             lines.append(f"{role}: {escape_xml_text(_render_recent_value(message.content))}")
     lines.append("<current_user_message>")
@@ -250,6 +286,36 @@ def build_planner_messages(
         SystemMessage(content=system_text),
         HumanMessage(content="\n".join(lines)),
     ]
+
+
+def build_planner_messages_from_context(
+    *,
+    context: Any,
+    user_message: str = "",
+) -> list[BaseMessage]:
+    """Build planner input directly from one canonical context object."""
+    from aa.conversation.conversation_context import ConversationContext as _CC
+
+    if isinstance(context, dict):
+        try:
+            parsed = _CC.model_validate(context)
+        except Exception:
+            return build_planner_messages(
+                user_message=user_message, summary="", recent=[], conversation_context=None
+            )
+    elif isinstance(context, _CC):
+        parsed = context
+    else:
+        return build_planner_messages(
+            user_message=user_message, summary="", recent=[], conversation_context=None
+        )
+    live = str(user_message or parsed.user_message or "")
+    return build_planner_messages(
+        user_message=live,
+        summary=str(parsed.summary or ""),
+        recent=[],
+        conversation_context=parsed.model_dump(mode="json"),
+    )
 
 
 def validate_structured_plan(data: object) -> QueryPlan:
@@ -374,6 +440,7 @@ async def run_planner(
     summary: str = "",
     recent: list[BaseMessage] | None = None,
     time_budget_s: float | None = None,
+    conversation_context: dict[str, Any] | None = None,
 ) -> QueryPlan:
     """Invoke the hidden planner through native structured output.
 
@@ -417,7 +484,10 @@ async def run_planner(
     validation failures still propagate fail-closed.
     """
     messages = build_planner_messages(
-        user_message=user_message, summary=summary, recent=list(recent or [])
+        user_message=user_message,
+        summary=summary,
+        recent=list(recent or []),
+        conversation_context=conversation_context,
     )
     system_text = str(messages[0].content)
     user_text = str(messages[1].content)
@@ -626,12 +696,29 @@ async def planner_node(
 ) -> dict[str, Any]:
     """LangGraph planner node: hidden model-driven plan into state.
 
-    Only orchestration state is written; ``messages`` is left untouched so
-    hidden calls never pollute the user-facing conversation. The full
-    framework-managed history is consumed; no fixed message-count slice is
-    applied. The plan carries ``mode``, ``resolved_intent`` and ``queries``;
-    application code validates schema/cardinality only.
+    Consumes the single canonical ``ConversationContext`` assembled after
+    managed memory (never an ad-hoc truncation) and returns a typed
+    ``ResolvedTurn`` with the raw user message, resolved intent, semantic
+    information needs and deterministic context digest. Only downstream
+    stages consume the completed resolved turn. ``messages`` is left
+    untouched so hidden calls never pollute the user conversation.
     """
+    from aa.conversation.conversation_context import (
+        ConversationContext as _CC,
+    )
+    from aa.conversation.conversation_context import (
+        build_conversation_context as _build_cc,
+    )
+    from aa.conversation.conversation_context import (
+        build_resolved_turn as _build_turn,
+    )
+    from aa.conversation.conversation_context import (
+        conversation_context_from_state as _cc_from_state,
+    )
+    from aa.conversation.conversation_context import (
+        needs_from_plan as _needs_from_plan,
+    )
+
     user_message = str(state.get("current_user_message", ""))
     summary = str(state.get("conversation_summary", ""))
     recent = [item for item in state.get("messages", []) if isinstance(item, BaseMessage)]
@@ -639,13 +726,66 @@ async def planner_node(
     # from history: drop the trailing copy of the live user message.
     if recent and recent[-1].type == "human" and user_message:
         recent = recent[:-1]
-    plan = await run_planner(user_message, model=model, summary=summary, recent=recent)
-    return {
+    canonical = _cc_from_state(state)
+    canonical_dict: dict[str, Any] | None = None
+    if canonical is not None:
+        canonical_dict = canonical.model_dump(mode="json")
+    else:
+        try:
+            built = _build_cc(
+                [item for item in state.get("messages", []) if isinstance(item, BaseMessage)],
+                summary,
+                user_message,
+            )
+            canonical = built
+            canonical_dict = built.model_dump(mode="json")
+        except Exception:
+            canonical = None
+            canonical_dict = None
+    if canonical_dict is not None:
+        plan = await run_planner(
+            user_message,
+            model=model,
+            summary=summary,
+            recent=recent,
+            conversation_context=canonical_dict,
+        )
+    else:
+        plan = await run_planner(user_message, model=model, summary=summary, recent=recent)
+    needs = _needs_from_plan(str(plan.resolved_intent), list(plan.queries))
+    if canonical is None:
+        try:
+            canonical = (
+                _CC.model_validate(canonical_dict)
+                if canonical_dict
+                else _build_cc(
+                    [item for item in state.get("messages", []) if isinstance(item, BaseMessage)],
+                    summary,
+                    user_message,
+                )
+            )
+        except Exception:
+            canonical = _CC(user_message=user_message, messages=[], summary=summary)
+    resolved = _build_turn(
+        user_message=user_message,
+        resolved_intent=str(plan.resolved_intent),
+        context=canonical,
+        information_needs=needs,
+        planner_mode=str(plan.mode),
+        search_queries=list(plan.queries),
+    )
+    update: dict[str, Any] = {
         "search_queries": list(plan.queries),
         "planner_invoked": True,
         "planner_mode": str(plan.mode),
         "resolved_intent": str(plan.resolved_intent),
+        "resolved_turn": resolved.model_dump(mode="json"),
+        "information_needs": [item.model_dump(mode="json") for item in needs],
+        "context_digest": str(resolved.context_digest),
     }
+    if canonical_dict is not None and not state.get("conversation_context"):
+        update["conversation_context"] = canonical_dict
+    return update
 
 
 __all__ = [
@@ -655,6 +795,7 @@ __all__ = [
     "PLANNER_TIME_BUDGET_S",
     "build_generic_fallback_queries",
     "build_planner_messages",
+    "build_planner_messages_from_context",
     "parse_planner_text_json",
     "planner_node",
     "query_plan_json_schema",

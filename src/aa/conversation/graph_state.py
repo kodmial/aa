@@ -25,6 +25,10 @@ class TurnState(TypedDict, total=False):
     search_queries: list[str]
     planner_mode: str
     resolved_intent: str
+    conversation_context: dict[str, Any]
+    resolved_turn: dict[str, Any]
+    information_needs: list[dict[str, Any]]
+    context_digest: str
     retrieval_hits: list[dict[str, Any]]
     evidence_pack: list[dict[str, Any]]
     retrieval_latency_ms: float
