@@ -103,6 +103,8 @@ class TelegramReply:
 
     chat_id: int
     text: str
+    reply_markup: dict[str, Any] | None = None
+    message_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,8 @@ class TelegramVoiceReply:
 
     chat_id: int
     voice_bytes: bytes
+    reply_markup: dict[str, Any] | None = None
+    caption: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,7 +131,9 @@ class TelegramIncoming:
     """Parsed private message with command routing info.
 
     Text messages carry ``text``; voice notes carry ``voice`` with an
-    empty ``text``. Text parsing is unchanged by voice support.
+    empty ``text``. Callback button presses carry ``is_callback`` with
+    ``callback_data`` and an empty ``text``. Text parsing is unchanged
+    by voice/callback support.
     """
 
     update_id: int
@@ -136,6 +142,12 @@ class TelegramIncoming:
     text: str
     command: str | None = None
     voice: VoiceAttachment | None = None
+    is_callback: bool = False
+    callback_id: str | None = None
+    callback_data: str | None = None
+    sender_id: int | None = None
+    callback_message_id: int | None = None
+    callback_inaccessible: bool = False
 
 
 UpdateHandler = Callable[[TelegramIncoming], Awaitable[None]]
@@ -154,6 +166,64 @@ def parse_command(text: str) -> str | None:
     if not command:
         return None
     return command
+
+
+def parse_callback_query(raw: Any) -> TelegramIncoming | None:
+    """Parse one raw ``callback_query`` entry into a typed callback, else ``None``."""
+    if not isinstance(raw, dict):
+        return None
+    update_id = raw.get("update_id")
+    query = raw.get("callback_query")
+    if not isinstance(update_id, int) or not isinstance(query, dict):
+        return None
+    callback_id = query.get("id")
+    sender = query.get("from")
+    data = query.get("data")
+    if not isinstance(callback_id, str) or not callback_id:
+        return None
+    if not isinstance(sender, dict) or not isinstance(sender.get("id"), int):
+        return None
+    if not isinstance(data, str) or not data:
+        return None
+    sender_id = int(sender["id"])
+    message = query.get("message")
+    if isinstance(message, dict):
+        chat = message.get("chat")
+        chat_id = chat.get("id") if isinstance(chat, dict) else None
+        bound_message_id = message.get("message_id")
+        if not isinstance(chat_id, int) or not isinstance(bound_message_id, int):
+            return None
+        if isinstance(chat, dict) and chat.get("type") != "private":
+            return None
+        return TelegramIncoming(
+            update_id=update_id,
+            chat_id=chat_id,
+            message_id=bound_message_id,
+            text="",
+            command=None,
+            is_callback=True,
+            callback_id=callback_id,
+            callback_data=data,
+            sender_id=sender_id,
+            callback_message_id=bound_message_id,
+        )
+    # MaybeInaccessibleMessage or absent message: untrusted without the
+    # full token/receipt context, so treat as stale/inert upstream.
+    chat_instance = query.get("chat_instance")
+    _ = chat_instance
+    return TelegramIncoming(
+        update_id=update_id,
+        chat_id=sender_id,
+        message_id=0,
+        text="",
+        command=None,
+        is_callback=True,
+        callback_id=callback_id,
+        callback_data=data,
+        sender_id=sender_id,
+        callback_message_id=None,
+        callback_inaccessible=True,
+    )
 
 
 def parse_update(raw: Any) -> TelegramIncoming | None:
@@ -217,14 +287,26 @@ class TelegramTransport(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def send(self, reply: TelegramReply) -> None:
-        """Queue or deliver an outbound reply."""
+    async def send(self, reply: TelegramReply) -> int | None:
+        """Queue or deliver an outbound reply; returns the sent message id when known."""
         raise NotImplementedError
 
     @abstractmethod
-    async def send_voice(self, reply: TelegramVoiceReply) -> None:
+    async def send_voice(self, reply: TelegramVoiceReply) -> int | None:
         """Deliver one OGG/Opus voice reply via ``sendVoice``."""
         raise NotImplementedError
+
+    async def answer_callback(
+        self, callback_id: str, text: str | None = None, show_alert: bool = False
+    ) -> None:
+        """Acknowledge one callback query (neutral UI acknowledgement)."""
+        _ = (callback_id, text, show_alert)
+
+    async def edit_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: dict[str, Any] | None
+    ) -> None:
+        """Edit or remove one inline keyboard without a new chat message."""
+        _ = (chat_id, message_id, reply_markup)
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         """Send one ``sendChatAction`` event (typing heartbeat).
@@ -250,6 +332,9 @@ class StubTelegramTransport(TelegramTransport):
         self.sent: list[TelegramReply] = []
         self.sent_voices: list[TelegramVoiceReply] = []
         self.chat_actions: list[tuple[int, str]] = []
+        self.callback_answers: list[dict[str, Any]] = []
+        self.markup_edits: list[dict[str, Any]] = []
+        self._next_message_id = 1000
 
     async def start(self) -> None:
         self._running = True
@@ -257,9 +342,26 @@ class StubTelegramTransport(TelegramTransport):
     async def stop(self) -> None:
         self._running = False
 
-    async def send(self, reply: TelegramReply) -> None:
+    async def send(self, reply: TelegramReply) -> int:
         _check_outbound_envelope(reply.text)
+        self._next_message_id += 1
         self.sent.append(reply)
+        return self._next_message_id
+
+    async def answer_callback(
+        self, callback_id: str, text: str | None = None, show_alert: bool = False
+    ) -> None:
+        """Record one neutral callback acknowledgement (no business state)."""
+        _ = show_alert
+        self.callback_answers.append({"id": callback_id, "text": text or ""})
+
+    async def edit_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: dict[str, Any] | None
+    ) -> None:
+        """Record one keyboard edit/removal (no new chat message)."""
+        self.markup_edits.append(
+            {"chat_id": chat_id, "message_id": message_id, "markup": reply_markup}
+        )
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         """Record one typing heartbeat event (no network I/O)."""
@@ -577,23 +679,31 @@ class PollingTelegramTransport(TelegramTransport):
         self._running = False
         logger.info("telegram polling stopped")
 
-    async def send(self, reply: TelegramReply) -> None:
+    async def send(self, reply: TelegramReply) -> int | None:
         """Deliver one reply via ``sendMessage`` with bounded retry.
 
         The #83 transport guard runs first: any ``text`` over the hard
         envelope fails closed here (typed error, no network call, no
         split into multiple messages, response text never logged).
+        Returns the Telegram message id when the API provides one.
         """
         _check_outbound_envelope(reply.text)
         payload: dict[str, Any] = {"chat_id": reply.chat_id, "text": reply.text}
-        await self._call_with_retry("sendMessage", payload, max_retries=self._max_send_retries)
+        if reply.reply_markup is not None:
+            payload["reply_markup"] = dict(reply.reply_markup)
+        result = await self._call_with_retry(
+            "sendMessage", payload, max_retries=self._max_send_retries
+        )
         self._sent.append(reply)
         logger.info(
             "telegram message sent",
             extra={"chat_id": reply.chat_id, "text_len": len(reply.text)},
         )
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
 
-    async def send_voice(self, reply: TelegramVoiceReply) -> None:
+    async def send_voice(self, reply: TelegramVoiceReply) -> int | None:
         """Deliver one OGG/Opus voice reply via ``sendVoice``.
 
         Only sizes are logged, never audio content. Retries are bounded
@@ -603,11 +713,12 @@ class PollingTelegramTransport(TelegramTransport):
         if not reply.voice_bytes:
             raise TelegramApiError("telegram voice payload is empty")
         payload_bytes = bytes(reply.voice_bytes)
+        result: Any = None
         attempt = 0
         while True:
             try:
                 try:
-                    await self._api.send_voice(reply.chat_id, payload_bytes)
+                    result = await self._send_voice_with_markup(reply, payload_bytes)
                 except NotImplementedError as exc:
                     raise TelegramApiError("telegram voice send is not supported") from exc
                 break
@@ -632,6 +743,49 @@ class PollingTelegramTransport(TelegramTransport):
         logger.info(
             "telegram voice message sent",
             extra={"chat_id": reply.chat_id, "byte_len": len(payload_bytes)},
+        )
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    async def _send_voice_with_markup(self, reply: TelegramVoiceReply, payload_bytes: bytes) -> Any:
+        """Send voice bytes, including inline markup when the API supports it."""
+        api = self._api
+        send_with_markup = getattr(api, "send_voice_with_markup", None)
+        if reply.reply_markup is not None and callable(send_with_markup):
+            return await send_with_markup(reply.chat_id, payload_bytes, dict(reply.reply_markup))
+        return await api.send_voice(reply.chat_id, payload_bytes)
+
+    async def answer_callback(
+        self, callback_id: str, text: str | None = None, show_alert: bool = False
+    ) -> None:
+        """Send one neutral ``answerCallbackQuery`` acknowledgement."""
+        payload: dict[str, Any] = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = str(text)[:200]
+        if show_alert:
+            payload["show_alert"] = True
+        try:
+            await self._api.call("answerCallbackQuery", payload)
+        except TelegramAuthError:
+            raise
+        except (TelegramApiError, TimeoutError, OSError):
+            logger.info("telegram callback acknowledgement failed")
+
+    async def edit_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: dict[str, Any] | None
+    ) -> None:
+        """Edit or remove one inline keyboard without a new chat message."""
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        if reply_markup is None:
+            payload["reply_markup"] = {"inline_keyboard": []}
+        else:
+            payload["reply_markup"] = dict(reply_markup)
+        await self._call_with_retry(
+            "editMessageReplyMarkup", payload, max_retries=self._max_send_retries
         )
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
@@ -798,7 +952,7 @@ class PollingTelegramTransport(TelegramTransport):
         payload: dict[str, Any] = {
             "limit": self._poll_limit,
             "timeout": self._poll_timeout_seconds,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         if self._offset is not None:
             payload["offset"] = self._offset
@@ -831,7 +985,7 @@ class PollingTelegramTransport(TelegramTransport):
             "offset": self._offset,
             "limit": 1,
             "timeout": 0,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         try:
             await self._api.call("getUpdates", payload)
@@ -848,6 +1002,31 @@ class PollingTelegramTransport(TelegramTransport):
         if self._is_duplicate(update_id):
             self._commit_update_id(update_id)
             logger.info("telegram duplicate update skipped", extra={"update_id": update_id})
+            return True
+
+        callback = parse_callback_query(raw)
+        if callback is not None:
+            # Fast neutral acknowledgement at ingress: stop the client
+            # spinner without claiming action success. Business state
+            # mutates only later inside the per-chat FIFO worker.
+            try:
+                await self.answer_callback(str(callback.callback_id or ""))
+            except TelegramAuthError:
+                raise
+            except Exception:
+                pass
+            logger.info(
+                "telegram callback received",
+                extra={
+                    "update_id": callback.update_id,
+                    "chat_id": callback.chat_id,
+                    "message_id": callback.message_id,
+                },
+            )
+            if not await self._dispatch(callback):
+                return False
+            self._received.append(callback)
+            self._commit_update_id(update_id)
             return True
 
         parsed = parse_update(raw)

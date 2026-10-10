@@ -447,10 +447,10 @@ class _DelayTransport(StubTelegramTransport):
         self.send_delay = send_delay
         self.send_calls = 0
 
-    async def send(self, reply: TelegramReply) -> None:
+    async def send(self, reply: TelegramReply) -> int:
         self.send_calls += 1
         await asyncio.sleep(self.send_delay)
-        await super().send(reply)
+        return await super().send(reply)
 
 
 async def test_typing_starts_immediately_and_stops_after_delivery() -> None:
@@ -503,13 +503,13 @@ async def test_typing_survives_delivery_retry() -> None:
             super().__init__()
             self.calls = 0
 
-        async def send(self, reply: TelegramReply) -> None:
+        async def send(self, reply: TelegramReply) -> int:
             from aa.telegram.transport import TelegramApiError
 
             self.calls += 1
             if self.calls == 1:
                 raise TelegramApiError("transient send failure")
-            await super().send(reply)
+            return await super().send(reply)
 
     transport = _Flaky()
     app = _app(_runtime(), transport)

@@ -727,11 +727,11 @@ async def run_transport_lane(repo_root: Path | None = None) -> LaneResult:
                 super().__init__()
                 self.calls = 0
 
-            async def send(self, reply: TelegramReply) -> None:
+            async def send(self, reply: TelegramReply) -> int:
                 self.calls += 1
                 if self.calls == 1:
                     raise TelegramApiError("transient")
-                await super().send(reply)
+                return await super().send(reply)
 
         flaky = _Flaky()
         flaky_app = Application(
