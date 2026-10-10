@@ -206,14 +206,47 @@ def context_digest_for_turn(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_planner_conversational_glue(
+    *,
+    planner_mode: str = "",
+    planner_query_count: int | None = None,
+) -> bool:
+    """Whether planner provenance positively proves conversational glue.
+
+    True only for model-resolved ``conversational`` mode with zero
+    queries (schema-only, never text heuristics). Any other mode, a
+    positive query count, or unknown provenance returns ``False`` so
+    substantive turns keep the strong answer path fail-closed.
+    """
+    if str(planner_mode or "").strip() != "conversational":
+        return False
+    try:
+        if planner_query_count is None:
+            return False
+        return int(planner_query_count) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def infer_outcome_kind(
     *,
     text: str,
     evidence_pack: list[dict[str, Any]],
     grounding_result: dict[str, Any] | None,
     telemetry: dict[str, Any] | None = None,
+    planner_mode: str = "",
+    planner_query_count: int | None = None,
 ) -> OutcomeKind:
-    """Infer the type-specific verification kind for one served candidate."""
+    """Infer the type-specific verification kind for one served candidate.
+
+    Planner-certified conversational glue (model-resolved
+    ``conversational`` mode with zero queries and an empty Evidence
+    Pack) certifies as ``clarification`` without a false book
+    requirement, matching the delegate/test seam which already serves
+    bookless turns as clarification. Any book unit or any non-empty
+    pack still takes the strong ``answer`` path, so unsupported book
+    claims can never evade grounding by masquerading as glue.
+    """
     telemetry_d = dict(telemetry) if isinstance(telemetry, dict) else {}
     if str(telemetry_d.get("outbound_safety", "") or "") == "repaired":
         return "safety"
@@ -228,6 +261,39 @@ def infer_outcome_kind(
     has_book = any(item.get("scope") == "book" for item in units)
     if has_book or bool(evidence_pack):
         return "answer"
+    # Conversational provenance travels explicitly (preferred) or via
+    # retry telemetry (production graph path). Only positively proven
+    # glue with an empty pack takes the weak path; provider errors and
+    # unknown provenance keep the strong path fail-closed.
+    mode = str(planner_mode or "").strip()
+    count: int | None = None
+    try:
+        count = int(planner_query_count) if planner_query_count is not None else None
+    except (TypeError, ValueError):
+        count = None
+    if not mode or count is None:
+        fallback_mode = str(
+            telemetry_d.get("planner_mode", "") or telemetry_d.get("plannerMode", "")
+        ).strip()
+        fallback_count = telemetry_d.get("planner_query_count", None)
+        if fallback_mode and fallback_count is not None:
+            try:
+                mode = mode or fallback_mode
+                if count is None:
+                    count = int(fallback_count)
+            except (TypeError, ValueError):
+                pass
+    if count is None:
+        try:
+            raw_queries = telemetry_d.get("search_queries", None)
+            if isinstance(raw_queries, list):
+                count = len(raw_queries)
+        except Exception:
+            count = None
+    if _is_planner_conversational_glue(
+        planner_mode=mode, planner_query_count=count if count is not None else -1
+    ):
+        return "clarification"
     # No book units and no evidence: only a short non-substantive
     # clarification may take the weak path. Substantive text with
     # missing/undetected verdicts must take the strong answer path so
@@ -932,8 +998,55 @@ def candidate_from_state(
     if isinstance(raw_retry, dict):
         inner = raw_retry.get("turn_telemetry", None)
         telemetry = dict(inner) if isinstance(inner, dict) else dict(raw_retry)
+    # Planner conversational provenance (Gate C live-meta fix): the
+    # production graph carries model-resolved mode + query count in
+    # retry_state and search_queries. Only positively proven glue
+    # (conversational + zero queries + empty pack, checked inside
+    # infer_outcome_kind) certifies as clarification; everything else
+    # keeps the strong answer path fail-closed.
+    planner_mode = ""
+    planner_query_count: int | None = None
+    try:
+        if isinstance(raw_retry, dict):
+            planner_mode = str(
+                raw_retry.get("planner_mode", "") or state.get("planner_mode", "") or ""
+            ).strip()
+            for key in ("planner_query_count", "plannerQueryCount"):
+                raw_count = raw_retry.get(key, None)
+                if raw_count is not None:
+                    planner_query_count = int(raw_count)
+                    break
+            if planner_query_count is None and isinstance(telemetry, dict):
+                for key in ("planner_query_count", "plannerQueryCount"):
+                    raw_tcount = telemetry.get(key, None)
+                    if raw_tcount is not None:
+                        planner_query_count = int(raw_tcount)
+                        break
+        if not planner_mode:
+            planner_mode = str(state.get("planner_mode", "") or "").strip()
+        if planner_query_count is None:
+            raw_queries = state.get("search_queries", None)
+            if isinstance(raw_queries, list):
+                planner_query_count = len(raw_queries)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from aa.conversation.conversation_context import resolved_turn_from_state as _rt_mode
+
+        _rt_obj = _rt_mode(state)
+        if _rt_obj is not None:
+            rt_mode = str(getattr(_rt_obj, "planner_mode", "") or "").strip()
+            if rt_mode and not planner_mode:
+                planner_mode = rt_mode
+    except Exception:
+        pass
     outcome: OutcomeKind = default_outcome or infer_outcome_kind(
-        text=normalized, evidence_pack=pack, grounding_result=grounding, telemetry=telemetry
+        text=normalized,
+        evidence_pack=pack,
+        grounding_result=grounding,
+        telemetry=telemetry,
+        planner_mode=planner_mode,
+        planner_query_count=planner_query_count,
     )
     candidate = AnswerCandidate(
         text=normalized,

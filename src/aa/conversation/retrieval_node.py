@@ -452,7 +452,32 @@ async def aretrieve_with_semantic_selection(
     bounded_iterations = max(1, min(int(max_iterations or 1), 5))
     forbidden_echoes = [repair_hint_clean] if repair_hint_clean else []
 
+    def _interactive_budget_exceeded() -> bool:
+        """Whether the retrieval loop already spent the interactive budget.
+
+        Gate E root repair: the shared read/coverage loop previously ran
+        up to three iterations (≈8 model calls) regardless of wall-clock
+        cost, producing the observed retrieval p95 ≈76s on the slow free
+        provider. The first discover/select/read/assess pair always runs
+        (model-driven semantic coverage preserved); further
+        expand/search_more iterations stop once the interactive budget
+        is spent and return a typed ``exhausted`` outcome with the
+        best-effort pack instead of grinding. No fake coverage, no
+        truncation, no skipped semantic checks on the fast path.
+        """
+        try:
+            from aa.retrieval.evidence import INTERACTIVE_LATENCY_BUDGET_MS as _budget
+
+            return (time.perf_counter() - started) * 1000.0 > float(_budget)
+        except Exception:
+            return False
+
     for iteration in range(bounded_iterations):
+        if iteration > 0 and _interactive_budget_exceeded():
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            progress_events.append("interactive-budget-stop")
+            break
         # ---- select_for_reading over the combined discovered pool.
         broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
         fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
@@ -747,7 +772,7 @@ async def aretrieve_with_semantic_selection(
                     index=index,
                     priority_child_ids=tuple(read_child_order),
                 )
-                if coverage_assessor is not None:
+                if coverage_assessor is not None and not _interactive_budget_exceeded():
                     regrown_verdict = await aassess_coverage(
                         list(regrown_selected),
                         needs_for_selection,
@@ -756,6 +781,13 @@ async def aretrieve_with_semantic_selection(
                         repair_hint=repair_hint_clean,
                     )
                     model_calls += 1
+                elif coverage_assessor is not None:
+                    # Interactive budget spent: keep the grown exact
+                    # passages but do not issue another model call.
+                    # Coverage stays conservatively uncovered (typed
+                    # exhausted downstream), never fake-covered.
+                    regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
+                    progress_events.append("interactive-budget-skip-reassess")
                 else:
                     regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
                 regrown_covered = [
@@ -798,6 +830,11 @@ async def aretrieve_with_semantic_selection(
         if searches >= MAX_COVERAGE_SEARCHES or model_calls >= 8:
             coverage_status = "exhausted"
             exhaustion_reason = "search-budget"
+            break
+        if _interactive_budget_exceeded():
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            progress_events.append("interactive-budget-stop-search")
             break
         # ---- search_more: bounded follow-up, then semantic
         # reconsideration next iteration (never rank-only append).
