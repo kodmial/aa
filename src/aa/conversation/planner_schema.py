@@ -37,6 +37,11 @@ class QueryPlan(BaseModel):
     mode: PlannerMode = Field(default="retrieval")
     resolved_intent: str = Field(default="")
     queries: list[str] = Field(default_factory=list)
+    # Optional trusted planner-side query->need association (#311): parallel
+    # to ``queries``; each inner list holds InformationNeed ids served by
+    # that query (empty = unknown/unmapped). ``None`` means the planner did
+    # not emit a mapping and the structural plan-order derivation applies.
+    query_need_ids: list[list[str]] | None = Field(default=None)
 
 
 class QueryPlanValidationError(ValueError):
@@ -88,9 +93,12 @@ def validate_query_plan(plan: QueryPlan) -> QueryPlan:
     if len(intent) > MAX_RESOLVED_INTENT_CHARS:
         raise QueryPlanValidationError("resolved_intent exceeds the length budget")
     queries = normalize_queries(list(plan.queries))
+    links = plan.query_need_ids
     if mode == "conversational":
         if queries:
             raise QueryPlanValidationError("conversational plans must carry zero queries")
+        if links is not None and links not in (None, []):
+            raise QueryPlanValidationError("conversational plans must carry no query mapping")
         return QueryPlan(mode="conversational", resolved_intent="", queries=[])
     if not intent:
         raise QueryPlanValidationError("retrieval plans require a non-empty resolved_intent")
@@ -100,7 +108,31 @@ def validate_query_plan(plan: QueryPlan) -> QueryPlan:
             f"{MIN_NONEMPTY_QUERIES}-{MAX_QUERIES} distinct queries, "
             f"got {len(queries)}"
         )
-    return QueryPlan(mode="retrieval", resolved_intent=intent, queries=queries)
+    if links is None:
+        return QueryPlan(mode="retrieval", resolved_intent=intent, queries=queries)
+    if not isinstance(links, list) or len(links) != len(queries):
+        raise QueryPlanValidationError("query_need_ids must parallel queries when present")
+    cleaned_links: list[list[str]] = []
+    for inner in links:
+        if not isinstance(inner, list):
+            raise QueryPlanValidationError("query_need_ids entries must be lists")
+        kept: list[str] = []
+        seen: set[str] = set()
+        for raw_need in inner:
+            if not isinstance(raw_need, str) or not raw_need.strip():
+                raise QueryPlanValidationError("query_need_ids entries must be strings")
+            nid = raw_need.strip()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            kept.append(nid)
+        cleaned_links.append(kept)
+    return QueryPlan(
+        mode="retrieval",
+        resolved_intent=intent,
+        queries=queries,
+        query_need_ids=cleaned_links,
+    )
 
 
 __all__ = [

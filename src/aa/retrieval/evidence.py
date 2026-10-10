@@ -445,6 +445,83 @@ def fuse_query_pool(
     return fused, [item.chunk_id for item in pool[:pool_cap]]
 
 
+def candidate_query_provenance(
+    per_query_ids: list[list[str]],
+) -> dict[str, list[str]]:
+    """Map each candidate to the planner query ids that retrieved it (#311).
+
+    Query ids are stable ``q1``..``qN`` in plan order. A candidate hit by
+    several queries retains all associations (many-to-many); nothing is
+    fabricated and no lexical inference is applied.
+    """
+    provenance: dict[str, list[str]] = {}
+    for pos, contributed in enumerate(list(per_query_ids or [])):
+        query_id = f"q{pos + 1}"
+        seen_in_query: set[str] = set()
+        for chunk_id in list(contributed or []):
+            cid = str(chunk_id or "").strip()
+            if not cid or cid in seen_in_query:
+                continue
+            seen_in_query.add(cid)
+            bucket = provenance.setdefault(cid, [])
+            if query_id not in bucket:
+                bucket.append(query_id)
+    for bucket in provenance.values():
+        bucket.sort(key=lambda qid: int(qid[1:]) if qid[1:].isdigit() else 0)
+    return provenance
+
+
+def candidate_need_provenance(
+    candidate_query_map: dict[str, list[str]],
+    query_need_map: list[dict[str, Any]] | list[Any],
+) -> dict[str, list[str]]:
+    """Map each candidate to semantic need ids via its query ids (#311).
+
+    Many-to-many links are preserved: a cross-query shared hit retains
+    all need associations. Queries mapped to no need (unknown/unmapped)
+    contribute no need; candidates with no mapped need stay unmapped
+    (``[]``) and must trigger conservative discovery, never fabricated
+    quota coverage.
+    """
+    query_to_needs: dict[str, list[str]] = {}
+    for entry in list(query_need_map or []):
+        try:
+            if isinstance(entry, dict):
+                qid = str(entry.get("query_id", "") or "").strip()
+                raw_needs = entry.get("need_ids", []) or []
+            else:
+                qid = str(getattr(entry, "query_id", "") or "").strip()
+                raw_needs = list(getattr(entry, "need_ids", []) or [])
+            if not qid:
+                continue
+            kept: list[str] = []
+            seen: set[str] = set()
+            items = list(raw_needs) if isinstance(raw_needs, list) else []
+            for raw in items:
+                nid = str(raw or "").strip()
+                if nid and nid not in seen:
+                    seen.add(nid)
+                    kept.append(nid)
+            query_to_needs[qid] = kept
+        except Exception:
+            continue
+    out: dict[str, list[str]] = {}
+    for chunk_id, query_ids in (candidate_query_map or {}).items():
+        cid = str(chunk_id or "").strip()
+        if not cid:
+            continue
+        merged: list[str] = []
+        seen_needs: set[str] = set()
+        for qid in list(query_ids or []):
+            for nid in query_to_needs.get(str(qid), []):
+                if nid not in seen_needs:
+                    seen_needs.add(nid)
+                    merged.append(nid)
+        merged.sort()
+        out[cid] = merged
+    return out
+
+
 def dedup_and_diversify(
     index: HybridIndex,
     pool_ids: list[str],
@@ -1228,6 +1305,8 @@ __all__ = [
     "POOL_CAP",
     "TOP_CHILD_CAP",
     "broad_fused_ranking",
+    "candidate_need_provenance",
+    "candidate_query_provenance",
     "clear_query_vector_cache",
     "query_vector_cache_info",
     "EvidenceError",

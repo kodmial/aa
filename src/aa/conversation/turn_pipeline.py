@@ -706,6 +706,21 @@ def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
     }
 
 
+def _union_id_lists(first: Any, second: Any) -> list[str]:
+    """Union two optional id lists preserving order (no fabrication)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in (first, second):
+        if not isinstance(source, list):
+            continue
+        for raw in source:
+            clean = str(raw or "").strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                out.append(clean)
+    return out
+
+
 def merge_pack_dicts(
     current: list[dict[str, Any]],
     incoming: list[dict[str, Any]],
@@ -714,19 +729,29 @@ def merge_pack_dicts(
     conversation_context: str = "",
     budget_tokens: int | None = None,
     max_passages: int | None = None,
+    information_needs: Any | None = None,
+    need_ids_by_passage: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge new exact passages with need-aware semantic re-selection.
+    """Merge new exact passages with coverage-aware budgeting (#311).
 
     All eligible old and new candidates are unioned first (stable-id
     dedup with integrity failure on same-id/different-content, never a
-    silent keep-older), then the combined pool is reconsidered against
-    the still-unanswered request using currently available
-    resolved intent/dialogue context under an explicit total token
-    budget plus the pack count bound. A newly relevant source can
-    therefore displace an older irrelevant one in an already full pack
-    instead of being rejected for insertion order. Provenance and all
-    stored passage fields are preserved verbatim for the future
-    typed-needs/coverage contracts.
+    silent keep-older; duplicate passages union their ``need_ids`` /
+    ``query_ids`` so shared evidence keeps all associations), then the
+    combined pool is reconsidered under an explicit total token budget
+    plus the pack count bound. A newly relevant source can therefore
+    displace an older irrelevant one in an already full pack instead of
+    being rejected for insertion order.
+
+    Ordering inside this function is a lexical fallback (generic token
+    overlap via :func:`order_pack_semantically`), never an LLM semantic
+    verdict. When typed ``information_needs`` (plus per-passage need
+    associations carried on the pack dicts or via
+    ``need_ids_by_passage``) are available, budgeting preserves
+    per-need representation round-robin so a second need's sole relevant
+    passage survives the budget boundary even with lower lexical
+    overlap; without need provenance the legacy lexical order applies.
+    Provenance and all stored passage fields are preserved verbatim.
     """
     from aa.corpus.budget import RETRIEVED_PASSAGES_BUDGET_TOKENS, estimate_text_tokens
     from aa.retrieval.evidence import check_passage_id_consistency, enrich_pack_provenance
@@ -745,9 +770,33 @@ def merge_pack_dicts(
         if key in combined:
             check_passage_id_consistency(key, combined[key], item)
             enrich_pack_provenance(combined[key], item)
+            try:
+                merged_needs = _union_id_lists(combined[key].get("need_ids"), item.get("need_ids"))
+                if merged_needs:
+                    combined[key]["need_ids"] = merged_needs
+                merged_queries = _union_id_lists(
+                    combined[key].get("query_ids"), item.get("query_ids")
+                )
+                if merged_queries:
+                    combined[key]["query_ids"] = merged_queries
+            except Exception:
+                pass
             continue
         combined[key] = dict(item)
         order.append(key)
+    # Explicit per-passage need map (same typed seam as retrieval)
+    # supplements pack-embedded provenance without overwriting it.
+    if isinstance(need_ids_by_passage, dict):
+        for pid, nids in need_ids_by_passage.items():
+            key = str(pid or "").strip()
+            if not key or key not in combined:
+                continue
+            try:
+                merged = _union_id_lists(combined[key].get("need_ids"), nids)
+                if merged:
+                    combined[key]["need_ids"] = merged
+            except Exception:
+                continue
     pool = [combined[key] for key in order]
     context = f"{resolved_intent or ''} {conversation_context or ''}".strip()
     if context:
@@ -761,9 +810,69 @@ def merge_pack_dicts(
             )
         except Exception:
             pool = [combined[key] for key in order]
+    # Coverage-aware budgeting: when need provenance exists, interleave
+    # per-need best-first so each represented need keeps exposure at the
+    # budget boundary; remaining slots fill in pool order.
+    ordered_pool = pool
+    try:
+        need_order: list[str] = []
+        if information_needs:
+            for entry in list(information_needs):
+                nid = ""
+                try:
+                    nid = str(
+                        entry.get("need_id", "")
+                        if isinstance(entry, dict)
+                        else getattr(entry, "need_id", "")
+                    )
+                except Exception:
+                    nid = ""
+                nid = nid.strip()
+                if nid and nid not in need_order:
+                    need_order.append(nid)
+        has_provenance = any(
+            isinstance(item.get("need_ids"), list)
+            and [n for n in item["need_ids"] if str(n).strip()]
+            for item in pool
+            if isinstance(item, dict)
+        )
+        if need_order and has_provenance:
+            buckets: dict[str, list[dict[str, Any]]] = {nid: [] for nid in need_order}
+            for item in pool:
+                raw = item.get("need_ids", [])
+                ids = (
+                    [str(n).strip() for n in list(raw) if str(n or "").strip()]
+                    if isinstance(raw, list)
+                    else []
+                )
+                for nid in ids:
+                    if nid in buckets and item not in buckets[nid]:
+                        buckets[nid].append(item)
+            interleaved: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            progressed = True
+            while progressed:
+                progressed = False
+                for nid in need_order:
+                    for candidate in list(buckets.get(nid, [])):
+                        pid = str(candidate.get("passage_id", ""))
+                        if pid not in seen_ids:
+                            interleaved.append(candidate)
+                            seen_ids.add(pid)
+                            progressed = True
+                            break
+            for item in pool:
+                pid = str(item.get("passage_id", ""))
+                if pid not in seen_ids:
+                    interleaved.append(item)
+                    seen_ids.add(pid)
+            if interleaved:
+                ordered_pool = interleaved
+    except Exception:
+        ordered_pool = pool
     selected: list[dict[str, Any]] = []
     total = 0
-    for item in pool:
+    for item in ordered_pool:
         if cap > 0 and len(selected) >= cap:
             break
         try:
@@ -1044,13 +1153,15 @@ async def run_v2_answer_turn(
         from aa.conversation.failures import TurnFailed as _PackTurnFailed
 
         raise _PackTurnFailed("evidence-integrity", f"evidence pack invalid: {exc}") from exc
-    # Model-driven semantic ordering over the broad Evidence Pack (issue
-    # #295): reorder by generic intent relevance without dropping any
-    # passage, so decisive deep-ranked material surfaces for generation
-    # and verification while the full pack stays available. Deterministic
-    # and model-free here (the retrieval layer already applied the same
-    # promotion); a dedicated selection-model pass may reorder again
-    # upstream without ever pruning before budgeting.
+    # Lexical-fallback ordering over the broad Evidence Pack (issue
+    # #295 heuristic, #311 provenance): reorder by generic intent
+    # relevance without dropping any passage, so decisive deep-ranked
+    # material surfaces for generation and verification while the full
+    # pack stays available. Deterministic and model-free here (the
+    # retrieval layer already applied the same promotion); a dedicated
+    # selection-model pass may reorder again upstream without ever
+    # pruning before budgeting. This is a lexical fallback, never a
+    # model semantic verdict (#311/#312).
     _pack_order = "fused"
     try:
         from aa.conversation.semantic_selection import order_pack_semantically as _order_pack
@@ -1060,20 +1171,20 @@ async def run_v2_answer_turn(
             pack = _order_pack(
                 pack, resolved_intent=_order_intent, conversation_context=str(summary or "")
             )
-            _pack_order = "semantic"
+            _pack_order = "lexical_fallback"
             logger.debug(
-                "evidence pack semantically ordered",
+                "evidence pack lexically reordered",
                 extra={"passages": len(pack)},
             )
         else:
             logger.debug(
-                "evidence pack semantic reorder skipped; fused order kept",
+                "evidence pack lexical reorder skipped; fused order kept",
                 extra={"pack_empty": not pack, "intent_empty": not _order_intent},
             )
     except Exception as exc:
         _pack_order = "fused-fallback"
         logger.debug(
-            "evidence pack semantic reorder failed; fused order kept",
+            "evidence pack lexical reorder failed; fused order kept",
             extra={"category": type(exc).__name__},
         )
     initial_pack_empty = not pack
