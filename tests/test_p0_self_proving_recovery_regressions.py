@@ -42,7 +42,8 @@ def test_qualification_does_not_preempt_same_sha_or_forge_missing_gate_a() -> No
     workflow = (
         ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
     ).read_text(encoding="utf-8")
-    assert "group: aa-self-proving-qualification-${{ inputs.required_sha || github.sha }}" in workflow
+    expected_group = "group: aa-self-proving-qualification-${{ inputs.required_sha || github.sha }}"
+    assert expected_group in workflow
     assert "cancel-in-progress: false" in workflow
     gate_f = workflow.split("- name: Gate F - exact-main final verdict", 1)[1].split(
         "- name: Upload per-gate evidence", 1
@@ -58,9 +59,9 @@ def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> N
     workflow = (
         ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
     ).read_text(encoding="utf-8")
-    publisher = workflow.split("- name: Publish machine-readable failure and repair marker", 1)[1].split(
-        "- name: Publish authoritative Product Contract result", 1
-    )[0]
+    start = "- name: Publish machine-readable failure and repair marker"
+    end = "- name: Publish authoritative Product Contract result"
+    publisher = workflow.split(start, 1)[1].split(end, 1)[0]
     before_parser, inside_parser = publisher.split(
         "const summary = JSON.parse(", 1
     )
