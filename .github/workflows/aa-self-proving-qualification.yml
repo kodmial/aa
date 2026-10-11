@@ -898,7 +898,9 @@ jobs:
         # not product-code repair issues.
         # A workflow_run recovery controller reruns failed jobs on a fresh VM
         # from the persisted gate checkpoints.
-        if: ${{ failure() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        # Missing setup/checkout proof is an infrastructure failure, not an
+        # implementation defect. Never open code-repair tasks for it.
+        if: ${{ failure() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
@@ -926,6 +928,21 @@ jobs:
             const sha = process.env.FAILED_SHA || context.sha;
             const runId = String(context.runId);
             const transientBlocked = fs.existsSync('self-proving-out/transient-blocked.json');
+            // A historical runner can finish after main advances. Its proof
+            // is STALE, not authority to mutate current production code.
+            // Skip old-SHA repair creation even if all original gates failed.
+            if (!/^[0-9a-f]{40}$/.test(sha)) {
+              core.warning('Missing exact checked SHA: refuse any repair mutation.');
+              return;
+            }
+            const { data: branch } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main',
+            });
+            if (String(branch.commit.sha || '').toLowerCase() !== sha.toLowerCase()) {
+              core.notice(`Qualification run ${runId} is stale (${sha.slice(0, 12)}); no repair issue is created.`);
+              return;
+            }
+
             async function apiRetry(label, fn) {
               let delayMs = 5000;
               for (let attempt = 1; attempt <= 5; attempt++) {
