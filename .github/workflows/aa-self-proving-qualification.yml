@@ -46,10 +46,12 @@ permissions:
   issues: write
 
 concurrency:
-  group: aa-self-proving-qualification
-  # Exact-main evidence becomes invalid as soon as main advances. Cancel stale
-  # qualification immediately so the newest main SHA owns the single slot.
-  cancel-in-progress: true
+  # The push runner and the mandatory lifecycle dispatcher can both target
+  # the SAME main SHA. Never preempt a healthy run while installing assets:
+  # cancellation produced a forged 'missing A evidence' verdict. Serialize
+  # by exact SHA, and let the explicit main-identity check reject stale runs.
+  group: aa-self-proving-qualification-${{ inputs.required_sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   qualify:
@@ -770,7 +772,10 @@ jobs:
         # cannot replace a real Gate C live-path-failed with
         # live-execution-not-enabled; the runner additionally prefers the
         # persisted live-out artifact regardless of env.
-        if: always()
+        # An interrupted/failed dependency-install step is infrastructure
+        # failure, not a product Gate A/B failure. Do not synthesize gate
+        # evidence before Gate A had a chance to run.
+        if: ${{ always() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') }}
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -940,6 +945,10 @@ jobs:
             let blocking = 'unknown';
             let component = 'unknown';
             let productFailures = [];
+            // Used both inside the evidence parser and in recurrence routing.
+            // A block-scoped const inside try caused ReferenceError before the
+            // automatic P0 repair task could be published (run 38107901985).
+            let failGates = new Set();
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
             let verifierLine = 'Verifier availability: unavailable.';
@@ -1033,7 +1042,7 @@ jobs:
                   timingLine = `Timings: p50=${Math.round(p50)}ms, p95=${Math.round(p95)}ms, max=${Math.round(max)}ms.`;
                 }
               }
-              const failGates = new Set(productFailures.map(g => String(g.gate || '')));
+              failGates = new Set(productFailures.map(g => String(g.gate || '')));
               if (failGates.has('C') && failGates.has('E')) {
                 repairFocus = '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.';
               } else if (blocking === 'E') {
@@ -1451,7 +1460,9 @@ jobs:
             core.info('Dispatched continuum-issue-scheduler.yml once for the P0 repair issue.');
 
       - name: Publish authoritative Product Contract result
-        if: ${{ always() && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        # Publish only when Gate A actually executed. A setup cancellation
+        # must never record a trusted product FAIL on missing artifacts.
+        if: ${{ always() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           QUAL_SHA: ${{ steps.sha.outputs.sha }}
