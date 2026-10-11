@@ -241,15 +241,18 @@ def test_ephemeral_gate_checkpoints_stay_untracked() -> None:
 
 
 def test_self_proving_gate_f_always_emits_verdict() -> None:
-    # Regression for kodmial/aa#151 unknown-gate-failure: Gate F must run even
-    # after a Gate C failure so the repair publisher maps a concrete blocking
-    # gate instead of "unknown".
+    # Gate F still runs after a real Gate C/D/E failure and reports every
+    # already-executed gate, but never manufactures a product verdict when
+    # setup was cancelled before Gate A (historical false B/A blame).
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
     ).read_text(encoding="utf-8")
     gate_f_index = workflow.index("Gate F - exact-main final verdict")
-    gate_f_block = workflow[gate_f_index : gate_f_index + 800]
-    assert "if: always()" in gate_f_block
+    gate_f_block = workflow[gate_f_index : gate_f_index + 1100]
+    assert "if: ${{ always()" in gate_f_block
+    assert "steps.gate-a.outcome == 'success'" in gate_f_block
+    assert "steps.gate-a.outcome == 'failure'" in gate_f_block
+    assert "steps.gate-c.outcome == 'success'" not in gate_f_block
 
 
 def test_live_runner_stale_on_sha_mismatch(tmp_path: Path) -> None:
