@@ -3586,7 +3586,11 @@ async def run_live_telegram_evidence_lane(
                     provenance=heldout_provenance, verdicts=heldout_verdicts
                 )
             # C-regression tier report: stable visible deterministic cases
-            # for fast failure localization (never unseen proof).
+            # for fast failure localization (never unseen proof). Built here
+            # from the pre-heldout snapshot and refreshed from the final
+            # lane failures before metrics (see below), so a post-heldout
+            # collapse over regression replies cannot leave the tier PASS
+            # while the lane fails.
             family_positions: dict[str, list[int]] = {}
             for position, (family, _, _) in enumerate(scenarios, start=1):
                 family_positions.setdefault(family, []).append(position)
@@ -3606,6 +3610,10 @@ async def run_live_telegram_evidence_lane(
                 failed_ids=sorted(failed_cases),
                 failure_categories=check_category_counts,
             )
+            regression_cases_for_refresh = list(regression_cases)
+            family_positions_for_refresh = {
+                key: list(value) for key, value in family_positions.items()
+            }
 
             collapsed_count = sum(1 for item in replies if is_service_error(item.strip()))
             # Hash-based answer variety is never evidence of helpfulness.
@@ -3969,6 +3977,44 @@ async def run_live_telegram_evidence_lane(
     # Gate C tier metrics (kodmial/aa#341): the single typed semantic
     # report holding C-regression plus C-heldout. Only opaque ids,
     # digests, counts and fixed-vocabulary tokens travel here.
+    # Refresh the C-regression tier from the final lane failures: the
+    # report above was snapshotted pre-heldout, while checks such as
+    # live-answer-no-generic-collapse run afterward over all replies
+    # (including regression replies). Without this refresh a collapse
+    # affecting regression replies would fail the lane while the tier
+    # still reports PASS.
+    try:
+        # Only lane-wide answer checks that evaluate regression replies
+        # refresh the tier (collapse/diversity/grounding/delivery cover
+        # the 18 visible turns). Voice/model-policy/heldout checks have
+        # their own lane signals and must not newly fail the
+        # regression tier.
+        _refresh_prefixes = (
+            "live-answer-no-generic-collapse",
+            "live-substantive-grounded-book-answer",
+            "live-answer-diversity",
+            "live-typing-heartbeat-continuous",
+            "live-delivery-sendmessage-observed",
+            "live-planner-retrieval-answer-verifier-telemetry",
+        )
+        _refresh_positions = dict(family_positions_for_refresh)
+        _refresh_failed_cases: set[str] = set()
+        for _check_name in failed:
+            _name = str(_check_name)
+            if _name in set(pre_heldout_failed) or _name.startswith(_refresh_prefixes):
+                _refresh_failed_cases.update(_regression_cases_for_check(_name, _refresh_positions))
+        _refresh_categories: dict[str, int] = {}
+        for _check_name in failed:
+            _key = str(_check_name)
+            if _key in set(pre_heldout_failed) or _key.startswith(_refresh_prefixes):
+                _refresh_categories[_key] = _refresh_categories.get(_key, 0) + 1
+        regression_report_for_metrics = _heldout.build_regression_tier_report(
+            scenario_ids=list(regression_cases_for_refresh),
+            failed_ids=sorted(_refresh_failed_cases),
+            failure_categories=_refresh_categories,
+        )
+    except Exception:
+        pass
     try:
         if heldout_report_for_metrics is not None and regression_report_for_metrics is not None:
             metrics.update(

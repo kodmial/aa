@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         if not primary:
             raise GateCHeldoutBlockedError("EXTERNAL_SEMANTIC_PROVIDER_UNAVAILABLE")
 
-        async def _client() -> Any:
+        async def _start_runtime() -> tuple[Any, Any]:
             runtime = LocalOpenCodeRuntime(
                 OpenCodeConfig(
                     base_url=settings.opencode_base_url,
@@ -143,11 +143,12 @@ def main(argv: list[str] | None = None) -> int:
             await runtime.start()
             try:
                 await runtime.ensure_ready()
-                return runtime.client
-            finally:
+            except Exception:
                 await runtime.stop()
+                raise
+            return runtime, runtime.client
 
-        client = asyncio.run(_client())
+        runtime, client = asyncio.run(_start_runtime())
     except Exception as exc:  # noqa: BLE001 - fail-closed typed BLOCKED only
         print(
             json.dumps(
@@ -158,8 +159,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    synthesizer = _provider_synthesizer(client, primary)
     try:
+        synthesizer = _provider_synthesizer(client, primary)
         rubric_hex = rubric_digest(ROOT)
         fixture, made = generate_unseen_fixture(
             seed=new_unseen_seed(),
@@ -173,6 +174,14 @@ def main(argv: list[str] | None = None) -> int:
         reason = getattr(exc, "reason", type(exc).__name__)
         print(json.dumps({"result": "BLOCKED", "reason": str(reason)}))
         return 2
+    finally:
+        # The provider runtime stays alive across synthesis and is stopped
+        # only after the fixture is built: stopping it before first use
+        # would leave the synthesizer with a closed transport.
+        try:
+            asyncio.run(runtime.stop())
+        except Exception:
+            pass
     args.out.write_text(
         json.dumps(fixture, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",

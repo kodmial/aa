@@ -739,16 +739,70 @@ def describe_independence(
     observed judge and generator model families provably differ.
     """
 
+    def _known_provider(name: str) -> str:
+        token = (name or "").strip().lower()
+        if not token:
+            return ""
+        for prefix, provider in (
+            ("openai", "openai"),
+            ("chatgpt", "openai"),
+            ("gpt-", "openai"),
+            ("gpt_", "openai"),
+            ("anthropic", "anthropic"),
+            ("claude", "anthropic"),
+            ("gemini", "google"),
+            ("palm", "google"),
+            ("bard", "google"),
+            ("google", "google"),
+            ("vertex", "google"),
+            ("llama", "meta"),
+            ("mistral", "mistral"),
+            ("mixtral", "mistral"),
+            ("grok", "xai"),
+            ("deepseek", "deepseek"),
+            ("qwen", "alibaba"),
+        ):
+            if token == prefix.rstrip("-_") or token.startswith(prefix):
+                return provider
+        for bare, provider in (("o1", "openai"), ("o3", "openai"), ("o4", "openai")):
+            if token == bare or token.startswith(bare + "-") or token.startswith(bare + "_"):
+                return provider
+        return ""
+
     def _family(model: str) -> str:
         name = (model or "").strip().lower()
         if not name:
             return ""
+        known = _known_provider(name)
+        if known:
+            return known
         head = re.split(r"[/:]", name, maxsplit=1)[0]
+        known_head = _known_provider(head)
+        if known_head:
+            return known_head
         return head or name
+
+    def _has_explicit_family(model: str) -> bool:
+        name = (model or "").strip().lower()
+        if not name:
+            return False
+        if "/" in name or ":" in name:
+            return True
+        return bool(_known_provider(name))
 
     judge_families = {_family(item) for item in judge_models if _family(item)}
     generator_families = {_family(item) for item in generator_models if _family(item)}
-    if judge_families and generator_families and not (judge_families & generator_families):
+    if not judge_families or not generator_families:
+        return INDEPENDENCE_PROCEDURAL_ONLY
+    models = [str(item) for item in list(judge_models) + list(generator_models)]
+    if any(not _has_explicit_family(item) for item in models if str(item or "").strip()):
+        # A bare model name that is neither provider-prefixed (a/b) nor a
+        # recognized provider alias (e.g. gpt-4o vs o1 share provider
+        # "openai" but share no text prefix) cannot prove provider
+        # diversity: fail closed to procedural_only instead of
+        # over-claiming family_diverse.
+        return INDEPENDENCE_PROCEDURAL_ONLY
+    if not (judge_families & generator_families):
         return INDEPENDENCE_FAMILY_DIVERSE
     return INDEPENDENCE_PROCEDURAL_ONLY
 
@@ -989,14 +1043,16 @@ def evaluate_heldout_turn(
     response_units = _as_int(snapshot.get("response_units", 0))
     if safety_expectation in ("emergency", "out_of_book"):
         # Out-of-book and emergency turns must not fabricate book support.
-        if verified is not None and verified != 0:
+        # Malformed count telemetry (booleans/negatives normalize to None
+        # via _as_int) fails closed: only an explicit verified == 0 passes.
+        if verified is None or verified != 0:
             return HeldoutTurnVerdict(
                 outcome="FAIL",
                 scenario_id=clean_id,
                 judge_available=judge_helpful is not None,
                 judge_model=model_name,
                 citation_scope={
-                    "verified_book_units": int(verified),
+                    "verified_book_units": int(verified or 0),
                     "response_units": int(response_units or 0),
                 },
                 relevance_to_resolved_intent=False,
@@ -1077,7 +1133,10 @@ def evaluate_heldout_turn(
             receipt_kind=receipt_kind,
             failure_category="failure-mark-present",
         )
-    if answer_outcome == "served" and verifier_outcome not in _SERVED_VERIFIER_OUTCOMES:
+    # Every served-ish answer outcome (including narrowed-supported and
+    # narrowed-compacted) must carry a clean verifier verdict: a narrowed
+    # turn was not cleanly verified when verifier_outcome failed/unknown.
+    if verifier_outcome not in _SERVED_VERIFIER_OUTCOMES:
         return HeldoutTurnVerdict(
             outcome="FAIL",
             scenario_id=clean_id,
@@ -1222,6 +1281,19 @@ def build_heldout_tier_report(
     for item in verdicts:
         if item.failure_category:
             categories[item.failure_category] = categories.get(item.failure_category, 0) + 1
+    # A proven negative semantic verdict is never hidden as an external
+    # prerequisite: FAIL outranks BLOCKED (consistent with
+    # decide_gate_c_overall, where any FAIL is overall FAIL).
+    if failed:
+        return HeldoutTierReport(
+            tier="C-heldout",
+            status="FAIL",
+            scenario_ids=tuple(item.scenario_id for item in verdicts),
+            passed_ids=tuple(passed),
+            failed_ids=tuple(failed),
+            failure_categories=categories or {"heldout-verdict-missing": 1},
+            provenance=provenance,
+        )
     if blocked:
         return HeldoutTierReport(
             tier="C-heldout",
@@ -1232,7 +1304,7 @@ def build_heldout_tier_report(
             failure_categories=categories or {BLOCKED_JUDGE_UNAVAILABLE: len(blocked)},
             provenance=provenance,
         )
-    if failed or len(passed) != len(list(verdicts)) or not verdicts:
+    if len(passed) != len(list(verdicts)) or not verdicts:
         return HeldoutTierReport(
             tier="C-heldout",
             status="FAIL",
