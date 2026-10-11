@@ -1324,7 +1324,89 @@ def _gate_c_live_evidence(
             "live-answer-diversity",
             "live-actual-served-model-identity",
             "live-planner-retrieval-answer-verifier-telemetry",
+            "live-egress-simulated-labeled",
         }
+        # Issue #340 boundary enforcement: Gate C egress is simulated with
+        # a trusted in-process receipt only. A lane claiming an external
+        # Bot API delivery receipt from the in-memory seam fails closed
+        # here so Gate D can never inherit a fake network proof from C.
+        lane_metrics = live_lane.get("metrics", {})
+        boundary = lane_metrics.get("gate_boundary", {}) if isinstance(lane_metrics, dict) else {}
+        if not isinstance(boundary, dict) or not boundary:
+            return (
+                GateEvidence(
+                    gate="C",
+                    status="FAIL",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category="in-memory-id-mislabeled-external",
+                    component="live-production-path",
+                    run_id=run_id,
+                    live_trusted=True,
+                    mocked_only=False,
+                    detail="gate-c-boundary-missing",
+                ),
+                real_latencies,
+                aggregate,
+            )
+        if isinstance(boundary, dict) and boundary:
+            egress = str(boundary.get("telegram_egress_mode", ""))
+            receipt = str(boundary.get("delivery_receipt_kind", ""))
+            if egress and egress != "stubbed":
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="FAIL",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="in-memory-id-mislabeled-external",
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                        detail="gate-c-egress-must-be-simulated",
+                    ),
+                    real_latencies,
+                    aggregate,
+                )
+            if receipt and receipt not in ("simulated-in-process", "none"):
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="FAIL",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="in-memory-id-mislabeled-external",
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                        detail="gate-c-receipt-must-be-simulated",
+                    ),
+                    real_latencies,
+                    aggregate,
+                )
+            if any("delivery-confirmed" in item for item in passed):
+                return (
+                    GateEvidence(
+                        gate="C",
+                        status="FAIL",
+                        sha=expected_sha,
+                        product_fingerprint=product,
+                        runtime_fingerprint=runtime,
+                        failure_category="in-memory-id-mislabeled-external",
+                        component="live-production-path",
+                        run_id=run_id,
+                        live_trusted=True,
+                        mocked_only=False,
+                        detail="gate-c-cannot-claim-external-delivery",
+                    ),
+                    real_latencies,
+                    aggregate,
+                )
 
         if lane_status == "PASS" and required_checks.issubset(set(passed)):
             return (
@@ -1464,7 +1546,10 @@ def _gate_d_marker_verdict(
     (then STOPPED after a clean stop with no leaked poll task). A FAILED
     marker means the live app failed to reach readiness.
     """
+    import time as _time
+
     from aa.control.runtime_status import RuntimeStatusError, read_marker
+    from aa.telegram.startup_probe import validate_trusted_ready_marker
 
     for candidate in (
         ROOT / "self-proving-out" / "runtime-status.json",
@@ -1478,16 +1563,46 @@ def _gate_d_marker_verdict(
             continue
         if marker.sha != expected_sha or marker.run_id != run_id:
             continue
+        # Issue #340: a marker alone never proves a currently live poller.
+        # A file carries only SHA/run/freshness claims and is copyable, so
+        # it is never accepted as direct poll-task liveness evidence here.
+        # This script holds no live poll-task handle, so fail closed
+        # (poll_task_live=False) and stay BLOCKED; a stale/copied marker
+        # never becomes D PASS.
         if marker.phase == "STOPPED":
+            ok, _reason = validate_trusted_ready_marker(
+                marker_sha=marker.sha,
+                marker_run_id=marker.run_id,
+                marker_timestamp_s=float(marker.timestamp_s),
+                expected_sha=expected_sha,
+                expected_run_id=run_id,
+                now_s=_time.time(),
+                poll_task_live=False,
+            )
+            if not ok:
+                return GateEvidence(
+                    gate="D",
+                    status="BLOCKED",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category="telegram-readiness-unproven",
+                    component="telegram-readiness",
+                    run_id=run_id,
+                    detail="stale-runtime-marker-without-liveness",
+                )
+            # Fail closed even when SHA/run/freshness match: a file alone
+            # never proves the poll task is currently live.
             return GateEvidence(
                 gate="D",
-                status="PASS",
+                status="BLOCKED",
                 sha=expected_sha,
                 product_fingerprint=product,
                 runtime_fingerprint=runtime,
+                failure_category="telegram-readiness-unproven",
                 component="telegram-readiness",
                 run_id=run_id,
-                live_trusted=True,
+                detail="stale-runtime-marker-without-liveness",
             )
         if marker.phase == "READY":
             return GateEvidence(
@@ -1517,9 +1632,25 @@ def _gate_d_marker_verdict(
 
 
 def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateEvidence:
-    token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
     live = (os.environ.get("SELF_PROVING_LIVE", "") or "").strip() == "1"
-    if not live or not token:
+    # Issue #340 safe isolation: prefer the isolated test bot identity;
+    # the production token is used only with an explicit exclusive lease.
+    # Without either, D is an explicit typed external blocker (no probing,
+    # no destructive webhook/poller calls, no fake PASS).
+    from aa.telegram.startup_probe import (
+        isolated_test_bot_id,
+        isolated_test_bot_token,
+        production_lease_authorized,
+        verify_bot_identity_scope,
+    )
+
+    test_token = isolated_test_bot_token()
+    production_token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    if test_token:
+        token = test_token
+    elif production_token and production_lease_authorized():
+        token = production_token
+    else:
         return GateEvidence(
             gate="D",
             status="BLOCKED",
@@ -1527,8 +1658,26 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
             product_fingerprint=product,
             runtime_fingerprint=runtime,
             failure_category=(
-                "missing-secret-telegram-token" if not token else "live-evidence-required"
+                "live-evidence-required"
+                if live and production_token
+                else (
+                    "missing-secret-telegram-token"
+                    if not production_token and not test_token
+                    else "test-bot-unavailable"
+                )
             ),
+            component="telegram-readiness",
+            run_id=run_id,
+            detail="EXTERNAL_TEST_BOT_UNAVAILABLE",
+        )
+    if not live:
+        return GateEvidence(
+            gate="D",
+            status="BLOCKED",
+            sha=expected_sha,
+            product_fingerprint=product,
+            runtime_fingerprint=runtime,
+            failure_category="live-evidence-required",
             component="telegram-readiness",
             run_id=run_id,
         )
@@ -1542,7 +1691,10 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
     # published from the running Application after proving OpenCode health,
     # getMe identity, webhook/commands bootstrap, ``transport.running`` with
     # a live poll task, and a clean stop with no leaked poll task. A bare
-    # getMe-only script is forbidden and stays BLOCKED here.
+    # getMe-only script is forbidden and stays BLOCKED here. Only read-only
+    # Bot API calls (getMe/getWebhookInfo) run here; destructive bootstrap
+    # (deleteWebhook/setMyCommands/getUpdates polling) runs solely in the
+    # workflow probe under the active-poller guard with guaranteed restore.
     try:
         me_payload = _telegram_get_json(token, "getMe")
         if me_payload.get("ok") is not True:
@@ -1552,6 +1704,18 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
             raise SelfProvingError("telegram getMe identity payload invalid")
         if result.get("is_bot") is not True:
             raise SelfProvingError("telegram getMe identity is not a bot")
+        if not verify_bot_identity_scope(bot_info=result, expected_bot_id=isolated_test_bot_id()):
+            return GateEvidence(
+                gate="D",
+                status="BLOCKED",
+                sha=expected_sha,
+                product_fingerprint=product,
+                runtime_fingerprint=runtime,
+                failure_category="test-bot-unavailable",
+                component="telegram-readiness",
+                run_id=run_id,
+                detail="EXTERNAL_TEST_BOT_UNAVAILABLE",
+            )
         hook_payload = _telegram_get_json(token, "getWebhookInfo")
         hook_result = hook_payload.get("result")
         if not isinstance(hook_result, dict):
@@ -1568,7 +1732,7 @@ def _gate_d(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 failure_category="telegram-readiness-unproven",
                 component="telegram-readiness",
                 run_id=run_id,
-                detail="webhook-configured-polling-blocked",
+                detail="EXTERNAL_POLLER_CONFLICT",
             )
         try:
             pending_count = int(pending or 0)
