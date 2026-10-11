@@ -687,7 +687,11 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 "output-envelope",
                 "short reply rejected",
             )
-        long_text = "Слово " * 400
+        # Complete, individually bounded units: compaction must keep a
+        # legal prefix without cutting any sentence or verified claim.
+        # A 400-word SINGLE unit cannot be truncated safely and must
+        # instead fail closed (tested separately below).
+        long_text = "Слово. " * 400
         if envelope_passes(long_text):
             return _fail_b(
                 expected_sha,
@@ -706,6 +710,17 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
                 runtime,
                 "output-envelope",
                 "compaction still over budget",
+            )
+        # An indivisible over-limit unit must not be silently truncated:
+        # this is the current multi-segment transport safety contract.
+        try:
+            compact_text_to_envelope("Слово " * 400)
+        except ValueError:
+            pass
+        else:
+            return _fail_b(
+                expected_sha, run_id, product, runtime,
+                "output-envelope", "indivisible oversized unit was accepted",
             )
     except Exception as exc:
         return _fail_b(
