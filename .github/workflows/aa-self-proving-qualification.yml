@@ -152,16 +152,20 @@ jobs:
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
           RESTORE_DIR="/tmp/aa-self-proving-checkpoints-restore"
           mkdir -p "$CKPT_DIR"
-          if compgen -G "$RESTORE_DIR/gate-*.done" > /dev/null; then
-            cp "$RESTORE_DIR"/gate-*.done "$CKPT_DIR"/
-            echo "restored gate checkpoints from previous attempt:"
+          # Typed checkpoints only (kodmial/aa#342): a bare gate-X.done file
+          # carries no SHA/run/fingerprint binding and never authorizes a
+          # skip. Only schema-validated checkpoint JSONs are staged; the
+          # per-gate --check-skip validation below enforces the binding.
+          if compgen -G "$RESTORE_DIR/gate-*.checkpoint.json" > /dev/null; then
+            cp "$RESTORE_DIR"/gate-*.checkpoint.json "$CKPT_DIR"/
+            echo "restored typed gate checkpoints from previous attempt:"
             ls -la "$CKPT_DIR"
-          elif compgen -G "$RESTORE_DIR/**/gate-*.done" > /dev/null; then
-            find "$RESTORE_DIR" -name 'gate-*.done' -exec cp {} "$CKPT_DIR"/ \;
-            echo "restored nested gate checkpoints from previous attempt:"
+          elif compgen -G "$RESTORE_DIR/**/gate-*.checkpoint.json" > /dev/null; then
+            find "$RESTORE_DIR" -name 'gate-*.checkpoint.json' -exec cp {} "$CKPT_DIR"/ \;
+            echo "restored nested typed gate checkpoints from previous attempt:"
             ls -la "$CKPT_DIR"
           else
-            echo "no previous gate checkpoints found"
+            echo "no previous typed gate checkpoints found"
           fi
           if [[ -d "$RESTORE_DIR/live-out" ]]; then
             rm -rf live-out
@@ -172,6 +176,11 @@ jobs:
             mkdir -p self-proving-out
             cp "$RESTORE_DIR/runtime-status.json" self-proving-out/runtime-status.json
             echo "restored Gate D runtime evidence"
+          fi
+          if [[ -f "$RESTORE_DIR/runtime-timings.json" ]]; then
+            mkdir -p self-proving-out
+            cp "$RESTORE_DIR/runtime-timings.json" self-proving-out/runtime-timings.json
+            echo "restored Gate D runtime timings"
           fi
           # Unified Gate A/B evidence (issue #339): restore already-published
           # validated artifacts so a resumed runner reuses the single
@@ -187,12 +196,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Checkpoint resume: skip this gate when its checkpoint already
-          # exists (provider 429 runner retire resumes from the last
-          # completed gate instead of re-running from the start).
+          # Checkpoint resume (kodmial/aa#342): skip only when a validated
+          # typed checkpoint plus its matching evidence artifact bind this
+          # exact SHA/run. A bare gate-X.done file never authorizes a skip.
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          if [[ -f "$CKPT_DIR/gate-A.done" ]]; then
-            echo "Gate A checkpoint present; skipping (resume)."
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip A; then
+            echo "Gate A validated checkpoint present; skipping (resume)."
             exit 0
           fi
           # Exact SHA + clean tree verified above; canonical restore
@@ -200,8 +212,9 @@ jobs:
           # retrieval fingerprint consistency run here fail-closed.
           # Unified Gate A evidence (issue #339): the shell checks below run
           # exactly once; their outcome plus the python trust-boundary checks
-          # publish ONE authoritative gate-A-evidence.json artifact. Gate F
-          # consumes that artifact read-only and never re-executes Gate A.
+          # publish ONE authoritative gate-A-evidence.json artifact plus its
+          # typed checkpoint. Gate F consumes that artifact read-only and
+          # never re-executes Gate A.
           gate_a_shell=pass
           bash scripts/verify.sh || gate_a_shell=fail
           python scripts/verify_product_contract_qualification.py --require-active || gate_a_shell=fail
@@ -209,10 +222,9 @@ jobs:
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" \
             --emit-gate A --shell-a-status "$gate_a_shell" \
             --shell-a-detail "workflow-gate-a-shell-$gate_a_shell"
-          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          echo "A" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-A.done"
 
       - name: Gate B - deterministic component integration
         id: gate-b
@@ -222,10 +234,14 @@ jobs:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
         run: |
           set -euo pipefail
-          # Checkpoint resume: skip when Gate B already completed.
+          # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
+          # only; a bare gate-X.done file never authorizes a skip.
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          if [[ -f "$CKPT_DIR/gate-B.done" ]]; then
-            echo "Gate B checkpoint present; skipping (resume)."
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip B; then
+            echo "Gate B validated checkpoint present; skipping (resume)."
             exit 0
           fi
           # Real RU corpus restore + real BM25/E5/FAISS index bootstrap, then
@@ -258,10 +274,9 @@ jobs:
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" \
             --emit-gate B --shell-b-status "$gate_b_shell" \
             --shell-b-detail "workflow-gate-b-shell-$gate_b_shell"
-          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          echo "B" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-B.done"
 
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
@@ -274,10 +289,14 @@ jobs:
           OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
-          # Checkpoint resume: skip when Gate C already completed.
+          # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
+          # only; a bare gate-X.done file never authorizes a skip.
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          if [[ -f "$CKPT_DIR/gate-C.done" ]]; then
-            echo "Gate C checkpoint present; skipping (resume)."
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip C; then
+            echo "Gate C validated checkpoint present; skipping (resume)."
             exit 0
           fi
           # Repository-owned live gate: real local OpenCode process and real
@@ -310,24 +329,15 @@ jobs:
             echo "::error::Gate C provider 429: retire runner and resume on a fresh VM."
             exit 75
           fi
-          QUAL_SHA="${{ steps.sha.outputs.sha }}" QUAL_RUN="${{ github.run_id }}" python - <<'PY'
-          import os
-          import sys
-          sys.path.insert(0, ".")
-          sys.path.insert(0, "src")
-          import scripts.run_self_proving_qualification as runner
-
-          sha = os.environ["QUAL_SHA"]
-          run_id = os.environ["QUAL_RUN"]
-          product = runner._product_fingerprint()
-          runtime = runner._runtime_fingerprint()
-          evidence, _, _ = runner._gate_c(sha, run_id, product, runtime)
-          print(f"Gate C {evidence.status}: {evidence.failure_category or evidence.component}")
-          if evidence.status != "PASS" or not evidence.live_trusted or evidence.mocked_only:
-              raise SystemExit(1 if evidence.status == "FAIL" else 2)
-          PY
-          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          echo "C" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-C.done"
+          # Gate C single owner (kodmial/aa#342): the live runner above
+          # executes the real provider/model path exactly once; the emit
+          # below only reduces its already-produced live-out artifact into
+          # the ONE authoritative gate-C-evidence.json plus typed
+          # checkpoint. No second provider run, no index rebuild here.
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --emit-gate C
 
       - name: Gate D - real Telegram network/runtime readiness
         id: gate-d
@@ -352,10 +362,14 @@ jobs:
           OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
-          # Checkpoint resume: skip when Gate D already completed.
+          # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
+          # only; a bare gate-X.done file never authorizes a skip.
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          if [[ -f "$CKPT_DIR/gate-D.done" ]]; then
-            echo "Gate D checkpoint present; skipping (resume)."
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip D; then
+            echo "Gate D validated checkpoint present; skipping (resume)."
             exit 0
           fi
           # Real Telegram Bot API identity, startup/health, polling/webhook
@@ -384,9 +398,11 @@ jobs:
           if [[ -n "${AA_TEST_TELEGRAM_BOT_TOKEN:-}" ]]; then
             PROBE_TOKEN="$AA_TEST_TELEGRAM_BOT_TOKEN"
             echo "Gate D probe identity: isolated-test-bot"
+            export QUAL_IDENTITY_KIND="isolated-test-bot"
           elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && "${AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE:-}" == "1" ]]; then
             PROBE_TOKEN="$TELEGRAM_BOT_TOKEN"
             echo "Gate D probe identity: production-lease (explicit exclusive lease)"
+            export QUAL_IDENTITY_KIND="production-lease"
           else
             echo "::error::Gate D BLOCKED: no isolated test bot and no production lease (EXTERNAL_TEST_BOT_UNAVAILABLE)."
             mkdir -p self-proving-out
@@ -471,7 +487,11 @@ jobs:
           async def _probe() -> None:
               sha = os.environ.get("QUAL_SHA", "")
               run_id = os.environ.get("QUAL_RUN", "")
+              identity_kind = os.environ.get("QUAL_IDENTITY_KIND", "unknown")
               out = Path("self-proving-out/runtime-status.json")
+              timings_path = Path("self-proving-out/runtime-timings.json")
+              probe_started = time.perf_counter()
+              ready_at = 0.0
               starting = RuntimeMarker(run_id=run_id, sha=sha, phase="STARTING", timestamp_s=time.time())
               write_marker(out, starting)
               print(f"runtime marker STARTING published run={run_id} sha={sha[:12]}")
@@ -566,6 +586,7 @@ jobs:
                       assert parsed_ready is not None, "running app readiness is not READY"
                       ready = RuntimeMarker(run_id=run_id, sha=sha, phase="READY", timestamp_s=time.time())
                       write_marker(out, ready)
+                      ready_at = time.perf_counter()
                       print(f"runtime marker READY published from live app run={run_id} sha={sha[:12]}")
                       print(f"polling live: transport.running={transport.running} poll_task_live={not poll_task.done()}")
                   finally:
@@ -578,6 +599,32 @@ jobs:
                   stopped = RuntimeMarker(run_id=run_id, sha=sha, phase="STOPPED", timestamp_s=time.time())
                   write_marker(out, stopped)
                   print(f"runtime marker STOPPED published run={run_id} sha={sha[:12]}")
+                  # Required real-network runtime lane timings (kodmial/aa#342):
+                  # monotonic startup/readiness durations plus the probe
+                  # identity. Gate D consumes this file read-only; it never
+                  # starts a second poller. Optional peer sends are recorded
+                  # separately and stay UNVERIFIED here (never mandatory).
+                  stopped_at = time.perf_counter()
+                  timings_path.parent.mkdir(parents=True, exist_ok=True)
+                  timings_path.write_text(
+                      json.dumps(
+                          {
+                              "sha": sha,
+                              "run_id": run_id,
+                              "identity_kind": identity_kind,
+                              "startup_ms": round(max(0.0, ready_at - probe_started) * 1000.0, 1) if ready_at else 0.0,
+                              "run_ms": round(max(0.0, stopped_at - probe_started) * 1000.0, 1),
+                              "polling_verified": True,
+                              "stop_clean": True,
+                              "external_send_status": "external_send_unverified",
+                          },
+                          sort_keys=True,
+                          indent=2,
+                      )
+                      + "\n",
+                      encoding="utf-8",
+                  )
+                  print(f"runtime timings recorded identity={identity_kind}")
               except Exception:
                   failed = RuntimeMarker(run_id=run_id, sha=sha, phase="FAILED", timestamp_s=time.time())
                   write_marker(out, failed)
@@ -585,75 +632,117 @@ jobs:
 
           asyncio.run(_probe())
           PY
-          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          echo "D" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-D.done"
+          # Gate D single owner (kodmial/aa#342): the probe above owned the
+          # one live poller; the emit below only reduces its durable marker
+          # plus timings into the ONE authoritative gate-D-evidence.json.
+          # No second poller, no webhook mutation here.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --emit-gate D
 
       - name: Gate E - live performance/SLO
         # Gate E owns latency independently of Gate C functional correctness.
         # Evaluate the trusted Gate C measurements even when C itself fails so
         # the repair loop can attack C and E in the same cycle.
+        # Single owner (kodmial/aa#342): consumes the validated Gate C
+        # evidence plus the live-out C-series exactly once. No Gate C rerun,
+        # no A/B bootstrap, no provider calls, no D network operations here
+        # (no secrets are even configured on this step by construction).
         if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
-          SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
-          # Checkpoint resume: skip when Gate E already completed.
+          # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
+          # only; a bare gate-X.done file never authorizes a skip.
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          if [[ -f "$CKPT_DIR/gate-E.done" ]]; then
-            echo "Gate E checkpoint present; skipping (resume)."
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip E; then
+            echo "Gate E validated checkpoint present; skipping (resume)."
             exit 0
           fi
-          # End-to-end and per-stage latency p50/p95 from Gate C evidence.
-          # Gate E consumes the trusted live measurements independently of
-          # Gate C's functional verdict and Gate D's network-readiness result.
-          # The runner reuses the already-published Gate A/B evidence
-          # artifacts (issue #339, zero second invocation) and evaluates only
-          # C/D/E fresh, publishing their evidence for the read-only Gate F.
-          # It therefore returns
-          # non-zero when Gate C is already known FAIL. Gate E must not inherit
-          # that functional verdict: consume the same trusted latency evidence
-          # and exit strictly from Gate E below. Preserve runner lifecycle
-          # exits that require VM restart/resume.
-          runner_rc=0
-          python scripts/run_self_proving_qualification.py \
-            --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}" || runner_rc=$?
-          if [[ "$runner_rc" -eq 75 || -f self-proving-out/restart-required.json ]]; then
+          if [[ -f self-proving-out/restart-required.json ]]; then
             echo "::error::Gate E interrupted by provider 429; runner restart required."
             exit 75
           fi
-          # Temporary quality-first SLO: no ordinary qualification turn >= 120s;
-          # p95 <= 60s. Gate C grounding/safety remains mandatory. Typing heartbeat continuity is
-          # verified independently. Pathological latency fails the gate.
+          python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --emit-gate E
+          # Unchanged canonical SLO guard (machine-enforced): p95 <= 60s,
+          # ordinary-turn max < 120s. Gate C grounding/safety remains
+          # mandatory. Failed/timeout ordinary turns are counted as
+          # bounded-censored evidence by the single-owner emit above and
+          # can never be dropped here. Pathological latency fails the gate.
           python - <<'PY'
           import json, sys
+          sys.path.insert(0, "src")
           from pathlib import Path
-          path = Path("self-proving-out/self-proving-summary.json")
+          from aa.qualification.gate_evidence import load_and_validate_evidence
+          from aa.qualification.self_proving import (
+              ORDINARY_TURN_BUDGET_MS,
+              P95_TARGET_MS,
+              SelfProvingError,
+          )
+          import os
+          sha = "${{ steps.sha.outputs.sha }}"
+          run_id = "${{ github.run_id }}"
+          path = Path("self-proving-out/gate-E-evidence.json")
           if not path.is_file():
-              print("Gate E BLOCKED: no Gate C latency evidence", file=sys.stderr)
+              print("Gate E BLOCKED: no Gate E evidence artifact", file=sys.stderr)
               sys.exit(2)
-          summary = json.loads(path.read_text(encoding="utf-8"))
-          gates = {g.get("gate"): g for g in summary.get("gates", [])}
-          print(json.dumps({"gates": [(k, v.get("status")) for k, v in gates.items()]}))
-          gate_e = gates.get("E")
-          if gate_e is None:
-              print("Gate E BLOCKED: missing Gate E evidence", file=sys.stderr)
-              sys.exit(2)
-          if gate_e.get("status") != "PASS":
-              print(f"Gate E BLOCKED: status={gate_e.get('status')}", file=sys.stderr)
-              sys.exit(2 if gate_e.get("status") in ("BLOCKED", "STALE") else 1)
           try:
-              p50 = float(gate_e.get("latency_p50_ms", 0.0))
-              p95 = float(gate_e.get("latency_p95_ms", 0.0))
-              max_turn = float(gate_e.get("max_turn_ms", 0.0))
+              evidence = load_and_validate_evidence(
+                  path, expected_gate="E", expected_sha=sha, expected_run_id=run_id
+              )
+          except SelfProvingError as exc:
+              print(f"Gate E BLOCKED: evidence invalid: {exc}", file=sys.stderr)
+              sys.exit(2)
+          status = str(evidence.get("status", "")).upper()
+          # Explicit sample/provenance line from the live-out C-series plus
+          # the validated evidence checksum (privacy-safe aggregates only).
+          live_path = Path("live-out/product-contract-live-summary.json")
+          samples = []
+          provider_id = ""
+          boundary = "production-update-intake-to-simulated-handoff"
+          proof_kind = "c-series-simulated-handoff"
+          if live_path.is_file():
+              try:
+                  live = json.loads(live_path.read_text(encoding="utf-8"))
+                  for lane in live.get("lanes", []):
+                      if isinstance(lane, dict) and lane.get("lane") == "live-telegram-evidence":
+                          metrics = lane.get("metrics", {}) or {}
+                          raw = metrics.get("turn_latency_samples", []) or []
+                          samples = raw if isinstance(raw, list) else []
+                          provider_id = str(metrics.get("latency_provider_id", "") or "")
+                          boundary = str(metrics.get("latency_boundary", "") or boundary)
+                          proof_kind = str(metrics.get("latency_source_proof_kind", "") or proof_kind)
+              except Exception:
+                  samples = []
+          try:
+              p50 = float(evidence.get("latency_p50_ms", 0.0))
+              p95 = float(evidence.get("latency_p95_ms", 0.0))
+              max_turn = float(evidence.get("max_turn_ms", 0.0))
           except (TypeError, ValueError):
               print("Gate E BLOCKED: latency evidence is not numeric", file=sys.stderr)
               sys.exit(2)
+          print(
+              "Gate E evidence: "
+              f"status={status} samples={len(samples)} "
+              f"p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms "
+              f"units=ms boundary={boundary} provider={provider_id[:32]} "
+              f"proof={proof_kind} sha={sha[:12]} run={run_id} "
+              f"checksum={evidence.get('evidence_checksum', '')[:16]}"
+          )
+          if status == "BLOCKED" or status == "STALE":
+              print(f"Gate E BLOCKED: status={status}", file=sys.stderr)
+              sys.exit(2)
+          if status != "PASS":
+              print(f"Gate E FAIL: status={status}", file=sys.stderr)
+              sys.exit(1)
           # Sample-count guard: zero/negative latencies mean no live samples.
           if p50 <= 0 or p95 <= 0 or max_turn <= 0:
               print(
@@ -661,7 +750,7 @@ jobs:
                   file=sys.stderr,
               )
               sys.exit(2)
-          # Temporary hard SLO guard (machine-enforced): p95 <= 60s,
+          # Unchanged hard SLO guard (machine-enforced): p95 <= 60s,
           # ordinary-turn max < 120s. Gate C still enforces usefulness.
           if p95 > 60000:
               print(f"Gate E FAIL: p95 {p95:.0f}ms exceeds 60000ms target", file=sys.stderr)
@@ -671,8 +760,6 @@ jobs:
               sys.exit(1)
           print(f"Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms")
           PY
-          mkdir -p "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
-          echo "E" > "${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints/gate-E.done"
 
       - name: Gate F - exact-main final verdict
         id: gate-f
@@ -720,6 +807,7 @@ jobs:
             self-proving-out/gate-C-evidence.json
             self-proving-out/gate-D-evidence.json
             self-proving-out/gate-E-evidence.json
+            self-proving-out/runtime-timings.json
             self-proving-out/failure-matrix.json
             self-proving-out/self-proving-summary.json
             self-proving-out/result.json
@@ -738,8 +826,10 @@ jobs:
           CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
           STAGE_DIR="aa-self-proving-checkpoints"
           mkdir -p "$STAGE_DIR"
-          if compgen -G "$CKPT_DIR/gate-*.done" > /dev/null; then
-            cp "$CKPT_DIR"/gate-*.done "$STAGE_DIR"/
+          # Typed checkpoints only (kodmial/aa#342): bare gate-X.done files
+          # are never staged or trusted for resume.
+          if compgen -G "$CKPT_DIR/gate-*.checkpoint.json" > /dev/null; then
+            cp "$CKPT_DIR"/gate-*.checkpoint.json "$STAGE_DIR"/
           fi
           if [[ -f live-out/product-contract-live-summary.json ]]; then
             mkdir -p "$STAGE_DIR/live-out"
@@ -748,6 +838,9 @@ jobs:
           fi
           if [[ -f self-proving-out/runtime-status.json ]]; then
             cp self-proving-out/runtime-status.json "$STAGE_DIR/runtime-status.json"
+          fi
+          if [[ -f self-proving-out/runtime-timings.json ]]; then
+            cp self-proving-out/runtime-timings.json "$STAGE_DIR/runtime-timings.json"
           fi
           # Unified Gate evidence (issue #339): persist validated A-E
           # artifacts across 429 runner retire so resume reuses them.

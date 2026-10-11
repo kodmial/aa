@@ -479,6 +479,9 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # Gate E and terminal Gate F must preserve the same live prerequisites as
     # Gate C. Otherwise the final verdict can falsely downgrade valid live
     # evidence to C:live-execution-not-enabled.
+    gate_c = workflow.split("Gate C - LIVE exact production conversation path", 1)[1].split(
+        "Gate D - real Telegram network/runtime readiness", 1
+    )[0]
     gate_d = workflow.split("Gate D - real Telegram network/runtime readiness", 1)[1].split(
         "Gate E - live performance/SLO", 1
     )[0]
@@ -492,13 +495,30 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
         assert "steps.gate-c.outcome == 'success'" in independent
         assert "steps.gate-c.outcome == 'failure'" in independent
         assert "restart-required.json" in independent
-    assert "runner_rc=0" in gate_e
-    assert "|| runner_rc=$?" in gate_e
-    assert '"$runner_rc" -eq 75' in gate_e
-    for block in (gate_e, gate_f):
+    # Gate E is a single-owner evidence consumer (kodmial/aa#342): it must
+    # not re-invoke the overall runner (which would recompute C/D and redo
+    # provider calls). It emits Gate E once from validated C evidence.
+    assert "--emit-gate E" in gate_e
+    assert "--check-skip E" in gate_e
+    assert "runner_rc=0" not in gate_e
+    assert "|| runner_rc=$?" not in gate_e
+    # Gate C/D single owners emit exactly once as well.
+    assert "--emit-gate C" in gate_c
+    assert "--emit-gate D" in gate_d
+    # Typed checkpoints: skips validate schema/SHA/run bindings, never a
+    # bare gate-X.done file.
+    for block in (gate_c, gate_d, gate_e):
+        assert "--check-skip" in block
+    assert "gate-*.done" not in workflow
+    # Gate C owns the live provider execution and Gate F reduces its trusted
+    # artifacts; both keep the live prerequisites. Gate D owns the isolated
+    # real-network probe identity instead of the live-execution flag.
+    for block in (gate_c, gate_f):
         assert 'SELF_PROVING_LIVE: "1"' in block
         assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block
         assert "AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}" in block
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" in gate_d
+    assert "isolated-test-bot" in gate_d
 
 
 def test_gate_c_preserves_live_failure_without_live_env(
@@ -671,14 +691,25 @@ def test_gate_e_uses_trusted_live_latency_even_when_gate_c_functionally_fails() 
 
 
 def test_gate_e_f_preserve_live_execution_context() -> None:
-    """Gate E/F re-evaluation must carry the Gate C live context (issue #153)."""
+    """Gate C/F keep live context; Gate E is an env-independent consumer.
+
+    Gate E (kodmial/aa#342) consumes validated C evidence plus the live-out
+    C-series without any live execution context of its own, so it can never
+    reclassify a real live-path-failed as live-execution-not-enabled. Gate C
+    still owns the live provider execution and Gate F still reduces under
+    the live context.
+    """
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
     ).read_text(encoding="utf-8")
-    # Gate C plus the Gate E and Gate F re-evaluations must all set the live
-    # execution context so a real live-path-failed is never reclassified as
+    # Gate C plus the Gate F reduction must both set the live execution
+    # context so a real live-path-failed is never reclassified as
     # live-execution-not-enabled.
-    assert workflow.count('SELF_PROVING_LIVE: "1"') >= 3
+    assert workflow.count('SELF_PROVING_LIVE: "1"') >= 2
+    gate_e = workflow.split("Gate E - live performance/SLO", 1)[1].split(
+        "Gate F - exact-main final verdict", 1
+    )[0]
+    assert "--emit-gate E" in gate_e
 
 
 def test_runner_stale_and_blocked_contract(tmp_path: Path) -> None:
