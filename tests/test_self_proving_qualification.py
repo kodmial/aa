@@ -572,6 +572,7 @@ def test_gate_c_ignores_foreign_lane_failure(
                             "live-answer-diversity",
                             "live-actual-served-model-identity",
                             "live-planner-retrieval-answer-verifier-telemetry",
+                            "live-egress-simulated-labeled",
                         ],
                         "failed": [],
                         "incomplete": [],

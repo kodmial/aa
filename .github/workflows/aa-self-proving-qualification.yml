@@ -339,6 +339,9 @@ jobs:
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          AA_TEST_TELEGRAM_BOT_TOKEN: ${{ secrets.AA_TEST_TELEGRAM_BOT_TOKEN }}
+          AA_TEST_TELEGRAM_BOT_ID: ${{ secrets.AA_TEST_TELEGRAM_BOT_ID }}
+          AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE: ${{ secrets.AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE }}
           QUAL_SHA: ${{ steps.sha.outputs.sha }}
           QUAL_RUN: ${{ github.run_id }}
           OPENCODE_BASE_URL: http://127.0.0.1:4096
@@ -355,10 +358,20 @@ jobs:
             echo "Gate D checkpoint present; skipping (resume)."
             exit 0
           fi
-          # Real bot token, OpenCode health, Telegram getMe, webhook cleanup/
-          # config, commands setup, long polling actually started. Publishes
-          # the durable STARTING -> READY -> STOPPED|FAILED marker with the
-          # exact run id/SHA; /bot status reports that marker.
+          # Real Telegram Bot API identity, startup/health, polling/webhook
+          # ownership, callback/button readiness (issue #340, Gate D only).
+          # Safe isolation: prefer the dedicated test bot identity
+          # (AA_TEST_TELEGRAM_BOT_TOKEN); the production token is used only
+          # with an explicit exclusive lease
+          # (AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE=1). Never blindly call
+          # getUpdates/deleteWebhook/setMyCommands on a concurrently running
+          # production bot: the probe below checks for an active poller
+          # (409) first, exits typed EXTERNAL_POLLER_CONFLICT without
+          # destructive retries, and always releases the lease/stops the app
+          # cleanly. A read-only deployed-runtime READY marker alone never
+          # proves a network send or a currently live poller.
+          # Publishes the durable STARTING -> READY -> STOPPED|FAILED marker
+          # with the exact run id/SHA; /bot status reports that marker.
           # Single-poller lock: this step runs under the workflow concurrency
           # group aa-self-proving-qualification (cancel-in-progress: false),
           # so only one qualification poller ever starts. The bounded probe
@@ -368,17 +381,27 @@ jobs:
           # task, publishes READY only from the running app, then stops
           # cleanly with no leaked poll task. A bare getMe + write_marker
           # without the live Application is forbidden and fails this gate.
-          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
-            echo "::error::Gate D BLOCKED: TELEGRAM_BOT_TOKEN is not configured."
+          if [[ -n "${AA_TEST_TELEGRAM_BOT_TOKEN:-}" ]]; then
+            PROBE_TOKEN="$AA_TEST_TELEGRAM_BOT_TOKEN"
+            echo "Gate D probe identity: isolated-test-bot"
+          elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && "${AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE:-}" == "1" ]]; then
+            PROBE_TOKEN="$TELEGRAM_BOT_TOKEN"
+            echo "Gate D probe identity: production-lease (explicit exclusive lease)"
+          else
+            echo "::error::Gate D BLOCKED: no isolated test bot and no production lease (EXTERNAL_TEST_BOT_UNAVAILABLE)."
             mkdir -p self-proving-out
-            printf '{"reason_code":"EXTERNAL_TELEGRAM_TOKEN_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
+            printf '{"reason_code":"EXTERNAL_TEST_BOT_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
             exit 78
           fi
+          if [[ -n "${AA_TEST_TELEGRAM_BOT_ID:-}" ]]; then
+            echo "Gate D test bot scope pinned (identity verified after getMe)."
+          fi
+          export TELEGRAM_BOT_TOKEN="$PROBE_TOKEN"
           # HTTP 403 uses bounded exponential retry with >= 5s base.
           delay=5
           for attempt in 1 2 3 4 5; do
             code="$(curl -s -o /tmp/getme.json -w '%{http_code}' --max-time 15 \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)"
+              "https://api.telegram.org/bot${PROBE_TOKEN}/getMe" || true)"
             if [[ "$code" == "200" ]]; then
               break
             fi
@@ -395,9 +418,15 @@ jobs:
           done
           python - <<'PY'
           import json
+          import os
           payload = json.loads(open("/tmp/getme.json", encoding="utf-8").read())
           assert payload.get("ok") is True, "Telegram getMe ok != true"
           assert (payload.get("result") or {}).get("is_bot") is True, "not a bot identity"
+          expected_id = (os.environ.get("AA_TEST_TELEGRAM_BOT_ID", "") or "").strip()
+          if expected_id:
+              assert str((payload.get("result") or {}).get("id", "")) == expected_id, (
+                  "test bot identity scope mismatch (EXTERNAL_TEST_BOT_UNAVAILABLE)"
+              )
           print("Telegram getMe readiness: OK")
           PY
           python - <<'PY'

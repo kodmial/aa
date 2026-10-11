@@ -78,12 +78,10 @@ async def test_transport_lane_reports_live_or_incomplete() -> None:
 
     result = await run_transport_lane()
     assert result.lane == "telegram-transport-25-32"
-    # Without a live bot token the real-stream sublane is INCOMPLETE
-    # (fail-closed); deterministic semantics still execute live.
-    assert result.status in ("PASS", "INCOMPLETE")
+    # Issue #340: deterministic Gate B semantics PASS offline without
+    # credentials; live startup/consent moved to the Gate D readiness lane.
+    assert result.status == "PASS", result.failed
     assert result.metrics["scenarios_executed"] == 8
-    if result.status == "INCOMPLETE":
-        assert result.incomplete
 
 
 def test_control_lane_bounds_and_restore() -> None:
@@ -204,21 +202,31 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     original_message = live_mod.run_message_lane
     original_transport = live_mod.run_transport_lane
     original_live = live_mod.run_live_telegram_evidence_lane
+
+    async def _ok_readiness() -> LaneResult:
+        return LaneResult(
+            lane="telegram-readiness-D", status="INCOMPLETE", incomplete=("deferred",)
+        )
+
     live_mod.run_message_lane = _boom  # type: ignore[assignment]
     live_mod.run_transport_lane = _ok_transport  # type: ignore[assignment]
     live_mod.run_live_telegram_evidence_lane = _ok_live  # type: ignore[assignment]
+    original_readiness = live_mod.run_telegram_readiness_lane
+    live_mod.run_telegram_readiness_lane = _ok_readiness  # type: ignore[assignment]
     try:
-        message, transport, live_evidence = asyncio.run(live_mod._run_async_lanes())
+        message, transport, live_evidence, readiness = asyncio.run(live_mod._run_async_lanes())
     finally:
         live_mod.run_message_lane = original_message
         live_mod.run_transport_lane = original_transport
         live_mod.run_live_telegram_evidence_lane = original_live
+        live_mod.run_telegram_readiness_lane = original_readiness
     assert message.lane == "product-contract-1-24"
     assert message.status == "FAIL"
     assert any("ModuleNotFoundError" in item for item in message.failed)
     assert_no_text_leak(message.to_dict())
     assert transport.status == "PASS"
     assert live_evidence.status == "INCOMPLETE"
+    assert readiness.status == "INCOMPLETE"
 
 
 def test_ephemeral_gate_checkpoints_stay_untracked() -> None:
@@ -299,13 +307,14 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
     if "lanes" not in payload:
         assert "clean" in str(payload.get("reason", "")).casefold()
         return
-    assert len(payload["lanes"]) == 5
+    assert len(payload["lanes"]) == 6
     assert {lane["lane"] for lane in payload["lanes"]} == {
         "product-contract-1-24",
         "telegram-transport-25-32",
         "runtime-control-33-41",
         "voice-1-16",
         "live-telegram-evidence",
+        "telegram-readiness-D",
     }
     summary = json.loads(
         (tmp_path / "product-contract-live-summary.json").read_text(encoding="utf-8")

@@ -24,7 +24,6 @@ from typing import Any
 import pytest
 
 from aa.telegram.startup_probe import (
-    EXTERNAL_PEER_DEPENDENCY,
     categorize_startup_exception,
     classify_http_status,
     confirm_full_delivery,
@@ -479,28 +478,45 @@ def test_live_peer_env_parsing_never_logs_value(monkeypatch: Any) -> None:
     assert live_delivery_peer_from_env() is None
 
 
-async def test_lane_offline_incomplete_never_pass(monkeypatch: Any) -> None:
+async def test_transport_lane_deterministic_pass_offline(monkeypatch: Any) -> None:
+    # Issue #340: deterministic transport semantics belong to Gate B and
+    # PASS offline without credentials; live startup/consent moved to D.
     from aa.qualification.product_contract_live import assert_no_text_leak, run_transport_lane
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("AA_LIVE_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("AA_TEST_TELEGRAM_BOT_TOKEN", raising=False)
     result = await run_transport_lane()
     assert result.lane == "telegram-transport-25-32"
+    assert result.status == "PASS", result.failed
+    assert result.metrics["live_network_owned_by"] == "telegram-readiness-D"
+    assert_no_text_leak(result.to_dict())
+
+
+async def test_lane_offline_incomplete_never_pass(monkeypatch: Any) -> None:
+    # Gate D readiness lane: no safely usable identity stays typed BLOCKED.
+    from aa.qualification.product_contract_live import (
+        assert_no_text_leak,
+        run_telegram_readiness_lane,
+    )
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("AA_TEST_TELEGRAM_BOT_TOKEN", raising=False)
+    result = await run_telegram_readiness_lane()
+    assert result.lane == "telegram-readiness-D"
     assert result.status == "INCOMPLETE"
     assert not result.failed
-    assert "real-telegram-typing-stream-requires-token" in result.incomplete
-    assert result.metrics["live_transport_status"] == "blocked"
-    assert result.metrics["live_transport_category"] == "environment-secrets"
-    assert result.metrics["live_transport_bootstrap_verified"] is False
-    assert result.metrics["live_external_dependency"] == "EXTERNAL_TELEGRAM_TOKEN_UNAVAILABLE"
-    # Token presence alone is never treated as a confirmed message.
+    assert result.metrics["live_external_dependency"] == "EXTERNAL_TEST_BOT_UNAVAILABLE"
+    assert result.metrics["external_send_status"] == "external_send_unverified"
     assert not any("delivery-confirmed" in item for item in result.passed)
     assert_no_text_leak(result.to_dict())
 
 
 async def test_lane_ready_without_peer_stays_incomplete(monkeypatch: Any) -> None:
+    # Issue #340: missing optional peer never downgrades mandatory PASS;
+    # it records external_send_unverified separately.
     import aa.telegram.startup_probe as probe_mod
-    from aa.qualification.product_contract_live import run_transport_lane
+    from aa.qualification.product_contract_live import run_telegram_readiness_lane
 
     async def _fake_ready(token: str, **kwargs: Any) -> Any:
         _ = (token, kwargs)
@@ -513,60 +529,63 @@ async def test_lane_ready_without_peer_stays_incomplete(monkeypatch: Any) -> Non
             bootstrap_verified=True,
         )
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "probe-token")
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_TOKEN", "probe-token")
     monkeypatch.delenv("AA_LIVE_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PEER_CHAT_ID", raising=False)
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PROBE_SEND", raising=False)
+    monkeypatch.delenv("AA_LIVE_TELEGRAM_PROBE_SEND", raising=False)
     monkeypatch.setattr(probe_mod, "probe_telegram_startup", _fake_ready)
-    result = await run_transport_lane()
-    assert result.status == "INCOMPLETE"
+    result = await run_telegram_readiness_lane()
+    assert result.status == "PASS", (result.failed, result.incomplete)
     assert "real-telegram-startup-ready" in result.passed
-    assert "live-telegram-delivery-peer-missing" in result.incomplete
     assert result.metrics["live_transport_bootstrap_verified"] is True
-    assert result.metrics["live_external_dependency"] == EXTERNAL_PEER_DEPENDENCY
+    assert result.metrics["external_send_status"] == "external_send_unverified"
     assert not any("delivery-confirmed" in item for item in result.passed)
 
 
 async def test_lane_blocked_conflict_stays_incomplete(monkeypatch: Any) -> None:
     import aa.telegram.startup_probe as probe_mod
-    from aa.qualification.product_contract_live import run_transport_lane
+    from aa.qualification.product_contract_live import run_telegram_readiness_lane
 
     async def _fake_blocked(token: str, **kwargs: Any) -> Any:
         _ = (token, kwargs)
         return probe_mod.StartupOutcome(status="blocked", category="polling-webhook-conflict")
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "probe-token")
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_TOKEN", "probe-token")
     monkeypatch.setattr(probe_mod, "probe_telegram_startup", _fake_blocked)
-    result = await run_transport_lane()
+    result = await run_telegram_readiness_lane()
     assert result.status == "INCOMPLETE"
     assert "live-telegram-startup-blocked-polling-webhook-conflict" in result.incomplete
+    assert result.metrics["live_external_dependency"] == "EXTERNAL_POLLER_CONFLICT"
     assert not result.failed
 
 
 async def test_lane_auth_failure_is_fail_not_incomplete(monkeypatch: Any) -> None:
     import aa.telegram.startup_probe as probe_mod
-    from aa.qualification.product_contract_live import run_transport_lane
+    from aa.qualification.product_contract_live import run_telegram_readiness_lane
 
     async def _fake_auth_failure(token: str, **kwargs: Any) -> Any:
         _ = (token, kwargs)
         return probe_mod.StartupOutcome(status="failed", category="telegram-auth")
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bad-token")
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_TOKEN", "bad-token")
     monkeypatch.setattr(probe_mod, "probe_telegram_startup", _fake_auth_failure)
-    result = await run_transport_lane()
+    result = await run_telegram_readiness_lane()
     assert result.status == "FAIL"
     assert "real-telegram-startup-telegram-auth" in result.failed
 
 
 async def test_lane_rate_limited_is_distinct_fail(monkeypatch: Any) -> None:
     import aa.telegram.startup_probe as probe_mod
-    from aa.qualification.product_contract_live import run_transport_lane
+    from aa.qualification.product_contract_live import run_telegram_readiness_lane
 
     async def _fake_limited(token: str, **kwargs: Any) -> Any:
         _ = (token, kwargs)
         return probe_mod.StartupOutcome(status="failed", category="transport-rate-limited")
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "probe-token")
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_TOKEN", "probe-token")
     monkeypatch.setattr(probe_mod, "probe_telegram_startup", _fake_limited)
-    result = await run_transport_lane()
+    result = await run_telegram_readiness_lane()
     assert result.status == "FAIL"
     assert "real-telegram-startup-transport-rate-limited" in result.failed
 
@@ -583,4 +602,4 @@ def test_no_synthetic_delivery_short_circuit_in_lane_source() -> None:
     ).read_text(encoding="utf-8")
     assert "real-telegram-typing-stream-not-dialed-in-qualification" not in source
     assert "probe_telegram_startup" in source
-    assert "live-telegram-delivery-peer-missing" in source
+    assert "run_telegram_readiness_lane" in source
