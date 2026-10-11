@@ -62,7 +62,7 @@ def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> N
         "- name: Publish authoritative Product Contract result", 1
     )[0]
     before_parser, inside_parser = publisher.split(
-        "            try:\n              const summary = JSON.parse", 1
+        "const summary = JSON.parse(", 1
     )
     assert "let failGates = new Set();" in before_parser
     assert "failGates = new Set(productFailures.map(" in inside_parser
