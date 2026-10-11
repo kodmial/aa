@@ -60,6 +60,7 @@ class StartupOutcome:
     status: StartupStatus
     category: str
     bot_id_present: bool = False
+    bot_id: int | None = None
     username_len: int = 0
     polling_live: bool = False
     bootstrap_verified: bool = False
@@ -163,25 +164,33 @@ def isolated_test_peer_from_env() -> int | None:
     Only digits (optionally leading ``-``) are accepted. Sending to an
     arbitrary chat id taken from environment logs or unrelated settings is
     forbidden: only the dedicated test-peer variable plus explicit opt-in
-    authorizes a real egress attempt.
+    authorizes a real egress attempt. The legacy live peer variable is
+    never consulted here so a production chat id can never become an
+    isolated-probe send target.
     """
-    for var in (TEST_PEER_ENV_VAR, LIVE_PEER_ENV_VAR):
-        raw = (os.environ.get(var, "") or "").strip()
-        if not raw:
-            continue
-        candidate = raw[1:] if raw.startswith("-") else raw
-        if not candidate.isdigit():
-            continue
-        try:
-            return int(raw)
-        except ValueError:
-            continue
-    return None
+    raw = (os.environ.get(TEST_PEER_ENV_VAR, "") or "").strip()
+    if not raw:
+        return None
+    candidate = raw[1:] if raw.startswith("-") else raw
+    if not candidate.isdigit():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def isolated_test_send_authorized() -> bool:
-    """Whether a real egress attempt to the isolated test peer is allowed."""
-    return live_send_authorized()
+    """Whether a real egress attempt to the isolated test peer is allowed.
+
+    Only the dedicated isolated-peer opt-in authorizes the send; the
+    legacy live opt-in never authorizes an isolated-probe egress.
+    """
+    return (os.environ.get(TEST_SEND_ENV_VAR, "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def production_lease_authorized() -> bool:
@@ -346,10 +355,18 @@ async def probe_telegram_startup(
             )
             return StartupOutcome(status=status, category=category)
         bot_info = transport.bot_info or {}
-        bot_id_present = bool(bot_info.get("id"))
+        _raw_bot_id: Any = bot_info.get("id")
+        bot_id_present = bool(_raw_bot_id)
+        try:
+            _bot_id: int | None = (
+                int(_raw_bot_id) if bot_id_present and _raw_bot_id is not None else None
+            )
+        except (TypeError, ValueError):
+            _bot_id = None
+            bot_id_present = False
         username = bot_info.get("username", "")
         username_len = len(username) if isinstance(username, str) else 0
-        if not bot_id_present:
+        if not bot_id_present or _bot_id is None:
             logger.warning("telegram startup probe failed", extra={"category": "telegram-getme"})
             return StartupOutcome(status="failed", category="telegram-getme")
         logger.info("telegram startup probe bootstrap verified")
@@ -357,6 +374,7 @@ async def probe_telegram_startup(
             status="ready",
             category="ready",
             bot_id_present=True,
+            bot_id=_bot_id,
             username_len=username_len,
             polling_live=False,
             bootstrap_verified=True,
@@ -374,14 +392,22 @@ async def probe_telegram_startup(
         return StartupOutcome(status=status, category=category)
     try:
         bot_info = transport.bot_info or {}
-        bot_id_present = bool(bot_info.get("id"))
+        _raw_live_bot_id: Any = bot_info.get("id")
+        bot_id_present = bool(_raw_live_bot_id)
+        try:
+            _live_bot_id: int | None = (
+                int(_raw_live_bot_id) if bot_id_present and _raw_live_bot_id is not None else None
+            )
+        except (TypeError, ValueError):
+            _live_bot_id = None
+            bot_id_present = False
         username = bot_info.get("username", "")
         username_len = len(username) if isinstance(username, str) else 0
         poll_task = getattr(transport, "_poll_task", None)
         polling_live = bool(
             transport.running and poll_task is not None and not bool(poll_task.done())
         )
-        if not bot_id_present:
+        if not bot_id_present or _live_bot_id is None:
             logger.warning("telegram startup probe failed", extra={"category": "telegram-getme"})
             return StartupOutcome(status="failed", category="telegram-getme")
         if not polling_live:
@@ -394,6 +420,7 @@ async def probe_telegram_startup(
             status="ready",
             category="ready",
             bot_id_present=True,
+            bot_id=_live_bot_id,
             username_len=username_len,
             polling_live=True,
             bootstrap_verified=True,

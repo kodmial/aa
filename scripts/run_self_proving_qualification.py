@@ -1332,6 +1332,24 @@ def _gate_c_live_evidence(
         # here so Gate D can never inherit a fake network proof from C.
         lane_metrics = live_lane.get("metrics", {})
         boundary = lane_metrics.get("gate_boundary", {}) if isinstance(lane_metrics, dict) else {}
+        if not isinstance(boundary, dict) or not boundary:
+            return (
+                GateEvidence(
+                    gate="C",
+                    status="FAIL",
+                    sha=expected_sha,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category="in-memory-id-mislabeled-external",
+                    component="live-production-path",
+                    run_id=run_id,
+                    live_trusted=True,
+                    mocked_only=False,
+                    detail="gate-c-boundary-missing",
+                ),
+                real_latencies,
+                aggregate,
+            )
         if isinstance(boundary, dict) and boundary:
             egress = str(boundary.get("telegram_egress_mode", ""))
             receipt = str(boundary.get("delivery_receipt_kind", ""))
@@ -1546,9 +1564,11 @@ def _gate_d_marker_verdict(
         if marker.sha != expected_sha or marker.run_id != run_id:
             continue
         # Issue #340: a marker alone never proves a currently live poller.
-        # Require exact SHA/run identity plus the freshness window; the
-        # workflow probe proved poll-task liveness before writing STOPPED,
-        # and a stale/copied marker stays BLOCKED here.
+        # A file carries only SHA/run/freshness claims and is copyable, so
+        # it is never accepted as direct poll-task liveness evidence here.
+        # This script holds no live poll-task handle, so fail closed
+        # (poll_task_live=False) and stay BLOCKED; a stale/copied marker
+        # never becomes D PASS.
         if marker.phase == "STOPPED":
             ok, _reason = validate_trusted_ready_marker(
                 marker_sha=marker.sha,
@@ -1557,7 +1577,7 @@ def _gate_d_marker_verdict(
                 expected_sha=expected_sha,
                 expected_run_id=run_id,
                 now_s=_time.time(),
-                poll_task_live=True,
+                poll_task_live=False,
             )
             if not ok:
                 return GateEvidence(
@@ -1571,15 +1591,18 @@ def _gate_d_marker_verdict(
                     run_id=run_id,
                     detail="stale-runtime-marker-without-liveness",
                 )
+            # Fail closed even when SHA/run/freshness match: a file alone
+            # never proves the poll task is currently live.
             return GateEvidence(
                 gate="D",
-                status="PASS",
+                status="BLOCKED",
                 sha=expected_sha,
                 product_fingerprint=product,
                 runtime_fingerprint=runtime,
+                failure_category="telegram-readiness-unproven",
                 component="telegram-readiness",
                 run_id=run_id,
-                live_trusted=True,
+                detail="stale-runtime-marker-without-liveness",
             )
         if marker.phase == "READY":
             return GateEvidence(

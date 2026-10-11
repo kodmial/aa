@@ -64,8 +64,29 @@ def test_canonical_boundaries_are_valid() -> None:
 
 
 def test_optional_send_status_never_invents_confirmation() -> None:
+    # Configuration alone (peer + opt-in) never proves external delivery:
+    # confirmation additionally requires a genuine Bot API message id plus
+    # a confirm_full_delivery acknowledgment.
     assert classify_optional_send_status(peer_configured=True, consent_opt_in=True) == (
-        EXTERNAL_SEND_CONFIRMED
+        EXTERNAL_SEND_UNVERIFIED
+    )
+    assert (
+        classify_optional_send_status(
+            peer_configured=True, consent_opt_in=True, message_id=4242, delivery_confirmed=True
+        )
+        == EXTERNAL_SEND_CONFIRMED
+    )
+    assert (
+        classify_optional_send_status(
+            peer_configured=True, consent_opt_in=True, message_id=4242, delivery_confirmed=False
+        )
+        == EXTERNAL_SEND_UNVERIFIED
+    )
+    assert (
+        classify_optional_send_status(
+            peer_configured=True, consent_opt_in=True, message_id=None, delivery_confirmed=True
+        )
+        == EXTERNAL_SEND_UNVERIFIED
     )
     assert classify_optional_send_status(peer_configured=False, consent_opt_in=True) == (
         EXTERNAL_SEND_UNVERIFIED
@@ -124,6 +145,7 @@ async def test_readiness_ready_without_peer_stays_mandatory_pass(monkeypatch: An
             status="ready",
             category="ready",
             bot_id_present=True,
+            bot_id=700000001,
             username_len=3,
             polling_live=False,
             bootstrap_verified=True,
@@ -154,6 +176,7 @@ async def test_readiness_opt_in_peer_confirms_genuine_ack(monkeypatch: Any) -> N
             status="ready",
             category="ready",
             bot_id_present=True,
+            bot_id=700000001,
             username_len=3,
             polling_live=False,
             bootstrap_verified=True,
@@ -439,3 +462,56 @@ async def test_unsafe_cross_user_callback_stays_inert() -> None:
         assert len(transport.sent) == sent_before
     finally:
         await app.stop()
+
+
+def test_isolated_peer_never_falls_back_to_live_chat(monkeypatch: Any) -> None:
+    from aa.telegram.startup_probe import isolated_test_peer_from_env
+
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PEER_CHAT_ID", raising=False)
+    monkeypatch.setenv("AA_LIVE_TELEGRAM_CHAT_ID", "123456")
+    assert isolated_test_peer_from_env() is None
+    monkeypatch.setenv("AA_TEST_TELEGRAM_PEER_CHAT_ID", "654321")
+    assert isolated_test_peer_from_env() == 654321
+
+
+def test_isolated_send_requires_dedicated_opt_in(monkeypatch: Any) -> None:
+    from aa.telegram.startup_probe import isolated_test_send_authorized
+
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PROBE_SEND", raising=False)
+    monkeypatch.setenv("AA_LIVE_TELEGRAM_PROBE_SEND", "1")
+    assert isolated_test_send_authorized() is False
+    monkeypatch.setenv("AA_TEST_TELEGRAM_PROBE_SEND", "1")
+    assert isolated_test_send_authorized() is True
+
+
+async def test_readiness_pinned_identity_uses_real_getme_id(monkeypatch: Any) -> None:
+    import aa.telegram.startup_probe as probe_mod
+    from aa.qualification.product_contract_live import run_telegram_readiness_lane
+
+    async def _fake_ready(token: str, **kwargs: Any) -> Any:
+        _ = (token, kwargs)
+        return probe_mod.StartupOutcome(
+            status="ready",
+            category="ready",
+            bot_id_present=True,
+            bot_id=700000001,
+            username_len=3,
+            polling_live=False,
+            bootstrap_verified=True,
+        )
+
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_ID", "700000001")
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PEER_CHAT_ID", raising=False)
+    monkeypatch.delenv("AA_LIVE_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("AA_TEST_TELEGRAM_PROBE_SEND", raising=False)
+    monkeypatch.delenv("AA_LIVE_TELEGRAM_PROBE_SEND", raising=False)
+    monkeypatch.setattr(probe_mod, "probe_telegram_startup", _fake_ready)
+    result = await run_telegram_readiness_lane()
+    assert result.status == "PASS", (result.failed, result.incomplete)
+    assert "real-telegram-startup-ready" in result.passed
+
+    monkeypatch.setenv("AA_TEST_TELEGRAM_BOT_ID", "700000002")
+    result = await run_telegram_readiness_lane()
+    assert result.status == "FAIL"
+    assert "real-telegram-test-identity-mismatch" in result.failed

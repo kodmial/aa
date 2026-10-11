@@ -1059,10 +1059,15 @@ async def run_telegram_readiness_lane(repo_root: Path | None = None) -> LaneResu
                 live_transport_category = outcome.category
                 live_transport_status = outcome.status
                 live_bootstrap_verified = bool(outcome.bootstrap_verified)
-                scope_ok = verify_bot_identity_scope(
-                    bot_info={"id": 1} if outcome.bot_id_present else {},
-                    expected_bot_id=isolated_test_bot_id(),
-                )
+                _real_bot_id = getattr(outcome, "bot_id", None)
+                _expected_bot_id = isolated_test_bot_id()
+                if _expected_bot_id is not None and _real_bot_id is None:
+                    scope_ok = False
+                else:
+                    scope_ok = verify_bot_identity_scope(
+                        bot_info={"id": _real_bot_id} if _real_bot_id is not None else {},
+                        expected_bot_id=_expected_bot_id,
+                    )
                 if not scope_ok:
                     failed.append("real-telegram-test-identity-mismatch")
                     live_external_dependency = "EXTERNAL_TEST_BOT_UNAVAILABLE"

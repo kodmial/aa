@@ -306,9 +306,26 @@ def coverage_gates() -> dict[str, list[str]]:
     return grouped
 
 
-def classify_optional_send_status(*, peer_configured: bool, consent_opt_in: bool) -> str:
-    """Return the optional external-delivery status (never a mandatory verdict)."""
-    if peer_configured and consent_opt_in:
+def classify_optional_send_status(
+    *,
+    peer_configured: bool,
+    consent_opt_in: bool,
+    message_id: int | None = None,
+    delivery_confirmed: bool = False,
+) -> str:
+    """Return the optional external-delivery status (never a mandatory verdict).
+
+    Configuration alone (peer plus opt-in) never proves external delivery:
+    ``external_send_confirmed`` additionally requires a genuine Bot API
+    integer message id and a ``confirm_full_delivery`` acknowledgment. Any
+    missing/invalid proof stays ``external_send_unverified`` (fail-closed,
+    no synthetic proof).
+    """
+    if not (peer_configured and consent_opt_in):
+        return EXTERNAL_SEND_UNVERIFIED
+    if not delivery_confirmed:
+        return EXTERNAL_SEND_UNVERIFIED
+    if not isinstance(message_id, bool) and isinstance(message_id, int) and message_id > 0:
         return EXTERNAL_SEND_CONFIRMED
     return EXTERNAL_SEND_UNVERIFIED
 

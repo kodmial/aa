@@ -526,7 +526,12 @@ def test_gate_c_preserves_live_failure_without_live_env(
                         "passed": [],
                         "failed": ["live-answer-no-generic-collapse"],
                         "incomplete": [],
-                        "metrics": {},
+                        "metrics": {
+                            "gate_boundary": {
+                                "telegram_egress_mode": "stubbed",
+                                "delivery_receipt_kind": "simulated-in-process",
+                            }
+                        },
                     }
                 ],
             }
@@ -582,6 +587,10 @@ def test_gate_c_ignores_foreign_lane_failure(
                             "latency_p95_s": 25.0,
                             "latency_max_s": 29.0,
                             "turn_latencies_ms": [18000.0, 20000.0, 24000.0, 29000.0],
+                            "gate_boundary": {
+                                "telegram_egress_mode": "stubbed",
+                                "delivery_receipt_kind": "simulated-in-process",
+                            },
                         },
                     },
                 ],
@@ -594,6 +603,48 @@ def test_gate_c_ignores_foreign_lane_failure(
     assert evidence.live_trusted is True
     assert latencies
     assert aggregate is not None
+
+
+def test_gate_c_missing_boundary_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing/empty gate_boundary never inherits a fake proof (fail-closed)."""
+    import scripts.run_self_proving_qualification as runner
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    live_dir = tmp_path / "live-out"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / "product-contract-live-summary.json").write_text(
+        json.dumps(
+            {
+                "main_sha": SHA,
+                "run_id": "run-1",
+                "status": "PASS",
+                "lanes": [
+                    {
+                        "lane": "live-telegram-evidence",
+                        "status": "PASS",
+                        "passed": [
+                            "live-raw-telegram-transport-boundary",
+                            "live-answer-no-generic-collapse",
+                            "live-substantive-grounded-book-answer",
+                            "live-answer-diversity",
+                            "live-actual-served-model-identity",
+                            "live-planner-retrieval-answer-verifier-telemetry",
+                            "live-egress-simulated-labeled",
+                        ],
+                        "failed": [],
+                        "incomplete": [],
+                        "metrics": {},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
+    assert evidence.status == "FAIL"
+    assert evidence.detail == "gate-c-boundary-missing"
 
 
 def test_gate_c_still_blocked_without_evidence_or_env(
