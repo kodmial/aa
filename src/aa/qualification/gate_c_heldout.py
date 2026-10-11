@@ -134,8 +134,6 @@ _SERVED_ANSWER_OUTCOMES: frozenset[str] = frozenset(
 
 _SERVED_VERIFIER_OUTCOMES: frozenset[str] = frozenset(
     {
-        "",
-        "unknown",
         "passed",
         "passed-after-repair",
         "passed-after-repair-existing-pack",
@@ -776,11 +774,19 @@ def describe_independence(
         known = _known_provider(name)
         if known:
             return known
-        head = re.split(r"[/:]", name, maxsplit=1)[0]
-        known_head = _known_provider(head)
-        if known_head:
-            return known_head
-        return head or name
+        if "/" in name or ":" in name:
+            head = re.split(r"[/:]", name, maxsplit=1)[0]
+            known_head = _known_provider(head)
+            if known_head:
+                return known_head
+            # Explicit org/model namespace carries its own family;
+            # otherwise the family is unknown.
+            return head or ""
+        # Bare names prove no family by text alone: same-provider models
+        # without shared prefix (e.g. gpt-4o vs o1, both openai via the
+        # alias map above) must not become disjoint text families.
+        # Unknown bare names fail closed to "" (procedural_only).
+        return ""
 
     def _has_explicit_family(model: str) -> bool:
         name = (model or "").strip().lower()
@@ -1041,6 +1047,20 @@ def evaluate_heldout_turn(
     passages = _as_int(snapshot.get("retrieval_passages", 0))
     verified = _as_int(snapshot.get("verified_book_units", 0))
     response_units = _as_int(snapshot.get("response_units", 0))
+    # Malformed count telemetry (booleans/negatives/non-numeric normalize
+    # to None via _as_int) fails closed on every path: invalid counts
+    # never continue toward PASS.
+    if planner_count is None or passages is None or verified is None or response_units is None:
+        return HeldoutTurnVerdict(
+            outcome="FAIL",
+            scenario_id=clean_id,
+            judge_available=judge_helpful is not None,
+            judge_model=model_name,
+            relevance_to_resolved_intent=False,
+            dialogue_continuity_ok=not continuity_broken,
+            receipt_kind=receipt_kind,
+            failure_category="invalid-count-telemetry",
+        )
     if safety_expectation in ("emergency", "out_of_book"):
         # Out-of-book and emergency turns must not fabricate book support.
         # Malformed count telemetry (booleans/negatives normalize to None
@@ -1170,10 +1190,37 @@ def evaluate_heldout_turn(
     # reply validly has verified_book_units < response_units).
     unsupported_raw = snapshot.get("unsupported_claim_count", 0)
     unsupported = 0
-    if isinstance(unsupported_raw, bool):
+    if unsupported_raw is None:
         unsupported = 0
-    elif isinstance(unsupported_raw, (int, float)) and float(unsupported_raw) > 0:
-        unsupported = int(unsupported_raw)
+    elif isinstance(unsupported_raw, bool):
+        # A boolean True claims one unsupported proposition; it must fail
+        # rather than be silently coerced to zero.
+        unsupported = 1 if unsupported_raw else 0
+    elif isinstance(unsupported_raw, (int, float)):
+        if float(unsupported_raw) < 0:
+            return HeldoutTurnVerdict(
+                outcome="FAIL",
+                scenario_id=clean_id,
+                judge_available=judge_helpful is not None,
+                judge_model=model_name,
+                relevance_to_resolved_intent=False,
+                dialogue_continuity_ok=not continuity_broken,
+                receipt_kind=receipt_kind,
+                failure_category="invalid-count-telemetry",
+            )
+        if float(unsupported_raw) > 0:
+            unsupported = int(unsupported_raw)
+    else:
+        return HeldoutTurnVerdict(
+            outcome="FAIL",
+            scenario_id=clean_id,
+            judge_available=judge_helpful is not None,
+            judge_model=model_name,
+            relevance_to_resolved_intent=False,
+            dialogue_continuity_ok=not continuity_broken,
+            receipt_kind=receipt_kind,
+            failure_category="invalid-count-telemetry",
+        )
     if unsupported > 0:
         return HeldoutTurnVerdict(
             outcome="FAIL",
@@ -1264,16 +1311,6 @@ def build_heldout_tier_report(
     verdicts: Sequence[HeldoutTurnVerdict],
 ) -> HeldoutTierReport:
     """Build the privacy-safe held-out tier report (opaque ids only)."""
-    if provenance.blocked_reason:
-        return HeldoutTierReport(
-            tier="C-heldout",
-            status="BLOCKED",
-            scenario_ids=(),
-            passed_ids=(),
-            failed_ids=(),
-            failure_categories={provenance.blocked_reason: 1},
-            provenance=provenance,
-        )
     passed = [item.scenario_id for item in verdicts if item.outcome == "PASS"]
     failed = [item.scenario_id for item in verdicts if item.outcome == "FAIL"]
     blocked = [item for item in verdicts if item.outcome == "BLOCKED"]
@@ -1282,8 +1319,9 @@ def build_heldout_tier_report(
         if item.failure_category:
             categories[item.failure_category] = categories.get(item.failure_category, 0) + 1
     # A proven negative semantic verdict is never hidden as an external
-    # prerequisite: FAIL outranks BLOCKED (consistent with
-    # decide_gate_c_overall, where any FAIL is overall FAIL).
+    # prerequisite: FAIL outranks BLOCKED at both the verdict level and
+    # the provenance level (consistent with decide_gate_c_overall, where
+    # any FAIL is overall FAIL).
     if failed:
         return HeldoutTierReport(
             tier="C-heldout",
@@ -1292,6 +1330,16 @@ def build_heldout_tier_report(
             passed_ids=tuple(passed),
             failed_ids=tuple(failed),
             failure_categories=categories or {"heldout-verdict-missing": 1},
+            provenance=provenance,
+        )
+    if provenance.blocked_reason:
+        return HeldoutTierReport(
+            tier="C-heldout",
+            status="BLOCKED",
+            scenario_ids=(),
+            passed_ids=(),
+            failed_ids=(),
+            failure_categories={provenance.blocked_reason: 1},
             provenance=provenance,
         )
     if blocked:
