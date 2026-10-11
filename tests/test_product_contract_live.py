@@ -194,7 +194,8 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     async def _ok_transport() -> LaneResult:
         return LaneResult(lane="telegram-transport-25-32", status="PASS", passed=("ok",))
 
-    async def _ok_live() -> LaneResult:
+    async def _ok_live(*args: object, **kwargs: object) -> LaneResult:
+        _ = (args, kwargs)
         return LaneResult(
             lane="live-telegram-evidence", status="INCOMPLETE", incomplete=("deferred",)
         )
@@ -210,7 +211,7 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
 
     live_mod.run_message_lane = _boom  # type: ignore[assignment]
     live_mod.run_transport_lane = _ok_transport  # type: ignore[assignment]
-    live_mod.run_live_telegram_evidence_lane = _ok_live  # type: ignore[assignment]
+    live_mod.run_live_telegram_evidence_lane = _ok_live
     original_readiness = live_mod.run_telegram_readiness_lane
     live_mod.run_telegram_readiness_lane = _ok_readiness  # type: ignore[assignment]
     try:

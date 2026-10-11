@@ -151,6 +151,9 @@ for _prefix in (
     "live-planner-retrieval-answer-verifier-telemetry",
     "live-voice-",
     "live-text-latency-measured",
+    "c-regression-",
+    "c-heldout-",
+    "gate-c-tier-",
 ):
     OLD_CHECK_TO_GATE[_prefix] = "C"
 for _prefix in (

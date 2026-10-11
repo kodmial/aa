@@ -1991,6 +1991,157 @@ def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool
 HELD_OUT_CORPUS_VERSION = "aa-held-out-eval-corpus/1"
 HELD_OUT_CORPUS_PATH = "qualification/held_out_v1.json"
 
+# Gate C tier separation (kodmial/aa#341): the fixed literal scenarios below
+# are C-regression (stable visible deterministic cases for fast failure
+# localization), never the unseen benchmark. C-heldout inputs are sealed,
+# provisioned post-code-freeze, and evaluated by
+# ``aa.qualification.gate_c_heldout``. This count is asserted by the
+# ``c-regression-preserved-18`` check so old scenario coverage is never
+# silently dropped or mistaken for independent proof.
+GATE_C_REGRESSION_SCENARIO_COUNT = 18
+
+
+def _blocked_provenance_for_lane(
+    *, reason: str, evaluator_sha: str, rubric_hex: str, run_id: str
+) -> Any:
+    """Build an unavailable-source provenance without leaking text."""
+    from aa.qualification.gate_c_heldout import (
+        GATE_C_EVALUATOR_VERSION,
+        INDEPENDENCE_PROCEDURAL_ONLY,
+        RUBRIC_VERSION,
+        HeldoutSourceProvenance,
+    )
+
+    return HeldoutSourceProvenance(
+        source="unavailable",
+        fixture_digest="",
+        generation_success=False,
+        evaluator_version=GATE_C_EVALUATOR_VERSION,
+        evaluator_source_sha=evaluator_sha,
+        rubric_version=RUBRIC_VERSION,
+        rubric_digest=rubric_hex,
+        run_id=run_id,
+        independence_level=INDEPENDENCE_PROCEDURAL_ONLY,
+        reproducibility="heldout-unavailable-no-reproducible-fixture",
+        blocked_reason=reason,
+        scenario_count=0,
+    )
+
+
+def _gate_c_blocked_tier_metrics(
+    *, reason: str, run_id: str = "local", regression_status: str = "BLOCKED"
+) -> dict[str, Any]:
+    """Build privacy-safe Gate C tier metrics for a blocked held-out tier.
+
+    Only digests/counts/fixed-vocabulary tokens travel here; no prompt
+    text, no seeds, no reply text.
+    """
+    from aa.qualification.gate_c_heldout import (
+        GATE_C_EVALUATOR_VERSION,
+        GATE_C_SEMANTIC_REPORT_VERSION,
+        INDEPENDENCE_PROCEDURAL_ONLY,
+        RUBRIC_VERSION,
+        HeldoutTierReport,
+        build_gate_c_semantic_report,
+        build_heldout_tier_report,
+        evaluator_source_sha,
+        rubric_digest,
+    )
+
+    try:
+        rubric_hex = rubric_digest()
+    except OSError:
+        rubric_hex = ""
+    try:
+        evaluator_sha = evaluator_source_sha()
+    except OSError:
+        evaluator_sha = ""
+    regression = HeldoutTierReport(
+        tier="C-regression",
+        status=regression_status,
+        scenario_ids=(),
+        passed_ids=(),
+        failed_ids=(),
+        failure_categories={},
+        provenance=None,
+    )
+    heldout = build_heldout_tier_report(
+        provenance=_blocked_provenance_for_lane(
+            reason=reason, evaluator_sha=evaluator_sha, rubric_hex=rubric_hex, run_id=run_id
+        ),
+        verdicts=(),
+    )
+    report = build_gate_c_semantic_report(regression=regression, heldout=heldout)
+    return {
+        "gate_c_tiers": report.to_dict(),
+        "gate_c_overall": report.overall,
+        "gate_c_regression_status": regression.status,
+        "gate_c_heldout_status": heldout.status,
+        "gate_c_heldout_source": "unavailable",
+        "gate_c_heldout_blocked_reason": reason,
+        "gate_c_evaluator_version": GATE_C_EVALUATOR_VERSION,
+        "gate_c_evaluator_source_sha": evaluator_sha[:16],
+        "gate_c_rubric_version": RUBRIC_VERSION,
+        "gate_c_rubric_digest": rubric_hex[:16],
+        "gate_c_independence_level": INDEPENDENCE_PROCEDURAL_ONLY,
+        "gate_c_semantic_report_version": GATE_C_SEMANTIC_REPORT_VERSION,
+    }
+
+
+def _regression_cases_for_check(name: str, family_positions: dict[str, list[int]]) -> list[str]:
+    """Map one regression check name to opaque C-regression case ids.
+
+    Position-suffixed checks map to their scenario; family-scoped checks
+    map to every scenario of that family; multi-turn and negative-control
+    checks map to their aggregate cases; everything else maps to the
+    aggregate case. Only opaque ids travel outward, never prompt text.
+    """
+    for marker, case in (
+        ("live-step-", "c-regression-multiturn"),
+        ("live-short-admission-", "c-regression-multiturn"),
+        ("live-typo-variant-", "c-regression-multiturn"),
+        ("live-context-switch-", "c-regression-multiturn"),
+        ("live-negative-control-", "c-regression-negative-controls"),
+    ):
+        if name.startswith(marker):
+            return [case]
+    for family, positions in family_positions.items():
+        if f"-{family}-" in f"-{name}-":
+            return [f"c-regression-{position:03d}" for position in positions]
+    tail = name.rsplit("-", 1)[-1]
+    if tail.isdigit() and 1 <= int(tail) <= GATE_C_REGRESSION_SCENARIO_COUNT:
+        return [f"c-regression-{int(tail):03d}"]
+    return ["c-regression-aggregate"]
+
+
+def _tier_metrics_from_reports(*, regression: Any, heldout: Any) -> dict[str, Any]:
+    """Build lane metrics from both tier reports (privacy-safe)."""
+    from aa.qualification.gate_c_heldout import (
+        GATE_C_EVALUATOR_VERSION,
+        GATE_C_SEMANTIC_REPORT_VERSION,
+        RUBRIC_VERSION,
+        build_gate_c_semantic_report,
+    )
+
+    provenance = heldout.provenance
+    if provenance is None:
+        return _gate_c_blocked_tier_metrics(reason="EXTERNAL_HELDOUT_FIXTURE_UNAVAILABLE")
+    report = build_gate_c_semantic_report(regression=regression, heldout=heldout)
+    return {
+        "gate_c_tiers": report.to_dict(),
+        "gate_c_overall": report.overall,
+        "gate_c_regression_status": regression.status,
+        "gate_c_heldout_status": heldout.status,
+        "gate_c_heldout_source": str(provenance.source),
+        "gate_c_heldout_blocked_reason": str(provenance.blocked_reason),
+        "gate_c_evaluator_version": GATE_C_EVALUATOR_VERSION,
+        "gate_c_evaluator_source_sha": str(provenance.evaluator_source_sha)[:16],
+        "gate_c_rubric_version": RUBRIC_VERSION,
+        "gate_c_rubric_digest": str(provenance.rubric_digest)[:16],
+        "gate_c_independence_level": str(provenance.independence_level),
+        "gate_c_semantic_report_version": GATE_C_SEMANTIC_REPORT_VERSION,
+    }
+
 
 def load_held_out_corpus(*, repo_root: Path | None = None) -> dict[str, Any]:
     """Load the versioned held-out evaluation corpus (never inline prompts).
@@ -2212,7 +2363,9 @@ async def assess_live_helpfulness_with_judge_metrics(
     return combined, metrics
 
 
-async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> LaneResult:
+async def run_live_telegram_evidence_lane(
+    repo_root: Path | None = None, run_id: str = "local"
+) -> LaneResult:
     """Execute real ordinary turns through the production Telegram boundary.
 
     Telegram network I/O is the only substituted dependency in this lane:
@@ -2226,6 +2379,14 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     trusted in-process receipt only (issue #340): synthetic ``sendMessage``
     ids never prove external delivery. Gate D separately proves the real
     Telegram network/bootstrap/poller.
+
+    Gate C tier separation (kodmial/aa#341): the fixed scenarios executed
+    here are C-regression only. The C-heldout tier (sealed unseen Russian
+    dialogue provisioned post-code-freeze) is resolved and, when a
+    validated unseen source exists, executed live through this same
+    production transport seam in the held-out branch below. Without a
+    viable unseen source the tier is typed BLOCKED (external
+    prerequisite), never PASS via regression strings and never FAIL.
     """
     del repo_root
     from dataclasses import replace
@@ -2240,6 +2401,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
     typing_sends = 0
     heartbeat_continuity_failures = 0
     stage_snapshots: list[dict[str, Any]] = []
+    regression_prompts: list[str] = []
+    heldout_verdicts: list[Any] = []
+    heldout_provenance: Any = None
+    heldout_report_for_metrics: Any = None
+    regression_report_for_metrics: Any = None
+    pre_heldout_failed: list[str] = []
     # Closed-vocabulary, text-free per-scenario diagnostic evidence. Without
     # this, a 25-minute Gate C collapses 18 different failures into one
     # fingerprint and automated repair has no actionable root cause.
@@ -2258,24 +2425,29 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
 
     ok, missing = _live_prerequisites()
     if not ok:
+        from aa.qualification.gate_c_heldout import BLOCKED_PREREQUISITES_UNAVAILABLE
+
         incomplete.extend(f"live-evidence-requires-{item}" for item in missing)
+        incomplete.append("c-heldout-blocked-external-live-prerequisites-unavailable")
+        metrics: dict[str, Any] = {
+            "scenarios_executed": 0,
+            "turns_executed": 0,
+            "latency_p50_s": 0.0,
+            "latency_p95_s": 0.0,
+            "latency_max_s": 0.0,
+            "turn_latencies_ms": [],
+            "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+            "live_prerequisites_present": False,
+            "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
+        }
+        metrics.update(_gate_c_blocked_tier_metrics(reason=BLOCKED_PREREQUISITES_UNAVAILABLE))
         return LaneResult(
             lane="live-telegram-evidence",
             status="INCOMPLETE",
             passed=tuple(passed),
             failed=tuple(failed),
             incomplete=tuple(incomplete),
-            metrics={
-                "scenarios_executed": 0,
-                "turns_executed": 0,
-                "latency_p50_s": 0.0,
-                "latency_p95_s": 0.0,
-                "latency_max_s": 0.0,
-                "turn_latencies_ms": [],
-                "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-                "live_prerequisites_present": False,
-                "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
-            },
+            metrics=metrics,
         )
 
     # Do not pre-probe localhost here: the production LocalOpenCodeRuntime
@@ -2417,9 +2589,12 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
             judge_overrides = 0
             judge_models_seen: list[str] = []
 
-            # Frozen core plus held-out differently worded variants. Repair
-            # tasks receive only failure categories/metrics, never this prompt
-            # corpus, so implementation cannot special-case exact questions.
+            # C-regression (kodmial/aa#341): frozen core plus held-out
+            # differently worded variants. These 18 fixed literal turns are
+            # stable visible deterministic cases for fast failure
+            # localization, never the unseen benchmark. Repair tasks receive
+            # only failure categories/metrics, never this prompt corpus, so
+            # implementation cannot special-case exact questions.
             core_scenarios: tuple[tuple[str, int, str], ...] = (
                 (
                     "meta-capability",
@@ -2515,6 +2690,13 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 ),
             )
             scenarios = core_scenarios + held_out_scenarios
+            # C-regression coverage is preserved, never discarded and never
+            # mistaken for the unseen benchmark (kodmial/aa#341).
+            _check(
+                "c-regression-preserved-18",
+                len(core_scenarios) + len(held_out_scenarios) == GATE_C_REGRESSION_SCENARIO_COUNT,
+            )
+            regression_prompts = [prompt for _, _, prompt in scenarios]
 
             replies: list[str] = []
             ordinary_families = {
@@ -3242,6 +3424,197 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
                 or judge_calls >= 5,
             )
 
+            # C-heldout tier (kodmial/aa#341): sealed unseen Russian dialogue
+            # executed live through this same production transport seam with
+            # the same independent whole-turn judge. The fixed 18 turns
+            # above are C-regression only and are never reused as unseen
+            # proof: without a protected fixture or a validated post-freeze
+            # generated fixture this tier is typed BLOCKED (an explicit
+            # external prerequisite), never PASS and never product FAIL.
+            # Only opaque scenario ids, digests and counts travel outward;
+            # held-out prompt text never enters logs, metrics or repair
+            # evidence.
+            pre_heldout_failed = list(failed)
+            from aa.qualification import gate_c_heldout as _heldout
+
+            heldout_provenance, heldout_fixture = _heldout.resolve_heldout_source(run_id=run_id)
+            if str(heldout_provenance.blocked_reason or "").strip():
+                slug = str(heldout_provenance.blocked_reason).strip().lower().replace("_", "-")
+                incomplete.append(f"c-heldout-blocked-{slug}")
+                heldout_report_for_metrics = _heldout.build_heldout_tier_report(
+                    provenance=heldout_provenance, verdicts=()
+                )
+            elif heldout_fixture is not None:
+                entries = [
+                    entry
+                    for entry in heldout_fixture.get("scenarios", [])
+                    if isinstance(entry, dict)
+                ]
+                novelty = _heldout.check_fixture_novelty(
+                    fixture_prompts=[str(entry.get("prompt", "")) for entry in entries],
+                    regression_prompts=regression_prompts,
+                )
+                if not bool(novelty.get("novel")):
+                    # Overt fixture leakage: held-out prompts echo visible
+                    # regression strings or repeat themselves.
+                    failed.append("c-heldout-novelty-leak")
+                    heldout_verdicts = [
+                        _heldout.HeldoutTurnVerdict(
+                            outcome="FAIL",
+                            scenario_id=str(entry.get("id", f"c-heldout-{pos:03d}"))[:64],
+                            judge_available=False,
+                            judge_model="",
+                            failure_category="fixture-leakage",
+                        )
+                        for pos, entry in enumerate(entries)
+                    ]
+                else:
+                    try:
+                        chat_base = 923000 + (
+                            int(str(heldout_provenance.fixture_digest[:8]), 16) % 1000
+                        )
+                    except ValueError:
+                        chat_base = 923000
+                    for index, entry in enumerate(entries):
+                        scenario_id = str(entry.get("id", f"c-heldout-{index:03d}"))[:64]
+                        category = str(entry.get("category", ""))
+                        prompt = str(entry.get("prompt", ""))
+                        context = str(entry.get("context", ""))
+                        requires_book = bool(entry.get("requires_book_evidence", True))
+                        safety_exp = str(entry.get("safety_expectation", "ordinary"))
+                        print(
+                            f"Gate C heldout {index + 1}/{len(entries)} "
+                            f"scenario={scenario_id} category={category} "
+                            "phase=start",
+                            flush=True,
+                        )
+                        heldout_reply = await _send_raw_text(
+                            chat_base + index, prompt, 932000 + index
+                        )
+                        if heldout_reply is None:
+                            failed.append(f"c-heldout-delivery-timeout-{scenario_id}")
+                            heldout_verdicts.append(
+                                _heldout.HeldoutTurnVerdict(
+                                    outcome="FAIL",
+                                    scenario_id=scenario_id,
+                                    judge_available=False,
+                                    judge_model="",
+                                    failure_category="delivery-timeout",
+                                )
+                            )
+                            continue
+                        replies.append(heldout_reply)
+                        heldout_snapshot: dict[str, Any] = {}
+                        try:
+                            graph_h = app.graph_runtime
+                            if graph_h is not None:
+                                heldout_snapshot = graph_h.last_telemetry_for_thread(
+                                    graph_h.thread_id(chat_base + index)
+                                )
+                                if heldout_snapshot:
+                                    stage_snapshots.append(dict(heldout_snapshot))
+                        except Exception:
+                            pass
+                        (
+                            heldout_helpful,
+                            heldout_judge_metrics,
+                        ) = await assess_live_helpfulness_with_judge_metrics(
+                            prompt=prompt,
+                            snapshot=heldout_snapshot,
+                            reply=heldout_reply,
+                            context=context,
+                            judge_model=judge_model,
+                        )
+                        judge_calls += 1
+                        judge_helpful_count += int(bool(heldout_helpful))
+                        judge_unavailable_count += int(
+                            heldout_judge_metrics.get("judge_available") is False
+                        )
+                        if heldout_judge_metrics.get("judge_failure_category"):
+                            _category = str(heldout_judge_metrics["judge_failure_category"])
+                            judge_failure_categories[_category] = (
+                                judge_failure_categories.get(_category, 0) + 1
+                            )
+                        if bool(heldout_judge_metrics.get("judge_overrode_telemetry", False)):
+                            judge_overrides += 1
+                        seen_model = str(heldout_judge_metrics.get("judge_model", "") or "")
+                        if seen_model and seen_model not in judge_models_seen:
+                            judge_models_seen.append(seen_model)
+                        judge_available_h = heldout_judge_metrics.get("judge_available") is True
+                        verdict = _heldout.evaluate_heldout_turn(
+                            scenario_id=scenario_id,
+                            reply=heldout_reply,
+                            snapshot=heldout_snapshot,
+                            judge_helpful=(
+                                bool(heldout_judge_metrics.get("judge_helpful"))
+                                if judge_available_h
+                                else None
+                            ),
+                            judge_addresses_intent=bool(
+                                heldout_judge_metrics.get("judge_addresses_intent")
+                            ),
+                            judge_contains_substantive_claim=bool(
+                                heldout_judge_metrics.get("judge_substantive", True)
+                            ),
+                            judge_model=seen_model,
+                            requires_book_evidence=requires_book,
+                            safety_expectation=safety_exp,
+                            receipt_kind="simulated-in-process",
+                        )
+                        heldout_verdicts.append(verdict)
+                        _check(
+                            f"c-heldout-turn-{scenario_id}-verdict",
+                            verdict.outcome == "PASS",
+                        )
+                        print(
+                            f"Gate C heldout {index + 1}/{len(entries)} "
+                            f"scenario={scenario_id} phase=completed "
+                            f"outcome={verdict.outcome}",
+                            flush=True,
+                        )
+                heldout_report_for_metrics = _heldout.build_heldout_tier_report(
+                    provenance=heldout_provenance, verdicts=heldout_verdicts
+                )
+                if heldout_report_for_metrics.status == "FAIL":
+                    failed.append("c-heldout-tier-fail")
+                elif heldout_report_for_metrics.status == "BLOCKED":
+                    incomplete.append("c-heldout-blocked-external-judge-unavailable")
+                else:
+                    passed.append("c-heldout-tier-pass")
+            else:
+                heldout_report_for_metrics = _heldout.build_heldout_tier_report(
+                    provenance=heldout_provenance, verdicts=heldout_verdicts
+                )
+            # C-regression tier report: stable visible deterministic cases
+            # for fast failure localization (never unseen proof). Built here
+            # from the pre-heldout snapshot and refreshed from the final
+            # lane failures before metrics (see below), so a post-heldout
+            # collapse over regression replies cannot leave the tier PASS
+            # while the lane fails.
+            family_positions: dict[str, list[int]] = {}
+            for position, (family, _, _) in enumerate(scenarios, start=1):
+                family_positions.setdefault(family, []).append(position)
+            regression_cases = [f"c-regression-{pos:03d}" for pos in range(1, 19)] + [
+                "c-regression-multiturn",
+                "c-regression-negative-controls",
+                "c-regression-aggregate",
+            ]
+            failed_cases: set[str] = set()
+            for check_name in pre_heldout_failed:
+                failed_cases.update(_regression_cases_for_check(check_name, family_positions))
+            check_category_counts: dict[str, int] = {}
+            for check_name in pre_heldout_failed:
+                check_category_counts[check_name] = check_category_counts.get(check_name, 0) + 1
+            regression_report_for_metrics = _heldout.build_regression_tier_report(
+                scenario_ids=regression_cases,
+                failed_ids=sorted(failed_cases),
+                failure_categories=check_category_counts,
+            )
+            regression_cases_for_refresh = list(regression_cases)
+            family_positions_for_refresh = {
+                key: list(value) for key, value in family_positions.items()
+            }
+
             collapsed_count = sum(1 for item in replies if is_service_error(item.strip()))
             # Hash-based answer variety is never evidence of helpfulness.
             _check("live-answer-no-generic-collapse", collapsed_count == 0)
@@ -3601,6 +3974,69 @@ async def run_live_telegram_evidence_lane(repo_root: Path | None = None) -> Lane
         "telegram_egress_label": "SIMULATED",
         "external_send_status": "external_send_unverified",
     }
+    # Gate C tier metrics (kodmial/aa#341): the single typed semantic
+    # report holding C-regression plus C-heldout. Only opaque ids,
+    # digests, counts and fixed-vocabulary tokens travel here.
+    # Refresh the C-regression tier from the final lane failures: the
+    # report above was snapshotted pre-heldout, while checks such as
+    # live-answer-no-generic-collapse run afterward over all replies
+    # (including regression replies). Without this refresh a collapse
+    # affecting regression replies would fail the lane while the tier
+    # still reports PASS.
+    try:
+        # Only lane-wide answer checks that evaluate regression replies
+        # refresh the tier (collapse/diversity/grounding/delivery cover
+        # the 18 visible turns). Voice/model-policy/heldout checks have
+        # their own lane signals and must not newly fail the
+        # regression tier.
+        _refresh_prefixes = (
+            "live-answer-no-generic-collapse",
+            "live-substantive-grounded-book-answer",
+            "live-answer-diversity",
+            "live-typing-heartbeat-continuous",
+            "live-delivery-sendmessage-observed",
+            "live-planner-retrieval-answer-verifier-telemetry",
+        )
+        _refresh_positions = dict(family_positions_for_refresh)
+        _refresh_failed_cases: set[str] = set()
+        for _check_name in failed:
+            _name = str(_check_name)
+            if _name in set(pre_heldout_failed) or _name.startswith(_refresh_prefixes):
+                _refresh_failed_cases.update(_regression_cases_for_check(_name, _refresh_positions))
+        _refresh_categories: dict[str, int] = {}
+        for _check_name in failed:
+            _key = str(_check_name)
+            if _key in set(pre_heldout_failed) or _key.startswith(_refresh_prefixes):
+                _refresh_categories[_key] = _refresh_categories.get(_key, 0) + 1
+        regression_report_for_metrics = _heldout.build_regression_tier_report(
+            scenario_ids=list(regression_cases_for_refresh),
+            failed_ids=sorted(_refresh_failed_cases),
+            failure_categories=_refresh_categories,
+        )
+    except Exception:
+        pass
+    try:
+        if heldout_report_for_metrics is not None and regression_report_for_metrics is not None:
+            metrics.update(
+                _tier_metrics_from_reports(
+                    regression=regression_report_for_metrics,
+                    heldout=heldout_report_for_metrics,
+                )
+            )
+        else:
+            metrics.update(
+                _gate_c_blocked_tier_metrics(
+                    reason="EXTERNAL_HELDOUT_FIXTURE_UNAVAILABLE", run_id=run_id
+                )
+            )
+            if not any(str(item).startswith("c-heldout-blocked-") for item in incomplete):
+                incomplete.append("c-heldout-blocked-external-heldout-fixture-unavailable")
+    except Exception:
+        metrics.update(
+            _gate_c_blocked_tier_metrics(
+                reason="EXTERNAL_HELDOUT_FIXTURE_UNAVAILABLE", run_id=run_id
+            )
+        )
     from aa.qualification.gate_cd_boundary import (
         assert_no_external_claim_from_simulated as _assert_no_ext,
     )
@@ -3673,7 +4109,9 @@ def _failed_lane(lane: str, reason: str, scenarios_executed: int = 0) -> LaneRes
     )
 
 
-async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult, LaneResult]:
+async def _run_async_lanes(
+    run_id: str = "local",
+) -> tuple[LaneResult, LaneResult, LaneResult, LaneResult]:
     # Per-lane fail-closed (issue #150): one lane's harness/import crash must
     # not abort the whole evaluation with no evidence. Each lane degrades to
     # an attributable FAIL so the summary still names the concrete lane.
@@ -3692,7 +4130,7 @@ async def _run_async_lanes() -> tuple[LaneResult, LaneResult, LaneResult, LaneRe
             raise
         transport = _failed_lane("telegram-transport-25-32", type(exc).__name__)
     try:
-        live_evidence = await run_live_telegram_evidence_lane()
+        live_evidence = await run_live_telegram_evidence_lane(run_id=run_id)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
         if isinstance(exc, OpenCodeRateLimitError):
             raise
@@ -3733,7 +4171,7 @@ def evaluate_live(
             run_id=run_id,
         )
     static_gates = collect_static_gates(root)
-    message, transport, live_evidence, readiness = asyncio.run(_run_async_lanes())
+    message, transport, live_evidence, readiness = asyncio.run(_run_async_lanes(run_id))
     try:
         control = run_control_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
@@ -3759,6 +4197,7 @@ __all__ = [
     "CAPABILITY_ISSUE",
     "EXIT_BY_STATUS",
     "FORBIDDEN_SUMMARY_KEYS",
+    "GATE_C_REGRESSION_SCENARIO_COUNT",
     "LIVE_TEXT_LATENCY_BUDGET_S",
     "LaneResult",
     "LiveSummary",
