@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -318,10 +319,16 @@ def main() -> int:
                     ]
                 )
         else:
+            # Healthy idempotent reuse (trusted result present, already
+            # dispatched, shared marker present, active lease retain) is
+            # not a runner failure: preserve the typed code embedded in
+            # the plan reason instead of mislabeling it as terminal.
+            _code_match = re.search(r"BLOCKED_[A-Z_]+", plan.reason)
+            _reuse_code = _code_match.group(0) if _code_match else "BLOCKED_NO_WAITING_CAPABILITIES"
             blocked_record = build_blocked_record(
                 capabilities=list(plan.waiting_capabilities),
                 sha=sha,
-                blocked_code="BLOCKED_RUNNER_TERMINAL",
+                blocked_code=_reuse_code,
                 detail=plan.reason[:200],
             )
             # Reuse/no-dispatch is informational, not an error: persist the

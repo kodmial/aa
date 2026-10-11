@@ -638,7 +638,9 @@ def load_capability_inventory_file(path: str | Path) -> list[int]:
         ) from exc
     stripped = text.strip()
     if not stripped:
-        raise MandatoryLifecycleError(f"{BLOCKED_INVENTORY_INCOMPLETE}: inventory file is empty")
+        # An empty JSONL inventory means zero open issues (idle state):
+        # no waiting capabilities, no dispatch, lease classified only.
+        return []
     entries: list[Mapping[str, Any]] = []
     if stripped.startswith("["):
         try:
@@ -753,8 +755,10 @@ def assemble_comment_history_from_pages(
                     f"page {index} entry {entry_index}"
                 )
             body = entry.get("body", "")
-            association = entry.get("authorAssociation", entry.get("association", ""))
-            author = entry.get("author", {})
+            association = entry.get(
+                "authorAssociation", entry.get("author_association", entry.get("association", ""))
+            )
+            author = entry.get("author", entry.get("user", {}))
             login = ""
             if isinstance(author, Mapping):
                 login_value = author.get("login", entry.get("login", ""))

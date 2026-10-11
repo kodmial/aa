@@ -200,11 +200,26 @@ jobs:
           gh api "repos/${repo}/issues/7" --jq '[.labels[].name] | join(",")' \
             > /tmp/mq-labels.txt
           chmod 600 /tmp/mq-labels.txt
+          # A queued/waiting run for the same SHA already owns the
+          # reservation before it reaches in_progress, so all pre-run
+          # states feed the pure active-lease classifier (no second
+          # workflow_dispatch for the same SHA).
           gh run list --workflow aa-self-proving-qualification.yml \
-            --status in_progress --limit 5 \
+            --status in_progress --limit 10 \
             --json databaseId,headSha,conclusion,status \
-            > /tmp/mq-runs.json || echo '[]' > /tmp/mq-runs.json
-          chmod 600 /tmp/mq-runs.json
+            > /tmp/mq-runs-active.json || echo '[]' > /tmp/mq-runs-active.json
+          gh run list --workflow aa-self-proving-qualification.yml \
+            --status queued --limit 10 \
+            --json databaseId,headSha,conclusion,status \
+            > /tmp/mq-runs-queued.json || echo '[]' > /tmp/mq-runs-queued.json
+          gh run list --workflow aa-self-proving-qualification.yml \
+            --status waiting --limit 10 \
+            --json databaseId,headSha,conclusion,status \
+            > /tmp/mq-runs-waiting.json || echo '[]' > /tmp/mq-runs-waiting.json
+          jq -s 'add' /tmp/mq-runs-active.json /tmp/mq-runs-queued.json \
+            /tmp/mq-runs-waiting.json > /tmp/mq-runs.json
+          chmod 600 /tmp/mq-runs-active.json /tmp/mq-runs-queued.json \
+            /tmp/mq-runs-waiting.json /tmp/mq-runs.json
 
       - name: Reconcile shared qualification dispatch (single claimant)
         shell: bash
