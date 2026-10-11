@@ -69,3 +69,8 @@ def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> N
     assert "failGates = new Set(productFailures.map(" in inside_parser
     assert "const failGates =" not in inside_parser
     assert "failGates.has('C')" in publisher
+    assert "steps.gate-a.outcome == 'success'" in publisher
+    assert "steps.gate-a.outcome == 'failure'" in publisher
+    assert "github.rest.repos.getBranch({" in publisher
+    assert "is stale" in publisher
+    assert "no repair issue is created" in publisher
