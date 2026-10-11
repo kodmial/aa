@@ -2395,6 +2395,12 @@ async def run_live_telegram_evidence_lane(
     failed: list[str] = []
     incomplete: list[str] = []
     latencies: list[float] = []
+    # Gate E single-owner latency series (kodmial/aa#342): one causality id
+    # per ordinary turn measured with the monotonic clock from raw
+    # production-update intake to confirmed simulated-network handoff.
+    # Timeout/failed turns are recorded here as bounded-censored samples and
+    # never dropped.
+    latency_samples: list[dict[str, Any]] = []
     collapsed_count = 0
     book_grounded_successes = 0
     book_grounded_expected = 0
@@ -2436,6 +2442,14 @@ async def run_live_telegram_evidence_lane(
             "latency_p95_s": 0.0,
             "latency_max_s": 0.0,
             "turn_latencies_ms": [],
+            "turn_latency_samples": [],
+            "served_turn_count": 0,
+            "censored_turn_count": 0,
+            "latency_clock": "monotonic-perf_counter",
+            "latency_series": "c-series-simulated-handoff",
+            "latency_boundary": "production-update-intake-to-simulated-handoff",
+            "latency_source_proof_kind": "c-series-simulated-handoff",
+            "latency_units": "ms",
             "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
             "live_prerequisites_present": False,
             "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
@@ -2783,6 +2797,33 @@ async def run_live_telegram_evidence_lane(
                             "delivery_timeout": True,
                         }
                     )
+                    # Bounded-censored latency: a timed-out ordinary turn is
+                    # measured evidence (never dropped). Gate E counts it in
+                    # reliability and p50/p95/max.
+                    if family in ordinary_families:
+                        import uuid as _uuid
+
+                        latency_samples.append(
+                            {
+                                "causality_id": _uuid.uuid4().hex,
+                                "family": family,
+                                "mode": "text",
+                                "outcome": "timeout",
+                                "latency_ms": round(
+                                    min(
+                                        (time.perf_counter() - started) * 1000.0,
+                                        LIVE_TEXT_LATENCY_BUDGET_S * 1000.0,
+                                    ),
+                                    1,
+                                ),
+                                "monotonic": True,
+                                "clock": "monotonic-perf_counter",
+                                "series": "c-series-simulated-handoff",
+                                "boundary": ("production-update-intake-to-simulated-handoff"),
+                                "receipt_kind": "simulated-in-process",
+                                "censored": True,
+                            }
+                        )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} "
                         f"family={family} phase=delivery-timeout",
@@ -2798,6 +2839,23 @@ async def run_live_telegram_evidence_lane(
                 elapsed = time.perf_counter() - started
                 if family in ordinary_families:
                     latencies.append(elapsed)
+                    import uuid as _uuid
+
+                    latency_samples.append(
+                        {
+                            "causality_id": _uuid.uuid4().hex,
+                            "family": family,
+                            "mode": "text",
+                            "outcome": "served",
+                            "latency_ms": round(elapsed * 1000.0, 1),
+                            "monotonic": True,
+                            "clock": "monotonic-perf_counter",
+                            "series": "c-series-simulated-handoff",
+                            "boundary": "production-update-intake-to-simulated-handoff",
+                            "receipt_kind": "simulated-in-process",
+                            "censored": False,
+                        }
+                    )
                 reply = api.sent_texts[-1]
                 replies.append(reply)
                 _check(
@@ -3026,8 +3084,50 @@ async def run_live_telegram_evidence_lane(
                 while len(api.sent_texts) <= before and loop.time() < deadline_turn:
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
+                    import uuid as _uuid
+
+                    elapsed_raw = time.perf_counter() - started_raw
+                    latency_samples.append(
+                        {
+                            "causality_id": _uuid.uuid4().hex,
+                            "family": "ordinary-text",
+                            "mode": "text",
+                            "outcome": "timeout",
+                            "latency_ms": round(
+                                min(
+                                    elapsed_raw * 1000.0,
+                                    LIVE_TEXT_LATENCY_BUDGET_S * 1000.0,
+                                ),
+                                1,
+                            ),
+                            "monotonic": True,
+                            "clock": "monotonic-perf_counter",
+                            "series": "c-series-simulated-handoff",
+                            "boundary": "production-update-intake-to-simulated-handoff",
+                            "receipt_kind": "simulated-in-process",
+                            "censored": True,
+                        }
+                    )
                     return None
-                latencies.append(time.perf_counter() - started_raw)
+                elapsed_raw = time.perf_counter() - started_raw
+                latencies.append(elapsed_raw)
+                import uuid as _uuid
+
+                latency_samples.append(
+                    {
+                        "causality_id": _uuid.uuid4().hex,
+                        "family": "ordinary-text",
+                        "mode": "text",
+                        "outcome": "served",
+                        "latency_ms": round(elapsed_raw * 1000.0, 1),
+                        "monotonic": True,
+                        "clock": "monotonic-perf_counter",
+                        "series": "c-series-simulated-handoff",
+                        "boundary": "production-update-intake-to-simulated-handoff",
+                        "receipt_kind": "simulated-in-process",
+                        "censored": False,
+                    }
+                )
                 return api.sent_texts[-1]
 
             # Step continuity: the follow-up relies on the prior referent.
@@ -3921,11 +4021,24 @@ async def run_live_telegram_evidence_lane(
 
     metrics = {
         "scenarios_executed": 8,
-        "turns_executed": len(latencies),
+        "turns_executed": len(latency_samples) if latency_samples else len(latencies),
         "latency_p50_s": round(p50, 4),
         "latency_p95_s": round(p95, 4),
         "latency_max_s": round(maximum, 4),
         "turn_latencies_ms": [round(v * 1000.0, 1) for v in latencies],
+        # Gate E single-owner series (kodmial/aa#342): monotonic per-turn
+        # samples with causality ids, including bounded-censored timeouts.
+        "turn_latency_samples": list(latency_samples),
+        "served_turn_count": sum(1 for item in latency_samples if item.get("outcome") == "served"),
+        "censored_turn_count": sum(
+            1 for item in latency_samples if bool(item.get("censored", False))
+        ),
+        "latency_clock": "monotonic-perf_counter",
+        "latency_series": "c-series-simulated-handoff",
+        "latency_boundary": "production-update-intake-to-simulated-handoff",
+        "latency_source_proof_kind": "c-series-simulated-handoff",
+        "latency_units": "ms",
+        "latency_provider_id": str(getattr(settings, "opencode_model", ""))[:64],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "independent_judge_calls": _judge_calls,
         "independent_judge_helpful": _judge_helpful,

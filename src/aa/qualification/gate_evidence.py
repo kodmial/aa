@@ -37,6 +37,7 @@ from aa.qualification.self_proving import (
 SCHEMA_VERSION = "aa-gate-evidence/2"
 VERDICT_SCHEMA_VERSION = "aa-self-proving-verdict/2"
 COVERAGE_SCHEMA_VERSION = "aa-gate-ab-coverage/1"
+CHECKPOINT_SCHEMA_VERSION = "aa-gate-checkpoint/1"
 
 EVIDENCE_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "BLOCKED", "STALE")
 
@@ -48,6 +49,14 @@ GATE_EVIDENCE_FILES: dict[str, str] = {
     "C": "gate-C-evidence.json",
     "D": "gate-D-evidence.json",
     "E": "gate-E-evidence.json",
+}
+
+GATE_CHECKPOINT_FILES: dict[str, str] = {
+    "A": "gate-A.checkpoint.json",
+    "B": "gate-B.checkpoint.json",
+    "C": "gate-C.checkpoint.json",
+    "D": "gate-D.checkpoint.json",
+    "E": "gate-E.checkpoint.json",
 }
 
 # Machine-readable inventory of every Gate A assertion. Each row maps one
@@ -592,25 +601,170 @@ def validate_no_status_in_vocab(status: str) -> str:
     return normalized
 
 
+def build_checkpoint_body(
+    *,
+    gate: str,
+    sha: str,
+    run_id: str,
+    product_fingerprint: str,
+    runtime_fingerprint: str,
+    attempt: str,
+    evidence_checksum: str,
+) -> dict[str, Any]:
+    """Build a typed gate checkpoint body (resume proof, not a bare marker).
+
+    Checkpoints bind the completed gate to the exact SHA, run id, product and
+    runtime fingerprints, and the workflow attempt plus the checksum of the
+    published evidence artifact. A bare ``gate-X.done`` file carries none of
+    this and must never authorize a skip on its own.
+    """
+    normalized_gate = (gate or "").strip().upper()
+    if normalized_gate not in ("A", "B", "C", "D", "E"):
+        raise SelfProvingError(f"unknown checkpoint gate {gate!r}")
+    sha_n = validate_exact_sha(sha)
+    if not run_id.strip() or any(c.isspace() for c in run_id):
+        raise SelfProvingError("checkpoint run_id must be a non-empty token")
+    product = validate_hex64(product_fingerprint)
+    runtime = validate_hex64(runtime_fingerprint)
+    digest = (evidence_checksum or "").strip().lower()
+    if len(digest) != 64:
+        raise SelfProvingError("checkpoint needs the 64-hex evidence checksum")
+    body: dict[str, Any] = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "gate": normalized_gate,
+        "sha": sha_n,
+        "run_id": run_id.strip(),
+        "product_fingerprint": product,
+        "runtime_fingerprint": runtime,
+        "attempt": (attempt or "").strip()[:16] or "1",
+        "evidence_checksum": digest,
+    }
+    assert_no_text_leak(body, owner="gate-checkpoint")
+    return body
+
+
+def checkpoint_checksum(body: dict[str, Any]) -> str:
+    """Checksum over the immutable checkpoint body (excludes the checksum)."""
+    return hashlib.sha256(_canonical_payload(body)).hexdigest()
+
+
+def sign_checkpoint_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Attach the immutable-content checksum to a checkpoint body."""
+    if body.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise SelfProvingError("refusing to sign non-checkpoint body")
+    signed = dict(body)
+    signed["checkpoint_checksum"] = checkpoint_checksum(body)
+    assert_no_text_leak(signed, owner="gate-checkpoint")
+    return signed
+
+
+def write_checkpoint_atomic(checkpoint_dir: Path, signed: dict[str, Any]) -> Path:
+    """Atomically publish one validated checkpoint (durable resume proof)."""
+    gate = str(signed.get("gate", ""))
+    filename = GATE_CHECKPOINT_FILES.get(gate)
+    if filename is None:
+        raise SelfProvingError(f"unknown checkpoint gate {gate!r}")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    target = checkpoint_dir / filename
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{filename}.", suffix=".tmp", dir=str(checkpoint_dir)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(signed, sort_keys=True, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+    return target
+
+
+def load_and_validate_checkpoint(
+    path: Path,
+    *,
+    expected_gate: str,
+    expected_sha: str,
+    expected_run_id: str,
+    expected_product: str = "",
+    expected_runtime: str = "",
+    expected_evidence_checksum: str = "",
+) -> dict[str, Any]:
+    """Load one checkpoint and validate it fail-closed.
+
+    A missing, unreadable, legacy, digest-mismatched, wrong-gate, old-SHA,
+    stale-run, fingerprint-mismatched, or evidence-diverged checkpoint raises
+    :class:`SelfProvingError` so no stale checkpoint ever accepts new code.
+    """
+    if not path.is_file():
+        raise SelfProvingError(f"missing {expected_gate} checkpoint")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SelfProvingError(f"{expected_gate} checkpoint unreadable") from exc
+    if not isinstance(payload, dict):
+        raise SelfProvingError(f"{expected_gate} checkpoint invalid shape")
+    if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise SelfProvingError(f"{expected_gate} legacy checkpoint rejected")
+    digest = str(payload.get("checkpoint_checksum", "") or "")
+    if len(digest) != 64:
+        raise SelfProvingError(f"{expected_gate} checkpoint missing checksum")
+    body = {key: value for key, value in payload.items() if key != "checkpoint_checksum"}
+    if checkpoint_checksum(body) != digest.lower():
+        raise SelfProvingError(f"{expected_gate} checkpoint digest mismatch")
+    if str(payload.get("gate", "")).upper() != expected_gate.upper():
+        raise SelfProvingError(f"{expected_gate} checkpoint gate mismatch")
+    if str(payload.get("sha", "")).lower() != validate_exact_sha(expected_sha):
+        raise SelfProvingError(f"{expected_gate} checkpoint stale SHA")
+    if str(payload.get("run_id", "")) != expected_run_id:
+        raise SelfProvingError(f"{expected_gate} checkpoint stale run")
+    if expected_product and str(payload.get("product_fingerprint", "")).lower() != (
+        expected_product.lower()
+    ):
+        raise SelfProvingError(f"{expected_gate} checkpoint product mismatch")
+    if expected_runtime and str(payload.get("runtime_fingerprint", "")).lower() != (
+        expected_runtime.lower()
+    ):
+        raise SelfProvingError(f"{expected_gate} checkpoint runtime mismatch")
+    if (
+        expected_evidence_checksum
+        and str(payload.get("evidence_checksum", "")).lower() != expected_evidence_checksum.lower()
+    ):
+        raise SelfProvingError(f"{expected_gate} checkpoint evidence diverged")
+    assert_no_text_leak(payload, owner="gate-checkpoint")
+    return payload
+
+
 __all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
     "COVERAGE_SCHEMA_VERSION",
     "EVIDENCE_STATUSES",
     "GATE_A_COVERAGE",
     "GATE_B_COVERAGE",
+    "GATE_CHECKPOINT_FILES",
     "GATE_EVIDENCE_FILES",
     "REQUIRED_A_CHECKS",
     "REQUIRED_B_CHECKS",
     "SCHEMA_VERSION",
     "VERDICT_SCHEMA_VERSION",
     "SubcheckResult",
+    "build_checkpoint_body",
     "build_evidence_body",
+    "checkpoint_checksum",
     "coverage_table",
     "evidence_checksum",
     "evidence_to_gate_evidence",
     "failed_gates_for_verdict",
+    "load_and_validate_checkpoint",
     "load_and_validate_evidence",
     "root_components_for_verdict",
+    "sign_checkpoint_body",
     "sign_evidence_body",
     "verdict_summary_v2",
+    "write_checkpoint_atomic",
     "write_evidence_atomic",
 ]
