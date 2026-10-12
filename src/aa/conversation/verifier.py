@@ -402,7 +402,10 @@ VERIFIER_TEXT_JSON_SUFFIX = (
     "only for explicit safety outcomes. "
     "Cite only short passage ids (p1..pN) from <book_evidence>. "
     "Set addresses_intent true only when the unit addresses the resolved "
-    "user intent described in <resolved_intent>. "
+    "user intent described in <resolved_intent>. A unit that only restates "
+    "background, repeats generic statements, drifts off-topic, or describes "
+    "difficulty as a substitute for practical guidance does not address the "
+    "intent, even when grounded. "
     "No other text, no markdown, no explanation."
 )
 
@@ -969,7 +972,10 @@ def build_single_unit_text(
         "A quote mark alone never decides the origin.",
         "Set addresses_intent true only when the unit addresses the user's "
         "context-resolved intent described in <resolved_intent>. An irrelevant "
-        "but perfectly grounded unit must set addresses_intent false. Judge "
+        "but perfectly grounded unit must set addresses_intent false. A unit "
+        "that only restates background, repeats generic statements, drifts "
+        "off-topic, or describes difficulty as a substitute for practical "
+        "guidance does not address the intent, even when grounded. Judge "
         "semantic relevance to the actual intent, never keyword overlap.",
         "<resolved_intent>",
         _escape(resolved_intent or user_message),
