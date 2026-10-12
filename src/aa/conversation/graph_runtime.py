@@ -882,6 +882,20 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
             primary_model=DEFAULT_PRIMARY_MODEL,
             request_timeout=planner.request_timeout,
         )
+        # Systemic repair (kodmial/aa#372): the production graph never
+        # constructed the independent whole-turn judge, so its glue-only
+        # guards inside the answer pipeline were dead code in production
+        # while live qualification judged every substantive turn with it.
+        # Binding the same separately-identified judge here makes the
+        # internal substantive delivery gate live on the exact production
+        # path instead of prompt-wording alignment per scenario family.
+        from aa.conversation.model_adapter import build_judge_model
+
+        judge = build_judge_model(
+            self._client,
+            primary_model=DEFAULT_PRIMARY_MODEL,
+            request_timeout=planner.request_timeout,
+        )
         return build_turn_graph(
             planner_model=planner,
             summary_model=summarizer,
@@ -891,6 +905,7 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
             retrieval_config=RetrievalConfig(),
             answer_model=answer,
             verifier_model=verifier,
+            whole_turn_judge_model=judge,
         )
 
     async def start(self) -> None:
