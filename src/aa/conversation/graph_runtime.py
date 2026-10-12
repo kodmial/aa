@@ -312,6 +312,21 @@ class GraphTurnRuntime:
                             }
                         except Exception:
                             pass
+                else:
+                    # Generic (non-TurnFailed) graph failure (kodmial/aa#370):
+                    # the turn still fails as a typed GraphRuntimeError, but
+                    # the delivered service-error text must carry a concrete
+                    # privacy-safe snapshot (exception type only) instead of
+                    # an empty snapshot that qualification can only report
+                    # as generic missing-turn-telemetry. Never carries user
+                    # text; only the closed-vocabulary failure category.
+                    try:
+                        self._last_telemetry[thread] = {
+                            "failure_category": type(exc).__name__[:64],
+                            "answer_outcome": "failed",
+                        }
+                    except Exception:
+                        pass
             except Exception:
                 pass
             raise GraphRuntimeError("graph-failed", type(exc).__name__) from exc
