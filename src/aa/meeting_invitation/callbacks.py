@@ -56,6 +56,17 @@ class CallbackCodec:
 
     def __init__(self, secret: bytes | None = None) -> None:
         self._secret = bytes(secret) if secret else secrets.token_bytes(32)
+        # Monotonic mint counter (kodmial/aa#360): the 1-byte salt field
+        # carries uniqueness, not entropy (authenticity comes from the
+        # HMAC). A random 8-bit salt aliases distinct button generations
+        # that share action/seq/generation/message/expiry (at most 256
+        # distinct tokens per semantic identity per second), so a fresh
+        # press after back-navigation could byte-match a consumed token
+        # and be dropped as a duplicate. A per-codec monotonic counter
+        # guarantees the first 256 mints for one identity are pairwise
+        # distinct; callers needing cross-instance ordering pass an
+        # explicit nonce instead.
+        self._salt_counter = 0
 
     @property
     def secret(self) -> bytes:
@@ -79,7 +90,11 @@ class CallbackCodec:
             raise ValueError(f"unknown callback action: {action}")
         moment = int(now if now is not None else time.time())
         expiry = moment + max(1, int(ttl_seconds))
-        salt = int(nonce) % 256 if nonce is not None else secrets.randbits(8)
+        if nonce is not None:
+            salt = int(nonce) % 256
+        else:
+            salt = int(self._salt_counter) % 256
+            self._salt_counter += 1
         payload = (
             int(CALLBACK_VERSION).to_bytes(1, "big")
             + int(_ACTION_TO_CODE[action]).to_bytes(1, "big")
