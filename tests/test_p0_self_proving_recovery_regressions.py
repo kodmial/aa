@@ -121,6 +121,7 @@ def _run_publisher_scenario(
     gate_outcomes: dict[str, str],
     failed_sha: str,
     initial_issues: list[dict[str, Any]],
+    transient_blocked: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -133,6 +134,11 @@ def _run_publisher_scenario(
     out_dir.mkdir(parents=True)
     if summary_text is not None:
         (out_dir / "self-proving-summary.json").write_text(summary_text, encoding="utf-8")
+    if transient_blocked:
+        (out_dir / "transient-blocked.json").write_text(
+            json.dumps({"reason_code": "SYNTHETIC-EXTERNAL-BLOCK", "gate": "D"}) + "\n",
+            encoding="utf-8",
+        )
     issues_file = work / "issues.json"
     issues_file.write_text(json.dumps(initial_issues), encoding="utf-8")
     comments_file = work / "comments.json"
@@ -358,3 +364,262 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     assert len(repeat["created"]) == 0
     assert len(repeat["updated"]) == 1
     assert len(repeat["issues"]) == 1
+
+
+# Architecture invariant (kodmial/aa#368): a bare workflow-step outcome is
+# never product evidence. Gate D workflow steps fail for infrastructure and
+# external reasons (missing test-bot secret, Telegram poller conflict, probe
+# crash before the single-owner emit) that carry no typed Gate FAIL entry.
+# Such failures must route to checkpoint recovery, never to product-code
+# mutation: every synthesized D:workflow-step-failed:workflow-step repair
+# issue is unfixable by construction and loops qualification forever. The
+# scenarios below use synthetic gate shapes only (no qualification prompts,
+# no corpus or user text).
+_D_BLOCKED_SUMMARY = _synthetic_summary(
+    [
+        {"gate": "A", "status": "PASS"},
+        {"gate": "B", "status": "PASS"},
+        {"gate": "C", "status": "PASS"},
+        {
+            "gate": "D",
+            "status": "BLOCKED",
+            "failure_category": "synthetic-external-block",
+            "component": "synthetic-readiness",
+            "latency_p50_ms": 0,
+            "latency_p95_ms": 0,
+            "max_turn_ms": 0,
+        },
+    ],
+    ["D"],
+    ["D:synthetic-external-block:synthetic-readiness"],
+    "D",
+)
+
+_D_STEP_FAILED_OUTCOMES = {
+    "GATE_A_OUTCOME": "success",
+    "GATE_B_OUTCOME": "success",
+    "GATE_C_OUTCOME": "success",
+    "GATE_D_OUTCOME": "failure",
+    "GATE_E_OUTCOME": "skipped",
+}
+
+
+def _assert_no_product_repair(payload: dict[str, Any]) -> None:
+    assert payload["created"] == []
+    assert payload["updated"] == []
+    assert payload["dispatched"] == 0
+
+
+def test_gate_d_workflow_step_blocked_routes_to_recovery_without_product_repair(
+    tmp_path: Path,
+) -> None:
+    """A Gate D step failure with only BLOCKED evidence mints no repair."""
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=_D_BLOCKED_SUMMARY,
+        gate_outcomes=dict(_D_STEP_FAILED_OUTCOMES),
+        failed_sha="b" * 40,
+        initial_issues=[],
+    )
+    _assert_no_product_repair(payload)
+
+
+def test_gate_d_workflow_step_transient_block_routes_to_recovery_without_product_repair(
+    tmp_path: Path,
+) -> None:
+    """A Gate D step failure with a transient marker mints no repair."""
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=_D_BLOCKED_SUMMARY,
+        gate_outcomes=dict(_D_STEP_FAILED_OUTCOMES),
+        failed_sha="c" * 40,
+        initial_issues=[],
+        transient_blocked=True,
+    )
+    _assert_no_product_repair(payload)
+
+
+def test_gate_d_missing_evidence_without_typed_fail_routes_to_recovery(
+    tmp_path: Path,
+) -> None:
+    """A Gate D step failure with no typed FAIL entry mints no repair.
+
+    This is the probe-crash-before-emit shape: Gate F can only synthesize a
+    BLOCKED evidence-invalid entry, which must not become a product defect.
+    """
+    missing_evidence = _synthetic_summary(
+        [
+            {"gate": "A", "status": "PASS"},
+            {"gate": "B", "status": "PASS"},
+            {"gate": "C", "status": "PASS"},
+            {
+                "gate": "D",
+                "status": "BLOCKED",
+                "failure_category": "evidence-invalid",
+                "component": "unknown",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+        ],
+        ["D"],
+        ["D:evidence-invalid:unknown"],
+        "D",
+    )
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=missing_evidence,
+        gate_outcomes=dict(_D_STEP_FAILED_OUTCOMES),
+        failed_sha="d" * 40,
+        initial_issues=[],
+    )
+    _assert_no_product_repair(payload)
+
+
+def test_gate_d_typed_fail_still_mints_typed_product_repair(tmp_path: Path) -> None:
+    """A Gate D step failure backed by typed FAIL evidence mints one repair."""
+    typed_fail = _synthetic_summary(
+        [
+            {
+                "gate": "D",
+                "status": "FAIL",
+                "failure_category": "synthetic-runtime-not-ready",
+                "component": "synthetic-readiness",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            }
+        ],
+        ["D"],
+        ["D:synthetic-runtime-not-ready:synthetic-readiness"],
+        "D",
+    )
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=typed_fail,
+        gate_outcomes=dict(_D_STEP_FAILED_OUTCOMES),
+        failed_sha="e" * 40,
+        initial_issues=[],
+    )
+    assert len(payload["created"]) == 1
+    body = str(payload["created"][0]["body"])
+    assert "Repair fingerprint: `D:synthetic-runtime-not-ready:synthetic-readiness`" in body
+    assert "workflow-step-failed" not in body
+    assert "workflow-step" not in body.split("Repair fingerprint:")[1].split("`")[1]
+
+
+def test_mixed_typed_and_workflow_step_failure_keeps_only_typed_scope(
+    tmp_path: Path,
+) -> None:
+    """A real typed defect beside a bare step failure repairs only the typed one."""
+    mixed = _synthetic_summary(
+        [
+            {
+                "gate": "C",
+                "status": "FAIL",
+                "failure_category": "synthetic-live-path",
+                "component": "synthetic-answer",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+            {
+                "gate": "D",
+                "status": "BLOCKED",
+                "failure_category": "synthetic-external-block",
+                "component": "synthetic-readiness",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+        ],
+        ["C", "D"],
+        [
+            "C:synthetic-live-path:synthetic-answer",
+            "D:synthetic-external-block:synthetic-readiness",
+        ],
+        "C",
+    )
+    outcomes = dict(_D_STEP_FAILED_OUTCOMES)
+    outcomes["GATE_C_OUTCOME"] = "failure"
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=mixed,
+        gate_outcomes=outcomes,
+        failed_sha="f" * 40,
+        initial_issues=[],
+    )
+    assert len(payload["created"]) == 1
+    body = str(payload["created"][0]["body"])
+    assert "Repair fingerprint: `C:synthetic-live-path:synthetic-answer`" in body
+    assert "workflow-step-failed" not in body
+    proven = body.split("All proven product failures: `")[1].split("`")[0]
+    assert "C:" in proven
+    assert "D:" not in proven
+
+
+def test_blocked_summary_without_workflow_failure_routes_to_recovery(
+    tmp_path: Path,
+) -> None:
+    """A BLOCKED verdict with no failed workflow gate mints no repair.
+
+    This is the diverged-checkpoint-resume shape: every gate step reports
+    success yet Gate F cannot validate one artifact. Recovery retries; no
+    product-code mutation follows.
+    """
+    outcomes = {
+        "GATE_A_OUTCOME": "success",
+        "GATE_B_OUTCOME": "success",
+        "GATE_C_OUTCOME": "success",
+        "GATE_D_OUTCOME": "success",
+        "GATE_E_OUTCOME": "success",
+    }
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=_D_BLOCKED_SUMMARY,
+        gate_outcomes=outcomes,
+        failed_sha="a" * 40,
+        initial_issues=[],
+    )
+    _assert_no_product_repair(payload)
+
+
+def test_transient_block_beside_typed_fail_still_mints_typed_repair(
+    tmp_path: Path,
+) -> None:
+    """A transient marker never suppresses a proven typed product defect."""
+    typed_fail = _synthetic_summary(
+        [
+            {
+                "gate": "C",
+                "status": "FAIL",
+                "failure_category": "synthetic-live-path",
+                "component": "synthetic-answer",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            }
+        ],
+        ["C"],
+        ["C:synthetic-live-path:synthetic-answer"],
+        "C",
+    )
+    outcomes = {
+        "GATE_A_OUTCOME": "success",
+        "GATE_B_OUTCOME": "success",
+        "GATE_C_OUTCOME": "failure",
+        "GATE_D_OUTCOME": "skipped",
+        "GATE_E_OUTCOME": "skipped",
+    }
+    payload = _run_publisher_scenario(
+        tmp_path,
+        summary_text=typed_fail,
+        gate_outcomes=outcomes,
+        failed_sha="9" * 40,
+        initial_issues=[],
+        transient_blocked=True,
+    )
+    assert len(payload["created"]) == 1
+    body = str(payload["created"][0]["body"])
+    assert "Repair fingerprint: `C:synthetic-live-path:synthetic-answer`" in body
+    assert payload["dispatched"] == 1

@@ -970,6 +970,12 @@ jobs:
             // A block-scoped const inside try caused ReferenceError before the
             // automatic P0 repair task could be published (run 38107901985).
             let failGates = new Set();
+            // Architecture invariant (kodmial/aa#368): whether the failed
+            // workflow gates carry typed Gate FAIL evidence. A bare
+            // workflow-step outcome without a typed FAIL entry is
+            // infrastructure/transient, never a product defect, so it must
+            // survive the parser try block for the post-parser routing below.
+            let hasTypedProductFail = false;
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
             let verifierLine = 'Verifier availability: unavailable.';
@@ -1030,6 +1036,43 @@ jobs:
                       g.failure_category
                     ),
                   }));
+              }
+
+              // Architecture invariant (kodmial/aa#368): a bare
+              // workflow-step outcome is never product evidence. The typed
+              // Gate F summary is the only authority for a product defect:
+              // only gates with a typed FAIL entry may enter a product repair
+              // fingerprint. Gates whose summary entry is BLOCKED (external
+              // secret/network/poller/transient), missing (probe crashed
+              // before the single-owner emit), or otherwise non-FAIL route to
+              // checkpoint recovery, never to product-code mutation. Without
+              // this, every Gate D infrastructure wobble synthesizes
+              // D:workflow-step-failed:workflow-step, a fingerprint no
+              // product-code patch can ever fix, looping qualification ->
+              // symptom patch -> merge -> qualification forever.
+              const typedFailByGate = new Map(
+                gates
+                  .filter(item => item && item.status === 'FAIL')
+                  .map(item => [String(item.gate || ''), item])
+              );
+              hasTypedProductFail = productFailures.some(item =>
+                typedFailByGate.has(String(item.gate || ''))
+              );
+              if (failedWorkflowGates.length && !hasTypedProductFail) {
+                core.notice(
+                  'Workflow step failure without typed Gate FAIL evidence is ' +
+                  'infrastructure/transient, not a product defect; no product ' +
+                  'repair is created (recovery resumes from checkpoints).'
+                );
+                return;
+              }
+              if (failedWorkflowGates.length) {
+                // Mixed case: keep only gates with typed FAIL evidence so a
+                // generic workflow-step entry can never join a product repair
+                // fingerprint alongside a real typed defect.
+                productFailures = productFailures.filter(item =>
+                  typedFailByGate.has(String(item.gate || ''))
+                );
               }
 
               const failed = productFailures[0] || (
@@ -1129,7 +1172,25 @@ jobs:
             } catch (error) {
               core.info('No per-stage live timing evidence yet: ' + error.message);
             }
-            if (transientBlocked && category === 'unknown-gate-failure') {
+            // Architecture invariant (kodmial/aa#368): without typed Gate
+            // FAIL evidence there is no product defect to repair. BLOCKED
+            // (missing secret, external network/poller conflict, transient,
+            // evidence-diverged checkpoint resume) routes to recovery, never
+            // to product-code mutation. The unknown-gate-failure fallback
+            // (unparseable/missing summary) keeps its historical behavior.
+            if (!hasTypedProductFail && category !== 'unknown-gate-failure') {
+              core.notice(
+                'No typed Gate FAIL evidence for the blocking gate; recovery ' +
+                'will retry qualification instead of opening product repair.'
+              );
+              return;
+            }
+            // Architecture invariant (kodmial/aa#368): an external/transient
+            // blocker without typed Gate FAIL evidence is recovery state, not
+            // a product defect. The bare unknown-gate-failure fallback and any
+            // generic workflow-step-failed entry (no typed FAIL behind it)
+            // must never mint a product repair issue.
+            if (transientBlocked && (category === 'unknown-gate-failure' || !hasTypedProductFail)) {
               core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
               return;
             }
