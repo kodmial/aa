@@ -823,6 +823,7 @@ def test_adapter_carries_no_semantic_policy() -> None:
     }
     assert defined <= {
         "OpenCodeChatModel",
+        "build_judge_model",
         "build_planner_model",
         "build_verifier_model",
         "render_messages_text",

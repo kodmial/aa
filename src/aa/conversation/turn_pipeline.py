@@ -189,6 +189,15 @@ TURN_END_TO_END_BUDGET_S = 105.0
 TURN_ANSWER_MIN_SLICE_S = 1.0
 TURN_VERIFIER_MIN_SLICE_S = 3.0
 
+# Internal substantive helpfulness gate (kodmial/aa#372): per-turn bound
+# on whole-turn judge invocations and per-call cap for one judge round.
+# The judge uses the fast structured channel (no extra retrieval or
+# verification round), so the bound only ever withholds an unhelpful
+# delivery in favor of the existing bounded regen/narrow/fail path;
+# Gate E latency is unchanged within one judge round.
+SUBSTANTIVE_JUDGE_MAX_CALLS = 3
+SUBSTANTIVE_JUDGE_CALL_CAP_S = 20.0
+
 
 def _diagnostic_no_turn_limits() -> bool:
     """Manual Telegram-only mode: let all AA stages finish without SLO cutoff."""
@@ -1957,6 +1966,120 @@ async def run_v2_answer_turn(
             telemetry=dict(telemetry),
         )
 
+    _substantive_judge_calls = 0
+    # Deterministic per-turn verdict cache (kodmial/aa#372): regen and
+    # narrowing frequently re-present byte-identical text. A cached
+    # verdict for the same normalized digest is reused without a new
+    # model call, so the common serve path costs exactly one judge
+    # round. Digests only, never text.
+    _judge_rejected_digests: set[str] = set()
+    _judge_approved_digests: set[str] = set()
+
+    async def _substantive_judge_rejects(candidate_text: str) -> bool:
+        """Whether the internal whole-turn judge rejects a substantive candidate.
+
+        Systemic repair (kodmial/aa#372): the verifier's per-unit
+        ``addresses_intent`` and the qualification judge's whole-turn
+        ``helpful`` are two independent model judgments that diverge
+        stochastically. Successive scenario families (background
+        restatement, greeting glue, irrelevant citation) each passed one
+        and failed the other, so prompt-wording alignment cannot
+        converge. The same judge invocation that live qualification runs
+        must therefore gate delivery on the production path.
+
+        Returns True only on an explicit available negative verdict
+        (helpful False or addresses_intent False). A missing judge
+        model, an exhausted per-turn call bound, a missing budget slice,
+        a call timeout, a transport outage, or an unavailable verdict
+        preserves the existing adequacy path (False): this gate only
+        ever withholds an unhelpful delivery in favor of the existing
+        bounded regen/narrow/fail path, never invents a success. No
+        prompt, reply, or evidence text enters telemetry; only the
+        boolean verdicts travel. Provider 429 and cancellation always
+        propagate for runner lifecycle recovery.
+        """
+        nonlocal _substantive_judge_calls
+        if whole_turn_judge_model is None:
+            return False
+        candidate = (candidate_text or "").strip()
+        if not candidate:
+            return False
+        try:
+            digest = safety_candidate_fingerprint(candidate)
+        except Exception:
+            digest = ""
+        if digest and digest in _judge_rejected_digests:
+            return True
+        if digest and digest in _judge_approved_digests:
+            return False
+        if _substantive_judge_calls >= SUBSTANTIVE_JUDGE_MAX_CALLS:
+            return False
+        remaining = _remaining_budget_s()
+        if remaining < TURN_VERIFIER_MIN_SLICE_S:
+            return False
+        _substantive_judge_calls += 1
+        try:
+            from aa.conversation.whole_turn_judge import (
+                JUDGE_INDEPENDENCE_LIMITATION as _JUDGE_LIMIT,
+            )
+            from aa.conversation.whole_turn_judge import judge_whole_turn as _judge_turn
+            from aa.opencode.errors import OpenCodeRateLimitError as _JudgeRateLimit
+        except Exception:
+            return False
+        telemetry["judge_independence_limitation"] = _JUDGE_LIMIT
+        cap = min(max(0.0, remaining), SUBSTANTIVE_JUDGE_CALL_CAP_S)
+        if cap <= 0:
+            return False
+        try:
+            judgement = await asyncio.wait_for(
+                _judge_turn(
+                    resolved_intent=_resolved_request,
+                    reply=candidate,
+                    context=_conversation_context,
+                    model=whole_turn_judge_model,
+                ),
+                timeout=cap,
+            )
+        except _JudgeRateLimit:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info(
+                "v2 substantive judge unavailable; adequacy path preserved",
+                extra={"category": type(exc).__name__},
+            )
+            return False
+        try:
+            available = bool(getattr(judgement, "available", False))
+            helpful = bool(getattr(judgement, "helpful", False))
+            addresses = bool(getattr(judgement, "addresses_intent", False))
+            substantive = bool(getattr(judgement, "contains_substantive_claim", False))
+        except Exception:
+            return False
+        telemetry["independent_judge_helpful"] = helpful
+        telemetry["independent_judge_addresses_intent"] = addresses
+        telemetry["independent_judge_substantive"] = substantive
+        if not available:
+            return False
+        if digest:
+            if helpful and addresses:
+                _judge_approved_digests.add(digest)
+                return False
+            _judge_rejected_digests.add(digest)
+            logger.info(
+                "v2 substantive candidate withheld by whole-turn judge",
+                extra={"category": "substantive-judge-reject"},
+            )
+            return True
+        if helpful and addresses:
+            return False
+        logger.info(
+            "v2 substantive candidate withheld by whole-turn judge",
+            extra={"category": "substantive-judge-reject"},
+        )
+        return True
+
     telemetry["answer_outcome"] = "draft-ok"
     verifier_slice = _verifier_round_budget()
     if verifier_slice is not None and verifier_slice < TURN_VERIFIER_MIN_SLICE_S:
@@ -2540,7 +2663,30 @@ async def run_v2_answer_turn(
             reply_text=current_draft,
             verification_state=grounding_result_to_state(result),
         )
-        if _adequacy_now.substantive_request and _adequacy_now.verdict == _ADEQ_FAIL and pack:
+        # Systemic gate (kodmial/aa#372): an adequacy PASS whose whole
+        # reply the independent judge finds unhelpful regenerates instead
+        # of serving verifier-passing but unhelpful text. Glue turns keep
+        # their dedicated judge guard above; this covers substantive
+        # delivery only.
+        _judge_demands_regen = False
+        if (
+            _adequacy_now.substantive_request
+            and _adequacy_now.verdict == _ADEQ_PASS
+            and pack
+            and not _proven_glue
+            and whole_turn_judge_model is not None
+        ):
+            _judge_demands_regen = await _substantive_judge_rejects(current_draft)
+            if (
+                _judge_demands_regen
+                and not str(telemetry.get("failure_category", "") or "").strip()
+            ):
+                telemetry["failure_category"] = _FAIL_REPAIR
+        if (
+            _adequacy_now.substantive_request
+            and (_adequacy_now.verdict == _ADEQ_FAIL or _judge_demands_regen)
+            and pack
+        ):
             _regen_prompt = anchored_adequacy_regen_prompt(_resolved_request)
             _regen_units: list[ResponseUnitDraft] = []
             _regen_result: GroundingResult | None = None
@@ -2566,7 +2712,14 @@ async def run_v2_answer_turn(
                             verification_state=_regen_state,
                             verifier_outcome="passed",
                         )
+                        # Systemic gate (kodmial/aa#372): a regenerated
+                        # draft that passes adequacy but fails the
+                        # independent judge falls through to narrowing
+                        # instead of serving as a verified success.
+                        _regen_judge_rejects = False
                         if _regen_adequacy.verdict == _ADEQ_PASS:
+                            _regen_judge_rejects = await _substantive_judge_rejects(_regen_draft)
+                        if _regen_adequacy.verdict == _ADEQ_PASS and not _regen_judge_rejects:
                             current_draft = _regen_draft
                             units, result, passed = _regen_units, _regen_result, True
                             telemetry["verifier_outcome"] = "passed-after-adequacy-repair"
@@ -2635,7 +2788,15 @@ async def run_v2_answer_turn(
                                         verification_state=_rn_state,
                                         verifier_outcome="passed",
                                     )
+                                    # Systemic gate (kodmial/aa#372): a
+                                    # narrowed subset the judge still finds
+                                    # unhelpful is not served as success.
+                                    _rn_judge_rejects = False
                                     if _rn_adequacy.verdict == _ADEQ_PASS:
+                                        _rn_judge_rejects = await _substantive_judge_rejects(
+                                            _regen_narrowed
+                                        )
+                                    if _rn_adequacy.verdict == _ADEQ_PASS and not _rn_judge_rejects:
                                         telemetry["answer_outcome"] = "narrowed-adequacy-regen"
                                         telemetry["outbound_safety"] = "pass"
                                         telemetry["verifier_unavailable_units"] = 0
@@ -2712,7 +2873,15 @@ async def run_v2_answer_turn(
                                     verification_state=_pn_state,
                                     verifier_outcome="passed",
                                 )
+                                # Systemic gate (kodmial/aa#372): same
+                                # whole-turn check before serving the
+                                # partial narrowed subset.
+                                _pn_judge_rejects = False
                                 if _pn_adequacy.verdict == _ADEQ_PASS:
+                                    _pn_judge_rejects = await _substantive_judge_rejects(
+                                        _part_narrowed
+                                    )
+                                if _pn_adequacy.verdict == _ADEQ_PASS and not _pn_judge_rejects:
                                     telemetry["answer_outcome"] = "narrowed-adequacy-regen"
                                     telemetry["outbound_safety"] = "pass"
                                     telemetry["verifier_unavailable_units"] = 0
@@ -2788,7 +2957,15 @@ async def run_v2_answer_turn(
                             verification_state=_narrow_state,
                             verifier_outcome="passed",
                         )
+                        # Systemic gate (kodmial/aa#372): same
+                        # whole-turn check before serving the narrowed
+                        # current-draft subset.
+                        _narrow_judge_rejects = False
                         if _narrow_adequacy.verdict == _ADEQ_PASS:
+                            _narrow_judge_rejects = await _substantive_judge_rejects(
+                                _narrowed_candidate
+                            )
+                        if _narrow_adequacy.verdict == _ADEQ_PASS and not _narrow_judge_rejects:
                             telemetry["answer_outcome"] = "narrowed-adequacy"
                             telemetry["outbound_safety"] = "pass"
                             _record_adequacy(
@@ -3298,10 +3475,31 @@ async def run_v2_answer_turn(
                     reply_text=str(recovered["text"]),
                     verification_state=_safe_state,
                 )
-                if not _proven_glue and telemetry.get("adequacy_verdict") == _ADEQ_FAIL:
+                # Systemic gate (kodmial/aa#372): a safe adequate
+                # recovery the independent judge still finds unhelpful
+                # falls through to safety-blocked instead of serving.
+                _recovery_judge_rejects = False
+                if (
+                    not _proven_glue
+                    and telemetry.get("adequacy_verdict") == _ADEQ_PASS
+                    and whole_turn_judge_model is not None
+                ):
+                    _recovery_judge_rejects = await _substantive_judge_rejects(
+                        str(recovered["text"])
+                    )
+                if not _proven_glue and (
+                    telemetry.get("adequacy_verdict") == _ADEQ_FAIL or _recovery_judge_rejects
+                ):
                     # A safe but inadequate recovery is no certified help:
                     # fall through to the transparent safety-blocked reply
                     # instead of serving it as success.
+                    if _recovery_judge_rejects:
+                        telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                        if not str(telemetry.get("failure_category", "") or "").strip():
+                            telemetry["failure_category"] = _FAIL_REPAIR
+                        telemetry["answers_request"] = False
+                        telemetry["technically_grounded"] = False
+                        telemetry["qualified"] = False
                     pass
                 else:
                     telemetry["outbound_safety"] = "repaired"
@@ -3332,7 +3530,20 @@ async def run_v2_answer_turn(
         # as a helpful success.
         _served_state = grounding_result_to_state(result)
         _record_adequacy(reply_text=final, verification_state=_served_state)
-        if not _proven_glue and telemetry.get("adequacy_verdict") == _ADEQ_FAIL:
+        # Systemic gate (kodmial/aa#372): the final served candidate is
+        # judged exactly as live qualification judges it. An explicit
+        # negative fails the turn instead of delivering
+        # verifier-passing but unhelpful text as a qualified success.
+        _served_judge_rejects = False
+        if (
+            not _proven_glue
+            and telemetry.get("adequacy_verdict") == _ADEQ_PASS
+            and whole_turn_judge_model is not None
+        ):
+            _served_judge_rejects = await _substantive_judge_rejects(final)
+        if not _proven_glue and (
+            telemetry.get("adequacy_verdict") == _ADEQ_FAIL or _served_judge_rejects
+        ):
             telemetry["answer_outcome"] = "adequacy-failed"
             if not str(telemetry.get("failure_category", "") or "").strip():
                 telemetry["failure_category"] = _FAIL_REPAIR

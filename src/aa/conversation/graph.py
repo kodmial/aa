@@ -465,6 +465,7 @@ def build_turn_graph(
     retrieval_config: Any = None,
     answer_model: Runnable[list[BaseMessage], BaseMessage] | Any | None = None,
     verifier_model: Any | None = None,
+    whole_turn_judge_model: Any | None = None,
 ) -> CompiledStateGraph[TurnState, None, TurnState, TurnState]:
     """Compile the v2 turn graph with managed checkpointing.
 
@@ -484,7 +485,10 @@ def build_turn_graph(
     when both are given, an ``answer`` node runs AA generation,
     claim-level verification, bounded targeted repair, and the #83
     envelope after retrieval. When omitted, the graph keeps its
-    planner-to-retrieval semantics for unit tests.
+    planner-to-retrieval semantics for unit tests. ``whole_turn_judge_model``
+    (optional) binds the independent whole-turn helpfulness judge used
+    as the internal substantive delivery gate; when omitted, the
+    historical adequacy-only path is preserved.
     """
     resolved_config = memory_config or default_memory_config()
     resolved_summary = summary_model if summary_model is not None else planner_model
@@ -538,6 +542,7 @@ def build_turn_graph(
                 planner_model=planner_model,
                 retrieval_index=retrieval_index,
                 retrieval_config=retrieval_config,
+                whole_turn_judge_model=whole_turn_judge_model,
             )
 
         from aa.conversation.finalization import finalize_answer_node as _finalize

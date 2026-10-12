@@ -1037,6 +1037,41 @@ def build_planner_model(
     )
 
 
+def build_judge_model(
+    client: OpenCodeClient,
+    *,
+    primary_model: str,
+    request_timeout: float = 120.0,
+) -> OpenCodeChatModel:
+    """Build the independent whole-turn helpfulness judge (kodmial/aa#372).
+
+    Architecture-level repair for the recurrent Gate C divergence where a
+    verifier-passing draft fails the independent qualification judge:
+    production never enforced the judge's helpfulness standard internally
+    (the production graph never constructed this model), so every
+    wording-level alignment of verifier/answer prompts drifted again on
+    the next scenario family. The judge shares the configured provider
+    family (explicit limitation, surfaced in telemetry by callers) but
+    keeps a distinct audit identity and fresh ephemeral sessions per
+    call, exactly like the qualification control. The fallback stays
+    empty and the transport selector is omitted, mirroring the
+    verifier's minimum-capability policy so a weaker model can never
+    fabricate a semantic negative.
+    """
+    from aa.config import DEFAULT_PRIMARY_MODEL
+    from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
+
+    pinned = (primary_model or "").strip() or DEFAULT_PRIMARY_MODEL
+    return OpenCodeChatModel(
+        client,
+        agent=WHOLE_TURN_JUDGE_AGENT_V2,
+        primary_model=pinned,
+        fallback_model="",
+        request_timeout=request_timeout,
+        transport_agent="",
+    )
+
+
 def build_verifier_model(
     client: OpenCodeClient,
     *,
@@ -1078,6 +1113,7 @@ __all__ = [
     "VERIFIER_AGENT_V2",
     "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
+    "build_judge_model",
     "build_planner_model",
     "build_verifier_model",
     "clear_omitted_structured_cache",
