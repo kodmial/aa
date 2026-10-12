@@ -361,7 +361,9 @@ PLANNER_TEXT_JSON_SUFFIX = (
     '{"mode": "conversational"|"retrieval", '
     '"resolved_intent": string, "queries": array of strings}. '
     'Use {"mode": "conversational", "resolved_intent": "", "queries": []} '
-    "only for purely conversational turns; otherwise return "
+    "only for purely conversational turns; a greeting opener plus a substantive "
+    "request is retrieval, never conversational, with the intent and queries "
+    "focused on the substantive request; otherwise return "
     '{"mode": "retrieval", "resolved_intent": standalone intent, '
     '"queries": 1 to 16 distinct useful Russian search queries '
     "(as many as genuinely help, never padded)}. "
