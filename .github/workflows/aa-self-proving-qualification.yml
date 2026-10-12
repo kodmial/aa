@@ -962,6 +962,10 @@ jobs:
             let blocking = 'unknown';
             let component = 'unknown';
             let productFailures = [];
+            // Gate F details must survive beyond the summary-parser try block:
+            // the repair issue is constructed later in this same function.
+            let typedFailedGates = [];
+            let typedRoots = [];
             // Used both inside the evidence parser and in recurrence routing.
             // A block-scoped const inside try caused ReferenceError before the
             // automatic P0 repair task could be published (run 38107901985).
@@ -1035,10 +1039,10 @@ jobs:
               // Gate F reducer publishes ALL independently failed gates plus
               // typed root components. Automated repair consumes this list,
               // never the alphabetical-first blocking gate alone.
-              const typedFailedGates = Array.isArray(summary.failed_gates)
+              typedFailedGates = Array.isArray(summary.failed_gates)
                 ? summary.failed_gates.map(gate => String(gate || '')).filter(Boolean)
                 : [];
-              const typedRoots = Array.isArray(summary.root_components)
+              typedRoots = Array.isArray(summary.root_components)
                 ? summary.root_components.map(root => String(root || '')).filter(Boolean)
                 : [];
               blocking = (failed && failed.gate) || summary.blocking_gate || blocking;
