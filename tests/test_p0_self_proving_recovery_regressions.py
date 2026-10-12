@@ -121,6 +121,7 @@ def _run_publisher_scenario(
     gate_outcomes: dict[str, str],
     failed_sha: str,
     initial_issues: list[dict[str, Any]],
+    transient: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -133,6 +134,11 @@ def _run_publisher_scenario(
     out_dir.mkdir(parents=True)
     if summary_text is not None:
         (out_dir / "self-proving-summary.json").write_text(summary_text, encoding="utf-8")
+    if transient:
+        (out_dir / "transient-blocked.json").write_text(
+            json.dumps({"reason_code": "EXTERNAL_TEST_BOT_UNAVAILABLE", "gate": "D"}),
+            encoding="utf-8",
+        )
     issues_file = work / "issues.json"
     issues_file.write_text(json.dumps(initial_issues), encoding="utf-8")
     comments_file = work / "comments.json"
@@ -358,3 +364,116 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     assert len(repeat["created"]) == 0
     assert len(repeat["updated"]) == 1
     assert len(repeat["issues"]) == 1
+
+
+def test_transient_block_without_product_fail_routes_to_recovery(
+    tmp_path: Path,
+) -> None:
+    """P0 kodmial/aa#367: a concrete external BLOCKED mints no product P0.
+
+    Proven failure on exact main 4c86dac (run 38250583756, attempt 2): only
+    the Gate D workflow step failed (EXTERNAL_TEST_BOT_UNAVAILABLE) while
+    the Gate C/E FAIL evidences were reused via checkpoint resume, so the
+    workflow-driven failure set held no summary FAIL. The publisher still
+    minted the generic D:workflow-step-failed product repair issue instead
+    of letting the recovery controller rerun the failed jobs.
+    """
+    failed_sha = "a" * 40
+    summary = _synthetic_summary(
+        [
+            {
+                "gate": "A",
+                "status": "PASS",
+                "failure_category": "",
+                "component": "",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+            {
+                "gate": "B",
+                "status": "PASS",
+                "failure_category": "",
+                "component": "",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+            {
+                "gate": "C",
+                "status": "FAIL",
+                "failure_category": "synthetic-live-path",
+                "component": "synthetic-answer",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+            {
+                "gate": "D",
+                "status": "BLOCKED",
+                "failure_category": "test-bot-unavailable",
+                "component": "telegram-readiness",
+                "latency_p50_ms": 0,
+                "latency_p95_ms": 0,
+                "max_turn_ms": 0,
+            },
+            {
+                "gate": "E",
+                "status": "FAIL",
+                "failure_category": "synthetic-slo",
+                "component": "synthetic-slo",
+                "latency_p50_ms": 99000,
+                "latency_p95_ms": 108000,
+                "max_turn_ms": 124000,
+            },
+        ],
+        ["C", "D", "E"],
+        [
+            "C:synthetic-live-path:synthetic-answer",
+            "D:test-bot-unavailable:telegram-readiness",
+            "E:synthetic-slo:synthetic-slo",
+        ],
+        "C",
+    )
+    # Only Gate D failed at the workflow level (C/E reused via resume):
+    # no summary FAIL in the driven set, so recovery owns the retry and no
+    # product issue is minted, without ReferenceError.
+    only_d = _run_publisher_scenario(
+        tmp_path,
+        summary_text=summary,
+        gate_outcomes={
+            "GATE_A_OUTCOME": "success",
+            "GATE_B_OUTCOME": "success",
+            "GATE_C_OUTCOME": "success",
+            "GATE_D_OUTCOME": "failure",
+            "GATE_E_OUTCOME": "success",
+        },
+        failed_sha=failed_sha,
+        initial_issues=[],
+        transient=True,
+    )
+    assert len(only_d["created"]) == 0
+    assert len(only_d["updated"]) == 0
+
+    # A real product FAIL alongside the transient BLOCKED still drives
+    # product repair (recovery does not hide proven product defects).
+    mixed_outcomes = {
+        "GATE_A_OUTCOME": "success",
+        "GATE_B_OUTCOME": "success",
+        "GATE_C_OUTCOME": "failure",
+        "GATE_D_OUTCOME": "failure",
+        "GATE_E_OUTCOME": "success",
+    }
+    mixed = _run_publisher_scenario(
+        tmp_path,
+        summary_text=summary,
+        gate_outcomes=mixed_outcomes,
+        failed_sha=failed_sha,
+        initial_issues=[],
+        transient=True,
+    )
+    assert len(mixed["created"]) == 1
+    mixed_body = str(mixed["created"][0]["body"])
+    proven = mixed_body.split("All proven product failures: `")[1].split("`")[0]
+    assert "C:synthetic-live-path:synthetic-answer" in proven
+    assert "D:test-bot-unavailable:telegram-readiness" in proven

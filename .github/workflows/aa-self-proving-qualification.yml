@@ -374,6 +374,23 @@ jobs:
             echo "Gate D validated checkpoint present; skipping (resume)."
             exit 0
           fi
+          # Concrete Gate D evidence on every exit path (kodmial/aa#367):
+          # early blocker exits below (missing test-bot identity, getMe
+          # failure, probe conflict/429/startup failure) must still publish
+          # the ONE typed gate-D-evidence.json with its concrete
+          # telegram-readiness category. Otherwise Gate F synthesizes the
+          # generic D:evidence-invalid:unknown and the repair publisher
+          # flattens the BLOCKED into D:workflow-step-failed:workflow-step.
+          # The emit only reduces the durable marker/timings (or the
+          # read-only identity state); it never starts a second poller.
+          # Its own exit code is ignored so the original blocker code
+          # (78 transient / 75 runner-retire) is preserved for recovery.
+          emit_gate_d() {
+            python scripts/run_self_proving_qualification.py \
+              --main-sha "${{ steps.sha.outputs.sha }}" \
+              --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+              --checkpoint-dir "$CKPT_DIR" --emit-gate D || true
+          }
           # Real Telegram Bot API identity, startup/health, polling/webhook
           # ownership, callback/button readiness (issue #340, Gate D only).
           # Safe isolation: prefer the dedicated test bot identity
@@ -409,6 +426,7 @@ jobs:
             echo "::error::Gate D BLOCKED: no isolated test bot and no production lease (EXTERNAL_TEST_BOT_UNAVAILABLE)."
             mkdir -p self-proving-out
             printf '{"reason_code":"EXTERNAL_TEST_BOT_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
+            emit_gate_d
             exit 78
           fi
           if [[ -n "${AA_TEST_TELEGRAM_BOT_ID:-}" ]]; then
@@ -432,8 +450,10 @@ jobs:
             echo "::error::Gate D BLOCKED: Telegram getMe failed (http=$code)."
             mkdir -p self-proving-out
             printf '{"reason_code":"EXTERNAL_TELEGRAM_GETME","gate":"D","http":"%s"}\n' "$code" > self-proving-out/transient-blocked.json
+            emit_gate_d
             exit 78
           done
+          set +e
           python - <<'PY'
           import json
           import os
@@ -447,6 +467,13 @@ jobs:
               )
           print("Telegram getMe readiness: OK")
           PY
+          getme_rc=$?
+          set -e
+          if [[ "$getme_rc" -ne 0 ]]; then
+            emit_gate_d
+            exit "$getme_rc"
+          fi
+          set +e
           python - <<'PY'
           import asyncio
           import json
@@ -634,6 +661,17 @@ jobs:
 
           asyncio.run(_probe())
           PY
+          probe_rc=$?
+          set -e
+          if [[ "$probe_rc" -ne 0 ]]; then
+            # 75 retires the runner (429 recovery resumes from checkpoints);
+            # 78 is an external/transient blocker (recovery reruns failed
+            # jobs); any other code is a real readiness failure. All three
+            # now carry typed evidence (emitted here) instead of a generic
+            # missing-artifact synthesis downstream.
+            emit_gate_d
+            exit "$probe_rc"
+          fi
           # Gate D single owner (kodmial/aa#342): the probe above owned the
           # one live poller; the emit below only reduces its durable marker
           # plus timings into the ONE authoritative gate-D-evidence.json.
@@ -970,6 +1008,12 @@ jobs:
             // A block-scoped const inside try caused ReferenceError before the
             // automatic P0 repair task could be published (run 38107901985).
             let failGates = new Set();
+            // Whether any workflow failure maps to a real summary FAIL
+            // (kodmial/aa#367): computed inside the parser where `gates`
+            // is visible, consumed after the catch for transient routing.
+            // A direct `gates` reference outside try is the same
+            // ReferenceError class as run 38107901985.
+            let hasProductFail = false;
             let timingLine = 'Timings: unavailable in self-proving summary.';
             let stageTimingLine = 'Stage timings: unavailable.';
             let verifierLine = 'Verifier availability: unavailable.';
@@ -1001,8 +1045,14 @@ jobs:
               // as the blocker when an earlier workflow gate actually failed.
               if (failedWorkflowGates.length) {
                 productFailures = failedWorkflowGates.map(gate => {
+                  // Concrete verdicts survive (kodmial/aa#367): match any
+                  // non-PASS summary entry so a concrete BLOCKED (e.g. Gate
+                  // D test-bot-unavailable) is never flattened to the
+                  // generic workflow-step-failed fallback. Truly missing
+                  // entries still fall back below.
                   const fromSummary = gates.find(
-                    item => item && String(item.gate || '') === gate && item.status === 'FAIL'
+                    item => item && String(item.gate || '') === gate
+                      && String(item.status || '') !== 'PASS'
                   );
                   return {
                     gate,
@@ -1022,7 +1072,7 @@ jobs:
                 });
               } else {
                 productFailures = gates
-                  .filter(g => g && g.status === 'FAIL')
+                  .filter(g => g && String(g.status || '') !== 'PASS')
                   .map(g => ({
                     ...g,
                     failure_category: normalizedFailureCategory(
@@ -1064,6 +1114,10 @@ jobs:
                 }
               }
               failGates = new Set(productFailures.map(g => String(g.gate || '')));
+              hasProductFail = productFailures.some(entry => gates.some(
+                item => item && String(item.gate || '') === String(entry.gate || '')
+                  && String(item.status || '') === 'FAIL'
+              ));
               if (failGates.has('C') && failGates.has('E')) {
                 repairFocus = '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.';
               } else if (blocking === 'E') {
@@ -1129,7 +1183,17 @@ jobs:
             } catch (error) {
               core.info('No per-stage live timing evidence yet: ' + error.message);
             }
-            if (transientBlocked && category === 'unknown-gate-failure') {
+            // External/transient blockers are recovery states, not
+            // product-code repair issues (kodmial/aa#367). The previous
+            // check only matched the fully-unknown category, so a concrete
+            // external BLOCKED (e.g. Gate D test-bot-unavailable with typed
+            // evidence) still minted a generic D:workflow-step-failed
+            // product P0. Return whenever the transient marker is present
+            // and no workflow failure maps to a real summary FAIL; the
+            // recovery controller reruns the failed jobs from the persisted
+            // gate checkpoints. Runs with at least one real product FAIL
+            // still proceed to product repair below.
+            if (transientBlocked && !hasProductFail) {
               core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
               return;
             }
