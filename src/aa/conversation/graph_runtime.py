@@ -270,10 +270,62 @@ class GraphTurnRuntime:
 
             if isinstance(exc, _TurnRateLimit):
                 raise
+            # Production/qualification delivery contract (kodmial/aa#358):
+            # a typed unsuccessful turn (TurnFailed) already carries a
+            # privacy-safe stage snapshot (counts/outcomes/latencies only).
+            # Preserve it as this thread's last telemetry instead of
+            # leaving an empty snapshot: qualification must attribute the
+            # delivered service-error text to its concrete broken stage
+            # (planner/retrieval/answer/verifier) instead of reporting a
+            # generic missing-turn-telemetry. The turn still fails as a
+            # typed GraphRuntimeError so the application serves the marked
+            # service error, never synthetic conversation.
+            try:
+                from aa.conversation.failures import TurnFailed as _TurnFailed
+
+                _failed: Any | None = None
+                if isinstance(exc, _TurnFailed):
+                    _failed = exc
+                else:
+                    for _chained in (
+                        getattr(exc, "__cause__", None),
+                        getattr(exc, "__context__", None),
+                    ):
+                        if isinstance(_chained, _TurnFailed):
+                            _failed = _chained
+                            break
+                if _failed is not None:
+                    try:
+                        failed_telemetry = dict(_failed.telemetry or {})
+                    except Exception:
+                        failed_telemetry = {}
+                    if failed_telemetry:
+                        try:
+                            self._last_telemetry[thread] = dict(failed_telemetry)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self._last_telemetry[thread] = {
+                                "failure_category": str(_failed.category or "turn-failed"),
+                                "answer_outcome": "failed",
+                            }
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             raise GraphRuntimeError("graph-failed", type(exc).__name__) from exc
         elapsed_ms = (_time.perf_counter() - started) * 1000.0
         final_raw = result.get("final_response", "") or result.get("draft_response", "")
         if not isinstance(final_raw, str) or not final_raw.strip():
+            try:
+                _retry = result.get("retry_state", {})
+                _retry_d = dict(_retry) if isinstance(_retry, dict) else {}
+                _turn_tel = _retry_d.get("turn_telemetry", {})
+                if isinstance(_turn_tel, dict) and _turn_tel:
+                    self._last_telemetry[thread] = dict(_turn_tel)
+            except Exception:
+                pass
             raise GraphRuntimeError("empty-reply", "graph returned no text")
         # Single delivery gate enforcement (kodmial/aa#304): the compiled
         # graph must certify the exact normalized text against the exact
@@ -321,6 +373,14 @@ class GraphTurnRuntime:
                 )
                 return final
             if not isinstance(candidate_raw, dict) or not isinstance(certificate_raw, dict):
+                try:
+                    _retry = result.get("retry_state", {})
+                    _retry_d = dict(_retry) if isinstance(_retry, dict) else {}
+                    _turn_tel = _retry_d.get("turn_telemetry", {})
+                    if isinstance(_turn_tel, dict) and _turn_tel:
+                        self._last_telemetry[thread] = dict(_turn_tel)
+                except Exception:
+                    pass
                 raise GraphRuntimeError("uncertified-reply", "missing delivery certificate")
             candidate = _Candidate.model_validate(candidate_raw)
             certificate = _Certificate.model_validate(certificate_raw)
@@ -334,6 +394,14 @@ class GraphTurnRuntime:
             # The graph's final_response must be the certified text exactly;
             # a borrowed verdict for mutated text fails closed here.
             if _normalize(final_raw) != candidate.text or final_raw != candidate.text:
+                try:
+                    _retry = result.get("retry_state", {})
+                    _retry_d = dict(_retry) if isinstance(_retry, dict) else {}
+                    _turn_tel = _retry_d.get("turn_telemetry", {})
+                    if isinstance(_turn_tel, dict) and _turn_tel:
+                        self._last_telemetry[thread] = dict(_turn_tel)
+                except Exception:
+                    pass
                 raise GraphRuntimeError(
                     "stale-certificate", "final text mutated after certification"
                 )
@@ -352,8 +420,27 @@ class GraphTurnRuntime:
             except Exception:
                 pass
         except GraphRuntimeError:
+            # Preserve the stage snapshot for certification-gate failures
+            # as well: the delivered service-error text must still carry
+            # its concrete pipeline telemetry for qualification.
+            try:
+                _retry = result.get("retry_state", {})
+                _retry_d = dict(_retry) if isinstance(_retry, dict) else {}
+                _turn_tel = _retry_d.get("turn_telemetry", {})
+                if isinstance(_turn_tel, dict) and _turn_tel and thread not in self._last_telemetry:
+                    self._last_telemetry[thread] = dict(_turn_tel)
+            except Exception:
+                pass
             raise
         except Exception as exc:
+            try:
+                _retry = result.get("retry_state", {})
+                _retry_d = dict(_retry) if isinstance(_retry, dict) else {}
+                _turn_tel = _retry_d.get("turn_telemetry", {})
+                if isinstance(_turn_tel, dict) and _turn_tel and thread not in self._last_telemetry:
+                    self._last_telemetry[thread] = dict(_turn_tel)
+            except Exception:
+                pass
             raise GraphRuntimeError("uncertified-reply", type(exc).__name__) from exc
         self._record_stage_telemetry(thread, result, elapsed_ms, len(final))
         logger.info(
