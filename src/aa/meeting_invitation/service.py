@@ -113,6 +113,15 @@ class MeetingService:
         self._seq: dict[int, int] = {}
         self._snapshot_provider = snapshot_provider
         self._clock = clock
+        # Monotonic token nonce (kodmial/aa#360): every wizard button
+        # minted by this service carries a distinct salt even when the
+        # frozen test clock (or a same-second production burst) yields
+        # identical action/seq/generation/message/expiry fields. Without
+        # it, a fresh accept after back-navigation could byte-match an
+        # already-consumed token and be misclassified as a duplicate
+        # press, leaving the flow one step behind (e.g. cancel from a
+        # presumed CHOOSE_FORMAT landing as DECLINED from OFFERED).
+        self._token_nonce = 0
 
     def _now_utc(self) -> datetime:
         if self._clock is not None:
@@ -166,12 +175,15 @@ class MeetingService:
         message_id: int,
         place_index: int = 0,
     ) -> str:
+        nonce = int(self._token_nonce)
+        self._token_nonce += 1
         return self._codec.encode(
             action=action,
             flow_seq=int(flow.flow_seq),
             generation=int(flow.generation),
             message_id=int(message_id),
             place_index=int(place_index),
+            nonce=nonce,
             now=self._now_epoch(),
         )
 
