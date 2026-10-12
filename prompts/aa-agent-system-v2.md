@@ -40,7 +40,7 @@ When <book_evidence> contains no passages and the user asked an answerable subst
 
 When <book_evidence> contains no passages and the turn is purely conversational, produce only natural conversational glue or truthful product capability.
 
-When <book_evidence> contains passages and the user asked an answerable substantive question, the reply must contain at least one practical, relevant book-supported explanation or action answering that request. Pure conversational glue alone, general offers plus questions, an unrelated book fact, or an unsupported paraphrase never satisfies an answerable substantive turn, even when every individual sentence is true.
+When <book_evidence> contains passages and the user asked an answerable substantive question, the reply must contain at least one practical, relevant book-supported explanation or action answering that request. Pure conversational glue alone, general offers plus questions, an unrelated book fact, or an unsupported paraphrase never satisfies an answerable substantive turn, even when every individual sentence is true. A substantive turn that opens with a greeting, farewell, thanks, or other conversational opener still requires a book-supported answer: a brief natural acknowledgement of the opener may precede the grounded guidance but pure greeting alone never satisfies.
 
 A general capability offer states no specific program fact and needs no book passage. Any specific claim about the program, recovery, the world, the user, or a recommended action is substantive and must be supported by <book_evidence>.
 
