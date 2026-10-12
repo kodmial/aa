@@ -1895,6 +1895,152 @@ async def run_v2_answer_turn(
                 telemetry["verifier_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
             )
 
+    # Architecture-level conversational fast-path (kodmial/aa#377
+    # systemic recurrence 1 for
+    # ``C:live-meta-direct-1:live-production-path`` on exact main
+    # db14541 run 38297999328 with repair_turns=6, repair_rounds=6,
+    # answer_rounds=32, budget_exceeded=5, clarifications=13 and two
+    # turns with unavailable verifier units): every planner-certified
+    # conversational turn previously paid the full substantive cost
+    # first -- one answer draft with an empty Evidence Pack plus one
+    # full per-unit verifier round -- and only then fell back to a
+    # model-composed dialogue reply. That sequential draft+verify
+    # sequence burns the shared answer/verifier budget on turns that
+    # need no book evidence, exposes them to verifier transport
+    # outages and turn-budget expiry, and converts a direct natural
+    # meta reply into a clarification/retry that Gate C counts as
+    # live-meta-direct failure while clean siblings pass, moving the
+    # same fingerprint across SHAs and paraphrases. Certification
+    # patches (#362 telemetry, #290 unavailable narrowing) cannot
+    # converge while the mechanism still routes glue through the
+    # substantive pipeline. A planner-certified conversational turn
+    # therefore serves exactly one model-composed dialogue reply
+    # directly, with no draft, no verifier round, no repair loop and
+    # no extra judge round beyond the misclassification overturn
+    # guard. Generic schema signal only (conversational mode with
+    # zero queries, legitimate-glue reason, empty pack); no text,
+    # keyword, stem, step-number, token-overlap or exact-question
+    # branching. The live production graph always supplies the
+    # separately instantiated whole-turn judge, so the overturn guard
+    # below runs there; judge-less direct callers keep the historical
+    # draft+verify path so no misclassification signal is weakened.
+    if (
+        _proven_glue
+        and not pack
+        and _effective_reason == "legitimate-glue"
+        and whole_turn_judge_model is not None
+    ):
+        if _remaining_budget_s() < TURN_ANSWER_MIN_SLICE_S:
+            _mark_turn_budget_exceeded()
+            telemetry["answer_outcome"] = "retry-turn-budget"
+            telemetry["verifier_outcome"] = "skipped-turn-budget"
+            _finish_telemetry()
+            raise TurnFailed(
+                "turn-budget-exceeded",
+                "end-to-end budget spent before conversational reply",
+                telemetry=dict(telemetry),
+            )
+        _fast_dialogue = await generate_dialogue_reply(
+            user_message=user_message,
+            summary=summary,
+            recent=list(recent or []),
+            answer_model=answer_model,
+        )
+        if _fast_dialogue is None:
+            telemetry["answer_outcome"] = "conversational-generation-failed"
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
+            _finish_telemetry()
+            raise TurnFailed(
+                "conversational-generation-failed",
+                "no dialogue candidate",
+                telemetry=dict(telemetry),
+            )
+        try:
+            from aa.conversation.whole_turn_judge import judge_whole_turn as _fast_judge
+
+            _fast_slice = _remaining_budget_s()
+            if _fast_slice < TURN_VERIFIER_MIN_SLICE_S:
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                if not str(telemetry.get("failure_category", "") or "").strip():
+                    telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["answers_request"] = False
+                telemetry["technically_grounded"] = False
+                telemetry["qualified"] = False
+                _finish_telemetry()
+                raise TurnFailed(
+                    "fallback-judge-skipped-budget",
+                    "insufficient budget for fast-path guard",
+                    telemetry=dict(telemetry),
+                )
+            _fast_probe = _fast_dialogue if _fast_dialogue.strip() else user_message
+            _fast_verdict = await _fast_judge(
+                resolved_intent=_resolved_request,
+                reply=_fast_probe,
+                context=_conversation_context,
+                model=whole_turn_judge_model,
+            )
+            telemetry["independent_judge_substantive"] = bool(
+                _fast_verdict.contains_substantive_claim
+            )
+            if bool(_fast_verdict.contains_substantive_claim):
+                logger.info(
+                    "v2 conversational fast-path withheld by whole-turn judge",
+                    extra={"category": "fallback-substantive-overturn"},
+                )
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                if not str(telemetry.get("failure_category", "") or "").strip():
+                    telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["answers_request"] = False
+                telemetry["technically_grounded"] = False
+                telemetry["qualified"] = False
+                _finish_telemetry()
+                raise TurnFailed(
+                    "fallback-substantive-overturn",
+                    "judge withheld fast-path fallback",
+                    telemetry=dict(telemetry),
+                )
+        except TurnFailed:
+            raise
+        except Exception as exc:
+            logger.info(
+                "v2 fast-path judge failed closed",
+                extra={"category": type(exc).__name__},
+            )
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
+            _finish_telemetry()
+            raise TurnFailed(
+                "fallback-judge-error",
+                "whole-turn judge unavailable for fast-path guard",
+                telemetry=dict(telemetry),
+            ) from exc
+        telemetry["outbound_safety"] = "pass"
+        telemetry["answer_outcome"] = "conversational-generated"
+        telemetry["verifier_outcome"] = "skipped"
+        telemetry["adequacy_verdict"] = _ADEQ_PASS
+        telemetry["answers_request"] = True
+        telemetry["technically_grounded"] = False
+        telemetry["qualified"] = True
+        _finish_telemetry()
+        return {
+            "text": _fast_dialogue,
+            "units": [],
+            "verification": grounding_result_to_state(None),
+            "rounds": 0,
+            "recent_quote_ranges": recent_ranges,
+            "telemetry": dict(telemetry),
+            "evidence_pack": list(pack),
+        }
+
     draft = await _draft_with_pack(pack, user_message)
     if draft is None:
         telemetry["answer_outcome"] = "failed"
