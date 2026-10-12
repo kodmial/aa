@@ -1999,6 +1999,18 @@ async def run_v2_answer_turn(
                 "v2 fast-path judge failed closed",
                 extra={"category": type(exc).__name__},
             )
+            telemetry["adequacy_verdict"] = _ADEQ_FAIL
+            if not str(telemetry.get("failure_category", "") or "").strip():
+                telemetry["failure_category"] = _FAIL_REPAIR
+            telemetry["answers_request"] = False
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = False
+            _finish_telemetry()
+            raise TurnFailed(
+                "fallback-judge-error",
+                "whole-turn judge unavailable for fast-path guard",
+                telemetry=dict(telemetry),
+            ) from exc
         telemetry["outbound_safety"] = "pass"
         telemetry["answer_outcome"] = "conversational-generated"
         telemetry["verifier_outcome"] = "skipped"
