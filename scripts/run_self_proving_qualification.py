@@ -719,8 +719,12 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
             pass
         else:
             return _fail_b(
-                expected_sha, run_id, product, runtime,
-                "output-envelope", "indivisible oversized unit was accepted",
+                expected_sha,
+                run_id,
+                product,
+                runtime,
+                "output-envelope",
+                "indivisible oversized unit was accepted",
             )
     except Exception as exc:
         return _fail_b(
