@@ -1987,16 +1987,34 @@ async def run_v2_answer_turn(
         converge. The same judge invocation that live qualification runs
         must therefore gate delivery on the production path.
 
+        Convergence breaker (kodmial/aa#375): exact-main history for
+        ``C:live-book-grounding-substantive-drinking-2:live-production-path``
+        (grounding, relevance, helpfulness, empty-telemetry and
+        budget-exceeded surfaces across successive mains, latest run
+        38288847872 with retrieval p95 61s, total p95 at the 105s turn
+        budget, repair_turns=3, budget_exceeded=2) proves the smallest
+        architecture invariant is joint budget neutrality, not wording:
+        every added sequential provider round pushes tail turns over the
+        shared deadline and collapses them to budget-exceeded grounding
+        failures, so wording alignment can never converge while the
+        mechanism adds the latency that creates the next failure. This
+        gate is therefore budget-neutral: it never launches a judge round
+        once the 50s repair budget or the end-to-end turn budget is
+        spent, and it never consumes the downstream verifier slice (the
+        call cap is carved out of remaining budget after reserving that
+        slice). Skipping the judge then preserves the existing
+        adequacy/verifier path instead of adding rounds.
+
         Returns True only on an explicit available negative verdict
         (helpful False or addresses_intent False). A missing judge
-        model, an exhausted per-turn call bound, a missing budget slice,
-        a call timeout, a transport outage, or an unavailable verdict
-        preserves the existing adequacy path (False): this gate only
-        ever withholds an unhelpful delivery in favor of the existing
-        bounded regen/narrow/fail path, never invents a success. No
-        prompt, reply, or evidence text enters telemetry; only the
-        boolean verdicts travel. Provider 429 and cancellation always
-        propagate for runner lifecycle recovery.
+        model, an exhausted per-turn call bound, a spent repair or
+        turn budget, a missing budget slice, a call timeout, a transport
+        outage, or an unavailable verdict preserves the existing adequacy
+        path (False): this gate only ever withholds an unhelpful delivery
+        in favor of the existing bounded regen/narrow/fail path, never
+        invents a success. No prompt, reply, or evidence text enters
+        telemetry; only the boolean verdicts travel. Provider 429 and
+        cancellation always propagate for runner lifecycle recovery.
         """
         nonlocal _substantive_judge_calls
         if whole_turn_judge_model is None:
@@ -2014,10 +2032,23 @@ async def run_v2_answer_turn(
             return False
         if _substantive_judge_calls >= SUBSTANTIVE_JUDGE_MAX_CALLS:
             return False
+        # Breaker (kodmial/aa#375): a judge-demanded regen is another
+        # sequential provider round. Once the repair budget or the
+        # end-to-end turn budget is spent, demanding it only converts an
+        # attributable adequacy outcome into a budget-exceeded collapse.
+        try:
+            if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
+                return False
+        except Exception:
+            pass
+        try:
+            if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                return False
+        except Exception:
+            pass
         remaining = _remaining_budget_s()
         if remaining < TURN_VERIFIER_MIN_SLICE_S:
             return False
-        _substantive_judge_calls += 1
         try:
             from aa.conversation.whole_turn_judge import (
                 JUDGE_INDEPENDENCE_LIMITATION as _JUDGE_LIMIT,
@@ -2027,9 +2058,19 @@ async def run_v2_answer_turn(
         except Exception:
             return False
         telemetry["judge_independence_limitation"] = _JUDGE_LIMIT
-        cap = min(max(0.0, remaining), SUBSTANTIVE_JUDGE_CALL_CAP_S)
+        # Breaker (kodmial/aa#375): carve the call cap out of remaining
+        # budget after reserving the downstream verifier slice, so one
+        # judge round can never consume the slice the verifier round
+        # needs to complete. A turn too close to the deadline keeps its
+        # adequacy outcome instead of grinding into budget-exceeded.
+        try:
+            _judge_reserve = max(0.0, float(TURN_VERIFIER_MIN_SLICE_S))
+        except (TypeError, ValueError):
+            _judge_reserve = TURN_VERIFIER_MIN_SLICE_S
+        cap = min(max(0.0, remaining - _judge_reserve), SUBSTANTIVE_JUDGE_CALL_CAP_S)
         if cap <= 0:
             return False
+        _substantive_judge_calls += 1
         try:
             judgement = await asyncio.wait_for(
                 _judge_turn(
