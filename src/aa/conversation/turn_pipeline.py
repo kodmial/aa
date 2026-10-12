@@ -1964,34 +1964,46 @@ async def run_v2_answer_turn(
             from aa.conversation.whole_turn_judge import judge_whole_turn as _fast_judge
 
             _fast_slice = _remaining_budget_s()
-            if _fast_slice >= TURN_VERIFIER_MIN_SLICE_S:
-                _fast_probe = _fast_dialogue if _fast_dialogue.strip() else user_message
-                _fast_verdict = await _fast_judge(
-                    resolved_intent=_resolved_request,
-                    reply=_fast_probe,
-                    context=_conversation_context,
-                    model=whole_turn_judge_model,
+            if _fast_slice < TURN_VERIFIER_MIN_SLICE_S:
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                if not str(telemetry.get("failure_category", "") or "").strip():
+                    telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["answers_request"] = False
+                telemetry["technically_grounded"] = False
+                telemetry["qualified"] = False
+                _finish_telemetry()
+                raise TurnFailed(
+                    "fallback-judge-skipped-budget",
+                    "insufficient budget for fast-path guard",
+                    telemetry=dict(telemetry),
                 )
-                telemetry["independent_judge_substantive"] = bool(
-                    _fast_verdict.contains_substantive_claim
+            _fast_probe = _fast_dialogue if _fast_dialogue.strip() else user_message
+            _fast_verdict = await _fast_judge(
+                resolved_intent=_resolved_request,
+                reply=_fast_probe,
+                context=_conversation_context,
+                model=whole_turn_judge_model,
+            )
+            telemetry["independent_judge_substantive"] = bool(
+                _fast_verdict.contains_substantive_claim
+            )
+            if bool(_fast_verdict.contains_substantive_claim):
+                logger.info(
+                    "v2 conversational fast-path withheld by whole-turn judge",
+                    extra={"category": "fallback-substantive-overturn"},
                 )
-                if bool(_fast_verdict.contains_substantive_claim):
-                    logger.info(
-                        "v2 conversational fast-path withheld by whole-turn judge",
-                        extra={"category": "fallback-substantive-overturn"},
-                    )
-                    telemetry["adequacy_verdict"] = _ADEQ_FAIL
-                    if not str(telemetry.get("failure_category", "") or "").strip():
-                        telemetry["failure_category"] = _FAIL_REPAIR
-                    telemetry["answers_request"] = False
-                    telemetry["technically_grounded"] = False
-                    telemetry["qualified"] = False
-                    _finish_telemetry()
-                    raise TurnFailed(
-                        "fallback-substantive-overturn",
-                        "judge withheld fast-path fallback",
-                        telemetry=dict(telemetry),
-                    )
+                telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                if not str(telemetry.get("failure_category", "") or "").strip():
+                    telemetry["failure_category"] = _FAIL_REPAIR
+                telemetry["answers_request"] = False
+                telemetry["technically_grounded"] = False
+                telemetry["qualified"] = False
+                _finish_telemetry()
+                raise TurnFailed(
+                    "fallback-substantive-overturn",
+                    "judge withheld fast-path fallback",
+                    telemetry=dict(telemetry),
+                )
         except TurnFailed:
             raise
         except Exception as exc:
