@@ -28,9 +28,7 @@ def test_gate_b_output_envelope_proves_both_safe_compaction_and_refusal() -> Non
         compact_text_to_envelope("Слово " * 400)
 
     # The actual Gate B check must test valid units and unsafe ones separately.
-    code = (ROOT / "scripts" / "run_self_proving_qualification.py").read_text(
-        encoding="utf-8"
-    )
+    code = (ROOT / "scripts" / "run_self_proving_qualification.py").read_text(encoding="utf-8")
     section = code.split("# -- output envelope --", 1)[1].split(
         "# -- memory/FIFO/concurrency/safety --", 1
     )[0]
@@ -39,9 +37,9 @@ def test_gate_b_output_envelope_proves_both_safe_compaction_and_refusal() -> Non
 
 
 def test_qualification_does_not_preempt_same_sha_or_forge_missing_gate_a() -> None:
-    workflow = (
-        ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
-    ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml").read_text(
+        encoding="utf-8"
+    )
     expected_group = "group: aa-self-proving-qualification-${{ inputs.required_sha || github.sha }}"
     assert expected_group in workflow
     assert "cancel-in-progress: false" in workflow
@@ -56,15 +54,13 @@ def test_qualification_does_not_preempt_same_sha_or_forge_missing_gate_a() -> No
 
 
 def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> None:
-    workflow = (
-        ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
-    ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml").read_text(
+        encoding="utf-8"
+    )
     start = "- name: Publish machine-readable failure and repair marker"
     end = "- name: Publish authoritative Product Contract result"
     publisher = workflow.split(start, 1)[1].split(end, 1)[0]
-    before_parser, inside_parser = publisher.split(
-        "const summary = JSON.parse(", 1
-    )
+    before_parser, inside_parser = publisher.split("const summary = JSON.parse(", 1)
     assert "let failGates = new Set();" in before_parser
     assert "failGates = new Set(productFailures.map(" in inside_parser
     assert "const failGates =" not in inside_parser
