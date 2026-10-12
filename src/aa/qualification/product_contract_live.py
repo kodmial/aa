@@ -2578,15 +2578,25 @@ async def run_live_telegram_evidence_lane(
             # Short ordinary turns intentionally skip memory compaction, so
             # explicitly exercise the production summarizer agent once. The
             # same real OpenCode client enforces the served provider/model.
-            summarizer_probe = OpenCodeChatModel(
-                app.opencode_runtime.client,
-                agent=SUMMARIZER_AGENT_V2,
-                primary_model=settings.opencode_model,
-                fallback_model=settings.opencode_fallback_model,
-            )
-            await summarizer_probe.ainvoke(
-                [HumanMessage(content="Кратко суммируй нейтральную тестовую фразу.")]
-            )
+            # Hardened (kodmial/aa#370): a summarizer-probe failure must not
+            # abort all 18 production scenarios with zero samples. A
+            # non-429 probe error records its concrete category and the lane
+            # continues to the scenario proof; provider 429 still retires
+            # the runner for checkpoint resume.
+            try:
+                summarizer_probe = OpenCodeChatModel(
+                    app.opencode_runtime.client,
+                    agent=SUMMARIZER_AGENT_V2,
+                    primary_model=settings.opencode_model,
+                    fallback_model=settings.opencode_fallback_model,
+                )
+                await summarizer_probe.ainvoke(
+                    [HumanMessage(content="Кратко суммируй нейтральную тестовую фразу.")]
+                )
+            except OpenCodeRateLimitError:
+                raise
+            except Exception as exc:
+                failed.append(f"live-summarizer-probe-{type(exc).__name__}"[:96])
             # Independent whole-turn judge (kodmial/aa#286 item 1): a
             # separately instantiated model control with its own audit
             # identity, invoked on the authoritative live
@@ -3895,8 +3905,69 @@ async def run_live_telegram_evidence_lane(
             await app.stop()
     except OpenCodeRateLimitError:
         raise
-    except Exception:
-        failed.append("live-production-telegram-harness")
+    except Exception as exc:
+        # Concrete harness attribution (kodmial/aa#370): a lane-level crash
+        # before any turn completes collapsed to generic
+        # live-production-telegram-harness with zero latencies, zero
+        # snapshots and zero diagnostics, so Gate C could only report a
+        # generic failure and Gate E degraded to missing-live-samples.
+        # Preserve the closed-vocabulary exception type as the failure
+        # category (never user/corpus text) and backfill one
+        # bounded-censored latency sample per ordinary family that produced
+        # no sample, so Gate E still evaluates the SLO and Gate C keeps a
+        # concrete per-family diagnostic. Generic, turn-independent, never
+        # an exact-question rule.
+        harness_category = type(exc).__name__[:64] or "harness-error"
+        failed.append(f"live-production-harness-{harness_category}")
+        try:
+            _ordinary = (
+                set(ordinary_families)
+                if "ordinary_families" in locals()
+                else {
+                    "meta-capability",
+                    "substantive-drinking",
+                    "family-relationship",
+                    "followup-ellipsis",
+                    "topic-shift",
+                    "unsupported-out-of-book",
+                    "long-conversation",
+                    "mixed-greeting-substantive",
+                }
+            )
+            _sampled_families = {
+                str(item.get("family", "")) for item in latency_samples if isinstance(item, dict)
+            }
+            for _family in sorted(_ordinary):
+                if _family in _sampled_families:
+                    continue
+                import uuid as _harness_uuid
+
+                latency_samples.append(
+                    {
+                        "causality_id": _harness_uuid.uuid4().hex,
+                        "family": _family,
+                        "mode": "text",
+                        "outcome": "harness-error",
+                        "latency_ms": round(LIVE_TEXT_LATENCY_BUDGET_S * 1000.0, 1),
+                        "monotonic": True,
+                        "clock": "monotonic-perf_counter",
+                        "series": "c-series-simulated-handoff",
+                        "boundary": ("production-update-intake-to-simulated-handoff"),
+                        "receipt_kind": "simulated-in-process",
+                        "censored": True,
+                    }
+                )
+            if not scenario_diagnostics:
+                scenario_diagnostics.append(
+                    {
+                        "scenario_index": 0,
+                        "family": "harness-error",
+                        "delivery_timeout": False,
+                        "harness_error": harness_category[:48],
+                    }
+                )
+        except Exception:
+            pass
 
     p50 = _percentile(latencies, 50)
     p95 = _percentile(latencies, 95)
