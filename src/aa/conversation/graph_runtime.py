@@ -369,7 +369,17 @@ class GraphTurnRuntime:
     def _record_stage_telemetry(
         self, thread: str, result: dict[str, Any], total_ms: float, reply_len: int
     ) -> None:
-        """Store one privacy-safe stage snapshot for later qualification."""
+        """Store one stage snapshot for later qualification.
+
+        Counts/latencies/outcomes stay privacy-safe and are the only
+        fields logged or persisted as gate evidence. ``resolved_intent``,
+        ``answer_relevant`` and ``context_digest`` are additionally carried
+        in-memory so the independent whole-turn judge evaluates terse
+        follow-ups (ellipsis, pronouns, short continuations) against the
+        planner-resolved substantive intent instead of the raw generic
+        surface text. They are never logged here and never enter
+        ``GateEvidence`` (which carries only counts/outcomes/digests).
+        """
         try:
             retry = result.get("retry_state", {})
             retry_d = dict(retry) if isinstance(retry, dict) else {}
@@ -417,6 +427,45 @@ class GraphTurnRuntime:
                     _runtime_sha = str(_tele_sha())
                 except Exception:
                     _runtime_sha = "unknown"
+            # Context-resolved intent for the independent judge (kodmial/aa#354):
+            # terse follow-ups carry little topical content on their own, so
+            # judging them against the raw surface text fails continuous
+            # grounded answers. Prefer the canonical ResolvedTurn intent bound
+            # to the shared context digest, then the planner state, then the
+            # retry telemetry; fall back to empty (callers substitute the raw
+            # prompt). Generic, turn-independent, never an exact-question rule.
+            _resolved_intent = ""
+            try:
+                _rt_raw = result.get("resolved_turn", None)
+                if isinstance(_rt_raw, dict):
+                    _resolved_intent = str(_rt_raw.get("resolved_intent", "") or "")
+                if not _resolved_intent.strip():
+                    _resolved_intent = str(result.get("resolved_intent", "") or "")
+                if not _resolved_intent.strip():
+                    _resolved_intent = str(retry_d.get("resolved_intent", "") or "")
+            except Exception:
+                _resolved_intent = ""
+            _resolved_intent = " ".join(_resolved_intent.split()).strip()[:2000]
+            # Whole-turn relevance verdict from the same verifier invocation
+            # (kodmial/aa#354): an explicit False must survive as False so
+            # irrelevant-but-grounded answers fail closed; missing stays None
+            # (never coerced to False here, never to True downstream).
+            _answer_relevant: bool | None = None
+            try:
+                _raw_relevant = grounding_d.get("answer_relevant", None)
+                if isinstance(_raw_relevant, bool):
+                    _answer_relevant = bool(_raw_relevant)
+            except Exception:
+                _answer_relevant = None
+            # Canonical context digest the turn was certified against.
+            _context_digest = ""
+            try:
+                _context_digest = str(result.get("context_digest", "") or "")
+                if not _context_digest.strip() and isinstance(_rt_raw, dict):
+                    _context_digest = str(_rt_raw.get("context_digest", "") or "")
+            except Exception:
+                _context_digest = ""
+            _context_digest = _context_digest.strip()[:128]
             snapshot: dict[str, Any] = {
                 "planner_query_count": int(embedded_d.get("planner_query_count", query_count)),
                 "planner_outcome": _planner_outcome,
@@ -462,6 +511,9 @@ class GraphTurnRuntime:
                 "answers_request": bool(embedded_d.get("answers_request", False)),
                 "technically_grounded": bool(embedded_d.get("technically_grounded", False)),
                 "qualified": bool(embedded_d.get("qualified", False)),
+                "answer_relevant": _answer_relevant,
+                "resolved_intent": _resolved_intent,
+                "context_digest": _context_digest,
                 "turn_trace_id": _trace_id,
                 "runtime_sha": _runtime_sha or "unknown",
                 "total_latency_ms": round(total_ms, 1),
