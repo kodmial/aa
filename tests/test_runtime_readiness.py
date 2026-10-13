@@ -122,7 +122,9 @@ def test_gate_d_probe_parses_ready_marker_instead_of_substring() -> None:
     assert "READY" not in marker
     assert parse_ready_marker(marker) is not None
     text = _read("aa-self-proving-qualification.yml")
-    assert "parse_ready_marker" in text
+    # Gate D was removed from mandatory product qualification; canary retains its probe.
+    assert "parse_ready_marker" not in text
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in text
     assert '"READY" in app.readiness_marker' not in text
     # The gated production canary (#82) probes readiness through the same
     # production Application boundary inside the repository-owned runner;
