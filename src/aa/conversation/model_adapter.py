@@ -24,7 +24,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -416,6 +416,13 @@ class OpenCodeChatModel(BaseChatModel):
     fallback_model: str = ""
     request_timeout: float = 120.0
     transport_agent: str | None = None
+
+    # Single coherent verifier topology (kodmial/aa#380): production
+    # models speak the batched single-round verifier (one call per
+    # draft with the Evidence Pack materialized once) instead of the
+    # multiplicative per-unit round. Capability-incompatible models
+    # keep the bounded per-unit round with identical strict gates.
+    supports_batched_verifier: ClassVar[bool] = True
 
     _client: OpenCodeClient = PrivateAttr()
     _primary_access_rejected_at: float | None = PrivateAttr(default=None)

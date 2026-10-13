@@ -50,6 +50,7 @@ class TurnState(TypedDict, total=False):
     meeting_state: dict[str, Any]
     meeting_observation: dict[str, Any]
     meeting_action: str
+    semantic_dag_id: str
 
 
 NORMAL_ROUTE = "normal"

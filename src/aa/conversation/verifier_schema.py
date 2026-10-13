@@ -4,13 +4,16 @@ The verifier gate is model-structured semantics, never handcrafted
 lexical heuristics: no keyword overlap, token stems, hand-written phrase
 lists, or source-ID presence checks decide semantic support.
 
-Transport contract: per-unit only. Each invocation returns both
-claim-support and intent-relevance verdicts for exactly one response
-unit, so groundedness and answer relevance are judged by the same model
-call against the same Evidence Pack. AA code binds ``unit_id`` from the
-input unit, derives the internal scope deterministically, and computes
-the turn aggregates as conjunctions. The model never copies ids and never
-computes an aggregate.
+Transport contract: one single round per draft (kodmial/aa#190,
+#380). Each invocation returns both claim-support and intent-relevance
+verdicts, so groundedness and answer relevance are judged by the same
+model call against the same Evidence Pack: per-unit decisions carry
+exactly one response unit, batched decisions carry exactly one ordered
+decision per unit (positional binding, see
+:class:`BatchedUnitDecisions`). AA code binds ``unit_id``, derives the
+internal scope deterministically, and computes the turn aggregates as
+conjunctions. The model never copies ids and never computes an
+aggregate.
 """
 
 from __future__ import annotations
@@ -194,6 +197,102 @@ def verifier_single_json_schema() -> dict[str, object]:
     }
 
 
+class BatchedUnitDecisions(BaseModel):
+    """Provider-native batched verifier decision (transport only, kodmial/aa#380).
+
+    One single-round verifier call judges every response unit of a
+    draft at once. ``verdicts`` carries exactly one decision per unit
+    in draft order (positional binding): AA code binds each
+    ``unit_id`` by position, derives each internal scope
+    deterministically, and computes the turn aggregates as
+    conjunctions. The model never copies ids and never computes an
+    aggregate. Every entry validates under the same strict
+    :class:`UnitDecision` contract as the per-unit path (strict
+    booleans, strict citation strings, explicit intent relevance,
+    claim-origin rules enforced in
+    :func:`aa.conversation.verifier.coerce_batched_verdicts`).
+    """
+
+    verdicts: list[UnitDecision] = Field(min_length=1)
+
+    model_config = {"extra": "forbid"}
+
+
+def verifier_batched_json_schema() -> dict[str, object]:
+    """Build the single-round batched transport schema for providers.
+
+    The native hint carries one ordered decision per response unit:
+    the same booleans plus citation list as
+    :func:`verifier_single_json_schema`, wrapped positionally. No
+    free-form scope string, no ``unit_id`` copy, and no model-computed
+    aggregate anywhere in the payload.
+    """
+    single = verifier_single_json_schema()
+    properties: dict[str, object] = {}
+    required: list[object] = []
+    try:
+        raw_properties = single.get("properties", {})
+        if isinstance(raw_properties, dict):
+            properties = dict(raw_properties)
+        raw_required = single.get("required", [])
+        if isinstance(raw_required, list):
+            required = list(raw_required)
+    except Exception:
+        properties = {}
+        required = []
+    return {
+        "type": "object",
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+                "minItems": 1,
+            }
+        },
+        "required": ["verdicts"],
+    }
+
+
+def validate_batched_decisions(data: object, *, expected_count: int) -> list[UnitDecision]:
+    """Pydantic-validate one batched verifier decision (fail-closed).
+
+    Requires exactly ``expected_count`` ordered decisions: a missing,
+    short, long, null or wrong-type ``verdicts`` list raises
+    :class:`VerifierValidationError`, as does any entry failing
+    :func:`validate_unit_decision`. An ambiguous batch (wrong count)
+    never binds to units.
+    """
+    try:
+        count = int(expected_count)
+    except (TypeError, ValueError) as exc:
+        raise VerifierValidationError("batched verifier needs a unit count") from exc
+    if count <= 0:
+        raise VerifierValidationError("batched verifier needs at least one response unit")
+    if isinstance(data, BatchedUnitDecisions):
+        decisions = list(data.verdicts)
+    elif isinstance(data, dict):
+        try:
+            decisions = list(BatchedUnitDecisions.model_validate(data).verdicts)
+        except Exception as exc:
+            from pydantic import ValidationError as PydanticValidationError
+
+            if isinstance(exc, PydanticValidationError):
+                raise VerifierValidationError(f"batched verifier output invalid: {exc}") from exc
+            raise VerifierValidationError(f"batched verifier output invalid: {exc}") from exc
+    else:
+        raise VerifierValidationError("batched verifier output is not a structured object")
+    if len(decisions) != count:
+        raise VerifierValidationError(
+            "batched verifier must return exactly one verdict per unit: "
+            f"expected {count}, got {len(decisions)}"
+        )
+    return decisions
+
+
 def validate_unit_decision(data: object) -> UnitDecision:
     """Pydantic-validate one native per-unit verifier decision."""
     from pydantic import ValidationError as PydanticValidationError
@@ -291,6 +390,7 @@ def validate_grounding_result(data: object, *, expected_unit_ids: list[str]) -> 
 
 
 __all__ = [
+    "BatchedUnitDecisions",
     "ClaimOrigin",
     "GroundingResult",
     "NON_BOOK_SCOPE",
@@ -301,7 +401,9 @@ __all__ = [
     "VERIFIER_MAX_ATTEMPTS",
     "VerifierValidationError",
     "unavailable_unit_verdict",
+    "validate_batched_decisions",
     "validate_grounding_result",
     "validate_unit_decision",
+    "verifier_batched_json_schema",
     "verifier_single_json_schema",
 ]

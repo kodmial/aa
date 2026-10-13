@@ -45,6 +45,7 @@ from aa.conversation.memory import (
 )
 from aa.conversation.planner_node import planner_node
 from aa.conversation.planner_schema import QueryPlanValidationError
+from aa.conversation.semantic_work_plan import ensure_turn_dag
 from aa.safety.router import SafetyDecision, SafetyResult, SafetyRouter
 
 logger = logging.getLogger("aa.conversation.graph")
@@ -63,22 +64,31 @@ def _default_safety_check(text: str) -> SafetyResult:
 
 async def gate_node(state: TurnState, *, safety_check: SafetyCheck | None = None) -> dict[str, Any]:
     """Deterministic command/safety gate; planner runs only for normal turns."""
+    # The per-turn critical-path DAG (kodmial/aa#380) is born here so
+    # every downstream graph stage records on one hashed turn id. The
+    # id is privacy-safe (hashed, no user text) and travels in state.
+    try:
+        _gate_dag = ensure_turn_dag(state)
+        _gate_dag.start_op("turn")
+        _gate_dag_id = _gate_dag.dag_id
+    except Exception:
+        _gate_dag_id = ""
     text = str(state.get("current_user_message", ""))
     check = safety_check or _default_safety_check
     if not text.strip():
         logger.info("v2 turn gated", extra={"route": BLOCKED_ROUTE})
-        return {"route": BLOCKED_ROUTE}
+        return {"route": BLOCKED_ROUTE, "semantic_dag_id": _gate_dag_id}
     if is_application_command(text):
         logger.info("v2 turn gated", extra={"route": COMMAND_ROUTE})
-        return {"route": COMMAND_ROUTE}
+        return {"route": COMMAND_ROUTE, "semantic_dag_id": _gate_dag_id}
     result = check(text)
     if result.decision is SafetyDecision.EMERGENCY:
         logger.info("v2 turn gated", extra={"route": EMERGENCY_ROUTE})
-        return {"route": EMERGENCY_ROUTE}
+        return {"route": EMERGENCY_ROUTE, "semantic_dag_id": _gate_dag_id}
     if result.decision is SafetyDecision.BLOCK:
         logger.info("v2 turn gated", extra={"route": BLOCKED_ROUTE})
-        return {"route": BLOCKED_ROUTE}
-    return {"route": NORMAL_ROUTE}
+        return {"route": BLOCKED_ROUTE, "semantic_dag_id": _gate_dag_id}
+    return {"route": NORMAL_ROUTE, "semantic_dag_id": _gate_dag_id}
 
 
 def _route_after_gate(state: TurnState) -> str:
@@ -215,11 +225,21 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
 
         started = _time.perf_counter()
         try:
+            _planner_dag = ensure_turn_dag(state)
+            _planner_dag.start_op("planner")
+            _planner_dag.provider_attempt("planner")
+            _planner_dag_id = _planner_dag.dag_id
+        except Exception:
+            _planner_dag = None
+            _planner_dag_id = ""
+        try:
             result = await planner_node(state, model=planner_model)
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             queries = result.get("search_queries", [])
             count = len(queries) if isinstance(queries, list) else 0
             mode = str(result.get("planner_mode", "retrieval") or "retrieval")
+            if _planner_dag is not None:
+                _planner_dag.finish_op("planner", ok=True, category="planned")
             logger.info(
                 "v2 planner done",
                 extra={
@@ -242,10 +262,13 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 retry["planner_outcome"] = outcome
                 retry["planner_reason"] = _reason_for(count, outcome)
             update["retry_state"] = retry
+            update["semantic_dag_id"] = _planner_dag_id
             return update
         except QueryPlanValidationError as exc:
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             logger.warning("v2 planner failed closed", extra={"category": "planner-invalid"})
+            if _planner_dag is not None:
+                _planner_dag.finish_op("planner", ok=False, category="planner-invalid")
             # Invalid semantic output is never conversational glue. Use the
             # generic retrieval fallback from the raw turn plus the shared
             # canonical context, just as for provider/timeout failures.
@@ -326,13 +349,20 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 _f_update["information_needs"] = _f_needs_d
                 _f_update["query_need_map"] = _f_qmap_d
                 _f_update["context_digest"] = _f_digest
+            _f_update["semantic_dag_id"] = _planner_dag_id
             return _f_update
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError as _PlannerRateLimit
 
             if isinstance(exc, _PlannerRateLimit):
+                if _planner_dag is not None:
+                    _planner_dag.provider_rate_limited("planner")
+                    _planner_dag.finish_op("planner", ok=False, category="provider-429")
                 raise
             if isinstance(exc, asyncio.CancelledError):
+                if _planner_dag is not None:
+                    _planner_dag.provider_cancelled("planner")
+                    _planner_dag.finish_op("planner", ok=False, category="cancelled")
                 raise
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             try:
@@ -423,6 +453,9 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 _e_update["information_needs"] = _e_needs_d
                 _e_update["query_need_map"] = _e_qmap_d
                 _e_update["context_digest"] = _e_digest
+            _e_update["semantic_dag_id"] = _planner_dag_id
+            if _planner_dag is not None:
+                _planner_dag.finish_op("planner", ok=False, category=str(outcome or "failed"))
             return _e_update
 
     return run_hidden_planner

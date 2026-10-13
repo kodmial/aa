@@ -703,6 +703,17 @@ class GraphTurnRuntime:
         result = await graph.ainvoke(payload, config=config)
         if not isinstance(result, dict):
             raise GraphRuntimeError("graph-failed", "graph returned no state")
+        # Close the per-turn critical-path DAG (kodmial/aa#380): the
+        # finished turn op marks the graph path done. Best-effort only;
+        # delivery confirmation still arrives via transport receipts.
+        try:
+            from aa.conversation.semantic_work_plan import dag_for_state as _dag_for_result
+
+            _turn_dag = _dag_for_result(result)
+            if _turn_dag is not None:
+                _turn_dag.finish_op("turn", ok=True, category="graph-done")
+        except Exception:
+            pass
         return dict(result)
 
     def commit_confirmed_delivery(self, thread: str) -> list[dict[str, Any]]:
