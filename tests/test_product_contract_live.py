@@ -215,7 +215,7 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     original_readiness = live_mod.run_telegram_readiness_lane
     live_mod.run_telegram_readiness_lane = _ok_readiness  # type: ignore[assignment]
     try:
-        message, transport, live_evidence, readiness = asyncio.run(live_mod._run_async_lanes())
+        message, transport, live_evidence = asyncio.run(live_mod._run_async_lanes())
     finally:
         live_mod.run_message_lane = original_message
         live_mod.run_transport_lane = original_transport
@@ -227,7 +227,6 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     assert_no_text_leak(message.to_dict())
     assert transport.status == "PASS"
     assert live_evidence.status == "INCOMPLETE"
-    assert readiness.status == "INCOMPLETE"
 
 
 def test_ephemeral_gate_checkpoints_stay_untracked() -> None:
