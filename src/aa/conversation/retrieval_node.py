@@ -69,6 +69,32 @@ logger = logging.getLogger("aa.conversation.retrieval_node")
 SELECTION_PER_CALL_BUDGET_S = 8.0
 COVERAGE_PER_CALL_BUDGET_S = 8.0
 
+# Systemic downstream-reserve invariant (kodmial/aa#387): the sequential
+# planner -> retrieval -> answer -> verifier pipeline recurred as
+# C:live-book-grounding-substantive-drinking-2 across distinct main SHAs
+# with retrieval p95 ~45s / max ~65s, answer p50 ~13s, verifier p50 ~17s,
+# repair_turns=0, answer_rounds=22, budget_exceeded=3 and clarifications=16.
+# The shared turn budget reserved only 5s for downstream, so retrieval
+# semantic work (up to 8 model rounds) consumed the budget and the answer
+# / verifier stages skipped via their minimal-slice guards, serving
+# clarification that Gate C counts as grounding failure. The repair loop
+# never ran because the budget was already spent upstream.
+# Architecture fix at the retrieval boundary (generic, turn-independent,
+# no exact-question branches, no keyword/stem tables, Product Contract
+# #110 and Gate E SLO unchanged): retrieval semantic work stops issuing
+# new model calls once the remaining turn budget cannot cover one bounded
+# answer attempt plus one verifier round plus finalization. The reserve is
+# derived from existing pipeline slices (answer attempt 35s + verifier
+# minimum 3s + finalize 2s = 40s) so a substantive turn always retains a
+# feasible downstream slice. Exhaustion keeps the best-effort lexical
+# pack with typed coverage_status=exhausted (never empty when lexical
+# candidates exist, never fake-covered), so the answer stage still
+# attempts grounded generation instead of collapsing to clarification.
+# A bounded semantic call cap further bounds the tail even when the
+# budget is still large but the provider is slow.
+RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S = 40.0
+RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS = 4
+
 # Bounded canonical read cache (kodmial/aa#331): exact expanded
 # passages keyed by stable child id + neighbor window. Content is
 # content-addressed (checksum validated on hit); the cache only avoids
@@ -264,6 +290,36 @@ def _preview_identity(previews: Any) -> str:
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
     except Exception:
         return ""
+
+
+def _retrieval_preserves_downstream(budget: Any) -> bool:
+    """Whether retrieval may issue another semantic model call.
+
+    Generic architecture guard (kodmial/aa#387): a new retrieval model
+    round starts only when the remaining turn budget still covers the
+    downstream slice (one bounded answer attempt plus verifier minimum
+    plus finalization). Otherwise the loop stops with typed
+    ``downstream-reserve`` exhaustion and serves the best-effort pack,
+    so the answer/verifier stages retain a feasible slice instead of
+    collapsing to clarification. No prompt, keyword, or domain signal.
+    """
+    try:
+        remaining = float(budget.remaining_s())
+    except Exception:
+        return False
+    try:
+        reserve = float(RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S)
+    except Exception:
+        reserve = 40.0
+    return bool(remaining >= reserve)
+
+
+def _retrieval_model_budget_exceeded(model_calls: int) -> bool:
+    """Whether the retrieval semantic call cap is spent (generic bound)."""
+    try:
+        return int(model_calls) >= int(RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS)
+    except Exception:
+        return False
 
 
 def _is_cached_expansion_valid(index: Any, winner_cid: str, cached: Any) -> bool:
@@ -1028,6 +1084,29 @@ async def aretrieve_with_semantic_selection(
             progress_events.append("turn-budget-stop")
             deadline_stops += 1
             break
+        # Systemic downstream-reserve guard (kodmial/aa#387): after the
+        # first discover/select/read/assess pair, stop issuing further
+        # retrieval model rounds once the remaining turn budget cannot
+        # cover the downstream answer/verifier/finalize slice, and cap
+        # total semantic rounds so a slow provider tail cannot starve the
+        # answer stage. The first pair always runs (model-driven semantic
+        # coverage preserved, tiny-budget timeout path unchanged).
+        # Generic counts/durations only, never prompt or domain signals.
+        # Exhaustion keeps the best-effort pack read so far.
+        if (iteration > 0 or model_calls >= 2) and _retrieval_model_budget_exceeded(model_calls):
+            coverage_status = "exhausted"
+            exhaustion_reason = "search-budget"
+            typed_stage = STAGE_COVERAGE_INSUFFICIENT
+            progress_events.append("retrieval-model-budget-stop")
+            deadline_stops += 1
+            break
+        if (iteration > 0 or model_calls >= 2) and not _retrieval_preserves_downstream(budget):
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
+            progress_events.append("retrieval-downstream-reserve-stop")
+            deadline_stops += 1
+            break
         # ---- select_for_reading over the combined discovered pool.
         broad_sorted = sorted(fused.values(), key=lambda item: item.fused_score, reverse=True)
         fused_ordered = [(item.chunk_id, item.fused_score) for item in broad_sorted]
@@ -1254,6 +1333,25 @@ async def aretrieve_with_semantic_selection(
         # typed exhausted outcome instead of grinding; 429/cancel
         # propagate, never swallowed. An exhausted (timed-out) model call
         # can never pass as sufficient book evidence.
+        # Systemic guard (kodmial/aa#387): skip further coverage rounds
+        # once the downstream slice or the semantic call cap is spent;
+        # the best-effort pack above is preserved for the answer stage.
+        # The first assess_coverage always runs (model_calls==1 after the
+        # first selection); only tail rounds are gated.
+        if model_calls >= 2 and _retrieval_model_budget_exceeded(model_calls):
+            coverage_status = "exhausted"
+            exhaustion_reason = "search-budget"
+            typed_stage = STAGE_COVERAGE_INSUFFICIENT
+            progress_events.append("retrieval-model-budget-stop-coverage")
+            deadline_stops += 1
+            break
+        if model_calls >= 2 and not _retrieval_preserves_downstream(budget):
+            coverage_status = "exhausted"
+            exhaustion_reason = "latency-budget"
+            typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
+            progress_events.append("retrieval-downstream-reserve-stop-coverage")
+            deadline_stops += 1
+            break
         cov_started = time.perf_counter()
         if coverage_assessor is not None:
             if turn_dag is not None:
@@ -1433,7 +1531,18 @@ async def aretrieve_with_semantic_selection(
                     index=index,
                     priority_child_ids=tuple(read_child_order),
                 )
-                if coverage_assessor is not None and not _interactive_budget_exceeded():
+                # Systemic guard (kodmial/aa#387): the grown-pack
+                # re-assessment is one more sequential model round; skip
+                # it once the downstream slice or the semantic call cap
+                # is spent, keeping the grown exact passages as
+                # best-effort evidence.
+                _regrown_allowed = bool(
+                    coverage_assessor is not None
+                    and not _interactive_budget_exceeded()
+                    and not _retrieval_model_budget_exceeded(model_calls)
+                    and _retrieval_preserves_downstream(budget)
+                )
+                if _regrown_allowed:
                     if turn_dag is not None:
                         turn_dag.provider_attempt("retrieval-coverage")
                     try:
@@ -2434,6 +2543,8 @@ def make_retrieval_node(
 
 __all__ = [
     "COVERAGE_PER_CALL_BUDGET_S",
+    "RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S",
+    "RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS",
     "SELECTION_PER_CALL_BUDGET_S",
     "_InteractiveBudgetTimeout",
     "aretrieve_with_semantic_selection",
