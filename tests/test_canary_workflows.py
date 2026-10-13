@@ -35,7 +35,7 @@ def test_canary_scope_uses_real_production_boundary() -> None:
     assert "bash scripts/verify.sh" in text
     assert "restore_canonical.py" in text
     assert "build_retrieval_index.py" in text
-    assert "TELEGRAM_BOT_TOKEN" in text
+    assert "TELEGRAM_BOT_TOKEN" not in text
     assert "AA_BOOK_AGE_IDENTITY" in text
 
 
