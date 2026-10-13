@@ -304,9 +304,7 @@ jobs:
           # response-diversity assertion and privacy-safe per-stage
           # outcomes/latency only. Missing secret/model yields BLOCKED, never
           # mocked PASS.
-          # The live runner may legitimately return INCOMPLETE for evidence
-          # explicitly owned by downstream Gate D. Always let the self-proving
-          # mapper classify PASS/FAIL/BLOCKED from the produced evidence.
+          # Live conversation verdict is independent of retired external Gate D.
           # Provider 429 is different: retire this VM immediately and persist
           # the restart marker for the workflow_run recovery controller.
           set +e
@@ -663,10 +661,9 @@ jobs:
                 A: String(process.env.GATE_A_OUTCOME || ''),
                 B: String(process.env.GATE_B_OUTCOME || ''),
                 C: String(process.env.GATE_C_OUTCOME || ''),
-                D: String(process.env.GATE_D_OUTCOME || ''),
                 E: String(process.env.GATE_E_OUTCOME || ''),
               };
-              const failedWorkflowGates = ['A', 'B', 'C', 'D', 'E']
+              const failedWorkflowGates = ['A', 'B', 'C', 'E']
                 .filter(gate => workflowOutcomes[gate] === 'failure');
               const normalizedFailureCategory = (gate, value) => {
                 let text = String(value || 'workflow-step-failed').trim();
