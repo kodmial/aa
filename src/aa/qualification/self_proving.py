@@ -60,6 +60,7 @@ QUALIFICATION_ISSUE_NUMBER = 7
 GATE_IDS: tuple[str, ...] = ("A", "B", "C", "D", "E", "F")
 # The external Telegram network Gate D was retired by product-owner decision.
 # No second bot, polling lease, or synthetic D PASS is required.
+# Telegram network proof is not a prerequisite for assistant qualification.
 MANDATORY_GATES: tuple[str, ...] = ("A", "B", "C", "E")
 
 GATE_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "INCOMPLETE", "STALE", "BLOCKED")

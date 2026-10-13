@@ -854,13 +854,10 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
 
 
 def _live_prerequisites() -> tuple[bool, str]:
-    token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
     identity = (os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip()
     live = (os.environ.get("SELF_PROVING_LIVE", "") or "").strip() == "1"
     if not live:
         return False, "live-execution-not-enabled"
-    if not token:
-        return False, "missing-secret-telegram-token"
     if not identity:
         return False, "missing-secret-corpus-identity"
     return True, ""

@@ -364,11 +364,24 @@ def test_external_telegram_probe_is_not_a_qualification_prerequisite() -> None:
     """Qualification must never require a second bot or poller lease."""
     wf = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(encoding="utf-8")
     assert "- name: Gate D - real Telegram" not in wf
+    assert "Gate D - real Telegram network/runtime readiness" not in wf
     assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in wf
     assert "AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE" not in wf
     assert "EXTERNAL_TEST_BOT_UNAVAILABLE" not in wf
     assert "- name: Gate C - LIVE exact production conversation path" in wf
     assert "- name: Gate E - live performance/SLO" in wf
+    assert "- name: Publish machine-readable failure and repair marker" in wf
+
+
+def test_qualification_never_requires_isolated_telegram_bot() -> None:
+    """Product gates check conversation quality without any external bot identity."""
+    wf = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(encoding="utf-8")
+    assert "Gate D - real Telegram network/runtime readiness" not in wf
+    assert "- name: Gate D - real Telegram" not in wf
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in wf
+    assert "EXTERNAL_TEST_BOT_UNAVAILABLE" not in wf
+    assert "- name: Gate E - live performance/SLO" in wf
+    assert "- name: Publish machine-readable failure and repair marker" in wf
 
 
 def _inline_github_script(block: str) -> str:
@@ -405,3 +418,13 @@ def test_lifecycle_does_not_wait_for_new_test_bot_credential() -> None:
     )
     assert "Reconcile newly authorized isolated test bot" not in wf
     assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in wf
+    assert "aa-self-proving-qualification.yml" in wf
+
+
+def test_qualification_lifecycle_does_not_wait_for_telegram_secrets() -> None:
+    wf = (ROOT / ".github/workflows/aa-mandatory-qualification-lifecycle.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in wf
+    assert "Reconcile newly authorized isolated test bot" not in wf
+    assert "aa-self-proving-qualification.yml" in wf

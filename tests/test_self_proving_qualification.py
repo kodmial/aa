@@ -130,6 +130,9 @@ def test_incomplete_missing_stale_mocked_all_block_qualification_not_run() -> No
     verdict = _verdict({"E": "FAIL"})
     assert verdict.status == "FAIL"
     assert is_run_allowed(verdict, current_sha=SHA) is True
+    verdict = _verdict({"D": "FAIL"})
+    assert verdict.status == "PASS"  # Telegram is not a product qualification gate.
+    assert is_run_allowed(verdict, current_sha=SHA) is True
     # Mocked-only PASS evidence blocks.
     mocked = GateEvidence(gate="C", status="PASS", sha=SHA, run_id="r", mocked_only=True)
     assert effective_gate_status(mocked, current_sha=SHA) == "BLOCKED"
@@ -410,7 +413,6 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
         "Gate C - LIVE exact production conversation path",
         "Gate E - live performance/SLO",
         "Gate F - exact-main final verdict",
-        "TELEGRAM_BOT_TOKEN",
         "AA_BOOK_AGE_IDENTITY",
         "OPENCODE_MODEL",
         "aa-self-proving-repair:v1",
@@ -487,10 +489,9 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     gate_f = workflow.split("Gate F - exact-main final verdict", 1)[1].split(
         "Stage gate checkpoints for resume", 1
     )[0]
-    for independent in (gate_e,):
-        assert "steps.gate-c.outcome == 'success'" in independent
-        assert "steps.gate-c.outcome == 'failure'" in independent
-        assert "restart-required.json" in independent
+    assert "steps.gate-c.outcome == 'success'" in gate_e
+    assert "steps.gate-c.outcome == 'failure'" in gate_e
+    assert "restart-required.json" in gate_e
     # Gate E is a single-owner evidence consumer (kodmial/aa#342): it must
     # not re-invoke the overall runner (which would recompute C/D and redo
     # provider calls). It emits Gate E once from validated C evidence.
@@ -510,11 +511,11 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # artifacts; both keep live prerequisites; no external test bot needed.
     for block in (gate_c, gate_f):
         assert 'SELF_PROVING_LIVE: "1"' in block
-        assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block
         assert "AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}" in block
     assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in workflow
     assert "EXTERNAL_TEST_BOT_UNAVAILABLE" not in workflow
     assert "Gate D - real Telegram" not in workflow
+    assert "Gate D - real Telegram network/runtime readiness" not in workflow
 
 
 def test_gate_c_preserves_live_failure_without_live_env(

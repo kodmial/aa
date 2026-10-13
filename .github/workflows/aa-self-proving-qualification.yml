@@ -11,6 +11,7 @@ name: AA self-proving qualification
 # Gate order with checkpoint resume:
 #   A static/build -> B deterministic integration -> C live production path
 #   -> E performance/SLO -> F exact-main verdict; no Telegram network probe.
+#   External Telegram excluded.
 # On failure the failed gate reruns first, then downstream gates, then the
 # final exact-main gate, bounded by MAX_REPAIR_CYCLES. Provider 429
 # (OPENCODE_429_RESTART_REQUIRED) retires
@@ -274,7 +275,6 @@ jobs:
         id: gate-c
         shell: bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
           OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
@@ -305,6 +305,9 @@ jobs:
           # outcomes/latency only. Missing secret/model yields BLOCKED, never
           # mocked PASS.
           # Live conversation verdict is independent of retired external Gate D.
+          # The live runner may legitimately return INCOMPLETE for evidence
+          # from live model/corpus execution. Always let the self-proving
+          # mapper classify PASS/FAIL/BLOCKED from the produced evidence.
           # Provider 429 is different: retire this VM immediately and persist
           # the restart marker for the workflow_run recovery controller.
           set +e
@@ -463,7 +466,6 @@ jobs:
         if: ${{ always() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') }}
         shell: bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
           OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free

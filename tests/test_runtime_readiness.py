@@ -126,6 +126,8 @@ def test_gate_d_probe_parses_ready_marker_instead_of_substring() -> None:
     # markers structurally, independently of the A/B/C/E product verdict.
     text = _read("aa-self-proving-qualification.yml")
     assert "Gate D - real Telegram network/runtime readiness" not in text
+    # Gate D was removed from mandatory product qualification; canary retains its probe.
+    assert "parse_ready_marker" not in text
     assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in text
     assert '"READY" in app.readiness_marker' not in text
     # The gated production canary (#82) probes readiness through the same
