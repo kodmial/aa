@@ -121,8 +121,12 @@ def test_gate_d_probe_parses_ready_marker_instead_of_substring() -> None:
     # The trap: the uppercase substring never matches the lowercase kind.
     assert "READY" not in marker
     assert parse_ready_marker(marker) is not None
+    # Product qualification no longer launches a Telegram poller or tests
+    # remote Bot API readiness. The production canary still checks runtime
+    # markers structurally, independently of the A/B/C/E product verdict.
     text = _read("aa-self-proving-qualification.yml")
-    assert "parse_ready_marker" in text
+    assert "Gate D - real Telegram network/runtime readiness" not in text
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in text
     assert '"READY" in app.readiness_marker' not in text
     # The gated production canary (#82) probes readiness through the same
     # production Application boundary inside the repository-owned runner;
