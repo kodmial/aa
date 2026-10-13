@@ -358,3 +358,85 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     assert len(repeat["created"]) == 0
     assert len(repeat["updated"]) == 1
     assert len(repeat["issues"]) == 1
+
+
+def test_gate_d_external_prerequisite_never_enters_provider_retry_loop() -> None:
+    """Missing test identity is not a provider outage and cannot be fixed by retrying."""
+    wf = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(
+        encoding="utf-8"
+    )
+    gate_d = wf.split("- name: Gate D - real Telegram network/runtime readiness", 1)[1]
+    gate_d = gate_d.split("- name: Gate E - live performance/SLO", 1)[0]
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" in gate_d
+    assert "AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE" in gate_d
+    assert 'self-proving-out/external-blocked.json' in gate_d
+    assert 'EXTERNAL_TEST_BOT_UNAVAILABLE' in gate_d
+    # External prereqs publish explicit safe evidence and never create
+    # a code-repair issue for an unchanged secret configuration.
+    assert "- name: Upload missing external-prerequisite evidence" in wf
+    assert "- name: Publish actionable external-prerequisite blocker" in wf
+    publisher = wf.split("- name: Publish machine-readable failure and repair marker", 1)[1]
+    assert "hashFiles('self-proving-out/external-blocked.json') == ''" in publisher
+    assert "never test by stealing" not in publisher.lower()  # no artificial bypass
+
+
+def _inline_github_script(block: str) -> str:
+    import textwrap
+
+    raw = block.split("script: |", 1)[1]
+    return textwrap.dedent(raw).strip() + "\n"
+
+
+def test_self_proving_recovery_is_bounded_and_javascript_parses(tmp_path: Path) -> None:
+    """Production incident: 500 on rerun after 240s caused a frozen six-attempt series."""
+    wf = (ROOT / ".github/workflows/aa-self-proving-429-recovery.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '"startup_failure"' in wf
+    assert "externalFound" in wf
+    assert "if (attempt >= 3)" in wf
+    assert "const delaySeconds = Math.min(15" in wf
+    assert "getWorkflowRun" in wf
+    assert "aa-startup-failure-recovery sha=" in wf
+    assert "attempt < 10" not in wf
+    script = _inline_github_script(wf)
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is needed to verify github-script syntax")
+    wrapped = "async function run() {\n" + script + "\n}\n"
+    check = subprocess.run(
+        [node, "--check"], input=wrapped, text=True, capture_output=True, check=False
+    )
+    assert check.returncode == 0, check.stderr
+
+
+def test_new_isolated_bot_credential_reconciles_without_new_code_sha() -> None:
+    """Exactly one same-SHA test-bot recovery is possible; no secret logged."""
+    wf = (ROOT / ".github/workflows/aa-mandatory-qualification-lifecycle.yml").read_text(
+        encoding="utf-8"
+    )
+    after = wf.split(
+        "- name: Reconcile newly authorized isolated test bot without a code commit", 1
+    )[1]
+    assert "github.event_name == 'schedule'" in after
+    assert "secrets.AA_TEST_TELEGRAM_BOT_TOKEN" in after
+    assert "aa-qualification-external-blocker sha=" in after
+    assert "aa-qualification-config-retry sha=" in after
+    assert "already dispatched once" in after
+    assert "Already qualified exact main" in after
+    assert "['queued','in_progress','waiting','requested','pending']" in after
+    assert "github.rest.actions.createWorkflowDispatch" in after
+    assert "String(main.data.commit.sha).toLowerCase() !== sha" in after
+    assert "ISOLATED_TEST_BOT_TOKEN}" not in after  # never rendered into a comment
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is needed to verify github-script syntax")
+    script = _inline_github_script(after)
+    check = subprocess.run(
+        [node, "--check"],
+        input="async function run() {\n" + script + "\n}\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr
