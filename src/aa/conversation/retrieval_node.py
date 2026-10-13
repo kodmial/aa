@@ -33,6 +33,7 @@ from typing import Any
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
+from aa.conversation.semantic_work_plan import SemanticTurnDAG, ensure_turn_dag
 from aa.conversation.turn_budget import (
     LOCAL_RRF_DIAGNOSTIC_BUDGET_MS,
     STAGE_COVERAGE_INSUFFICIENT,
@@ -733,6 +734,7 @@ async def aretrieve_with_semantic_selection(
     max_iterations: int = 3,
     turn_budget: TurnBudget | None = None,
     upstream_latency_ms: float = 0.0,
+    turn_dag: SemanticTurnDAG | None = None,
 ) -> EvidencePack:
     """Run broad hybrid retrieval as one read/coverage loop (#306, #335).
 
@@ -1072,6 +1074,8 @@ async def aretrieve_with_semantic_selection(
         sel_started = time.perf_counter()
         known_chunk_ids = {cid for cid in fused if cid in index.chunks}
         known_need_ids = {s.need_id for s in preview_statuses} or None
+        if turn_dag is not None:
+            turn_dag.provider_attempt("retrieval-select")
         try:
             selection = await _await_model_under_turn_deadline(
                 functools.partial(
@@ -1096,6 +1100,8 @@ async def aretrieve_with_semantic_selection(
             typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
             progress_events.append("selection-deadline-stop")
             deadline_stops += 1
+            if turn_dag is not None:
+                turn_dag.provider_timeout("retrieval-select")
             break
         except OpenCodeRateLimitError:
             budget.record_stage(
@@ -1105,8 +1111,18 @@ async def aretrieve_with_semantic_selection(
                 category="rate-limit",
                 id_digest=need_digest,
             )
+            if turn_dag is not None:
+                turn_dag.provider_rate_limited("retrieval-select")
             raise
         model_calls += 1
+        if turn_dag is not None:
+            try:
+                _selected_ids = list(selection.selected_chunk_ids or [])
+            except Exception:
+                _selected_ids = []
+            turn_dag.record_selection_iteration(
+                candidates=len(previews), selected=len(_selected_ids)
+            )
         # Conservative close-out (#311): unrepresented/unselected needs
         # report uncovered; only full-read assessment can mark sufficiency.
         try:
@@ -1240,6 +1256,8 @@ async def aretrieve_with_semantic_selection(
         # can never pass as sufficient book evidence.
         cov_started = time.perf_counter()
         if coverage_assessor is not None:
+            if turn_dag is not None:
+                turn_dag.provider_attempt("retrieval-coverage")
             try:
                 verdict = await _await_model_under_turn_deadline(
                     functools.partial(
@@ -1260,6 +1278,8 @@ async def aretrieve_with_semantic_selection(
                 typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
                 progress_events.append("coverage-deadline-stop")
                 deadline_stops += 1
+                if turn_dag is not None:
+                    turn_dag.provider_timeout("retrieval-coverage")
                 break
             except OpenCodeRateLimitError:
                 budget.record_stage(
@@ -1269,6 +1289,8 @@ async def aretrieve_with_semantic_selection(
                     category="rate-limit",
                     id_digest=need_digest,
                 )
+                if turn_dag is not None:
+                    turn_dag.provider_rate_limited("retrieval-coverage")
                 raise
             cov_ms = (time.perf_counter() - cov_started) * 1000.0
             cov_ms_total += cov_ms
@@ -1301,6 +1323,14 @@ async def aretrieve_with_semantic_selection(
             for pid in newly_cited:
                 cited_passage_ids.add(pid)
             progress_events.append(f"cited:{len(newly_cited)}-passages")
+        if turn_dag is not None:
+            try:
+                _missing_now = list(getattr(verdict, "missing_need_ids", []) or [])
+            except Exception:
+                _missing_now = []
+            turn_dag.record_coverage_iteration(
+                covered=len(newly_covered), uncovered=len(_missing_now)
+            )
         # Repeated action/state detection over semantic state (unmet
         # needs, passages/ranges read, action and candidate identity).
         try:
@@ -1404,6 +1434,8 @@ async def aretrieve_with_semantic_selection(
                     priority_child_ids=tuple(read_child_order),
                 )
                 if coverage_assessor is not None and not _interactive_budget_exceeded():
+                    if turn_dag is not None:
+                        turn_dag.provider_attempt("retrieval-coverage")
                     try:
                         _regrown_started = time.perf_counter()
                         regrown_verdict = await _await_model_under_turn_deadline(
@@ -1423,13 +1455,27 @@ async def aretrieve_with_semantic_selection(
                         regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
                         progress_events.append("turn-budget-skip-reassess")
                         deadline_stops += 1
+                        if turn_dag is not None:
+                            turn_dag.provider_timeout("retrieval-coverage")
                     except OpenCodeRateLimitError:
+                        if turn_dag is not None:
+                            turn_dag.provider_rate_limited("retrieval-coverage")
                         raise
                     else:
                         _regrown_ms = (time.perf_counter() - _regrown_started) * 1000.0
                         cov_ms_total += _regrown_ms
                         provider_durations_ms.append(_regrown_ms)
                         model_calls += 1
+                        if turn_dag is not None:
+                            try:
+                                _regrown_missing = list(
+                                    getattr(regrown_verdict, "missing_need_ids", []) or []
+                                )
+                            except Exception:
+                                _regrown_missing = []
+                            turn_dag.record_coverage_iteration(
+                                covered=0, uncovered=len(_regrown_missing)
+                            )
                 elif coverage_assessor is not None:
                     # Turn budget spent: keep the grown exact
                     # passages but do not issue another model call.
@@ -2207,8 +2253,17 @@ async def retrieval_node(
                 break
     else:
         queries = []
+    try:
+        _node_dag = ensure_turn_dag(state)
+        _node_dag.start_op("retrieval")
+        _node_dag_id = _node_dag.dag_id
+    except Exception:
+        _node_dag = None
+        _node_dag_id = ""
     if not queries:
         logger.info("v2 retrieval skipped", extra={"queries": 0})
+        if _node_dag is not None:
+            _node_dag.finish_op("retrieval", ok=True, category="skipped")
         return {
             "retrieval_hits": [],
             "evidence_pack": [],
@@ -2224,6 +2279,7 @@ async def retrieval_node(
                     "coverage_status": "not_requested",
                 }
             ),
+            "semantic_dag_id": _node_dag_id,
         }
     active_config = config if config is not None else RetrievalConfig()
     started = time.perf_counter()
@@ -2282,6 +2338,7 @@ async def retrieval_node(
         information_needs=state_needs,
         query_need_map=state_query_map,
         turn_budget=graph_budget,
+        turn_dag=_node_dag,
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     over_budget = elapsed_ms > INTERACTIVE_LATENCY_BUDGET_MS
@@ -2335,12 +2392,21 @@ async def retrieval_node(
         retrieval_metadata = sanitize_retrieval_metadata(dict(pack.retrieval_metadata or {}))
     except Exception:
         retrieval_metadata = {}
+    if _node_dag is not None:
+        try:
+            _coverage_status = str(
+                (pack.retrieval_metadata or {}).get("coverage_status", "unknown") or "unknown"
+            )
+        except Exception:
+            _coverage_status = "unknown"
+        _node_dag.finish_op("retrieval", ok=True, category=_coverage_status)
     return {
         "retrieval_hits": hits,
         "evidence_pack": pack_dicts,
         "retrieval_latency_ms": elapsed_ms,
         "retrieval_over_budget": over_budget,
         "retrieval_metadata": retrieval_metadata,
+        "semantic_dag_id": _node_dag_id,
     }
 
 

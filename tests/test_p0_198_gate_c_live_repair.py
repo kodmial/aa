@@ -79,6 +79,22 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
     )
 
 
+def _batched_decision_json(passage_id: str, *, supported: bool = True) -> str:
+    """One batched single-round text reply for one response unit (kodmial/aa#380)."""
+    return json.dumps(
+        {
+            "verdicts": [
+                {
+                    "requires_book_evidence": True,
+                    "supported": supported,
+                    "evidence_passage_ids": [passage_id] if supported else [],
+                    "addresses_intent": bool(supported),
+                }
+            ]
+        }
+    )
+
+
 class _AdapterScriptedClient:
     """Scripted OpenCode client at the transport boundary."""
 
@@ -133,7 +149,7 @@ async def test_fallback_path_skips_structured_proactively() -> None:
                 "addresses_intent": True,
             }
         ],
-        text_outcomes=[_decision_json(pack[0]["passage_id"])],
+        text_outcomes=[_batched_decision_json(pack[0]["passage_id"])],
     )
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
@@ -157,7 +173,7 @@ async def test_text_validation_failure_retries_once_and_serves() -> None:
     client = _AdapterScriptedClient(
         text_outcomes=[
             "Конечно, постараюсь помочь.",
-            _decision_json(pack[0]["passage_id"]),
+            _batched_decision_json(pack[0]["passage_id"]),
         ],
     )
     model = OpenCodeChatModel(

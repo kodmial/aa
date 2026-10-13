@@ -125,6 +125,22 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
     )
 
 
+def _batched_decision_json(passage_id: str, *, supported: bool = True) -> str:
+    """One batched single-round text reply for one response unit (kodmial/aa#380)."""
+    return json.dumps(
+        {
+            "verdicts": [
+                {
+                    "requires_book_evidence": True,
+                    "supported": supported,
+                    "evidence_passage_ids": [passage_id] if supported else [],
+                    "addresses_intent": bool(supported),
+                }
+            ]
+        }
+    )
+
+
 async def test_structured_invalid_falls_back_to_text_once() -> None:
     """A structured object failing the decision schema still serves via text."""
     pack = [_pack_entry()]
@@ -133,14 +149,18 @@ async def test_structured_invalid_falls_back_to_text_once() -> None:
     client = _AdapterScriptedClient(
         structured_outcomes=[
             {
-                "requires_book_evidence": True,
-                "supported": True,
-                "evidence_passage_ids": [],
-                "addresses_intent": True,
-                "unit_id": "u1",
+                "verdicts": [
+                    {
+                        "requires_book_evidence": True,
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": True,
+                        "unit_id": "u1",
+                    }
+                ]
             }
         ],
-        text_outcomes=[_decision_json(pack[0]["passage_id"])],
+        text_outcomes=[_batched_decision_json(pack[0]["passage_id"])],
     )
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
@@ -163,8 +183,8 @@ async def test_capability_cache_skips_structured_on_next_round() -> None:
             OpenCodeDeterministicError("opencode structured output missing"),
         ],
         text_outcomes=[
-            _decision_json(pack[0]["passage_id"]),
-            _decision_json(pack[0]["passage_id"]),
+            _batched_decision_json(pack[0]["passage_id"]),
+            _batched_decision_json(pack[0]["passage_id"]),
         ],
     )
     model = OpenCodeChatModel(
