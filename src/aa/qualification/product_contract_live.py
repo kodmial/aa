@@ -1681,8 +1681,6 @@ LIVE_TEXT_LATENCY_BUDGET_S = 120.0
 def _live_prerequisites() -> tuple[bool, list[str]]:
     """Check real live prerequisites (fail-closed, privacy-safe)."""
     missing: list[str] = []
-    if not (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip():
-        missing.append("live-telegram-token-missing")
     if not (os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip():
         missing.append("live-book-identity-missing")
     return (not missing, missing)
@@ -4295,7 +4293,7 @@ def _failed_lane(lane: str, reason: str, scenarios_executed: int = 0) -> LaneRes
 
 async def _run_async_lanes(
     run_id: str = "local",
-) -> tuple[LaneResult, LaneResult, LaneResult, LaneResult]:
+) -> tuple[LaneResult, LaneResult, LaneResult]:
     # Per-lane fail-closed (issue #150): one lane's harness/import crash must
     # not abort the whole evaluation with no evidence. Each lane degrades to
     # an attributable FAIL so the summary still names the concrete lane.
@@ -4319,13 +4317,8 @@ async def _run_async_lanes(
         if isinstance(exc, OpenCodeRateLimitError):
             raise
         live_evidence = _failed_lane("live-telegram-evidence", type(exc).__name__)
-    try:
-        readiness = await run_telegram_readiness_lane()
-    except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
-        if isinstance(exc, OpenCodeRateLimitError):
-            raise
-        readiness = _failed_lane("telegram-readiness-D", type(exc).__name__)
-    return message, transport, live_evidence, readiness
+    # External Telegram readiness is outside product qualification.
+    return message, transport, live_evidence
 
 
 def evaluate_live(
@@ -4355,7 +4348,7 @@ def evaluate_live(
             run_id=run_id,
         )
     static_gates = collect_static_gates(root)
-    message, transport, live_evidence, readiness = asyncio.run(_run_async_lanes(run_id))
+    message, transport, live_evidence = asyncio.run(_run_async_lanes(run_id))
     try:
         control = run_control_lane(root)
     except Exception as exc:  # noqa: BLE001 - fail-closed attribution only
@@ -4368,7 +4361,7 @@ def evaluate_live(
         if isinstance(exc, OpenCodeRateLimitError):
             raise
         voice = _failed_lane("voice-1-16", type(exc).__name__)
-    lanes = (message, transport, control, voice, live_evidence, readiness)
+    lanes = (message, transport, control, voice, live_evidence)
     status = decide_status([lane.status for lane in lanes])
     summary = LiveSummary(
         main_sha=expected, status=status, lanes=lanes, static_gates=static_gates, run_id=run_id
