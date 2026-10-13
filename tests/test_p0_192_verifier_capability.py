@@ -9,8 +9,8 @@ not only fake-model unit tests, so a provider path that never returns a
 native structured verdict cannot look green:
 
 - structured-capability failure falls back once to bounded plain-text JSON
-  through the ordinary text path and still yields a strictly validated
-  decision (same single concurrent per-unit round);
+  through the ordinary text path and still yields strictly validated
+  per-unit decisions (same batched single round, kodmial/aa#380);
 - provider 429 always propagates immediately and never triggers text fallback;
 - invalid text JSON / missing keys / wrong types / unknown citations still
   fail closed (unknown envelope keys are dropped without being trusted;
@@ -139,6 +139,44 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
     )
 
 
+def _batched_decision_json(passage_id: str, *, supported: bool = True) -> str:
+    """One batched text reply: exactly one verdict for the single unit."""
+    return json.dumps(
+        {
+            "verdicts": [
+                {
+                    "requires_book_evidence": True,
+                    "supported": supported,
+                    "evidence_passage_ids": [passage_id] if supported else [],
+                    "addresses_intent": bool(supported),
+                }
+            ]
+        }
+    )
+
+
+def _batched_two_unit_json(passage_id: str) -> str:
+    """One batched text reply: glue verdict plus supported book verdict."""
+    return json.dumps(
+        {
+            "verdicts": [
+                {
+                    "requires_book_evidence": False,
+                    "supported": True,
+                    "evidence_passage_ids": [],
+                    "addresses_intent": True,
+                },
+                {
+                    "requires_book_evidence": True,
+                    "supported": True,
+                    "evidence_passage_ids": [passage_id],
+                    "addresses_intent": True,
+                },
+            ]
+        }
+    )
+
+
 async def test_structured_missing_falls_back_to_text_json_at_adapter_boundary() -> None:
     """A provider path with no native structured verdict still serves via text."""
     pack = [_pack_entry()]
@@ -147,11 +185,9 @@ async def test_structured_missing_falls_back_to_text_json_at_adapter_boundary() 
     client = _AdapterScriptedClient(
         structured_outcomes=[
             OpenCodeDeterministicError("opencode structured output missing"),
-            OpenCodeDeterministicError("opencode structured output missing"),
         ],
         text_outcomes=[
-            _decision_json(pack[0]["passage_id"]),
-            _decision_json(pack[0]["passage_id"]),
+            _batched_two_unit_json(pack[0]["passage_id"]),
         ],
     )
     model = OpenCodeChatModel(
@@ -163,10 +199,11 @@ async def test_structured_missing_falls_back_to_text_json_at_adapter_boundary() 
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
     assert [v.unit_id for v in result.units] == ["u1", "u2"]
-    # Exactly one logical concurrent round: one structured attempt plus one
-    # bounded text attempt per unit, no second verifier round.
-    assert client.structured_calls == len(units)
-    assert client.text_calls == len(units)
+    # Exactly one batched single round (kodmial/aa#380): one structured
+    # attempt plus one bounded text attempt for the whole draft, no
+    # second verifier round and no per-unit fanout.
+    assert client.structured_calls == 1
+    assert client.text_calls == 1
 
 
 async def test_text_fallback_rejects_invalid_json_fail_closed() -> None:
@@ -240,16 +277,20 @@ async def test_native_structured_success_uses_no_text_call() -> None:
     client = _AdapterScriptedClient(
         structured_outcomes=[
             {
-                "requires_book_evidence": False,
-                "supported": True,
-                "evidence_passage_ids": [],
-                "addresses_intent": True,
-            },
-            {
-                "requires_book_evidence": True,
-                "supported": True,
-                "evidence_passage_ids": [pack[0]["passage_id"]],
-                "addresses_intent": True,
+                "verdicts": [
+                    {
+                        "requires_book_evidence": False,
+                        "supported": True,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": True,
+                    },
+                    {
+                        "requires_book_evidence": True,
+                        "supported": True,
+                        "evidence_passage_ids": [pack[0]["passage_id"]],
+                        "addresses_intent": True,
+                    },
+                ]
             },
         ],
         text_outcomes=[],
@@ -263,7 +304,7 @@ async def test_native_structured_success_uses_no_text_call() -> None:
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
     assert client.text_calls == 0
-    assert client.structured_calls == len(units)
+    assert client.structured_calls == 1
 
 
 def test_parse_text_json_decision_strict() -> None:
@@ -356,10 +397,14 @@ async def test_text_fallback_unsupported_verdict_stays_unsupported() -> None:
     pack = [_pack_entry()]
     bad = json.dumps(
         {
-            "requires_book_evidence": True,
-            "supported": False,
-            "evidence_passage_ids": [pack[0]["passage_id"]],
-            "addresses_intent": False,
+            "verdicts": [
+                {
+                    "requires_book_evidence": True,
+                    "supported": False,
+                    "evidence_passage_ids": [pack[0]["passage_id"]],
+                    "addresses_intent": False,
+                }
+            ]
         }
     )
     client = _AdapterScriptedClient(

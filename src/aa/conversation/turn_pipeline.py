@@ -1081,12 +1081,13 @@ async def _verify_draft(
     try:
         result = await _invoke_verifier()
     except (VerifierValidationError, ValueError) as exc:
-        # Per-unit only verifier (kodmial/aa#190): run_verifier performs
-        # exactly one concurrent per-unit round of minimal boolean
-        # decisions. A validation-shaped failure fails closed immediately
-        # here without re-running planner/retrieval/answer: only a verdict
-        # passing full Pydantic + completeness + cite/quote/checksum gates
-        # is accepted. Provider or transport
+        # Single-round verifier (kodmial/aa#190, #380): run_verifier runs
+        # one batched round (or one bounded concurrent per-unit round on
+        # capability-incompatible models) of minimal boolean decisions. A
+        # validation-shaped failure fails closed immediately here without
+        # re-running planner/retrieval/answer: only a verdict passing
+        # full Pydantic + completeness + cite/quote/checksum gates is
+        # accepted. Provider or transport
         # failures below never retry here (the model adapter already
         # exhausted primary/fallback).
         logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
@@ -1134,6 +1135,7 @@ async def run_v2_answer_turn(
     resolved_turn: dict[str, Any] | None = None,
     context_digest: str | None = None,
     selection_events: dict[str, Any] | None = None,
+    turn_dag: Any | None = None,
 ) -> dict[str, Any]:
     """Run draft -> verify -> bounded repair -> envelope for one turn.
 
@@ -1340,6 +1342,65 @@ async def run_v2_answer_turn(
     except Exception:
         _proven_glue = bool(_mode == "conversational" and _query_hint == 0)
     _trace_id = str(turn_trace_id or _new_trace_id())
+
+    # Single coherent semantic work plan (kodmial/aa#380): one
+    # budget-aware plan plus the privacy-safe critical-path DAG for
+    # this turn. The caller (LangGraph answer node) shares its
+    # graph-level DAG so planner/retrieval/answer/verifier/judge stages
+    # record on one per-turn hashed id; direct callers get a fresh DAG.
+    # The DAG stores counts/digests/durations only, never text.
+    try:
+        from aa.conversation.semantic_work_plan import SemanticTurnDAG as _PlanDAG
+        from aa.conversation.semantic_work_plan import digest_bytes as _digest_bytes
+        from aa.conversation.semantic_work_plan import estimate_tokens_for_chars as _estimate_tokens
+        from aa.conversation.semantic_work_plan import new_work_plan as _new_work_plan
+
+        _dag = turn_dag if isinstance(turn_dag, _PlanDAG) else _PlanDAG()
+        _plan = _new_work_plan(_dag)
+    except Exception:
+        from aa.conversation.semantic_work_plan import SemanticTurnDAG as _PlanDAG
+        from aa.conversation.semantic_work_plan import digest_bytes as _digest_bytes
+        from aa.conversation.semantic_work_plan import estimate_tokens_for_chars as _estimate_tokens
+        from aa.conversation.semantic_work_plan import new_work_plan as _new_work_plan
+
+        _dag = _PlanDAG()
+        _plan = _new_work_plan(_dag)
+    try:
+        from aa.conversation.verifier import model_supports_batched_verifier as _batched_capable
+
+        _verifier_mode = (
+            "batched-single-round"
+            if bool(_batched_capable(verifier_model))
+            else "per-unit-concurrent-fallback"
+        )
+    except Exception:
+        _verifier_mode = "per-unit-concurrent-fallback"
+    # Validated-decision reuse within the same turn (kodmial/aa#380):
+    # a byte-identical draft reverified against a digest-identical pack
+    # reuses its verdicts without a new model call. Keyed by exact
+    # digests only, never text.
+    _verified_cache: dict[
+        tuple[str, str], tuple[list[ResponseUnitDraft], GroundingResult | None, bool]
+    ] = {}
+    _verifier_cache_hits = 0
+
+    def _supported_book_unit_count(result: GroundingResult | None) -> int:
+        """Count supported non-unavailable book units (progress marker)."""
+        if result is None:
+            return 0
+        try:
+            unavailable = set(getattr(result, "unavailable_unit_ids", ()) or ())
+            count = 0
+            for verdict in list(getattr(result, "units", []) or []):
+                if str(getattr(verdict, "unit_id", "")) in unavailable:
+                    continue
+                if str(getattr(verdict, "scope", "")) == "book" and bool(
+                    getattr(verdict, "supported", False)
+                ):
+                    count += 1
+            return count
+        except Exception:
+            return 0
 
     # Truthful selection route (#312): derived exclusively from executed
     # selection events, never from pack size or heuristic ordering. A
@@ -1622,6 +1683,37 @@ async def run_v2_answer_turn(
             telemetry["repair_rounds"] = rounds
         except NameError:
             telemetry["repair_rounds"] = int(telemetry.get("repair_rounds", 0))
+        # Single coherent work-plan evidence (kodmial/aa#380): the
+        # privacy-safe critical-path DAG snapshot plus plan
+        # description ride in telemetry (counts/digests/durations
+        # only, never user/book text). Provider timeout/cancellation
+        # censorship for Gate E is captured here as explicit counts,
+        # never hidden inside a generic clarification outcome.
+        try:
+            telemetry["verifier_round_mode"] = _verifier_mode
+            telemetry["verifier_cache_hits"] = int(_verifier_cache_hits)
+            telemetry["semantic_work_plan"] = _plan.describe()
+            _dag_snapshot = _dag.snapshot()
+            telemetry["semantic_dag"] = _dag_snapshot
+            _attempts = 0
+            _timeouts = 0
+            _cancelled = 0
+            _rate_limited = 0
+            for _op in _dag_snapshot.get("ops", []) or []:
+                if isinstance(_op, dict):
+                    try:
+                        _attempts += int(_op.get("attempts", 0) or 0)
+                        _timeouts += int(_op.get("timeouts", 0) or 0)
+                        _cancelled += int(_op.get("cancellations", 0) or 0)
+                        _rate_limited += int(_op.get("rate_limits", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            telemetry["provider_attempts"] = int(_attempts)
+            telemetry["provider_timeouts"] = int(_timeouts)
+            telemetry["provider_cancellations"] = int(_cancelled)
+            telemetry["provider_rate_limits"] = int(_rate_limited)
+        except Exception:
+            pass
         try:
             telemetry["evidence_window_omitted_generation"] = 0
             telemetry["evidence_window_omitted_verifier"] = 0
@@ -1791,7 +1883,12 @@ async def run_v2_answer_turn(
         # model call starts when the remaining slice cannot usefully
         # serve one; the caller serves narrowed/retry instead.
         remaining = _remaining_budget_s()
-        if remaining < TURN_ANSWER_MIN_SLICE_S:
+        # Deadline-aware plan check before issuing the provider call
+        # (kodmial/aa#380): the single coherent work plan owns the
+        # minimum-slice decision with identical numeric behavior.
+        if not _plan.allows_provider_call(
+            remaining_s=remaining, need_s=TURN_ANSWER_MIN_SLICE_S
+        ) or (remaining < TURN_ANSWER_MIN_SLICE_S):
             logger.info(
                 "v2 answer attempt skipped for end-to-end budget",
                 extra={"category": "answer-turn-budget"},
@@ -1800,6 +1897,19 @@ async def run_v2_answer_turn(
             telemetry["answer_outcome"] = "failed"
             return None
         attempt_budget = min(ANSWER_DRAFT_ATTEMPT_BUDGET_S, remaining)
+        try:
+            _evidence_chars_for_answer = sum(
+                len(str(item.get("text", "") or ""))
+                for item in active_pack
+                if isinstance(item, dict)
+            )
+        except Exception:
+            _evidence_chars_for_answer = 0
+        _dag.start_op("answer")
+        _dag.provider_attempt(
+            "answer",
+            input_tokens=_estimate_tokens(len(str(prompt_text or "")) + _evidence_chars_for_answer),
+        )
         # Re-validate on every draft, including repair paths (kodmial/aa#310):
         # merged/recovered packs fail before any answer LLM call.
         try:
@@ -1837,11 +1947,17 @@ async def run_v2_answer_turn(
                 1,
             )
             telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
+            _dag.record_token_usage("answer", output_tokens=_estimate_tokens(len(text)))
+            _dag.finish_op("answer", ok=True, category="draft-ok")
             return text
         except OpenCodeRateLimitError:
             # Provider 429 retires the runner; never collapse to retry.
+            _dag.provider_rate_limited("answer")
+            _dag.finish_op("answer", ok=False, category="provider-429")
             raise
         except asyncio.CancelledError:
+            _dag.provider_cancelled("answer")
+            _dag.finish_op("answer", ok=False, category="cancelled")
             raise
         except TimeoutError:
             # Caller-observed answer deadline (recurrence 9): the single
@@ -1865,10 +1981,13 @@ async def run_v2_answer_turn(
             )
             telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
             telemetry["answer_outcome"] = "failed"
+            _dag.provider_timeout("answer")
+            _dag.finish_op("answer", ok=False, category="attempt-timeout")
             return None
         except Exception as exc:
             logger.info("v2 answer generation failed", extra={"category": type(exc).__name__})
             telemetry["answer_outcome"] = "failed"
+            _dag.finish_op("answer", ok=False, category=type(exc).__name__)
             return None
 
     async def _verify_with_telemetry(
@@ -1877,19 +1996,98 @@ async def run_v2_answer_turn(
         *,
         turn_budget_s: float | None = None,
     ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
+        nonlocal _verifier_cache_hits
+
         started = time.perf_counter()
         try:
-            return await _verify_draft(
-                draft_text,
-                active_pack,
-                verifier_model=verifier_model,
-                turn_budget_s=turn_budget_s,
-                resolved_intent=_resolved_intent,
-                user_message=user_message,
-                conversation_context=_conversation_context,
-                recent=list(recent or []),
-                context_digest=_canonical_digest,
+            _draft_digest = _digest_bytes(str(draft_text or "").encode("utf-8"))
+        except Exception:
+            _draft_digest = ""
+        try:
+            from aa.conversation.finalization import (
+                evidence_digest_for_pack as _pack_digest_for_verify,
             )
+
+            _pack_digest_key = str(_pack_digest_for_verify(active_pack) or "")
+        except Exception:
+            _pack_digest_key = ""
+        _cache_key = (_draft_digest, _pack_digest_key)
+        if _draft_digest and _pack_digest_key and _cache_key in _verified_cache:
+            # Same-turn validated-decision reuse (kodmial/aa#380): a
+            # byte-identical draft against a digest-identical immutable
+            # pack reuses its verdicts with no new provider call.
+            _verifier_cache_hits += 1
+            telemetry["verifier_cache_hits"] = int(_verifier_cache_hits)
+            logger.info("v2 verifier cache hit reused validated decisions")
+            telemetry["verifier_latency_ms"] = round(
+                telemetry["verifier_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
+            )
+            return _verified_cache[_cache_key]
+        try:
+            _verify_evidence_chars = sum(
+                len(str(item.get("text", "") or ""))
+                for item in active_pack
+                if isinstance(item, dict)
+            )
+        except Exception:
+            _verify_evidence_chars = 0
+        _dag.start_op("verifier")
+        _dag.provider_attempt(
+            "verifier",
+            input_tokens=_estimate_tokens(len(str(draft_text or "")) + _verify_evidence_chars),
+        )
+        try:
+            try:
+                triple = await _verify_draft(
+                    draft_text,
+                    active_pack,
+                    verifier_model=verifier_model,
+                    turn_budget_s=turn_budget_s,
+                    resolved_intent=_resolved_intent,
+                    user_message=user_message,
+                    conversation_context=_conversation_context,
+                    recent=list(recent or []),
+                    context_digest=_canonical_digest,
+                )
+            except Exception as exc:
+                from aa.opencode.errors import OpenCodeRateLimitError as _VerifyRateLimit
+
+                if isinstance(exc, _VerifyRateLimit):
+                    _dag.provider_rate_limited("verifier")
+                    _dag.finish_op("verifier", ok=False, category="provider-429")
+                elif isinstance(exc, asyncio.CancelledError):
+                    _dag.provider_cancelled("verifier")
+                    _dag.finish_op("verifier", ok=False, category="cancelled")
+                elif isinstance(exc, TimeoutError):
+                    _dag.provider_timeout("verifier")
+                    _dag.finish_op("verifier", ok=False, category="round-timeout")
+                else:
+                    _dag.finish_op("verifier", ok=False, category=type(exc).__name__)
+                raise
+            _cached_units, _cached_result, _cached_passed = triple
+            if _draft_digest and _pack_digest_key:
+                _verified_cache[_cache_key] = triple
+            # One batched round ships the pack once; the per-unit
+            # fallback ships it once per unit. Record both the canonical
+            # size and the actually materialized bytes so repeated
+            # transfers stay visible.
+            _verify_unit_count = len(_cached_units)
+            if _verifier_mode == "batched-single-round":
+                _verify_materialized = _verify_evidence_chars
+            else:
+                _verify_materialized = _verify_evidence_chars * max(1, _verify_unit_count)
+            _dag.record_verifier_round(
+                unit_count=_verify_unit_count,
+                evidence_chars=_verify_evidence_chars,
+                materialized_chars=_verify_materialized,
+            )
+            if _cached_result is None:
+                _dag.finish_op("verifier", ok=False, category="unavailable")
+            elif _cached_passed:
+                _dag.finish_op("verifier", ok=True, category="passed")
+            else:
+                _dag.finish_op("verifier", ok=True, category="unsupported-or-partial")
+            return triple
         finally:
             telemetry["verifier_latency_ms"] = round(
                 telemetry["verifier_latency_ms"] + (time.perf_counter() - started) * 1000.0, 1
@@ -2209,14 +2407,19 @@ async def run_v2_answer_turn(
         # judge round can never consume the slice the verifier round
         # needs to complete. A turn too close to the deadline keeps its
         # adequacy outcome instead of grinding into budget-exceeded.
-        try:
-            _judge_reserve = max(0.0, float(TURN_VERIFIER_MIN_SLICE_S))
-        except (TypeError, ValueError):
-            _judge_reserve = TURN_VERIFIER_MIN_SLICE_S
-        cap = min(max(0.0, remaining - _judge_reserve), SUBSTANTIVE_JUDGE_CALL_CAP_S)
+        # The single coherent work plan owns this slice (kodmial/aa#380)
+        # with identical numeric behavior.
+        cap = _plan.judge_slice(remaining)
         if cap <= 0:
             return False
         _substantive_judge_calls += 1
+        _dag.start_op("whole_turn_judge")
+        _dag.provider_attempt(
+            "whole_turn_judge",
+            input_tokens=_estimate_tokens(
+                len(_resolved_request or "") + len(candidate) + len(_conversation_context or "")
+            ),
+        )
         try:
             judgement = await asyncio.wait_for(
                 _judge_turn(
@@ -2228,22 +2431,32 @@ async def run_v2_answer_turn(
                 timeout=cap,
             )
         except _JudgeRateLimit:
+            _dag.provider_rate_limited("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category="provider-429")
             raise
         except asyncio.CancelledError:
+            _dag.provider_cancelled("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category="cancelled")
             raise
         except Exception as exc:
             logger.info(
                 "v2 substantive judge unavailable; adequacy path preserved",
                 extra={"category": type(exc).__name__},
             )
+            if isinstance(exc, TimeoutError):
+                _dag.provider_timeout("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category=type(exc).__name__)
             return False
+        _dag.record_judge_round()
         try:
             available = bool(getattr(judgement, "available", False))
             helpful = bool(getattr(judgement, "helpful", False))
             addresses = bool(getattr(judgement, "addresses_intent", False))
             substantive = bool(getattr(judgement, "contains_substantive_claim", False))
         except Exception:
+            _dag.finish_op("whole_turn_judge", ok=False, category="verdict-invalid")
             return False
+        _dag.finish_op("whole_turn_judge", ok=True, category="judged")
         telemetry["independent_judge_helpful"] = helpful
         telemetry["independent_judge_addresses_intent"] = addresses
         telemetry["independent_judge_substantive"] = substantive
@@ -2381,7 +2594,29 @@ async def run_v2_answer_turn(
     # sequential work, so it is skipped without a provider call; the
     # existing-pack regen below still gets its bounded chance.
     seen_repair_query_sets: set[frozenset[str]] = set()
-    while not passed and rounds < max_repair_rounds and repair_allowed:
+    # Progress-gated repair (kodmial/aa#380): the full replan/retrieve
+    # pipeline never repeats on no-progress. Each round must add
+    # canonical evidence or newly supported units; otherwise the loop
+    # stops and downstream narrowing serves verified material instead
+    # of grinding more sequential provider calls.
+    try:
+        from aa.conversation.semantic_work_plan import RepairProgress as _RepairProgress
+        from aa.conversation.semantic_work_plan import (
+            repair_made_progress as _repair_progressed,
+        )
+
+        _repair_before = _RepairProgress(
+            pack_passages=len(pack),
+            supported_units=_supported_book_unit_count(result),
+        )
+    except Exception:
+        _repair_before = None
+    while (
+        not passed
+        and rounds < max_repair_rounds
+        and repair_allowed
+        and _plan.repair_full_round_allowed(full_rounds_used=rounds)
+    ):
         if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
             telemetry["repair_budget_exceeded"] = True
             logger.info(
@@ -2668,6 +2903,23 @@ async def run_v2_answer_turn(
             telemetry["verifier_outcome"] = "partial-unavailable"
         else:
             telemetry["verifier_outcome"] = "unsupported"
+        if not passed and rounds < max_repair_rounds and _repair_before is not None:
+            try:
+                _repair_after = _RepairProgress(
+                    pack_passages=len(pack),
+                    supported_units=_supported_book_unit_count(result),
+                )
+                if _repair_progressed(_repair_before, _repair_after):
+                    _repair_before = _repair_after
+                else:
+                    telemetry["repair_stopped_no_progress"] = True
+                    logger.info(
+                        "v2 repair stopped: no semantic progress",
+                        extra={"rounds": rounds},
+                    )
+                    break
+            except Exception:
+                pass
 
     # Relevance-padding rescue (kodmial/aa#284 systemic recurrence 2,
     # closed by breaker kodmial/aa#290 for verifier-unavailable poisoning).
@@ -4160,6 +4412,15 @@ async def answer_pipeline_node(
         )
     except Exception:
         _selection_events_d = None
+    # Share the graph-level per-turn DAG (kodmial/aa#380): planner and
+    # retrieval already recorded on it via state; the answer phase
+    # continues the same hashed turn id.
+    try:
+        from aa.conversation.semantic_work_plan import ensure_turn_dag as _ensure_answer_dag
+
+        _answer_dag = _ensure_answer_dag(state)
+    except Exception:
+        _answer_dag = None
     outcome = await run_v2_answer_turn(
         user_message=user_message,
         summary=str(state.get("conversation_summary", "")),
@@ -4185,6 +4446,7 @@ async def answer_pipeline_node(
         resolved_turn=_resolved_turn_d,
         context_digest=_ctx_digest or None,
         selection_events=_selection_events_d,
+        turn_dag=_answer_dag,
     )
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot

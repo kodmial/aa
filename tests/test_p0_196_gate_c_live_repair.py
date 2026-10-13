@@ -123,6 +123,22 @@ def _decision_json(passage_id: str, *, supported: bool = True) -> str:
     )
 
 
+def _batched_decision_json(passage_id: str, *, supported: bool = True) -> str:
+    """One batched single-round text reply for one response unit (kodmial/aa#380)."""
+    return json.dumps(
+        {
+            "verdicts": [
+                {
+                    "requires_book_evidence": True,
+                    "supported": supported,
+                    "evidence_passage_ids": [passage_id] if supported else [],
+                    "addresses_intent": bool(supported),
+                }
+            ]
+        }
+    )
+
+
 async def test_generic_provider_error_falls_back_to_text_once() -> None:
     """A generic provider-side structured failure still serves via text."""
     pack = [_pack_entry()]
@@ -130,7 +146,7 @@ async def test_generic_provider_error_falls_back_to_text_once() -> None:
     assert len(units) == 1
     client = _AdapterScriptedClient(
         structured_outcomes=[OpenCodeNotReadyError("opencode runtime has not been started")],
-        text_outcomes=[_decision_json(pack[0]["passage_id"])],
+        text_outcomes=[_batched_decision_json(pack[0]["passage_id"])],
     )
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]
@@ -150,7 +166,7 @@ async def test_startup_error_falls_back_to_text_once() -> None:
     units = split_response_units("Поддержка рядом помогает.")
     client = _AdapterScriptedClient(
         structured_outcomes=[OpenCodeStartupError("failed to launch opencode serve")],
-        text_outcomes=[_decision_json(pack[0]["passage_id"])],
+        text_outcomes=[_batched_decision_json(pack[0]["passage_id"])],
     )
     model = OpenCodeChatModel(
         client,  # type: ignore[arg-type]

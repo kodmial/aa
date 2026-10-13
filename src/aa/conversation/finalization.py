@@ -1080,10 +1080,19 @@ async def finalize_answer_node(state: Any) -> dict[str, Any]:
 
     if str(state.get("route", NORMAL_ROUTE)) != NORMAL_ROUTE:
         return {}
+    try:
+        from aa.conversation.semantic_work_plan import ensure_turn_dag as _ensure_finalize_dag
+
+        _finalize_dag = _ensure_finalize_dag(state)
+        _finalize_dag.start_op("finalize")
+    except Exception:
+        _finalize_dag = None
     candidate, grounding, question, resolved_intent, summary, messages, stored_texts = (
         candidate_from_state(state)
     )
     if not question.strip():
+        if _finalize_dag is not None:
+            _finalize_dag.finish_op("finalize", ok=False, category="empty-question")
         raise FinalizationError("empty-question", "refusing certification without a question")
     try:
         certificate = certify_candidate(
@@ -1095,12 +1104,24 @@ async def finalize_answer_node(state: Any) -> dict[str, Any]:
             recent_messages=messages,
             stored_unit_texts=stored_texts,
         )
-    except FinalizationError:
+    except FinalizationError as exc:
+        if _finalize_dag is not None:
+            _finalize_dag.finish_op(
+                "finalize", ok=False, category=str(getattr(exc, "category", "certify-failed"))
+            )
         raise
     except Exception as exc:
+        if _finalize_dag is not None:
+            _finalize_dag.finish_op("finalize", ok=False, category=type(exc).__name__)
         raise FinalizationError("certify-failed", type(exc).__name__) from exc
     # Mechanical self-check before the message enters history.
     verify_certificate(candidate=candidate, certificate=certificate)
+    if _finalize_dag is not None:
+        # Final certificate issued on the real graph path
+        # (kodmial/aa#380): the certified finalize op in the DAG
+        # snapshot is the delivery-gate proof. Counts only, never
+        # candidate/certificate text.
+        _finalize_dag.finish_op("finalize", ok=True, category="certified")
     return {
         "draft_response": candidate.text,
         "final_response": candidate.text,
