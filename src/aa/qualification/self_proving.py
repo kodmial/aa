@@ -1,6 +1,6 @@
 """Self-proving layered qualification DAG (issue #146).
 
-Authoritative Gates A-F for the exact current ``main`` SHA:
+Authoritative required Gates A/B/C/E/F for the exact current ``main`` SHA:
 
 - Gate A -- static/build: exact SHA checkout + clean tree, canonical
   restore metadata/fingerprints, unit/type/lint, prompt/config/model/
@@ -21,14 +21,10 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
   planner/answer/verifier/provider/retrieval. Scenario families (never
   exact-question whitelists), response-diversity assertion, privacy-safe
   per-stage outcomes and latency only.
-- Gate D -- real Telegram network/runtime readiness: real bot token,
-  OpenCode health, ``getMe``, webhook cleanup/config, commands setup, long
-  polling started, durable ``STARTING -> READY -> STOPPED|FAILED`` marker
-  with exact run id/SHA. ``/bot status`` reports that marker.
 - Gate E -- live performance/SLO: end-to-end and per-stage latency,
   p50/p95, hard guard (no ordinary turn >= 30s), typing heartbeat
   continuity verified independently.
-- Gate F -- exact-main final verdict: PASS only if A-E PASS for the exact
+- Gate F -- exact-main final verdict: PASS only if A/B/C/E PASS for the exact
   same current main SHA and matching product/runtime fingerprints. No stale
   reuse, no manual override.
 
@@ -60,6 +56,7 @@ ISSUE_NUMBER = 146
 CONTROL_ISSUE_NUMBER = 31
 QUALIFICATION_ISSUE_NUMBER = 7
 
+# Preserve legacy D as a historical evidence identifier, not a required gate.
 GATE_IDS: tuple[str, ...] = ("A", "B", "C", "D", "E", "F")
 # The external Telegram network Gate D was retired by product-owner decision.
 # No second bot, polling lease, or synthetic D PASS is required.
