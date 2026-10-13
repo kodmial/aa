@@ -124,7 +124,7 @@ def _evidence_dir(
             category="" if c_status == "PASS" else "live-path-failed",
             live=True,
         ),
-                _signed(
+        _signed(
             "E",
             e_status,
             [],
