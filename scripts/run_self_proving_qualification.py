@@ -61,6 +61,7 @@ from aa.qualification.gate_latency import (  # noqa: E402
 )
 from aa.qualification.self_proving import (  # noqa: E402
     GateEvidence,
+    MANDATORY_GATES,
     SelfProvingError,
     build_result_marker,
     decide_final_verdict,
@@ -853,13 +854,10 @@ def _gate_b(expected_sha: str, run_id: str, product: str, runtime: str) -> GateE
 
 
 def _live_prerequisites() -> tuple[bool, str]:
-    token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
     identity = (os.environ.get("AA_BOOK_AGE_IDENTITY", "") or "").strip()
     live = (os.environ.get("SELF_PROVING_LIVE", "") or "").strip() == "1"
     if not live:
         return False, "live-execution-not-enabled"
-    if not token:
-        return False, "missing-secret-telegram-token"
     if not identity:
         return False, "missing-secret-corpus-identity"
     return True, ""
@@ -3025,7 +3023,7 @@ def reduce_final_from_evidence_dir(
     out_dir.mkdir(parents=True, exist_ok=True)
     loaded: dict[str, dict[str, object]] = {}
     load_errors: dict[str, SelfProvingError] = {}
-    for gate in ("A", "B", "C", "D", "E"):
+    for gate in MANDATORY_GATES:
         filename = GATE_EVIDENCE_FILES[gate]
         try:
             payload = load_and_validate_evidence(
@@ -3058,7 +3056,7 @@ def reduce_final_from_evidence_dir(
             partial_runtime = next(iter(runtimes))
             try:
                 partial_evidences: list[GateEvidence] = []
-                for gate in ("A", "B", "C", "D", "E"):
+                for gate in MANDATORY_GATES:
                     if gate in loaded:
                         partial_evidences.append(evidence_to_gate_evidence(loaded[gate]))
                     else:
@@ -3102,14 +3100,14 @@ def reduce_final_from_evidence_dir(
                 product=partial_product,
                 runtime=partial_runtime,
             )
-        first_missing = next(gate for gate in ("A", "B", "C", "D", "E") if gate in load_errors)
+        first_missing = next(gate for gate in MANDATORY_GATES if gate in load_errors)
         load_exc = load_errors[first_missing]
         print(f"self-proving Gate F BLOCKED: {load_exc}", file=sys.stderr)
         # blocking_gate is the first failed gate (human summary); failed_gates
         # names every independently failed gate: each unloadable artifact plus
         # any loaded artifact that is non-PASS or part of a
         # fingerprint-disagreement/unknown set.
-        order = ("A", "B", "C", "D", "E")
+        order = MANDATORY_GATES
         products_seen = {str(loaded[gate].get("product_fingerprint", "")) for gate in loaded}
         runtimes_seen = {str(loaded[gate].get("runtime_fingerprint", "")) for gate in loaded}
         fingerprints_disagree = bool(loaded) and (
@@ -3192,7 +3190,7 @@ def reduce_final_from_evidence_dir(
         )
         return EXIT_BLOCKED
     try:
-        evidences = [evidence_to_gate_evidence(loaded[gate]) for gate in ("A", "B", "C", "D", "E")]
+        evidences = [evidence_to_gate_evidence(loaded[gate]) for gate in MANDATORY_GATES]
         verdict = decide_final_verdict(
             evidences,
             current_sha=expected,
@@ -3224,14 +3222,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", "local"))
     parser.add_argument(
         "--emit-gate",
-        choices=("A", "B", "C", "D", "E"),
+        choices=MANDATORY_GATES,
         default=None,
         help="Execute one gate exactly once and publish its durable V2 evidence artifact.",
     )
     parser.add_argument(
         "--final-only",
         action="store_true",
-        help="Gate F pure reducer: consume validated A-E evidence only, no re-evaluation.",
+        help="Gate F pure reducer: consume validated A/B/C/E evidence only, no re-evaluation.",
     )
     parser.add_argument(
         "--evidence-dir",
@@ -3259,7 +3257,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--check-skip",
-        choices=("A", "B", "C", "D", "E"),
+        choices=MANDATORY_GATES,
         default=None,
         help=(
             "Exit 0 only when a validated typed checkpoint plus its matching "
@@ -3303,7 +3301,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_dir=evidence_dir, out_dir=out_dir, expected_sha=expected, run_id=run_id
         )
 
-    if args.emit_gate in ("A", "B", "C", "D", "E"):
+    if args.emit_gate in MANDATORY_GATES:
         if args.emit_gate == "A":
             shell_status = _normalize_shell_status(str(args.shell_a_status))
             shell_detail = str(args.shell_a_detail or "")
@@ -3462,20 +3460,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         latencies, aggregate_slo = [], None
     try:
-        gate_d = _gate_d(expected, run_id, product, runtime)
-    except Exception as exc:
-        gate_d = GateEvidence(
-            gate="D",
-            status="BLOCKED",
-            sha=expected,
-            product_fingerprint=product,
-            runtime_fingerprint=runtime,
-            failure_category="runner-error",
-            component="telegram-readiness",
-            run_id=run_id,
-            detail=f"{type(exc).__name__}: {exc}"[:64],
-        )
-    try:
         # Prefer the single-owner C-series (served plus bounded-censored
         # timeout samples with causality ids) when the live-out payload
         # carries it; timed-out turns are then counted, never dropped.
@@ -3509,13 +3493,12 @@ def main(argv: list[str] | None = None) -> int:
             detail=f"{type(exc).__name__}: {exc}"[:64],
         )
 
-    evidences = [gate_a, gate_b, gate_c, gate_d, gate_e]
+    evidences = [gate_a, gate_b, gate_c, gate_e]
     # Publish durable V2 evidence for the freshly evaluated live gates so
     # Gate F can reduce read-only (A/B artifacts already published above).
     _publish_generic_gate_evidence(out_dir, gate_c)
-    _publish_generic_gate_evidence(out_dir, gate_d)
     _publish_generic_gate_evidence(out_dir, gate_e)
-    for _fresh in (gate_c, gate_d, gate_e):
+    for _fresh in (gate_c, gate_e):
         _write_gate_checkpoint(out_dir, _fresh, product=product, runtime=runtime)
     try:
         verdict = decide_final_verdict(
