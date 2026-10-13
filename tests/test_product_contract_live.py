@@ -310,14 +310,13 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
     if "lanes" not in payload:
         assert "clean" in str(payload.get("reason", "")).casefold()
         return
-    assert len(payload["lanes"]) == 6
+    assert len(payload["lanes"]) == 5
     assert {lane["lane"] for lane in payload["lanes"]} == {
         "product-contract-1-24",
         "telegram-transport-25-32",
         "runtime-control-33-41",
         "voice-1-16",
         "live-telegram-evidence",
-        "telegram-readiness-D",
     }
     summary = json.loads(
         (tmp_path / "product-contract-live-summary.json").read_text(encoding="utf-8")
