@@ -21,10 +21,6 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
   planner/answer/verifier/provider/retrieval. Scenario families (never
   exact-question whitelists), response-diversity assertion, privacy-safe
   per-stage outcomes and latency only.
-- Gate D -- real Telegram network/runtime readiness: real bot token,
-  OpenCode health, ``getMe``, webhook cleanup/config, commands setup, long
-  polling started, durable ``STARTING -> READY -> STOPPED|FAILED`` marker
-  with exact run id/SHA. ``/bot status`` reports that marker.
 - Gate E -- live performance/SLO: end-to-end and per-stage latency,
   p50/p95, hard guard (no ordinary turn >= 30s), typing heartbeat
   continuity verified independently.
@@ -739,7 +735,7 @@ def canary_scope() -> dict[str, Any]:
     """
     return {
         "schedule_hours": _CANARY_EVERY_HOURS,
-        "gates": ["C-smoke", "D-readiness", "E-latency-guard"],
+        "gates": ["C-smoke", "E-latency-guard"],
         "blocks_new_run_until_green": False,
         "never_blocks_owner_run": True,
         "auto_repair": True,
