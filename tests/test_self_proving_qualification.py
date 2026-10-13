@@ -340,8 +340,8 @@ def test_repair_loop_single_issue_and_rerun_order() -> None:
     assert repair_fingerprint(same_defect_new_sha) == fingerprint
     assert find_reusable_repair([(12, fingerprint), (13, "other")], fingerprint=fingerprint) == 12
     assert find_reusable_repair([(12, "other")], fingerprint=fingerprint) is None
-    assert rerun_plan("C") == ["C", "D", "E", "F"]
-    assert rerun_plan("A") == ["A", "B", "C", "D", "E", "F"]
+    assert rerun_plan("C") == ["C", "E", "F"]
+    assert rerun_plan("A") == ["A", "B", "C", "E", "F"]
     with pytest.raises(SelfProvingError):
         rerun_plan("Z")
 
