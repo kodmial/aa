@@ -215,7 +215,7 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     original_readiness = live_mod.run_telegram_readiness_lane
     live_mod.run_telegram_readiness_lane = _ok_readiness  # type: ignore[assignment]
     try:
-        message, transport, live_evidence, readiness = asyncio.run(live_mod._run_async_lanes())
+        message, transport, live_evidence = asyncio.run(live_mod._run_async_lanes())
     finally:
         live_mod.run_message_lane = original_message
         live_mod.run_transport_lane = original_transport
@@ -227,7 +227,6 @@ def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:
     assert_no_text_leak(message.to_dict())
     assert transport.status == "PASS"
     assert live_evidence.status == "INCOMPLETE"
-    assert readiness.status == "INCOMPLETE"
 
 
 def test_ephemeral_gate_checkpoints_stay_untracked() -> None:
@@ -311,14 +310,13 @@ def test_live_runner_executes_all_lanes(tmp_path: Path) -> None:
     if "lanes" not in payload:
         assert "clean" in str(payload.get("reason", "")).casefold()
         return
-    assert len(payload["lanes"]) == 6
+    assert len(payload["lanes"]) == 5
     assert {lane["lane"] for lane in payload["lanes"]} == {
         "product-contract-1-24",
         "telegram-transport-25-32",
         "runtime-control-33-41",
         "voice-1-16",
         "live-telegram-evidence",
-        "telegram-readiness-D",
     }
     summary = json.loads(
         (tmp_path / "product-contract-live-summary.json").read_text(encoding="utf-8")

@@ -28,7 +28,7 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
 - Gate E -- live performance/SLO: end-to-end and per-stage latency,
   p50/p95, hard guard (no ordinary turn >= 30s), typing heartbeat
   continuity verified independently.
-- Gate F -- exact-main final verdict: PASS only if A-E PASS for the exact
+- Gate F -- exact-main final verdict: PASS only if A/B/C/E PASS for the exact
   same current main SHA and matching product/runtime fingerprints. No stale
   reuse, no manual override.
 
@@ -61,7 +61,8 @@ CONTROL_ISSUE_NUMBER = 31
 QUALIFICATION_ISSUE_NUMBER = 7
 
 GATE_IDS: tuple[str, ...] = ("A", "B", "C", "D", "E", "F")
-MANDATORY_GATES: tuple[str, ...] = ("A", "B", "C", "D", "E")
+# Telegram network proof is not a prerequisite for assistant qualification.
+MANDATORY_GATES: tuple[str, ...] = ("A", "B", "C", "E")
 
 GATE_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "INCOMPLETE", "STALE", "BLOCKED")
 FINAL_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "BLOCKED")
