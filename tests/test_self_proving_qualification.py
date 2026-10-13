@@ -380,7 +380,7 @@ def test_canary_never_blocks_owner_run() -> None:
     scope = canary_scope()
     assert scope["schedule_hours"] == 4
     assert "C-smoke" in scope["gates"]
-    assert "D-readiness" in scope["gates"]
+    assert "D-readiness" not in scope["gates"]
     assert "E-latency-guard" in scope["gates"]
     assert scope["blocks_new_run_until_green"] is False
     assert scope["never_blocks_owner_run"] is True
