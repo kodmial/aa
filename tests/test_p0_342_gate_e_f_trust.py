@@ -662,13 +662,9 @@ def test_checkpoint_skip_binds_evidence(tmp_path: Path, monkeypatch: pytest.Monk
     )
 
 
-def test_emit_c_and_d_publish_single_owner_evidence(
+def test_emit_c_and_retired_d_cannot_publish_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import time as _time
-
-    from aa.control.runtime_status import RuntimeMarker, write_marker
-
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setenv("AA_GATE_CHECKPOINT_DIR", str(tmp_path / "checkpoints"))
     out_dir = tmp_path / "self-proving-out"
@@ -718,10 +714,8 @@ def test_emit_c_and_d_publish_single_owner_evidence(
         expected_run_id="run-9",
     )
     assert c_loaded["status"] == "FAIL"
-    write_marker(
-        out_dir / "runtime-status.json",
-        RuntimeMarker(run_id="run-9", sha=SHA, phase="STOPPED", timestamp_s=_time.time()),
-    )
+    # The old external polling/network Gate D is deliberately non-runnable;
+    # a historical marker must never manufacture an accepted D PASS.
     rc = runner._run_emit_gate(
         gate="D",
         expected=SHA,
@@ -730,14 +724,8 @@ def test_emit_c_and_d_publish_single_owner_evidence(
         shell_status="missing",
         shell_detail="",
     )
-    assert rc == 0
-    d_loaded = load_and_validate_evidence(
-        out_dir / GATE_EVIDENCE_FILES["D"],
-        expected_gate="D",
-        expected_sha=SHA,
-        expected_run_id="run-9",
-    )
-    assert d_loaded["status"] == "PASS"
+    assert rc == runner.EXIT_BLOCKED
+    assert not (out_dir / GATE_EVIDENCE_FILES["D"]).exists()
 
 
 def test_coerce_samples_rejects_mixed_series() -> None:
