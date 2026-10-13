@@ -124,8 +124,7 @@ def _evidence_dir(
             category="" if c_status == "PASS" else "live-path-failed",
             live=True,
         ),
-        _signed("D", "PASS", [], sha=sha, run_id=run_id, component="telegram-readiness", live=True),
-        _signed(
+                _signed(
             "E",
             e_status,
             [],
@@ -477,7 +476,7 @@ def test_gate_f_fail_closed_negatives(tmp_path: Path) -> None:
     missing = json.loads((tmp_path / "empty-out" / "result.json").read_text(encoding="utf-8"))
     assert missing["result"] == "BLOCKED"
     assert missing["blocking_gate"] == "A"
-    assert missing["failed_gates"] == ["A", "B", "C", "D", "E"]
+    assert missing["failed_gates"] == ["A", "B", "C", "E"]
 
 
 def test_gate_f_forged_artifact_fails_closed(tmp_path: Path) -> None:
@@ -533,7 +532,6 @@ def test_blocking_gate_is_human_summary_failed_gates_is_complete() -> None:
             ("A", "PASS"),
             ("B", "PASS"),
             ("C", "FAIL"),
-            ("D", "PASS"),
             ("E", "FAIL"),
         )
     ]
