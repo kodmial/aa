@@ -235,7 +235,7 @@ def test_mandatory_workflow_is_observable_idempotent_trigger() -> None:
 
 def test_self_proving_lane_owns_live_secrets_and_privacy() -> None:
     body = SELF_PROVING_WORKFLOW.read_text(encoding="utf-8")
-    assert "TELEGRAM_BOT_TOKEN" in body
+    assert "TELEGRAM_BOT_TOKEN" not in body
     assert "AA_BOOK_AGE_IDENTITY" in body
     assert "required_sha" in body
     assert "exact current main" in body
