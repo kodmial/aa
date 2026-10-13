@@ -2480,6 +2480,162 @@ async def run_v2_answer_turn(
         )
         return True
 
+    async def _judge_reconciled_dialogue(
+        candidate_text: str,
+        candidate_units: list[ResponseUnitDraft] | None,
+        candidate_result: GroundingResult | None,
+    ) -> bool:
+        """Whether two model judgments agree the candidate is pure dialogue.
+
+        Systemic repair (kodmial/aa#385): the recurrent
+        ``C:live-meta-direct-1:live-production-path`` collapse is a
+        planner-mode coupling, not wording. Every narrow patch certified
+        one planner-certified glue path (telemetry, narrowing, fast-path)
+        but delivery still gated on the planner's stochastic
+        conversational/retrieval bit plus an empty pack. A meta paraphrase
+        whose planner emits queries (or whose retrieval returns an
+        irrelevant pack) therefore collapses to clarification while clean
+        siblings pass, moving the same fingerprint across SHAs with
+        repair_turns/budget_exceeded/clarifications stable. This helper
+        decouples delivery from that single bit: the verifier's
+        per-unit scope and the separately instantiated whole-turn judge
+        must independently agree the served candidate carries no
+        substantive claim, while mechanical guards hold. Substantive
+        requests keep strict grounding (any book-scoped unit, any
+        judge substantive flag, or any unavailable unit fails closed to
+        the historical path). Budget-neutral: at most one bounded judge
+        call on the collapse path only, skipped when either budget is
+        spent or the remaining slice cannot serve one call. No
+        exact-question, keyword, stem, step-number, token-overlap or
+        handcrafted semantic predicates; only model verdicts plus
+        mechanical output guards.
+        """
+        nonlocal _substantive_judge_calls
+        if whole_turn_judge_model is None:
+            return False
+        candidate = (candidate_text or "").strip()
+        if not candidate:
+            return False
+        try:
+            from aa.conversation.failures import is_service_error as _is_svc385
+        except Exception:
+            return False
+        if _is_svc385(candidate):
+            return False
+        if not contains_cyrillic(candidate) or leaks_internal_terms(candidate):
+            return False
+        if not envelope_passes(candidate):
+            return False
+        if not certify_outbound_safety(candidate):
+            return False
+        if candidate_result is None:
+            return False
+        try:
+            unavailable_ids = set(getattr(candidate_result, "unavailable_unit_ids", ()) or ())
+        except Exception:
+            return False
+        if unavailable_ids:
+            return False
+        try:
+            has_book_scope = any(
+                str(getattr(item, "scope", "")) == "book" for item in (candidate_result.units or [])
+            )
+        except Exception:
+            return False
+        if has_book_scope:
+            return False
+        # Verifier units alone never prove dialogue: an empty unit list
+        # carries no scope signal, so the judge must still certify.
+        if _substantive_judge_calls >= SUBSTANTIVE_JUDGE_MAX_CALLS:
+            return False
+        try:
+            if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
+                return False
+            if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                return False
+        except Exception:
+            return False
+        remaining = _remaining_budget_s()
+        if remaining < TURN_VERIFIER_MIN_SLICE_S:
+            return False
+        try:
+            from aa.conversation.whole_turn_judge import (
+                JUDGE_INDEPENDENCE_LIMITATION as _JUDGE_LIMIT385,
+            )
+            from aa.conversation.whole_turn_judge import judge_whole_turn as _judge385
+            from aa.opencode.errors import OpenCodeRateLimitError as _JudgeRL385
+        except Exception:
+            return False
+        telemetry["judge_independence_limitation"] = _JUDGE_LIMIT385
+        cap = _plan.judge_slice(remaining)
+        if cap <= 0:
+            return False
+        try:
+            digest = safety_candidate_fingerprint(candidate)
+        except Exception:
+            digest = ""
+        if digest and digest in _judge_approved_digests:
+            # A previously approved digest still needs its substantive
+            # flag: approval alone does not prove dialogue.
+            pass
+        _substantive_judge_calls += 1
+        _dag.start_op("whole_turn_judge")
+        _dag.provider_attempt(
+            "whole_turn_judge",
+            input_tokens=_estimate_tokens(
+                len(_resolved_request or "") + len(candidate) + len(_conversation_context or "")
+            ),
+        )
+        try:
+            judgement = await asyncio.wait_for(
+                _judge385(
+                    resolved_intent=_resolved_request,
+                    reply=candidate,
+                    context=_conversation_context,
+                    model=whole_turn_judge_model,
+                ),
+                timeout=cap,
+            )
+        except _JudgeRL385:
+            _dag.provider_rate_limited("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category="provider-429")
+            raise
+        except asyncio.CancelledError:
+            _dag.provider_cancelled("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category="cancelled")
+            raise
+        except Exception as exc:
+            logger.info(
+                "v2 reconciled dialogue judge unavailable",
+                extra={"category": type(exc).__name__},
+            )
+            if isinstance(exc, TimeoutError):
+                _dag.provider_timeout("whole_turn_judge")
+            _dag.finish_op("whole_turn_judge", ok=False, category=type(exc).__name__)
+            return False
+        _dag.record_judge_round()
+        try:
+            available = bool(getattr(judgement, "available", False))
+            helpful = bool(getattr(judgement, "helpful", False))
+            addresses = bool(getattr(judgement, "addresses_intent", False))
+            substantive = bool(getattr(judgement, "contains_substantive_claim", False))
+        except Exception:
+            _dag.finish_op("whole_turn_judge", ok=False, category="verdict-invalid")
+            return False
+        _dag.finish_op("whole_turn_judge", ok=True, category="judged")
+        telemetry["independent_judge_helpful"] = helpful
+        telemetry["independent_judge_addresses_intent"] = addresses
+        telemetry["independent_judge_substantive"] = substantive
+        if not available:
+            return False
+        if helpful and addresses and not substantive:
+            if digest:
+                _judge_approved_digests.add(digest)
+            return True
+        if digest:
+            _judge_rejected_digests.add(digest)
+        return False
+
     telemetry["answer_outcome"] = "draft-ok"
     verifier_slice = _verifier_round_budget()
     if verifier_slice is not None and verifier_slice < TURN_VERIFIER_MIN_SLICE_S:
@@ -3421,6 +3577,34 @@ async def run_v2_answer_turn(
                                 "telemetry": dict(telemetry),
                                 "evidence_pack": list(pack),
                             }
+                # Judge-reconciled dialogue rescue (kodmial/aa#385):
+                # a verifier-passing draft that adequacy rejects as
+                # all-glue/irrelevant for a planner-substantive turn is
+                # exactly the planner-misclassified meta shape. When the
+                # verifier and the whole-turn judge independently agree it
+                # carries no substantive claim and it addresses the live
+                # request, serve it as conversational delivery instead of
+                # collapsing to clarification. Mixed substantive requests
+                # stay failed (judge addresses False or verifier book
+                # scope present).
+                if await _judge_reconciled_dialogue(current_draft, units, result):
+                    telemetry["outbound_safety"] = "pass"
+                    telemetry["answer_outcome"] = "conversational-generated"
+                    telemetry["adequacy_verdict"] = _ADEQ_PASS
+                    telemetry["failure_category"] = ""
+                    telemetry["answers_request"] = True
+                    telemetry["technically_grounded"] = False
+                    telemetry["qualified"] = True
+                    _finish_telemetry()
+                    return {
+                        "text": current_draft,
+                        "units": units,
+                        "verification": grounding_result_to_state(result),
+                        "rounds": rounds,
+                        "recent_quote_ranges": list(recent_ranges),
+                        "telemetry": dict(telemetry),
+                        "evidence_pack": list(pack),
+                    }
                 telemetry["answer_outcome"] = "adequacy-repair-failed"
                 telemetry["failure_category"] = str(
                     telemetry.get("failure_category", "") or _FAIL_REPAIR
@@ -4316,6 +4500,43 @@ async def run_v2_answer_turn(
                 "telemetry": dict(telemetry),
                 "evidence_pack": list(pack),
             }
+    # Judge-reconciled tail rescue (kodmial/aa#385): same planner-mode
+    # decoupling as above, for turns that reach the repair-exhausted tail
+    # with an irrelevant non-empty pack. The existing candidate is served
+    # only when the verifier reports no book scope and the whole-turn
+    # judge independently certifies helpful, addresses_intent and no
+    # substantive claim. No new answer generation, no extra verifier
+    # round; at most the one bounded judge call inside the helper, skipped
+    # when budgets are spent. Substantive or unavailable turns still fail
+    # closed to clarification.
+    try:
+        _tail_candidate = current_draft if isinstance(current_draft, str) else ""
+        _tail_units = units
+        _tail_result = result
+    except NameError:
+        _tail_candidate = ""
+        _tail_units = []
+        _tail_result = None
+    if _tail_candidate.strip() and await _judge_reconciled_dialogue(
+        _tail_candidate, _tail_units, _tail_result
+    ):
+        telemetry["outbound_safety"] = "pass"
+        telemetry["answer_outcome"] = "conversational-generated"
+        telemetry["adequacy_verdict"] = _ADEQ_PASS
+        telemetry["failure_category"] = ""
+        telemetry["answers_request"] = True
+        telemetry["technically_grounded"] = False
+        telemetry["qualified"] = True
+        _finish_telemetry()
+        return {
+            "text": _tail_candidate,
+            "units": units,
+            "verification": grounding_result_to_state(result),
+            "rounds": rounds,
+            "recent_quote_ranges": list(recent_ranges),
+            "telemetry": dict(telemetry),
+            "evidence_pack": list(pack),
+        }
     telemetry["answer_outcome"] = "clarification-unavailable"
     if not str(telemetry.get("failure_category", "") or "").strip():
         telemetry["failure_category"] = _FAIL_REPAIR
