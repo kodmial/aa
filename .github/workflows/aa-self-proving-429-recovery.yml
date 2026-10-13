@@ -10,11 +10,16 @@ on:
 permissions:
   actions: write
   contents: read
+  issues: write
 
 jobs:
   recover:
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    # A GitHub startup_failure has no Gate evidence and is not a product FAIL.
+    if: ${{ contains(fromJSON('["failure","startup_failure","timed_out"]'), github.event.workflow_run.conclusion) }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: aa-self-proving-recovery-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     timeout-minutes: 10
     steps:
       - name: Recover self-proving control-plane failure
@@ -31,6 +36,31 @@ jobs:
             const runId = Number(process.env.FAILED_RUN_ID);
             const attempt = Number(process.env.FAILED_RUN_ATTEMPT || '1');
             const failedSha = String(process.env.FAILED_HEAD_SHA || '');
+            const conclusion = String(context.payload.workflow_run?.conclusion || '');
+            const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+            async function retryRerun() {
+              for (let trial = 1; trial <= 3; trial++) {
+                try {
+                  await github.rest.actions.reRunWorkflowFailedJobs({owner, repo, run_id: runId});
+                  return true;
+                } catch (error) {
+                  if (![429,500,502,503,504].includes(Number(error.status || 0))) throw error;
+                  // A 500 response may occur AFTER GitHub accepted the rerun.
+                  const response = await github.rest.actions.getWorkflowRun({owner, repo, run_id: runId});
+                  if (Number(response.data.run_attempt || 0) > attempt ||
+                      ['queued', 'in_progress', 'waiting'].includes(response.data.status)) {
+                    core.info('Rerun already accepted despite ambiguous HTTP error; do not submit twice.');
+                    return true;
+                  }
+                  if (trial === 3) {
+                    core.warning('GitHub rerun API still unavailable after 3 bounded attempts; no blind duplicate.');
+                    return false;
+                  }
+                  await delay(3000 * trial);
+                }
+              }
+              return false;
+            }
             if (!Number.isInteger(runId) || runId <= 0) {
               core.setFailed('Invalid failed run id for self-proving recovery.');
               return;
@@ -42,6 +72,8 @@ jobs:
             let restartFound = false;
             let staleFound = false;
             let transientFound = false;
+            let externalFound = false;
+            let evidenceFound = false;
             for (let check = 1; check <= 5; check++) {
               const artifacts = await github.paginate(
                 github.rest.actions.listWorkflowRunArtifacts,
@@ -50,7 +82,9 @@ jobs:
               restartFound = artifacts.some(a => a.name === restartName && !a.expired);
               staleFound = artifacts.some(a => a.name === staleName && !a.expired);
               transientFound = artifacts.some(a => a.name === transientName && !a.expired);
-              if (restartFound || staleFound || transientFound) break;
+              externalFound = artifacts.some(a => a.name === `aa-self-proving-external-${attempt}` && !a.expired);
+              evidenceFound = artifacts.some(a => a.name.startsWith('aa-self-proving-evidence-') && !a.expired);
+              if (restartFound || staleFound || transientFound || externalFound || evidenceFound) break;
               if (check < 5) await new Promise(resolve => setTimeout(resolve, 5000));
             }
 
@@ -60,6 +94,11 @@ jobs:
             const currentMain = String((main.commit && main.commit.sha) || '');
             if (!currentMain) {
               core.setFailed('Cannot resolve current main SHA for self-proving recovery.');
+              return;
+            }
+
+            if (externalFound) {
+              core.warning('Gate D lacks an authorized isolated test bot; unchanged credentials cannot be repaired by reruns.');
               return;
             }
 
@@ -78,9 +117,7 @@ jobs:
             }
 
             if (transientFound) {
-              const delaySeconds = Math.min(
-                300, 15 * (2 ** Math.min(Math.max(attempt - 1, 0), 4))
-              );
+              const delaySeconds = Math.min(15, 5 * Math.max(attempt, 1));
               core.info(
                 `External/transient qualification blocker: waiting ${delaySeconds}s before ownerless retry.`
               );
@@ -94,24 +131,45 @@ jobs:
                 });
                 return;
               }
-              if (attempt < 10) {
-                await github.rest.actions.reRunWorkflowFailedJobs({
-                  owner, repo, run_id: runId,
-                });
+              // Never spin through 10 runs for an unchanged environmental
+              // fault, and never start a fresh unbounded retry generation.
+              if (attempt >= 3) {
+                core.warning('Transient run retry budget exhausted; manual prerequisites or a new main revision are needed.');
                 return;
               }
-              await github.rest.actions.createWorkflowDispatch({
-                owner, repo,
-                workflow_id: 'aa-self-proving-qualification.yml',
-                ref: 'main',
-                inputs: { required_sha: currentMain },
-              });
+              if (!await retryRerun()) {
+                core.warning('GitHub 5xx prevented a bounded rerun. No duplicate workflow was launched.');
+              }
               return;
             }
 
             if (!restartFound) {
+              if (conclusion === 'startup_failure' && !evidenceFound && failedSha === currentMain) {
+                // A runner did not start; do not misclassify it as Gate A
+                // failure. Recover once per exact SHA with a durable marker.
+                const marker = `<!-- aa-startup-failure-recovery sha=${currentMain} -->`;
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: 7, per_page: 100,
+                });
+                if (comments.some(x => String(x.body || '').includes(marker))) {
+                  core.warning('Exact-SHA runner startup recovery already used; refusing another.');
+                  return;
+                }
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: 'aa-self-proving-qualification.yml',
+                  ref: 'main',
+                  inputs: { required_sha: currentMain },
+                });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: 7,
+                  body: marker + '\nOne bounded fresh-run recovery for a GitHub startup failure with no gate artifacts.',
+                });
+                core.notice('Dispatched one fresh exact-main run for GitHub startup_failure.');
+                return;
+              }
               core.info(
-                `No ${restartName}, ${staleName}, or ${transientName}; product failure stays with the repair loop.`
+                `No recoverable provider/infra marker for run ${runId}; completed product or external blockers stay BLOCKED.`
               );
               return;
             }
@@ -130,29 +188,15 @@ jobs:
               return;
             }
 
-            const delaySeconds = Math.min(
-              300, 5 * (2 ** Math.min(Math.max(attempt - 1, 0), 6))
-            );
+            const delaySeconds = Math.min(15, 5 * Math.max(attempt, 1));
             core.info(`Provider 429 backoff: waiting ${delaySeconds}s before fresh-VM recovery.`);
             await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
 
-            if (attempt < 10) {
-              core.info(
-                `Provider 429: re-running failed jobs for run ${runId}, next attempt ${attempt + 1}.`
-              );
-              await github.rest.actions.reRunWorkflowFailedJobs({
-                owner, repo, run_id: runId,
-              });
+            if (attempt >= 3) {
+              core.warning('Provider 429 retry budget exhausted for this exact SHA; no fresh infinite run series.');
               return;
             }
-
-            core.info(
-              `Provider 429 persisted through ${attempt} attempts; dispatching a fresh exact-main qualification run.`
-            );
-            await github.rest.actions.createWorkflowDispatch({
-              owner,
-              repo,
-              workflow_id: 'aa-self-proving-qualification.yml',
-              ref: 'main',
-              inputs: { required_sha: currentMain },
-            });
+            core.info(`Provider 429: bounded attempt ${attempt + 1} for run ${runId}.`);
+            if (!await retryRerun()) {
+              core.warning('Provider 429 recovery could not contact GitHub Actions; no blind duplicate.');
+            }
