@@ -61,7 +61,9 @@ CONTROL_ISSUE_NUMBER = 31
 QUALIFICATION_ISSUE_NUMBER = 7
 
 GATE_IDS: tuple[str, ...] = ("A", "B", "C", "D", "E", "F")
-MANDATORY_GATES: tuple[str, ...] = ("A", "B", "C", "D", "E")
+# The external Telegram network Gate D was retired by product-owner decision.
+# No second bot, polling lease, or synthetic D PASS is required.
+MANDATORY_GATES: tuple[str, ...] = ("A", "B", "C", "E")
 
 GATE_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "INCOMPLETE", "STALE", "BLOCKED")
 FINAL_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "BLOCKED")
@@ -738,7 +740,7 @@ def canary_scope() -> dict[str, Any]:
     """
     return {
         "schedule_hours": _CANARY_EVERY_HOURS,
-        "gates": ["C-smoke", "D-readiness", "E-latency-guard"],
+        "gates": ["C-smoke", "E-latency-guard"],
         "blocks_new_run_until_green": False,
         "never_blocks_owner_run": True,
         "auto_repair": True,
