@@ -60,8 +60,8 @@ from aa.qualification.gate_latency import (  # noqa: E402
     evaluate_latency_report,
 )
 from aa.qualification.self_proving import (  # noqa: E402
-    GateEvidence,
     MANDATORY_GATES,
+    GateEvidence,
     SelfProvingError,
     build_result_marker,
     decide_final_verdict,
