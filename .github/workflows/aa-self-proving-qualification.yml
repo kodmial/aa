@@ -408,7 +408,9 @@ jobs:
           else
             echo "::error::Gate D BLOCKED: no isolated test bot and no production lease (EXTERNAL_TEST_BOT_UNAVAILABLE)."
             mkdir -p self-proving-out
-            printf '{"reason_code":"EXTERNAL_TEST_BOT_UNAVAILABLE","gate":"D"}\n' > self-proving-out/transient-blocked.json
+            # Missing authorization is a permanent external prerequisite for this SHA,
+            # not a transient provider error. Retrying cannot create a bot.
+            printf '{"reason_code":"EXTERNAL_TEST_BOT_UNAVAILABLE","gate":"D"}\n' > self-proving-out/external-blocked.json
             exit 78
           fi
           if [[ -n "${AA_TEST_TELEGRAM_BOT_ID:-}" ]]; then
@@ -893,6 +895,48 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+      - name: Upload missing external-prerequisite evidence
+        if: ${{ always() && hashFiles('self-proving-out/external-blocked.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-self-proving-external-${{ github.run_attempt }}
+          path: self-proving-out/external-blocked.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish actionable external-prerequisite blocker
+        if: ${{ always() && hashFiles('self-proving-out/external-blocked.json') != '' }}
+        uses: actions/github-script@v7
+        env:
+          QUAL_SHA: ${{ steps.sha.outputs.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('self-proving-out/external-blocked.json', 'utf8'));
+            const sha = String(process.env.QUAL_SHA || '').toLowerCase();
+            if (data.reason_code !== 'EXTERNAL_TEST_BOT_UNAVAILABLE' || !/^[0-9a-f]{40}$/.test(sha)) {
+              core.setFailed('External blocker proof malformed; refusing classification.');
+              return;
+            }
+            const marker = `<!-- aa-qualification-external-blocker sha=${sha} reason=EXTERNAL_TEST_BOT_UNAVAILABLE -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: 7, per_page: 100,
+            });
+            if (!comments.some(c => String(c.body || '').includes(marker))) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: 7,
+                body: [
+                  marker,
+                  'Gate D BLOCKED: neither an isolated test bot nor an authorized exclusive production-poller lease exists.',
+                  'This is a missing external test credential, not a defect repaired by OpenCode retries.',
+                  'Configure AA_TEST_TELEGRAM_BOT_TOKEN for a dedicated isolated test bot; optionally pin AA_TEST_TELEGRAM_BOT_ID.',
+                  'Do not mutate a deployed bot, forge polling/delivery evidence, or mark #7 PASS.',
+                ].join('\n'),
+              });
+            }
+            core.warning('External Gate D authorization missing: code mutation/retry suppressed until configuration changes.');
+
       - name: Publish machine-readable failure and repair marker
         # Provider 429 and external/transient blockers are recovery states,
         # not product-code repair issues.
@@ -900,7 +944,7 @@ jobs:
         # from the persisted gate checkpoints.
         # Missing setup/checkout proof is an infrastructure failure, not an
         # implementation defect. Never open code-repair tasks for it.
-        if: ${{ failure() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        if: ${{ failure() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' && hashFiles('self-proving-out/external-blocked.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
