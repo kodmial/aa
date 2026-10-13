@@ -362,15 +362,13 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
 
 def test_gate_d_external_prerequisite_never_enters_provider_retry_loop() -> None:
     """Missing test identity is not a provider outage and cannot be fixed by retrying."""
-    wf = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(
-        encoding="utf-8"
-    )
+    wf = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(encoding="utf-8")
     gate_d = wf.split("- name: Gate D - real Telegram network/runtime readiness", 1)[1]
     gate_d = gate_d.split("- name: Gate E - live performance/SLO", 1)[0]
     assert "AA_TEST_TELEGRAM_BOT_TOKEN" in gate_d
     assert "AA_TEST_TELEGRAM_USE_PRODUCTION_LEASE" in gate_d
-    assert 'self-proving-out/external-blocked.json' in gate_d
-    assert 'EXTERNAL_TEST_BOT_UNAVAILABLE' in gate_d
+    assert "self-proving-out/external-blocked.json" in gate_d
+    assert "EXTERNAL_TEST_BOT_UNAVAILABLE" in gate_d
     # External prereqs publish explicit safe evidence and never create
     # a code-repair issue for an unchanged secret configuration.
     assert "- name: Upload missing external-prerequisite evidence" in wf
@@ -389,9 +387,7 @@ def _inline_github_script(block: str) -> str:
 
 def test_self_proving_recovery_is_bounded_and_javascript_parses(tmp_path: Path) -> None:
     """Production incident: 500 on rerun after 240s caused a frozen six-attempt series."""
-    wf = (ROOT / ".github/workflows/aa-self-proving-429-recovery.yml").read_text(
-        encoding="utf-8"
-    )
+    wf = (ROOT / ".github/workflows/aa-self-proving-429-recovery.yml").read_text(encoding="utf-8")
     assert '"startup_failure"' in wf
     assert "externalFound" in wf
     assert "if (attempt >= 3)" in wf
