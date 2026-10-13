@@ -12,7 +12,7 @@ After activation the canary exercises the real production boundary:
 - qualified encrypted RU corpus, RAM index, pinned E5 prerequisites;
 - bounded production AA runtime through ``Application.start``;
 - OpenCode readiness;
-- Telegram Bot API authentication/readiness;
+- in-process production Telegram-adapter serialization (no Bot API calls);
 - synthetic Russian meta turn with no mechanics leakage;
 - synthetic Russian substantive turn with planner 10-16, hybrid
   retrieval, Evidence Pack, and claim-grounded reply;
@@ -658,55 +658,6 @@ async def _run_compact_checks() -> tuple[list[CheckResult], float]:
             ready_detail,
         )
 
-        # Telegram Bot API readiness without a real user message.
-        started = time.perf_counter()
-        token = (os.environ.get("TELEGRAM_BOT_TOKEN", "") or "").strip()
-        if token:
-            try:
-                probe_url = f"https://api.telegram.org/bot{token}/getMe"
-                request = urllib.request.Request(probe_url, method="GET")
-
-                def _probe() -> tuple[bool, str]:
-                    try:
-                        with urllib.request.urlopen(request, timeout=15) as response:
-                            payload = json.loads(response.read().decode("utf-8"))
-                        result = payload.get("result") or {}
-                        ok = bool(payload.get("ok") is True and result.get("is_bot") is True)
-                        return ok, "bot-api-ready" if ok else "telegram-auth-failed"
-                    except urllib.error.HTTPError as exc:
-                        if exc.code == 429:
-                            return False, "telegram-transient-rate-limit-429"
-                        if 500 <= exc.code < 600:
-                            return False, f"telegram-transient-network-http-{exc.code}"
-                        return False, f"telegram-http-{exc.code}"
-                    except Exception as exc:
-                        # Timeouts, DNS/reset connection errors, and other
-                        # transport failures must stay distinguishable from
-                        # an auth failure so a transient blip never opens a
-                        # P0 product repair issue.
-                        return False, _transient_aware_detail(
-                            "telegram", exc, "telegram-auth-failed"
-                        )
-
-                telegram_ok, telegram_detail = await asyncio.to_thread(_probe)
-                _record(
-                    "telegram-readiness",
-                    telegram_ok,
-                    started,
-                    telegram_detail,
-                )
-            except Exception as exc:
-                _record("telegram-readiness", False, started, f"telegram:{type(exc).__name__}")
-        else:
-            # Fail closed without a token: no Bot API authentication was
-            # proven, so the check must FAIL instead of passing offline.
-            _record(
-                "telegram-readiness",
-                False,
-                started,
-                "telegram-token-missing",
-            )
-
         # Synthetic Russian meta turn through the production Telegram adapter.
         started = time.perf_counter()
         chat_meta = 820001
@@ -1218,11 +1169,11 @@ def main(argv: list[str] | None = None) -> int:
         details = " ".join(check.detail for check in failed)
         candidate = classify_failure(details)
         # An infrastructure-looking detail is only trusted when every
-        # failing check owns external I/O (telegram-readiness,
-        # opencode-readiness). Anything else stays a product regression
+        # failing check owns external I/O (opencode-readiness only).
+        # Anything else stays a product regression
         # so external blips cannot mask a real product defect.
         if candidate in ("provider-transient", "github-infrastructure") and not all(
-            check.name in ("telegram-readiness", "opencode-readiness") for check in failed
+            check.name == "opencode-readiness" for check in failed
         ):
             candidate = "product-regression"
         failure_class = candidate
