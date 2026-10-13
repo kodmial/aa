@@ -127,7 +127,7 @@ def test_incomplete_missing_stale_mocked_all_block_qualification_not_run() -> No
         assert verdict.status in ("FAIL", "BLOCKED")
         # Qualification is BLOCKED, but owner /run stays available.
         assert is_run_allowed(verdict, current_sha=SHA) is True
-    verdict = _verdict({"D": "FAIL"})
+    verdict = _verdict({"E": "FAIL"})
     assert verdict.status == "FAIL"
     assert is_run_allowed(verdict, current_sha=SHA) is True
     # Mocked-only PASS evidence blocks.
@@ -380,7 +380,7 @@ def test_canary_never_blocks_owner_run() -> None:
     scope = canary_scope()
     assert scope["schedule_hours"] == 4
     assert "C-smoke" in scope["gates"]
-    assert "D-readiness" in scope["gates"]
+    assert "D-readiness" not in scope["gates"]
     assert "E-latency-guard" in scope["gates"]
     assert scope["blocks_new_run_until_green"] is False
     assert scope["never_blocks_owner_run"] is True
@@ -408,7 +408,6 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
         "Gate A - static/build",
         "Gate B - deterministic component integration",
         "Gate C - LIVE exact production conversation path",
-        "Gate D - real Telegram network/runtime readiness",
         "Gate E - live performance/SLO",
         "Gate F - exact-main final verdict",
         "TELEGRAM_BOT_TOKEN",
@@ -480,9 +479,6 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     # Gate C. Otherwise the final verdict can falsely downgrade valid live
     # evidence to C:live-execution-not-enabled.
     gate_c = workflow.split("Gate C - LIVE exact production conversation path", 1)[1].split(
-        "Gate D - real Telegram network/runtime readiness", 1
-    )[0]
-    gate_d = workflow.split("Gate D - real Telegram network/runtime readiness", 1)[1].split(
         "Gate E - live performance/SLO", 1
     )[0]
     gate_e = workflow.split("Gate E - live performance/SLO", 1)[1].split(
@@ -491,7 +487,7 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     gate_f = workflow.split("Gate F - exact-main final verdict", 1)[1].split(
         "Stage gate checkpoints for resume", 1
     )[0]
-    for independent in (gate_d, gate_e):
+    for independent in (gate_e,):
         assert "steps.gate-c.outcome == 'success'" in independent
         assert "steps.gate-c.outcome == 'failure'" in independent
         assert "restart-required.json" in independent
@@ -502,23 +498,23 @@ def test_workflows_own_secrets_assets_and_repair() -> None:
     assert "--check-skip E" in gate_e
     assert "runner_rc=0" not in gate_e
     assert "|| runner_rc=$?" not in gate_e
-    # Gate C/D single owners emit exactly once as well.
+    # Gate C single owner; the retired Telegram network probe never runs.
     assert "--emit-gate C" in gate_c
-    assert "--emit-gate D" in gate_d
+    assert "--emit-gate D" not in workflow
     # Typed checkpoints: skips validate schema/SHA/run bindings, never a
     # bare gate-X.done file.
-    for block in (gate_c, gate_d, gate_e):
+    for block in (gate_c, gate_e):
         assert "--check-skip" in block
     assert "gate-*.done" not in workflow
     # Gate C owns the live provider execution and Gate F reduces its trusted
-    # artifacts; both keep the live prerequisites. Gate D owns the isolated
-    # real-network probe identity instead of the live-execution flag.
+    # artifacts; both keep live prerequisites; no external test bot needed.
     for block in (gate_c, gate_f):
         assert 'SELF_PROVING_LIVE: "1"' in block
         assert "TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}" in block
         assert "AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}" in block
-    assert "AA_TEST_TELEGRAM_BOT_TOKEN" in gate_d
-    assert "isolated-test-bot" in gate_d
+    assert "AA_TEST_TELEGRAM_BOT_TOKEN" not in workflow
+    assert "EXTERNAL_TEST_BOT_UNAVAILABLE" not in workflow
+    assert "Gate D - real Telegram" not in workflow
 
 
 def test_gate_c_preserves_live_failure_without_live_env(
