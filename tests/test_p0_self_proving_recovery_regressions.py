@@ -150,7 +150,7 @@ def _run_publisher_scenario(
         f"sha: '{failed_sha}', runId: 424242 }};\n"
         "const __issues = JSON.parse(__fs.readFileSync("
         f"'{issues_file.as_posix()}', 'utf8'));\n"
-        "const __calls = { created: [], updated: [], dispatched: 0 };\n"
+        "const __calls = { created: [], updated: [], comments: [], dispatched: 0 };\n"
         "function __listForRepo() {}\n"
         "function __listComments() {}\n"
         "const github = { rest: { repos: { getBranch: async () => "
@@ -161,6 +161,8 @@ def _run_publisher_scenario(
         "      __issues.push({ number: n, state: 'open', body: args.body, title: args.title,\n"
         "        labels: (args.labels || []).map((name) => ({ name })) });\n"
         "      return { data: { number: n } }; },\n"
+        "    createComment: async (args) => { __calls.comments.push(args);\n"
+        "      return { data: { id: 1000 + __calls.comments.length } }; },\n"
         "    update: async (args) => { __calls.updated.push(args);\n"
         "      const found = __issues.find((i) => i.number === args.issue_number);\n"
         "      if (found) { if (args.body) found.body = args.body;\n"
@@ -178,7 +180,7 @@ def _run_publisher_scenario(
     epilogue = (
         "\n}\nawait __publisher();\n"
         f"__fs.writeFileSync('{result_file.as_posix()}', JSON.stringify("
-        "{ created: __calls.created, updated: __calls.updated, "
+        "{ created: __calls.created, updated: __calls.updated, comments: __calls.comments, "
         "dispatched: __calls.dispatched, issues: __issues, "
         "warnings: core.warnings, failures: core.failures }));\n"
         "})();\n"
@@ -356,7 +358,12 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         initial_issues=existing_issues,
     )
     assert len(repeat["created"]) == 0
-    assert len(repeat["updated"]) == 1
+    assert len(repeat["updated"]) == 0
+    assert len(repeat["comments"]) == 1
+    assert (
+        "Existing OpenCode generation specification remains immutable."
+        in repeat["comments"][0]["body"]
+    )
     assert len(repeat["issues"]) == 1
 
 
