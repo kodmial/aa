@@ -360,7 +360,10 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     assert len(repeat["created"]) == 0
     assert len(repeat["updated"]) == 0
     assert len(repeat["comments"]) == 1
-    assert "Existing OpenCode generation specification remains immutable." in repeat["comments"][0]["body"]
+    assert (
+        "Existing OpenCode generation specification remains immutable."
+        in repeat["comments"][0]["body"]
+    )
     assert len(repeat["issues"]) == 1
 
 
