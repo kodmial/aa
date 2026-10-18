@@ -21,7 +21,7 @@ import logging
 import re
 from typing import Any
 
-from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+from aa.config import DEFAULT_PRIMARY_MODEL
 from aa.conversation.model_adapter import VERIFIER_AGENT_V2
 from aa.opencode.errors import OpenCodeError
 
@@ -36,7 +36,10 @@ REQUESTED_PIN_FAILURE = "live-verifier-muse-requested-pinned"
 SPACE_BUNNY_FORBIDDEN_FAILURE = "live-verifier-space-bunny-forbidden"
 
 VERIFIER_EXPECTED_MODEL = DEFAULT_PRIMARY_MODEL
-VERIFIER_FORBIDDEN_MODEL = DEFAULT_FALLBACK_MODEL
+# Preserve the historically forbidden weak verifier route even when the
+# runtime fallback is configured to the same live model as the primary.
+# Otherwise every successful exact-model verifier response is rejected.
+VERIFIER_FORBIDDEN_MODEL = "opencode/space-bunny-free"
 
 # Fixed neutral probe utterance. It carries no evaluation content and is
 # never logged or returned; both wire variants use the identical text so
