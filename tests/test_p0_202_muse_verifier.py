@@ -57,7 +57,9 @@ from aa.qualification.verifier_muse_probe import (
     verifier_audit_entries,
 )
 
-MUSE = "opencode/muse-spark-1.3-contributor-free"
+# Legacy MUSE identifier retains historical test vocabulary while exercising
+# the currently qualified exact verifier model.
+MUSE = "opencode/nemotron-3-ultra-free"
 SPACE_BUNNY = "opencode/space-bunny-free"
 
 
@@ -256,6 +258,7 @@ def test_absent_verifier_is_specific_muse_access_failure() -> None:
 def test_space_bunny_can_never_serve_verifier() -> None:
     """Any Space Bunny record for the verifier fails the forbidden check."""
     assert VERIFIER_FORBIDDEN_MODEL == SPACE_BUNNY
+    assert VERIFIER_FORBIDDEN_MODEL != VERIFIER_EXPECTED_MODEL
     served_fallback = [{"agent": "aa-verifier-v2", "requested": MUSE, "served": SPACE_BUNNY}]
     _, failed = check_verifier_served_exact(served_fallback)
     assert failed == (SPACE_BUNNY_FORBIDDEN_FAILURE,)
