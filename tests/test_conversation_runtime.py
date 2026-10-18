@@ -795,9 +795,9 @@ def test_runtime_model_policy_has_no_third_fallback() -> None:
 
     settings = Settings.from_env({})
     assert settings.opencode_agent == AGENT_NAME
-    assert settings.opencode_model == PRIMARY
-    assert settings.opencode_fallback_model == FALLBACK
-    assert settings.opencode_model != settings.opencode_fallback_model
+    assert settings.opencode_model == "opencode/nemotron-3-ultra-free"
+    assert settings.opencode_fallback_model == settings.opencode_model
+    # No unverified second provider: model adapter suppresses same-model fallback.
 
 
 def test_fail_closed_reply_carries_no_book_claims() -> None:

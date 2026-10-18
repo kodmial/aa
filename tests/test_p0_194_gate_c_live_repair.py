@@ -348,7 +348,7 @@ def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> No
     assert planner.fallback_model == "opencode/space-bunny-free"
     assert verifier.agent == "aa-verifier-v2"
     assert verifier.primary_model == DEFAULT_PRIMARY_MODEL
-    assert verifier.primary_model == "opencode/muse-spark-1.3-contributor-free"
+    assert verifier.primary_model == "opencode/nemotron-3-ultra-free"
     assert verifier.fallback_model == ""
     # kodmial/aa#202: the logical audit identity stays aa-verifier-v2
     # while the transport selector is omitted on the wire.

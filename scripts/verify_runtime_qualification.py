@@ -42,7 +42,7 @@ REQUIRED_PROMPT_MARKERS = (
     "Russian conversations display quotations in Russian",
     "aa.grounding",
 )
-REQUIRED_AGENT_MODEL = "opencode/muse-spark-1.3-contributor-free"
+REQUIRED_AGENT_MODEL = "opencode/nemotron-3-ultra-free"
 
 
 def _fail(message: str) -> int:
