@@ -1,0 +1,20 @@
+name: Emergency model-qualified review
+on:
+  push:
+    branches: [ops/nemotron-review-recovery-20261019]
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: write
+jobs:
+  reviewed-head:
+    uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@fix/model-route-probe-20261018
+    secrets: inherit
+    with:
+      continuum_ref: fix/model-route-probe-20261018
+      review_provider: pr-agent
+      pr_number: "390"
+      expected_head_sha: "af4599e411fdb2bc198cf4582fdefce3105565fc"
+      opencode_model: opencode/nemotron-3-ultra-free
