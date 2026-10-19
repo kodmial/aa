@@ -4328,6 +4328,7 @@ def evaluate_live(
     *,
     repo_root: Path | None = None,
     run_id: str = "local",
+    gate_c_only: bool = False,
 ) -> LiveSummary:
     """Run all live lanes for ``main_sha`` and return a privacy-safe summary.
 
@@ -4350,6 +4351,27 @@ def evaluate_live(
             run_id=run_id,
         )
     static_gates = collect_static_gates(root)
+    if gate_c_only:
+        # A/B own deterministic message/transport/control/voice checks.
+        # The mandatory live C job must execute the real provider+book+agent
+        # conversation boundary ONCE, not re-run four other qualification lanes.
+        # Missing model/runtime proof still fails closed; full evaluate_live()
+        # remains available unchanged for standalone full-product diagnostics.
+        try:
+            live_evidence = asyncio.run(run_live_telegram_evidence_lane(run_id=run_id))
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            live_evidence = _failed_lane("live-telegram-evidence", type(exc).__name__)
+        summary = LiveSummary(
+            main_sha=expected,
+            status=decide_status([live_evidence.status]),
+            lanes=(live_evidence,),
+            static_gates=static_gates,
+            run_id=run_id,
+        )
+        assert_no_text_leak(summary.to_dict())
+        return summary
     message, transport, live_evidence = asyncio.run(_run_async_lanes(run_id))
     try:
         control = run_control_lane(root)
