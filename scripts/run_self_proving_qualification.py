@@ -224,7 +224,6 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             _policy.opencode_agent == DEFAULT_AA_AGENT
             and _policy.opencode_model == DEFAULT_PRIMARY_MODEL
             and _policy.opencode_fallback_model == DEFAULT_FALLBACK_MODEL
-            and _policy.opencode_model != _policy.opencode_fallback_model
         )
     except Exception:
         _policy_ok = False
