@@ -239,21 +239,21 @@ class TurnBudget:
                 elapsed_ms=self.elapsed_ms(),
                 remaining_ms=self.remaining_ms(),
             )
+        timeout_s = max(MIN_MODEL_SLICE_S, min(float(remaining), PROVIDER_REQUEST_TIMEOUT_S))
         if max_timeout_s is not None:
             try:
                 stage_cap = float(max_timeout_s)
             except (TypeError, ValueError):
-                stage_cap = None
-            if stage_cap is not None:
-                if stage_cap <= 0:
-                    raise TurnBudgetExpired(
-                        "semantic stage headroom already spent",
-                        stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
-                        elapsed_ms=self.elapsed_ms(),
-                        remaining_ms=self.remaining_ms(),
-                    )
-                remaining = min(float(remaining), stage_cap)
-        return max(MIN_MODEL_SLICE_S, min(float(remaining), PROVIDER_REQUEST_TIMEOUT_S))
+                stage_cap = 0.0
+            if stage_cap <= 0:
+                raise TurnBudgetExpired(
+                    "semantic stage headroom already spent",
+                    stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                    elapsed_ms=self.elapsed_ms(),
+                    remaining_ms=self.remaining_ms(),
+                )
+            timeout_s = min(timeout_s, stage_cap)
+        return timeout_s
 
     def record_stage(
         self,
