@@ -55,6 +55,21 @@ def test_qualified_model_403_and_broken_performance_are_not_code_mutations() -> 
     )
 
 
+def test_exhausted_c_breaker_cannot_be_evaded_via_e_slo_repair() -> None:
+    result = plan_repair(
+        [
+            failure("C", "live-book-grounding-substantive-drinking-2"),
+            failure("E", "latency-budget-exceeded", "slo"),
+        ],
+        gate_c_breaker=True,
+    )
+    assert result.actionable == ()
+    assert result.held == (
+        ("C", "global-gate-c-breaker"),
+        ("E", "latency-dependent-on-exhausted-c"),
+    )
+
+
 def test_clean_standalone_e_latency_regression_remains_actionable() -> None:
     assert plan_repair([failure("E", "ordinary-turn-failed", "slo")]).actionable == (0,)
 
