@@ -90,7 +90,10 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
     # The runner recovers after a quota burn, but production route policy
     # comes from Continuum and the owner-approved GitHub Variable. The old
     # hardcoded weak fallback must never be silently selected mid-turn.
-    assert "uses: kodmial/continuum/.github/actions/model-route@main" in workflow
+    assert (
+        "uses: kodmial/continuum/.github/actions/model-route@"
+        "d41b6ed6c87e544c70f3bf283ad4e272b4004fbe"
+    ) in workflow
     assert "models: ${{ vars.OPENCODE_MODELS }}" in workflow
     assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in workflow
     assert "opencode/space-bunny-free" not in workflow

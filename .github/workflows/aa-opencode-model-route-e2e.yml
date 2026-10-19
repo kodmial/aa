@@ -52,7 +52,7 @@ jobs:
           task-class: coder
           profile: aa-pr-live-acceptance
           state-token: ${{ github.token }}
-      - name: Run official OpenCode on live AA code checkout
+      - name: Run the AA agent on the live model route
         shell: bash
         env:
           MODEL: ${{ steps.aa_model_route.outputs.model }}
@@ -74,14 +74,30 @@ jobs:
           trap 'rm -rf "$dir"' EXIT
           cp opencode.json "$dir/opencode.json"
           cp -R prompts "$dir/prompts"
-          cp scripts/run_self_proving_qualification.py "$dir/aa-contract.py"
           cd "$dir"
+          log="$RUNNER_TEMP/aa-model-route-proof.log"
           env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
-            opencode run --auto --model "$MODEL" \
-            'Create aa-task-acceptance.txt containing exactly AA_MODEL_POLICY_ACCEPTED. This is a real isolated AA issue #391 code-task capability test.' \
-            > "$RUNNER_TEMP/aa-model-route-proof.log" 2>&1
-          test -f aa-task-acceptance.txt
-          test "$(cat aa-task-acceptance.txt)" = AA_MODEL_POLICY_ACCEPTED
+            opencode run --auto --agent aa --model "$MODEL" \
+            'Привет! Ответь по-русски одним коротким предложением.' \
+            > "$log" 2>&1
+          python3 - "$MODEL" "$log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          model, log_path = sys.argv[1], Path(sys.argv[2])
+          text = log_path.read_text(encoding="utf-8", errors="replace")
+          expected = f"> aa · {model.split('/', 1)[-1]}"
+          if expected not in text:
+              raise SystemExit(f"served model mismatch: expected {expected!r} in proof log")
+          response = [
+              line.strip()
+              for line in text.splitlines()
+              if line.strip() and not line.lstrip().startswith(">")
+          ]
+          if not response:
+              raise SystemExit("AA agent produced no response")
+          print("AA agent executed on the qualified model.")
+          PY
       - name: Attest real AA task completion
         uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:

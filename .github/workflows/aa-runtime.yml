@@ -424,7 +424,7 @@ jobs:
 
       - name: Qualify approved AA OpenCode model route
         id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           models: ${{ vars.OPENCODE_MODELS }}
           task-class: coder
