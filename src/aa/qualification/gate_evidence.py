@@ -94,9 +94,10 @@ GATE_A_COVERAGE: tuple[dict[str, str], ...] = (
     {
         "check_id": "a-model-policy",
         "owner": "gate-a",
-        "input": "Settings.from_env agent/model/fallback policy",
+        "input": "Settings.from_env agent/model/fallback policy + approved model pool/selection",
         "executable_check": (
-            "aa.config pinned runtime policy (agent/model/fallback match defaults; "
+            "runner _aa_model_policy_valid via self_proving.runtime_model_policy_ok "
+            "(agent/model/fallback match the Continuum-selected approved model; "
             "same-model fallback allowed)"
         ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-model-policy]",

@@ -52,7 +52,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from aa.config import DEFAULT_AA_AGENT, DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+from aa.config import DEFAULT_AA_AGENT
 
 ISSUE_NUMBER = 146
 CONTROL_ISSUE_NUMBER = 31
@@ -297,20 +297,35 @@ def validate_hex64(value: str) -> str:
     return normalized
 
 
-def runtime_model_policy_ok(*, agent: str, model: str, fallback_model: str) -> bool:
-    """Whether the resolved runtime model policy matches the pinned defaults.
+def runtime_model_policy_ok(
+    *,
+    agent: str,
+    pool: str,
+    selected_model: str,
+    model: str,
+    fallback_model: str,
+) -> bool:
+    """Whether the runtime route matches the Continuum-selected model.
 
-    The single live-validated free model serves as both the primary and the
-    fallback. The model adapter deliberately suppresses same-model fallback
-    (``fallback_model != primary_model``), so a distinct second provider is
-    neither required nor permitted: no unverified second provider may serve
-    the product. Any drift of the agent, primary model, or fallback model
-    from the pinned config defaults is a Gate A model-policy failure.
+    Continuum owns the approved model pool and freezes one selected model
+    before any product side effect. Gate A requires a non-empty, unique,
+    bounded pool that contains the selected model, and the agent, primary
+    model, and fallback model must all use that same frozen selection. The
+    model adapter suppresses same-model fallback (``fallback_model !=
+    primary_model``), so a distinct second provider is neither required nor
+    permitted: no unverified second provider may serve the product.
     """
+    raw_pool = (pool or "").strip()
+    routes = [route.strip() for route in raw_pool.split(",")] if raw_pool else []
+    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
+        return False
+    selected = (selected_model or "").strip()
     return (
-        (agent or "").strip() == DEFAULT_AA_AGENT
-        and (model or "").strip() == DEFAULT_PRIMARY_MODEL
-        and (fallback_model or "").strip() == DEFAULT_FALLBACK_MODEL
+        bool(selected)
+        and selected in routes
+        and (agent or "").strip() == DEFAULT_AA_AGENT
+        and (model or "").strip() == selected
+        and (fallback_model or "").strip() == selected
     )
 
 

@@ -129,19 +129,14 @@ def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool
     disabling in-turn fallback after irreversible conversational side effects.
     Missing/invalid pool attestation is a real Gate A failure.
     """
-    from aa.config import DEFAULT_AA_AGENT
+    from aa.qualification.self_proving import runtime_model_policy_ok
 
-    pool = environ.get("OPENCODE_MODELS", "").strip()
-    selected = environ.get("CONTINUUM_SELECTED_MODEL", "").strip()
-    routes = [route.strip() for route in pool.split(",")] if pool else []
-    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
-        return False
-    return (
-        bool(selected)
-        and selected in routes
-        and getattr(settings, "opencode_agent", None) == DEFAULT_AA_AGENT
-        and getattr(settings, "opencode_model", None) == selected
-        and getattr(settings, "opencode_fallback_model", None) == selected
+    return runtime_model_policy_ok(
+        agent=str(getattr(settings, "opencode_agent", "") or ""),
+        pool=environ.get("OPENCODE_MODELS", ""),
+        selected_model=environ.get("CONTINUUM_SELECTED_MODEL", ""),
+        model=str(getattr(settings, "opencode_model", "") or ""),
+        fallback_model=str(getattr(settings, "opencode_fallback_model", "") or ""),
     )
 
 

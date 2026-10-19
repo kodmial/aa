@@ -59,8 +59,6 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
-      OPENCODE_MODEL: opencode/nemotron-3-ultra-free
-      OPENCODE_FALLBACK_MODEL: opencode/nemotron-3-ultra-free
     steps:
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -78,6 +76,53 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install -e ".[dev]"
+
+      - name: Install pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
+              bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Qualify AA production model via Continuum
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          task-class: coder
+          profile: aa-product
+          state-token: ${{ github.token }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Freeze verified model for Gate C fixture generation
+        env:
+          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
+          test -n "$VERIFIED_MODEL"
+          {
+            echo "OPENCODE_MODELS=$APPROVED_POOL"
+            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
+            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
+            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
+          } >> "$GITHUB_ENV"
+          echo "AA model route frozen before Gate C fixture generation; no in-turn model switching."
 
       - name: Calibrate evaluator against public fixtures only
         shell: bash
