@@ -48,7 +48,7 @@ jobs:
           printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
       - name: Qualify real coding route with Continuum
         id: route
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           models: ${{ steps.pool.outputs.models }}
           profile: aa-live-e2e
@@ -75,7 +75,7 @@ jobs:
           test ! -e .git
           echo 'AA code-inspection/file-editing task passed on real approved route.'
       - name: Record accepted real AA task
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           operation: record
           models: ${{ steps.pool.outputs.models }}
@@ -107,7 +107,7 @@ jobs:
         run: printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
       - name: Reload sticky AA model on fresh VM
         id: route
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           models: ${{ steps.pool.outputs.models }}
           profile: aa-live-e2e
