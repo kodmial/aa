@@ -834,6 +834,70 @@ jobs:
               core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
               return;
             }
+            // Code mutation is NOT the same as a negative qualification verdict.
+            // Admission is one testable, repository-owned pure policy. Record
+            // every FAIL in #7 as before; use only proven product failures
+            // for automatic Git/PR side effects.
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100,
+            });
+            const activeRepair = issues.some(issue =>
+              !issue.pull_request && issue.state === 'open' &&
+              (String(issue.body || '').includes('<!-- aa-self-proving-repair:v1 -->') ||
+               String(issue.body || '').includes('<!-- aa-self-proving-systemic-escalation:v1 -->') ||
+               String(issue.body || '').includes('<!-- aa-self-proving-convergence-breaker:v1 -->')) &&
+              (issue.labels || []).some(label =>
+                label.name === 'automation:ready' || label.name === 'automation:in-progress'
+              )
+            );
+            const gateCBreaker = issues.some(issue =>
+              !issue.pull_request && issue.state === 'open' &&
+              String(issue.body || '').includes('<!-- aa-self-proving-convergence-breaker:v1 -->') &&
+              String(issue.body || '').includes('Convergence scope: `gate:C`') &&
+              (issue.labels || []).some(label => label.name === 'automation:blocked')
+            );
+            const { execFileSync } = require('child_process');
+            let admission;
+            try {
+              admission = JSON.parse(execFileSync(
+                'python',
+                ['scripts/plan_qualification_repair.py'],
+                {
+                  input: JSON.stringify({
+                    failures: productFailures,
+                    gate_c_breaker: gateCBreaker,
+                    in_flight_repair: activeRepair,
+                  }),
+                  encoding: 'utf8',
+                  timeout: 10000,
+                }
+              ));
+            } catch (error) {
+              // Invalid classifier/evidence blocks mutation, not qualification.
+              core.error('Qualification repair classifier failed; no code mutation: ' + error.message);
+              return;
+            }
+            core.notice('repair-policy decision: actionable=' +
+              admission.actionable.length + ' held=' + admission.held.length);
+            for (const held of admission.held) {
+              core.notice('repair-policy held gate ' + held.gate + ': ' + held.reason);
+            }
+            if (!Array.isArray(admission.actionable) || admission.actionable.length === 0) {
+              core.notice('FAIL/UNQUALIFIED evidence is preserved. No proven new code mutation admitted.');
+              return;
+            }
+            productFailures = admission.actionable.map(index => productFailures[index]);
+            typedFailedGates = productFailures.map(item => String(item.gate));
+            typedRoots = productFailures.map(item =>
+              String(item.gate) + ':' +
+              String(item.failure_category || 'FAIL') + ':' +
+              String(item.component || 'unknown')
+            );
+            const firstAdmitted = productFailures[0];
+            blocking = String(firstAdmitted.gate || 'unknown');
+            category = blocking + ':' + String(firstAdmitted.failure_category || 'FAIL');
+            component = String(firstAdmitted.component || 'unknown');
+            failGates = new Set(typedFailedGates);
             const marker = '<!-- aa-self-proving-repair:v1 -->';
             // Stable defect identity deliberately excludes main SHA. When
             // several product gates fail in one trusted run, keep one combined
@@ -857,9 +921,6 @@ jobs:
               ? productFailures.map(g => g.gate).join('+')
               : blocking;
             const title = `P0: Repair self-proving qualification failure (Gate ${gateLabel})`;
-            const issues = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'all', per_page: 100,
-            });
             const existing = issues
               .filter(issue => !issue.pull_request && String(issue.body || '').includes(marker))
               .find(issue =>
