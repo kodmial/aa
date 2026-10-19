@@ -825,6 +825,7 @@ def test_adapter_carries_no_semantic_policy() -> None:
         "OpenCodeChatModel",
         "build_judge_model",
         "build_planner_model",
+        "build_summarizer_model",
         "build_verifier_model",
         "render_messages_text",
         "split_system_and_user",
