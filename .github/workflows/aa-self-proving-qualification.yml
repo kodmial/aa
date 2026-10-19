@@ -137,6 +137,18 @@ jobs:
           set -euo pipefail
           test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
           test -n "$VERIFIED_MODEL"
+          if [[ ! "$APPROVED_POOL" =~ ^[A-Za-z0-9._/-]+(,[A-Za-z0-9._/-]+){0,7}$ ]]; then
+            echo "::error::OPENCODE_MODELS must be 1-8 comma-separated model identifiers"
+            exit 3
+          fi
+          if [[ ! "$VERIFIED_MODEL" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Continuum returned an invalid model identifier"
+            exit 4
+          fi
+          case ",$APPROVED_POOL," in
+            *",$VERIFIED_MODEL,"*) ;;
+            *) echo "::error::Continuum selected '$VERIFIED_MODEL', which is not in OPENCODE_MODELS"; exit 5 ;;
+          esac
           {
             echo "OPENCODE_MODELS=$APPROVED_POOL"
             echo "OPENCODE_MODEL=$VERIFIED_MODEL"
