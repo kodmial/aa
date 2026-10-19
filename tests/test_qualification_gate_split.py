@@ -38,7 +38,7 @@ def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(mon
     monkeypatch.setattr(live, "run_voice_lane", lambda root: forbidden())
     result = live.evaluate_live(SHA, repo_root=Path("."), run_id="r1", gate_c_only=True)
     assert result.status == "PASS"
-    assert [l.lane for l in result.lanes] == ["live-telegram-evidence"]
+    assert [lane.lane for lane in result.lanes] == ["live-telegram-evidence"]
     assert calls == [("real", "r1")]
 
 
@@ -73,7 +73,7 @@ def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(monkeyp
     result = live.evaluate_live(SHA, repo_root=Path("."), deterministic_only=True)
     assert result.status == "PASS"
     assert calls == ["message", "transport", "control", "voice"]
-    assert {l.lane for l in result.lanes} == {
+    assert {lane.lane for lane in result.lanes} == {
         "product-contract-1-24",
         "telegram-transport-25-32",
         "runtime-control-33-41",
