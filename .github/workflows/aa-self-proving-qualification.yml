@@ -41,7 +41,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   actions: write
   issues: write
 
@@ -115,6 +115,22 @@ jobs:
             sleep $((attempt * 10))
           done
 
+
+      - name: Qualify approved AA OpenCode model route
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          task-class: coder
+          profile: aa-product-contract
+          state-token: ${{ github.token }}
+          runtime-version: ''
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Install system voice media dependency
         shell: bash
         run: |
@@ -186,6 +202,10 @@ jobs:
       - name: Gate A - static/build
         id: gate-a
         shell: bash
+        env:
+          OPENCODE_MODELS: ${{ vars.OPENCODE_MODELS }}
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): skip only when a validated
@@ -276,8 +296,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
@@ -466,8 +486,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
@@ -483,6 +503,18 @@ jobs:
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
             --final-only
+
+      - name: Record completed AA Product Contract model execution
+        if: ${{ steps.aa_model_route.outcome == 'success' && steps.gate-f.outcome == 'success' }}
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          task-class: coder
+          profile: aa-product-contract
+          state-token: ${{ github.token }}
 
       - name: Upload per-gate evidence and failure matrix
         # Privacy-safe full per-gate evidence (issue #339): atomic validated

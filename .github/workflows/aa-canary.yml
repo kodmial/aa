@@ -236,6 +236,22 @@ jobs:
           python scripts/prefetch_voice_assets.py
           python scripts/build_retrieval_index.py --backend e5
 
+
+      - name: Qualify approved AA OpenCode model route
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          task-class: coder
+          profile: aa-canary
+          state-token: ${{ secrets.TAP_PAT }}
+          runtime-version: ''
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Run compact production canary
         id: run
         shell: bash
@@ -244,8 +260,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           set +e

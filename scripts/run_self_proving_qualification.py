@@ -212,19 +212,23 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             run_id=run_id,
         )
     try:
-        from aa.config import (
-            DEFAULT_AA_AGENT,
-            DEFAULT_FALLBACK_MODEL,
-            DEFAULT_PRIMARY_MODEL,
-            Settings,
-        )
+        from aa.config import DEFAULT_AA_AGENT, Settings
 
+        # Gate A checks the actual frozen, trusted caller-variable policy.
+        # The selector already validated syntax, duplicates and capability.
+        # AA's in-turn fallback is deliberately the SAME frozen route:
+        # no unqualified alternative model may be invoked after side effects.
+        pool_raw = os.environ.get("OPENCODE_MODELS", "")
+        approved = tuple(item.strip() for item in pool_raw.split(","))
         _policy = Settings.from_env(None)
         _policy_ok = (
-            _policy.opencode_agent == DEFAULT_AA_AGENT
-            and _policy.opencode_model == DEFAULT_PRIMARY_MODEL
-            and _policy.opencode_fallback_model == DEFAULT_FALLBACK_MODEL
-            and _policy.opencode_model != _policy.opencode_fallback_model
+            bool(pool_raw)
+            and 1 <= len(approved) <= 8
+            and all(approved)
+            and len(set(approved)) == len(approved)
+            and _policy.opencode_agent == DEFAULT_AA_AGENT
+            and _policy.opencode_model in approved
+            and _policy.opencode_fallback_model == _policy.opencode_model
         )
     except Exception:
         _policy_ok = False

@@ -1,0 +1,55 @@
+name: AA model-pool variable bootstrap
+
+# One-time, trusted-main adoption from the user-approved deployment fixture.
+# Normal runtime never reads this fixture; it reads vars.OPENCODE_MODELS.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aa-model-pool-variable-bootstrap.yml'
+      - 'tests/fixtures/approved-model-pool-66.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    if: github.repository == 'kodmial/aa' && (github.event_name == 'push' || github.actor == github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact trusted main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Update repository variable with existing trusted PAT
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?TAP_PAT must have permission to write Actions Variables}"
+          [ "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/main | cut -f1)" ]
+          value="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          fixture = json.loads(Path("tests/fixtures/approved-model-pool-66.json").read_text())
+          models = fixture["ordered_models"]
+          assert fixture["schema"] == 1
+          assert len(models) == 3 and len(set(models)) == 3
+          assert all("/" in item and len(item) < 90 for item in models)
+          print(",".join(models))
+          PY
+          )"
+          # Only operator-approved configuration is published. Do not log any PAT.
+          if gh api "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" -f value="$value" >/dev/null
+          else
+            gh api -X POST "repos/$TARGET_REPO/actions/variables" -f name="OPENCODE_MODELS" -f value="$value" >/dev/null
+          fi
+          actual="$(gh api "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" --jq .value)"
+          test "$actual" = "$value"
+          echo "AA OPENCODE_MODELS repository variable verified (3 owner-approved routes)."

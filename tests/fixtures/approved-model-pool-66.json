@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "description": "Owner-approved AA deployment model routes. Fixture is used only to provision a GitHub Actions Variable, not as a runtime fallback.",
+  "ordered_models": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3-ultra-free"
+  ]
+}

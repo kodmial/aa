@@ -4,7 +4,6 @@
     "aa": {
       "description": "Closed-book AA literature support assistant",
       "mode": "primary",
-      "model": "opencode/nemotron-3-ultra-free",
       "prompt": "{file:./prompts/aa-agent-system.md}",
       "temperature": 0.2,
       "permission": {
@@ -17,7 +16,6 @@
     },
     "aa-planner-v2": {
       "description": "Hidden retrieval query planner for the v2 conversation graph",
-      "model": "opencode/nemotron-3-ultra-free",
       "prompt": "{file:./prompts/aa-planner-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -27,7 +25,6 @@
     },
     "aa-summarizer-v2": {
       "description": "Hidden conversation continuity summarizer for the v2 graph",
-      "model": "opencode/nemotron-3-ultra-free",
       "prompt": "{file:./prompts/aa-summarizer-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -36,7 +33,6 @@
     },
     "aa-v2": {
       "description": "Russian-language AA conversational assistant (v2 graph foundation)",
-      "model": "opencode/nemotron-3-ultra-free",
       "prompt": "{file:./prompts/aa-agent-system-v2.md}",
       "temperature": 0.2,
       "permission": {
@@ -45,7 +41,6 @@
     },
     "aa-judge-v2": {
       "description": "Independent whole-turn AA response-quality evaluator for live qualification",
-      "model": "opencode/nemotron-3-ultra-free",
       "temperature": 0,
       "permission": {
         "*": "deny",
@@ -54,7 +49,6 @@
     },
     "aa-verifier-v2": {
       "description": "Hidden claim-level grounding verifier for the v2 conversation graph",
-      "model": "opencode/nemotron-3-ultra-free",
       "prompt": "{file:./prompts/aa-verifier-system-v2.md}",
       "temperature": 0,
       "permission": {

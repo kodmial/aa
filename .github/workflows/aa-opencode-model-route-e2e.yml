@@ -1,0 +1,85 @@
+name: AA real OpenCode model-route E2E
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aa-opencode-model-route-e2e.yml'
+      - '.github/workflows/aa-model-pool-variable-bootstrap.yml'
+      - '.github/workflows/aa-self-proving-qualification.yml'
+      - '.github/workflows/aa-runtime.yml'
+      - '.github/workflows/aa-canary.yml'
+      - 'scripts/run_self_proving_qualification.py'
+      - 'opencode.json'
+      - 'tests/fixtures/approved-model-pool-66.json'
+
+permissions:
+  contents: write
+
+jobs:
+  qualify-real-aa:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Install actual AA pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat docker/opencode.version)"
+          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version "$version"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - name: Load approved deployment fixture as isolated PR-only test input
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "models=$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/approved-model-pool-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Qualify official model capabilities and durable state in AA
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          state-token: ${{ github.token }}
+      - name: Run official OpenCode on live AA code checkout
+        shell: bash
+        env:
+          MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_MODELS: ${{ steps.fixture.outputs.models }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        run: |
+          set -euo pipefail
+          export OPENCODE_MODEL="$MODEL"
+          # Real acceptance checks model policy against the actual AA source.
+          PYTHONPATH=src python - <<'PY'
+          import os
+          from aa.config import Settings
+          c = Settings.from_env()
+          assert c.opencode_model == c.opencode_fallback_model
+          assert c.opencode_model in os.environ["OPENCODE_MODELS"].split(",")
+          print("AA runtime selected a qualified approved model.")
+          PY
+          dir="$(mktemp -d)"
+          trap 'rm -rf "$dir"' EXIT
+          cp scripts/run_self_proving_qualification.py "$dir/aa-contract.py"
+          cd "$dir"
+          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+            opencode run --auto --model "$MODEL" \
+            'Create aa-task-acceptance.txt containing exactly AA_MODEL_POLICY_ACCEPTED. This is a real isolated AA issue #391 code-task capability test.' \
+            > "$RUNNER_TEMP/aa-model-route-proof.log" 2>&1
+          test -f aa-task-acceptance.txt
+          test "$(cat aa-task-acceptance.txt)" = AA_MODEL_POLICY_ACCEPTED
+      - name: Attest real AA task completion
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: record
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          state-token: ${{ github.token }}
