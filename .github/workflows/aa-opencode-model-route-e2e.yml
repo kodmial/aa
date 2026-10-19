@@ -1,0 +1,113 @@
+name: AA real OpenCode model-route E2E
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aa-opencode-model-route-e2e.yml'
+      - '.github/workflows/aa-model-pool-variable-bootstrap.yml'
+      - '.github/workflows/aa-self-proving-qualification.yml'
+      - '.github/workflows/aa-runtime.yml'
+      - '.github/workflows/aa-canary.yml'
+      - 'scripts/run_self_proving_qualification.py'
+      - 'src/**'
+      - 'prompts/**'
+      - 'pyproject.toml'
+      - 'opencode.json'
+      - 'docker/opencode.version'
+      - 'tests/fixtures/approved-model-pool-66.json'
+
+permissions:
+  # The model-route action persists durable selection state in a Git ref.
+  contents: write
+
+jobs:
+  qualify-real-aa:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Install AA package without provider/runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install -e . --no-deps
+      - name: Install actual AA pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat docker/opencode.version)"
+          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version "$version"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - name: Load approved deployment fixture as isolated PR-only test input
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "models=$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/approved-model-pool-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Qualify official model capabilities and durable state in AA
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        with:
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          state-token: ${{ github.token }}
+      - name: Run the AA agent on the live model route
+        shell: bash
+        env:
+          MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_MODELS: ${{ steps.fixture.outputs.models }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        run: |
+          set -euo pipefail
+          export OPENCODE_MODEL="$MODEL"
+          # Real acceptance checks model policy against the actual AA source.
+          PYTHONPATH=src python - <<'PY'
+          import os
+          from aa.config import Settings
+          c = Settings.from_env()
+          assert c.opencode_model == c.opencode_fallback_model
+          assert c.opencode_model in os.environ["OPENCODE_MODELS"].split(",")
+          print("AA runtime selected a qualified approved model.")
+          PY
+          dir="$(mktemp -d)"
+          trap 'rm -rf "$dir"' EXIT
+          cp opencode.json "$dir/opencode.json"
+          cp -R prompts "$dir/prompts"
+          cd "$dir"
+          log="$RUNNER_TEMP/aa-model-route-proof.log"
+          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+            opencode run --auto --agent aa --model "$MODEL" \
+            'Привет! Ответь по-русски одним коротким предложением.' \
+            > "$log" 2>&1
+          python3 - "$MODEL" "$log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          model, log_path = sys.argv[1], Path(sys.argv[2])
+          text = log_path.read_text(encoding="utf-8", errors="replace")
+          expected = f"> aa · {model.split('/', 1)[-1]}"
+          if expected not in text:
+              raise SystemExit(f"served model mismatch: expected {expected!r} in proof log")
+          response = [
+              line.strip()
+              for line in text.splitlines()
+              if line.strip() and not line.lstrip().startswith(">")
+          ]
+          if not response:
+              raise SystemExit("AA agent produced no response")
+          print("AA agent executed on the qualified model.")
+          PY
+      - name: Attest real AA task completion
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        with:
+          operation: record
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          state-token: ${{ github.token }}
