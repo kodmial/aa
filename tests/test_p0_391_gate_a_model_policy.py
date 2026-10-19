@@ -3,10 +3,10 @@
 The single live-validated free model serves as both the primary and the
 fallback. The model adapter suppresses same-model fallback
 (``fallback_model != primary_model``), so a distinct second provider is
-neither required nor permitted. The Gate A policy check must therefore
-validate the pinned agent/model/fallback defaults instead of demanding a
-distinct retired provider, and every live workflow must pin that same
-model rather than the retired Muse Spark / Space Bunny pair.
+neither required nor permitted. Production routing is owned by Continuum
+(kodmial/aa Work Lock #66): Gate A must therefore validate the frozen,
+owner-approved selected model instead of demanding a distinct retired
+provider, and the retired Muse Spark / Space Bunny pair must never return.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def test_model_policy_drift_is_rejected(agent: str, model: str, fallback: str) -
     assert not runtime_model_policy_ok(agent=agent, model=model, fallback_model=fallback)
 
 
-def test_gate_a_accepts_pinned_policy_and_rejects_drift(
+def test_gate_a_accepts_frozen_approved_model_and_rejects_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sha = "f" * 40
@@ -55,8 +55,11 @@ def test_gate_a_accepts_pinned_policy_and_rejects_drift(
         return sha if args and args[0] == "rev-parse" else ""
 
     monkeypatch.setattr(runner, "_git", _fake_git)
-    for name in ("OPENCODE_AGENT", "OPENCODE_MODEL", "OPENCODE_FALLBACK_MODEL"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENCODE_AGENT", DEFAULT_AA_AGENT)
+    monkeypatch.setenv("OPENCODE_MODELS", DEFAULT_PRIMARY_MODEL)
+    monkeypatch.setenv("CONTINUUM_SELECTED_MODEL", DEFAULT_PRIMARY_MODEL)
+    monkeypatch.setenv("OPENCODE_MODEL", DEFAULT_PRIMARY_MODEL)
+    monkeypatch.setenv("OPENCODE_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
 
     accepted = runner._gate_a(sha, "run-391")
     assert accepted.status == "PASS"
@@ -87,11 +90,14 @@ def test_gate_a_subchecks_attribute_model_policy_failure() -> None:
     assert by_id["a-exact-sha"] == "PASS"
 
 
-def test_live_workflows_pin_the_live_validated_model() -> None:
+def test_live_workflows_never_pin_retired_models() -> None:
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text(encoding="utf-8")
         assert "OPENCODE_MODEL: opencode/muse-spark" not in text, path.name
         assert "OPENCODE_FALLBACK_MODEL: opencode/space-bunny" not in text, path.name
+    # Production model routing is selected and frozen by Continuum before any
+    # product side effect; those workflows must not embed a static model.
     self_proving = (WORKFLOWS / "aa-self-proving-qualification.yml").read_text(encoding="utf-8")
-    assert f"OPENCODE_MODEL: {DEFAULT_PRIMARY_MODEL}" in self_proving
-    assert f"OPENCODE_FALLBACK_MODEL: {DEFAULT_FALLBACK_MODEL}" in self_proving
+    assert "uses: kodmial/continuum/.github/actions/model-route@main" in self_proving
+    assert "OPENCODE_MODEL=$VERIFIED_MODEL" in self_proving
+    assert f"OPENCODE_MODEL: {DEFAULT_PRIMARY_MODEL}" not in self_proving

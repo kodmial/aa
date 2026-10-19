@@ -27,6 +27,7 @@ import math
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -67,7 +68,6 @@ from aa.qualification.self_proving import (  # noqa: E402
     decide_final_verdict,
     failure_report_for_gate,
     repair_fingerprint,
-    runtime_model_policy_ok,
     validate_exact_sha,
 )
 
@@ -119,6 +119,30 @@ def _product_fingerprint() -> str:
     from aa.qualification.product_fingerprint import compute_product_fingerprint
 
     return compute_product_fingerprint(ROOT)
+
+
+def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool:
+    """Gate A checks the *selected* trusted route, not obsolete static IDs.
+
+    Continuum is the only model-pool parser/qualifier. AA checks that its
+    planner, answer, judge and verifier all receive the same frozen model,
+    disabling in-turn fallback after irreversible conversational side effects.
+    Missing/invalid pool attestation is a real Gate A failure.
+    """
+    from aa.config import DEFAULT_AA_AGENT
+
+    pool = environ.get("OPENCODE_MODELS", "").strip()
+    selected = environ.get("CONTINUUM_SELECTED_MODEL", "").strip()
+    routes = [route.strip() for route in pool.split(",")] if pool else []
+    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
+        return False
+    return (
+        bool(selected)
+        and selected in routes
+        and getattr(settings, "opencode_agent", None) == DEFAULT_AA_AGENT
+        and getattr(settings, "opencode_model", None) == selected
+        and getattr(settings, "opencode_fallback_model", None) == selected
+    )
 
 
 def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
@@ -216,11 +240,11 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
         from aa.config import Settings
 
         _policy = Settings.from_env(None)
-        _policy_ok = runtime_model_policy_ok(
-            agent=_policy.opencode_agent,
-            model=_policy.opencode_model,
-            fallback_model=_policy.opencode_fallback_model,
-        )
+        # Work Lock #66: production route policy is authoritative. Gate A
+        # validates the Continuum-selected approved model (which also permits
+        # the same live-validated model as both primary and fallback, per
+        # kodmial/aa#391) instead of obsolete hardcoded provider IDs.
+        _policy_ok = _aa_model_policy_valid(_policy, os.environ)
     except Exception:
         _policy_ok = False
     if not _policy_ok:

@@ -41,7 +41,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   actions: write
   issues: write
 
@@ -114,6 +114,36 @@ jobs:
             fi
             sleep $((attempt * 10))
           done
+
+      - name: Qualify AA production model via Continuum
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          task-class: coder
+          profile: aa-product
+          state-token: ${{ github.token }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Freeze verified model for all AA agents and quality gates
+        env:
+          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
+          test -n "$VERIFIED_MODEL"
+          {
+            echo "OPENCODE_MODELS=$APPROVED_POOL"
+            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
+            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
+            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
+          } >> "$GITHUB_ENV"
+          echo "AA model route frozen before product side effects; no in-turn model switching."
 
       - name: Install system voice media dependency
         shell: bash
@@ -276,8 +306,6 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/nemotron-3-ultra-free
-          OPENCODE_FALLBACK_MODEL: opencode/nemotron-3-ultra-free
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
@@ -466,8 +494,6 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/nemotron-3-ultra-free
-          OPENCODE_FALLBACK_MODEL: opencode/nemotron-3-ultra-free
         run: |
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
