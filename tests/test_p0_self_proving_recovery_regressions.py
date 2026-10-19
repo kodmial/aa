@@ -121,6 +121,8 @@ def _run_publisher_scenario(
     gate_outcomes: dict[str, str],
     failed_sha: str,
     initial_issues: list[dict[str, Any]],
+    initial_comments: list[dict[str, Any]] | None = None,
+    run_id: int = 424242,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -136,7 +138,7 @@ def _run_publisher_scenario(
     issues_file = work / "issues.json"
     issues_file.write_text(json.dumps(initial_issues), encoding="utf-8")
     comments_file = work / "comments.json"
-    comments_file.write_text(json.dumps([]), encoding="utf-8")
+    comments_file.write_text(json.dumps(initial_comments or []), encoding="utf-8")
     result_file = work / "result.json"
     harness = work / "harness.js"
     prelude = (
@@ -147,9 +149,11 @@ def _run_publisher_scenario(
         "  info(m) { this.infos.push(String(m)); },\n"
         "  setFailed(m) { this.failures.push(String(m)); } };\n"
         "const context = { repo: { owner: 'o', repo: 'r' }, "
-        f"sha: '{failed_sha}', runId: 424242 }};\n"
+        f"sha: '{failed_sha}', runId: {run_id} }};\n"
         "const __issues = JSON.parse(__fs.readFileSync("
         f"'{issues_file.as_posix()}', 'utf8'));\n"
+        "const __comments = JSON.parse(__fs.readFileSync("
+        f"'{comments_file.as_posix()}', 'utf8'));\n"
         "const __calls = { created: [], updated: [], comments: [], dispatched: 0 };\n"
         "function __listForRepo() {}\n"
         "function __listComments() {}\n"
@@ -162,6 +166,9 @@ def _run_publisher_scenario(
         "        labels: (args.labels || []).map((name) => ({ name })) });\n"
         "      return { data: { number: n } }; },\n"
         "    createComment: async (args) => { __calls.comments.push(args);\n"
+        "      __comments.push({ id: 1000 + __calls.comments.length,\n"
+        "        body: args.body, issue_number: args.issue_number,\n"
+        "        user: { login: 'github-actions[bot]' } });\n"
         "      return { data: { id: 1000 + __calls.comments.length } }; },\n"
         "    update: async (args) => { __calls.updated.push(args);\n"
         "      const found = __issues.find((i) => i.number === args.issue_number);\n"
@@ -173,7 +180,7 @@ def _run_publisher_scenario(
         "  actions: { createWorkflowDispatch: async () => "
         "{ __calls.dispatched += 1; return {}; } } },\n"
         "  paginate: async (fn) => { if (fn === __listForRepo) return __issues;\n"
-        "    if (fn === __listComments) return []; return []; } };\n"
+        "    if (fn === __listComments) return __comments; return []; } };\n"
         "(async () => {\n"
         "async function __publisher() {\n"
     )
@@ -181,7 +188,7 @@ def _run_publisher_scenario(
         "\n}\nawait __publisher();\n"
         f"__fs.writeFileSync('{result_file.as_posix()}', JSON.stringify("
         "{ created: __calls.created, updated: __calls.updated, comments: __calls.comments, "
-        "dispatched: __calls.dispatched, issues: __issues, "
+        "dispatched: __calls.dispatched, issues: __issues, commentHistory: __comments, "
         "warnings: core.warnings, failures: core.failures }));\n"
         "})();\n"
     )
@@ -358,13 +365,37 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         initial_issues=existing_issues,
     )
     assert len(repeat["created"]) == 0
-    assert len(repeat["updated"]) == 0
+    assert len(repeat["updated"]) == 1
     assert len(repeat["comments"]) == 1
+    assert "Repair recurrence: `2`" in str(repeat["comments"][0]["body"])
     assert (
         "Existing OpenCode generation specification remains immutable."
         in repeat["comments"][0]["body"]
     )
+    # Recurrence reopens the existing issue with automation:ready without
+    # rewriting its pinned title/body.
+    reopened = repeat["updated"][0]
+    assert "title" not in reopened and "body" not in reopened
+    assert reopened["state"] == "open"
+    assert "automation:ready" in reopened["labels"]
     assert len(repeat["issues"]) == 1
+
+    # A GitHub workflow re-run keeps the same runId/SHA. The second attempt
+    # must reuse the recurrence already recorded for this run instead of
+    # incrementing it past MAX_LOCAL_REPAIR_RECURRENCE and tripping the
+    # systemic breaker.
+    rerun = _run_publisher_scenario(
+        tmp_path,
+        summary_text=both_summary,
+        gate_outcomes=both_outcomes,
+        failed_sha=failed_sha,
+        initial_issues=repeat["issues"],
+        initial_comments=repeat["commentHistory"],
+    )
+    assert len(rerun["created"]) == 0
+    assert len(rerun["updated"]) == 0
+    assert len(rerun["comments"]) == 0
+    assert len(rerun["commentHistory"]) == len(repeat["commentHistory"])
 
 
 def test_qualification_never_requires_isolated_telegram_bot() -> None:

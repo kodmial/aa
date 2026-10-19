@@ -669,21 +669,66 @@ jobs:
                 })
               );
             }
+            function trustObservationComment(comment) {
+              return comment.user?.login === 'github-actions[bot]';
+            }
+            function issueLabelNames(issue) {
+              return (issue.labels || [])
+                .map(label => typeof label === 'string' ? label : label.name)
+                .filter(Boolean);
+            }
+            async function redispatchExistingIssue(issue, kind) {
+              const labels = issueLabelNames(issue);
+              const inProgress = issue.state === 'open' && labels.includes('automation:in-progress');
+              if (inProgress) {
+                core.notice('Existing ' + kind + ' generation is still in progress; observation recorded only.');
+                return;
+              }
+              const nextLabels = labels.filter(name =>
+                name !== 'automation:blocked' &&
+                name !== 'automation:qualifying' &&
+                name !== 'automation:in-progress'
+              );
+              if (!nextLabels.includes('automation:ready')) nextLabels.push('automation:ready');
+              await apiRetry('reopen and relabel existing ' + kind + ' issue', () =>
+                github.rest.issues.update({
+                  owner, repo, issue_number: issue.number,
+                  state: 'open',
+                  labels: nextLabels,
+                })
+              );
+              await apiRetry('wake issue scheduler for existing ' + kind + ' issue', () =>
+                github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+                })
+              );
+              core.warning('Recorded ' + kind + ' recurrence on #' + issue.number +
+                '; reopened with automation:ready without rewriting the pinned specification.');
+            }
             async function nextObservationRecurrence(issue, kind, legacy) {
               if (!issue) return 1;
               const comments = await issueHistory(issue.number);
               const prefix = '<!-- aa-self-proving-' + kind + '-observation:v1 run=';
               const values = comments
+                .filter(trustObservationComment)
                 .map(comment => String(comment.body || ''))
                 .filter(body => body.includes(prefix))
                 .map(body => Number(body.match(/(?:Repair|Systemic) recurrence: \`(\d+)\`/)?.[1] || 0));
-              return Math.max(legacy, ...values) + 1;
+              const currentRunMarker = prefix + runId + ' sha=' + sha + ' -->';
+              const recordedForCurrentRun = comments
+                .filter(trustObservationComment)
+                .some(comment => String(comment.body || '').includes(currentRunMarker));
+              return recordedForCurrentRun
+                ? Math.max(legacy, ...values)
+                : Math.max(legacy, ...values) + 1;
             }
             async function postObservation(issueNumber, kind, lines) {
               const marker = '<!-- aa-self-proving-' + kind +
                 '-observation:v1 run=' + runId + ' sha=' + sha + ' -->';
               const comments = await issueHistory(issueNumber);
-              if (comments.some(comment => String(comment.body || '').includes(marker))) {
+              if (comments.some(comment =>
+                trustObservationComment(comment) && String(comment.body || '').includes(marker)
+              )) {
                 core.notice('Already recorded ' + kind + ' observation for run ' + runId);
                 return false;
               }
@@ -1035,6 +1080,13 @@ jobs:
                     stageTimingLine,
                     'Breaker remains blocked; no specification rewrite or redispatch.',
                   ]);
+                  await apiRetry('keep exhausted convergence scope blocked', () =>
+                    github.rest.issues.update({
+                      owner, repo, issue_number: breakerExisting.number,
+                      state: 'open',
+                      labels: ['priority:p0', 'automation:blocked'],
+                    })
+                  );
                   core.setFailed(
                     'Convergence scope ' + systemicScope + ' exhausted; further automatic mutations are blocked.'
                   );
@@ -1097,7 +1149,7 @@ jobs:
               const systemicInProgress = Boolean(systemicExisting && systemicExisting.state === 'open' &&
                 (systemicExisting.labels || []).some(label => label.name === 'automation:in-progress'));
               if (systemicExisting) {
-                await postObservation(systemicExisting.number, 'systemic', [
+                const posted = await postObservation(systemicExisting.number, 'systemic', [
                   'Systemic recurrence: \`' + systemicRecurrence + '\`',
                   'Qualification run: \`' + runId + '\`',
                   'Main SHA: \`' + sha + '\`',
@@ -1109,9 +1161,14 @@ jobs:
                   modelPathLine,
                   'Existing OpenCode generation specification remains immutable.',
                 ]);
-                // Never unblock or redispatch a terminal OpenCode generation.
-                core.warning('Recorded systemic recurrence on #' + systemicExisting.number +
-                  '; existing generation remains unchanged.');
+                // This workflow run's recurrence is already recorded; do not
+                // reopen or redispatch a duplicate generation on rerun.
+                if (posted) {
+                  await redispatchExistingIssue(systemicExisting, 'systemic');
+                } else {
+                  core.notice('Systemic recurrence already recorded for run ' + runId +
+                    '; no redispatch.');
+                }
                 return;
               } else {
                 const created = await apiRetry('create systemic convergence issue', () =>
@@ -1173,7 +1230,7 @@ jobs:
               'This issue is generated and refreshed automatically; the same stable failure series reopens this issue instead of creating another one.',
             ].join('\n');
             if (existing) {
-              await postObservation(existing.number, 'repair', [
+              const posted = await postObservation(existing.number, 'repair', [
                 'Repair recurrence: \`' + recurrence + '\`',
                 'Qualification run: \`' + runId + '\`',
                 'Main SHA: \`' + sha + '\`',
@@ -1182,8 +1239,14 @@ jobs:
                 stageTimingLine,
                 'Existing OpenCode generation specification remains immutable.',
               ]);
-              core.warning('Recorded repair recurrence on #' + existing.number +
-                '; existing generation remains unchanged.');
+              // This workflow run's recurrence is already recorded; do not
+              // reopen or redispatch a duplicate generation on rerun.
+              if (posted) {
+                await redispatchExistingIssue(existing, 'repair');
+              } else {
+                core.notice('Repair recurrence already recorded for run ' + runId +
+                  '; no redispatch.');
+              }
               return;
             } else {
               const created = await apiRetry('create self-proving repair issue', () =>
