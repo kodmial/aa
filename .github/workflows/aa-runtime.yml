@@ -36,7 +36,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  model_pool_readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    outputs:
+      models: ${{ steps.wait.outputs.models }}
+    steps:
+      - name: Wait for approved model pool variable
+        id: wait
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?TAP_PAT must have Actions Variables read permission}"
+          for attempt in $(seq 1 30); do
+            models="$(gh api "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" --jq .value 2>/dev/null || true)"
+            if [[ -n "$models" ]]; then
+              echo "models=$models" >> "$GITHUB_OUTPUT"
+              echo "AA model pool ready."
+              exit 0
+            fi
+            echo "OPENCODE_MODELS not ready (attempt $attempt/30); waiting..."
+            sleep 10
+          done
+          echo "::error::AA requires approved OPENCODE_MODELS repository variable"
+          exit 2
+
   runtime:
+    needs: model_pool_readiness
     runs-on: ubuntu-latest
     # Campaign hard bounds: 5h application runtime per session, 4 starts max,
     # 20h aggregate requested runtime max, 24h wall-clock campaign max. The
@@ -426,7 +455,7 @@ jobs:
         id: aa_model_route
         uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
-          models: ${{ vars.OPENCODE_MODELS }}
+          models: ${{ needs.model_pool_readiness.outputs.models }}
           task-class: coder
           profile: aa-live-poller
           state-token: ${{ secrets.AA_MODEL_ROUTE_STATE_TOKEN || github.token }}
@@ -438,7 +467,7 @@ jobs:
 
       - name: Freeze verified model for all AA agents and quality gates
         env:
-          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          APPROVED_POOL: ${{ needs.model_pool_readiness.outputs.models }}
           VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
         shell: bash
         run: |

@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${GH_TOKEN:?TAP_PAT must have permission to write Actions Variables}"
-          [ "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/main | cut -f1)" ]
+          [ "$(git rev-parse HEAD)" = "$(gh api "repos/$TARGET_REPO/git/ref/heads/main" --jq .object.sha)" ]
           value="$(python3 - <<'PY'
           import json
           from pathlib import Path

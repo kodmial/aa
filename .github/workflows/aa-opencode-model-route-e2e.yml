@@ -9,7 +9,11 @@ on:
       - '.github/workflows/aa-runtime.yml'
       - '.github/workflows/aa-canary.yml'
       - 'scripts/run_self_proving_qualification.py'
+      - 'src/**'
+      - 'prompts/**'
+      - 'pyproject.toml'
       - 'opencode.json'
+      - 'docker/opencode.version'
       - 'tests/fixtures/approved-model-pool-66.json'
 
 permissions:

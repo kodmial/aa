@@ -94,7 +94,7 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
         "uses: kodmial/continuum/.github/actions/model-route@"
         "d41b6ed6c87e544c70f3bf283ad4e272b4004fbe"
     ) in workflow
-    assert "models: ${{ vars.OPENCODE_MODELS }}" in workflow
+    assert "models: ${{ needs.model_pool_readiness.outputs.models }}" in workflow
     assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in workflow
     assert "opencode/space-bunny-free" not in workflow
 
