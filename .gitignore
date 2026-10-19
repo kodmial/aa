@@ -51,3 +51,5 @@ __pycache__/
 /aa-self-proving-checkpoints/
 runtime-status.json
 gate-*.done
+# Workflow-owned crash-recovery progress metadata (never product code).
+/.continuum-429-stage

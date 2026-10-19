@@ -52,6 +52,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from aa.config import DEFAULT_AA_AGENT
+
 ISSUE_NUMBER = 146
 CONTROL_ISSUE_NUMBER = 31
 QUALIFICATION_ISSUE_NUMBER = 7
@@ -293,6 +295,38 @@ def validate_hex64(value: str) -> str:
     if not _HEX64_RE.fullmatch(normalized):
         raise SelfProvingError("fingerprint must be 64-hex or empty")
     return normalized
+
+
+def runtime_model_policy_ok(
+    *,
+    agent: str,
+    pool: str,
+    selected_model: str,
+    model: str,
+    fallback_model: str,
+) -> bool:
+    """Whether the runtime route matches the Continuum-selected model.
+
+    Continuum owns the approved model pool and freezes one selected model
+    before any product side effect. Gate A requires a non-empty, unique,
+    bounded pool that contains the selected model, and the agent, primary
+    model, and fallback model must all use that same frozen selection. The
+    model adapter suppresses same-model fallback (``fallback_model !=
+    primary_model``), so a distinct second provider is neither required nor
+    permitted: no unverified second provider may serve the product.
+    """
+    raw_pool = (pool or "").strip()
+    routes = [route.strip() for route in raw_pool.split(",")] if raw_pool else []
+    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
+        return False
+    selected = (selected_model or "").strip()
+    return (
+        bool(selected)
+        and selected in routes
+        and (agent or "").strip() == DEFAULT_AA_AGENT
+        and (model or "").strip() == selected
+        and (fallback_model or "").strip() == selected
+    )
 
 
 def _subtree_holds_text(value: Any) -> bool:
