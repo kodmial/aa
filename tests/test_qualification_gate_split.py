@@ -14,21 +14,21 @@ def _fake_lane(lane: str, *, status: str = "PASS") -> live.LaneResult:
     return live.LaneResult(lane=lane, status=status)
 
 
-def _setup(monkeypatch):
+def _setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(live, "checked_out_sha", lambda _: SHA)
     monkeypatch.setattr(live, "collect_static_gates", lambda _: {})
     monkeypatch.setattr(live, "assert_no_text_leak", lambda _: None)
 
 
-def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(monkeypatch):
+def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
     calls = []
 
-    async def model_lane(run_id):
+    async def model_lane(run_id: str) -> live.LaneResult:
         calls.append(("real", run_id))
         return _fake_lane("live-telegram-evidence")
 
-    async def forbidden():
+    async def forbidden() -> None:
         raise AssertionError("Gate C duplicated Gate B deterministic product tests")
 
     monkeypatch.setattr(live, "run_live_telegram_evidence_lane", model_lane)
@@ -42,27 +42,27 @@ def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(mon
     assert calls == [("real", "r1")]
 
 
-def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(monkeypatch):
+def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
     calls = []
 
-    async def messages():
+    async def messages() -> live.LaneResult:
         calls.append("message")
         return _fake_lane("product-contract-1-24")
 
-    async def transport():
+    async def transport() -> live.LaneResult:
         calls.append("transport")
         return _fake_lane("telegram-transport-25-32")
 
-    def control(root):
+    def control(root: Path) -> live.LaneResult:
         calls.append("control")
         return _fake_lane("runtime-control-33-41")
 
-    def voice(root):
+    def voice(root: Path) -> live.LaneResult:
         calls.append("voice")
         return _fake_lane("voice-1-16")
 
-    async def no_real_provider(run_id):
+    async def no_real_provider(run_id: str) -> live.LaneResult:
         raise AssertionError("Gate B unexpectedly called live provider")
 
     monkeypatch.setattr(live, "run_message_lane", messages)
@@ -81,13 +81,13 @@ def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(monkeyp
     }
 
 
-def test_b_failure_preserved_not_flattened_to_pass(monkeypatch):
+def test_b_failure_preserved_not_flattened_to_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
 
-    async def messages():
+    async def messages() -> live.LaneResult:
         return _fake_lane("product-contract-1-24", status="FAIL")
 
-    async def transport():
+    async def transport() -> live.LaneResult:
         return _fake_lane("telegram-transport-25-32")
 
     monkeypatch.setattr(live, "run_message_lane", messages)
@@ -98,10 +98,10 @@ def test_b_failure_preserved_not_flattened_to_pass(monkeypatch):
     assert result.status == "FAIL"
 
 
-def test_gate_c_provider_failure_cannot_be_reported_as_pass(monkeypatch):
+def test_gate_c_provider_failure_cannot_be_reported_as_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
 
-    async def provider_fails(run_id):
+    async def provider_fails(run_id: str) -> live.LaneResult:
         raise RuntimeError("provider offline")
 
     monkeypatch.setattr(live, "run_live_telegram_evidence_lane", provider_fails)
@@ -110,13 +110,13 @@ def test_gate_c_provider_failure_cannot_be_reported_as_pass(monkeypatch):
     assert result.lanes[0].failed == ("live-telegram-evidence:RuntimeError",)
 
 
-def test_c_and_deterministic_flags_are_mutually_exclusive(monkeypatch):
+def test_c_and_deterministic_flags_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
     with pytest.raises(live.ProductContractLiveError):
         live.evaluate_live(SHA, repo_root=Path("."), gate_c_only=True, deterministic_only=True)
 
 
-def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff():
+def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/aa-self-proving-qualification.yml").read_text()
     assert "timeout-minutes: 120" not in workflow
@@ -133,12 +133,17 @@ def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff():
     assert "continuum-qualification-result" in workflow
 
 
-def test_standalone_full_diagnostic_still_invokes_all_lanes(monkeypatch):
+def test_standalone_full_diagnostic_still_invokes_all_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
     _setup(monkeypatch)
-    async def async_all(run_id):
-        return (_fake_lane("product-contract-1-24"),
-                _fake_lane("telegram-transport-25-32"),
-                _fake_lane("live-telegram-evidence"))
+
+    async def async_all(
+        run_id: str,
+    ) -> tuple[live.LaneResult, live.LaneResult, live.LaneResult]:
+        return (
+            _fake_lane("product-contract-1-24"),
+            _fake_lane("telegram-transport-25-32"),
+            _fake_lane("live-telegram-evidence"),
+        )
 
     monkeypatch.setattr(live, "_run_async_lanes", async_all)
     monkeypatch.setattr(live, "run_control_lane", lambda root: _fake_lane("runtime-control-33-41"))
