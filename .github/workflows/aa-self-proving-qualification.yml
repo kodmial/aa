@@ -544,7 +544,7 @@ jobs:
           set +e
           python scripts/run_product_contract_live_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir live-out --run-id "${{ github.run_id }}"
+            --out-dir live-out --run-id "${{ github.run_id }}" --gate-c-only
           product_rc=$?
           set -e
           if [[ "$product_rc" -eq 75 ]]; then
