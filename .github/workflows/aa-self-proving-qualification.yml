@@ -865,6 +865,20 @@ jobs:
               .find(issue =>
                 String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
               );
+            // Global Gate C exhaustion always takes precedence over per-fingerprint retries.
+            // A changed model/provider error must not bypass blocked breaker #290.
+            const gateCExhausted = (blocking === 'C' || productFailures.some(g => g.gate === 'C')) &&
+              issues.some(issue =>
+                !issue.pull_request && issue.state === 'open' &&
+                String(issue.body || '').includes('<!-- aa-self-proving-convergence-breaker:v1 -->') &&
+                String(issue.body || '').includes('Convergence scope: `gate:C`') &&
+                (issue.labels || []).some(label => label.name === 'automation:blocked')
+              );
+            if (gateCExhausted) {
+              core.warning('Global Gate C convergence breaker exhausted: retain FAIL/UNQUALIFIED; ' +
+                'no new automated C code mutation for a changed failure fingerprint.');
+              return;
+            }
             let recurrence = 1;
             if (existing) {
               const match = String(existing.body || '').match(/Repair recurrence: \`(\d+)\`/);
