@@ -54,7 +54,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  model_pool_readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    outputs:
+      models: ${{ steps.wait.outputs.models }}
+    steps:
+      - name: Wait for approved model pool variable
+        id: wait
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?TAP_PAT must have Actions Variables read permission}"
+          for attempt in $(seq 1 30); do
+            models="$(gh api "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" --jq .value 2>/dev/null || true)"
+            if [[ -n "$models" ]]; then
+              echo "models=$models" >> "$GITHUB_OUTPUT"
+              echo "AA model pool ready."
+              exit 0
+            fi
+            echo "OPENCODE_MODELS not ready (attempt $attempt/30); waiting..."
+            sleep 10
+          done
+          echo "::error::AA requires approved OPENCODE_MODELS repository variable"
+          exit 2
+
   qualify:
+    needs: model_pool_readiness
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -115,14 +144,15 @@ jobs:
             sleep $((attempt * 10))
           done
 
-      - name: Qualify AA production model via Continuum
+      - name: Qualify approved AA OpenCode model route
         id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
-          models: ${{ vars.OPENCODE_MODELS }}
+          models: ${{ needs.model_pool_readiness.outputs.models }}
           task-class: coder
-          profile: aa-product
+          profile: aa-product-contract
           state-token: ${{ github.token }}
+          runtime-version: ''
           strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
           probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
           cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
@@ -130,7 +160,7 @@ jobs:
 
       - name: Freeze verified model for all AA agents and quality gates
         env:
-          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          APPROVED_POOL: ${{ needs.model_pool_readiness.outputs.models }}
           VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
         shell: bash
         run: |
@@ -228,6 +258,10 @@ jobs:
       - name: Gate A - static/build
         id: gate-a
         shell: bash
+        env:
+          OPENCODE_MODELS: ${{ needs.model_pool_readiness.outputs.models }}
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): skip only when a validated
@@ -318,6 +352,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
@@ -506,6 +542,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
         run: |
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
@@ -521,6 +559,17 @@ jobs:
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
             --final-only
+
+      - name: Record completed AA Product Contract model execution
+        if: ${{ steps.aa_model_route.outcome == 'success' && steps.gate-f.outcome == 'success' }}
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        with:
+          operation: record
+          models: ${{ needs.model_pool_readiness.outputs.models }}
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          task-class: coder
+          profile: aa-product-contract
+          state-token: ${{ github.token }}
 
       - name: Upload per-gate evidence and failure matrix
         # Privacy-safe full per-gate evidence (issue #339): atomic validated
