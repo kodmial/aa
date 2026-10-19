@@ -23,7 +23,7 @@ permissions:
   # prompts, corpus dumps or credentials). packages: read pulls the private
   # prebuilt GHCR runtime image (issue #298).
   actions: write
-  contents: read
+  contents: write
   issues: write
   packages: read
 
@@ -422,7 +422,6 @@ jobs:
             sleep $((attempt * 10))
           done
 
-
       - name: Qualify approved AA OpenCode model route
         id: aa_model_route
         uses: kodmial/continuum/.github/actions/model-route@main
@@ -437,6 +436,23 @@ jobs:
           probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
           cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Freeze verified model for all AA agents and quality gates
+        env:
+          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
+          test -n "$VERIFIED_MODEL"
+          {
+            echo "OPENCODE_MODELS=$APPROVED_POOL"
+            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
+            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
+            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
+          } >> "$GITHUB_ENV"
+          echo "AA model route frozen before product side effects; no in-turn model switching."
 
       - name: Build and validate AA knowledge runtime
         env:
