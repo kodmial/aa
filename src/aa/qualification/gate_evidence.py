@@ -95,7 +95,10 @@ GATE_A_COVERAGE: tuple[dict[str, str], ...] = (
         "check_id": "a-model-policy",
         "owner": "gate-a",
         "input": "Settings.from_env agent/model/fallback policy",
-        "executable_check": "aa.config defaults identity (agent/model/fallback distinct)",
+        "executable_check": (
+            "aa.config pinned runtime policy (agent/model/fallback match defaults; "
+            "same-model fallback allowed)"
+        ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-model-policy]",
     },
     {

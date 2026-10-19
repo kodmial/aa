@@ -34,7 +34,7 @@
     },
     {
       "check_id": "a-model-policy",
-      "executable_check": "aa.config defaults identity (agent/model/fallback distinct)",
+      "executable_check": "aa.config pinned runtime policy (agent/model/fallback match defaults; same-model fallback allowed)",
       "input": "Settings.from_env agent/model/fallback policy",
       "owner": "gate-a",
       "proof_artifact": "gate-A-evidence.json:subchecks[a-model-policy]",

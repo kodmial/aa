@@ -52,6 +52,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from aa.config import DEFAULT_AA_AGENT, DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+
 ISSUE_NUMBER = 146
 CONTROL_ISSUE_NUMBER = 31
 QUALIFICATION_ISSUE_NUMBER = 7
@@ -293,6 +295,23 @@ def validate_hex64(value: str) -> str:
     if not _HEX64_RE.fullmatch(normalized):
         raise SelfProvingError("fingerprint must be 64-hex or empty")
     return normalized
+
+
+def runtime_model_policy_ok(*, agent: str, model: str, fallback_model: str) -> bool:
+    """Whether the resolved runtime model policy matches the pinned defaults.
+
+    The single live-validated free model serves as both the primary and the
+    fallback. The model adapter deliberately suppresses same-model fallback
+    (``fallback_model != primary_model``), so a distinct second provider is
+    neither required nor permitted: no unverified second provider may serve
+    the product. Any drift of the agent, primary model, or fallback model
+    from the pinned config defaults is a Gate A model-policy failure.
+    """
+    return (
+        (agent or "").strip() == DEFAULT_AA_AGENT
+        and (model or "").strip() == DEFAULT_PRIMARY_MODEL
+        and (fallback_model or "").strip() == DEFAULT_FALLBACK_MODEL
+    )
 
 
 def _subtree_holds_text(value: Any) -> bool:

@@ -67,6 +67,7 @@ from aa.qualification.self_proving import (  # noqa: E402
     decide_final_verdict,
     failure_report_for_gate,
     repair_fingerprint,
+    runtime_model_policy_ok,
     validate_exact_sha,
 )
 
@@ -212,19 +213,13 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             run_id=run_id,
         )
     try:
-        from aa.config import (
-            DEFAULT_AA_AGENT,
-            DEFAULT_FALLBACK_MODEL,
-            DEFAULT_PRIMARY_MODEL,
-            Settings,
-        )
+        from aa.config import Settings
 
         _policy = Settings.from_env(None)
-        _policy_ok = (
-            _policy.opencode_agent == DEFAULT_AA_AGENT
-            and _policy.opencode_model == DEFAULT_PRIMARY_MODEL
-            and _policy.opencode_fallback_model == DEFAULT_FALLBACK_MODEL
-            and _policy.opencode_model != _policy.opencode_fallback_model
+        _policy_ok = runtime_model_policy_ok(
+            agent=_policy.opencode_agent,
+            model=_policy.opencode_model,
+            fallback_model=_policy.opencode_fallback_model,
         )
     except Exception:
         _policy_ok = False

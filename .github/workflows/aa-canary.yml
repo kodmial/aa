@@ -244,8 +244,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
+          OPENCODE_MODEL: opencode/nemotron-3-ultra-free
+          OPENCODE_FALLBACK_MODEL: opencode/nemotron-3-ultra-free
         run: |
           set -euo pipefail
           set +e

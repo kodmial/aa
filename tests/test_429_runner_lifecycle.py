@@ -87,7 +87,7 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
     assert 'if [ "$status" -eq 75 ]' in workflow
     assert "OPENCODE_429_RESTART_REQUIRED" in workflow
     assert "aa-runtime-429-recovery" in workflow
-    assert "opencode/space-bunny-free" in workflow
+    assert "opencode/nemotron-3-ultra-free" in workflow
 
 
 def test_global_429_recovery_watches_runtime_and_qualification() -> None:
