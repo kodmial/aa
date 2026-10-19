@@ -96,6 +96,8 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
     ) in workflow
     assert "models: ${{ needs.model_pool_readiness.outputs.models }}" in workflow
     assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in workflow
+    # The retired Muse Spark / Space Bunny pair must not re-enter the runtime.
+    assert "opencode/muse-spark" not in workflow
     assert "opencode/space-bunny-free" not in workflow
 
 

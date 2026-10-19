@@ -58,8 +58,10 @@ without accidentally launching an ungrounded assistant.
 The user-facing OpenCode agent is `aa`, backed by
 `prompts/aa-agent-system.md`. Its runtime model defaults are:
 
-- primary: `opencode/muse-spark-1.3-contributor-free`;
-- technical fallback: `opencode/space-bunny-free`.
+- primary: `opencode/nemotron-3-ultra-free`;
+- technical fallback: `opencode/nemotron-3-ultra-free` (same live-validated
+  model; the adapter suppresses same-model fallback so no unverified second
+  provider serves the product).
 
 These are AA-assistant runtime models; they do not define the model Continuum
 uses to implement repository tasks.
