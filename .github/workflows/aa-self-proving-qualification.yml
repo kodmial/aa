@@ -29,10 +29,8 @@ on:
       - "corpus/**"
       - "qualification/**"
       - "scripts/**"
-      - "tests/**"
       - "pyproject.toml"
       - ".github/workflows/aa-*.yml"
-      - ".github/workflows/continuum-*.yml"
   workflow_dispatch:
     inputs:
       required_sha:
@@ -56,7 +54,10 @@ concurrency:
 jobs:
   qualify:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
+    outputs:
+      gate_a_outcome: ${{ steps.gate-a.outcome }}
+      gate_b_outcome: ${{ steps.gate-b.outcome }}
     steps:
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -300,8 +301,212 @@ jobs:
             --emit-gate B --shell-b-status "$gate_b_shell" \
             --shell-b-detail "workflow-gate-b-shell-$gate_b_shell"
 
+
+      - name: Save exact-SHA A/B evidence for live qualification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-preflight-evidence
+          path: |
+            self-proving-out/gate-A-evidence.json
+            self-proving-out/gate-B-evidence.json
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
+  qualify-live:
+    needs: qualify
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.required_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact current main identity and clean tree
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_sha="$(git rev-parse HEAD)"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Refusing qualification on a dirty tree."
+            exit 2
+          fi
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main --depth=1
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$checked_sha" != "$current_main" ]]; then
+            echo "::error::Refusing stale qualification: checked=$checked_sha current-main=$current_main"
+            mkdir -p self-proving-out
+            printf '{"reason_code":"STALE_MAIN","checked_sha":"%s","current_main":"%s"}\n' \
+              "$checked_sha" "$current_main" > self-proving-out/stale-main.json
+            exit 3
+          fi
+          echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
+          echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project and dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install pinned OpenCode
+        if: ${{ needs.qualify.result == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
+              bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Qualify AA production model via Continuum
+        id: aa_model_route
+        if: ${{ needs.qualify.result == 'success' }}
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          task-class: coder
+          profile: aa-product
+          state-token: ${{ github.token }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Freeze verified model for all AA agents and quality gates
+        env:
+          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        if: ${{ needs.qualify.result == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
+          test -n "$VERIFIED_MODEL"
+          {
+            echo "OPENCODE_MODELS=$APPROVED_POOL"
+            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
+            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
+            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
+          } >> "$GITHUB_ENV"
+          echo "AA model route frozen before product side effects; no in-turn model switching."
+
+      - name: Install system voice media dependency
+        if: ${{ needs.qualify.result == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gate C live voice end-to-end (GigaAM ASR decode + Silero TTS
+          # OGG/Opus encode) shells out to system ffmpeg. Ubuntu runners do
+          # not preinstall it, so every Gate C run failed
+          # live-voice-fixture-synthesis-encode-failed with no voice
+          # end-to-end evidence. Install once so all gates share it.
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already present: $(ffmpeg -version | head -n 1)"
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Restore gate checkpoints from previous attempt
+        # RUNNER_TEMP is ephemeral per runner, so a 429 runner retire would
+        # otherwise lose completed-gate checkpoints. Persist them as a
+        # run-scoped artifact and restore them here so the next runner
+        # resumes from the last completed gate instead of rerunning Gate A.
+        if: ${{ needs.qualify.result == 'success' && github.run_attempt > 1 }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-self-proving-checkpoints
+          path: /tmp/aa-self-proving-checkpoints-restore
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage restored gate checkpoints
+        if: ${{ needs.qualify.result == 'success' && github.run_attempt > 1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          RESTORE_DIR="/tmp/aa-self-proving-checkpoints-restore"
+          mkdir -p "$CKPT_DIR"
+          # Typed checkpoints only (kodmial/aa#342): a bare gate-X.done file
+          # carries no SHA/run/fingerprint binding and never authorizes a
+          # skip. Only schema-validated checkpoint JSONs are staged; the
+          # per-gate --check-skip validation below enforces the binding.
+          if compgen -G "$RESTORE_DIR/gate-*.checkpoint.json" > /dev/null; then
+            cp "$RESTORE_DIR"/gate-*.checkpoint.json "$CKPT_DIR"/
+            echo "restored typed gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          elif compgen -G "$RESTORE_DIR/**/gate-*.checkpoint.json" > /dev/null; then
+            find "$RESTORE_DIR" -name 'gate-*.checkpoint.json' -exec cp {} "$CKPT_DIR"/ \;
+            echo "restored nested typed gate checkpoints from previous attempt:"
+            ls -la "$CKPT_DIR"
+          else
+            echo "no previous typed gate checkpoints found"
+          fi
+          if [[ -d "$RESTORE_DIR/live-out" ]]; then
+            rm -rf live-out
+            cp -R "$RESTORE_DIR/live-out" live-out
+            echo "restored Gate C privacy-safe live evidence"
+          fi
+          # Unified Gate A/B evidence (issue #339): restore already-published
+          # validated artifacts so a resumed runner reuses the single
+          # authoritative verdict instead of re-executing the gate.
+          if compgen -G "$RESTORE_DIR/gate-[A-E]-evidence.json" > /dev/null; then
+            mkdir -p self-proving-out
+            cp "$RESTORE_DIR"/gate-[A-E]-evidence.json self-proving-out/
+            echo "restored validated Gate evidence artifacts"
+          fi
+
+
+      - name: Restore trusted exact-run A/B evidence (never recompute on live runner)
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: aa-preflight-evidence
+          path: self-proving-out
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Bootstrap exact production book/index for Gate C only
+        if: ${{ needs.qualify.result == 'success' }}
+        shell: bash
+        env:
+          AA_ALLOW_NETWORK_FETCH: "0"
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
+          python scripts/build_corpus_structure.py
+          python scripts/prefetch_public_assets.py
+          python scripts/prefetch_voice_assets.py
+          python scripts/build_retrieval_index.py --backend e5
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
+        if: ${{ needs.qualify.result == 'success' }}
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -489,7 +694,7 @@ jobs:
         # An interrupted/failed dependency-install step is infrastructure
         # failure, not a product Gate A/B failure. Do not synthesize gate
         # evidence before Gate A had a chance to run.
-        if: ${{ always() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') }}
+        if: ${{ always() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') }}
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -603,12 +808,12 @@ jobs:
         # from the persisted gate checkpoints.
         # Missing setup/checkout proof is an infrastructure failure, not an
         # implementation defect. Never open code-repair tasks for it.
-        if: ${{ failure() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        if: ${{ failure() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
-          GATE_A_OUTCOME: ${{ steps.gate-a.outcome }}
-          GATE_B_OUTCOME: ${{ steps.gate-b.outcome }}
+          GATE_A_OUTCOME: ${{ needs.qualify.outputs.gate_a_outcome }}
+          GATE_B_OUTCOME: ${{ needs.qualify.outputs.gate_b_outcome }}
           GATE_C_OUTCOME: ${{ steps.gate-c.outcome }}
           GATE_E_OUTCOME: ${{ steps.gate-e.outcome }}
         with:
@@ -1245,7 +1450,7 @@ jobs:
       - name: Publish authoritative Product Contract result
         # Publish only when Gate A actually executed. A setup cancellation
         # must never record a trusted product FAIL on missing artifacts.
-        if: ${{ always() && (steps.gate-a.outcome == 'success' || steps.gate-a.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        if: ${{ always() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           QUAL_SHA: ${{ steps.sha.outputs.sha }}
