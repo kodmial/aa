@@ -1096,7 +1096,7 @@ jobs:
               ));
             } catch (error) {
               // Invalid classifier/evidence blocks mutation, not qualification.
-              core.error('Qualification repair classifier failed; no code mutation: ' + error.message);
+              core.warning('Qualification repair classifier failed; no code mutation: ' + error.message);
               return;
             }
             core.notice('repair-policy decision: actionable=' +
