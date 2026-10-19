@@ -80,7 +80,9 @@ def test_cli_uses_same_policy_and_fails_closed_on_malformed_input():
     payload = {"failures": [failure("C", "OpenCodeProviderAccessError")]}
     run = subprocess.run(cmd, input=json.dumps(payload), text=True, capture_output=True, check=True)
     assert json.loads(run.stdout)["actionable"] == []
-    malformed = subprocess.run(cmd, input='{"failures": "not-a-list"}', text=True, capture_output=True)
+    malformed = subprocess.run(
+        cmd, input='{"failures": "not-a-list"}', text=True, capture_output=True
+    )
     assert malformed.returncode != 0
 
 
