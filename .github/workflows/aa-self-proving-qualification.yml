@@ -58,6 +58,7 @@ jobs:
     outputs:
       gate_a_outcome: ${{ steps.gate-a.outcome }}
       gate_b_outcome: ${{ steps.gate-b.outcome }}
+      verified_model: ${{ steps.aa_model_route.outputs.model }}
     steps:
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -403,6 +404,7 @@ jobs:
           models: ${{ vars.OPENCODE_MODELS }}
           task-class: coder
           profile: aa-product
+          explicit-pin: ${{ needs.qualify.outputs.verified_model }}
           state-token: ${{ github.token }}
           strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
           probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
