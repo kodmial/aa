@@ -6,7 +6,6 @@ import pytest
 
 from aa.qualification import product_contract_live as live
 
-
 SHA = "a" * 40
 
 
@@ -20,7 +19,9 @@ def _setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(live, "assert_no_text_leak", lambda _: None)
 
 
-def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _setup(monkeypatch)
     calls = []
 
@@ -42,7 +43,9 @@ def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(mon
     assert calls == [("real", "r1")]
 
 
-def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _setup(monkeypatch)
     calls = []
 
@@ -98,7 +101,9 @@ def test_b_failure_preserved_not_flattened_to_pass(monkeypatch: pytest.MonkeyPat
     assert result.status == "FAIL"
 
 
-def test_gate_c_provider_failure_cannot_be_reported_as_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gate_c_provider_failure_cannot_be_reported_as_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _setup(monkeypatch)
 
     async def provider_fails(run_id: str) -> live.LaneResult:
@@ -135,7 +140,9 @@ def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None
     assert "continuum-qualification-result" in workflow
 
 
-def test_standalone_full_diagnostic_still_invokes_all_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_standalone_full_diagnostic_still_invokes_all_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _setup(monkeypatch)
 
     async def async_all(
