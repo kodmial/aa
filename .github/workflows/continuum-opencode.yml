@@ -132,6 +132,14 @@ permissions:
 
 jobs:
   call:
+    # AA #7's exact-SHA A/B/C/E/F proof belongs exclusively to its own
+    # repository-owned self-proving workflow. Generic no-secret OpenCode
+    # qualification runs created false missing-evidence diagnostics and
+    # duplicate code-repair cycles. Normal issue/review/CI modes stay active.
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.mode != 'qualification') &&
+      (github.event_name != 'issue_comment' ||
+       !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
     uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main
     secrets: inherit
     with:
