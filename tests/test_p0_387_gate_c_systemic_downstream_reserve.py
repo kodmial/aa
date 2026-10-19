@@ -166,6 +166,9 @@ def test_downstream_reserve_constants_preserve_slo() -> None:
 
     assert node_mod.RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S == 40.0
     assert node_mod.RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS == 4
+    # #400: planner+retrieval semantic work fits the Gate E p95 headroom
+    # left after the downstream reserve (60s - 40s = 20s).
+    assert node_mod.RETRIEVAL_SEMANTIC_STAGE_BUDGET_S == 20.0
     # Authoritative SLO and turn budgets are unchanged by this repair.
     assert budget_mod.TURN_END_TO_END_BUDGET_S == 105.0
     assert pipeline_mod.TURN_END_TO_END_BUDGET_S == 105.0
@@ -178,7 +181,7 @@ def test_downstream_reserve_constants_preserve_slo() -> None:
     assert node_mod.RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S > budget_mod.DOWNSTREAM_MIN_RESERVE_S
 
 
-async def test_first_pair_runs_then_tail_stops_on_downstream_reserve(
+async def test_no_semantic_round_when_downstream_headroom_is_spent(
     monkeypatch: Any,
 ) -> None:
     import aa.conversation.retrieval_node as retrieval_node_mod
@@ -200,9 +203,9 @@ async def test_first_pair_runs_then_tail_stops_on_downstream_reserve(
         [[first.chunk_id, second.chunk_id]],
     )
     # Upstream planner cost already spent 70s: only ~35s remain, below the
-    # 40s downstream reserve. The first discover/select/read/assess pair
-    # still runs (model-driven coverage preserved); only tail rounds stop
-    # with a typed exhausted outcome instead of starving the answer stage.
+    # 40s downstream reserve and far below the 60s Gate E p95 target.
+    # #400 closes the old first-pair exemption: no semantic model call
+    # may start when it cannot preserve the downstream slice.
     budget = new_turn_budget(upstream_latency_ms=70_000.0)
     model = _CountingModel(select_ids=[first.chunk_id])
     pack = await aretrieve_with_semantic_selection(
@@ -222,11 +225,67 @@ async def test_first_pair_runs_then_tail_stops_on_downstream_reserve(
     # the downstream-reserve cause travels as a progress event.
     assert metadata.get("coverage_exhaustion_reason") == "latency-budget"
     assert metadata.get("coverage_all_covered") is False
-    # First pair ran (one selection plus one coverage); tail never ground.
-    assert model.calls == 2
+    # No semantic call started, so the best-effort lexical pack never
+    # starved the answer/verifier reserve.
+    assert model.calls == 0
     assert "retrieval-downstream-reserve-stop" in list(
         metadata.get("loop_progress_events", []) or []
     )
+
+
+async def test_first_slow_semantic_call_is_bounded_by_p95_headroom(
+    monkeypatch: Any,
+) -> None:
+    import asyncio
+    import time as _time
+
+    import aa.conversation.retrieval_node as retrieval_node_mod
+    from aa.conversation.retrieval_node import aretrieve_with_semantic_selection
+
+    retrieval_node_mod.clear_canonical_read_cache()
+    first = _record("chapter-3:ru:first", text="Synthetic calm routine ALPHA marker nearby.")
+    index = _fake_index([first])
+    _install_branch(
+        monkeypatch,
+        [{first.chunk_id: _fused(first.chunk_id, 50.0)}],
+        [[first.chunk_id]],
+    )
+    # Shrink only the stage headroom so the bounded tail is observable
+    # without a multi-second test; the production value is 20s.
+    monkeypatch.setattr(retrieval_node_mod, "RETRIEVAL_SEMANTIC_STAGE_BUDGET_S", 0.3)
+
+    class _SlowModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 1
+        ) -> dict[str, object]:
+            _ = (prompt, system, schema, retry_count)
+            self.calls += 1
+            await asyncio.sleep(5.0)
+            return {"selected_chunk_ids": [], "need_more_detail": False, "followup_queries": []}
+
+    model = _SlowModel()
+    started = _time.perf_counter()
+    pack = await aretrieve_with_semantic_selection(
+        index,
+        ["synthetic calm routine query"],
+        resolved_intent="synthetic calm routine intent",
+        conversation_context="",
+        user_message="synthetic calm routine request",
+        selection_model=model,
+        information_needs=[{"need_id": "need-1", "text": "synthetic calm routine"}],
+        max_iterations=3,
+    )
+    elapsed = _time.perf_counter() - started
+    metadata = dict(pack.retrieval_metadata or {})
+    assert elapsed < 2.0
+    assert model.calls == 1
+    assert metadata.get("coverage_status") == "exhausted"
+    assert metadata.get("coverage_exhaustion_reason") == "latency-budget"
+    assert metadata.get("typed_stage") == "provider_semantic_timeout"
+    assert "selection-deadline-stop" in list(metadata.get("loop_progress_events", []) or [])
 
 
 async def test_semantic_rounds_capped_despite_ample_budget(monkeypatch: Any) -> None:
