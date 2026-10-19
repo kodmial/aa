@@ -1,0 +1,9 @@
+{
+  "approved_by": "owner in kodmial/work-lock#66",
+  "note": "Deployment fixture only; production authoritative value is GitHub repository Variable OPENCODE_MODELS",
+  "models": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3-ultra-free"
+  ]
+}
