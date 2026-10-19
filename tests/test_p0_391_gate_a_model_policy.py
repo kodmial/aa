@@ -28,10 +28,10 @@ PRODUCTION_WORKFLOWS = (
 )
 OTHER_APPROVED_MODEL = "opencode/other-approved-free"
 APPROVED_POOL = f"{DEFAULT_PRIMARY_MODEL},{OTHER_APPROVED_MODEL}"
-# The Continuum route action is a first-party dependency; an immutable commit
-# pin is preferred over the mutable main branch for supply-chain safety.
+# The Continuum route action is a first-party dependency; production workflows
+# must pin it to an immutable 40-hex commit rather than a mutable branch.
 MODEL_ROUTE_USE_RE = re.compile(
-    r"uses:\s*kodmial/continuum/\.github/actions/model-route@(?:main|[0-9a-f]{40})\b"
+    r"uses:\s*kodmial/continuum/\.github/actions/model-route@[0-9a-f]{40}\b"
 )
 
 
