@@ -4,6 +4,7 @@
 Must not be used to calculate product PASS/FAIL. Exit nonzero on invalid input
 rather than silently accepting empty/corrupt evidence as a product success.
 """
+
 from __future__ import annotations
 
 import json
