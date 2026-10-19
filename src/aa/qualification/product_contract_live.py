@@ -2476,7 +2476,7 @@ async def run_live_telegram_evidence_lane(
             PLANNER_AGENT_V2,
             SUMMARIZER_AGENT_V2,
             VERIFIER_AGENT_V2,
-            OpenCodeChatModel,
+            build_summarizer_model,
         )
         from aa.conversation.output_limits import envelope_passes
         from aa.conversation.turn_pipeline import (
@@ -2575,16 +2575,18 @@ async def run_live_telegram_evidence_lane(
 
             # Short ordinary turns intentionally skip memory compaction, so
             # explicitly exercise the production summarizer agent once. The
-            # same real OpenCode client enforces the served provider/model.
-            # Hardened (kodmial/aa#370): a summarizer-probe failure must not
-            # abort all 18 production scenarios with zero samples. A
-            # non-429 probe error records its concrete category and the lane
-            # continues to the scenario proof; provider 429 still retires
-            # the runner for checkpoint resume.
+            # probe is built through the exact production helper
+            # (``build_summarizer_model``), so it uses the real production
+            # wire policy instead of a custom provider selector the provider
+            # may reject (kodmial/aa#395). The same real OpenCode client
+            # enforces the served provider/model. Hardened (kodmial/aa#370):
+            # a summarizer-probe failure must not abort all 18 production
+            # scenarios with zero samples. A non-429 probe error records its
+            # concrete category and the lane continues to the scenario proof;
+            # provider 429 still retires the runner for checkpoint resume.
             try:
-                summarizer_probe = OpenCodeChatModel(
+                summarizer_probe = build_summarizer_model(
                     app.opencode_runtime.client,
-                    agent=SUMMARIZER_AGENT_V2,
                     primary_model=settings.opencode_model,
                     fallback_model=settings.opencode_fallback_model,
                 )
