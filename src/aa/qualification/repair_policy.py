@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 _PROVIDERS = re.compile(
     r"opencodeprovideraccesserror|opencoderatelimiterror|provider[-_ ](?:access|"
@@ -45,7 +46,9 @@ _PRODUCT_C = re.compile(
     r"retrieval[-_ ](?:coverage|wrong[-_ ]passage)",
     re.IGNORECASE,
 )
-_PERFORMANCE_E = re.compile(r"slo|latency|p95|turn[-_ ]budget|ordinary[-_ ]turn[-_ ]failed", re.IGNORECASE)
+_PERFORMANCE_E = re.compile(
+    r"slo|latency|p95|turn[-_ ]budget|ordinary[-_ ]turn[-_ ]failed", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -101,12 +104,12 @@ def plan_repair(
     decisions = [_classify(failure) for failure in failures]
     c_unavailable = any(
         str(f.get("gate", "")).upper() == "C" and decision != "product"
-        for f, decision in zip(failures, decisions)
+        for f, decision in zip(failures, decisions, strict=True)
         if str(f.get("status", "")).upper() == "FAIL"
     )
     actionable: list[int] = []
     held: list[tuple[str, str]] = []
-    for index, (failure, reason) in enumerate(zip(failures, decisions)):
+    for index, (failure, reason) in enumerate(zip(failures, decisions, strict=True)):
         gate = str(failure.get("gate", "")).upper()
         if reason != "product":
             held.append((gate, reason))
