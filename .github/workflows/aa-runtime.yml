@@ -427,10 +427,9 @@ jobs:
         uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ vars.OPENCODE_MODELS }}
-          legacy-model: ${{ vars.OPENCODE_MODEL }}
           task-class: coder
           profile: aa-live-poller
-          state-token: ${{ secrets.TAP_PAT }}
+          state-token: ${{ secrets.AA_MODEL_ROUTE_STATE_TOKEN || github.token }}
           runtime-version: ''
           strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
           probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}

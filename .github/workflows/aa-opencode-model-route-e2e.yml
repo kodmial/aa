@@ -13,6 +13,7 @@ on:
       - 'tests/fixtures/approved-model-pool-66.json'
 
 permissions:
+  # The model-route action persists durable selection state in a Git ref.
   contents: write
 
 jobs:
@@ -25,6 +26,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Install AA package without provider/runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install -e . --no-deps
       - name: Install actual AA pinned OpenCode
         shell: bash
         run: |
@@ -40,7 +46,7 @@ jobs:
           echo "models=$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/approved-model-pool-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
       - name: Qualify official model capabilities and durable state in AA
         id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
@@ -66,6 +72,8 @@ jobs:
           PY
           dir="$(mktemp -d)"
           trap 'rm -rf "$dir"' EXIT
+          cp opencode.json "$dir/opencode.json"
+          cp -R prompts "$dir/prompts"
           cp scripts/run_self_proving_qualification.py "$dir/aa-contract.py"
           cd "$dir"
           env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
@@ -75,7 +83,7 @@ jobs:
           test -f aa-task-acceptance.txt
           test "$(cat aa-task-acceptance.txt)" = AA_MODEL_POLICY_ACCEPTED
       - name: Attest real AA task completion
-        uses: kodmial/continuum/.github/actions/model-route@main
+        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
         with:
           operation: record
           models: ${{ steps.fixture.outputs.models }}
