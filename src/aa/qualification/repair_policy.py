@@ -110,8 +110,7 @@ def plan_repair(
     # A known-exhausted C failure can poison E timing samples. Do not
     # reopen the same C convergence loop under the alternative E fingerprint.
     c_exhausted = gate_c_breaker and any(
-        str(f.get("gate", "")).upper() == "C"
-        and str(f.get("status", "")).upper() == "FAIL"
+        str(f.get("gate", "")).upper() == "C" and str(f.get("status", "")).upper() == "FAIL"
         for f in failures
     )
     actionable: list[int] = []

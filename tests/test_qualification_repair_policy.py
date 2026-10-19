@@ -10,9 +10,7 @@ from pathlib import Path
 from aa.qualification.repair_policy import plan_repair
 
 
-def failure(
-    gate: str, category: str, component: str = "live-production-path"
-) -> dict[str, str]:
+def failure(gate: str, category: str, component: str = "live-production-path") -> dict[str, str]:
     return {
         "gate": gate,
         "status": "FAIL",
@@ -103,9 +101,7 @@ def test_cli_uses_same_policy_and_fails_closed_on_malformed_input() -> None:
     root = Path(__file__).resolve().parents[1]
     cmd = [sys.executable, str(root / "scripts" / "plan_qualification_repair.py")]
     payload = {"failures": [failure("C", "OpenCodeProviderAccessError")]}
-    run = subprocess.run(
-        cmd, input=json.dumps(payload), text=True, capture_output=True, check=True
-    )
+    run = subprocess.run(cmd, input=json.dumps(payload), text=True, capture_output=True, check=True)
     assert json.loads(run.stdout)["actionable"] == []
     malformed = subprocess.run(
         cmd, input='{"failures": "not-a-list"}', text=True, capture_output=True
