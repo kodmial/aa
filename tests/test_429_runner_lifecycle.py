@@ -87,7 +87,13 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
     assert 'if [ "$status" -eq 75 ]' in workflow
     assert "OPENCODE_429_RESTART_REQUIRED" in workflow
     assert "aa-runtime-429-recovery" in workflow
-    assert "opencode/space-bunny-free" in workflow
+    # The runner recovers after a quota burn, but production route policy
+    # comes from Continuum and the owner-approved GitHub Variable. The old
+    # hardcoded weak fallback must never be silently selected mid-turn.
+    assert "uses: kodmial/continuum/.github/actions/model-route@main" in workflow
+    assert "models: ${{ vars.OPENCODE_MODELS }}" in workflow
+    assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in workflow
+    assert "opencode/space-bunny-free" not in workflow
 
 
 def test_global_429_recovery_watches_runtime_and_qualification() -> None:
