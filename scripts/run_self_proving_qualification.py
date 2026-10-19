@@ -27,6 +27,7 @@ import math
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -118,6 +119,30 @@ def _product_fingerprint() -> str:
     from aa.qualification.product_fingerprint import compute_product_fingerprint
 
     return compute_product_fingerprint(ROOT)
+
+
+def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool:
+    """Gate A checks the *selected* trusted route, not obsolete static IDs.
+
+    Continuum is the only model-pool parser/qualifier. AA checks that its
+    planner, answer, judge and verifier all receive the same frozen model,
+    disabling in-turn fallback after irreversible conversational side effects.
+    Missing/invalid pool attestation is a real Gate A failure.
+    """
+    from aa.config import DEFAULT_AA_AGENT
+
+    pool = environ.get("OPENCODE_MODELS", "").strip()
+    selected = environ.get("CONTINUUM_SELECTED_MODEL", "").strip()
+    routes = [route.strip() for route in pool.split(",")] if pool else []
+    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
+        return False
+    return (
+        bool(selected)
+        and selected in routes
+        and getattr(settings, "opencode_agent", None) == DEFAULT_AA_AGENT
+        and getattr(settings, "opencode_model", None) == selected
+        and getattr(settings, "opencode_fallback_model", None) == selected
+    )
 
 
 def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
@@ -212,20 +237,10 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
             run_id=run_id,
         )
     try:
-        from aa.config import (
-            DEFAULT_AA_AGENT,
-            DEFAULT_FALLBACK_MODEL,
-            DEFAULT_PRIMARY_MODEL,
-            Settings,
-        )
+        from aa.config import Settings
 
         _policy = Settings.from_env(None)
-        _policy_ok = (
-            _policy.opencode_agent == DEFAULT_AA_AGENT
-            and _policy.opencode_model == DEFAULT_PRIMARY_MODEL
-            and _policy.opencode_fallback_model == DEFAULT_FALLBACK_MODEL
-            and _policy.opencode_model != _policy.opencode_fallback_model
-        )
+        _policy_ok = _aa_model_policy_valid(_policy, os.environ)
     except Exception:
         _policy_ok = False
     if not _policy_ok:

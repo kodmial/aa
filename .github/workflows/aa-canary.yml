@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: write
   issues: write
 
@@ -207,6 +207,36 @@ jobs:
             sleep $((attempt * 10))
           done
 
+      - name: Qualify AA production model via Continuum
+        id: aa_model_route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          task-class: coder
+          profile: aa-product
+          state-token: ${{ github.token }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Freeze verified model for all AA agents and quality gates
+        env:
+          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
+          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
+          test -n "$VERIFIED_MODEL"
+          {
+            echo "OPENCODE_MODELS=$APPROVED_POOL"
+            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
+            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
+            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
+          } >> "$GITHUB_ENV"
+          echo "AA model route frozen before product side effects; no in-turn model switching."
+
       - name: Install system voice media dependency
         shell: bash
         run: |
@@ -244,8 +274,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: opencode/muse-spark-1.3-contributor-free
-          OPENCODE_FALLBACK_MODEL: opencode/space-bunny-free
         run: |
           set -euo pipefail
           set +e

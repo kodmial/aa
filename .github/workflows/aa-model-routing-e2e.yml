@@ -1,0 +1,126 @@
+name: AA real OpenCode model routing E2E
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aa-model-routing-e2e.yml'
+      - '.github/workflows/aa-model-policy.yml'
+      - '.github/workflows/aa-self-proving-qualification.yml'
+      - '.github/workflows/aa-runtime.yml'
+      - 'scripts/run_self_proving_qualification.py'
+      - 'tests/test_aa_model_route_policy.py'
+      - 'tests/fixtures/aa-approved-models.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  live-aa-task:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      model: ${{ steps.route.outputs.model }}
+    steps:
+      - name: Checkout AA code from exact HEAD
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Load AA runtime version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'value=%s\n' "$(cat docker/opencode.version)" >> "$GITHUB_OUTPUT"
+      - name: Install verified OpenCode matching AA runtime
+        id: toolchain
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ steps.version.outputs.value }}
+      - name: Read owner-approved model fixture for E2E only
+        id: pool
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Qualify real coding route with Continuum
+        id: route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ steps.pool.outputs.models }}
+          profile: aa-live-e2e
+          task-class: coder
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+      - name: Execute actual AA code audit with anonymous OpenCode
+        env:
+          MODEL: ${{ steps.route.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cp src/aa/config.py "$work/config.py"
+          cd "$work"
+          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+            opencode run --auto --model "$MODEL" \
+            'Inspect config.py and write a file called aa-model-audit.txt containing the exact identifiers DEFAULT_PRIMARY_MODEL and DEFAULT_FALLBACK_MODEL and a short explanation of the stale same-model default failure. Do not change config.py.' \
+            > "$RUNNER_TEMP/aa-model-audit.log" 2>&1
+          test -f aa-model-audit.txt
+          grep -q 'DEFAULT_PRIMARY_MODEL' aa-model-audit.txt
+          grep -q 'DEFAULT_FALLBACK_MODEL' aa-model-audit.txt
+          test ! -e .git
+          echo 'AA code-inspection/file-editing task passed on real approved route.'
+      - name: Record accepted real AA task
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: record
+          models: ${{ steps.pool.outputs.models }}
+          selected-model: ${{ steps.route.outputs.model }}
+          profile: aa-live-e2e
+          task-class: coder
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+
+  fresh-aa-runner:
+    needs: live-aa-task
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: version
+        shell: bash
+        run: printf 'value=%s\n' "$(cat docker/opencode.version)" >> "$GITHUB_OUTPUT"
+      - id: toolchain
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ steps.version.outputs.value }}
+      - id: pool
+        shell: bash
+        run: printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Reload sticky AA model on fresh VM
+        id: route
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ steps.pool.outputs.models }}
+          profile: aa-live-e2e
+          task-class: coder
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+      - name: Verify durable real task model recovery
+        env:
+          GOT: ${{ steps.route.outputs.model }}
+          EXPECTED: ${{ needs.live-aa-task.outputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GOT"
+          test "$GOT" = "$EXPECTED"
+          echo 'AA model stickiness verified on independent GitHub runner.'

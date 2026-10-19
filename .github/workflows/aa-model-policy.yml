@@ -1,0 +1,56 @@
+name: AA owner-approved model policy provisioning
+on:
+  # Trusted post-merge deployment: main receives only reviewed code and the
+  # owner's approved model fixture. No webhook comment or manual admin work
+  # required to activate the AA consumer after the PR is merged.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aa-model-policy.yml'
+      - 'tests/fixtures/aa-approved-models.json'
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+
+# Trusted main deployment and owner-initiated reconciliation only.
+# TAP_PAT must possess repository Variables admin scope, no new secret.
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.actor == github.repository_owner &&
+       (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'issue_comment' &&
+         github.event.issue.number == 391 &&
+         github.event.comment.body == '/sync-opencode-models')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout approved policy fixture
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Provision only the owner-approved repository variable
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo "::error::TAP_PAT is required to provision repository Variables"; exit 2; }
+          models="$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')"
+          test -n "$models"
+          # Authoritative production policy is the protected GitHub Variable,
+          # never a model-name constant in an executable workflow.
+          endpoint="repos/$GITHUB_REPOSITORY/actions/variables/OPENCODE_MODELS"
+          if gh api "$endpoint" --silent >/dev/null 2>&1; then
+            gh api -X PATCH "$endpoint" -f name=OPENCODE_MODELS -f value="$models" --silent >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/variables" -f name=OPENCODE_MODELS -f value="$models" --silent >/dev/null
+          fi
+          # Read back and verify exact value without exposing it in logs.
+          actual="$(gh api "$endpoint" --jq '.value')"
+          test "$actual" = "$models" || { echo "::error::GitHub variable readback mismatch"; exit 1; }
+          echo "Owner-approved OPENCODE_MODELS is configured in this AA repository."
