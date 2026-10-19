@@ -207,7 +207,12 @@ class TurnBudget:
     def is_expired(self) -> bool:
         return self.remaining_s() <= 0.0
 
-    def allocate_semantic_timeout_s(self, *, reserve_s: float = DOWNSTREAM_MIN_RESERVE_S) -> float:
+    def allocate_semantic_timeout_s(
+        self,
+        *,
+        reserve_s: float = DOWNSTREAM_MIN_RESERVE_S,
+        max_timeout_s: float | None = None,
+    ) -> float:
         """Timeout for one semantic model await from remaining turn budget.
 
         The allocation is the remaining end-to-end budget minus the small
@@ -217,6 +222,10 @@ class TurnBudget:
         pair (total far below the turn bound) is never forcibly
         exhausted, while a call past the real remaining deadline still
         fails fast to a typed timeout.
+
+        ``max_timeout_s`` is an optional stage-level cap (Gate E p95
+        headroom for retrieval, kodmial/aa#400). A non-positive cap means
+        the stage already spent its headroom, so no provider call starts.
         """
         try:
             reserve = max(0.0, float(reserve_s))
@@ -230,7 +239,21 @@ class TurnBudget:
                 elapsed_ms=self.elapsed_ms(),
                 remaining_ms=self.remaining_ms(),
             )
-        return max(MIN_MODEL_SLICE_S, min(float(remaining), PROVIDER_REQUEST_TIMEOUT_S))
+        timeout_s = max(MIN_MODEL_SLICE_S, min(float(remaining), PROVIDER_REQUEST_TIMEOUT_S))
+        if max_timeout_s is not None:
+            try:
+                stage_cap = float(max_timeout_s)
+            except (TypeError, ValueError):
+                stage_cap = 0.0
+            if stage_cap <= 0:
+                raise TurnBudgetExpired(
+                    "semantic stage headroom already spent",
+                    stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                    elapsed_ms=self.elapsed_ms(),
+                    remaining_ms=self.remaining_ms(),
+                )
+            timeout_s = min(timeout_s, stage_cap)
+        return timeout_s
 
     def record_stage(
         self,
@@ -318,12 +341,15 @@ async def await_model_under_turn_budget(
     stage: str = STAGE_PROVIDER_SEMANTIC_TIMEOUT,
     id_digest: str = "",
     reserve_s: float = DOWNSTREAM_MIN_RESERVE_S,
+    max_timeout_s: float | None = None,
 ) -> Any:
     """Await one provider/model coroutine under the turn deadline.
 
     ``coro_factory`` is a zero-argument callable producing the awaitable,
     invoked only after the budget check so an already-spent budget never
-    creates an un-awaited coroutine. Timeouts raise
+    creates an un-awaited coroutine. ``max_timeout_s`` optionally caps
+    this call by a stage-level headroom (Gate E p95 for retrieval,
+    kodmial/aa#400). Timeouts raise
     :class:`ProviderSemanticTimeout` (typed ``provider_semantic_timeout``
     with anonymized durations); ``asyncio.CancelledError`` and provider
     429 (``OpenCodeRateLimitError``) always propagate and are recorded as
@@ -331,7 +357,7 @@ async def await_model_under_turn_budget(
     failure propagates to the caller (coverage maps it to conservative
     uncovered, never fake sufficiency).
     """
-    timeout_s = budget.allocate_semantic_timeout_s(reserve_s=reserve_s)
+    timeout_s = budget.allocate_semantic_timeout_s(reserve_s=reserve_s, max_timeout_s=max_timeout_s)
     started = time.perf_counter()
     coro = coro_factory() if callable(coro_factory) else coro_factory
     try:

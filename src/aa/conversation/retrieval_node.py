@@ -40,6 +40,7 @@ from aa.conversation.turn_budget import (
     STAGE_LOCAL_RETRIEVAL_SLOW,
     STAGE_PROVIDER_429,
     STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+    TURN_P95_TARGET_MS,
     LocalRetrievalTimeout,
     ProviderSemanticTimeout,
     TurnBudget,
@@ -94,6 +95,23 @@ COVERAGE_PER_CALL_BUDGET_S = 8.0
 # budget is still large but the provider is slow.
 RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S = 40.0
 RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS = 4
+
+# Gate E p95-aware upstream stage bound (kodmial/aa#400): the same
+# C:live-meta-direct-1 failure recurred with every turn at ~105s while
+# answer/verifier cost only ~5s. The #387 tail guard stopped *later*
+# rounds, but the first selector/coverage pair still used the 5s legacy
+# reserve, so a slow provider tail could spend the whole shared turn
+# before the downstream stages. The architecture invariant is now that
+# planner+retrieval semantic work fits inside the Gate E p95 headroom
+# left after the downstream reserve: 60s target - 40s reserve = 20s.
+# Every semantic await is additionally capped by the remaining headroom,
+# and no call starts once that headroom is spent, including the first
+# pair. The bound derives from the authoritative SLO and existing stage
+# slices, is turn-independent, and keeps the best-effort lexical pack.
+RETRIEVAL_SEMANTIC_STAGE_BUDGET_S = max(
+    1.0,
+    float(TURN_P95_TARGET_MS) / 1000.0 - RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S,
+)
 
 # Bounded canonical read cache (kodmial/aa#331): exact expanded
 # passages keyed by stable child id + neighbor window. Content is
@@ -250,18 +268,26 @@ async def _await_model_under_turn_deadline(
     *,
     stage: str = STAGE_PROVIDER_SEMANTIC_TIMEOUT,
     id_digest: str = "",
+    max_timeout_s: float | None = None,
 ) -> Any:
     """Await one semantic model call under the remaining turn budget.
 
     Thin wrapper over :func:`await_model_under_turn_budget` that also
     converts the typed turn-budget errors to the legacy
     :class:`_InteractiveBudgetTimeout` shape at loop boundaries where
-    historic call sites catch it. ``Cancelled`` and provider 429 always
-    propagate (recorded as ``provider_429`` inside the budget).
+    historic call sites catch it. Every retrieval semantic call preserves
+    the full downstream reserve (#387) and is capped by the Gate E p95
+    headroom (#400) via ``max_timeout_s``. ``Cancelled`` and provider 429
+    always propagate (recorded as ``provider_429`` inside the budget).
     """
     try:
         return await await_model_under_turn_budget(
-            coro_factory, budget, stage=stage, id_digest=id_digest
+            coro_factory,
+            budget,
+            stage=stage,
+            id_digest=id_digest,
+            reserve_s=RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S,
+            max_timeout_s=max_timeout_s,
         )
     except (ProviderSemanticTimeout, TurnBudgetExpired) as exc:
         raise _InteractiveBudgetTimeout(str(exc)) from exc
@@ -312,6 +338,28 @@ def _retrieval_preserves_downstream(budget: Any) -> bool:
     except Exception:
         reserve = 40.0
     return bool(remaining >= reserve)
+
+
+def _retrieval_semantic_stage_remaining_s(budget: Any) -> float:
+    """Gate E p95 headroom left for upstream planner+retrieval work.
+
+    Generic architecture bound (kodmial/aa#400): the authoritative Gate E
+    p95 target (60s) minus the downstream answer/verifier/finalize reserve
+    (40s) leaves 20s for planner plus retrieval semantic calls. The
+    elapsed turn time is already included in the shared budget, so this
+    helper returns the remaining headroom. Non-positive means no further
+    retrieval model call may start; the best-effort lexical pack is kept.
+    No prompt, keyword, or domain signal.
+    """
+    try:
+        elapsed_s = max(0.0, float(budget.elapsed_s()))
+    except Exception:
+        return 0.0
+    try:
+        stage_budget_s = max(0.0, float(RETRIEVAL_SEMANTIC_STAGE_BUDGET_S))
+    except (TypeError, ValueError):
+        stage_budget_s = 20.0
+    return max(0.0, stage_budget_s - elapsed_s)
 
 
 def _retrieval_model_budget_exceeded(model_calls: int) -> bool:
@@ -1059,13 +1107,12 @@ async def aretrieve_with_semantic_selection(
         The shared read/coverage loop previously stopped further
         expand/search_more iterations once the 5s local RRF diagnostic was
         spent. Since #335 the gate is the remaining end-to-end turn budget
-        owned by the graph: the first discover/select/read/assess pair
-        always runs (model-driven semantic coverage preserved); further
-        iterations stop once the turn deadline is spent and return a typed
-        ``exhausted`` outcome with the best-effort pack instead of
-        grinding. No fake coverage, no truncation, no skipped semantic
-        checks on the fast path. The 5s local value stays a diagnostic
-        slow flag only.
+        owned by the graph; since #400 it also preserves the Gate E p95
+        headroom so no semantic call can starve downstream. When the
+        deadline is spent the loop returns a typed ``exhausted`` outcome
+        with the best-effort pack instead of grinding. No fake coverage,
+        no truncation, no skipped semantic checks on the fast path. The
+        5s local value stays a diagnostic slow flag only.
         """
         try:
             return bool(budget.is_expired())
@@ -1084,27 +1131,29 @@ async def aretrieve_with_semantic_selection(
             progress_events.append("turn-budget-stop")
             deadline_stops += 1
             break
-        # Systemic downstream-reserve guard (kodmial/aa#387): after the
-        # first discover/select/read/assess pair, stop issuing further
-        # retrieval model rounds once the remaining turn budget cannot
-        # cover the downstream answer/verifier/finalize slice, and cap
-        # total semantic rounds so a slow provider tail cannot starve the
-        # answer stage. The first pair always runs (model-driven semantic
-        # coverage preserved, tiny-budget timeout path unchanged).
+        # Gate E p95-aware stage guard (kodmial/aa#400): no retrieval
+        # semantic call starts once planner+retrieval has spent the p95
+        # headroom left after the downstream reserve. This includes the
+        # first pair: the #387 first-pair exemption still allowed one
+        # slow selector/coverage sequence to consume the whole turn.
         # Generic counts/durations only, never prompt or domain signals.
-        # Exhaustion keeps the best-effort pack read so far.
-        if (iteration > 0 or model_calls >= 2) and _retrieval_model_budget_exceeded(model_calls):
-            coverage_status = "exhausted"
-            exhaustion_reason = "search-budget"
-            typed_stage = STAGE_COVERAGE_INSUFFICIENT
-            progress_events.append("retrieval-model-budget-stop")
-            deadline_stops += 1
-            break
-        if (iteration > 0 or model_calls >= 2) and not _retrieval_preserves_downstream(budget):
+        # Exhaustion keeps the best-effort lexical pack so the answer
+        # stage still attempts grounded generation.
+        if _retrieval_semantic_stage_remaining_s(budget) <= 0:
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
             typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
             progress_events.append("retrieval-downstream-reserve-stop")
+            deadline_stops += 1
+            break
+        # Systemic downstream-reserve guard (kodmial/aa#387): cap total
+        # semantic rounds so a slow provider tail cannot starve the
+        # answer stage even while the p95 headroom remains.
+        if _retrieval_model_budget_exceeded(model_calls):
+            coverage_status = "exhausted"
+            exhaustion_reason = "search-budget"
+            typed_stage = STAGE_COVERAGE_INSUFFICIENT
+            progress_events.append("retrieval-model-budget-stop")
             deadline_stops += 1
             break
         # ---- select_for_reading over the combined discovered pool.
@@ -1172,6 +1221,7 @@ async def aretrieve_with_semantic_selection(
                 budget,
                 stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
                 id_digest=need_digest,
+                max_timeout_s=_retrieval_semantic_stage_remaining_s(budget),
             )
         except _InteractiveBudgetTimeout:
             coverage_status = "exhausted"
@@ -1333,19 +1383,18 @@ async def aretrieve_with_semantic_selection(
         # typed exhausted outcome instead of grinding; 429/cancel
         # propagate, never swallowed. An exhausted (timed-out) model call
         # can never pass as sufficient book evidence.
-        # Systemic guard (kodmial/aa#387): skip further coverage rounds
-        # once the downstream slice or the semantic call cap is spent;
-        # the best-effort pack above is preserved for the answer stage.
-        # The first assess_coverage always runs (model_calls==1 after the
-        # first selection); only tail rounds are gated.
-        if model_calls >= 2 and _retrieval_model_budget_exceeded(model_calls):
+        # Systemic guards (#387/#400): skip coverage once the semantic
+        # call cap or the Gate E p95 headroom is spent; the best-effort
+        # pack above is preserved for the answer stage. The first
+        # assess_coverage still runs while the headroom remains.
+        if _retrieval_model_budget_exceeded(model_calls):
             coverage_status = "exhausted"
             exhaustion_reason = "search-budget"
             typed_stage = STAGE_COVERAGE_INSUFFICIENT
             progress_events.append("retrieval-model-budget-stop-coverage")
             deadline_stops += 1
             break
-        if model_calls >= 2 and not _retrieval_preserves_downstream(budget):
+        if _retrieval_semantic_stage_remaining_s(budget) <= 0:
             coverage_status = "exhausted"
             exhaustion_reason = "latency-budget"
             typed_stage = STAGE_PROVIDER_SEMANTIC_TIMEOUT
@@ -1369,6 +1418,7 @@ async def aretrieve_with_semantic_selection(
                     budget,
                     stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
                     id_digest=need_digest,
+                    max_timeout_s=_retrieval_semantic_stage_remaining_s(budget),
                 )
             except _InteractiveBudgetTimeout:
                 coverage_status = "exhausted"
@@ -1541,6 +1591,7 @@ async def aretrieve_with_semantic_selection(
                     and not _interactive_budget_exceeded()
                     and not _retrieval_model_budget_exceeded(model_calls)
                     and _retrieval_preserves_downstream(budget)
+                    and _retrieval_semantic_stage_remaining_s(budget) > 0
                 )
                 if _regrown_allowed:
                     if turn_dag is not None:
@@ -1559,6 +1610,7 @@ async def aretrieve_with_semantic_selection(
                             budget,
                             stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
                             id_digest=need_digest,
+                            max_timeout_s=_retrieval_semantic_stage_remaining_s(budget),
                         )
                     except _InteractiveBudgetTimeout:
                         regrown_verdict = conservative_uncovered_verdict(needs_for_selection)
@@ -2545,6 +2597,7 @@ __all__ = [
     "COVERAGE_PER_CALL_BUDGET_S",
     "RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S",
     "RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS",
+    "RETRIEVAL_SEMANTIC_STAGE_BUDGET_S",
     "SELECTION_PER_CALL_BUDGET_S",
     "_InteractiveBudgetTimeout",
     "aretrieve_with_semantic_selection",
