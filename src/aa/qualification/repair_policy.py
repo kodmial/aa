@@ -107,6 +107,13 @@ def plan_repair(
         for f, decision in zip(failures, decisions, strict=True)
         if str(f.get("status", "")).upper() == "FAIL"
     )
+    # A known-exhausted C failure can poison E timing samples. Do not
+    # reopen the same C convergence loop under the alternative E fingerprint.
+    c_exhausted = gate_c_breaker and any(
+        str(f.get("gate", "")).upper() == "C"
+        and str(f.get("status", "")).upper() == "FAIL"
+        for f in failures
+    )
     actionable: list[int] = []
     held: list[tuple[str, str]] = []
     for index, (failure, reason) in enumerate(zip(failures, decisions, strict=True)):
@@ -117,6 +124,8 @@ def plan_repair(
             held.append((gate, "global-gate-c-breaker"))
         elif gate == "E" and c_unavailable:
             held.append((gate, "latency-inconclusive-while-c-unavailable"))
+        elif gate == "E" and c_exhausted:
+            held.append((gate, "latency-dependent-on-exhausted-c"))
         elif in_flight_repair:
             held.append((gate, "repair-already-in-flight"))
         else:
