@@ -9,8 +9,8 @@ Transient provider, model, infrastructure, harness and ambiguous faults do not.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 _PROVIDERS = re.compile(
