@@ -63,6 +63,13 @@ VERIFIER_TRANSPORT_AGENT_V2 = ""
 # planner family too; derived answer/summarizer models preserve this wire
 # policy while retaining their distinct logical audit identities.
 PLANNER_TRANSPORT_AGENT_V2 = ""
+# The conversation summarizer is part of the same hidden family and must
+# omit the provider selector on the wire. It is built through
+# :func:`build_summarizer_model` so the production graph and the live
+# qualification smoke probe can never drift: the probe exercises the exact
+# production summarizer policy, so a custom-selector provider 403 is never
+# reported as a production-path summarizer failure (kodmial/aa#395).
+SUMMARIZER_TRANSPORT_AGENT_V2 = ""
 STRUCTURED_RETRY_COUNT = 2
 MODEL_TRANSIENT_RETRY_DELAYS = (1.0, 4.0)
 # Live SLO guard (Gate C/E): a persistent provider-access (403) rejection
@@ -1044,6 +1051,36 @@ def build_planner_model(
     )
 
 
+def build_summarizer_model(
+    client: OpenCodeClient,
+    *,
+    primary_model: str,
+    fallback_model: str,
+    request_timeout: float = 120.0,
+) -> OpenCodeChatModel:
+    """Build the hidden conversation summarizer with an omitted selector.
+
+    Exact same configured primary/fallback policy and transport policy as
+    :func:`build_planner_model`; only the logical audit identity and native
+    summarizer system prompt differ. The production graph and the live
+    qualification smoke probe both build the summarizer through this
+    helper, so the probe exercises the real production wire policy instead
+    of a custom selector the provider may reject (kodmial/aa#395).
+    """
+    from aa.config import DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+
+    pinned_primary = (primary_model or "").strip() or DEFAULT_PRIMARY_MODEL
+    pinned_fallback = (fallback_model or "").strip() or DEFAULT_FALLBACK_MODEL
+    return OpenCodeChatModel(
+        client,
+        agent=SUMMARIZER_AGENT_V2,
+        primary_model=pinned_primary,
+        fallback_model=pinned_fallback,
+        request_timeout=request_timeout,
+        transport_agent=SUMMARIZER_TRANSPORT_AGENT_V2,
+    )
+
+
 def build_judge_model(
     client: OpenCodeClient,
     *,
@@ -1117,11 +1154,13 @@ __all__ = [
     "RUNTIME_AGENT_V2",
     "STRUCTURED_RETRY_COUNT",
     "SUMMARIZER_AGENT_V2",
+    "SUMMARIZER_TRANSPORT_AGENT_V2",
     "VERIFIER_AGENT_V2",
     "VERIFIER_TRANSPORT_AGENT_V2",
     "OpenCodeChatModel",
     "build_judge_model",
     "build_planner_model",
+    "build_summarizer_model",
     "build_verifier_model",
     "clear_omitted_structured_cache",
     "clear_primary_circuit",

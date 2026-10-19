@@ -876,8 +876,8 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         from aa.conversation.memory import default_memory_config
         from aa.conversation.model_adapter import (
             ANSWER_AGENT_V2,
-            SUMMARIZER_AGENT_V2,
             build_planner_model,
+            build_summarizer_model,
         )
         from aa.retrieval.evidence import RetrievalConfig
 
@@ -888,7 +888,15 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
             primary_model=primary,
             fallback_model=fallback,
         )
-        summarizer = planner.with_agent(SUMMARIZER_AGENT_V2)
+        # The summarizer is built through its own helper (same hidden-family
+        # policy as the planner, distinct logical identity) so production and
+        # the live qualification probe share one wire policy (kodmial/aa#395).
+        summarizer = build_summarizer_model(
+            self._client,
+            primary_model=primary,
+            fallback_model=fallback,
+            request_timeout=planner.request_timeout,
+        )
         answer = planner.with_agent(ANSWER_AGENT_V2)
         # Product invariant (kodmial/aa#202): the grounding verifier uses
         # Muse Spark only with no fallback. Space Bunny is deliberately
