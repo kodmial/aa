@@ -23,7 +23,8 @@ _PROVIDERS = re.compile(
 )
 
 _HARNESS = re.compile(
-    r"workflow[-_ ]step[-_ ]failed|evidence[-_ ](?:invalid|incomplete|missing)|"
+    r"workflow[-_ ](?:step|gate[-_ ][ab][- _]?shell)[-_ ]fail(?:ed)?|"
+    r"evidence[-_ ](?:invalid|incomplete|missing)|"
     r"missing[-_ ](?:live|secret|fixture|artifact|checkpoint)|"
     r"harness|collector|modulenotfounderror|importerror|"
     r"runtime[-_ ](?:not[-_ ]ready|unavailable)|"
