@@ -11,6 +11,7 @@ provider, and the retired Muse Spark / Space Bunny pair must never return.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,11 @@ PRODUCTION_WORKFLOWS = (
 )
 OTHER_APPROVED_MODEL = "opencode/other-approved-free"
 APPROVED_POOL = f"{DEFAULT_PRIMARY_MODEL},{OTHER_APPROVED_MODEL}"
+# The Continuum route action is a first-party dependency; an immutable commit
+# pin is preferred over the mutable main branch for supply-chain safety.
+MODEL_ROUTE_USE_RE = re.compile(
+    r"uses:\s*kodmial/continuum/\.github/actions/model-route@(?:main|[0-9a-f]{40})\b"
+)
 
 
 def test_selected_approved_model_policy_is_accepted() -> None:
@@ -159,7 +165,7 @@ def test_live_workflows_never_pin_retired_models() -> None:
     # product side effect; those workflows must not embed a static model.
     for name in PRODUCTION_WORKFLOWS:
         text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        assert "uses: kodmial/continuum/.github/actions/model-route@main" in text, name
+        assert MODEL_ROUTE_USE_RE.search(text), name
         assert "OPENCODE_MODEL=$VERIFIED_MODEL" in text, name
         assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in text, name
         assert "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL" in text, name
