@@ -1,7 +1,8 @@
 """Regression: live AA agent provider access denial must retire its route."""
-from pathlib import Path
+
 import re
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/aa-opencode-model-route-e2e.yml"
@@ -15,9 +16,13 @@ class ProviderDenialRouteTests(unittest.TestCase):
         # The actual provider message has an apostrophe. Use the identical
         # POSIX extended regex shape as the workflow (without shell quoting).
         pattern = r"OpenCode.s free tier can only be used from within OpenCode"
-        self.assertIsNotNone(re.search(pattern,
-            "Error: OpenCode's free tier can only be used from within OpenCode",
-            re.IGNORECASE))
+        self.assertIsNotNone(
+            re.search(
+                pattern,
+                "Error: OpenCode's free tier can only be used from within OpenCode",
+                re.IGNORECASE,
+            )
+        )
         self.assertIn("kind=unavailable", text)
         self.assertIn("provider_failure=$kind", text)
         self.assertIn("steps.live_aa.outputs.provider_failure != ''", text)
