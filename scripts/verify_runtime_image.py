@@ -90,8 +90,15 @@ def check_pins() -> list[str]:
         return errors + [f"opencode.version unreadable: {exc}"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", want):
         errors.append(f"opencode.version malformed: {want!r}")
-    elif "docker/opencode.version" not in docker_text:
-        errors.append("Dockerfile does not consume docker/opencode.version")
+    elif not all(
+        fragment in docker_text
+        for fragment in (
+            'COPY opencode.version /opt/aa/opencode.version',
+            'ARG AA_OPENCODE_VERSION=""',
+            '${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}',
+        )
+    ):
+        errors.append("Dockerfile must take the Actions version override or read the verified AA fallback pin")
     if "python:3.12" not in docker_text:
         errors.append("Dockerfile must use a Python 3.12 base")
     if "libopus" not in docker_text:
