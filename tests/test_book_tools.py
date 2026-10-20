@@ -3,7 +3,7 @@
 All literary content uses invented fixture sentences; no canonical book
 text is committed. Covers RU search/read/expand/section, slang-planner
 queries, the disabled EN secondary branch, invalid IDs/stale versions,
-exact RU fidelity, output limits, deny-by-default permissions and log
+exact RU fidelity, output limits, approval-by-default permissions and log
 privacy over the single shared implementation.
 """
 
@@ -331,10 +331,11 @@ def test_four_tools_share_one_implementation() -> None:
         assert name in bridge
 
 
-def test_deny_by_default_permissions() -> None:
+def test_free_model_permissions_keep_builtin_tools_advertised() -> None:
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     permission = config["agent"]["aa"]["permission"]
-    assert permission.get("*") == "deny"
+    assert permission.get("*") == "ask"
+    assert "deny" not in permission.values()
     allowed = {name for name, value in permission.items() if value == "allow"}
     assert allowed == {"book_search", "book_read", "book_expand", "book_section"}
 
