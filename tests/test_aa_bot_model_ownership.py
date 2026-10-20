@@ -12,19 +12,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_bot_models_ignore_coding_routes() -> None:
-    assert resolve_bot_models({
+    env = {
         "OPENCODE_MODELS": "opencode/dev-only",
         "CONTINUUM_SELECTED_MODEL": "opencode/dev-only",
         "OPENCODE_MODEL": "opencode/dev-only",
-    }) == (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_MODEL)
+    }
+    assert resolve_bot_models(env) == (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_MODEL)
 
 
 def test_aa_primary_and_fallback_are_independent() -> None:
-    assert resolve_bot_models({
+    env = {
         "AA_BOT_PRIMARY_MODEL": "opencode/bot-primary",
         "AA_BOT_FALLBACK_MODEL": "opencode/bot-fallback",
         "CONTINUUM_SELECTED_MODEL": "opencode/dev-only",
-    }) == ("opencode/bot-primary", "opencode/bot-fallback")
+    }
+    assert resolve_bot_models(env) == ("opencode/bot-primary", "opencode/bot-fallback")
 
 
 @pytest.mark.parametrize("value", ["no-slash", "opencode/../escape", "open//code"])
