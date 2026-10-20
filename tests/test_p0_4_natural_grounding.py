@@ -1292,11 +1292,11 @@ def test_verifier_agent_locked_down() -> None:
 
     config = json_module.loads((ROOT / "opencode.json").read_text(encoding="utf-8"))
     verifier = config["agent"]["aa-verifier-v2"]
-    assert verifier["permission"] == {"*": "deny", "StructuredOutput": "allow"}
+    assert verifier["permission"] == {"*": "ask", "StructuredOutput": "allow"}
     assert verifier["prompt"] == "{file:./prompts/aa-verifier-system-v2.md}"
     assert (ROOT / "prompts" / "aa-verifier-system-v2.md").exists()
     answer = config["agent"]["aa-v2"]
-    assert answer["permission"] == {"*": "deny"}
+    assert answer["permission"] == {"*": "ask"}
 
 
 async def test_graph_runs_answer_pipeline_end_to_end() -> None:
