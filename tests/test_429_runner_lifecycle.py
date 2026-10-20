@@ -87,15 +87,11 @@ def test_runtime_workflow_emits_429_recovery_artifact() -> None:
     assert 'if [ "$status" -eq 75 ]' in workflow
     assert "OPENCODE_429_RESTART_REQUIRED" in workflow
     assert "aa-runtime-429-recovery" in workflow
-    # The runner recovers after a quota burn, but production route policy
-    # comes from Continuum and the owner-approved GitHub Variable. The old
-    # hardcoded weak fallback must never be silently selected mid-turn.
-    assert (
-        "uses: kodmial/continuum/.github/actions/model-route@"
-        "d41b6ed6c87e544c70f3bf283ad4e272b4004fbe"
-    ) in workflow
-    assert "models: ${{ needs.model_pool_readiness.outputs.models }}" in workflow
-    assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in workflow
+    # Model routing for AA production is independent from Continuum coding.
+    assert "model-route@" not in workflow
+    assert "AA_BOT_PRIMARY_MODEL" in workflow
+    assert "AA_BOT_FALLBACK_MODEL" in workflow
+    assert "steps.bot_model.outputs.fallback" in workflow
     # The retired Muse Spark / Space Bunny pair must not re-enter the runtime.
     assert "opencode/muse-spark" not in workflow
     assert "opencode/space-bunny-free" not in workflow

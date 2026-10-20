@@ -16,9 +16,7 @@ _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,12
 def resolve_bot_models(source: Mapping[str, str] | None = None) -> tuple[str, str]:
     """Only AA_BOT_* selects bot models; OPENCODE_MODELS is a coding route."""
     values = os.environ if source is None else source
-    primary = (
-        (values.get("AA_BOT_PRIMARY_MODEL", "") or "").strip() or DEFAULT_PRIMARY_MODEL
-    )
+    primary = (values.get("AA_BOT_PRIMARY_MODEL", "") or "").strip() or DEFAULT_PRIMARY_MODEL
     fallback = (values.get("AA_BOT_FALLBACK_MODEL", "") or "").strip() or primary
     for role, value in (("primary", primary), ("fallback", fallback)):
         if not _MODEL.fullmatch(value) or ".." in value or "//" in value:
@@ -27,9 +25,7 @@ def resolve_bot_models(source: Mapping[str, str] | None = None) -> tuple[str, st
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Resolve AA-owned production model pointers"
-    )
+    parser = argparse.ArgumentParser(description="Resolve AA-owned production model pointers")
     parser.add_argument("--github-output", required=True, type=Path)
     args = parser.parse_args()
     primary, fallback = resolve_bot_models()

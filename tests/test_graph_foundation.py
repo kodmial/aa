@@ -966,7 +966,7 @@ def test_opencode_agents_keep_legacy_and_add_locked_down_v2() -> None:
         ("aa-summarizer-v2", "aa-summarizer-system-v2.md"),
     ):
         agent = agents[name]
-        expected_permission = {"*": "deny"}
+        expected_permission = {"*": "ask"}
         if name == "aa-planner-v2":
             expected_permission["StructuredOutput"] = "allow"
         assert agent["permission"] == expected_permission
