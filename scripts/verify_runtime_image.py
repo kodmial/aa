@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -90,7 +91,7 @@ def check_pins() -> list[str]:
         return errors + [f"opencode.version unreadable: {exc}"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", want):
         errors.append(f"opencode.version malformed: {want!r}")
-    elif "docker/opencode.version" not in docker_text:
+    elif "COPY opencode.version /opt/aa/opencode.version" not in docker_text:
         errors.append("Dockerfile does not consume docker/opencode.version")
     if "python:3.12" not in docker_text:
         errors.append("Dockerfile must use a Python 3.12 base")
@@ -234,9 +235,15 @@ def check_native_imports(*, started_ms: dict[str, int]) -> list[str]:
 
 def check_opencode() -> list[str]:
     try:
-        want = OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip()
+        want = (
+            os.environ.get("CONTINUUM_OPENCODE_VERSION")
+            or os.environ.get("AA_OPENCODE_VERSION")
+            or OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip()
+        )
     except OSError as exc:
         return [f"opencode.version unreadable: {exc}"]
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", want):
+        return ["invalid effective OpenCode version"]
     binary = shutil.which("opencode")
     if binary is None:
         home_binary = Path.home() / ".opencode" / "bin" / "opencode"
@@ -257,7 +264,7 @@ def check_opencode() -> list[str]:
 def check_head_match() -> list[str]:
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={ROOT}", "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,

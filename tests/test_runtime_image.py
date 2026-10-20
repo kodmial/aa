@@ -26,9 +26,10 @@ def test_dockerfile_is_reproducible_and_secret_free() -> None:
         "transformers==4.57.3",
     ):
         assert pin in text
-    assert "docker/opencode.version" in text
+    assert "COPY opencode.version /opt/aa/opencode.version" in text
     assert "1.18.34" not in text  # version comes from the pin file, not drift
-    assert "1.18.34" in _read(ROOT / "docker" / "opencode.version")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", _read(ROOT / "docker" / "opencode.version").strip())
+    assert _read(ROOT / "docker" / "opencode.version").strip() != "1.18.34"
     for forbidden in ("TELEGRAM_BOT_TOKEN", "AGE-SECRET-KEY", "corpus/generated"):
         assert forbidden not in text
     assert "COPY opencode.version" in text
@@ -82,18 +83,22 @@ def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
     assert "Reject duplicate runtime" in workflow
     assert "verify_runtime_image.py" in _read(WORKFLOWS / "aa-runtime-image.yml")
     assert "git rev-parse HEAD" in workflow
-    assert "opencode --version" in workflow
+    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow
+    assert "opencode --version" in _read(ROOT / ".github/actions/aa-opencode-toolchain/action.yml")
     assert "encoder=libopus" in workflow
 
 
 def test_runtime_hot_path_skips_redundant_installs() -> None:
     workflow = _read(WORKFLOWS / "aa-runtime.yml")
     assert "pip install -e . --no-deps" in workflow
-    assert "already present" in workflow
-    assert "docker/opencode.version" in workflow
-    # Cold-miss path is bounded: apt-get stays guarded, OpenCode retries capped.
+    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow
+    toolchain = _read(ROOT / ".github/actions/aa-opencode-toolchain/action.yml")
+    assert "docker/opencode.version" in toolchain
+    assert "opencode --version" in toolchain
+    assert "components: opencode" in toolchain
+    assert "opencode-version: ${{ steps.version.outputs.version }}" in toolchain
+    # Cold-miss path stays bounded by Continuum\u2019s verified cached installer.
     assert "if ! command -v ffmpeg" in workflow
-    assert "for attempt in 1 2 3" in workflow
 
 
 def test_image_workflow_publishes_only_from_trusted_events() -> None:
@@ -138,6 +143,12 @@ def test_pins_helper_accepts_current_tree() -> None:
         cwd=str(ROOT),
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_container_git_head_check_trusts_only_exact_checkout() -> None:
+    source = _read(ROOT / "scripts" / "verify_runtime_image.py")
+    assert '["git", "-c", f"safe.directory={ROOT}", "rev-parse", "HEAD"]' in source
+    assert "safe.directory=*" not in source
 
 
 def test_image_promotion_script_dry_run() -> None:

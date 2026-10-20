@@ -1,30 +1,24 @@
 """Regression: live AA agent provider access denial must retire its route."""
-from pathlib import Path
-import re
+
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/aa-opencode-model-route-e2e.yml"
 
 
 class ProviderDenialRouteTests(unittest.TestCase):
-    def test_access_denial_is_classified_as_real_model_unavailable(self):
+    def test_provider_denial_fails_closed_without_unreviewed_workaround(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        anchor = 'elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode" "$log"; then'
-        self.assertIn(anchor, text)
-        # The actual provider message has an apostrophe. Use the identical
-        # POSIX extended regex shape as the workflow (without shell quoting).
-        pattern = r"OpenCode.s free tier can only be used from within OpenCode"
-        self.assertIsNotNone(re.search(pattern,
-            "Error: OpenCode's free tier can only be used from within OpenCode",
-            re.IGNORECASE))
-        self.assertIn("kind=unavailable", text)
+        # The free-tier denial workaround still returned HTTP 403 and must not
+        # be classified as a retryable provider failure.
+        self.assertNotIn("kind=unavailable", text)
         self.assertIn("provider_failure=$kind", text)
         self.assertIn("steps.live_aa.outputs.provider_failure != ''", text)
         self.assertIn("operation: fail", text)
         self.assertIn("failure-reason: ${{ steps.live_aa.outputs.provider_failure }}", text)
 
-    def test_denial_is_not_reclassified_as_qualified_success(self):
+    def test_denial_is_not_reclassified_as_qualified_success(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("AA agent live call failed; provider_error=", text)
         self.assertIn("exit 1", text)

@@ -425,31 +425,10 @@ jobs:
           key: ${{ steps.derived-cache-key.outputs.derived-key }}
           fail-on-cache-miss: false
 
-      - name: Install pinned OpenCode
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Issue #298 hot path: skip the curl install when the prebuilt
-          # image already ships the pinned OpenCode from
-          # docker/opencode.version.
-          want="$(cat docker/opencode.version)"
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -qF "$want"; then
-            echo "OpenCode $want already present (prebuilt image hot path)."
-            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-            exit 0
-          fi
-          for attempt in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
-              bash -s -- --version "$want"; then
-              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-              exit 0
-            fi
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::OpenCode installer failed after 3 attempts."
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
+        uses: ./.github/actions/aa-opencode-toolchain
+        with:
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
 
       - name: Qualify approved AA OpenCode model route
         id: aa_model_route

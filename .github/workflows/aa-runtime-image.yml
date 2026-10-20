@@ -123,10 +123,14 @@ jobs:
 
       - name: Extract image metadata
         id: meta
+        env:
+          OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
         run: |
           set -euo pipefail
+          version="${OPENCODE_VERSION_OVERRIDE:-$(cat docker/opencode.version)}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid OpenCode version"; exit 2; }
           echo "image=ghcr.io/kodmial/aa-runtime" >> "$GITHUB_OUTPUT"
-          echo "opencode=$(cat docker/opencode.version)" >> "$GITHUB_OUTPUT"
+          echo "opencode=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build and push (trusted events) / build only (PRs)
         id: push
@@ -136,6 +140,8 @@ jobs:
           # The repository code and corpus are never sent to Docker BuildKit.
           context: ./docker
           file: ./docker/Dockerfile.aa-runtime
+          build-args: |
+            AA_OPENCODE_VERSION=${{ steps.meta.outputs.opencode }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
@@ -174,7 +180,7 @@ jobs:
             echo "## AA runtime image published"
             echo
             echo "- image: \`ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST\`"
-            echo "- arch: linux/amd64, python 3.12, opencode $(cat docker/opencode.version)"
+            echo "- arch: linux/amd64, python 3.12, opencode ${{ steps.meta.outputs.opencode }}"
             echo "- size:"
             echo '```'
             docker image inspect "ghcr.io/kodmial/aa-runtime@$IMAGE_DIGEST" --format 'Size={{.Size}} Os={{.Os}} Arch={{.Architecture}}' || true
