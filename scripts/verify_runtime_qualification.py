@@ -13,8 +13,8 @@ match the live corpus/model versions:
   architecture decision with EN-secondary disabled);
 - the authoritative prompt/agent config matches (named ``aa`` primary
   agent, pinned primary model, exactly the four book tools,
-  deny-by-default);
-- the four narrow book tools exist with deny-by-default permissions.
+  approval-by-default, without stripping built-in tools from free-model requests);
+- the four book tools are explicitly allowed; other tools require approval.
 
 Stale or mismatched artifacts fail closed. Logs carry only ids, digests
 and counts, never user text or corpus text.
@@ -159,8 +159,8 @@ def _check_prompt_config() -> dict[str, str]:
         raise ValueError("aa agent primary model is not the pinned runtime model")
     if "prompts/aa-agent-system.md" not in str(agent.get("prompt", "")):
         raise ValueError("aa agent prompt binding is stale")
-    if permission.get("*") != "deny":
-        raise ValueError("aa agent must stay deny-by-default")
+    if permission.get("*") != "ask":
+        raise ValueError("aa agent must expose standard tools behind approval")
     allowed = {name for name, value in permission.items() if value == "allow"}
     if allowed != {"book_search", "book_read", "book_expand", "book_section"}:
         raise ValueError("aa agent must allow exactly the four book tools")
