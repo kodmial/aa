@@ -623,7 +623,7 @@ def test_book_map_and_tools_available_in_every_session() -> None:
     declared = _json.loads((root / "opencode.json").read_text(encoding="utf-8"))
     agent = declared["agent"]["aa"]
     assert agent["mode"] == "primary"
-    assert agent["model"] == "opencode/nemotron-3-ultra-free"
+    assert "model" not in agent  # configured by AA_BOT_* runtime policy
     permissions = agent["permission"]
     assert permissions["*"] == "ask"
     for tool in ("book_search", "book_read", "book_expand", "book_section"):

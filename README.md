@@ -56,15 +56,15 @@ infrastructure can exist before the remaining retrieval issues are complete
 without accidentally launching an ungrounded assistant.
 
 The user-facing OpenCode agent is `aa`, backed by
-`prompts/aa-agent-system.md`. Its runtime model defaults are:
-
-- primary: `opencode/nemotron-3-ultra-free`;
-- technical fallback: `opencode/nemotron-3-ultra-free` (same live-validated
-  model; the adapter suppresses same-model fallback so no unverified second
-  provider serves the product).
-
-These are AA-assistant runtime models; they do not define the model Continuum
-uses to implement repository tasks.
+`prompts/aa-agent-system.md`. Production conversation models are controlled
+by repository Actions variables `AA_BOT_PRIMARY_MODEL` and
+`AA_BOT_FALLBACK_MODEL`. The current deployment selects
+`opencode/deepseek-v4.1-flash-free` with `opencode/beam-free` as fallback.
+The runtime exposes these as `OPENCODE_MODEL` and
+`OPENCODE_FALLBACK_MODEL`; all six OpenCode AA agents inherit the active
+session model and **must not pin a different model in `opencode.json`**.
+Qualification uses the same AA policy independently of the Continuum coder
+model pool.
 
 ## AA knowledge architecture
 

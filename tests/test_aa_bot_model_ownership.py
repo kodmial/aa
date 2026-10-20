@@ -51,6 +51,7 @@ def test_agents_advertise_open_code_tools() -> None:
     config = json.loads((ROOT / "opencode.json").read_text())
     for name, agent in config["agent"].items():
         permission = agent["permission"]
+        assert "model" not in agent, name  # inherit the runtime-selected AA model
         assert permission["*"] == "ask", name
         assert "deny" not in permission.values(), name
     for tool in ("book_search", "book_read", "book_expand", "book_section"):

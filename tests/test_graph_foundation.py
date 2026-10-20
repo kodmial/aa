@@ -972,7 +972,7 @@ def test_opencode_agents_keep_legacy_and_add_locked_down_v2() -> None:
         assert agent["permission"] == expected_permission
         assert agent["prompt"] == "{file:./prompts/" + prompt_file + "}"
         assert (root / "prompts" / prompt_file).exists()
-        assert agent["model"] == "opencode/nemotron-3-ultra-free"
+        assert "model" not in agent  # inherit the AA session model
 
 
 def test_typed_state_contract_fields() -> None:

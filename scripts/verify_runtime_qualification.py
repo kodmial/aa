@@ -12,7 +12,7 @@ match the live corpus/model versions:
 - ``qualification/ru_first_retrieval.v1.decision.json`` (#47 RU-first
   architecture decision with EN-secondary disabled);
 - the authoritative prompt/agent config matches (named ``aa`` primary
-  agent, pinned primary model, exactly the four book tools,
+  agent, runtime-resolved primary session model, exactly the four book tools,
   approval-by-default, without stripping built-in tools from free-model requests);
 - the four book tools are explicitly allowed; other tools require approval.
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,6 @@ REQUIRED_PROMPT_MARKERS = (
     "Russian conversations display quotations in Russian",
     "aa.grounding",
 )
-REQUIRED_AGENT_MODEL = "opencode/nemotron-3-ultra-free"
 
 
 def _fail(message: str) -> int:
@@ -155,8 +155,13 @@ def _check_prompt_config() -> dict[str, str]:
         raise ValueError(f"agent permission contract is unreadable: {exc}") from exc
     if agent.get("mode") != "primary":
         raise ValueError("aa agent must stay the primary agent")
-    if agent.get("model") != REQUIRED_AGENT_MODEL:
-        raise ValueError("aa agent primary model is not the pinned runtime model")
+    # OpenCode agent-level model pins override CLI/session selection and
+    # silently defeat AA_BOT_* failover. All AA agents inherit the session.
+    if any(
+        isinstance(item, dict) and "model" in item
+        for item in config["agent"].values()
+    ):
+        raise ValueError("AA agent model pin overrides runtime model policy")
     if "prompts/aa-agent-system.md" not in str(agent.get("prompt", "")):
         raise ValueError("aa agent prompt binding is stale")
     if permission.get("*") != "ask":
@@ -164,7 +169,17 @@ def _check_prompt_config() -> dict[str, str]:
     allowed = {name for name, value in permission.items() if value == "allow"}
     if allowed != {"book_search", "book_read", "book_expand", "book_section"}:
         raise ValueError("aa agent must allow exactly the four book tools")
-    return {"model": str(agent.get("model")), "prompt": "prompts/aa-agent-system.md"}
+    from aa.bot_models import resolve_bot_models
+
+    primary, _ = resolve_bot_models(
+        {
+            "AA_BOT_PRIMARY_MODEL": os.environ.get("OPENCODE_MODEL")
+            or os.environ.get("AA_BOT_PRIMARY_MODEL", ""),
+            "AA_BOT_FALLBACK_MODEL": os.environ.get("OPENCODE_FALLBACK_MODEL")
+            or os.environ.get("AA_BOT_FALLBACK_MODEL", ""),
+        }
+    )
+    return {"model": primary, "prompt": "prompts/aa-agent-system.md"}
 
 
 def main() -> int:
