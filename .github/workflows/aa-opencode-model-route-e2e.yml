@@ -90,6 +90,12 @@ jobs:
               kind=quota_429
             elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$log"; then
               kind=upstream
+            elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode" "$log"; then
+              # Real provider access denial despite a successful tiny probe.
+              # This is a route-capability failure, never an AA source defect.
+              # Report to the trusted run-bound model router, which will
+              # quarantine this route for the next isolated CI invocation.
+              kind=unavailable
             fi
             if [[ -n "$kind" ]]; then
               echo "provider_failure=$kind" >> "$GITHUB_OUTPUT"
