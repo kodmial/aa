@@ -124,8 +124,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$PRIMARY_MODEL" && test -n "$FALLBACK_MODEL"
-          printf 'AA_BOT_PRIMARY_MODEL=%s\nAA_BOT_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
-          printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
+          {
+            printf 'AA_BOT_PRIMARY_MODEL=%s\nAA_BOT_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL"
+            printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL"
+          } >> "$GITHUB_ENV"
 
       - name: Install system voice media dependency
         shell: bash
@@ -393,8 +395,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$PRIMARY_MODEL" && test -n "$FALLBACK_MODEL"
-          printf 'AA_BOT_PRIMARY_MODEL=%s\nAA_BOT_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
-          printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
+          {
+            printf 'AA_BOT_PRIMARY_MODEL=%s\nAA_BOT_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL"
+            printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL"
+          } >> "$GITHUB_ENV"
 
       - name: Install system voice media dependency
         if: ${{ needs.qualify.result == 'success' }}

@@ -132,6 +132,11 @@ _CANARY_EVERY_HOURS = 4
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_MODEL_SEGMENT_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?"
+_MODEL_RE = re.compile(
+    rf"[A-Za-z0-9][A-Za-z0-9._-]*/(?:{_MODEL_SEGMENT_RE})(?:/{_MODEL_SEGMENT_RE})*"
+)
+_RETIRED_MODEL_MARKERS = ("muse-spark", "space-bunny")
 
 FORBIDDEN_EVIDENCE_KEYS = frozenset(
     {
@@ -297,33 +302,59 @@ def validate_hex64(value: str) -> str:
     return normalized
 
 
+def _valid_runtime_model(value: str) -> bool:
+    route = (value or "").strip()
+    return bool(
+        route
+        and _MODEL_RE.fullmatch(route)
+        and ".." not in route
+        and "//" not in route
+        and not any(marker in route for marker in _RETIRED_MODEL_MARKERS)
+    )
+
+
 def runtime_model_policy_ok(
     *,
     agent: str,
-    expected_primary_model: str,
-    expected_fallback_model: str,
     model: str,
     fallback_model: str,
+    expected_primary_model: str = "",
+    expected_fallback_model: str = "",
 ) -> bool:
-    """Validate AA chatbot primary/fallback independently of coder routes."""
+    """Whether Gate A may accept the effective AA conversation model route.
+
+    AA owns its chatbot route independently of Continuum coding routes
+    (kodmial/aa Work Lock #66). The effective ``OPENCODE_MODEL`` and
+    ``OPENCODE_FALLBACK_MODEL`` must both be valid provider/model
+    identifiers. The workflow must resolve the owner-controlled
+    ``AA_BOT_*`` policy, and the effective values must match that frozen
+    policy exactly; a missing policy fails closed. Same-model fallback is
+    allowed because the adapter suppresses duplicate retries; a distinct
+    fallback is also allowed. The retired Muse Spark / Space Bunny routes
+    must never be selected again.
+    """
     from aa.bot_models import resolve_bot_models
 
     if (agent or "").strip() != DEFAULT_AA_AGENT:
         return False
-    if not (expected_primary_model or "").strip():
+    primary = (model or "").strip()
+    fallback = (fallback_model or "").strip()
+    if not _valid_runtime_model(primary) or not _valid_runtime_model(fallback):
         return False
-    if not (expected_fallback_model or "").strip():
+    expected_primary = (expected_primary_model or "").strip()
+    expected_fallback = (expected_fallback_model or "").strip()
+    if not expected_primary or not expected_fallback:
         return False
     try:
-        primary, fallback = resolve_bot_models(
+        resolved_primary, resolved_fallback = resolve_bot_models(
             {
-                "AA_BOT_PRIMARY_MODEL": expected_primary_model,
-                "AA_BOT_FALLBACK_MODEL": expected_fallback_model,
+                "AA_BOT_PRIMARY_MODEL": expected_primary,
+                "AA_BOT_FALLBACK_MODEL": expected_fallback,
             }
         )
     except ValueError:
         return False
-    return (model or "").strip() == primary and (fallback_model or "").strip() == fallback
+    return primary == resolved_primary and fallback == resolved_fallback
 
 
 def _subtree_holds_text(value: Any) -> bool:

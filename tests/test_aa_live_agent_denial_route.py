@@ -9,7 +9,7 @@ WORKFLOW = ROOT / ".github/workflows/aa-opencode-model-route-e2e.yml"
 
 
 class ProviderDenialRouteTests(unittest.TestCase):
-    def test_access_denial_is_classified_as_real_model_unavailable(self):
+    def test_access_denial_is_classified_as_real_model_unavailable(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         anchor = (
             'elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode"'
@@ -32,7 +32,7 @@ class ProviderDenialRouteTests(unittest.TestCase):
         self.assertIn("operation: fail", text)
         self.assertIn("failure-reason: ${{ steps.live_aa.outputs.provider_failure }}", text)
 
-    def test_denial_is_not_reclassified_as_qualified_success(self):
+    def test_denial_is_not_reclassified_as_qualified_success(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("AA agent live call failed; provider_error=", text)
         self.assertIn("exit 1", text)

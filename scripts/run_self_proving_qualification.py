@@ -127,19 +127,44 @@ def _product_fingerprint() -> str:
 
 
 def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool:
-    """Gate A verifies the AA-owned production model variables.
+    """Gate A checks the AA-owned chatbot route, not Continuum coding routes.
 
-    Continuum coder and PR-Agent pools have no authority to select the
-    chatbot's planner, answer, judge, or verifier models.
+    The workflow resolves the owner-controlled ``AA_BOT_PRIMARY_MODEL`` /
+    ``AA_BOT_FALLBACK_MODEL`` policy and exports both the AA variables and
+    the runtime ``OPENCODE_*`` aliases. Continuum coder and PR-Agent pools
+    have no authority over the chatbot's planner, answer, judge, or
+    verifier models.
+
+    Gate A accepts the same-model route used when one verified model serves
+    both roles and the distinct primary/fallback route used by the current
+    AA deployment. It rejects a missing, malformed, retired, or drifted
+    route so an unapproved model can never be qualified.
     """
+    from aa.bot_models import resolve_bot_models
     from aa.qualification.self_proving import runtime_model_policy_ok
 
+    expected_primary = (environ.get("AA_BOT_PRIMARY_MODEL", "") or "").strip()
+    expected_fallback = (environ.get("AA_BOT_FALLBACK_MODEL", "") or "").strip()
+    if not expected_primary:
+        return False
+    if not expected_fallback:
+        # An omitted fallback intentionally means the same-model route.
+        expected_fallback = expected_primary
+    try:
+        expected_primary, expected_fallback = resolve_bot_models(
+            {
+                "AA_BOT_PRIMARY_MODEL": expected_primary,
+                "AA_BOT_FALLBACK_MODEL": expected_fallback,
+            }
+        )
+    except ValueError:
+        return False
     return runtime_model_policy_ok(
         agent=str(getattr(settings, "opencode_agent", "") or ""),
-        expected_primary_model=environ.get("AA_BOT_PRIMARY_MODEL", ""),
-        expected_fallback_model=environ.get("AA_BOT_FALLBACK_MODEL", ""),
         model=str(getattr(settings, "opencode_model", "") or ""),
         fallback_model=str(getattr(settings, "opencode_fallback_model", "") or ""),
+        expected_primary_model=expected_primary,
+        expected_fallback_model=expected_fallback,
     )
 
 
@@ -238,10 +263,10 @@ def _gate_a(expected_sha: str, run_id: str) -> GateEvidence:
         from aa.config import Settings
 
         _policy = Settings.from_env(None)
-        # Work Lock #66: production route policy is authoritative. Gate A
-        # validates the Continuum-selected approved model (which also permits
-        # the same live-validated model as both primary and fallback, per
-        # kodmial/aa#391) instead of obsolete hardcoded provider IDs.
+        # Work Lock #66: AA owns its chatbot route independently of the
+        # Continuum coding pool. Gate A validates the resolved AA_BOT_*
+        # policy aliased into the runtime OPENCODE_* variables (same-model
+        # and distinct primary/fallback routes are both valid).
         _policy_ok = _aa_model_policy_valid(_policy, os.environ)
     except Exception:
         _policy_ok = False
