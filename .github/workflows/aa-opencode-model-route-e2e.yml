@@ -95,6 +95,22 @@ jobs:
               echo "provider_failure=$kind" >> "$GITHUB_OUTPUT"
             fi
             # Never publish raw assistant messages, book content or secrets.
+            # This synthetic, public-repository E2E carries a fixed greeting
+            # and no user messages. Print only bounded, secret-scrubbed
+            # diagnostics; raw prompts and raw logs remain runner-local.
+            python3 - "$log" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          for line in text.splitlines()[:10]:
+              if not re.search(r"error|failed|invalid|unknown|not found|denied|missing", line, re.I):
+                  continue
+              line = re.sub(r"https?://\\S+", "[url]", line)
+              line = re.sub(r"(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]+", "[redacted]", line)
+              line = re.sub(r"Bearer\\s+\\S+", "Bearer [redacted]", line, flags=re.I)
+              print("::warning::AA CLI diagnostic: " + line[:240])
+          PY
             echo "::error::AA agent live call failed; provider_error=${kind:-not_proven}; log_bytes=$(wc -c < "$log")."
             exit 1
           fi
