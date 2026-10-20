@@ -357,12 +357,14 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     # repair issue instead of minting a second one.
     existing_issues = both["issues"]
     assert len(existing_issues) == 1
+    recurrence_run_id = 424243
     repeat = _run_publisher_scenario(
         tmp_path,
         summary_text=both_summary,
         gate_outcomes=both_outcomes,
         failed_sha=failed_sha,
         initial_issues=existing_issues,
+        run_id=recurrence_run_id,
     )
     assert len(repeat["created"]) == 0
     assert len(repeat["updated"]) == 1
@@ -391,11 +393,42 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         failed_sha=failed_sha,
         initial_issues=repeat["issues"],
         initial_comments=repeat["commentHistory"],
+        run_id=recurrence_run_id,
     )
     assert len(rerun["created"]) == 0
     assert len(rerun["updated"]) == 0
     assert len(rerun["comments"]) == 0
     assert len(rerun["commentHistory"]) == len(repeat["commentHistory"])
+
+    # Re-running the very run that *created* the repair issue must also be
+    # recognized: the create path records this run's marker in the pinned
+    # body, so a re-run is not misclassified as recurrence 2 and does not
+    # dispatch a duplicate generation (which would consume one of the two
+    # allowed recurrences and trip the breaker on the next real failure).
+    creation_run_id = 424244
+    first = _run_publisher_scenario(
+        tmp_path,
+        summary_text=both_summary,
+        gate_outcomes=both_outcomes,
+        failed_sha=failed_sha,
+        initial_issues=[],
+        run_id=creation_run_id,
+    )
+    assert len(first["created"]) == 1
+    assert "aa-self-proving-repair-observation:v1" in str(first["created"][0]["body"])
+    first_rerun = _run_publisher_scenario(
+        tmp_path,
+        summary_text=both_summary,
+        gate_outcomes=both_outcomes,
+        failed_sha=failed_sha,
+        initial_issues=first["issues"],
+        initial_comments=first["commentHistory"],
+        run_id=creation_run_id,
+    )
+    assert len(first_rerun["created"]) == 0
+    assert len(first_rerun["updated"]) == 0
+    assert len(first_rerun["comments"]) == 0
+    assert first_rerun["dispatched"] == 0
 
 
 def test_qualification_never_requires_isolated_telegram_bot() -> None:
