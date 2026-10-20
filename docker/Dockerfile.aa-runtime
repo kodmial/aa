@@ -87,6 +87,7 @@ RUN set -eux; \
 # OpenCode version is provided by the Actions variable through an exact build
 # argument; when absent, use the same reviewed repository default as every job.
 ARG AA_OPENCODE_VERSION=""
+ENV AA_OPENCODE_VERSION=${AA_OPENCODE_VERSION}
 COPY opencode.version /opt/aa/opencode.version
 RUN set -eux; \
     want="${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}"; \

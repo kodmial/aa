@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -93,12 +94,15 @@ def check_pins() -> list[str]:
     elif not all(
         fragment in docker_text
         for fragment in (
-            'COPY opencode.version /opt/aa/opencode.version',
+            "COPY opencode.version /opt/aa/opencode.version",
             'ARG AA_OPENCODE_VERSION=""',
-            '${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}',
+            "ENV AA_OPENCODE_VERSION=${AA_OPENCODE_VERSION}",
+            "${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}",
         )
     ):
-        errors.append("Dockerfile must take the Actions version override or read the verified AA fallback pin")
+        errors.append(
+            "Dockerfile must take the Actions version override or read the verified AA fallback pin"
+        )
     if "python:3.12" not in docker_text:
         errors.append("Dockerfile must use a Python 3.12 base")
     if "libopus" not in docker_text:
@@ -241,9 +245,15 @@ def check_native_imports(*, started_ms: dict[str, int]) -> list[str]:
 
 def check_opencode() -> list[str]:
     try:
-        want = OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip()
+        want = (
+            os.environ.get("CONTINUUM_OPENCODE_VERSION")
+            or os.environ.get("AA_OPENCODE_VERSION")
+            or OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip()
+        )
     except OSError as exc:
         return [f"opencode.version unreadable: {exc}"]
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", want):
+        return ["invalid effective OpenCode version"]
     binary = shutil.which("opencode")
     if binary is None:
         home_binary = Path.home() / ".opencode" / "bin" / "opencode"
