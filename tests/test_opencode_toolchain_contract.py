@@ -33,6 +33,11 @@ def test_aa_version_pin_is_exact_semver_and_consistent() -> None:
     docker = (ROOT / "docker/Dockerfile.aa-runtime").read_text(encoding="utf-8")
     assert "COPY opencode.version /opt/aa/opencode.version" in docker
     assert "cat /opt/aa/opencode.version" in docker
+    assert 'ARG AA_OPENCODE_VERSION=""' in docker
+    assert '${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}' in docker
+    image = (WORKFLOWS / "aa-runtime-image.yml").read_text(encoding="utf-8")
+    assert "OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in image
+    assert "AA_OPENCODE_VERSION=${{ steps.meta.outputs.opencode }}" in image
     assert "opencode --version" in docker
 
 
@@ -46,7 +51,8 @@ def test_all_aa_live_runners_share_verified_toolchain() -> None:
 
 def test_aa_toolchain_reads_only_pin_and_verifies_real_binary() -> None:
     text = ACTION.read_text(encoding="utf-8")
-    assert 'version="$(cat docker/opencode.version)"' in text
+    assert 'OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}' in text
+    assert 'version="${OPENCODE_VERSION_OVERRIDE:-$(cat docker/opencode.version)}"' in text
     assert '[[ "$version" =~' in text
     assert "kodmial/continuum/.github/actions/agent-toolchain@" in text
     assert "components: opencode" in text
