@@ -315,7 +315,7 @@ def runtime_model_policy_ok(
     agent: str,
     model: str,
     fallback_model: str,
-    expected_model: str = "",
+    expected_primary_model: str = "",
     expected_fallback_model: str = "",
 ) -> bool:
     """Whether Gate A may accept the effective AA conversation model route.
@@ -329,19 +329,30 @@ def runtime_model_policy_ok(
     duplicate retries; a distinct fallback is also allowed. The retired
     Muse Spark / Space Bunny routes must never be selected again.
     """
+    from aa.bot_models import resolve_bot_models
+
     if (agent or "").strip() != DEFAULT_AA_AGENT:
         return False
     primary = (model or "").strip()
     fallback = (fallback_model or "").strip()
     if not _valid_runtime_model(primary) or not _valid_runtime_model(fallback):
         return False
-    expected_primary = (expected_model or "").strip()
+    expected_primary = (expected_primary_model or "").strip()
     expected_fallback = (expected_fallback_model or "").strip()
-    if expected_primary and primary != expected_primary:
+    if not expected_primary and not expected_fallback:
+        return True
+    if not expected_primary:
         return False
-    if expected_fallback and fallback != expected_fallback:
+    try:
+        resolved_primary, resolved_fallback = resolve_bot_models(
+            {
+                "AA_BOT_PRIMARY_MODEL": expected_primary,
+                "AA_BOT_FALLBACK_MODEL": expected_fallback,
+            }
+        )
+    except ValueError:
         return False
-    return True
+    return primary == resolved_primary and fallback == resolved_fallback
 
 
 def _subtree_holds_text(value: Any) -> bool:

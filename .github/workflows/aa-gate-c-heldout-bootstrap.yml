@@ -82,47 +82,26 @@ jobs:
         with:
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
 
-      - name: Qualify AA production model via Continuum
-        id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
-        with:
-          models: ${{ vars.OPENCODE_MODELS }}
-          task-class: coder
-          profile: aa-product
-          state-token: ${{ github.token }}
-          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
-          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
-          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
-          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
-
-      - name: Freeze verified model for Gate C fixture generation
+      - name: Resolve AA-owned held-out conversation models
+        id: bot_model
         env:
-          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
-          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          AA_BOT_PRIMARY_MODEL: ${{ vars.AA_BOT_PRIMARY_MODEL }}
+          AA_BOT_FALLBACK_MODEL: ${{ vars.AA_BOT_FALLBACK_MODEL }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
-          test -n "$VERIFIED_MODEL"
-          if [[ ! "$APPROVED_POOL" =~ ^[A-Za-z0-9._/-]+(,[A-Za-z0-9._/-]+){0,7}$ ]]; then
-            echo "::error::OPENCODE_MODELS must be 1-8 comma-separated model identifiers"
-            exit 3
-          fi
-          if [[ ! "$VERIFIED_MODEL" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "::error::Continuum returned an invalid model identifier"
-            exit 4
-          fi
-          case ",$APPROVED_POOL," in
-            *",$VERIFIED_MODEL,"*) ;;
-            *) echo "::error::Continuum selected '$VERIFIED_MODEL', which is not in OPENCODE_MODELS"; exit 5 ;;
-          esac
-          {
-            echo "OPENCODE_MODELS=$APPROVED_POOL"
-            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
-            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
-            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
-          } >> "$GITHUB_ENV"
-          echo "AA model route frozen before Gate C fixture generation; no in-turn model switching."
+          python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
+
+      - name: Export AA-only Gate C fixture model policy
+        env:
+          PRIMARY_MODEL: ${{ steps.bot_model.outputs.primary }}
+          FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PRIMARY_MODEL" && test -n "$FALLBACK_MODEL"
+          printf 'AA_BOT_PRIMARY_MODEL=%s\nAA_BOT_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
+          printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
 
       - name: Calibrate evaluator against public fixtures only
         shell: bash

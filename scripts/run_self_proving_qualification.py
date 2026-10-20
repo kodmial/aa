@@ -131,11 +131,14 @@ def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool
 
     The workflow resolves the owner-controlled ``AA_BOT_PRIMARY_MODEL`` /
     ``AA_BOT_FALLBACK_MODEL`` policy and exports both the AA variables and
-    the runtime ``OPENCODE_*`` aliases. Gate A accepts the same-model route
-    used when one verified model serves both roles and the distinct
-    primary/fallback route used by the current AA deployment. It rejects a
-    missing, malformed, retired, or drifted route so an unapproved model can
-    never be qualified.
+    the runtime ``OPENCODE_*`` aliases. Continuum coder and PR-Agent pools
+    have no authority over the chatbot's planner, answer, judge, or
+    verifier models.
+
+    Gate A accepts the same-model route used when one verified model serves
+    both roles and the distinct primary/fallback route used by the current
+    AA deployment. It rejects a missing, malformed, retired, or drifted
+    route so an unapproved model can never be qualified.
     """
     from aa.bot_models import resolve_bot_models
     from aa.qualification.self_proving import runtime_model_policy_ok
@@ -156,7 +159,7 @@ def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool
         agent=str(getattr(settings, "opencode_agent", "") or ""),
         model=str(getattr(settings, "opencode_model", "") or ""),
         fallback_model=str(getattr(settings, "opencode_fallback_model", "") or ""),
-        expected_model=expected_primary,
+        expected_primary_model=expected_primary,
         expected_fallback_model=expected_fallback,
     )
 
