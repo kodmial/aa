@@ -102,6 +102,14 @@ jobs:
           )
           category = next((code for code, rx in probes if re.search(rx, text, re.I)), "unclassified-cli-failure")
           print(f"AA live-model E2E FAIL: OpenCode exited {sys.argv[2]} reason={category}; full log retained only on ephemeral runner")
+          # This test uses a public synthetic greeting and no provider, GitHub
+          # or book secrets. Print only a heavily redacted error tail, not the
+          # raw log, to distinguish CLI, adapter and provider failures.
+          for line in [ln.strip() for ln in text.splitlines() if ln.strip()][-6:]:
+              line = re.sub(r"https?://\\S+", "[url]", line)
+              line = re.sub(r"(?i)(?:bearer\\s+\\S+|sk-[\\w-]+|gh[pousr]_[\\w-]+)", "[redacted]", line)
+              line = re.sub(r"[a-zA-Z0-9_/-]{28,}", "[redacted]", line)
+              print("AA sanitized-error-tail: " + line[:180])
           PY
             exit "$rc"
           fi
