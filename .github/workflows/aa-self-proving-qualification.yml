@@ -271,16 +271,22 @@ jobs:
           # publish ONE authoritative gate-A-evidence.json artifact plus its
           # typed checkpoint. Gate F consumes that artifact read-only and
           # never re-executes Gate A.
+          # Per-check attribution (issue #360): every shell check runs
+          # independently and publishes its own SHA/run-bound result. A
+          # failure names the exact check instead of one coarse shell boolean.
           gate_a_shell=pass
-          bash scripts/verify.sh || gate_a_shell=fail
-          python scripts/verify_product_contract_qualification.py --require-active || gate_a_shell=fail
-          python scripts/verify_runtime_qualification.py || gate_a_shell=fail
+          python scripts/run_gate_a_shell.py \
+            --profile gate-a \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --out self-proving-out/gate-a-shell-results.json || gate_a_shell=fail
           python scripts/run_self_proving_qualification.py \
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
             --checkpoint-dir "$CKPT_DIR" \
             --emit-gate A --shell-a-status "$gate_a_shell" \
-            --shell-a-detail "workflow-gate-a-shell-$gate_a_shell"
+            --shell-a-detail "workflow-gate-a-shell-$gate_a_shell" \
+            --shell-a-results self-proving-out/gate-a-shell-results.json
 
       - name: Gate B - deterministic component integration
         id: gate-b

@@ -37,8 +37,13 @@ if TYPE_CHECKING:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from aa.qualification.gate_a_shell import (  # noqa: E402
+    GateAShellResult,
+    load_shell_results,
+)
 from aa.qualification.gate_evidence import (  # noqa: E402
     GATE_EVIDENCE_FILES,
+    REQUIRED_A_SHELL_CHECKS,
     SubcheckResult,
     build_checkpoint_body,
     build_evidence_body,
@@ -2040,14 +2045,105 @@ def _shell_subcheck_status(shell_status: str) -> str:
     return "BLOCKED"
 
 
-def _gate_a_subchecks(
-    gate_a: GateEvidence, shell_status: str, shell_detail: str
+def _load_gate_a_shell_results(
+    path: Path | None, *, expected_sha: str, run_id: str
+) -> tuple[dict[str, GateAShellResult] | None, str]:
+    if path is None:
+        return None, ""
+    try:
+        return (
+            load_shell_results(path, expected_sha=expected_sha, expected_run_id=run_id),
+            "",
+        )
+    except (SelfProvingError, OSError) as exc:
+        return None, f"shell-results-invalid:{type(exc).__name__}"[:160]
+
+
+def _gate_a_shell_subchecks(
+    shell_status: str,
+    shell_detail: str,
+    shell_results: Mapping[str, GateAShellResult] | None,
+    shell_results_error: str,
 ) -> list[SubcheckResult]:
-    """Decompose a Gate A verdict into per-assertion subchecks (no drops)."""
     shell_state = _shell_subcheck_status(shell_status)
     shell_note = (shell_detail or "").strip()[:160] or (
         "shell-proof-absent" if shell_status == "missing" else f"shell-{shell_status}"
     )
+    if shell_results_error:
+        if shell_status == "fail":
+            return [
+                SubcheckResult(
+                    check_id=check_id,
+                    status="FAIL",
+                    component="gate-a-shell",
+                    detail=shell_results_error,
+                )
+                for check_id in REQUIRED_A_SHELL_CHECKS
+            ]
+        return [
+            SubcheckResult(
+                check_id=check_id,
+                status="BLOCKED",
+                component="gate-a-shell",
+                detail=shell_results_error,
+            )
+            for check_id in REQUIRED_A_SHELL_CHECKS
+        ]
+    if shell_results is not None:
+        if shell_status == "missing":
+            return [
+                SubcheckResult(
+                    check_id=check_id,
+                    status="BLOCKED",
+                    component="gate-a-shell",
+                    detail="shell-proof-missing",
+                )
+                for check_id in REQUIRED_A_SHELL_CHECKS
+            ]
+        observed = (
+            "fail" if any(result.status != "PASS" for result in shell_results.values()) else "pass"
+        )
+        if observed != shell_status:
+            return [
+                SubcheckResult(
+                    check_id=check_id,
+                    status="BLOCKED",
+                    component="gate-a-shell",
+                    detail="shell-proof-inconsistent",
+                )
+                for check_id in REQUIRED_A_SHELL_CHECKS
+            ]
+        return [
+            SubcheckResult(
+                check_id=check_id,
+                status=shell_results[check_id].status,
+                component=check_id,
+                detail=(
+                    shell_results[check_id].detail
+                    or ("" if shell_results[check_id].status == "PASS" else shell_note)
+                )[:160],
+            )
+            for check_id in REQUIRED_A_SHELL_CHECKS
+        ]
+    return [
+        SubcheckResult(
+            check_id=check_id,
+            status=shell_state,
+            component="gate-a-shell",
+            detail=shell_note,
+        )
+        for check_id in REQUIRED_A_SHELL_CHECKS
+    ]
+
+
+def _gate_a_subchecks(
+    gate_a: GateEvidence,
+    shell_status: str,
+    shell_detail: str,
+    shell_results: Mapping[str, GateAShellResult] | None = None,
+    shell_results_error: str = "",
+) -> list[SubcheckResult]:
+    """Decompose a Gate A verdict into per-assertion subchecks (no drops)."""
     category = (gate_a.failure_category or "").strip()
     failed_ids: set[str] = set()
     blocked_ids: set[str] = set()
@@ -2085,23 +2181,9 @@ def _gate_a_subchecks(
         subchecks.append(
             SubcheckResult(check_id=check_id, status=state, component="gate-a", detail=note)
         )
-    for check_id in (
-        "a-shell-aa-check",
-        "a-shell-pytest",
-        "a-shell-ruff-check",
-        "a-shell-ruff-format",
-        "a-shell-mypy",
-        "a-shell-contract-qualification",
-        "a-shell-runtime-qualification",
-    ):
-        subchecks.append(
-            SubcheckResult(
-                check_id=check_id,
-                status=shell_state,
-                component="gate-a-shell",
-                detail=shell_note,
-            )
-        )
+    subchecks.extend(
+        _gate_a_shell_subchecks(shell_status, shell_detail, shell_results, shell_results_error)
+    )
     return subchecks
 
 
@@ -2865,6 +2947,7 @@ def _run_emit_gate(
     out_dir: Path,
     shell_status: str,
     shell_detail: str,
+    shell_results_path: Path | None = None,
 ) -> int:
     """Execute one gate exactly once and publish its durable V2 artifact."""
     try:
@@ -2910,7 +2993,16 @@ def _run_emit_gate(
                 mocked_only=python_evidence.mocked_only,
                 detail=python_evidence.detail,
             )
-        subchecks = _gate_a_subchecks(python_evidence, shell_status, shell_detail)
+        shell_results, shell_results_error = _load_gate_a_shell_results(
+            shell_results_path, expected_sha=expected, run_id=run_id
+        )
+        subchecks = _gate_a_subchecks(
+            python_evidence,
+            shell_status,
+            shell_detail,
+            shell_results,
+            shell_results_error,
+        )
         verdict = _combine_ab_verdict(python_evidence, subchecks)
     elif gate == "B":
         try:
@@ -3258,6 +3350,12 @@ def main(argv: list[str] | None = None) -> int:
         "--shell-a-detail", default="", help="Gate A shell proof detail (privacy-safe)"
     )
     parser.add_argument(
+        "--shell-a-results",
+        type=Path,
+        default=None,
+        help="Gate A per-check result artifact (SHA/run bound, fail-closed).",
+    )
+    parser.add_argument(
         "--shell-b-status", default="missing", help="Gate B shell proof: pass|fail|missing"
     )
     parser.add_argument(
@@ -3329,6 +3427,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=out_dir,
             shell_status=shell_status,
             shell_detail=shell_detail,
+            shell_results_path=args.shell_a_results if args.emit_gate == "A" else None,
         )
     shell_a_status = _normalize_shell_status(str(args.shell_a_status))
     shell_a_detail = str(args.shell_a_detail or "")
@@ -3430,7 +3529,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     gate_a_subchecks: list[SubcheckResult] | None = None
     if gate_a is None:
-        gate_a_subchecks = _gate_a_subchecks(gate_a_fresh, shell_a_status, shell_a_detail)
+        shell_a_results, shell_a_results_error = _load_gate_a_shell_results(
+            args.shell_a_results, expected_sha=expected, run_id=run_id
+        )
+        gate_a_subchecks = _gate_a_subchecks(
+            gate_a_fresh,
+            shell_a_status,
+            shell_a_detail,
+            shell_a_results,
+            shell_a_results_error,
+        )
         gate_a = _combine_ab_verdict(gate_a_fresh, gate_a_subchecks)
         if gate_a.status in ("STALE",):
             _write(out_dir, None, "STALE", main_sha=expected, run_id=run_id)
