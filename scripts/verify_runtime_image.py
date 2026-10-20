@@ -264,7 +264,7 @@ def check_opencode() -> list[str]:
 def check_head_match() -> list[str]:
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={ROOT}", "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,

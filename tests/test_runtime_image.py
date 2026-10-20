@@ -145,6 +145,12 @@ def test_pins_helper_accepts_current_tree() -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+def test_container_git_head_check_trusts_only_exact_checkout() -> None:
+    source = _read(ROOT / "scripts" / "verify_runtime_image.py")
+    assert '["git", "-c", f"safe.directory={ROOT}", "rev-parse", "HEAD"]' in source
+    assert "safe.directory=*" not in source
+
+
 def test_image_promotion_script_dry_run() -> None:
     import subprocess
     import sys
