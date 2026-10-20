@@ -4381,7 +4381,7 @@ def evaluate_live(
             if isinstance(exc, OpenCodeRateLimitError):
                 raise
             voice = _failed_lane("voice-1-16", type(exc).__name__)
-        lanes = (message, transport, control, voice)
+        lanes: tuple[LaneResult, ...] = (message, transport, control, voice)
         summary = LiveSummary(
             main_sha=expected,
             status=decide_status([lane.status for lane in lanes]),

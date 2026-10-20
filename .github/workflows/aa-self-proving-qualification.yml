@@ -945,6 +945,103 @@ jobs:
                 }
               }
             }
+            // Continuum snapshots the title/body for an OpenCode generation.
+            // Qualification observations must not rewrite that pinned spec.
+            async function issueHistory(issueNumber) {
+              return apiRetry('read repair issue history', () =>
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: issueNumber, per_page: 100,
+                })
+              );
+            }
+            function trustObservationComment(comment) {
+              return comment.user?.login === 'github-actions[bot]';
+            }
+            function issueLabelNames(issue) {
+              return (issue.labels || [])
+                .map(label => typeof label === 'string' ? label : label.name)
+                .filter(Boolean);
+            }
+            async function redispatchExistingIssue(issue, kind) {
+              const labels = issueLabelNames(issue);
+              const inProgress = issue.state === 'open' && labels.includes('automation:in-progress');
+              if (inProgress) {
+                core.notice('Existing ' + kind + ' generation is still in progress; observation recorded only.');
+                return;
+              }
+              const nextLabels = labels.filter(name =>
+                name !== 'automation:blocked' &&
+                name !== 'automation:qualifying' &&
+                name !== 'automation:in-progress'
+              );
+              if (!nextLabels.includes('automation:ready')) nextLabels.push('automation:ready');
+              await apiRetry('reopen and relabel existing ' + kind + ' issue', () =>
+                github.rest.issues.update({
+                  owner, repo, issue_number: issue.number,
+                  state: 'open',
+                  labels: nextLabels,
+                })
+              );
+              await apiRetry('wake issue scheduler for existing ' + kind + ' issue', () =>
+                github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'continuum-issue-scheduler.yml', ref: 'main',
+                })
+              );
+              core.warning('Recorded ' + kind + ' recurrence on #' + issue.number +
+                '; reopened with automation:ready without rewriting the pinned specification.');
+            }
+            function observationMarker(kind) {
+              return '<!-- aa-self-proving-' + kind +
+                '-observation:v1 run=' + runId + ' sha=' + sha + ' -->';
+            }
+            // A run's marker can live in the issue body (recorded when the
+            // issue is first created) or in a trusted observation comment
+            // (recorded on recurrence). Either form means this exact
+            // runId/SHA has already been processed, so a workflow re-run of
+            // the creating run is never misclassified as a new recurrence.
+            function bodyRecordsRun(issue, kind) {
+              return String((issue && issue.body) || '').includes(observationMarker(kind));
+            }
+            async function commentsRecordRun(issue, kind) {
+              const comments = await issueHistory(issue.number);
+              return comments.some(comment =>
+                trustObservationComment(comment) &&
+                String(comment.body || '').includes(observationMarker(kind))
+              );
+            }
+            async function runAlreadyRecorded(issue, kind) {
+              return bodyRecordsRun(issue, kind) || await commentsRecordRun(issue, kind);
+            }
+            async function nextObservationRecurrence(issue, kind, legacy) {
+              if (!issue) return 1;
+              const comments = await issueHistory(issue.number);
+              const prefix = '<!-- aa-self-proving-' + kind + '-observation:v1 run=';
+              const values = comments
+                .filter(trustObservationComment)
+                .map(comment => String(comment.body || ''))
+                .filter(body => body.includes(prefix))
+                .map(body => Number(body.match(/(?:Repair|Systemic) recurrence: \`(\d+)\`/)?.[1] || 0));
+              const recordedForCurrentRun = bodyRecordsRun(issue, kind) ||
+                comments
+                  .filter(trustObservationComment)
+                  .some(comment => String(comment.body || '').includes(observationMarker(kind)));
+              return recordedForCurrentRun
+                ? Math.max(legacy, ...values)
+                : Math.max(legacy, ...values) + 1;
+            }
+            async function postObservation(issue, kind, lines) {
+              if (await runAlreadyRecorded(issue, kind)) {
+                core.notice('Already recorded ' + kind + ' observation for run ' + runId);
+                return false;
+              }
+              await apiRetry('append immutable repair observation', () =>
+                github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: [observationMarker(kind), ...lines].join('\n'),
+                })
+              );
+              return true;
+            }
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
             let component = 'unknown';
@@ -1211,11 +1308,10 @@ jobs:
               .find(issue =>
                 String(issue.body || '').includes(`Repair fingerprint: \`${fingerprint}\``)
               );
-            let recurrence = 1;
-            if (existing) {
-              const match = String(existing.body || '').match(/Repair recurrence: \`(\d+)\`/);
-              recurrence = match ? Number(match[1]) + 1 : 2;
-            }
+            const legacyLocalRecurrence = Number(
+              String(existing?.body || '').match(/Repair recurrence: \`(\d+)\`/)?.[1] || 1
+            );
+            const recurrence = await nextObservationRecurrence(existing, 'repair', legacyLocalRecurrence);
             const MAX_LOCAL_REPAIR_RECURRENCE = 2;
             const recurrenceFocus = recurrence > 1
               ? '- RECURRENCE: the previous repair for this same stable failure set did not converge. Do not repeat the same local symptom patch. Compare the new per-stage evidence with the prior failure, identify the dominant persistent cause, and change strategy at the responsible boundary.'
@@ -1283,11 +1379,12 @@ jobs:
                     ? String(issue.body || '').includes('Systemic scope: `gate:C`')
                     : String(issue.body || '').includes(`Failure fingerprint: \`${fingerprint}\``))
                 );
-              let systemicRecurrence = 1;
-              if (systemicExisting) {
-                const match = String(systemicExisting.body || '').match(/Systemic recurrence: \`(\d+)\`/);
-                systemicRecurrence = match ? Number(match[1]) + 1 : 2;
-              }
+              const legacySystemicRecurrence = Number(
+                String(systemicExisting?.body || '').match(/Systemic recurrence: \`(\d+)\`/)?.[1] || 1
+              );
+              const systemicRecurrence = await nextObservationRecurrence(
+                systemicExisting, 'systemic', legacySystemicRecurrence
+              );
               const MAX_SYSTEMIC_REPAIR_RECURRENCE = 2;
               if (systemicRecurrence > MAX_SYSTEMIC_REPAIR_RECURRENCE) {
                 if (systemicExisting) {
@@ -1309,6 +1406,7 @@ jobs:
                   .find(issue => String(issue.body || '').includes(`Convergence scope: \`${systemicScope}\``));
                 const breakerBody = [
                   breakerMarker,
+                  observationMarker('breaker'),
                   `Convergence scope: \`${systemicScope}\``,
                   '',
                   '## Automatic convergence breaker',
@@ -1340,19 +1438,21 @@ jobs:
                 ].join('\n');
 
                 if (breakerExisting) {
-                  await apiRetry('block exhausted convergence scope', () =>
+                  await postObservation(breakerExisting, 'breaker', [
+                    'Qualification run: \`' + runId + '\`',
+                    'Convergence scope: \`' + systemicScope + '\`',
+                    stageTimingLine,
+                    'Breaker remains blocked; no specification rewrite or redispatch.',
+                  ]);
+                  await apiRetry('keep exhausted convergence scope blocked', () =>
                     github.rest.issues.update({
-                      owner,
-                      repo,
-                      issue_number: breakerExisting.number,
+                      owner, repo, issue_number: breakerExisting.number,
                       state: 'open',
-                      title: `P0 BLOCKED: Product Contract convergence exhausted (${systemicScope})`,
-                      body: breakerBody,
                       labels: ['priority:p0', 'automation:blocked'],
                     })
                   );
                   core.setFailed(
-                    `Convergence scope ${systemicScope} exhausted its one breaker repair; further automatic mutations are blocked.`
+                    'Convergence scope ' + systemicScope + ' exhausted; further automatic mutations are blocked.'
                   );
                   return;
                 }
@@ -1379,6 +1479,7 @@ jobs:
 
               const systemicBody = [
                 systemicMarker,
+                observationMarker('systemic'),
                 `Systemic scope: \`${systemicScope}\``,
                 '',
                 '## Automatic convergence escalation',
@@ -1413,22 +1514,37 @@ jobs:
               const systemicInProgress = Boolean(systemicExisting && systemicExisting.state === 'open' &&
                 (systemicExisting.labels || []).some(label => label.name === 'automation:in-progress'));
               if (systemicExisting) {
-                await apiRetry('refresh systemic convergence issue', () =>
-                  github.rest.issues.update({
-                    owner,
-                    repo,
-                    issue_number: systemicExisting.number,
-                    state: 'open',
-                    title: systemicTitle,
-                    body: systemicBody,
-                    labels: systemicInProgress
-                      ? ['priority:p0', 'automation:in-progress']
-                      : ['priority:p0', 'automation:ready'],
-                  })
-                );
-                core.warning(
-                  `Escalated recurrent fingerprint to systemic issue #${systemicExisting.number}; systemic recurrence=${systemicRecurrence}.`
-                );
+                const systemicLabels = issueLabelNames(systemicExisting);
+                // A recorded run is only truly done when the issue is actually
+                // open and scheduled. If a previous attempt recorded the
+                // observation but failed before reopening/dispatching, recover
+                // by redispatching instead of leaving the repair stalled.
+                const systemicRecorded = await runAlreadyRecorded(systemicExisting, 'systemic');
+                const systemicScheduled = systemicExisting.state === 'open' &&
+                  systemicLabels.includes('automation:ready') &&
+                  !systemicLabels.includes('automation:in-progress') &&
+                  !systemicLabels.includes('automation:blocked');
+                if (systemicRecorded && systemicScheduled) {
+                  core.notice('Systemic recurrence already recorded for run ' + runId +
+                    '; no redispatch.');
+                  return;
+                }
+                // Record the observation only after the reopen/dispatch side
+                // effect succeeds so a failed run is safely retried on rerun.
+                await redispatchExistingIssue(systemicExisting, 'systemic');
+                await postObservation(systemicExisting, 'systemic', [
+                  'Systemic recurrence: \`' + systemicRecurrence + '\`',
+                  'Qualification run: \`' + runId + '\`',
+                  'Main SHA: \`' + sha + '\`',
+                  'Failure fingerprint: \`' + fingerprint + '\`',
+                  stageTimingLine,
+                  verifierLine,
+                  transportTimingLine,
+                  tokenUsageLine,
+                  modelPathLine,
+                  'Existing OpenCode generation specification remains immutable.',
+                ]);
+                return;
               } else {
                 const created = await apiRetry('create systemic convergence issue', () =>
                   github.rest.issues.create({
@@ -1457,6 +1573,7 @@ jobs:
 
             const body = [
               marker,
+              observationMarker('repair'),
               '',
               '## Automatic self-proving repair',
               '',
@@ -1489,20 +1606,34 @@ jobs:
               'This issue is generated and refreshed automatically; the same stable failure series reopens this issue instead of creating another one.',
             ].join('\n');
             if (existing) {
-              await apiRetry('refresh self-proving repair issue', () =>
-                github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number: existing.number,
-                  state: 'open',
-                  title,
-                  body,
-                  labels: ['priority:p0', 'automation:ready'],
-                })
-              );
-              core.warning(
-                `Reopened self-proving repair issue #${existing.number}; recurrence=${recurrence} fingerprint=${fingerprint}.`
-              );
+              const existingLabels = issueLabelNames(existing);
+              // A recorded run is only truly done when the pinned issue is
+              // actually open and scheduled. If a previous attempt recorded the
+              // observation but failed before reopening/dispatching, recover by
+              // redispatching instead of leaving the repair stalled forever.
+              const existingRecorded = await runAlreadyRecorded(existing, 'repair');
+              const existingScheduled = existing.state === 'open' &&
+                existingLabels.includes('automation:ready') &&
+                !existingLabels.includes('automation:in-progress') &&
+                !existingLabels.includes('automation:blocked');
+              if (existingRecorded && existingScheduled) {
+                core.notice('Repair recurrence already recorded for run ' + runId +
+                  '; no redispatch.');
+                return;
+              }
+              // Record the observation only after the reopen/dispatch side
+              // effect succeeds so a failed run is safely retried on rerun.
+              await redispatchExistingIssue(existing, 'repair');
+              await postObservation(existing, 'repair', [
+                'Repair recurrence: \`' + recurrence + '\`',
+                'Qualification run: \`' + runId + '\`',
+                'Main SHA: \`' + sha + '\`',
+                'Repair fingerprint: \`' + fingerprint + '\`',
+                timingLine,
+                stageTimingLine,
+                'Existing OpenCode generation specification remains immutable.',
+              ]);
+              return;
             } else {
               const created = await apiRetry('create self-proving repair issue', () =>
                 github.rest.issues.create({
@@ -1604,7 +1735,7 @@ jobs:
               `Gates: ${gates || 'unavailable'}`,
               `Blocking gate: ${blocking}`,
               '',
-              'Evidence was produced by the repository-owned qualification workflow with the configured Telegram token, encrypted canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. Generic no-secret qualification workers are not authoritative for AA.',
+              'Evidence was produced by the repository-owned qualification workflow with canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. External Telegram Bot API checks and a separate test bot are not qualification prerequisites. Generic no-secret qualification workers are not authoritative for AA.',
             ].join('\n');
 
             const comments = await apiRetry('list qualification comments', () =>
