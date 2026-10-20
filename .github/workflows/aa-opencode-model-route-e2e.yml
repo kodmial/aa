@@ -50,13 +50,14 @@ jobs:
           echo "models=$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/approved-model-pool-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
       - name: Qualify official model capabilities and durable state in AA
         id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
           profile: aa-pr-live-acceptance
           state-token: ${{ github.token }}
       - name: Run the AA agent on the live model route
+        id: live_aa
         shell: bash
         env:
           MODEL: ${{ steps.aa_model_route.outputs.model }}
@@ -74,16 +75,29 @@ jobs:
           assert c.opencode_model in os.environ["OPENCODE_MODELS"].split(",")
           print("AA runtime selected a qualified approved model.")
           PY
-          dir="$(mktemp -d)"
-          trap 'rm -rf "$dir"' EXIT
-          cp opencode.json "$dir/opencode.json"
-          cp -R prompts "$dir/prompts"
-          cd "$dir"
+          # Run the *actual* AA checkout, not a partial temporary tree:
+          # book tools resolve scripts/ and corpus/ relative to their worktree.
+          # A temp copy of only opencode.json and prompts cannot exercise AA.
           log="$RUNNER_TEMP/aa-model-route-proof.log"
-          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
             opencode run --auto --agent aa --model "$MODEL" \
             'Привет! Ответь по-русски одним коротким предложением.' \
-            > "$log" 2>&1
+            > "$log" 2>&1; then
+            kind=''
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$log"; then
+              kind=timeout
+            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$log"; then
+              kind=quota_429
+            elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$log"; then
+              kind=upstream
+            fi
+            if [[ -n "$kind" ]]; then
+              echo "provider_failure=$kind" >> "$GITHUB_OUTPUT"
+            fi
+            # Never publish raw assistant messages, book content or secrets.
+            echo "::error::AA agent live call failed; provider_error=${kind:-not_proven}; log_bytes=$(wc -c < "$log")."
+            exit 1
+          fi
           python3 - "$MODEL" "$log" <<'PY'
           import sys
           from pathlib import Path
@@ -102,8 +116,23 @@ jobs:
               raise SystemExit("AA agent produced no response")
           print("AA agent executed on the qualified model.")
           PY
+      - name: Retire failed real AA provider route
+        if: >-
+          always() &&
+          steps.aa_model_route.outcome == 'success' &&
+          steps.live_aa.outcome == 'failure' &&
+          steps.live_aa.outputs.provider_failure != ''
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: fail
+          failure-reason: ${{ steps.live_aa.outputs.provider_failure }}
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          state-token: ${{ github.token }}
       - name: Attest real AA task completion
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: record
           models: ${{ steps.fixture.outputs.models }}
