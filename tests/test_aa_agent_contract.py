@@ -49,6 +49,18 @@ def test_only_four_read_only_aa_tools_are_allowed() -> None:
     assert permission.get("*") == "deny"
     allowed = {name for name, value in permission.items() if value == "allow"}
     assert allowed == ALLOWED_TOOLS
+    # The upstream OpenCode free-tier gateway rejects custom agents when
+    # the bash tool is entirely missing from the request schema. Keep it
+    # structurally visible, but never grant ANY executable shell command.
+    bash = permission.get("bash")
+    assert isinstance(bash, dict)
+    assert bash == {
+        "*": "deny",
+        "/__aa_nonexistent_opencode_compatibility_only__/no-such-executable": "ask",
+    }
+    assert permission.get("read", "deny") != "allow"
+    assert permission.get("edit", "deny") != "allow"
+    assert permission.get("write", "deny") != "allow"
 
 
 def test_system_prompt_is_english_and_concise() -> None:
