@@ -35,10 +35,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install -e . --no-deps
-      - name: Install AA pinned OpenCode via verified Continuum toolchain
-        uses: ./.github/actions/aa-opencode-toolchain
-        with:
-          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
+      - name: Install actual AA pinned OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat docker/opencode.version)"
+          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version "$version"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
       - name: Load approved deployment fixture as isolated PR-only test input
         id: fixture
         shell: bash
@@ -47,13 +50,14 @@ jobs:
           echo "models=$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/approved-model-pool-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
       - name: Qualify official model capabilities and durable state in AA
         id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
           profile: aa-pr-live-acceptance
           state-token: ${{ github.token }}
       - name: Run the AA agent on the live model route
+        id: live_aa
         shell: bash
         env:
           MODEL: ${{ steps.aa_model_route.outputs.model }}
@@ -71,49 +75,46 @@ jobs:
           assert c.opencode_model in os.environ["OPENCODE_MODELS"].split(",")
           print("AA runtime selected a qualified approved model.")
           PY
-          dir="$(mktemp -d)"
-          trap 'rm -rf "$dir"' EXIT
-          cp opencode.json "$dir/opencode.json"
-          cp -R prompts "$dir/prompts"
-          cd "$dir"
+          # Run the *actual* AA checkout, not a partial temporary tree:
+          # book tools resolve scripts/ and corpus/ relative to their worktree.
+          # A temp copy of only opencode.json and prompts cannot exercise AA.
           log="$RUNNER_TEMP/aa-model-route-proof.log"
-          set +e
-          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
             opencode run --auto --agent aa --model "$MODEL" \
             'Привет! Ответь по-русски одним коротким предложением.' \
-            > "$log" 2>&1
-          rc=$?
-          set -e
-          if [[ "$rc" -ne 0 ]]; then
-            # Fail closed, but emit a privacy-safe typed diagnostic. The
-            # complete provider/session log is never uploaded or printed.
-            python3 - "$log" "$rc" <<'PY'
+            > "$log" 2>&1; then
+            kind=''
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$log"; then
+              kind=timeout
+            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$log"; then
+              kind=quota_429
+            elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$log"; then
+              kind=upstream
+            elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode" "$log"; then
+              kind=unavailable
+            fi
+            if [[ -n "$kind" ]]; then
+              echo "provider_failure=$kind" >> "$GITHUB_OUTPUT"
+            fi
+            # Never publish raw assistant messages, book content or secrets.
+            # This synthetic, public-repository E2E carries a fixed greeting
+            # and no user messages. Print only bounded, secret-scrubbed
+            # diagnostics; raw prompts and raw logs remain runner-local.
+            python3 - "$log" <<'PY'
           import re
           import sys
           from pathlib import Path
           text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-          probes = (
-              ("rate-limited", r"(?:\\b429\\b|rate.?limit|quota.exceeded)"),
-              ("unauthorized", r"(?:\\b401\\b|unauthori[sz]ed|invalid.api.key)"),
-              ("forbidden", r"(?:\\b403\\b|forbidden)"),
-              ("missing-model", r"(?:model.not.found|unknown.model|invalid.model)"),
-              ("timeout", r"(?:timeout|timed.out|ETIMEDOUT)"),
-              ("invalid-cli", r"(?:unknown.option|unknown.argument|unrecognized.option)"),
-              ("provider-error", r"(?:provider.error|APIError|InternalServerError)"),
-              ("network-error", r"(?:ECONN|DNS|network.error)"),
-          )
-          category = next((code for code, rx in probes if re.search(rx, text, re.I)), "unclassified-cli-failure")
-          print(f"AA live-model E2E FAIL: OpenCode exited {sys.argv[2]} reason={category}; full log retained only on ephemeral runner")
-          # This test uses a public synthetic greeting and no provider, GitHub
-          # or book secrets. Print only a heavily redacted error tail, not the
-          # raw log, to distinguish CLI, adapter and provider failures.
-          for line in [ln.strip() for ln in text.splitlines() if ln.strip()][-6:]:
-              line = re.sub(r"https?://\\S+", "[url]", line)
-              line = re.sub(r"(?i)(?:bearer\\s+\\S+|sk-[\\w-]+|gh[pousr]_[\\w-]+)", "[redacted]", line)
-              line = re.sub(r"[a-zA-Z0-9_/-]{28,}", "[redacted]", line)
-              print("AA sanitized-error-tail: " + line[:180])
+          for line in text.splitlines()[:10]:
+              if not re.search(r"error|failed|invalid|unknown|not found|denied|missing", line, re.I):
+                  continue
+              line = re.sub(r"https?://\S+", "[url]", line)
+              line = re.sub(r"(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]+", "[redacted]", line)
+              line = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", line, flags=re.I)
+              print("::warning::AA CLI diagnostic: " + line[:240])
           PY
-            exit "$rc"
+            echo "::error::AA agent live call failed; provider_error=${kind:-not_proven}; log_bytes=$(wc -c < "$log")."
+            exit 1
           fi
           python3 - "$MODEL" "$log" <<'PY'
           import sys
@@ -133,8 +134,23 @@ jobs:
               raise SystemExit("AA agent produced no response")
           print("AA agent executed on the qualified model.")
           PY
+      - name: Retire failed real AA provider route
+        if: >-
+          always() &&
+          steps.aa_model_route.outcome == 'success' &&
+          steps.live_aa.outcome == 'failure' &&
+          steps.live_aa.outputs.provider_failure != ''
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: fail
+          failure-reason: ${{ steps.live_aa.outputs.provider_failure }}
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: aa-pr-live-acceptance
+          selected-model: ${{ steps.aa_model_route.outputs.model }}
+          state-token: ${{ github.token }}
       - name: Attest real AA task completion
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: record
           models: ${{ steps.fixture.outputs.models }}

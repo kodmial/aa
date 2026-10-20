@@ -80,11 +80,11 @@ def test_qualification_does_not_preempt_same_sha_or_forge_missing_gate_a() -> No
     gate_f = workflow.split("- name: Gate F - exact-main final verdict", 1)[1].split(
         "- name: Upload per-gate evidence", 1
     )[0]
-    assert "steps.gate-a.outcome == 'success'" in gate_f
-    assert "steps.gate-a.outcome == 'failure'" in gate_f
+    assert "needs.qualify.outputs.gate_a_outcome == 'success'" in gate_f
+    assert "needs.qualify.outputs.gate_a_outcome == 'failure'" in gate_f
     publisher = workflow.split("- name: Publish authoritative Product Contract result", 1)[1]
-    assert "steps.gate-a.outcome == 'success'" in publisher
-    assert "steps.gate-a.outcome == 'failure'" in publisher
+    assert "needs.qualify.outputs.gate_a_outcome == 'success'" in publisher
+    assert "needs.qualify.outputs.gate_a_outcome == 'failure'" in publisher
 
 
 def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> None:
@@ -107,8 +107,8 @@ def test_qualification_repair_publisher_keeps_failure_set_in_shared_scope() -> N
     assert "typedFailedGates.length ? typedFailedGates : [blocking]" in after_catch
     assert "typedRoots.length ? typedRoots : [component]" in after_catch
     assert "failGates.has('C')" in publisher
-    assert "steps.gate-a.outcome == 'success'" in publisher
-    assert "steps.gate-a.outcome == 'failure'" in publisher
+    assert "needs.qualify.outputs.gate_a_outcome == 'success'" in publisher
+    assert "needs.qualify.outputs.gate_a_outcome == 'failure'" in publisher
     assert "github.rest.repos.getBranch({" in publisher
     assert "is stale" in publisher
     assert "no repair issue is created" in publisher
@@ -131,6 +131,17 @@ def _run_publisher_scenario(
     work = tmp_path / "publisher-work"
     if work.exists():
         shutil.rmtree(work)
+    # The publisher now invokes the same pure classifier used by production.
+    # Mirror only the source files required to exercise its real CLI in this
+    # isolated Node.js harness; absent classifier is a fail-closed no-mutation.
+    policy_script = work / "scripts" / "plan_qualification_repair.py"
+    policy_script.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "plan_qualification_repair.py", policy_script)
+    policy_src = work / "src" / "aa" / "qualification" / "repair_policy.py"
+    policy_src.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "src" / "aa" / "qualification" / "repair_policy.py", policy_src)
+    (work / "src" / "aa" / "__init__.py").touch()
+    (work / "src" / "aa" / "qualification" / "__init__.py").touch()
     out_dir = work / "self-proving-out"
     out_dir.mkdir(parents=True)
     if summary_text is not None:
@@ -244,8 +255,9 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         "GATE_E_OUTCOME": "skipped",
     }
 
-    # Missing summary is not trusted product evidence; no repair issue must
-    # be invented and the publisher must not throw ReferenceError.
+    # Missing summary: the parser try block fails, so the publisher must fall
+    # back to the generic unknown failure without ReferenceError, phantom
+    # B/C/D/E product failures, or spurious SUCCESS.
     missing = _run_publisher_scenario(
         tmp_path,
         summary_text=None,
@@ -253,9 +265,11 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         failed_sha=failed_sha,
         initial_issues=[],
     )
+    # No typed trustworthy failure evidence: do not manufacture a code task.
     assert missing["created"] == []
+    assert missing["dispatched"] == 0
 
-    # Invalid summary also fails closed without inventing a code defect.
+    # Invalid summary: same generic fallback, still no ReferenceError.
     invalid = _run_publisher_scenario(
         tmp_path,
         summary_text="not-json{",
@@ -264,6 +278,7 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         initial_issues=[],
     )
     assert invalid["created"] == []
+    assert invalid["dispatched"] == 0
 
     # One failing Gate A summary with typed details recovers the publisher and
     # reports exactly the typed A failure without phantom gates.
@@ -337,11 +352,11 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
     )
     assert len(both["created"]) == 1
     both_body = str(both["created"][0]["body"])
-    assert "Failed gates (typed): `A, C`" in both_body
-    assert "C:synthetic-live-path:synthetic-answer" in both_body
+    # C without a typed semantic defect is HELD, not misreported as product.
+    assert "Failed gates (typed): `A`" in both_body
     proven = both_body.split("All proven product failures: `")[1].split("`")[0]
-    assert "A:" in proven and "C:" in proven
-    assert "B:" not in proven and "D:" not in proven and "E:" not in proven
+    assert "A:" in proven
+    assert "C:" not in proven and "B:" not in proven and "E:" not in proven
 
     # Idempotence: repeating the same same-SHA failure reuses the single P0
     # repair issue instead of minting a second one.
@@ -357,20 +372,39 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         run_id=recurrence_run_id,
     )
     assert len(repeat["created"]) == 0
-    assert len(repeat["updated"]) == 1
-    assert len(repeat["comments"]) == 1
-    assert "Repair recurrence: `2`" in str(repeat["comments"][0]["body"])
+    # A still-ready/in-progress repair is the single writer for this scope.
+    assert len(repeat["updated"]) == 0
+    assert len(repeat["comments"]) == 0
+    assert len(repeat["issues"]) == 1
+
+    # Once the prior repair is no longer active, recurrence reopens it and
+    # records an immutable observation without rewriting its pinned
+    # OpenCode generation specification.
+    dormant_issues = json.loads(json.dumps(existing_issues))
+    dormant_issues[0]["state"] = "closed"
+    reopened_result = _run_publisher_scenario(
+        tmp_path,
+        summary_text=both_summary,
+        gate_outcomes=both_outcomes,
+        failed_sha=failed_sha,
+        initial_issues=dormant_issues,
+        run_id=recurrence_run_id,
+    )
+    assert len(reopened_result["created"]) == 0
+    assert len(reopened_result["updated"]) == 1
+    assert len(reopened_result["comments"]) == 1
+    assert "Repair recurrence: `2`" in str(reopened_result["comments"][0]["body"])
     assert (
         "Existing OpenCode generation specification remains immutable."
-        in repeat["comments"][0]["body"]
+        in reopened_result["comments"][0]["body"]
     )
     # Recurrence reopens the existing issue with automation:ready without
     # rewriting its pinned title/body.
-    reopened = repeat["updated"][0]
+    reopened = reopened_result["updated"][0]
     assert "title" not in reopened and "body" not in reopened
     assert reopened["state"] == "open"
     assert "automation:ready" in reopened["labels"]
-    assert len(repeat["issues"]) == 1
+    assert len(reopened_result["issues"]) == 1
 
     # A GitHub workflow re-run keeps the same runId/SHA. The second attempt
     # must reuse the recurrence already recorded for this run instead of
@@ -381,14 +415,14 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         summary_text=both_summary,
         gate_outcomes=both_outcomes,
         failed_sha=failed_sha,
-        initial_issues=repeat["issues"],
-        initial_comments=repeat["commentHistory"],
+        initial_issues=reopened_result["issues"],
+        initial_comments=reopened_result["commentHistory"],
         run_id=recurrence_run_id,
     )
     assert len(rerun["created"]) == 0
     assert len(rerun["updated"]) == 0
     assert len(rerun["comments"]) == 0
-    assert len(rerun["commentHistory"]) == len(repeat["commentHistory"])
+    assert len(rerun["commentHistory"]) == len(reopened_result["commentHistory"])
 
     # Re-running the very run that *created* the repair issue must also be
     # recognized: the create path records this run's marker in the pinned

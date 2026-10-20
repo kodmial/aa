@@ -4328,6 +4328,8 @@ def evaluate_live(
     *,
     repo_root: Path | None = None,
     run_id: str = "local",
+    gate_c_only: bool = False,
+    deterministic_only: bool = False,
 ) -> LiveSummary:
     """Run all live lanes for ``main_sha`` and return a privacy-safe summary.
 
@@ -4350,6 +4352,66 @@ def evaluate_live(
             run_id=run_id,
         )
     static_gates = collect_static_gates(root)
+    if gate_c_only and deterministic_only:
+        raise ProductContractLiveError("Gate C and deterministic lanes are mutually exclusive")
+    if deterministic_only:
+        # Deterministic product Contract scenarios 1-41 and voice 1-16
+        # execute in Gate B only, never in real provider Gate C again.
+        try:
+            message = asyncio.run(run_message_lane())
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            message = _failed_lane("product-contract-1-24", type(exc).__name__)
+        try:
+            transport = asyncio.run(run_transport_lane())
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            transport = _failed_lane("telegram-transport-25-32", type(exc).__name__)
+        try:
+            control = run_control_lane(root)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            control = _failed_lane("runtime-control-33-41", type(exc).__name__)
+        try:
+            voice = run_voice_lane(root)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            voice = _failed_lane("voice-1-16", type(exc).__name__)
+        lanes: tuple[LaneResult, ...] = (message, transport, control, voice)
+        summary = LiveSummary(
+            main_sha=expected,
+            status=decide_status([lane.status for lane in lanes]),
+            lanes=lanes,
+            static_gates=static_gates,
+            run_id=run_id,
+        )
+        assert_no_text_leak(summary.to_dict())
+        return summary
+    if gate_c_only:
+        # A/B own deterministic message/transport/control/voice checks.
+        # The mandatory live C job must execute the real provider+book+agent
+        # conversation boundary ONCE, not re-run four other qualification lanes.
+        # Missing model/runtime proof still fails closed; full evaluate_live()
+        # remains available unchanged for standalone full-product diagnostics.
+        try:
+            live_evidence = asyncio.run(run_live_telegram_evidence_lane(run_id=run_id))
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OpenCodeRateLimitError):
+                raise
+            live_evidence = _failed_lane("live-telegram-evidence", type(exc).__name__)
+        summary = LiveSummary(
+            main_sha=expected,
+            status=decide_status([live_evidence.status]),
+            lanes=(live_evidence,),
+            static_gates=static_gates,
+            run_id=run_id,
+        )
+        assert_no_text_leak(summary.to_dict())
+        return summary
     message, transport, live_evidence = asyncio.run(_run_async_lanes(run_id))
     try:
         control = run_control_lane(root)

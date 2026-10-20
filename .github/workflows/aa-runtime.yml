@@ -43,6 +43,11 @@ jobs:
     # 330-minute job timeout stays below the 6-hour hosted-runner ceiling so
     # Telegram/OpenCode cleanup always has headroom.
     timeout-minutes: 330
+    container:
+      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     # Image promotion occurs only after the trusted GHCR build and its
     # fresh-runner canary validate a real immutable digest. Until promotion,
     # keep the existing hosted-runner path so /run remains operational.
@@ -78,11 +83,12 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
+      - name: Validate promoted dependency-image provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_runtime_image.py --pins-only
+          test $(git rev-parse HEAD) = ${{ github.sha }}
 
       - name: Compute public cache keys
         id: public-cache-keys
@@ -410,6 +416,10 @@ jobs:
         run: |
           set -euo pipefail
           python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify image hot path and external model cache
+        shell: bash
+        run: python scripts/verify_runtime_image.py
 
       - name: Build and validate AA knowledge runtime
         env:

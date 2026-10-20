@@ -48,7 +48,7 @@ jobs:
           printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
       - name: Qualify real coding route with Continuum
         id: route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ steps.pool.outputs.models }}
           profile: aa-live-e2e
@@ -56,6 +56,7 @@ jobs:
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
       - name: Execute actual AA code audit with anonymous OpenCode
+        id: run_audit
         env:
           MODEL: ${{ steps.route.outputs.model }}
         shell: bash
@@ -65,17 +66,50 @@ jobs:
           trap 'rm -rf "$work"' EXIT
           cp src/aa/config.py "$work/config.py"
           cd "$work"
-          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+          log="$RUNNER_TEMP/aa-model-audit.log"
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
             opencode run --auto --model "$MODEL" \
             'Inspect config.py and write a file called aa-model-audit.txt containing the exact identifiers DEFAULT_PRIMARY_MODEL and DEFAULT_FALLBACK_MODEL and a short explanation of the stale same-model default failure. Do not change config.py.' \
-            > "$RUNNER_TEMP/aa-model-audit.log" 2>&1
+            > "$log" 2>&1; then
+            kind=''
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$log"; then
+              kind=timeout
+            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$log"; then
+              kind=quota_429
+            elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$log"; then
+              kind=upstream
+            elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode" "$log"; then
+              kind=unavailable
+            fi
+            if [[ -n "$kind" ]]; then
+              echo "provider_failure=$kind" >> "$GITHUB_OUTPUT"
+            fi
+            echo "::error::AA real code audit failed; provider_error=${kind:-not_proven}; full log remains runner-local."
+            exit 1
+          fi
           test -f aa-model-audit.txt
           grep -q 'DEFAULT_PRIMARY_MODEL' aa-model-audit.txt
           grep -q 'DEFAULT_FALLBACK_MODEL' aa-model-audit.txt
           test ! -e .git
           echo 'AA code-inspection/file-editing task passed on real approved route.'
+      - name: Retire failed real AA code-audit provider route
+        if: >-
+          always() &&
+          steps.route.outcome == 'success' &&
+          steps.run_audit.outcome == 'failure' &&
+          steps.run_audit.outputs.provider_failure != ''
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: fail
+          failure-reason: ${{ steps.run_audit.outputs.provider_failure }}
+          models: ${{ steps.pool.outputs.models }}
+          task-class: coder
+          profile: aa-live-e2e
+          selected-model: ${{ steps.route.outputs.model }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+          state-token: ${{ github.token }}
       - name: Record accepted real AA task
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: record
           models: ${{ steps.pool.outputs.models }}
@@ -107,7 +141,7 @@ jobs:
         run: printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/aa-approved-models.json"))["models"]))')" >> "$GITHUB_OUTPUT"
       - name: Reload sticky AA model on fresh VM
         id: route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
+        uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ steps.pool.outputs.models }}
           profile: aa-live-e2e

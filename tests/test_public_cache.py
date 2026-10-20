@@ -282,7 +282,9 @@ def test_workflow_runtime_semantics_are_unchanged() -> None:
     )
     for required in (
         "actions/checkout",
-        'python-version: "3.12"',
+        "Validate promoted dependency-image provenance",
+        "ghcr.io/kodmial/aa-runtime@sha256:",
+        "scripts/verify_runtime_image.py --pins-only",
         "pip install -e .",
         # Production activation (#28): verified EN + RU restore from the
         # committed encrypted snapshots; RU fails closed without translation.

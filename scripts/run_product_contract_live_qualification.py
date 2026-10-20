@@ -52,6 +52,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--main-sha", required=True, help="Exact main SHA under test")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "eval-product-contract-live-out")
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", "local"))
+    parser.add_argument(
+        "--deterministic-only",
+        action="store_true",
+        help="Run all deterministic 1-41 and voice 1-16 B scenarios",
+    )
+    parser.add_argument(
+        "--gate-c-only",
+        action="store_true",
+        help="Run only genuine Gate C product conversation; A/B cover other lanes",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -81,7 +91,13 @@ def main(argv: list[str] | None = None) -> int:
         return _fail_incomplete(out_dir, reason="working tree is not clean", main_sha=expected_sha)
 
     try:
-        summary = evaluate_live(expected_sha, repo_root=ROOT, run_id=str(args.run_id))
+        summary = evaluate_live(
+            expected_sha,
+            repo_root=ROOT,
+            run_id=str(args.run_id),
+            gate_c_only=args.gate_c_only,
+            deterministic_only=args.deterministic_only,
+        )
     except OpenCodeRateLimitError:
         (out_dir / "restart-required.json").write_text(
             json.dumps(

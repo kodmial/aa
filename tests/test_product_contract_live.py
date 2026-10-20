@@ -249,8 +249,8 @@ def test_self_proving_gate_f_always_emits_verdict() -> None:
     gate_f_index = workflow.index("Gate F - exact-main final verdict")
     gate_f_block = workflow[gate_f_index : gate_f_index + 1100]
     assert "if: ${{ always()" in gate_f_block
-    assert "steps.gate-a.outcome == 'success'" in gate_f_block
-    assert "steps.gate-a.outcome == 'failure'" in gate_f_block
+    assert "needs.qualify.outputs.gate_a_outcome == 'success'" in gate_f_block
+    assert "needs.qualify.outputs.gate_a_outcome == 'failure'" in gate_f_block
     assert "steps.gate-c.outcome == 'success'" not in gate_f_block
 
 
