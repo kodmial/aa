@@ -999,6 +999,7 @@ jobs:
             }
             // Unknown or incomplete evidence has no permission to mutate code.
             if (!productFailures.length || productFailures.some(g =>
+              (g.gate === 'C' || g.gate === 'E') &&
               /(?:evidence[-_ ](?:invalid|missing|incomplete)|workflow[-_ ]step[-_ ]failed|proof[-_ ]unavailable|missing[-_ ]artifact|unknown[-_ ]gate)/i
                 .test(String(g.failure_category || ''))
             )) {

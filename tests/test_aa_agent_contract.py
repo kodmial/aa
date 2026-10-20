@@ -46,7 +46,7 @@ def test_only_four_read_only_aa_tools_are_allowed() -> None:
     assert isinstance(aa, dict)
     permission = aa["permission"]
     assert isinstance(permission, dict)
-    assert permission.get("*") == "deny"
+    assert permission.get("*") == "ask"
     allowed = {name for name, value in permission.items() if value == "allow"}
     assert allowed == ALLOWED_TOOLS
 

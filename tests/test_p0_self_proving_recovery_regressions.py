@@ -244,9 +244,8 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         "GATE_E_OUTCOME": "skipped",
     }
 
-    # Missing summary: the parser try block fails, so the publisher must fall
-    # back to the generic unknown failure without ReferenceError, phantom
-    # B/C/D/E product failures, or spurious SUCCESS.
+    # Missing summary is not trusted product evidence; no repair issue must
+    # be invented and the publisher must not throw ReferenceError.
     missing = _run_publisher_scenario(
         tmp_path,
         summary_text=None,
@@ -254,15 +253,9 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         failed_sha=failed_sha,
         initial_issues=[],
     )
-    assert len(missing["created"]) == 1
-    body = str(missing["created"][0]["body"])
-    assert "unknown-gate-failure" in body
-    assert "Failed gates (typed): `unknown`" in body
-    assert "Repair fingerprint:" in body
-    for phantom in ("B:", "C:", "D:", "E:"):
-        assert f"All proven product failures: `{phantom}" not in body
+    assert missing["created"] == []
 
-    # Invalid summary: same generic fallback, still no ReferenceError.
+    # Invalid summary also fails closed without inventing a code defect.
     invalid = _run_publisher_scenario(
         tmp_path,
         summary_text="not-json{",
@@ -270,10 +263,7 @@ def test_qualification_repair_publisher_recovers_failed_gate_a_without_reference
         failed_sha=failed_sha,
         initial_issues=[],
     )
-    assert len(invalid["created"]) == 1
-    invalid_body = str(invalid["created"][0]["body"])
-    assert "unknown-gate-failure" in invalid_body
-    assert "Failed gates (typed): `unknown`" in invalid_body
+    assert invalid["created"] == []
 
     # One failing Gate A summary with typed details recovers the publisher and
     # reports exactly the typed A failure without phantom gates.
