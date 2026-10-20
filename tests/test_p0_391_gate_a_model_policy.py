@@ -32,17 +32,6 @@ DISTINCT_FALLBACK_MODEL = FALLBACK
 
 
 def test_aa_owned_model_policy_accepts_same_and_distinct_routes() -> None:
-    # Without a frozen AA_BOT_* expectation, any well-formed route is valid.
-    assert runtime_model_policy_ok(
-        agent=DEFAULT_AA_AGENT,
-        model=PRIMARY,
-        fallback_model=FALLBACK,
-    )
-    assert runtime_model_policy_ok(
-        agent=DEFAULT_AA_AGENT,
-        model=OTHER_APPROVED_MODEL,
-        fallback_model=DISTINCT_FALLBACK_MODEL,
-    )
     # The owner may select any approved primary/fallback pair from AA_BOT_*.
     assert runtime_model_policy_ok(
         agent=DEFAULT_AA_AGENT,
@@ -73,6 +62,8 @@ def test_aa_owned_model_policy_accepts_same_and_distinct_routes() -> None:
     [
         ("other-agent", "", "", PRIMARY, FALLBACK),
         ("other-agent", PRIMARY, FALLBACK, PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, "", "", PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, "", "", "opencode/foo/", FALLBACK),
         (DEFAULT_AA_AGENT, "", "", "opencode/muse-spark-1.3-contributor-free", FALLBACK),
         (DEFAULT_AA_AGENT, "", "", PRIMARY, "opencode/space-bunny-free"),
         (DEFAULT_AA_AGENT, "", "", "", FALLBACK),

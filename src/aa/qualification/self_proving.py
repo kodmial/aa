@@ -132,7 +132,9 @@ _CANARY_EVERY_HOURS = 4
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
-_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+_MODEL_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
+)
 _RETIRED_MODEL_MARKERS = ("muse-spark", "space-bunny")
 
 FORBIDDEN_EVIDENCE_KEYS = frozenset(
@@ -323,11 +325,12 @@ def runtime_model_policy_ok(
     AA owns its chatbot route independently of Continuum coding routes
     (kodmial/aa Work Lock #66). The effective ``OPENCODE_MODEL`` and
     ``OPENCODE_FALLBACK_MODEL`` must both be valid provider/model
-    identifiers. When the workflow has resolved the owner-controlled
-    ``AA_BOT_*`` policy, the effective values must match that frozen policy
-    exactly. Same-model fallback is allowed because the adapter suppresses
-    duplicate retries; a distinct fallback is also allowed. The retired
-    Muse Spark / Space Bunny routes must never be selected again.
+    identifiers. The workflow must resolve the owner-controlled
+    ``AA_BOT_*`` policy, and the effective values must match that frozen
+    policy exactly; a missing policy fails closed. Same-model fallback is
+    allowed because the adapter suppresses duplicate retries; a distinct
+    fallback is also allowed. The retired Muse Spark / Space Bunny routes
+    must never be selected again.
     """
     from aa.bot_models import resolve_bot_models
 
@@ -339,9 +342,7 @@ def runtime_model_policy_ok(
         return False
     expected_primary = (expected_primary_model or "").strip()
     expected_fallback = (expected_fallback_model or "").strip()
-    if not expected_primary and not expected_fallback:
-        return True
-    if not expected_primary:
+    if not expected_primary or not expected_fallback:
         return False
     try:
         resolved_primary, resolved_fallback = resolve_bot_models(

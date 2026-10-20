@@ -15,11 +15,12 @@ from scripts.run_self_proving_qualification import _aa_model_policy_valid
         ("opencode/a", "opencode/b", "opencode/a", "opencode/b", True),
         ("opencode/a", "opencode/b", "opencode/b", "opencode/b", False),
         ("opencode/a", "opencode/b", "opencode/a", "opencode/b ", True),
-        ("", "", "opencode/a", "opencode/b", True),
+        ("", "", "opencode/a", "opencode/b", False),
         ("", "", "", "opencode/b", False),
         ("opencode/a", "opencode/b", "opencode/a", "opencode/c", False),
         ("opencode/a", "", "opencode/a", "opencode/a", True),
         ("opencode/a", "", "opencode/a", "opencode/b", False),
+        ("opencode/a", "opencode/b", "opencode/a/", "opencode/b", False),
     ],
 )
 def test_policy_requires_effective_route_to_match_frozen_aa_policy(
