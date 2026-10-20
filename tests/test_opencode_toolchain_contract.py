@@ -47,13 +47,14 @@ def test_all_aa_live_runners_share_verified_toolchain() -> None:
     for name in OPEN_CODE_WORKFLOWS:
         text = (WORKFLOWS / name).read_text(encoding="utf-8")
         assert "uses: ./.github/actions/aa-opencode-toolchain" in text, name
+        assert "opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in text, name
         assert "https://opencode.ai/install" not in text, name
         assert not re.search(r"bash -s -- --version\s+[0-9]", text), name
 
 
 def test_aa_toolchain_reads_only_pin_and_verifies_real_binary() -> None:
     text = ACTION.read_text(encoding="utf-8")
-    assert 'OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}' in text
+    assert 'OPENCODE_VERSION_OVERRIDE: ${{ inputs.opencode-version }}' in text
     assert 'version="${OPENCODE_VERSION_OVERRIDE:-$(cat docker/opencode.version)}"' in text
     assert '[[ "$version" =~' in text
     assert "kodmial/continuum/.github/actions/agent-toolchain@" in text

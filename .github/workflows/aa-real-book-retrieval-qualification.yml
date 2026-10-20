@@ -170,6 +170,8 @@ jobs:
 
       - name: Install AA pinned OpenCode via verified Continuum toolchain
         uses: ./.github/actions/aa-opencode-toolchain
+        with:
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
 
       - name: Restore pip download cache (public wheels only)
         uses: actions/cache@v4

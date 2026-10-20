@@ -26,6 +26,8 @@ jobs:
           pip install -e ".[dev]"
       - name: Install AA pinned OpenCode via verified Continuum toolchain
         uses: ./.github/actions/aa-opencode-toolchain
+        with:
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
 
       - name: Run canonical project verification
         run: bash scripts/verify.sh

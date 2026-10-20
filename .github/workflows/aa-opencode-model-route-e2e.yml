@@ -37,6 +37,8 @@ jobs:
           python3 -m pip install -e . --no-deps
       - name: Install AA pinned OpenCode via verified Continuum toolchain
         uses: ./.github/actions/aa-opencode-toolchain
+        with:
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
       - name: Load approved deployment fixture as isolated PR-only test input
         id: fixture
         shell: bash
