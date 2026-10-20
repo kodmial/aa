@@ -1,0 +1,39 @@
+name: AA PR-Agent fresh diagnostic dispatch
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/aa-pr-agent-diagnostic-one-time.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch:
+    if: github.repository == 'kodmial/aa' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Recheck exact live PR head and dispatch fresh review
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: '407'
+          EXPECTED_HEAD: '12e562fed53c8152cfa5f4070cce7293758b1fe9'
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?TAP_PAT is required}"
+          current="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
+          if [[ "$current" != "$EXPECTED_HEAD" ]]; then
+            echo "::notice::PR head changed; diagnostic dispatch skipped instead of testing stale code."
+            exit 0
+          fi
+          gh workflow run continuum-pr-agent.yml --repo "$REPO" --ref main \
+            -f pr_number="$PR_NUMBER" \
+            -f expected_head_sha="$EXPECTED_HEAD" \
+            -f retry_attempt=0 \
+            -f recovery_kind=review \
+            -f retry_workflow=continuum-pr-agent.yml
+          echo "Fresh exact-head PR-Agent review dispatched."
