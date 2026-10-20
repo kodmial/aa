@@ -10,11 +10,16 @@ from pathlib import Path
 
 from aa.config import DEFAULT_PRIMARY_MODEL
 
-_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+_MODEL_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?"
+_MODEL = re.compile(rf"[A-Za-z0-9][A-Za-z0-9._-]*/(?:{_MODEL_SEGMENT})(?:/{_MODEL_SEGMENT})*")
 
 
 def resolve_bot_models(source: Mapping[str, str] | None = None) -> tuple[str, str]:
-    """Only AA_BOT_* selects bot models; OPENCODE_MODELS is a coding route."""
+    """Only AA_BOT_* selects bot models; OPENCODE_MODELS is a coding route.
+
+    An empty fallback intentionally resolves to the primary model so a
+    same-model deployment does not need to set both variables.
+    """
     values = os.environ if source is None else source
     primary = (values.get("AA_BOT_PRIMARY_MODEL", "") or "").strip() or DEFAULT_PRIMARY_MODEL
     fallback = (values.get("AA_BOT_FALLBACK_MODEL", "") or "").strip() or primary

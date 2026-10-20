@@ -132,8 +132,9 @@ _CANARY_EVERY_HOURS = 4
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_MODEL_SEGMENT_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?"
 _MODEL_RE = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
+    rf"[A-Za-z0-9][A-Za-z0-9._-]*/(?:{_MODEL_SEGMENT_RE})(?:/{_MODEL_SEGMENT_RE})*"
 )
 _RETIRED_MODEL_MARKERS = ("muse-spark", "space-bunny")
 

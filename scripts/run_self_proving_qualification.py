@@ -145,16 +145,20 @@ def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool
 
     expected_primary = (environ.get("AA_BOT_PRIMARY_MODEL", "") or "").strip()
     expected_fallback = (environ.get("AA_BOT_FALLBACK_MODEL", "") or "").strip()
-    if expected_primary or expected_fallback:
-        try:
-            expected_primary, expected_fallback = resolve_bot_models(
-                {
-                    "AA_BOT_PRIMARY_MODEL": expected_primary,
-                    "AA_BOT_FALLBACK_MODEL": expected_fallback,
-                }
-            )
-        except ValueError:
-            return False
+    if not expected_primary:
+        return False
+    if not expected_fallback:
+        # An omitted fallback intentionally means the same-model route.
+        expected_fallback = expected_primary
+    try:
+        expected_primary, expected_fallback = resolve_bot_models(
+            {
+                "AA_BOT_PRIMARY_MODEL": expected_primary,
+                "AA_BOT_FALLBACK_MODEL": expected_fallback,
+            }
+        )
+    except ValueError:
+        return False
     return runtime_model_policy_ok(
         agent=str(getattr(settings, "opencode_agent", "") or ""),
         model=str(getattr(settings, "opencode_model", "") or ""),
