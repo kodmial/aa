@@ -35,13 +35,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install -e . --no-deps
-      - name: Install actual AA pinned OpenCode
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(cat docker/opencode.version)"
-          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version "$version"
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
+        uses: ./.github/actions/aa-opencode-toolchain
       - name: Load approved deployment fixture as isolated PR-only test input
         id: fixture
         shell: bash
@@ -80,10 +75,44 @@ jobs:
           cp -R prompts "$dir/prompts"
           cd "$dir"
           log="$RUNNER_TEMP/aa-model-route-proof.log"
+          set +e
           env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
             opencode run --auto --agent aa --model "$MODEL" \
             'Привет! Ответь по-русски одним коротким предложением.' \
             > "$log" 2>&1
+          rc=$?
+          set -e
+          if [[ "$rc" -ne 0 ]]; then
+            # Fail closed, but emit a privacy-safe typed diagnostic. The
+            # complete provider/session log is never uploaded or printed.
+            python3 - "$log" "$rc" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          probes = (
+              ("rate-limited", r"(?:\\b429\\b|rate.?limit|quota.exceeded)"),
+              ("unauthorized", r"(?:\\b401\\b|unauthori[sz]ed|invalid.api.key)"),
+              ("forbidden", r"(?:\\b403\\b|forbidden)"),
+              ("missing-model", r"(?:model.not.found|unknown.model|invalid.model)"),
+              ("timeout", r"(?:timeout|timed.out|ETIMEDOUT)"),
+              ("invalid-cli", r"(?:unknown.option|unknown.argument|unrecognized.option)"),
+              ("provider-error", r"(?:provider.error|APIError|InternalServerError)"),
+              ("network-error", r"(?:ECONN|DNS|network.error)"),
+          )
+          category = next((code for code, rx in probes if re.search(rx, text, re.I)), "unclassified-cli-failure")
+          print(f"AA live-model E2E FAIL: OpenCode exited {sys.argv[2]} reason={category}; full log retained only on ephemeral runner")
+          # This test uses a public synthetic greeting and no provider, GitHub
+          # or book secrets. Print only a heavily redacted error tail, not the
+          # raw log, to distinguish CLI, adapter and provider failures.
+          for line in [ln.strip() for ln in text.splitlines() if ln.strip()][-6:]:
+              line = re.sub(r"https?://\\S+", "[url]", line)
+              line = re.sub(r"(?i)(?:bearer\\s+\\S+|sk-[\\w-]+|gh[pousr]_[\\w-]+)", "[redacted]", line)
+              line = re.sub(r"[a-zA-Z0-9_/-]{28,}", "[redacted]", line)
+              print("AA sanitized-error-tail: " + line[:180])
+          PY
+            exit "$rc"
+          fi
           python3 - "$MODEL" "$log" <<'PY'
           import sys
           from pathlib import Path

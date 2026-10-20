@@ -1,0 +1,41 @@
+name: AA pinned OpenCode toolchain
+description: Resolve repository OpenCode version variable or reviewed default, then verify Continuum's cached toolchain
+outputs:
+  runtime-version:
+    description: Verified OpenCode version in PATH
+    value: ${{ steps.toolchain.outputs.runtime-version }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve sole AA OpenCode version pin
+      id: version
+      shell: bash
+      env:
+        # Repository Actions variable, never embedded into individual workflows.
+        # An unset variable uses the reviewed, reproducible repository pin.
+        OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
+      run: |
+        set -euo pipefail
+        version="${OPENCODE_VERSION_OVERRIDE:-$(cat docker/opencode.version)}"
+        if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Invalid docker/opencode.version"; exit 2
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+    - name: Install verified OpenCode from Continuum
+      id: toolchain
+      uses: kodmial/continuum/.github/actions/agent-toolchain@main
+      with:
+        components: opencode
+        opencode-version: ${{ steps.version.outputs.version }}
+    - name: Verify actual CLI is exactly the AA pin
+      shell: bash
+      env:
+        PIN: ${{ steps.version.outputs.version }}
+        RESOLVED: ${{ steps.toolchain.outputs.runtime-version }}
+      run: |
+        set -euo pipefail
+        actual="$(opencode --version)"
+        if [[ "$actual" != "$PIN" || "$RESOLVED" != "$PIN" ]]; then
+          echo "::error::OpenCode version mismatch: expected $PIN, resolved $RESOLVED, actual $actual"
+          exit 2
+        fi
