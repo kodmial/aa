@@ -59,8 +59,21 @@ def test_agents_advertise_open_code_tools() -> None:
 
 def test_provider_failures_not_used_as_code_repair_authority() -> None:
     workflow = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text()
-    admission = workflow.index("const providerBlocked = productFailures.some")
+    admission = workflow.index("scripts/plan_qualification_repair.py")
     mutation = workflow.index("const marker = '<!-- aa-self-proving-repair:v1 -->';")
     assert admission < mutation
-    assert "OpenCodeProviderAccessError" in workflow[admission:mutation]
-    assert "if (providerBlocked)" in workflow[admission:mutation]
+    assert "repair-policy decision" in workflow[admission:mutation]
+    policy = (ROOT / "src/aa/qualification/repair_policy.py").read_text()
+    assert "opencodeprovideraccesserror" in policy.lower()
+    assert "provider-or-infrastructure" in policy
+
+
+def test_qualification_uses_chatbot_policy_not_continuum_coder_route() -> None:
+    workflow = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text()
+    assert "AA_BOT_PRIMARY_MODEL" in workflow
+    assert "AA_BOT_FALLBACK_MODEL" in workflow
+    assert "python -m aa.bot_models --github-output" in workflow
+    assert "task-class: coder" not in workflow
+    assert "model-route@" not in workflow
+    assert "1.18.34" not in workflow
+    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow

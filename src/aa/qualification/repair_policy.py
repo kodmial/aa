@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import Any
 
 _PROVIDERS = re.compile(
-    r"opencodeprovideraccesserror|opencoderatelimiterror|provider[-_ ](?:access|"
+    r"opencodeprovideraccesserror|opencoderatelimiterror|opencodetimeouterror|"
+    r"opencodetransienterror|provider[-_ ](?:access|"
     r"unavailable|error|down|timeout|rate)|model[-_ ](?:unavailable|route|probe|policy[-_ ]"
     r"unavailable)|http[-_ ]?(?:403|429|500|502|503|504)|rate[-_ ]?limit|"
     r"external[-_ ](?:model|provider|service)|transport[-_ ](?:timeout|network)|"

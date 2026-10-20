@@ -128,8 +128,10 @@ def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None
     assert workflow.count("timeout-minutes: 45") == 2
     assert "qualify-live:" in workflow
     assert "needs: qualify" in workflow
-    assert "verified_model: ${{ steps.aa_model_route.outputs.model }}" in workflow
-    assert "explicit-pin: ${{ needs.qualify.outputs.verified_model }}" in workflow
+    assert "verified_model: ${{ steps.bot_model.outputs.primary }}" in workflow
+    assert "verified_fallback: ${{ steps.bot_model.outputs.fallback }}" in workflow
+    assert "AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model }}" in workflow
+    assert "AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback }}" in workflow
     assert "aa-preflight-evidence" in workflow
     assert "--deterministic-only" in workflow
     assert "--gate-c-only" in workflow

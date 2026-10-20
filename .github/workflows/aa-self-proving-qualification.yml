@@ -52,42 +52,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  model_pool_readiness:
-    runs-on: ubuntu-latest
-    timeout-minutes: 6
-    outputs:
-      models: ${{ steps.wait.outputs.models }}
-    steps:
-      - name: Wait for approved model pool variable
-        id: wait
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          TARGET_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          : "${GH_TOKEN:?TAP_PAT must have Actions Variables read permission}"
-          for attempt in $(seq 1 30); do
-            models="$(gh api "repos/$TARGET_REPO/actions/variables/OPENCODE_MODELS" --jq .value 2>/dev/null || true)"
-            if [[ -n "$models" ]]; then
-              echo "models=$models" >> "$GITHUB_OUTPUT"
-              echo "AA model pool ready."
-              exit 0
-            fi
-            echo "OPENCODE_MODELS not ready (attempt $attempt/30); waiting..."
-            sleep 10
-          done
-          echo "::error::AA requires approved OPENCODE_MODELS repository variable"
-          exit 2
-
   qualify:
-    needs: model_pool_readiness
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
       gate_a_outcome: ${{ steps.gate-a.outcome }}
       gate_b_outcome: ${{ steps.gate-b.outcome }}
-      verified_model: ${{ steps.aa_model_route.outputs.model }}
+      verified_model: ${{ steps.bot_model.outputs.primary }}
+      verified_fallback: ${{ steps.bot_model.outputs.fallback }}
     steps:
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -129,65 +101,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Install pinned OpenCode
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
-              bash -s -- --version 1.18.34; then
-              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-              exit 0
-            fi
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::OpenCode installer failed after 3 attempts."
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
+        uses: ./.github/actions/aa-opencode-toolchain
 
-      - name: Qualify approved AA OpenCode model route
-        id: aa_model_route
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
-        with:
-          models: ${{ needs.model_pool_readiness.outputs.models }}
-          task-class: coder
-          profile: aa-product-contract
-          state-token: ${{ github.token }}
-          runtime-version: ''
-          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
-          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
-          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
-          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
-
-      - name: Freeze verified model for all AA agents and quality gates
+      - name: Resolve AA-owned conversation models
+        id: bot_model
         env:
-          APPROVED_POOL: ${{ needs.model_pool_readiness.outputs.models }}
-          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          AA_BOT_PRIMARY_MODEL: ${{ vars.AA_BOT_PRIMARY_MODEL }}
+          AA_BOT_FALLBACK_MODEL: ${{ vars.AA_BOT_FALLBACK_MODEL }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
-          test -n "$VERIFIED_MODEL"
-          if [[ ! "$APPROVED_POOL" =~ ^[A-Za-z0-9._/-]+(,[A-Za-z0-9._/-]+){0,7}$ ]]; then
-            echo "::error::OPENCODE_MODELS must be 1-8 comma-separated model identifiers"
-            exit 3
-          fi
-          if [[ ! "$VERIFIED_MODEL" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "::error::Continuum returned an invalid model identifier"
-            exit 4
-          fi
-          case ",$APPROVED_POOL," in
-            *",$VERIFIED_MODEL,"*) ;;
-            *) echo "::error::Continuum selected '$VERIFIED_MODEL', which is not in OPENCODE_MODELS"; exit 5 ;;
-          esac
-          {
-            echo "OPENCODE_MODELS=$APPROVED_POOL"
-            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
-            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
-            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
-          } >> "$GITHUB_ENV"
-          echo "AA model route frozen before product side effects; no in-turn model switching."
+          python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
+
+      - name: Export AA conversation model policy
+        env:
+          PRIMARY_MODEL: ${{ steps.bot_model.outputs.primary }}
+          FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PRIMARY_MODEL" && test -n "$FALLBACK_MODEL"
+          printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
 
       - name: Install system voice media dependency
         shell: bash
@@ -261,9 +196,8 @@ jobs:
         id: gate-a
         shell: bash
         env:
-          OPENCODE_MODELS: ${{ needs.model_pool_readiness.outputs.models }}
-          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
-          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): skip only when a validated
@@ -424,56 +358,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Install pinned OpenCode
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
         if: ${{ needs.qualify.result == 'success' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install |
-              bash -s -- --version 1.18.34; then
-              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-              exit 0
-            fi
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::OpenCode installer failed after 3 attempts."
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+        uses: ./.github/actions/aa-opencode-toolchain
 
-      - name: Qualify AA production model via Continuum
-        id: aa_model_route
+      - name: Restore exact AA conversation models from preflight
+        id: bot_model
         if: ${{ needs.qualify.result == 'success' }}
-        uses: kodmial/continuum/.github/actions/model-route@main
-        with:
-          models: ${{ vars.OPENCODE_MODELS }}
-          task-class: coder
-          profile: aa-product
-          explicit-pin: ${{ needs.qualify.outputs.verified_model }}
-          state-token: ${{ github.token }}
-          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
-          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
-          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
-          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
-
-      - name: Freeze verified model for all AA agents and quality gates
         env:
-          APPROVED_POOL: ${{ vars.OPENCODE_MODELS }}
-          VERIFIED_MODEL: ${{ steps.aa_model_route.outputs.model }}
-        if: ${{ needs.qualify.result == 'success' }}
+          AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model }}
+          AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$APPROVED_POOL" || { echo "::error::AA requires approved OPENCODE_MODELS repository variable"; exit 2; }
-          test -n "$VERIFIED_MODEL"
-          {
-            echo "OPENCODE_MODELS=$APPROVED_POOL"
-            echo "OPENCODE_MODEL=$VERIFIED_MODEL"
-            echo "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL"
-            echo "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL"
-          } >> "$GITHUB_ENV"
-          echo "AA model route frozen before product side effects; no in-turn model switching."
+          test -n "$AA_BOT_PRIMARY_MODEL" && test -n "$AA_BOT_FALLBACK_MODEL"
+          python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
+
+      - name: Export AA conversation model policy
+        if: ${{ needs.qualify.result == 'success' }}
+        env:
+          PRIMARY_MODEL: ${{ steps.bot_model.outputs.primary }}
+          FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PRIMARY_MODEL" && test -n "$FALLBACK_MODEL"
+          printf 'OPENCODE_MODEL=%s\nOPENCODE_FALLBACK_MODEL=%s\n' "$PRIMARY_MODEL" "$FALLBACK_MODEL" >> "$GITHUB_ENV"
 
       - name: Install system voice media dependency
         if: ${{ needs.qualify.result == 'success' }}
@@ -576,8 +486,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
-          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
@@ -766,8 +676,8 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"
-          OPENCODE_MODEL: ${{ steps.aa_model_route.outputs.model }}
-          OPENCODE_FALLBACK_MODEL: ${{ steps.aa_model_route.outputs.model }}
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
         run: |
           set -euo pipefail
           # Checkpoint resume: Gate F is terminal; re-verify unconditionally
@@ -783,17 +693,6 @@ jobs:
             --main-sha "${{ steps.sha.outputs.sha }}" \
             --out-dir self-proving-out --run-id "${{ github.run_id }}" \
             --final-only
-
-      - name: Record completed AA Product Contract model execution
-        if: ${{ steps.aa_model_route.outcome == 'success' && steps.gate-f.outcome == 'success' }}
-        uses: kodmial/continuum/.github/actions/model-route@d41b6ed6c87e544c70f3bf283ad4e272b4004fbe
-        with:
-          operation: record
-          models: ${{ needs.model_pool_readiness.outputs.models }}
-          selected-model: ${{ steps.aa_model_route.outputs.model }}
-          task-class: coder
-          profile: aa-product-contract
-          state-token: ${{ github.token }}
 
       - name: Upload per-gate evidence and failure matrix
         # Privacy-safe full per-gate evidence (issue #339): atomic validated
