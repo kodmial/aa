@@ -27,7 +27,9 @@ def test_provider_access_error_is_not_a_code_repair() -> None:
 
 def test_timeout_and_transient_provider_errors_are_not_product_code_repairs() -> None:
     for category in ("OpenCodeTimeoutError", "OpenCodeTransientError"):
-        result = plan_repair([failure("C", category), failure("E", "latency-budget-exceeded", "slo")])
+        result = plan_repair(
+            [failure("C", category), failure("E", "latency-budget-exceeded", "slo")]
+        )
         assert result.actionable == ()
         assert result.held[0] == ("C", "provider-or-infrastructure")
 
