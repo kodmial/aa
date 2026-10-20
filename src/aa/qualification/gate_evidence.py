@@ -106,49 +106,59 @@ GATE_A_COVERAGE: tuple[dict[str, str], ...] = (
         "check_id": "a-shell-aa-check",
         "owner": "gate-a-shell",
         "input": "production entrypoint",
-        "executable_check": "scripts/verify.sh: python3 -m aa --check",
+        "executable_check": "scripts/run_gate_a_shell.py: a-shell-aa-check (python3 -m aa --check)",
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-aa-check]",
     },
     {
         "check_id": "a-shell-pytest",
         "owner": "gate-a-shell",
         "input": "full unit suite",
-        "executable_check": "scripts/verify.sh: python3 -m pytest -q",
+        "executable_check": "scripts/run_gate_a_shell.py: a-shell-pytest (python3 -m pytest -q)",
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-pytest]",
     },
     {
         "check_id": "a-shell-ruff-check",
         "owner": "gate-a-shell",
         "input": "repository tree",
-        "executable_check": "scripts/verify.sh: python3 -m ruff check .",
+        "executable_check": (
+            "scripts/run_gate_a_shell.py: a-shell-ruff-check (python3 -m ruff check .)"
+        ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-ruff-check]",
     },
     {
         "check_id": "a-shell-ruff-format",
         "owner": "gate-a-shell",
         "input": "repository tree",
-        "executable_check": "scripts/verify.sh: python3 -m ruff format --check .",
+        "executable_check": (
+            "scripts/run_gate_a_shell.py: a-shell-ruff-format (python3 -m ruff format --check .)"
+        ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-ruff-format]",
     },
     {
         "check_id": "a-shell-mypy",
         "owner": "gate-a-shell",
         "input": "src + tests",
-        "executable_check": "scripts/verify.sh: python3 -m mypy src tests",
+        "executable_check": "scripts/run_gate_a_shell.py: a-shell-mypy (python3 -m mypy src tests)",
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-mypy]",
     },
     {
         "check_id": "a-shell-contract-qualification",
         "owner": "gate-a-shell",
         "input": "product contract fixtures",
-        "executable_check": "scripts/verify_product_contract_qualification.py --require-active",
+        "executable_check": (
+            "scripts/run_gate_a_shell.py: a-shell-contract-qualification "
+            "(python3 scripts/verify_product_contract_qualification.py --require-active)"
+        ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-contract-qualification]",
     },
     {
         "check_id": "a-shell-runtime-qualification",
         "owner": "gate-a-shell",
         "input": "runtime fixtures",
-        "executable_check": "scripts/verify_runtime_qualification.py",
+        "executable_check": (
+            "scripts/run_gate_a_shell.py: a-shell-runtime-qualification "
+            "(python3 scripts/verify_runtime_qualification.py)"
+        ),
         "proof_artifact": "gate-A-evidence.json:subchecks[a-shell-runtime-qualification]",
     },
 )
@@ -314,6 +324,9 @@ GATE_B_COVERAGE: tuple[dict[str, str], ...] = (
 )
 
 REQUIRED_A_CHECKS: tuple[str, ...] = tuple(row["check_id"] for row in GATE_A_COVERAGE)
+REQUIRED_A_SHELL_CHECKS: tuple[str, ...] = tuple(
+    row["check_id"] for row in GATE_A_COVERAGE if row["owner"] == "gate-a-shell"
+)
 REQUIRED_B_CHECKS: tuple[str, ...] = tuple(row["check_id"] for row in GATE_B_COVERAGE)
 
 
@@ -752,6 +765,7 @@ __all__ = [
     "GATE_CHECKPOINT_FILES",
     "GATE_EVIDENCE_FILES",
     "REQUIRED_A_CHECKS",
+    "REQUIRED_A_SHELL_CHECKS",
     "REQUIRED_B_CHECKS",
     "SCHEMA_VERSION",
     "VERDICT_SCHEMA_VERSION",
