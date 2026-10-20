@@ -35,13 +35,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install -e . --no-deps
-      - name: Install actual AA pinned OpenCode
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(cat docker/opencode.version)"
-          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version "$version"
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
+        uses: ./.github/actions/aa-opencode-toolchain
       - name: Load approved deployment fixture as isolated PR-only test input
         id: fixture
         shell: bash
