@@ -12,11 +12,7 @@
         "book_search": "allow",
         "book_read": "allow",
         "book_expand": "allow",
-        "book_section": "allow",
-        "bash": {
-          "*": "deny",
-          "/__aa_nonexistent_opencode_compatibility_only__/no-such-executable": "ask"
-        }
+        "book_section": "allow"
       }
     },
     "aa-planner-v2": {
