@@ -8,7 +8,7 @@
       "prompt": "{file:./prompts/aa-agent-system.md}",
       "temperature": 0.2,
       "permission": {
-        "*": "deny",
+        "*": "ask",
         "book_search": "allow",
         "book_read": "allow",
         "book_expand": "allow",
@@ -21,7 +21,7 @@
       "prompt": "{file:./prompts/aa-planner-system-v2.md}",
       "temperature": 0.2,
       "permission": {
-        "*": "deny",
+        "*": "ask",
         "StructuredOutput": "allow"
       }
     },
@@ -31,7 +31,7 @@
       "prompt": "{file:./prompts/aa-summarizer-system-v2.md}",
       "temperature": 0.2,
       "permission": {
-        "*": "deny"
+        "*": "ask"
       }
     },
     "aa-v2": {
@@ -40,7 +40,7 @@
       "prompt": "{file:./prompts/aa-agent-system-v2.md}",
       "temperature": 0.2,
       "permission": {
-        "*": "deny"
+        "*": "ask"
       }
     },
     "aa-judge-v2": {
@@ -48,7 +48,7 @@
       "model": "opencode/nemotron-3-ultra-free",
       "temperature": 0,
       "permission": {
-        "*": "deny",
+        "*": "ask",
         "StructuredOutput": "allow"
       }
     },
@@ -58,7 +58,7 @@
       "prompt": "{file:./prompts/aa-verifier-system-v2.md}",
       "temperature": 0,
       "permission": {
-        "*": "deny",
+        "*": "ask",
         "StructuredOutput": "allow"
       }
     }

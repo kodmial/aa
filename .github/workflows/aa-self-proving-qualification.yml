@@ -986,6 +986,25 @@ jobs:
               core.notice('External/transient block has no independent product FAIL; recovery will retry qualification.');
               return;
             }
+            // Gate failure evidence is not automatically a code defect.
+            // Provider/model outages remain unqualified but never start AA
+            // source-code repair jobs (including an unrelated Gate E timeout).
+            const providerBlocked = productFailures.some(g =>
+              /(?:OpenCodeProviderAccessError|OpenCodeRateLimitError|OpenCodeTimeoutError|OpenCodeTransientError|provider[-_ ](?:access|unavailable|error|timeout)|model[-_ ](?:unavailable|route|probe)|rate[-_ ]?limit|quota[-_ ]?exhausted|http[-_ ]?(?:403|429|50[0-9]))/i
+                .test(String(g.failure_category || '') + ' ' + String(g.component || ''))
+            );
+            if (providerBlocked) {
+              core.warning('AA model/provider unavailable: no code-repair task or scheduler dispatch; product remains unqualified.');
+              return;
+            }
+            // Unknown or incomplete evidence has no permission to mutate code.
+            if (!productFailures.length || productFailures.some(g =>
+              /(?:evidence[-_ ](?:invalid|missing|incomplete)|workflow[-_ ]step[-_ ]failed|proof[-_ ]unavailable|missing[-_ ]artifact|unknown[-_ ]gate)/i
+                .test(String(g.failure_category || ''))
+            )) {
+              core.warning('AA qualification evidence unavailable or unattributed: no code-repair task.');
+              return;
+            }
             const marker = '<!-- aa-self-proving-repair:v1 -->';
             // Stable defect identity deliberately excludes main SHA. When
             // several product gates fail in one trusted run, keep one combined
