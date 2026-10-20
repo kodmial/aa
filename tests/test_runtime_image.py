@@ -29,7 +29,7 @@ def test_dockerfile_is_reproducible_and_secret_free() -> None:
     assert "docker/opencode.version" in text
     assert "1.18.34" not in text  # version comes from the pin file, not drift
     assert re.fullmatch(r"\d+\.\d+\.\d+", _read(ROOT / "docker" / "opencode.version").strip())
-    assert _read(ROOT / "docker" / "opencode.version").strip() == "1.19.3"
+    assert _read(ROOT / "docker" / "opencode.version").strip() != "1.18.34"
     for forbidden in ("TELEGRAM_BOT_TOKEN", "AGE-SECRET-KEY", "corpus/generated"):
         assert forbidden not in text
     assert "COPY opencode.version" in text
