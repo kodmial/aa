@@ -1,0 +1,44 @@
+name: AA bot models one-time configuration
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aa-bot-models-one-time.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    if: github.repository == 'kodmial/aa' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify trusted exact main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set AA-owned primary and fallback variables
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?TAP_PAT must allow repository Variables write}"
+          test "$(git rev-parse HEAD)" = "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          upsert() {
+            local name="$1" value="$2"
+            local endpoint="repos/$REPOSITORY/actions/variables/$name"
+            if gh api "$endpoint" --silent >/dev/null 2>&1; then
+              gh api -X PATCH "$endpoint" -f name="$name" -f value="$value" --silent
+            else
+              gh api -X POST "repos/$REPOSITORY/actions/variables" -f name="$name" -f value="$value" --silent
+            fi
+            local actual
+            actual="$(gh api "$endpoint" --jq '.value')"
+            test "$actual" = "$value" || { echo "::error::$name variable readback mismatch"; exit 2; }
+          }
+          upsert AA_BOT_PRIMARY_MODEL 'opencode/deepseek-v4.1-flash-free'
+          upsert AA_BOT_FALLBACK_MODEL 'opencode/glm-5.3-flash-free'
+          echo 'AA Telegram production primary/fallback variables set and verified.'
