@@ -34,8 +34,8 @@
     },
     {
       "check_id": "a-model-policy",
-      "executable_check": "runner _aa_model_policy_valid via self_proving.runtime_model_policy_ok (agent/model/fallback match the Continuum-selected approved model; same-model fallback allowed)",
-      "input": "Settings.from_env agent/model/fallback policy + approved model pool/selection",
+      "executable_check": "runner _aa_model_policy_valid via self_proving.runtime_model_policy_ok (AA-owned primary/fallback match the frozen AA_BOT_* route; same-model and distinct fallback allowed; retired routes rejected)",
+      "input": "Settings.from_env agent/model/fallback + resolved AA_BOT_* policy",
       "owner": "gate-a",
       "proof_artifact": "gate-A-evidence.json:subchecks[a-model-policy]",
       "status": "active"

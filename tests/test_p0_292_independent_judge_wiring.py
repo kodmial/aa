@@ -32,7 +32,9 @@ def test_real_whole_turn_judge_registered_for_opencode() -> None:
     assert judge["permission"]["StructuredOutput"] == "allow"
     assert judge["permission"]["*"] == "ask"
     assert judge["temperature"] == 0
-    assert judge["model"]
+    # All AA agents inherit the session model selected by AA_BOT_*; an
+    # agent-level pin would silently bypass the qualified runtime route.
+    assert "model" not in judge
     settings = SimpleNamespace(
         opencode_model="opencode/muse-spark-1.3-contributor-free",
         opencode_fallback_model="opencode/space-bunny-free",

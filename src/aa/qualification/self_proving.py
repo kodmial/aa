@@ -132,6 +132,8 @@ _CANARY_EVERY_HOURS = 4
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+_RETIRED_MODEL_MARKERS = ("muse-spark", "space-bunny")
 
 FORBIDDEN_EVIDENCE_KEYS = frozenset(
     {
@@ -297,36 +299,49 @@ def validate_hex64(value: str) -> str:
     return normalized
 
 
+def _valid_runtime_model(value: str) -> bool:
+    route = (value or "").strip()
+    return bool(
+        route
+        and _MODEL_RE.fullmatch(route)
+        and ".." not in route
+        and "//" not in route
+        and not any(marker in route for marker in _RETIRED_MODEL_MARKERS)
+    )
+
+
 def runtime_model_policy_ok(
     *,
     agent: str,
-    pool: str,
-    selected_model: str,
     model: str,
     fallback_model: str,
+    expected_model: str = "",
+    expected_fallback_model: str = "",
 ) -> bool:
-    """Whether the runtime route matches the Continuum-selected model.
+    """Whether Gate A may accept the effective AA conversation model route.
 
-    Continuum owns the approved model pool and freezes one selected model
-    before any product side effect. Gate A requires a non-empty, unique,
-    bounded pool that contains the selected model, and the agent, primary
-    model, and fallback model must all use that same frozen selection. The
-    model adapter suppresses same-model fallback (``fallback_model !=
-    primary_model``), so a distinct second provider is neither required nor
-    permitted: no unverified second provider may serve the product.
+    AA owns its chatbot route independently of Continuum coding routes
+    (kodmial/aa Work Lock #66). The effective ``OPENCODE_MODEL`` and
+    ``OPENCODE_FALLBACK_MODEL`` must both be valid provider/model
+    identifiers. When the workflow has resolved the owner-controlled
+    ``AA_BOT_*`` policy, the effective values must match that frozen policy
+    exactly. Same-model fallback is allowed because the adapter suppresses
+    duplicate retries; a distinct fallback is also allowed. The retired
+    Muse Spark / Space Bunny routes must never be selected again.
     """
-    raw_pool = (pool or "").strip()
-    routes = [route.strip() for route in raw_pool.split(",")] if raw_pool else []
-    if not (1 <= len(routes) <= 8 and all(routes) and len(set(routes)) == len(routes)):
+    if (agent or "").strip() != DEFAULT_AA_AGENT:
         return False
-    selected = (selected_model or "").strip()
-    return (
-        bool(selected)
-        and selected in routes
-        and (agent or "").strip() == DEFAULT_AA_AGENT
-        and (model or "").strip() == selected
-        and (fallback_model or "").strip() == selected
-    )
+    primary = (model or "").strip()
+    fallback = (fallback_model or "").strip()
+    if not _valid_runtime_model(primary) or not _valid_runtime_model(fallback):
+        return False
+    expected_primary = (expected_model or "").strip()
+    expected_fallback = (expected_fallback_model or "").strip()
+    if expected_primary and primary != expected_primary:
+        return False
+    if expected_fallback and fallback != expected_fallback:
+        return False
+    return True
 
 
 def _subtree_holds_text(value: Any) -> bool:
