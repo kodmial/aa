@@ -127,19 +127,17 @@ def _product_fingerprint() -> str:
 
 
 def _aa_model_policy_valid(settings: object, environ: Mapping[str, str]) -> bool:
-    """Gate A checks the *selected* trusted route, not obsolete static IDs.
+    """Gate A verifies the AA-owned production model variables.
 
-    Continuum is the only model-pool parser/qualifier. AA checks that its
-    planner, answer, judge and verifier all receive the same frozen model,
-    disabling in-turn fallback after irreversible conversational side effects.
-    Missing/invalid pool attestation is a real Gate A failure.
+    Continuum coder and PR-Agent pools have no authority to select the
+    chatbot's planner, answer, judge, or verifier models.
     """
     from aa.qualification.self_proving import runtime_model_policy_ok
 
     return runtime_model_policy_ok(
         agent=str(getattr(settings, "opencode_agent", "") or ""),
-        pool=environ.get("OPENCODE_MODELS", ""),
-        selected_model=environ.get("CONTINUUM_SELECTED_MODEL", ""),
+        expected_primary_model=environ.get("AA_BOT_PRIMARY_MODEL", ""),
+        expected_fallback_model=environ.get("AA_BOT_FALLBACK_MODEL", ""),
         model=str(getattr(settings, "opencode_model", "") or ""),
         fallback_model=str(getattr(settings, "opencode_fallback_model", "") or ""),
     )

@@ -11,7 +11,10 @@ WORKFLOW = ROOT / ".github/workflows/aa-opencode-model-route-e2e.yml"
 class ProviderDenialRouteTests(unittest.TestCase):
     def test_access_denial_is_classified_as_real_model_unavailable(self):
         text = WORKFLOW.read_text(encoding="utf-8")
-        anchor = 'elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode" "$log"; then'
+        anchor = (
+            'elif grep -Eiq "OpenCode.s free tier can only be used from within OpenCode"'
+            ' "$log"; then'
+        )
         self.assertIn(anchor, text)
         # The actual provider message has an apostrophe. Use the identical
         # POSIX extended regex shape as the workflow (without shell quoting).

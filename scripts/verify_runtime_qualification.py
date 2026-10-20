@@ -157,10 +157,7 @@ def _check_prompt_config() -> dict[str, str]:
         raise ValueError("aa agent must stay the primary agent")
     # OpenCode agent-level model pins override CLI/session selection and
     # silently defeat AA_BOT_* failover. All AA agents inherit the session.
-    if any(
-        isinstance(item, dict) and "model" in item
-        for item in config["agent"].values()
-    ):
+    if any(isinstance(item, dict) and "model" in item for item in config["agent"].values()):
         raise ValueError("AA agent model pin overrides runtime model policy")
     if "prompts/aa-agent-system.md" not in str(agent.get("prompt", "")):
         raise ValueError("aa agent prompt binding is stale")

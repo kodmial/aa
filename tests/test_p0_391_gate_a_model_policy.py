@@ -1,23 +1,17 @@
-"""Regression for the Gate A runtime model-policy repair (kodmial/aa#391).
+"""Regression: Gate A validates AA chatbot model policy, not coder routes.
 
-The single live-validated free model serves as both the primary and the
-fallback. The model adapter suppresses same-model fallback
-(``fallback_model != primary_model``), so a distinct second provider is
-neither required nor permitted. Production routing is owned by Continuum
-(kodmial/aa Work Lock #66): Gate A must therefore validate the frozen,
-owner-approved selected model instead of demanding a distinct retired
-provider, and the retired Muse Spark / Space Bunny pair must never return.
+AA's user-facing model and fallback may differ. A Continuum coding pool,
+probe or selected model cannot authorize a different production chat model.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
 import scripts.run_self_proving_qualification as runner
-from aa.config import DEFAULT_AA_AGENT, DEFAULT_FALLBACK_MODEL, DEFAULT_PRIMARY_MODEL
+from aa.config import DEFAULT_AA_AGENT
 from aa.qualification.self_proving import GateEvidence, runtime_model_policy_ok
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,92 +20,52 @@ PRODUCTION_WORKFLOWS = (
     "aa-self-proving-qualification.yml",
     "aa-gate-c-heldout-bootstrap.yml",
 )
-OTHER_APPROVED_MODEL = "opencode/other-approved-free"
-APPROVED_POOL = f"{DEFAULT_PRIMARY_MODEL},{OTHER_APPROVED_MODEL}"
-# The Continuum route action is a first-party dependency; production workflows
-# must pin it to an immutable 40-hex commit rather than a mutable branch.
-MODEL_ROUTE_USE_RE = re.compile(
-    r"uses:\s*kodmial/continuum/\.github/actions/model-route@[0-9a-f]{40}\b"
-)
+PRIMARY = "opencode/deepseek-v4.1-flash-free"
+FALLBACK = "opencode/beam-free"
 
 
-def test_selected_approved_model_policy_is_accepted() -> None:
-    assert DEFAULT_PRIMARY_MODEL == DEFAULT_FALLBACK_MODEL
+def test_distinct_aa_primary_and_fallback_are_valid() -> None:
     assert runtime_model_policy_ok(
         agent=DEFAULT_AA_AGENT,
-        pool=APPROVED_POOL,
-        selected_model=DEFAULT_PRIMARY_MODEL,
-        model=DEFAULT_PRIMARY_MODEL,
-        fallback_model=DEFAULT_FALLBACK_MODEL,
+        expected_primary_model=PRIMARY,
+        expected_fallback_model=FALLBACK,
+        model=PRIMARY,
+        fallback_model=FALLBACK,
     )
-    # Continuum may legitimately select a non-default model from the pool.
     assert runtime_model_policy_ok(
         agent=DEFAULT_AA_AGENT,
-        pool=APPROVED_POOL,
-        selected_model=OTHER_APPROVED_MODEL,
-        model=OTHER_APPROVED_MODEL,
-        fallback_model=OTHER_APPROVED_MODEL,
+        expected_primary_model=PRIMARY,
+        expected_fallback_model=PRIMARY,
+        model=PRIMARY,
+        fallback_model=PRIMARY,
     )
 
 
 @pytest.mark.parametrize(
-    ("pool", "selected", "agent", "model", "fallback"),
+    ("agent", "expected_primary", "expected_fallback", "model", "fallback"),
     [
-        (
-            APPROVED_POOL,
-            DEFAULT_PRIMARY_MODEL,
-            "other-agent",
-            DEFAULT_PRIMARY_MODEL,
-            DEFAULT_FALLBACK_MODEL,
-        ),
-        (
-            APPROVED_POOL,
-            DEFAULT_PRIMARY_MODEL,
-            DEFAULT_AA_AGENT,
-            "opencode/muse-spark-1.3-contributor-free",
-            DEFAULT_FALLBACK_MODEL,
-        ),
-        (
-            APPROVED_POOL,
-            DEFAULT_PRIMARY_MODEL,
-            DEFAULT_AA_AGENT,
-            DEFAULT_PRIMARY_MODEL,
-            "opencode/space-bunny-free",
-        ),
-        (APPROVED_POOL, DEFAULT_PRIMARY_MODEL, DEFAULT_AA_AGENT, "", DEFAULT_FALLBACK_MODEL),
-        (APPROVED_POOL, DEFAULT_PRIMARY_MODEL, DEFAULT_AA_AGENT, DEFAULT_PRIMARY_MODEL, ""),
-        (
-            "",
-            DEFAULT_PRIMARY_MODEL,
-            DEFAULT_AA_AGENT,
-            DEFAULT_PRIMARY_MODEL,
-            DEFAULT_FALLBACK_MODEL,
-        ),
-        (APPROVED_POOL, "", DEFAULT_AA_AGENT, DEFAULT_PRIMARY_MODEL, DEFAULT_FALLBACK_MODEL),
-        ("opencode/a,opencode/a", "opencode/a", DEFAULT_AA_AGENT, "opencode/a", "opencode/a"),
-        ("opencode/a,,opencode/b", "opencode/a", DEFAULT_AA_AGENT, "opencode/a", "opencode/a"),
-        (
-            APPROVED_POOL,
-            "opencode/not-in-pool",
-            DEFAULT_AA_AGENT,
-            "opencode/not-in-pool",
-            "opencode/not-in-pool",
-        ),
+        ("other-agent", PRIMARY, FALLBACK, PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, PRIMARY, FALLBACK, "opencode/other", FALLBACK),
+        (DEFAULT_AA_AGENT, PRIMARY, FALLBACK, PRIMARY, "opencode/other"),
+        (DEFAULT_AA_AGENT, "", FALLBACK, PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, PRIMARY, "", PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, "bad-id", FALLBACK, PRIMARY, FALLBACK),
+        (DEFAULT_AA_AGENT, PRIMARY, "bad-id", PRIMARY, FALLBACK),
     ],
 )
-def test_model_policy_drift_is_rejected(
-    pool: str, selected: str, agent: str, model: str, fallback: str
+def test_aa_model_policy_drift_is_rejected(
+    agent: str, expected_primary: str, expected_fallback: str, model: str, fallback: str
 ) -> None:
     assert not runtime_model_policy_ok(
         agent=agent,
-        pool=pool,
-        selected_model=selected,
+        expected_primary_model=expected_primary,
+        expected_fallback_model=expected_fallback,
         model=model,
         fallback_model=fallback,
     )
 
 
-def test_gate_a_accepts_frozen_approved_model_and_rejects_drift(
+def test_gate_a_accepts_aa_vars_and_rejects_wrong_runtime_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sha = "f" * 40
@@ -121,17 +75,18 @@ def test_gate_a_accepts_frozen_approved_model_and_rejects_drift(
 
     monkeypatch.setattr(runner, "_git", _fake_git)
     monkeypatch.setenv("OPENCODE_AGENT", DEFAULT_AA_AGENT)
-    monkeypatch.setenv("OPENCODE_MODELS", APPROVED_POOL)
-    # Continuum may select any approved model, not only the config default.
-    monkeypatch.setenv("CONTINUUM_SELECTED_MODEL", OTHER_APPROVED_MODEL)
-    monkeypatch.setenv("OPENCODE_MODEL", OTHER_APPROVED_MODEL)
-    monkeypatch.setenv("OPENCODE_FALLBACK_MODEL", OTHER_APPROVED_MODEL)
+    monkeypatch.setenv("AA_BOT_PRIMARY_MODEL", PRIMARY)
+    monkeypatch.setenv("AA_BOT_FALLBACK_MODEL", FALLBACK)
+    monkeypatch.setenv("OPENCODE_MODEL", PRIMARY)
+    monkeypatch.setenv("OPENCODE_FALLBACK_MODEL", FALLBACK)
+    monkeypatch.setenv("OPENCODE_MODELS", "opencode/unrelated-coder")
+    monkeypatch.setenv("CONTINUUM_SELECTED_MODEL", "opencode/unrelated-coder")
 
     accepted = runner._gate_a(sha, "run-391")
     assert accepted.status == "PASS"
     assert accepted.failure_category == ""
 
-    monkeypatch.setenv("OPENCODE_FALLBACK_MODEL", "opencode/space-bunny-free")
+    monkeypatch.setenv("OPENCODE_FALLBACK_MODEL", "opencode/other")
     drifted = runner._gate_a(sha, "run-391")
     assert drifted.status == "FAIL"
     assert drifted.failure_category == "model-policy-mismatch"
@@ -156,17 +111,18 @@ def test_gate_a_subchecks_attribute_model_policy_failure() -> None:
     assert by_id["a-exact-sha"] == "PASS"
 
 
-def test_live_workflows_never_pin_retired_models() -> None:
+def test_live_qualification_uses_chatbot_vars_not_coder_pool() -> None:
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text(encoding="utf-8")
         assert "OPENCODE_MODEL: opencode/" not in text, path.name
         assert "OPENCODE_FALLBACK_MODEL: opencode/" not in text, path.name
-    # Production model routing is selected and frozen by Continuum before any
-    # product side effect; those workflows must not embed a static model.
+
     for name in PRODUCTION_WORKFLOWS:
-        text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        assert MODEL_ROUTE_USE_RE.search(text), name
-        assert "OPENCODE_MODEL=$VERIFIED_MODEL" in text, name
-        assert "OPENCODE_FALLBACK_MODEL=$VERIFIED_MODEL" in text, name
-        assert "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL" in text, name
-        assert f"OPENCODE_MODEL: {DEFAULT_PRIMARY_MODEL}" not in text, name
+        workflow = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "AA_BOT_PRIMARY_MODEL: ${{ vars.AA_BOT_PRIMARY_MODEL }}" in workflow, name
+        assert "AA_BOT_FALLBACK_MODEL: ${{ vars.AA_BOT_FALLBACK_MODEL }}" in workflow, name
+        assert "python -m aa.bot_models --github-output" in workflow, name
+        assert "OPENCODE_MODEL=$VERIFIED_MODEL" not in workflow, name
+        assert "CONTINUUM_SELECTED_MODEL=$VERIFIED_MODEL" not in workflow, name
+        assert "model-route@" not in workflow, name
+        assert "task-class: coder" not in workflow, name
