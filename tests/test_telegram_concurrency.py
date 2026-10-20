@@ -625,7 +625,7 @@ def test_book_map_and_tools_available_in_every_session() -> None:
     assert agent["mode"] == "primary"
     assert agent["model"] == "opencode/nemotron-3-ultra-free"
     permissions = agent["permission"]
-    assert permissions["*"] == "deny"
+    assert permissions["*"] == "ask"
     for tool in ("book_search", "book_read", "book_expand", "book_section"):
         assert permissions[tool] == "allow"
     prompt = (root / "prompts" / "aa-agent-system.md").read_text(encoding="utf-8")

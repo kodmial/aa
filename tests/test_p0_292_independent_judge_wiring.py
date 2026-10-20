@@ -30,7 +30,7 @@ def test_real_whole_turn_judge_registered_for_opencode() -> None:
     data = json.loads((root / "opencode.json").read_text(encoding="utf-8"))
     judge = data["agent"][WHOLE_TURN_JUDGE_AGENT_V2]
     assert judge["permission"]["StructuredOutput"] == "allow"
-    assert judge["permission"]["*"] == "deny"
+    assert judge["permission"]["*"] == "ask"
     assert judge["temperature"] == 0
     assert judge["model"]
     settings = SimpleNamespace(
