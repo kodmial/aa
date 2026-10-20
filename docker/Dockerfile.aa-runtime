@@ -87,10 +87,11 @@ RUN set -eux; \
 # OpenCode version is provided by the Actions variable through an exact build
 # argument; when absent, use the same reviewed repository default as every job.
 ARG AA_OPENCODE_VERSION=""
+ENV AA_OPENCODE_VERSION=${AA_OPENCODE_VERSION}
 COPY opencode.version /opt/aa/opencode.version
 RUN set -eux; \
     want="${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}"; \
-    echo "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+
+    echo "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; \
     for attempt in 1 2 3; do \
         if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install \
             | bash -s -- --version "$want"; then break; fi; \

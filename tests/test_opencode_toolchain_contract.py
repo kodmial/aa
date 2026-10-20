@@ -34,6 +34,41 @@ def test_aa_version_pin_is_exact_semver_and_consistent() -> None:
     assert "COPY opencode.version /opt/aa/opencode.version" in docker
     assert "cat /opt/aa/opencode.version" in docker
     assert 'ARG AA_OPENCODE_VERSION=""' in docker
+    assert 'ENV AA_OPENCODE_VERSION=${AA_OPENCODE_VERSION}' in docker
+    assert "grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+
+    assert '${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}' in docker
+    image = (WORKFLOWS / "aa-runtime-image.yml").read_text(encoding="utf-8")
+    assert "OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in image
+    assert "AA_OPENCODE_VERSION=${{ steps.meta.outputs.opencode }}" in image
+    assert "opencode --version" in docker
+
+
+def test_all_aa_live_runners_share_verified_toolchain() -> None:
+    for name in OPEN_CODE_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "uses: ./.github/actions/aa-opencode-toolchain" in text, name
+        assert "https://opencode.ai/install" not in text, name
+        assert not re.search(r"bash -s -- --version\s+[0-9]", text), name
+
+
+def test_aa_toolchain_reads_only_pin_and_verifies_real_binary() -> None:
+    text = ACTION.read_text(encoding="utf-8")
+    assert 'OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}' in text
+    assert 'version="${OPENCODE_VERSION_OVERRIDE:-$(cat docker/opencode.version)}"' in text
+    assert '[[ "$version" =~' in text
+    assert "kodmial/continuum/.github/actions/agent-toolchain@" in text
+    assert "components: opencode" in text
+    assert "opencode-version: ${{ steps.version.outputs.version }}" in text
+    assert 'actual="$(opencode --version)"' in text
+    assert '[[ "$actual" != "$PIN" || "$RESOLVED" != "$PIN" ]]' in text
+
+
+def test_no_workflow_embeds_an_unreviewed_cli_installer() -> None:
+    for path in WORKFLOWS.glob("*.yml"):
+        text = path.read_text(encoding="utf-8")
+        assert "https://opencode.ai/install" not in text, path.name
+        assert not re.search(r"bash -s -- --version\s+[0-9]", text), path.name
+;" in docker
     assert '${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}' in docker
     image = (WORKFLOWS / "aa-runtime-image.yml").read_text(encoding="utf-8")
     assert "OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in image
