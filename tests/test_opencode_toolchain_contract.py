@@ -16,6 +16,8 @@ ACTION = ROOT / ".github" / "actions" / "aa-opencode-toolchain" / "action.yml"
 PIN = ROOT / "docker" / "opencode.version"
 
 OPEN_CODE_WORKFLOWS = (
+    "ci.yml",
+    "aa-gate-c-heldout-bootstrap.yml",
     "aa-self-proving-qualification.yml",
     "aa-canary.yml",
     "aa-real-book-retrieval-qualification.yml",
