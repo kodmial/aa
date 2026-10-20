@@ -235,8 +235,11 @@ def check_native_imports(*, started_ms: dict[str, int]) -> list[str]:
 
 def check_opencode() -> list[str]:
     try:
-        want = (os.environ.get("CONTINUUM_OPENCODE_VERSION") or os.environ.get("AA_OPENCODE_VERSION")
-                or OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip())
+        want = (
+            os.environ.get("CONTINUUM_OPENCODE_VERSION")
+            or os.environ.get("AA_OPENCODE_VERSION")
+            or OPENCODE_VERSION_FILE.read_text(encoding="utf-8").strip()
+        )
     except OSError as exc:
         return [f"opencode.version unreadable: {exc}"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", want):
