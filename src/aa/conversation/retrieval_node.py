@@ -356,6 +356,8 @@ def _retrieval_semantic_stage_remaining_s(budget: Any) -> float:
     retrieval model call may start; the best-effort lexical pack is kept.
     No prompt, keyword, or domain signal.
     """
+    if not bool(getattr(budget, "time_limits_enabled", True)):
+        return float("inf")
     from aa.time_policy import current_time_policy
 
     policy = current_time_policy()

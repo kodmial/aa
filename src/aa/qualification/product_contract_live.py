@@ -2416,6 +2416,9 @@ async def run_live_telegram_evidence_lane(
     # this, a 25-minute Gate C collapses 18 different failures into one
     # fingerprint and automated repair has no actionable root cause.
     scenario_diagnostics: list[dict[str, Any]] = []
+    # Resolve the configurable operational wait once, before the harness can
+    # fail, so timeout evidence stays available for a pre-scenario crash too.
+    scenario_wait_s = float(current_time_policy().qualification_scenario_wait_s)
     served_models_by_agent: dict[str, list[str]] = {}
     voice_readiness: dict[str, Any] = {
         "voice_available": False,
@@ -2761,7 +2764,6 @@ async def run_live_telegram_evidence_lane(
             # follow-up. The direct prompt check stays primary.
             prior_by_chat: dict[int, list[str]] = {}
             scenario_deliveries = 0
-            scenario_wait_s = float(current_time_policy().qualification_scenario_wait_s)
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 # These logs contain only scenario identifiers, never the
                 # Telegram input, delivered text or canonical-book passage.
