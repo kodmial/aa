@@ -37,8 +37,6 @@ from typing import Any
 
 import pytest
 
-import aa.conversation.planner_node as planner_module
-import aa.conversation.verifier as verifier_module
 from aa.conversation.model_adapter import clear_omitted_structured_cache
 from aa.conversation.planner_node import (
     PLANNER_STRUCTURED_ATTEMPT_BUDGET_S,
@@ -110,7 +108,7 @@ async def test_planner_timeout_reprobes_structured_next_turn(
     """A slow planner turn does not pin the next turn to slow text."""
     from aa.conversation.model_adapter import omitted_structured_unavailable
 
-    monkeypatch.setattr(planner_module, "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
 
     class _SlowStructured:
         wire_agent = ""
@@ -147,7 +145,7 @@ async def test_verifier_timeout_and_transient_do_not_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verifier deadline and transient fall back once without marking."""
-    monkeypatch.setattr(verifier_module, "VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
     pack = [_pack_entry()]
     units = split_response_units("Support nearby helps to get through craving today.")
     assert len(units) == 1
@@ -222,3 +220,8 @@ async def test_verifier_deterministic_still_marks() -> None:
     result = await run_verifier(units, pack, model=model)
     assert result.all_required_supported is True
     assert structured_text_fallback_preferred(model) is True
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

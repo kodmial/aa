@@ -1906,16 +1906,15 @@ def _gate_e(
 
     Gate E never repeats Gate C, the A/B index bootstrap, provider calls, or
     Gate D live network operations: it consumes already-measured C-series
-    samples (or the measured aggregate SLO) and applies the unchanged
-    canonical guards (p95 <= 60s, ordinary-turn max < 120s). Without any
-    trustworthy real turn samples it returns ``BLOCKED: missing-live-samples``,
-    never a fabricated PASS/FAIL.
+    samples (or the measured aggregate SLO). ``observe`` publishes timing
+    without evaluating p95/max; ``enforce`` applies the configured
+    thresholds. Without any trustworthy real turn samples it returns
+    ``BLOCKED: missing-live-samples``, never a fabricated PASS/FAIL.
     """
-    from aa.qualification.self_proving import (
-        ORDINARY_TURN_BUDGET_MS,
-        P95_TARGET_MS,
-        slo_guards,
-    )
+    from aa.qualification.self_proving import slo_guards
+    from aa.time_policy import current_time_policy, evaluate_latency_thresholds
+
+    policy = current_time_policy()
 
     def _blocked() -> GateEvidence:
         return GateEvidence(
@@ -1947,7 +1946,8 @@ def _gate_e(
         )
 
     def _verdict(p50: float, p95: float, maximum: float) -> GateEvidence:
-        if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
+        ok, detail = evaluate_latency_thresholds(p95, maximum, policy=policy)
+        if not ok:
             return GateEvidence(
                 gate="E",
                 status="FAIL",
@@ -1961,6 +1961,7 @@ def _gate_e(
                 latency_p50_ms=p50,
                 latency_p95_ms=p95,
                 max_turn_ms=maximum,
+                detail=detail[:160],
             )
         return GateEvidence(
             gate="E",
@@ -1974,13 +1975,14 @@ def _gate_e(
             latency_p50_ms=p50,
             latency_p95_ms=p95,
             max_turn_ms=maximum,
+            detail=detail[:160],
         )
 
     if not gate_c_live:
         return _blocked()
     # Prefer real measured per-turn samples; they carry the true variance.
     if latencies_ms:
-        ok, detail, metrics = slo_guards(latencies_ms)
+        ok, detail, metrics = slo_guards(latencies_ms, mode=policy.latency_gate_mode)
         p50 = float(metrics["p50_ms"])
         p95 = float(metrics["p95_ms"])
         maximum = float(metrics["max_ms"])
@@ -2002,8 +2004,9 @@ def _gate_e(
             return _blocked()
         if not all(math.isfinite(v) for v in (p50, p95, maximum, turns)):
             return _blocked()
-        if p95 > float(P95_TARGET_MS) or maximum >= float(ORDINARY_TURN_BUDGET_MS):
-            return _fail(p50, p95, maximum, "aggregate p95/budget exceeds canonical guard")
+        ok, detail = evaluate_latency_thresholds(p95, maximum, policy=policy)
+        if not ok:
+            return _fail(p50, p95, maximum, detail)
         return _verdict(p50, p95, maximum)
     return _blocked()
 

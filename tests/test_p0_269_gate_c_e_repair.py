@@ -210,7 +210,7 @@ async def test_binding_repair_budget_skips_replan_on_slow_turn(
         raise AssertionError("repair re-plan must be skipped over budget")
 
     monkeypatch.setattr("aa.conversation.planner_node.run_planner", _noisy_planner)
-    monkeypatch.setattr(pipeline, "TURN_REPAIR_TIME_BUDGET_S", 0.0)
+    monkeypatch.setattr(pipeline, "_effective_repair_budget_s", lambda: 0.0)
 
     class _AlwaysUnsupportedAnswer:
         async def ainvoke(self, messages: Any) -> AIMessage:
@@ -248,3 +248,8 @@ async def test_binding_repair_budget_skips_replan_on_slow_turn(
     telemetry = dict(_exc269.value.telemetry)
     assert telemetry["repair_budget_exceeded"] is True
     assert telemetry["repair_rounds"] == 0
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

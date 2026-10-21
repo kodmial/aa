@@ -73,7 +73,6 @@ from typing import Any
 
 import pytest
 
-import aa.conversation.planner_node as planner_module
 import aa.conversation.verifier as verifier_module
 from aa.conversation.model_adapter import (
     clear_omitted_structured_cache,
@@ -171,7 +170,7 @@ async def test_planner_structured_timeout_marks_capability_for_next_turn(
     fast structured instead of going text-direct for a full minute.
     """
 
-    monkeypatch.setattr(planner_module, "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
 
     class _OmittedWireSlowStructured:
         wire_agent = ""
@@ -224,7 +223,7 @@ async def test_planner_structured_timeout_does_not_mark_custom_wire(
 ) -> None:
     """The deadline marking applies only to the omitted-wire capability path."""
 
-    monkeypatch.setattr(planner_module, "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
 
     class _CustomWireSlowStructured:
         wire_agent = "aa-planner-v2"
@@ -265,7 +264,7 @@ async def test_verifier_slow_structured_degrades_within_unit_bound(
 ) -> None:
     """One hung structured attempt degrades to text inside the unit, not the turn."""
 
-    monkeypatch.setattr(verifier_module, "VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
 
     class _SlowStructuredTextServes:
         def __init__(self) -> None:
@@ -483,3 +482,8 @@ def test_no_exact_live_question_special_cases() -> None:
     for source in sources:
         for fragment in frozen_fragments:
             assert fragment not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

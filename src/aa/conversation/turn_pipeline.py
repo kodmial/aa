@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 from collections.abc import Sequence
@@ -51,6 +50,7 @@ from aa.conversation.response_units import (
 from aa.conversation.retrieval_node import state_passages_to_prompt
 from aa.conversation.verifier import run_verifier
 from aa.conversation.verifier_schema import GroundingResult, VerifierValidationError
+from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.turn_pipeline")
 
@@ -199,17 +199,19 @@ SUBSTANTIVE_JUDGE_MAX_CALLS = 3
 SUBSTANTIVE_JUDGE_CALL_CAP_S = 20.0
 
 
-def _diagnostic_no_turn_limits() -> bool:
-    """Manual Telegram-only mode: let all AA stages finish without SLO cutoff."""
-    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+def _turn_time_limits_disabled() -> bool:
+    """Whether AA-owned turn/stage time limits are disabled by policy."""
+    return not current_time_policy().turn_time_limits_enabled
 
 
 def _effective_turn_budget_s() -> float:
-    return float("inf") if _diagnostic_no_turn_limits() else TURN_END_TO_END_BUDGET_S
+    policy = current_time_policy()
+    return float("inf") if not policy.turn_time_limits_enabled else policy.turn_end_to_end_budget_s
 
 
 def _effective_repair_budget_s() -> float:
-    return float("inf") if _diagnostic_no_turn_limits() else TURN_REPAIR_TIME_BUDGET_S
+    policy = current_time_policy()
+    return float("inf") if not policy.turn_time_limits_enabled else policy.repair_time_budget_s
 
 
 # Issue #301: no hardcoded AA conversational replies. Model/provider /
@@ -1896,7 +1898,7 @@ async def run_v2_answer_turn(
             _mark_turn_budget_exceeded()
             telemetry["answer_outcome"] = "failed"
             return None
-        attempt_budget = min(ANSWER_DRAFT_ATTEMPT_BUDGET_S, remaining)
+        attempt_budget = min(float(current_time_policy().answer_draft_attempt_budget_s), remaining)
         try:
             _evidence_chars_for_answer = sum(
                 len(str(item.get("text", "") or ""))
@@ -1938,7 +1940,7 @@ async def run_v2_answer_turn(
             )
             text = (
                 await draft_call
-                if _diagnostic_no_turn_limits()
+                if _turn_time_limits_disabled()
                 else await asyncio.wait_for(draft_call, timeout=attempt_budget)
             )
             telemetry["answer_latency_ms"] = round(
@@ -2421,14 +2423,16 @@ async def run_v2_answer_turn(
             ),
         )
         try:
-            judgement = await asyncio.wait_for(
-                _judge_turn(
-                    resolved_intent=_resolved_request,
-                    reply=candidate,
-                    context=_conversation_context,
-                    model=whole_turn_judge_model,
-                ),
-                timeout=cap,
+            judge_call = _judge_turn(
+                resolved_intent=_resolved_request,
+                reply=candidate,
+                context=_conversation_context,
+                model=whole_turn_judge_model,
+            )
+            judgement = (
+                await judge_call
+                if _turn_time_limits_disabled()
+                else await asyncio.wait_for(judge_call, timeout=cap)
             )
         except _JudgeRateLimit:
             _dag.provider_rate_limited("whole_turn_judge")
@@ -2587,14 +2591,16 @@ async def run_v2_answer_turn(
             ),
         )
         try:
-            judgement = await asyncio.wait_for(
-                _judge385(
-                    resolved_intent=_resolved_request,
-                    reply=candidate,
-                    context=_conversation_context,
-                    model=whole_turn_judge_model,
-                ),
-                timeout=cap,
+            judge_call_385 = _judge385(
+                resolved_intent=_resolved_request,
+                reply=candidate,
+                context=_conversation_context,
+                model=whole_turn_judge_model,
+            )
+            judgement = (
+                await judge_call_385
+                if _turn_time_limits_disabled()
+                else await asyncio.wait_for(judge_call_385, timeout=cap)
             )
         except _JudgeRL385:
             _dag.provider_rate_limited("whole_turn_judge")

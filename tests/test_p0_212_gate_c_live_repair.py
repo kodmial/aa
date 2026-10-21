@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from aa.conversation import turn_pipeline as turn_pipeline_module
@@ -119,7 +120,7 @@ async def test_over_budget_envelope_overflow_skips_regeneration(
             },
         ]
     )
-    monkeypatch.setattr(turn_pipeline_module, "TURN_REPAIR_TIME_BUDGET_S", -1.0)
+    monkeypatch.setattr(turn_pipeline_module, "_effective_repair_budget_s", lambda: -1.0)
     assert TURN_REPAIR_TIME_BUDGET_S > 0
 
     outcome = await run_v2_answer_turn(
@@ -189,3 +190,8 @@ async def test_fast_envelope_overflow_still_regenerates() -> None:
     assert 1 < len(segments) <= MAX_TRANSPORT_SEGMENTS
     assert all(envelope_passes(seg) for seg in segments)
     assert outcome["text"] == long_draft
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

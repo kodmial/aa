@@ -595,10 +595,10 @@ jobs:
           sys.path.insert(0, "src")
           from pathlib import Path
           from aa.qualification.gate_evidence import load_and_validate_evidence
-          from aa.qualification.self_proving import (
-              ORDINARY_TURN_BUDGET_MS,
-              P95_TARGET_MS,
-              SelfProvingError,
+          from aa.qualification.self_proving import SelfProvingError
+          from aa.time_policy import (
+              current_time_policy,
+              evaluate_latency_thresholds,
           )
           import os
           sha = "${{ steps.sha.outputs.sha }}"
@@ -663,15 +663,19 @@ jobs:
                   file=sys.stderr,
               )
               sys.exit(2)
-          # Unchanged hard SLO guard (machine-enforced): p95 <= 60s,
-          # ordinary-turn max < 120s. Gate C still enforces usefulness.
-          if p95 > 60000:
-              print(f"Gate E FAIL: p95 {p95:.0f}ms exceeds 60000ms target", file=sys.stderr)
+          # Mode-aware Gate E timing (single shared policy/helper):
+          # observe publishes timing without a p95/max failure; enforce
+          # applies the configured thresholds. Reliability/evidence
+          # integrity failures above still fail closed in both modes.
+          policy = current_time_policy()
+          ok, timing_detail = evaluate_latency_thresholds(p95, max_turn, policy=policy)
+          if not ok:
+              print(f"Gate E FAIL: {timing_detail}", file=sys.stderr)
               sys.exit(1)
-          if max_turn >= 120000:
-              print(f"Gate E FAIL: ordinary turn {max_turn:.0f}ms >= 120000ms budget", file=sys.stderr)
-              sys.exit(1)
-          print(f"Gate E PASS: p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms")
+          print(
+              f"Gate E PASS ({policy.latency_gate_mode}): "
+              f"p50={p50:.0f}ms p95={p95:.0f}ms max={max_turn:.0f}ms; {timing_detail}"
+          )
           PY
 
       - name: Gate F - exact-main final verdict
@@ -974,9 +978,15 @@ jobs:
             let transportTimingLine = 'OpenCode request timings: unavailable.';
             let tokenUsageLine = 'Model token usage: unavailable.';
             let modelPathLine = 'Served models: unavailable.';
+            let latencyMode = 'observe';
+            let qualificationScope = 'quality-first; latency SLO not evaluated';
             let repairFocus = '- Diagnose the concrete failing component for the blocking gate; never flatten to generic PASS.';
             try {
               const summary = JSON.parse(fs.readFileSync('self-proving-out/self-proving-summary.json', 'utf8'));
+              latencyMode = String(summary.latency_gate_mode || 'observe');
+              qualificationScope = String(
+                summary.qualification_scope || 'quality-first; latency SLO not evaluated'
+              );
               const gates = summary.gates || [];
               const workflowOutcomes = {
                 A: String(process.env.GATE_A_OUTCOME || ''),
@@ -1062,9 +1072,13 @@ jobs:
               }
               failGates = new Set(productFailures.map(g => String(g.gate || '')));
               if (failGates.has('C') && failGates.has('E')) {
-                repairFocus = '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.';
+                repairFocus = latencyMode === 'enforce'
+                  ? '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.'
+                  : '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E evidence/reliability failure (observe mode does not evaluate p95/max thresholds). Keep Gate C strict; do not add latency tuning or weaken qualification semantics.';
               } else if (blocking === 'E') {
-                repairFocus = '- Gate E is the sole live-text SLO owner: meet the temporary quality-first SLO p95 <= 60000ms and max < 120000ms. Keep Gate C strict; do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.';
+                repairFocus = latencyMode === 'enforce'
+                  ? '- Gate E is the sole live-text SLO owner: meet the configured p95/max thresholds. Keep Gate C strict; do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.'
+                  : '- Gate E failed evidence/reliability integrity, not time thresholds (observe mode). Repair the missing/invalid/censored timing evidence or timed-out turn; do not add latency tuning or weaken Gate C.';
               } else if (blocking === 'C') {
                 repairFocus = '- Gate C owns functional production-path correctness only. Diagnose the concrete broken stage/fallback/diversity/grounding component; latency-only defects belong to Gate E.';
               }
@@ -1638,6 +1652,18 @@ jobs:
               ? summary.gates.map(g => `${g.gate}:${g.status}`).join(' ')
               : '';
             const blocking = String(summary.blocking_gate || 'none');
+            const latencyMode = String(summary.latency_gate_mode || 'observe');
+            const qualificationScope = String(
+              summary.qualification_scope ||
+                (latencyMode === 'observe'
+                  ? 'quality-first; latency SLO not evaluated'
+                  : 'quality-and-latency')
+            );
+            const verdictLabel = result === 'pass'
+              ? latencyMode === 'observe'
+                ? 'PASS (QUALIFIED (quality-first; latency SLO not evaluated))'
+                : 'PASS (QUALIFIED)'
+              : 'FAIL (UNQUALIFIED)';
             const body = [
               marker,
               '',
@@ -1645,9 +1671,11 @@ jobs:
               '',
               `Exact current main: \`${sha}\``,
               `Workflow run: \`${context.runId}\``,
-              `Verdict: **${result.toUpperCase()}**`,
+              `Verdict: **${verdictLabel}**`,
               `Gates: ${gates || 'unavailable'}`,
               `Blocking gate: ${blocking}`,
+              `Latency gate: ${latencyMode}`,
+              `Qualification scope: ${qualificationScope}`,
               '',
               'Evidence was produced by the repository-owned qualification workflow with canonical book identity, real OpenCode/provider path, production retrieval index and voice assets. External Telegram Bot API checks and a separate test bot are not qualification prerequisites. Generic no-secret qualification workers are not authoritative for AA.',
             ].join('\n');

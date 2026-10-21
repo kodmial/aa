@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from aa.time_policy import TimePolicy
+
 DEFAULT_AA_AGENT = "aa"
 DEFAULT_PRIMARY_MODEL = "opencode/nemotron-3-ultra-free"
 DEFAULT_FALLBACK_MODEL = "opencode/nemotron-3-ultra-free"
@@ -119,6 +121,10 @@ class Settings:
     # Logging.
     log_level: str = "INFO"
 
+    # Single validated time-policy seam (kodmial/aa#408). Runtime time
+    # limits are disabled by default; Gate E observes timing by default.
+    time_policy: TimePolicy = field(default_factory=TimePolicy)
+
     # Reserved names (authoritative contract). Any rename must stay in sync
     # with ``.env.example`` and the README.
     RESERVED_ENV_NAMES: tuple[str, ...] = field(
@@ -142,6 +148,21 @@ class Settings:
             "AA_TTS_MODEL_PATH",
             "AA_VOICE_PRESENTATION_MODEL_PATH",
             "LOG_LEVEL",
+            "AA_TURN_TIME_LIMITS_ENABLED",
+            "AA_LATENCY_GATE_MODE",
+            "AA_LATENCY_P95_TARGET_MS",
+            "AA_LATENCY_MAX_TURN_MS",
+            "AA_TRANSPORT_TIMEOUT_S",
+            "AA_QUALIFICATION_SCENARIO_WAIT_S",
+            "AA_TURN_END_TO_END_BUDGET_S",
+            "AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S",
+            "AA_REPAIR_TIME_BUDGET_S",
+            "AA_PLANNER_TIME_BUDGET_S",
+            "AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S",
+            "AA_RETRIEVAL_SEMANTIC_STAGE_BUDGET_S",
+            "AA_RETRIEVAL_PER_CALL_BUDGET_S",
+            "AA_VERIFIER_TURN_BUDGET_S",
+            "AA_VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S",
         ),
         compare=False,
         repr=False,
@@ -183,6 +204,7 @@ class Settings:
                     "./models/voice-presentation/model_quantized.onnx",
                 ),
                 log_level=_get_str("LOG_LEVEL", "INFO").upper(),
+                time_policy=TimePolicy.from_env(source),
             )
         return cls(
             telegram_bot_token=source.get("TELEGRAM_BOT_TOKEN", ""),
@@ -215,6 +237,7 @@ class Settings:
                 "./models/voice-presentation/model_quantized.onnx",
             ),
             log_level=source.get("LOG_LEVEL", "INFO").upper(),
+            time_policy=TimePolicy.from_env(source),
         )
 
     @property
@@ -281,4 +304,5 @@ class Settings:
             "aa_tts_model_path": self.aa_tts_model_path,
             "aa_voice_presentation_model_path": self.aa_voice_presentation_model_path,
             "log_level": self.log_level,
+            "time_policy": self.time_policy.to_safe_dict(),
         }

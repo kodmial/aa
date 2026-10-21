@@ -202,11 +202,16 @@ async def _await_under_interactive_deadline(
     from aa.conversation.turn_budget import (
         MIN_MODEL_SLICE_S as _min_slice_s,
     )
-    from aa.conversation.turn_budget import (
-        PROVIDER_REQUEST_TIMEOUT_S as _provider_ceiling_s,
-    )
     from aa.conversation.turn_budget import TURN_END_TO_END_BUDGET_S as _turn_s
+    from aa.time_policy import current_time_policy
 
+    policy = current_time_policy()
+    if not policy.turn_time_limits_enabled:
+        coro = coro_factory() if callable(coro_factory) else coro_factory
+        try:
+            return await coro
+        except OpenCodeRateLimitError:
+            raise
     try:
         cap_s = float(per_call_cap_s)
     except (TypeError, ValueError):
@@ -232,10 +237,7 @@ async def _await_under_interactive_deadline(
     alloc_s = remaining_s - reserve_s
     if alloc_s <= 0:
         raise _InteractiveBudgetTimeout("turn budget already spent")
-    try:
-        ceiling_s = max(0.0, float(_provider_ceiling_s))
-    except (TypeError, ValueError):
-        ceiling_s = 120.0
+    ceiling_s = max(0.0, float(policy.transport_timeout_s))
     try:
         floor_s = max(0.0, float(_min_slice_s))
     except (TypeError, ValueError):
@@ -329,6 +331,8 @@ def _retrieval_preserves_downstream(budget: Any) -> bool:
     so the answer/verifier stages retain a feasible slice instead of
     collapsing to clarification. No prompt, keyword, or domain signal.
     """
+    if not bool(getattr(budget, "time_limits_enabled", True)):
+        return True
     try:
         remaining = float(budget.remaining_s())
     except Exception:
@@ -351,14 +355,19 @@ def _retrieval_semantic_stage_remaining_s(budget: Any) -> float:
     retrieval model call may start; the best-effort lexical pack is kept.
     No prompt, keyword, or domain signal.
     """
+    from aa.time_policy import current_time_policy
+
+    policy = current_time_policy()
+    if not policy.turn_time_limits_enabled:
+        return float("inf")
     try:
         elapsed_s = max(0.0, float(budget.elapsed_s()))
     except Exception:
         return 0.0
     try:
-        stage_budget_s = max(0.0, float(RETRIEVAL_SEMANTIC_STAGE_BUDGET_S))
+        stage_budget_s = max(0.0, float(policy.retrieval_semantic_stage_budget_s))
     except (TypeError, ValueError):
-        stage_budget_s = 20.0
+        stage_budget_s = RETRIEVAL_SEMANTIC_STAGE_BUDGET_S
     return max(0.0, stage_budget_s - elapsed_s)
 
 
@@ -991,9 +1000,13 @@ async def aretrieve_with_semantic_selection(
     local_retrieval_slow = False
     local_worker_in_flight = False
     try:
-        _local_wait_s: float = budget.remaining_s()
-        if not _local_wait_s > 0:
-            raise TurnBudgetExpired("turn deadline already spent")
+        _local_wait_s: float | None
+        if bool(getattr(budget, "time_limits_enabled", True)):
+            _local_wait_s = budget.remaining_s()
+            if not _local_wait_s > 0:
+                raise TurnBudgetExpired("turn deadline already spent")
+        else:
+            _local_wait_s = None
         _branch_out, _local_report = await run_local_retrieval_bounded(
             run_branch_searches,
             index,
@@ -1756,9 +1769,13 @@ async def aretrieve_with_semantic_selection(
             # (never the 5s diagnostic), and a waiter expiry reports
             # worker-in-flight truthfully without claiming the sync thread
             # was cancelled.
-            _followup_wait_s = budget.remaining_s()
-            if not _followup_wait_s > 0:
-                raise _InteractiveBudgetTimeout("turn budget already spent")
+            _followup_wait_s: float | None
+            if bool(getattr(budget, "time_limits_enabled", True)):
+                _followup_wait_s = budget.remaining_s()
+                if not _followup_wait_s > 0:
+                    raise _InteractiveBudgetTimeout("turn budget already spent")
+            else:
+                _followup_wait_s = None
             _followup_out, _followup_report = await run_local_retrieval_bounded(
                 run_branch_searches,
                 index,

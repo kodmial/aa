@@ -90,6 +90,11 @@ from aa.opencode.errors import (
 
 
 @pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_verifier_and_dag_state() -> Any:
     clear_verifier_capability_cache()
     clear_dag_registry()
@@ -1119,9 +1124,8 @@ async def test_concurrent_429_turn_does_not_sink_healthy_siblings() -> None:
 async def test_slow_answer_turn_fails_fast_inside_internal_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import aa.conversation.turn_pipeline as pipeline
 
-    monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 1.0)
+    monkeypatch.setenv("AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S", "1.0")
     pack = [_pack_entry()]
 
     class _SlowAnswer:

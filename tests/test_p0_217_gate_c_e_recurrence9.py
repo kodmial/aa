@@ -82,9 +82,8 @@ async def test_answer_timeout_fails_fast_with_single_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A hung answer attempt serves retry with exactly one model call."""
-    import aa.conversation.turn_pipeline as pipeline
 
-    monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S", str(0.05))
 
     class _HangOnce:
         def __init__(self) -> None:
@@ -122,9 +121,8 @@ async def test_answer_timeout_never_serves_clarification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fail-fast timeout preserves no-collapse (retry distinct from generic)."""
-    import aa.conversation.turn_pipeline as pipeline
 
-    monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S", str(0.05))
 
     class _AlwaysHang:
         async def ainvoke(self, messages: Any) -> AIMessage:
@@ -200,3 +198,8 @@ def test_no_exact_live_question_special_cases() -> None:
     for source in sources:
         for fragment in frozen_fragments:
             assert fragment not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

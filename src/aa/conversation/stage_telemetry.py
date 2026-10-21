@@ -232,6 +232,7 @@ def evaluate_gate_e_telemetry(
     heartbeat_sends: int,
     heartbeat_interval_ms: float,
     p95_target_ms: float = 15000.0,
+    mode: str | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Evaluate Gate E SLO telemetry: p50/p95, budget, heartbeat."""
     if not telemetries:
@@ -250,7 +251,7 @@ def evaluate_gate_e_telemetry(
             },
         )
     latencies = [turn.total_ms() for turn in telemetries]
-    ok, detail, slo = slo_guards(latencies, p95_target_ms=p95_target_ms)
+    ok, detail, slo = slo_guards(latencies, p95_target_ms=p95_target_ms, mode=mode)
     duration = sum(latencies)
     hb_ok, hb_detail = heartbeat_continuity_ok(
         sends=heartbeat_sends,

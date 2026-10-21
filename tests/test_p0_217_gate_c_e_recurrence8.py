@@ -147,9 +147,8 @@ async def test_answer_attempt_timeout_uses_fast_minimal_retry(
     single attempt now fails fast to the retry reply with one model
     call only.
     """
-    import aa.conversation.turn_pipeline as pipeline
 
-    monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S", str(0.05))
     seen: list[dict[str, Any]] = []
 
     class _HangOnceThenServe:
@@ -220,9 +219,8 @@ async def test_answer_double_timeout_serves_retry_not_clarification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two hung attempts fail to retry (never fake-grounded, never collapse)."""
-    import aa.conversation.turn_pipeline as pipeline
 
-    monkeypatch.setattr(pipeline, "ANSWER_DRAFT_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S", str(0.05))
 
     class _AlwaysHang:
         async def ainvoke(self, messages: Any) -> AIMessage:
@@ -298,3 +296,8 @@ def test_no_exact_live_question_special_cases() -> None:
     for source in sources:
         for fragment in frozen_fragments:
             assert fragment not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

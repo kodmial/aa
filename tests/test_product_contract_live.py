@@ -171,10 +171,9 @@ def test_gate_c_records_latency_but_gate_e_owns_slo_verdict() -> None:
     )
     assert 'failed.append("live-text-max-over-budget")' not in source
     assert 'passed.append("live-text-latency-measured")' in source
-    assert "P95_TARGET_MS" in self_proving
-    assert "ORDINARY_TURN_BUDGET_MS" in self_proving
-    assert "p95 > float(P95_TARGET_MS)" in self_proving
-    assert "maximum >= float(ORDINARY_TURN_BUDGET_MS)" in self_proving
+    assert "evaluate_latency_thresholds" in self_proving
+    assert "current_time_policy" in self_proving
+    assert "slo_guards(latencies_ms, mode=policy.latency_gate_mode)" in self_proving
 
 
 def test_async_lanes_attribute_harness_crash_instead_of_aborting() -> None:

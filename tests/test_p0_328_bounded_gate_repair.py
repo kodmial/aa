@@ -16,6 +16,7 @@ import hashlib
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from langchain_core.messages import HumanMessage
 
 
@@ -359,3 +360,8 @@ async def test_retrieval_loop_stops_after_interactive_budget_with_typed_exhausti
     # coverage ran once); no grinding across three iterations.
     assert int(metadata.get("loop_model_calls", 0)) <= 2
     assert int(metadata.get("loop_iterations", 0)) <= 1
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

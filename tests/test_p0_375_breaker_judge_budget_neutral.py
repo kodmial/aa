@@ -166,8 +166,7 @@ async def test_judge_skipped_when_repair_budget_spent(
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     _install_pipeline_doubles(monkeypatch)
-    monkeypatch.setattr(pipeline, "TURN_REPAIR_TIME_BUDGET_S", -1.0)
-    assert pipeline.TURN_REPAIR_TIME_BUDGET_S < 0
+    monkeypatch.setattr(pipeline, "_effective_repair_budget_s", lambda: -1.0)
     judge = _StubJudge(helpful=False)
     outcome = await run_v2_answer_turn(**_substantive_kwargs(judge))
     assert outcome["text"] == _SYNTHETIC_DRAFT
@@ -257,3 +256,8 @@ def test_no_literal_qualification_branches() -> None:
         assert fragment not in source
     for stem in ("тяне", "тянет выпить", "бухл", "похмел"):
         assert stem not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

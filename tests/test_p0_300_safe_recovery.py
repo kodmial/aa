@@ -490,3 +490,8 @@ def test_fallback_telemetry_stable_and_gate_c_fails() -> None:
     assert telemetry.get("technically_grounded") is False
     assert telemetry.get("qualified") is False
     assert _is_gate_c_fail(telemetry, "")
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")
