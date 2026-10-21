@@ -264,3 +264,30 @@ async def test_planner_slow_success_not_cut_when_disabled(
         "evening craving", model=_Model(), summary="", recent=[], time_budget_s=0.01
     )
     assert 1 <= len(plan.queries) <= 16
+
+
+def test_semantic_work_plan_time_gates_follow_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aa.conversation.semantic_work_plan import (
+        SemanticTurnDAG,
+        new_work_plan,
+        remaining_turn_s,
+    )
+
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "false")
+    disabled = new_work_plan(SemanticTurnDAG())
+    assert disabled.time_limits_enabled is False
+    assert disabled.allows_provider_call(remaining_s=0.0, need_s=1.0) is True
+    assert disabled.verifier_slice(0.0) is None
+    assert disabled.judge_slice(0.0) == float("inf")
+    assert remaining_turn_s(turn_started_monotonic=0.0) == float("inf")
+    assert disabled.repair_full_round_allowed(full_rounds_used=2) is False
+
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")
+    enabled = new_work_plan(SemanticTurnDAG())
+    assert enabled.time_limits_enabled is True
+    assert enabled.allows_provider_call(remaining_s=0.0, need_s=1.0) is False
+    assert enabled.verifier_slice(0.0) == 0.0
+    assert enabled.judge_slice(10.0) == 7.0
+    assert enabled.repair_full_round_allowed(full_rounds_used=2) is False

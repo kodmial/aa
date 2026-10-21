@@ -2291,12 +2291,13 @@ async def run_v2_answer_turn(
         turn: remaining covers the whole stage budget, so behavior is
         byte-identical to before), otherwise the reduced remaining
         slice. Callers skip the round entirely when the slice cannot
-        usefully serve one verifier call.
+        usefully serve one verifier call. The stage default comes from
+        the shared time policy so operators can adjust it without edits.
         """
-        from aa.conversation.verifier import VERIFIER_TURN_BUDGET_S
+        verifier_budget = float(current_time_policy().verifier_turn_budget_s)
 
         remaining = _remaining_budget_s()
-        if remaining >= VERIFIER_TURN_BUDGET_S:
+        if remaining >= verifier_budget:
             return None
         return max(0.0, remaining)
 
