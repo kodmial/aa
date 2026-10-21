@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from aa.opencode.errors import OpenCodeRateLimitError
+from aa.qualification.live_watchdog import record_live_progress, scenario_grace_s
 from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.qualification.product_contract_live")
@@ -2762,12 +2763,32 @@ async def run_live_telegram_evidence_lane(
             # follow-up. The direct prompt check stays primary.
             prior_by_chat: dict[int, list[str]] = {}
             scenario_deliveries = 0
+            record_live_progress(
+                "scenarios-start",
+                scenario_total=len(scenarios),
+                completed_scenario_count=0,
+                scenario_diagnostics=scenario_diagnostics,
+                latency_samples=latency_samples,
+            )
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 # These logs contain only scenario identifiers, never the
                 # Telegram input, delivered text or canonical-book passage.
                 print(
                     f"Gate C scenario {position}/{len(scenarios)} family={family} phase=start",
                     flush=True,
+                )
+                # Persist a wall-clock deadline before entering downstream
+                # work. The parent watchdog can preempt a synchronous hang
+                # even when this event loop never regains control.
+                record_live_progress(
+                    "scenario-start",
+                    scenario_index=position,
+                    family=family,
+                    scenario_total=len(scenarios),
+                    completed_scenario_count=len(scenario_diagnostics),
+                    scenario_deadline_at=time.time() + scenario_wait_s + scenario_grace_s(),
+                    scenario_diagnostics=scenario_diagnostics,
+                    latency_samples=latency_samples,
                 )
                 active_judge_metrics: dict[str, Any] = {}
                 snapshot: dict[str, Any] = {}
@@ -2803,6 +2824,14 @@ async def run_live_telegram_evidence_lane(
                             flush=True,
                         )
                         last_progress_tick = loop.time()
+                        record_live_progress(
+                            "scenario-heartbeat",
+                            scenario_index=position,
+                            family=family,
+                            completed_scenario_count=len(scenario_diagnostics),
+                            scenario_diagnostics=scenario_diagnostics,
+                            latency_samples=latency_samples,
+                        )
                 if len(api.sent_texts) <= before:
                     timeout_elapsed_ms = round(
                         (time.perf_counter() - started) * 1000.0,
@@ -2814,6 +2843,12 @@ async def run_live_telegram_evidence_lane(
                             "scenario_index": position,
                             "family": family,
                             "delivery_timeout": True,
+                            # Never infer a provider/retrieval cause without
+                            # stage evidence; "unknown" is the honest category
+                            # for an unresponsive turn (kodmial/aa#411).
+                            "timeout_category": "unknown",
+                            "completed_scenario_count": len(scenario_diagnostics),
+                            "scenario_total": len(scenarios),
                             # Preserve the actually observed elapsed wait for
                             # legacy/aggregate consumers; never cap it at the
                             # old product SLO.
@@ -2841,6 +2876,16 @@ async def run_live_telegram_evidence_lane(
                                 "censored": True,
                             }
                         )
+                    record_live_progress(
+                        "scenario-timeout",
+                        scenario_index=position,
+                        family=family,
+                        clear_scenario_deadline=True,
+                        completed_scenario_count=len(scenario_diagnostics),
+                        scenario_diagnostics=scenario_diagnostics,
+                        latency_samples=latency_samples,
+                        timeout_category="unknown",
+                    )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} "
                         f"family={family} phase=delivery-timeout",
@@ -3070,6 +3115,15 @@ async def run_live_telegram_evidence_lane(
                             )[:64],
                         }
                     )
+                    record_live_progress(
+                        "scenario-complete",
+                        scenario_index=position,
+                        family=family,
+                        clear_scenario_deadline=True,
+                        completed_scenario_count=len(scenario_diagnostics),
+                        scenario_diagnostics=scenario_diagnostics,
+                        latency_samples=latency_samples,
+                    )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} family={family} "
                         f"phase=completed latency_ms={round(elapsed * 1000)} "
@@ -3077,6 +3131,15 @@ async def run_live_telegram_evidence_lane(
                         flush=True,
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
+
+            record_live_progress(
+                "post-scenario-checks",
+                clear_scenario_deadline=True,
+                scenario_total=len(scenarios),
+                completed_scenario_count=len(scenario_diagnostics),
+                scenario_diagnostics=scenario_diagnostics,
+                latency_samples=latency_samples,
+            )
 
             # Multi-turn regression families (kodmial/aa#259): raw Telegram
             # updates through the same production transport, exercising
@@ -4399,8 +4462,24 @@ def evaluate_live(
         # conversation boundary ONCE, not re-run four other qualification lanes.
         # Missing model/runtime proof still fails closed; full evaluate_live()
         # remains available unchanged for standalone full-product diagnostics.
+        # The live lane runs in an independently supervised child process so a
+        # blocking provider/retrieval call can never consume the whole job
+        # (kodmial/aa#411); in-process execution remains available for
+        # controlled local diagnostics through an explicit env opt-out.
+        from aa.qualification.live_watchdog import (
+            supervise_live_gate_c,
+            watchdog_enabled,
+        )
+
         try:
-            live_evidence = asyncio.run(run_live_telegram_evidence_lane(run_id=run_id))
+            if watchdog_enabled():
+                live_evidence = supervise_live_gate_c(
+                    run_live_telegram_evidence_lane,
+                    run_id=run_id,
+                    main_sha=expected,
+                )
+            else:
+                live_evidence = asyncio.run(run_live_telegram_evidence_lane(run_id=run_id))
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, OpenCodeRateLimitError):
                 raise
