@@ -681,6 +681,9 @@ class OpenCodeChatModel(BaseChatModel):
                 logger.warning("ephemeral session cleanup failed")
 
     async def _ainvoke_text(self, prompt: str, *, system: str = "") -> str:
+        from aa.conversation.semantic_work_plan import notify_stage
+
+        notify_stage("opencode")
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
         # Fast path for a persistently rejected primary: the first failure
@@ -823,6 +826,9 @@ class OpenCodeChatModel(BaseChatModel):
         against ``schema`` with its own bounded ``retryCount`` and returns
         the structured object.
         """
+        from aa.conversation.semantic_work_plan import notify_stage
+
+        notify_stage("opencode")
         if not self.primary_model.strip():
             raise ValueError("primary model must be pinned")
 

@@ -225,7 +225,9 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
 
         from aa.conversation.answer_adequacy import planner_reason_for as _reason_for
         from aa.conversation.planner_node import build_generic_fallback_queries
+        from aa.conversation.semantic_work_plan import notify_stage
 
+        notify_stage("planner")
         started = _time.perf_counter()
         try:
             _planner_dag = ensure_turn_dag(state)
@@ -571,6 +573,9 @@ def build_turn_graph(
         from aa.conversation.turn_pipeline import answer_pipeline_node
 
         async def _answer(state: TurnState) -> dict[str, Any]:
+            from aa.conversation.semantic_work_plan import notify_stage
+
+            notify_stage("answer")
             return await answer_pipeline_node(
                 state,
                 answer_model=answer_model,

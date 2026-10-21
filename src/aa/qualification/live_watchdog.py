@@ -139,7 +139,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             json.dump(payload, handle, sort_keys=True, ensure_ascii=False)
             handle.write("\n")
         os.replace(tmp_name, path)
-    except BaseException:
+    except Exception:
         try:
             os.unlink(tmp_name)
         except OSError:

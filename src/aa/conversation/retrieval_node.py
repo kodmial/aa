@@ -33,7 +33,7 @@ from typing import Any
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.prompt_builder import EvidencePassage
-from aa.conversation.semantic_work_plan import SemanticTurnDAG, ensure_turn_dag
+from aa.conversation.semantic_work_plan import SemanticTurnDAG, ensure_turn_dag, notify_stage
 from aa.conversation.turn_budget import (
     LOCAL_RRF_DIAGNOSTIC_BUDGET_MS,
     STAGE_COVERAGE_INSUFFICIENT,
@@ -1010,6 +1010,7 @@ async def aretrieve_with_semantic_selection(
                 raise TurnBudgetExpired("turn deadline already spent")
         else:
             _local_wait_s = None
+        notify_stage("index")
         _branch_out, _local_report = await run_local_retrieval_bounded(
             run_branch_searches,
             index,
@@ -2429,6 +2430,7 @@ async def retrieval_node(
     stays conservatively uncovered (lexical signals never decide
     sufficiency).
     """
+    notify_stage("retrieval")
     raw_queries = state.get("search_queries", [])
     if isinstance(raw_queries, (list, tuple)):
         queries: list[str] = []
