@@ -161,6 +161,9 @@ def make_memory_node(
             node_input["context"] = {"running_summary": running}
         else:
             node_input["context"] = {}
+        from aa.conversation.semantic_work_plan import notify_stage
+
+        notify_stage("provider")
         result = await summarizer.ainvoke(node_input)
         new_context = dict(result.get("context", {}) or {})
         new_running = new_context.get("running_summary")

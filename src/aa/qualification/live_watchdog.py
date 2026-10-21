@@ -166,6 +166,7 @@ def record_live_progress(
     family: str | None = None,
     scenario_deadline_at: float | None = None,
     clear_scenario_deadline: bool = False,
+    clear_active_stage: bool = False,
     completed_scenario_count: int | None = None,
     scenario_total: int | None = None,
     scenario_diagnostics: Sequence[Mapping[str, Any]] | None = None,
@@ -199,6 +200,8 @@ def record_live_progress(
             payload["scenario_deadline_at"] = float(scenario_deadline_at)
         if clear_scenario_deadline:
             payload.pop("scenario_deadline_at", None)
+        if clear_active_stage:
+            payload.pop("active_stage", None)
         if completed_scenario_count is not None:
             payload["completed_scenario_count"] = int(completed_scenario_count)
         if scenario_total is not None:
@@ -245,7 +248,7 @@ def _child_main(
             )
         else:
             outcome.update({"kind": "result", "lane": result.to_dict()})
-    except BaseException as exc:  # noqa: BLE001 - type-only cross-process evidence
+    except Exception as exc:  # noqa: BLE001 - type-only cross-process evidence
         outcome.update({"kind": "error", "exception": type(exc).__name__})
     try:
         _atomic_write_json(Path(outcome_path), outcome)
@@ -269,11 +272,6 @@ def _terminate_process_group(proc: Any, grace_s: float = DEFAULT_KILL_GRACE_S) -
         except (ProcessLookupError, PermissionError):
             pass
         proc.join(grace_s)
-    # Best-effort final sweep for descendants that ignored SIGTERM.
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def _lane_from_payload(payload: Mapping[str, Any]) -> LaneResult:
@@ -329,7 +327,14 @@ def _timeout_category(progress: Mapping[str, Any]) -> str:
     if recorded in {"stuck-provider", "stuck-retrieval", "unknown"}:
         return recorded
     stage = str(progress.get("active_stage", "") or "").strip()
-    if stage in {"planner", "answer", "verifier", "opencode", "provider"}:
+    if stage in {
+        "planner",
+        "answer",
+        "verifier",
+        "opencode",
+        "provider",
+        "whole_turn_judge",
+    }:
         return "stuck-provider"
     if stage in {"retrieval", "index"}:
         return "stuck-retrieval"

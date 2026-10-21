@@ -2563,6 +2563,13 @@ async def run_live_telegram_evidence_lane(
         )
         app = Application(settings, transport=transport)
         await app.start()
+
+        from aa.conversation.semantic_work_plan import set_stage_observer
+
+        def _record_active_stage(stage: str) -> None:
+            record_live_progress("scenario-stage", active_stage=stage)
+
+        set_stage_observer(_record_active_stage)
         try:
             _check(
                 "live-raw-telegram-transport-boundary",
@@ -2767,6 +2774,7 @@ async def run_live_telegram_evidence_lane(
                 "scenarios-start",
                 scenario_total=len(scenarios),
                 completed_scenario_count=0,
+                clear_active_stage=True,
                 scenario_diagnostics=scenario_diagnostics,
                 latency_samples=latency_samples,
             )
@@ -2789,6 +2797,7 @@ async def run_live_telegram_evidence_lane(
                     scenario_deadline_at=time.time() + scenario_wait_s + scenario_grace_s(),
                     scenario_diagnostics=scenario_diagnostics,
                     latency_samples=latency_samples,
+                    active_stage="planner",
                 )
                 active_judge_metrics: dict[str, Any] = {}
                 snapshot: dict[str, Any] = {}
@@ -2881,6 +2890,7 @@ async def run_live_telegram_evidence_lane(
                         scenario_index=position,
                         family=family,
                         clear_scenario_deadline=True,
+                        clear_active_stage=True,
                         completed_scenario_count=len(scenario_diagnostics),
                         scenario_diagnostics=scenario_diagnostics,
                         latency_samples=latency_samples,
@@ -3120,6 +3130,7 @@ async def run_live_telegram_evidence_lane(
                         scenario_index=position,
                         family=family,
                         clear_scenario_deadline=True,
+                        clear_active_stage=True,
                         completed_scenario_count=len(scenario_diagnostics),
                         scenario_diagnostics=scenario_diagnostics,
                         latency_samples=latency_samples,
@@ -3135,6 +3146,7 @@ async def run_live_telegram_evidence_lane(
             record_live_progress(
                 "post-scenario-checks",
                 clear_scenario_deadline=True,
+                clear_active_stage=True,
                 scenario_total=len(scenarios),
                 completed_scenario_count=len(scenario_diagnostics),
                 scenario_diagnostics=scenario_diagnostics,
@@ -3966,6 +3978,7 @@ async def run_live_telegram_evidence_lane(
             else:
                 voice_elapsed = 0.0
         finally:
+            set_stage_observer(None)
             await app.stop()
     except OpenCodeRateLimitError:
         raise
