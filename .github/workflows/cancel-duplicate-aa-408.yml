@@ -1,0 +1,54 @@
+# One-shot, branch-scoped incident mitigation. Never merge to main.
+# Created only to cancel erroneous second AA #408 OpenCode run, not its primary.
+name: Cancel AA #408 duplicate only
+on:
+  pull_request:
+    types: [opened, synchronize]
+permissions:
+  actions: write
+  contents: read
+jobs:
+  cancel-duplicate:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ops/cancel-run-39627686076' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel run 39627686076 (never touch 39627655676)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            if (`${owner}/${repo}` !== 'kodmial/aa') {
+              throw new Error('Refusing non-AA repository');
+            }
+            const targetRunId = 39627686076;
+            const primaryRunId = 39627655676;
+            if (targetRunId === primaryRunId) throw new Error('Target is the primary run');
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: targetRunId
+            });
+            if (run.display_title !== 'OpenCode issue #408' || run.event !== 'issue_comment') {
+              throw new Error('Run identity mismatch; no cancellation attempted');
+            }
+            if (run.status === 'completed') {
+              core.notice(`Duplicate run ${targetRunId} already completed: ${run.conclusion}`);
+              return;
+            }
+            core.notice(`Canceling ONLY queued duplicate OpenCode run ${targetRunId}; primary ${primaryRunId} untouched`);
+            await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: targetRunId });
+            for (let n = 0; n < 12; n += 1) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const { data: latest } = await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id: targetRunId
+              });
+              core.info(`Duplicate run: ${latest.status}, conclusion: ${latest.conclusion || 'none'}`);
+              if (latest.status === 'completed') {
+                if (latest.conclusion !== 'cancelled') {
+                  core.warning(`Run completed with ${latest.conclusion} instead of cancelled; check exact run`);
+                }
+                return;
+              }
+            }
+            core.warning('Cancellation submitted but not yet reflected in GitHub run status');
