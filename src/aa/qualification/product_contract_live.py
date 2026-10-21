@@ -2453,9 +2453,7 @@ async def run_live_telegram_evidence_lane(
             "latency_source_proof_kind": "c-series-simulated-handoff",
             "latency_units": "ms",
             "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
-            "qualification_scenario_wait_s": float(
-                current_time_policy().qualification_scenario_wait_s
-            ),
+            "qualification_scenario_wait_s": float(scenario_wait_s),
             "live_prerequisites_present": False,
             "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
         }
