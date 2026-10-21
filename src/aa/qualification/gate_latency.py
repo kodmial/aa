@@ -370,11 +370,16 @@ def build_c_series_from_live_summary(
                 continue
             family = str(entry.get("family", "") or "ordinary-text")[:64]
             # Prefer the actual observed timeout elapsed time when the
-            # legacy diagnostic carries it. Only fall back to the configured
-            # operational wait bound when no observation exists, never to a
-            # product SLO number or an artificial cap.
+            # legacy diagnostic carries it, bounded by the operational wait
+            # that was actually in effect. Only fall back to that bound when
+            # no observation exists, never to a product SLO number or an
+            # artificial cap.
             observed_ms = _diagnostic_timeout_latency_ms(entry)
-            latency_ms = observed_ms if observed_ms is not None else operation_bound_ms
+            latency_ms = (
+                min(observed_ms, operation_bound_ms)
+                if observed_ms is not None
+                else operation_bound_ms
+            )
             censored.append(
                 TurnSample(
                     causality_id=new_causality_id(),
