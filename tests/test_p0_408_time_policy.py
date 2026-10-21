@@ -191,6 +191,65 @@ def test_typed_live_samples_are_not_recapped_to_old_budget() -> None:
     assert samples[0].latency_ms == 150_000.0
 
 
+def test_legacy_timeout_uses_observed_elapsed_without_policy_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AA_QUALIFICATION_SCENARIO_WAIT_S", "300")
+    for observed_ms in (130_000.0, 500_000.0):
+        payload = {
+            "lanes": [
+                {
+                    "lane": "live-telegram-evidence",
+                    "metrics": {
+                        "scenario_diagnostics": [
+                            {
+                                "family": "ordinary-text",
+                                "delivery_timeout": True,
+                                "delivery_latency_ms": observed_ms,
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        samples = build_c_series_from_live_summary(payload)
+        assert [sample.latency_ms for sample in samples] == [observed_ms]
+
+
+def test_legacy_timeout_uses_recorded_wait_not_current_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AA_QUALIFICATION_SCENARIO_WAIT_S", "300")
+    payload = {
+        "lanes": [
+            {
+                "lane": "live-telegram-evidence",
+                "failed": ["live-delivery-ordinary-text-timeout"],
+                "metrics": {"qualification_scenario_wait_s": 180.0},
+            }
+        ]
+    }
+    samples = build_c_series_from_live_summary(payload)
+    assert [sample.latency_ms for sample in samples] == [180_000.0]
+
+
+def test_legacy_timeout_without_recorded_wait_preserves_bounded_censor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AA_QUALIFICATION_SCENARIO_WAIT_S", "300")
+    payload = {
+        "lanes": [
+            {
+                "lane": "live-telegram-evidence",
+                "failed": ["live-delivery-ordinary-text-timeout"],
+                "metrics": {},
+            }
+        ]
+    }
+    samples = build_c_series_from_live_summary(payload)
+    assert [sample.latency_ms for sample in samples] == [120_000.0]
+
+
 def test_script_gate_e_is_mode_aware(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AA_LATENCY_GATE_MODE", "observe")
     observe = runner._gate_e(SHA, "run-1", PRODUCT, RUNTIME, [150_000.0], gate_c_live=True)

@@ -35,7 +35,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from aa.qualification.self_proving import GateEvidence, percentile_ms
+from aa.qualification.self_proving import (
+    ORDINARY_TURN_BUDGET_MS,
+    GateEvidence,
+    percentile_ms,
+)
 from aa.time_policy import (
     TimePolicy,
     current_time_policy,
@@ -311,16 +315,13 @@ def build_c_series_from_live_summary(
     metrics = live_lane.get("metrics", {})
     if not isinstance(metrics, dict):
         raise GateLatencyError(MISSING_LIVE_SAMPLES)
-    policy = current_time_policy()
-    # Legacy payloads should carry the wait bound actually used for that
-    # run. Prefer it over the process policy so rebuilding evidence later
-    # under a different configuration cannot inflate censored latency.
+    # New payloads record the scenario wait actually used for the run.
+    # Legacy payloads predate that field, so fall back to the old
+    # bounded-censor value instead of the current process policy: rebuilding
+    # old evidence under a larger configured wait must not inflate it.
     recorded_wait_s = _as_finite_positive_float(metrics.get("qualification_scenario_wait_s"))
-    operation_bound_ms = (
-        recorded_wait_s * 1000.0
-        if recorded_wait_s is not None
-        else float(policy.qualification_scenario_wait_s) * 1000.0
-    )
+    recorded_wait_ms = recorded_wait_s * 1000.0 if recorded_wait_s is not None else None
+    legacy_bound_ms = float(ORDINARY_TURN_BUDGET_MS)
     typed_raw = metrics.get("turn_latency_samples", [])
     if isinstance(typed_raw, list) and typed_raw:
         typed: list[TurnSample] = []
@@ -370,16 +371,18 @@ def build_c_series_from_live_summary(
                 continue
             family = str(entry.get("family", "") or "ordinary-text")[:64]
             # Prefer the actual observed timeout elapsed time when the
-            # legacy diagnostic carries it, bounded by the operational wait
-            # that was actually in effect. Only fall back to that bound when
-            # no observation exists, never to a product SLO number or an
-            # artificial cap.
+            # legacy diagnostic carries it, bounded only by the operational
+            # wait recorded for that run (if any). Never cap observed
+            # elapsed time at a product SLO or the current process policy.
             observed_ms = _diagnostic_timeout_latency_ms(entry)
-            latency_ms = (
-                min(observed_ms, operation_bound_ms)
-                if observed_ms is not None
-                else operation_bound_ms
-            )
+            if observed_ms is not None:
+                latency_ms = (
+                    min(observed_ms, recorded_wait_ms)
+                    if recorded_wait_ms is not None
+                    else observed_ms
+                )
+            else:
+                latency_ms = recorded_wait_ms if recorded_wait_ms is not None else legacy_bound_ms
             censored.append(
                 TurnSample(
                     causality_id=new_causality_id(),
@@ -405,7 +408,9 @@ def build_c_series_from_live_summary(
                     family="ordinary-text",
                     mode="text",
                     outcome="timeout",
-                    latency_ms=operation_bound_ms,
+                    latency_ms=(
+                        recorded_wait_ms if recorded_wait_ms is not None else legacy_bound_ms
+                    ),
                     series=C_SERIES,
                     censored=True,
                 )
