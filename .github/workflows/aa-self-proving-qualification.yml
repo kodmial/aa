@@ -1071,14 +1071,29 @@ jobs:
                 }
               }
               failGates = new Set(productFailures.map(g => String(g.gate || '')));
+              const gateEFailure = productFailures.find(g => String(g.gate || '') === 'E')
+                || (String(blocking) === 'E' ? failed : null);
+              const gateECategory = gateEFailure
+                ? normalizedFailureCategory(
+                    'E',
+                    gateEFailure.failure_category || gateEFailure.status
+                  )
+                : '';
               if (failGates.has('C') && failGates.has('E')) {
                 repairFocus = latencyMode === 'enforce'
                   ? '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E SLO failure. Use the concrete C category plus per-stage latency/model evidence; do not defer E until a later qualification run.'
-                  : '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E evidence/reliability failure (observe mode does not evaluate p95/max thresholds). Keep Gate C strict; do not add latency tuning or weaken qualification semantics.';
+                  : '- Repair both proven defects in this same cycle: Gate C functional live-path failure and Gate E evidence/reliability failure (observe mode does not evaluate p95/max thresholds). Keep Gate C strict; do not add latency tuning or weaken qualification semantics.' +
+                    (gateECategory === 'latency-budget-exceeded'
+                      ? ' Gate E also reported a timing threshold failure while observe mode is active: repair the mode propagation so observe publishes timing without evaluating p95/max; do not weaken reliability/evidence integrity.'
+                      : '');
               } else if (blocking === 'E') {
-                repairFocus = latencyMode === 'enforce'
-                  ? '- Gate E is the sole live-text SLO owner: meet the configured p95/max thresholds. Keep Gate C strict; do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.'
-                  : '- Gate E failed evidence/reliability integrity, not time thresholds (observe mode). Repair the missing/invalid/censored timing evidence or timed-out turn; do not add latency tuning or weaken Gate C.';
+                if (latencyMode === 'enforce') {
+                  repairFocus = '- Gate E is the sole live-text SLO owner: meet the configured p95/max thresholds. Keep Gate C strict; do not weaken thresholds, tests, qualification semantics, or reclassify the failure into Gate C. Use per-stage telemetry to identify and remove the dominant latency source.';
+                } else if (gateECategory === 'latency-budget-exceeded') {
+                  repairFocus = '- Gate E reported a p95/max threshold failure while latency_gate_mode=observe. Treat this as a mode-propagation/evaluation defect: observe must publish timing without failing slow-but-valid turns on thresholds. Do not weaken evidence/reliability integrity, Gate C, or relabel an unfinished/censored run as successful.';
+                } else {
+                  repairFocus = '- Gate E failed evidence/reliability integrity, not time thresholds (observe mode). Repair the missing/invalid/censored timing evidence or timed-out turn; do not add latency tuning or weaken Gate C.';
+                }
               } else if (blocking === 'C') {
                 repairFocus = '- Gate C owns functional production-path correctness only. Diagnose the concrete broken stage/fallback/diversity/grounding component; latency-only defects belong to Gate E.';
               }

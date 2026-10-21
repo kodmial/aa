@@ -73,8 +73,8 @@ def test_defaults_disable_runtime_limits_and_observe_gate_e(
     assert policy.latency_gate_mode == "observe"
     assert policy.latency_p95_target_ms == 60_000.0
     assert policy.latency_max_turn_ms == 120_000.0
-    assert policy.transport_timeout_s == 600.0
-    assert policy.qualification_scenario_wait_s == 600.0
+    assert policy.transport_timeout_s == 300.0
+    assert policy.qualification_scenario_wait_s == 300.0
     settings = Settings.from_env({})
     assert settings.time_policy == policy
 

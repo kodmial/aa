@@ -46,6 +46,7 @@ from aa.conversation.turn_budget import (
     TurnBudget,
     TurnBudgetExpired,
     await_model_under_turn_budget,
+    finite_remaining_ms,
     hash_ids,
     local_worker_info,
     new_turn_budget,
@@ -207,11 +208,11 @@ async def _await_under_interactive_deadline(
 
     policy = current_time_policy()
     if not policy.turn_time_limits_enabled:
-        coro = coro_factory() if callable(coro_factory) else coro_factory
-        try:
-            return await coro
-        except OpenCodeRateLimitError:
-            raise
+        # No AA-owned deadline is imposed. Provider/transport liveness
+        # errors (OpenCodeRateLimitError, OpenCodeTimeoutError,
+        # OpenCodeTransientError) propagate unchanged from the coroutine;
+        # callers must not rely on a legacy wait_for boundary here.
+        return await (coro_factory() if callable(coro_factory) else coro_factory)
     try:
         cap_s = float(per_call_cap_s)
     except (TypeError, ValueError):
@@ -788,7 +789,7 @@ def _exhausted_pack_for_local_timeout(
         "retrieval_loop": "discover/select_for_reading/read_exact/assess_coverage",
         "turn_deadline_s": float(budget.deadline_s),
         "turn_elapsed_ms": round(elapsed_ms, 3),
-        "turn_remaining_ms": round(budget.remaining_ms(), 3),
+        "turn_remaining_ms": round(finite_remaining_ms(budget), 3),
         "turn_budget_snapshot": budget.snapshot(),
         "local_retrieval_ms": round(float(local_retrieval_ms), 3),
         "local_retrieval_diagnostic_ms": float(LOCAL_RRF_DIAGNOSTIC_BUDGET_MS),
@@ -2009,13 +2010,17 @@ async def aretrieve_with_semantic_selection(
     except Exception:
         source_digest = ""
     try:
-        _turn_remaining_ms = float(budget.remaining_ms())
+        _turn_remaining_ms = float(finite_remaining_ms(budget))
     except Exception:
         _turn_remaining_ms = 0.0
     try:
         _turn_deadline_s = float(budget.deadline_s)
     except Exception:
         _turn_deadline_s = 105.0
+    try:
+        _turn_over_budget = bool(budget.is_expired())
+    except Exception:
+        _turn_over_budget = False
     try:
         _budget_snapshot = budget.snapshot()
     except Exception:
@@ -2085,7 +2090,7 @@ async def aretrieve_with_semantic_selection(
         "turn_deadline_s": _turn_deadline_s,
         "turn_elapsed_ms": round(elapsed_ms, 3),
         "turn_remaining_ms": round(_turn_remaining_ms, 3),
-        "turn_over_budget": elapsed_ms > _turn_deadline_s * 1000.0,
+        "turn_over_budget": _turn_over_budget,
         "turn_budget_snapshot": _budget_snapshot,
         "local_retrieval_ms": round(float(local_retrieval_ms), 3),
         "local_retrieval_diagnostic_ms": float(LOCAL_RRF_DIAGNOSTIC_BUDGET_MS),
@@ -2339,6 +2344,13 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
                     )
             safe["turn_budget_snapshot"] = {
                 "deadline_s": float(snapshot.get("deadline_s", 0.0) or 0.0),
+                "time_limits_enabled": bool(snapshot.get("time_limits_enabled", True)),
+                "remaining_unbounded": bool(
+                    snapshot.get(
+                        "remaining_unbounded",
+                        not bool(snapshot.get("time_limits_enabled", True)),
+                    )
+                ),
                 "elapsed_ms": float(snapshot.get("elapsed_ms", 0.0) or 0.0),
                 "remaining_ms": float(snapshot.get("remaining_ms", 0.0) or 0.0),
                 "stages": safe_stages,

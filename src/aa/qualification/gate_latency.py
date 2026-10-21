@@ -73,12 +73,16 @@ def new_causality_id() -> str:
     return uuid.uuid4().hex
 
 
-def _is_finite_positive(value: Any) -> bool:
+def _as_finite_positive_float(value: Any) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return False
-    return math.isfinite(number) and number > 0
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _is_finite_positive(value: Any) -> bool:
+    return _as_finite_positive_float(value) is not None
 
 
 @dataclass(frozen=True)
@@ -258,6 +262,26 @@ def samples_from_legacy_latencies(
     return samples
 
 
+def _diagnostic_timeout_latency_ms(entry: dict[str, Any]) -> float | None:
+    """Return an actually observed timeout latency from a legacy diagnostic.
+
+    Legacy payloads may carry the elapsed wait/deadline in one of these
+    privacy-safe numeric fields. Prefer it over the configured operational
+    bound so censored evidence never claims more elapsed time than was
+    actually observed.
+    """
+    for key in (
+        "delivery_latency_ms",
+        "observed_latency_ms",
+        "elapsed_ms",
+        "latency_ms",
+    ):
+        numeric = _as_finite_positive_float(entry.get(key))
+        if numeric is not None:
+            return numeric
+    return None
+
+
 def build_c_series_from_live_summary(
     payload: dict[str, Any],
     *,
@@ -287,6 +311,16 @@ def build_c_series_from_live_summary(
     metrics = live_lane.get("metrics", {})
     if not isinstance(metrics, dict):
         raise GateLatencyError(MISSING_LIVE_SAMPLES)
+    policy = current_time_policy()
+    # Legacy payloads should carry the wait bound actually used for that
+    # run. Prefer it over the process policy so rebuilding evidence later
+    # under a different configuration cannot inflate censored latency.
+    recorded_wait_s = _as_finite_positive_float(metrics.get("qualification_scenario_wait_s"))
+    operation_bound_ms = (
+        recorded_wait_s * 1000.0
+        if recorded_wait_s is not None
+        else float(policy.qualification_scenario_wait_s) * 1000.0
+    )
     typed_raw = metrics.get("turn_latency_samples", [])
     if isinstance(typed_raw, list) and typed_raw:
         typed: list[TurnSample] = []
@@ -335,16 +369,19 @@ def build_c_series_from_live_summary(
             if bool(entry.get("delivery_timeout", False)) is not True:
                 continue
             family = str(entry.get("family", "") or "ordinary-text")[:64]
-            # Legacy payloads carry no per-turn observed deadline. Use the
-            # configured operational wait bound, never the old SLO number.
-            operation_bound_ms = float(current_time_policy().qualification_scenario_wait_s) * 1000.0
+            # Prefer the actual observed timeout elapsed time when the
+            # legacy diagnostic carries it. Only fall back to the configured
+            # operational wait bound when no observation exists, never to a
+            # product SLO number or an artificial cap.
+            observed_ms = _diagnostic_timeout_latency_ms(entry)
+            latency_ms = observed_ms if observed_ms is not None else operation_bound_ms
             censored.append(
                 TurnSample(
                     causality_id=new_causality_id(),
                     family=family or "ordinary-text",
                     mode="text",
                     outcome="timeout",
-                    latency_ms=operation_bound_ms,
+                    latency_ms=latency_ms,
                     series=C_SERIES,
                     censored=True,
                 )
@@ -363,7 +400,7 @@ def build_c_series_from_live_summary(
                     family="ordinary-text",
                     mode="text",
                     outcome="timeout",
-                    latency_ms=float(current_time_policy().qualification_scenario_wait_s) * 1000.0,
+                    latency_ms=operation_bound_ms,
                     series=C_SERIES,
                     censored=True,
                 )

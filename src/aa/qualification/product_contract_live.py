@@ -2804,12 +2804,20 @@ async def run_live_telegram_evidence_lane(
                         )
                         last_progress_tick = loop.time()
                 if len(api.sent_texts) <= before:
+                    timeout_elapsed_ms = round(
+                        (time.perf_counter() - started) * 1000.0,
+                        1,
+                    )
                     failed.append(f"live-delivery-{family}-timeout")
                     scenario_diagnostics.append(
                         {
                             "scenario_index": position,
                             "family": family,
                             "delivery_timeout": True,
+                            # Preserve the actually observed elapsed wait for
+                            # legacy/aggregate consumers; never cap it at the
+                            # old product SLO.
+                            "delivery_latency_ms": timeout_elapsed_ms,
                         }
                     )
                     # Bounded-censored latency: a timed-out ordinary turn is
@@ -2824,10 +2832,7 @@ async def run_live_telegram_evidence_lane(
                                 "family": family,
                                 "mode": "text",
                                 "outcome": "timeout",
-                                "latency_ms": round(
-                                    (time.perf_counter() - started) * 1000.0,
-                                    1,
-                                ),
+                                "latency_ms": timeout_elapsed_ms,
                                 "monotonic": True,
                                 "clock": "monotonic-perf_counter",
                                 "series": "c-series-simulated-handoff",

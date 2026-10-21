@@ -422,7 +422,7 @@ class OpenCodeChatModel(BaseChatModel):
     agent: str
     primary_model: str
     fallback_model: str = ""
-    request_timeout: float = 600.0
+    request_timeout: float = 300.0
     transport_agent: str | None = None
 
     # Single coherent verifier topology (kodmial/aa#380): production

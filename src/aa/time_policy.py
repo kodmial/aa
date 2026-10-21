@@ -21,8 +21,8 @@ DEFAULT_TURN_TIME_LIMITS_ENABLED = False
 DEFAULT_LATENCY_GATE_MODE = "observe"
 DEFAULT_LATENCY_P95_TARGET_MS = 60_000.0
 DEFAULT_LATENCY_MAX_TURN_MS = 120_000.0
-DEFAULT_TRANSPORT_TIMEOUT_S = 600.0
-DEFAULT_QUALIFICATION_SCENARIO_WAIT_S = 600.0
+DEFAULT_TRANSPORT_TIMEOUT_S = 300.0
+DEFAULT_QUALIFICATION_SCENARIO_WAIT_S = 300.0
 DEFAULT_TURN_END_TO_END_BUDGET_S = 105.0
 DEFAULT_ANSWER_DRAFT_ATTEMPT_BUDGET_S = 35.0
 DEFAULT_REPAIR_TIME_BUDGET_S = 50.0
@@ -32,6 +32,29 @@ DEFAULT_RETRIEVAL_SEMANTIC_STAGE_BUDGET_S = 20.0
 DEFAULT_RETRIEVAL_PER_CALL_BUDGET_S = 8.0
 DEFAULT_VERIFIER_TURN_BUDGET_S = 40.0
 DEFAULT_VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
+
+# Environment names that participate in policy resolution. The cache key
+# below includes their current values, so a process that changes env vars
+# (tests, controlled reload) still sees the new policy immediately.
+_TIME_POLICY_ENV_NAMES: tuple[str, ...] = (
+    "AA_TURN_TIME_LIMITS_ENABLED",
+    "AA_LATENCY_GATE_MODE",
+    "AA_LATENCY_P95_TARGET_MS",
+    "AA_LATENCY_MAX_TURN_MS",
+    "AA_TRANSPORT_TIMEOUT_S",
+    "AA_QUALIFICATION_SCENARIO_WAIT_S",
+    "AA_TURN_END_TO_END_BUDGET_S",
+    "AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S",
+    "AA_REPAIR_TIME_BUDGET_S",
+    "AA_PLANNER_TIME_BUDGET_S",
+    "AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S",
+    "AA_RETRIEVAL_SEMANTIC_STAGE_BUDGET_S",
+    "AA_RETRIEVAL_PER_CALL_BUDGET_S",
+    "AA_VERIFIER_TURN_BUDGET_S",
+    "AA_VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S",
+)
+_POLICY_CACHE_MAX = 16
+_POLICY_CACHE: dict[tuple[str | None, ...], TimePolicy] = {}
 
 
 class TimePolicyError(ValueError):
@@ -165,8 +188,24 @@ class TimePolicy:
 
 
 def current_time_policy(environ: Mapping[str, str] | None = None) -> TimePolicy:
-    """Resolve the policy for the current process environment."""
-    return TimePolicy.from_env(environ)
+    """Resolve the policy for the current process environment.
+
+    Explicit mappings are always parsed as given. For the live process
+    environment, validated policies are cached by the values of the
+    participating variables, avoiding repeated object construction in
+    per-turn hot paths without hiding env changes.
+    """
+    if environ is not None:
+        return TimePolicy.from_env(environ)
+    key = tuple(os.environ.get(name) for name in _TIME_POLICY_ENV_NAMES)
+    cached = _POLICY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    policy = TimePolicy.from_env()
+    if len(_POLICY_CACHE) >= _POLICY_CACHE_MAX:
+        _POLICY_CACHE.clear()
+    _POLICY_CACHE[key] = policy
+    return policy
 
 
 def evaluate_latency_thresholds(

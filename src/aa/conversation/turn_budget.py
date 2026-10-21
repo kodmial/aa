@@ -80,6 +80,12 @@ DOWNSTREAM_MIN_RESERVE_S = 5.0
 # fails fast instead of launching a zero-time round.
 MIN_MODEL_SLICE_S = 0.05
 
+# Evidence/debugging sentinel for an unbounded remaining budget. Keeping
+# the value finite avoids non-standard ``Infinity`` in JSON evidence;
+# consumers must treat any negative value as "time limits disabled", not
+# as an expired deadline (see ``remaining_unbounded`` in snapshots).
+UNBOUNDED_REMAINING_MS = -1.0
+
 # Typed stage names for per-stage outcomes (privacy-safe, no text).
 STAGE_LOCAL_RETRIEVAL_SLOW = "local_retrieval_slow"
 STAGE_PROVIDER_SEMANTIC_TIMEOUT = "provider_semantic_timeout"
@@ -287,10 +293,17 @@ class TurnBudget:
         return record
 
     def snapshot(self) -> dict[str, Any]:
-        """Privacy-safe snapshot: durations, digests, remaining (no text)."""
+        """Privacy-safe snapshot: durations, digests, remaining (no text).
+
+        ``remaining_ms`` is :data:`UNBOUNDED_REMAINING_MS` (a negative
+        sentinel) when turn time limits are disabled; ``remaining_unbounded``
+        makes that state explicit so evidence/debug consumers never mistake
+        it for an expired deadline.
+        """
         return {
             "deadline_s": float(self.deadline_s),
             "time_limits_enabled": bool(self.time_limits_enabled),
+            "remaining_unbounded": not bool(self.time_limits_enabled),
             "elapsed_ms": round(self.elapsed_ms(), 3),
             "remaining_ms": round(_finite_remaining_ms(self), 3),
             "upstream_spent_s": round(float(self.upstream_spent_s or 0.0), 3),
@@ -308,9 +321,14 @@ class TurnBudget:
         }
 
 
-def _finite_remaining_ms(budget: TurnBudget) -> float:
+def finite_remaining_ms(budget: TurnBudget) -> float:
+    """Return finite evidence remaining ms (``-1`` means unbounded)."""
     value = budget.remaining_ms()
-    return value if value != float("inf") else -1.0
+    return value if value != float("inf") else UNBOUNDED_REMAINING_MS
+
+
+# Backwards-compatible private alias for internal call sites/tests.
+_finite_remaining_ms = finite_remaining_ms
 
 
 def new_turn_budget(
@@ -627,6 +645,7 @@ __all__ = [
     "TURN_HARD_SLO_MS",
     "TURN_P95_TARGET_MS",
     "TYPED_STAGES",
+    "UNBOUNDED_REMAINING_MS",
     "LocalRetrievalReport",
     "LocalRetrievalTimeout",
     "ProviderSemanticTimeout",
@@ -634,6 +653,7 @@ __all__ = [
     "TurnBudget",
     "TurnBudgetExpired",
     "await_model_under_turn_budget",
+    "finite_remaining_ms",
     "hash_ids",
     "local_worker_info",
     "new_turn_budget",
