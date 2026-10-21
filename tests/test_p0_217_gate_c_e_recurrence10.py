@@ -368,3 +368,8 @@ async def test_answer_429_still_propagates_with_upstream() -> None:
             initial_query_count=12,
             upstream_latency_ms=5000.0,
         )
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

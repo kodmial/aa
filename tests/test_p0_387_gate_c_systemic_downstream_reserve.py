@@ -34,6 +34,13 @@ import pathlib
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")
+
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -252,7 +259,7 @@ async def test_first_slow_semantic_call_is_bounded_by_p95_headroom(
     )
     # Shrink only the stage headroom so the bounded tail is observable
     # without a multi-second test; the production value is 20s.
-    monkeypatch.setattr(retrieval_node_mod, "RETRIEVAL_SEMANTIC_STAGE_BUDGET_S", 0.3)
+    monkeypatch.setenv("AA_RETRIEVAL_SEMANTIC_STAGE_BUDGET_S", "0.3")
 
     class _SlowModel:
         def __init__(self) -> None:

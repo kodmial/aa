@@ -59,6 +59,12 @@ from aa.qualification.self_proving import (
     validate_exact_sha,
 )
 
+
+@pytest.fixture(autouse=True)
+def _enforce_gate_e(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_LATENCY_GATE_MODE", "enforce")
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
 OTHER_SHA = "b" * 40

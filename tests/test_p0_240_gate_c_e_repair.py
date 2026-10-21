@@ -279,3 +279,8 @@ def test_no_exact_live_question_special_cases() -> None:
     for source in sources:
         for fragment in frozen_fragments:
             assert fragment not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

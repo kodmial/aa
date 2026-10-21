@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aa.config import DEFAULT_AA_AGENT
+from aa.time_policy import current_time_policy, evaluate_latency_thresholds
 
 ISSUE_NUMBER = 146
 CONTROL_ISSUE_NUMBER = 31
@@ -596,6 +597,11 @@ def refusal_explanation(verdict: FinalVerdict | None, *, current_sha: str) -> st
             f"current main is {current[:12]}; /run allowed as UNQUALIFIED pending requalification."
         )
     if verdict.status == "PASS" and not verdict.blocking_gate:
+        if current_time_policy().latency_gate_mode == "observe":
+            return (
+                f"READY (QUALIFIED (quality-first; latency SLO not evaluated)): "
+                f"exact main {current[:12]} holds fresh trusted PASS."
+            )
         return f"READY (QUALIFIED): exact main {current[:12]} holds fresh trusted PASS."
     blocking = verdict.blocking_gate or next(
         (
@@ -684,17 +690,27 @@ def rerun_plan(failed_gate: str) -> list[str]:
 
 
 def slo_guards(
-    latencies_ms: list[float], *, p95_target_ms: float = float(P95_TARGET_MS)
-) -> tuple[bool, str, dict[str, float]]:
-    """Evaluate Gate E SLO guards (fail-closed on pathological latency)."""
+    latencies_ms: list[float],
+    *,
+    p95_target_ms: float | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Evaluate Gate E timing (observe mode never fails on thresholds)."""
+    policy = current_time_policy()
+    if mode is not None:
+        policy = policy.with_latency_mode(mode)
+    target_ms = float(P95_TARGET_MS) if p95_target_ms is None else float(p95_target_ms)
+    metrics: dict[str, Any]
     if not isinstance(latencies_ms, list) or not latencies_ms:
         metrics = {
             "p50_ms": 0.0,
             "p95_ms": 0.0,
             "max_ms": 0.0,
             "turns": 0.0,
-            "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
-            "p95_target_ms": float(p95_target_ms),
+            "budget_ms": float(policy.latency_max_turn_ms),
+            "p95_target_ms": float(target_ms),
+            "policy_mode": policy.latency_gate_mode,
+            "slo_evaluated": policy.latency_gate_mode == "enforce",
         }
         return False, "no latency samples; INCOMPLETE", metrics
     validated: list[float] = []
@@ -707,8 +723,10 @@ def slo_guards(
                 "p95_ms": 0.0,
                 "max_ms": 0.0,
                 "turns": float(len(latencies_ms)),
-                "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
-                "p95_target_ms": float(p95_target_ms),
+                "budget_ms": float(policy.latency_max_turn_ms),
+                "p95_target_ms": float(target_ms),
+                "policy_mode": policy.latency_gate_mode,
+                "slo_evaluated": policy.latency_gate_mode == "enforce",
             }
             return False, "non-numeric latency sample; INCOMPLETE", metrics
         if not math.isfinite(value) or value <= 0:
@@ -717,8 +735,10 @@ def slo_guards(
                 "p95_ms": 0.0,
                 "max_ms": 0.0,
                 "turns": float(len(latencies_ms)),
-                "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
-                "p95_target_ms": float(p95_target_ms),
+                "budget_ms": float(policy.latency_max_turn_ms),
+                "p95_target_ms": float(target_ms),
+                "policy_mode": policy.latency_gate_mode,
+                "slo_evaluated": policy.latency_gate_mode == "enforce",
             }
             return False, "invalid latency sample; INCOMPLETE", metrics
         validated.append(value)
@@ -727,22 +747,17 @@ def slo_guards(
         "p95_ms": percentile_ms(validated, 95),
         "max_ms": max(validated),
         "turns": float(len(validated)),
-        "budget_ms": float(ORDINARY_TURN_BUDGET_MS),
-        "p95_target_ms": float(p95_target_ms),
+        "budget_ms": float(policy.latency_max_turn_ms),
+        "p95_target_ms": float(target_ms),
+        "policy_mode": policy.latency_gate_mode,
+        "slo_evaluated": policy.latency_gate_mode == "enforce",
     }
-    if metrics["max_ms"] >= float(ORDINARY_TURN_BUDGET_MS):
-        return (
-            False,
-            (f"ordinary turn took {metrics['max_ms']:.0f}ms >= {ORDINARY_TURN_BUDGET_MS}ms budget"),
-            metrics,
-        )
-    if metrics["p95_ms"] > float(p95_target_ms):
-        return (
-            False,
-            (f"p95 {metrics['p95_ms']:.0f}ms exceeds target {p95_target_ms:.0f}ms"),
-            metrics,
-        )
-    return True, "slo within guard", metrics
+    ok, detail = evaluate_latency_thresholds(
+        float(metrics["p95_ms"]), float(metrics["max_ms"]), policy=policy
+    )
+    if not ok:
+        return False, detail, metrics
+    return True, detail, metrics
 
 
 def diversity_passes(reply_signatures: list[str]) -> tuple[bool, str]:

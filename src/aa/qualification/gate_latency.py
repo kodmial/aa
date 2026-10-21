@@ -37,9 +37,13 @@ from typing import Any
 
 from aa.qualification.self_proving import (
     ORDINARY_TURN_BUDGET_MS,
-    P95_TARGET_MS,
     GateEvidence,
     percentile_ms,
+)
+from aa.time_policy import (
+    TimePolicy,
+    current_time_policy,
+    evaluate_latency_thresholds,
 )
 
 LATENCY_EVIDENCE_SCHEMA = "aa-gate-e-latency/1"
@@ -73,12 +77,16 @@ def new_causality_id() -> str:
     return uuid.uuid4().hex
 
 
-def _is_finite_positive(value: Any) -> bool:
+def _as_finite_positive_float(value: Any) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return False
-    return math.isfinite(number) and number > 0
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _is_finite_positive(value: Any) -> bool:
+    return _as_finite_positive_float(value) is not None
 
 
 @dataclass(frozen=True)
@@ -183,6 +191,8 @@ class LatencyReport:
     source_proof_kind: str = "c-series-simulated-handoff"
     failure_category: str = ""
     detail: str = ""
+    latency_gate_mode: str = "observe"
+    slo_evaluated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -200,6 +210,8 @@ class LatencyReport:
             "source_proof_kind": self.source_proof_kind,
             "failure_category": self.failure_category,
             "detail": self.detail,
+            "latency_gate_mode": self.latency_gate_mode,
+            "slo_evaluated": bool(self.slo_evaluated),
         }
 
 
@@ -254,6 +266,26 @@ def samples_from_legacy_latencies(
     return samples
 
 
+def _diagnostic_timeout_latency_ms(entry: dict[str, Any]) -> float | None:
+    """Return an actually observed timeout latency from a legacy diagnostic.
+
+    Legacy payloads may carry the elapsed wait/deadline in one of these
+    privacy-safe numeric fields. Prefer it over the configured operational
+    bound so censored evidence never claims more elapsed time than was
+    actually observed.
+    """
+    for key in (
+        "delivery_latency_ms",
+        "observed_latency_ms",
+        "elapsed_ms",
+        "latency_ms",
+    ):
+        numeric = _as_finite_positive_float(entry.get(key))
+        if numeric is not None:
+            return numeric
+    return None
+
+
 def build_c_series_from_live_summary(
     payload: dict[str, Any],
     *,
@@ -283,6 +315,36 @@ def build_c_series_from_live_summary(
     metrics = live_lane.get("metrics", {})
     if not isinstance(metrics, dict):
         raise GateLatencyError(MISSING_LIVE_SAMPLES)
+    # New payloads record the scenario wait actually used for the run.
+    # Legacy payloads predate that field, so fall back to the old
+    # bounded-censor value instead of the current process policy: rebuilding
+    # old evidence under a larger configured wait must not inflate it.
+    recorded_wait_s = _as_finite_positive_float(metrics.get("qualification_scenario_wait_s"))
+    recorded_wait_ms = recorded_wait_s * 1000.0 if recorded_wait_s is not None else None
+    legacy_bound_ms = float(ORDINARY_TURN_BUDGET_MS)
+    typed_raw = metrics.get("turn_latency_samples", [])
+    if isinstance(typed_raw, list) and typed_raw:
+        typed: list[TurnSample] = []
+        for entry in typed_raw:
+            if not isinstance(entry, dict):
+                raise GateLatencyError("turn sample must be an object")
+            outcome = str(entry.get("outcome", "served") or "served").strip()
+            if outcome == "harness-error":
+                typed.append(
+                    TurnSample(
+                        causality_id=new_causality_id(),
+                        family=str(entry.get("family", "") or "ordinary-text")[:64],
+                        mode="text",
+                        outcome="failed",
+                        latency_ms=float(entry.get("latency_ms", 0.0) or 0.0),
+                        series=C_SERIES,
+                        censored=True,
+                    )
+                )
+                continue
+            typed.append(TurnSample.from_dict(entry))
+        validate_samples(typed)
+        return typed
     served: list[TurnSample] = []
     raw_served = metrics.get("turn_latencies_ms", [])
     if isinstance(raw_served, list):
@@ -308,16 +370,26 @@ def build_c_series_from_live_summary(
             if bool(entry.get("delivery_timeout", False)) is not True:
                 continue
             family = str(entry.get("family", "") or "ordinary-text")[:64]
-            # Bounded censoring: the observed deadline is the measurement,
-            # capped at the canonical budget so one wedged turn cannot
-            # produce an infinite sample while still failing reliability.
+            # Prefer the actual observed timeout elapsed time when the
+            # legacy diagnostic carries it, bounded only by the operational
+            # wait recorded for that run (if any). Never cap observed
+            # elapsed time at a product SLO or the current process policy.
+            observed_ms = _diagnostic_timeout_latency_ms(entry)
+            if observed_ms is not None:
+                latency_ms = (
+                    min(observed_ms, recorded_wait_ms)
+                    if recorded_wait_ms is not None
+                    else observed_ms
+                )
+            else:
+                latency_ms = recorded_wait_ms if recorded_wait_ms is not None else legacy_bound_ms
             censored.append(
                 TurnSample(
                     causality_id=new_causality_id(),
                     family=family or "ordinary-text",
                     mode="text",
                     outcome="timeout",
-                    latency_ms=float(ORDINARY_TURN_BUDGET_MS),
+                    latency_ms=latency_ms,
                     series=C_SERIES,
                     censored=True,
                 )
@@ -336,7 +408,9 @@ def build_c_series_from_live_summary(
                     family="ordinary-text",
                     mode="text",
                     outcome="timeout",
-                    latency_ms=float(ORDINARY_TURN_BUDGET_MS),
+                    latency_ms=(
+                        recorded_wait_ms if recorded_wait_ms is not None else legacy_bound_ms
+                    ),
                     series=C_SERIES,
                     censored=True,
                 )
@@ -354,13 +428,20 @@ def evaluate_latency_report(
     provider_id: str = "",
     source_proof_kind: str = "c-series-simulated-handoff",
     boundary: str = "production-update-intake-to-simulated-handoff",
+    mode: str | None = None,
+    policy: TimePolicy | None = None,
 ) -> LatencyReport:
-    """Evaluate C-series samples against the unchanged SLO (fail-closed).
+    """Evaluate C-series samples under the configured Gate E policy.
 
-    Any censored timeout/failed ordinary turn fails reliability (FAIL),
-    while still contributing its bounded latency to p50/p95/max so slow
-    turns cannot be hidden by exclusion.
+    Reliability is always enforced: any censored timeout/failed ordinary
+    turn fails Gate E while still contributing its observed latency to
+    p50/p95/max. In ``observe`` mode the p95/max thresholds are not
+    evaluated; in ``enforce`` mode they are. Evidence-integrity failures
+    remain BLOCKED in both modes.
     """
+    active = policy if policy is not None else current_time_policy()
+    if mode is not None:
+        active = active.with_latency_mode(mode)
     if not samples:
         return LatencyReport(
             status="BLOCKED",
@@ -375,6 +456,8 @@ def evaluate_latency_report(
             source_proof_kind=source_proof_kind[:64],
             failure_category=MISSING_LIVE_SAMPLES,
             detail="no trustworthy live turn samples",
+            latency_gate_mode=active.latency_gate_mode,
+            slo_evaluated=active.latency_gate_mode == "enforce",
         )
     validate_samples(samples)
     latencies = [float(sample.latency_ms) for sample in samples]
@@ -383,64 +466,35 @@ def evaluate_latency_report(
     p50 = percentile_ms(latencies, 50)
     p95 = percentile_ms(latencies, 95)
     maximum = max(latencies)
+
+    def _report(status: str, *, failure_category: str = "", detail: str = "") -> LatencyReport:
+        return LatencyReport(
+            status=status,
+            sample_count=len(samples),
+            served_count=served_count,
+            censored_count=censored_count,
+            p50_ms=p50,
+            p95_ms=p95,
+            max_ms=maximum,
+            boundary=boundary,
+            provider_id=provider_id[:64],
+            source_proof_kind=source_proof_kind[:64],
+            failure_category=failure_category,
+            detail=detail,
+            latency_gate_mode=active.latency_gate_mode,
+            slo_evaluated=active.latency_gate_mode == "enforce",
+        )
+
     if censored_count > 0:
-        return LatencyReport(
-            status="FAIL",
-            sample_count=len(samples),
-            served_count=served_count,
-            censored_count=censored_count,
-            p50_ms=p50,
-            p95_ms=p95,
-            max_ms=maximum,
-            boundary=boundary,
-            provider_id=provider_id[:64],
-            source_proof_kind=source_proof_kind[:64],
+        return _report(
+            "FAIL",
             failure_category=RELIABILITY_FAILED,
-            detail=f"{censored_count} ordinary turn(s) timed out/failed; censored timing counted",
+            detail=f"{censored_count} ordinary turn(s) timed out/failed; observed timing counted",
         )
-    if maximum >= float(ORDINARY_TURN_BUDGET_MS):
-        return LatencyReport(
-            status="FAIL",
-            sample_count=len(samples),
-            served_count=served_count,
-            censored_count=censored_count,
-            p50_ms=p50,
-            p95_ms=p95,
-            max_ms=maximum,
-            boundary=boundary,
-            provider_id=provider_id[:64],
-            source_proof_kind=source_proof_kind[:64],
-            failure_category=SLO_EXCEEDED,
-            detail=f"ordinary turn took {maximum:.0f}ms >= {ORDINARY_TURN_BUDGET_MS}ms budget",
-        )
-    if p95 > float(P95_TARGET_MS):
-        return LatencyReport(
-            status="FAIL",
-            sample_count=len(samples),
-            served_count=served_count,
-            censored_count=censored_count,
-            p50_ms=p50,
-            p95_ms=p95,
-            max_ms=maximum,
-            boundary=boundary,
-            provider_id=provider_id[:64],
-            source_proof_kind=source_proof_kind[:64],
-            failure_category=SLO_EXCEEDED,
-            detail=f"p95 {p95:.0f}ms exceeds target {P95_TARGET_MS:.0f}ms",
-        )
-    return LatencyReport(
-        status="PASS",
-        sample_count=len(samples),
-        served_count=served_count,
-        censored_count=censored_count,
-        p50_ms=p50,
-        p95_ms=p95,
-        max_ms=maximum,
-        boundary=boundary,
-        provider_id=provider_id[:64],
-        source_proof_kind=source_proof_kind[:64],
-        detail="slo within guard",
-    )
+    ok, detail = evaluate_latency_thresholds(p95, maximum, policy=active)
+    if not ok:
+        return _report("FAIL", failure_category=SLO_EXCEEDED, detail=detail)
+    return _report("PASS", detail=detail)
 
 
 def classify_optional_external_send(
@@ -476,6 +530,8 @@ def latency_evidence_checksum(report: LatencyReport, *, sha: str, run_id: str) -
             "boundary": report.boundary,
             "provider_id": report.provider_id,
             "source_proof_kind": report.source_proof_kind,
+            "latency_gate_mode": report.latency_gate_mode,
+            "slo_evaluated": bool(report.slo_evaluated),
             "sha": sha,
             "run_id": run_id,
         },

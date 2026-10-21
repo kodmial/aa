@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any
 
@@ -35,6 +34,7 @@ from aa.conversation.planner_schema import (
     validate_query_plan,
 )
 from aa.conversation.v2_prompts import load_planner_system_v2
+from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.planner_node")
 
@@ -109,13 +109,9 @@ PLANNER_TIME_BUDGET_S = 25.0
 PLANNER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
 
 
-def _diagnostic_no_turn_limits() -> bool:
-    """Temporarily disable AA-owned latency budgets in manual Telegram tests.
-
-    Provider/network error deadlines and runner lifetime remain authoritative.
-    Ordinary production and qualification (env absent) are unchanged.
-    """
-    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+def _turn_time_limits_disabled() -> bool:
+    """Whether AA-owned turn/stage time limits are disabled by policy."""
+    return not current_time_policy().turn_time_limits_enabled
 
 
 def _display_message_text(value: object) -> str:
@@ -493,7 +489,8 @@ async def run_planner(
     )
     system_text = str(messages[0].content)
     user_text = str(messages[1].content)
-    budget = PLANNER_TIME_BUDGET_S if time_budget_s is None else float(time_budget_s)
+    policy = current_time_policy()
+    budget = float(policy.planner_time_budget_s) if time_budget_s is None else float(time_budget_s)
     if not budget > 0:
         raise QueryPlanValidationError("planner time budget must be > 0")
 
@@ -505,13 +502,13 @@ async def run_planner(
             messages=messages,
             structured_attempt_budget=(
                 float("inf")
-                if _diagnostic_no_turn_limits()
-                else min(PLANNER_STRUCTURED_ATTEMPT_BUDGET_S, budget)
+                if _turn_time_limits_disabled()
+                else min(float(policy.planner_structured_attempt_budget_s), budget)
             ),
         )
 
     try:
-        if _diagnostic_no_turn_limits():
+        if _turn_time_limits_disabled():
             return await _provider_plan()
         return await asyncio.wait_for(_provider_plan(), timeout=budget)
     except TimeoutError as exc:
@@ -590,7 +587,7 @@ async def _run_planner_provider(
             )
             raw = (
                 await structured_call
-                if _diagnostic_no_turn_limits()
+                if _turn_time_limits_disabled()
                 else await asyncio.wait_for(structured_call, timeout=structured_attempt_budget)
             )
         except TimeoutError:

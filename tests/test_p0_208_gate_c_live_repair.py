@@ -301,7 +301,7 @@ async def test_repair_budget_exceeded_skips_repair_and_narrows(
         raise AssertionError("repair retrieval must not run over budget")
 
     monkeypatch.setattr(evidence_mod, "retrieve_evidence", _fail_retrieve)
-    monkeypatch.setattr(turn_pipeline_module, "TURN_REPAIR_TIME_BUDGET_S", -1.0)
+    monkeypatch.setattr(turn_pipeline_module, "_effective_repair_budget_s", lambda: -1.0)
     assert TURN_REPAIR_TIME_BUDGET_S > 0
 
     outcome = await run_v2_answer_turn(
@@ -412,3 +412,8 @@ async def test_fast_turn_still_repairs(monkeypatch: pytest.MonkeyPatch) -> None:
     assert outcome["rounds"] == 1
     assert outcome["text"] == repaired_draft
     assert outcome["telemetry"]["repair_budget_exceeded"] is False
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

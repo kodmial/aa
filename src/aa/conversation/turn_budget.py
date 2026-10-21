@@ -48,6 +48,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from aa.time_policy import current_time_policy
+
 # Diagnostic target for the warm local RRF-only RAM stage. Must stay
 # equal to ``aa.retrieval.evidence.INTERACTIVE_LATENCY_BUDGET_MS``;
 # enforced by tests. Diagnostic only: never a model-call deadline.
@@ -77,6 +79,12 @@ DOWNSTREAM_MIN_RESERVE_S = 5.0
 # Floor for one allocated model await so a nearly-spent budget still
 # fails fast instead of launching a zero-time round.
 MIN_MODEL_SLICE_S = 0.05
+
+# Evidence/debugging sentinel for an unbounded remaining budget. Keeping
+# the value finite avoids non-standard ``Infinity`` in JSON evidence;
+# consumers must treat any negative value as "time limits disabled", not
+# as an expired deadline (see ``remaining_unbounded`` in snapshots).
+UNBOUNDED_REMAINING_MS = -1.0
 
 # Typed stage names for per-stage outcomes (privacy-safe, no text).
 STAGE_LOCAL_RETRIEVAL_SLOW = "local_retrieval_slow"
@@ -183,6 +191,7 @@ class TurnBudget:
     deadline_s: float = TURN_END_TO_END_BUDGET_S
     upstream_spent_s: float = 0.0
     stages: list[StageRecord] = field(default_factory=list)
+    time_limits_enabled: bool = True
 
     def elapsed_s(self) -> float:
         try:
@@ -196,6 +205,8 @@ class TurnBudget:
         return self.elapsed_s() * 1000.0
 
     def remaining_s(self) -> float:
+        if not self.time_limits_enabled:
+            return float("inf")
         try:
             return float(self.deadline_s) - self.elapsed_s()
         except Exception:
@@ -205,14 +216,14 @@ class TurnBudget:
         return self.remaining_s() * 1000.0
 
     def is_expired(self) -> bool:
-        return self.remaining_s() <= 0.0
+        return self.time_limits_enabled and self.remaining_s() <= 0.0
 
     def allocate_semantic_timeout_s(
         self,
         *,
         reserve_s: float = DOWNSTREAM_MIN_RESERVE_S,
         max_timeout_s: float | None = None,
-    ) -> float:
+    ) -> float | None:
         """Timeout for one semantic model await from remaining turn budget.
 
         The allocation is the remaining end-to-end budget minus the small
@@ -226,7 +237,12 @@ class TurnBudget:
         ``max_timeout_s`` is an optional stage-level cap (Gate E p95
         headroom for retrieval, kodmial/aa#400). A non-positive cap means
         the stage already spent its headroom, so no provider call starts.
+
+        When turn time limits are disabled, returns ``None``: the caller
+        must await the provider without a turn/stage timeout.
         """
+        if not self.time_limits_enabled:
+            return None
         try:
             reserve = max(0.0, float(reserve_s))
         except (TypeError, ValueError):
@@ -239,7 +255,8 @@ class TurnBudget:
                 elapsed_ms=self.elapsed_ms(),
                 remaining_ms=self.remaining_ms(),
             )
-        timeout_s = max(MIN_MODEL_SLICE_S, min(float(remaining), PROVIDER_REQUEST_TIMEOUT_S))
+        transport_ceiling = float(current_time_policy().transport_timeout_s)
+        timeout_s = max(MIN_MODEL_SLICE_S, min(float(remaining), transport_ceiling))
         if max_timeout_s is not None:
             try:
                 stage_cap = float(max_timeout_s)
@@ -270,17 +287,25 @@ class TurnBudget:
             latency_ms=max(0.0, float(latency_ms or 0.0)),
             category=str(category or "")[:64],
             id_digest=str(id_digest or "")[:32],
-            remaining_ms=self.remaining_ms(),
+            remaining_ms=_finite_remaining_ms(self),
         )
         self.stages.append(record)
         return record
 
     def snapshot(self) -> dict[str, Any]:
-        """Privacy-safe snapshot: durations, digests, remaining (no text)."""
+        """Privacy-safe snapshot: durations, digests, remaining (no text).
+
+        ``remaining_ms`` is :data:`UNBOUNDED_REMAINING_MS` (a negative
+        sentinel) when turn time limits are disabled; ``remaining_unbounded``
+        makes that state explicit so evidence/debug consumers never mistake
+        it for an expired deadline.
+        """
         return {
             "deadline_s": float(self.deadline_s),
+            "time_limits_enabled": bool(self.time_limits_enabled),
+            "remaining_unbounded": not bool(self.time_limits_enabled),
             "elapsed_ms": round(self.elapsed_ms(), 3),
-            "remaining_ms": round(self.remaining_ms(), 3),
+            "remaining_ms": round(_finite_remaining_ms(self), 3),
             "upstream_spent_s": round(float(self.upstream_spent_s or 0.0), 3),
             "stages": [
                 {
@@ -296,16 +321,37 @@ class TurnBudget:
         }
 
 
+def finite_remaining_ms(budget: TurnBudget) -> float:
+    """Return finite evidence remaining ms (``-1`` means unbounded)."""
+    value = budget.remaining_ms()
+    return value if value != float("inf") else UNBOUNDED_REMAINING_MS
+
+
+# Backwards-compatible private alias for internal call sites/tests.
+_finite_remaining_ms = finite_remaining_ms
+
+
 def new_turn_budget(
-    *, upstream_latency_ms: float = 0.0, deadline_s: float | None = None
+    *,
+    upstream_latency_ms: float = 0.0,
+    deadline_s: float | None = None,
+    time_limits_enabled: bool | None = None,
 ) -> TurnBudget:
     """Create one turn budget folding in already-spent upstream cost."""
+    policy = current_time_policy()
+    enabled = (
+        policy.turn_time_limits_enabled
+        if time_limits_enabled is None
+        else bool(time_limits_enabled)
+    )
     try:
         upstream_s = max(0.0, float(upstream_latency_ms or 0.0)) / 1000.0
     except (TypeError, ValueError):
         upstream_s = 0.0
     try:
-        deadline = float(deadline_s) if deadline_s is not None else TURN_END_TO_END_BUDGET_S
+        deadline = (
+            float(deadline_s) if deadline_s is not None else float(policy.turn_end_to_end_budget_s)
+        )
     except (TypeError, ValueError):
         deadline = TURN_END_TO_END_BUDGET_S
     if not deadline > 0:
@@ -314,6 +360,7 @@ def new_turn_budget(
         started_monotonic=time.perf_counter(),
         deadline_s=deadline,
         upstream_spent_s=upstream_s,
+        time_limits_enabled=enabled,
     )
 
 
@@ -367,7 +414,10 @@ async def await_model_under_turn_budget(
     except ImportError:
         _rate_limit_types = ()
     try:
-        result = await asyncio.wait_for(coro, timeout=timeout_s)
+        if timeout_s is None:
+            result = await coro
+        else:
+            result = await asyncio.wait_for(coro, timeout=timeout_s)
     except _rate_limit_types:
         # Dedicated 429 path: OpenCodeRateLimitError is a plain Exception
         # (never a TimeoutError), so it must be caught before the timeout
@@ -397,8 +447,8 @@ async def await_model_under_turn_budget(
             "semantic provider call exceeded turn deadline",
             stage=stage,
             elapsed_ms=elapsed_ms,
-            allocated_s=timeout_s,
-            remaining_ms=budget.remaining_ms(),
+            allocated_s=timeout_s or 0.0,
+            remaining_ms=_finite_remaining_ms(budget),
         ) from exc
     except TimeoutError as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -413,8 +463,8 @@ async def await_model_under_turn_budget(
             "semantic provider call exceeded turn deadline",
             stage=stage,
             elapsed_ms=elapsed_ms,
-            allocated_s=timeout_s,
-            remaining_ms=budget.remaining_ms(),
+            allocated_s=timeout_s or 0.0,
+            remaining_ms=_finite_remaining_ms(budget),
         ) from exc
     except Exception:
         # Any other provider failure propagates untouched (the dedicated
@@ -595,6 +645,7 @@ __all__ = [
     "TURN_HARD_SLO_MS",
     "TURN_P95_TARGET_MS",
     "TYPED_STAGES",
+    "UNBOUNDED_REMAINING_MS",
     "LocalRetrievalReport",
     "LocalRetrievalTimeout",
     "ProviderSemanticTimeout",
@@ -602,6 +653,7 @@ __all__ = [
     "TurnBudget",
     "TurnBudgetExpired",
     "await_model_under_turn_budget",
+    "finite_remaining_ms",
     "hash_ids",
     "local_worker_info",
     "new_turn_budget",

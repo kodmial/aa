@@ -381,6 +381,16 @@ def clear_dag_registry() -> None:
         pass
 
 
+def _policy_time_limits_enabled() -> bool:
+    """Resolve the shared runtime time-policy switch (never raises)."""
+    try:
+        from aa.time_policy import current_time_policy
+
+        return bool(current_time_policy().turn_time_limits_enabled)
+    except Exception:
+        return True
+
+
 @dataclass(frozen=True)
 class SemanticWorkPlan:
     """One coherent budget-aware semantic work plan for a turn.
@@ -402,6 +412,15 @@ class SemanticWorkPlan:
     finalize_reserve_s: float = FINALIZE_RESERVE_S
     verifier_round_mode: str = VERIFIER_ROUND_MODE
     max_full_repair_rounds: int = MAX_FULL_REPAIR_ROUNDS
+    time_limits_enabled: bool | None = None
+
+    def __post_init__(self) -> None:
+        enabled = (
+            _policy_time_limits_enabled()
+            if self.time_limits_enabled is None
+            else bool(self.time_limits_enabled)
+        )
+        object.__setattr__(self, "time_limits_enabled", enabled)
 
     def allows_provider_call(
         self, *, remaining_s: float, need_s: float, reserve_for: str = ""
@@ -412,7 +431,13 @@ class SemanticWorkPlan:
         ``need_s`` the minimum useful slice for the call, and
         ``reserve_for`` the downstream stage that must keep its slice
         (``"verifier"``, ``"judge"``, ``"finalize"`` or ``""``).
+
+        When turn time limits are disabled by policy, no elapsed-time or
+        downstream-reserve gate applies: finite count/progress limits are
+        enforced elsewhere and remain active.
         """
+        if not self.time_limits_enabled:
+            return True
         try:
             remaining = float(remaining_s)
             need = float(need_s)
@@ -435,20 +460,29 @@ class SemanticWorkPlan:
 
     def verifier_slice(self, remaining_s: float) -> float | None:
         """Remaining slice for one verifier round (``None`` = full default)."""
+        if not self.time_limits_enabled:
+            return None
         try:
             remaining = float(remaining_s)
         except (TypeError, ValueError):
             return 0.0
         try:
-            from aa.conversation.verifier import VERIFIER_TURN_BUDGET_S as _default
+            from aa.time_policy import current_time_policy
+
+            default = float(current_time_policy().verifier_turn_budget_s)
         except Exception:
-            _default = 40.0
-        if remaining >= float(_default):
+            try:
+                from aa.conversation.verifier import VERIFIER_TURN_BUDGET_S as default
+            except Exception:
+                default = 40.0
+        if remaining >= float(default):
             return None
         return max(0.0, remaining)
 
     def judge_slice(self, remaining_s: float) -> float:
         """Capped slice for one judge round (``0`` = skip, budget-neutral)."""
+        if not self.time_limits_enabled:
+            return float("inf")
         try:
             remaining = float(remaining_s)
         except (TypeError, ValueError):
@@ -482,16 +516,26 @@ class SemanticWorkPlan:
             "finalize_reserve_s": float(self.finalize_reserve_s),
             "verifier_round_mode": str(self.verifier_round_mode or ""),
             "max_full_repair_rounds": int(self.max_full_repair_rounds),
+            "time_limits_enabled": bool(self.time_limits_enabled),
         }
 
 
-def new_work_plan(dag: SemanticTurnDAG | None = None) -> SemanticWorkPlan:
-    """Build the per-turn work plan bound to one DAG (never raises)."""
+def new_work_plan(
+    dag: SemanticTurnDAG | None = None,
+    *,
+    time_limits_enabled: bool | None = None,
+) -> SemanticWorkPlan:
+    """Build the per-turn work plan bound to one DAG (never raises).
+
+    The plan follows the shared runtime time policy: when turn time
+    limits are disabled, deadline/slice gates become inactive while all
+    finite count/progress limits remain unchanged.
+    """
     try:
         dag_id = str(dag.dag_id) if dag is not None else ""
     except Exception:
         dag_id = ""
-    return SemanticWorkPlan(dag_id=dag_id)
+    return SemanticWorkPlan(dag_id=dag_id, time_limits_enabled=time_limits_enabled)
 
 
 @dataclass(frozen=True)
@@ -522,8 +566,19 @@ def remaining_turn_s(
     turn_started_monotonic: float,
     upstream_spent_s: float = 0.0,
     budget_s: float = INTERNAL_TURN_BUDGET_S,
+    time_limits_enabled: bool | None = None,
 ) -> float:
-    """Return remaining end-to-end budget seconds (never raises)."""
+    """Return remaining end-to-end budget seconds (never raises).
+
+    When turn time limits are disabled by policy the remaining budget is
+    unbounded (``float("inf")``), so callers never turn elapsed time into
+    a skip gate while finite count/progress controls stay active.
+    """
+    enabled = (
+        _policy_time_limits_enabled() if time_limits_enabled is None else bool(time_limits_enabled)
+    )
+    if not enabled:
+        return float("inf")
     try:
         elapsed = max(0.0, time.perf_counter() - float(turn_started_monotonic))
         upstream = max(0.0, float(upstream_spent_s or 0.0))

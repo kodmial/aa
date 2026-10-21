@@ -58,7 +58,6 @@ from typing import Any
 
 import pytest
 
-import aa.conversation.planner_node as planner_module
 from aa.conversation.model_adapter import (
     clear_omitted_structured_cache,
     clear_primary_circuit,
@@ -112,7 +111,7 @@ async def test_slow_structured_serves_tailored_text_queries_not_generic(
 ) -> None:
     """A slow structured channel degrades to this turn's text queries."""
 
-    monkeypatch.setattr(planner_module, "PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", 0.05)
+    monkeypatch.setenv("AA_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S", str(0.05))
 
     class _SlowStructured:
         def __init__(self) -> None:
@@ -395,10 +394,9 @@ async def test_slow_verifier_maps_to_unavailable_without_slow_grind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The answer pipeline maps a verifier timeout to fast unavailable handling."""
-    import aa.conversation.verifier as verifier_module
     from aa.conversation.turn_pipeline import _verify_draft
 
-    monkeypatch.setattr(verifier_module, "VERIFIER_TURN_BUDGET_S", 0.2)
+    monkeypatch.setenv("AA_VERIFIER_TURN_BUDGET_S", str(0.2))
 
     class _SlowVerifier:
         async def ainvoke_structured(
@@ -526,3 +524,8 @@ def test_no_exact_live_question_special_cases() -> None:
             "ночью не могу успокоиться",
         ):
             assert probe not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

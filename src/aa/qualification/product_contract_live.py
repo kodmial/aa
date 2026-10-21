@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from aa.opencode.errors import OpenCodeRateLimitError
+from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.qualification.product_contract_live")
 
@@ -2415,6 +2416,9 @@ async def run_live_telegram_evidence_lane(
     # this, a 25-minute Gate C collapses 18 different failures into one
     # fingerprint and automated repair has no actionable root cause.
     scenario_diagnostics: list[dict[str, Any]] = []
+    # Resolve the configurable operational wait once, before the harness can
+    # fail, so timeout evidence stays available for a pre-scenario crash too.
+    scenario_wait_s = float(current_time_policy().qualification_scenario_wait_s)
     served_models_by_agent: dict[str, list[str]] = {}
     voice_readiness: dict[str, Any] = {
         "voice_available": False,
@@ -2449,6 +2453,7 @@ async def run_live_telegram_evidence_lane(
             "latency_source_proof_kind": "c-series-simulated-handoff",
             "latency_units": "ms",
             "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+            "qualification_scenario_wait_s": float(scenario_wait_s),
             "live_prerequisites_present": False,
             "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
         }
@@ -2784,7 +2789,7 @@ async def run_live_telegram_evidence_lane(
                 }
                 started = time.perf_counter()
                 api.pending_updates.append(raw)
-                deadline = loop.time() + 150.0
+                deadline = loop.time() + scenario_wait_s
                 last_progress_tick = loop.time()
                 while len(api.sent_texts) <= before and loop.time() < deadline:
                     await asyncio.sleep(0.02)
@@ -2799,12 +2804,20 @@ async def run_live_telegram_evidence_lane(
                         )
                         last_progress_tick = loop.time()
                 if len(api.sent_texts) <= before:
+                    timeout_elapsed_ms = round(
+                        (time.perf_counter() - started) * 1000.0,
+                        1,
+                    )
                     failed.append(f"live-delivery-{family}-timeout")
                     scenario_diagnostics.append(
                         {
                             "scenario_index": position,
                             "family": family,
                             "delivery_timeout": True,
+                            # Preserve the actually observed elapsed wait for
+                            # legacy/aggregate consumers; never cap it at the
+                            # old product SLO.
+                            "delivery_latency_ms": timeout_elapsed_ms,
                         }
                     )
                     # Bounded-censored latency: a timed-out ordinary turn is
@@ -2819,13 +2832,7 @@ async def run_live_telegram_evidence_lane(
                                 "family": family,
                                 "mode": "text",
                                 "outcome": "timeout",
-                                "latency_ms": round(
-                                    min(
-                                        (time.perf_counter() - started) * 1000.0,
-                                        LIVE_TEXT_LATENCY_BUDGET_S * 1000.0,
-                                    ),
-                                    1,
-                                ),
+                                "latency_ms": timeout_elapsed_ms,
                                 "monotonic": True,
                                 "clock": "monotonic-perf_counter",
                                 "series": "c-series-simulated-handoff",
@@ -3090,7 +3097,7 @@ async def run_live_telegram_evidence_lane(
                 }
                 started_raw = time.perf_counter()
                 api.pending_updates.append(raw_turn)
-                deadline_turn = loop.time() + 150.0
+                deadline_turn = loop.time() + scenario_wait_s
                 while len(api.sent_texts) <= before and loop.time() < deadline_turn:
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
@@ -3103,13 +3110,7 @@ async def run_live_telegram_evidence_lane(
                             "family": "ordinary-text",
                             "mode": "text",
                             "outcome": "timeout",
-                            "latency_ms": round(
-                                min(
-                                    elapsed_raw * 1000.0,
-                                    LIVE_TEXT_LATENCY_BUDGET_S * 1000.0,
-                                ),
-                                1,
-                            ),
+                            "latency_ms": round(elapsed_raw * 1000.0, 1),
                             "monotonic": True,
                             "clock": "monotonic-perf_counter",
                             "series": "c-series-simulated-handoff",
@@ -3948,7 +3949,7 @@ async def run_live_telegram_evidence_lane(
                         "family": _family,
                         "mode": "text",
                         "outcome": "harness-error",
-                        "latency_ms": round(LIVE_TEXT_LATENCY_BUDGET_S * 1000.0, 1),
+                        "latency_ms": round(scenario_wait_s * 1000.0, 1),
                         "monotonic": True,
                         "clock": "monotonic-perf_counter",
                         "series": "c-series-simulated-handoff",
@@ -4111,6 +4112,7 @@ async def run_live_telegram_evidence_lane(
         "latency_units": "ms",
         "latency_provider_id": str(getattr(settings, "opencode_model", ""))[:64],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
+        "qualification_scenario_wait_s": float(scenario_wait_s),
         "independent_judge_calls": _judge_calls,
         "independent_judge_helpful": _judge_helpful,
         "independent_judge_unavailable": _judge_unavailable,

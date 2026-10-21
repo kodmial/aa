@@ -27,6 +27,7 @@ import hashlib
 import pathlib
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 
@@ -593,3 +594,8 @@ def test_no_exact_question_whitelist_in_product() -> None:
     for source in sources:
         for fragment in frozen_fragments:
             assert fragment not in source
+
+
+@pytest.fixture(autouse=True)
+def _enable_turn_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AA_TURN_TIME_LIMITS_ENABLED", "true")

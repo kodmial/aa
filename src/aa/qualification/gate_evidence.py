@@ -33,6 +33,7 @@ from aa.qualification.self_proving import (
     validate_exact_sha,
     validate_hex64,
 )
+from aa.time_policy import current_time_policy
 
 SCHEMA_VERSION = "aa-gate-evidence/2"
 VERDICT_SCHEMA_VERSION = "aa-self-proving-verdict/2"
@@ -591,9 +592,17 @@ def verdict_summary_v2(verdict: FinalVerdict, *, failures: list[dict[str, Any]])
     """V2 summary: blocking_gate (human) + failed_gates (all) + roots."""
     payload = verdict.to_dict()
     payload["schema_version"] = VERDICT_SCHEMA_VERSION
+    policy = current_time_policy()
     payload["failed_gates"] = failed_gates_for_verdict(verdict)
     payload["root_components"] = root_components_for_verdict(verdict)
     payload["failures"] = failures
+    payload["latency_gate_mode"] = policy.latency_gate_mode
+    payload["qualification_scope"] = (
+        "quality-first; latency SLO not evaluated"
+        if policy.latency_gate_mode == "observe"
+        else "quality-and-latency"
+    )
+    payload["time_limits_enabled"] = policy.turn_time_limits_enabled
     assert_no_text_leak(payload, owner="gate-verdict")
     return payload
 

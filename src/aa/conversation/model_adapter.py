@@ -41,6 +41,7 @@ from aa.opencode.errors import (
     OpenCodeTimeoutError,
     OpenCodeTransientError,
 )
+from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.model_adapter")
 
@@ -421,7 +422,7 @@ class OpenCodeChatModel(BaseChatModel):
     agent: str
     primary_model: str
     fallback_model: str = ""
-    request_timeout: float = 120.0
+    request_timeout: float = 300.0
     transport_agent: str | None = None
 
     # Single coherent verifier topology (kodmial/aa#380): production
@@ -441,14 +442,19 @@ class OpenCodeChatModel(BaseChatModel):
         agent: str,
         primary_model: str,
         fallback_model: str = "",
-        request_timeout: float = 120.0,
+        request_timeout: float | None = None,
         transport_agent: str | None = None,
     ) -> None:
+        resolved_timeout = (
+            float(current_time_policy().transport_timeout_s)
+            if request_timeout is None
+            else float(request_timeout)
+        )
         super().__init__(  # type: ignore[call-arg]
             agent=agent,
             primary_model=primary_model,
             fallback_model=fallback_model,
-            request_timeout=request_timeout,
+            request_timeout=resolved_timeout,
             transport_agent=transport_agent,
         )
         self._client = client
@@ -1029,7 +1035,7 @@ def build_planner_model(
     *,
     primary_model: str,
     fallback_model: str,
-    request_timeout: float = 120.0,
+    request_timeout: float | None = None,
 ) -> OpenCodeChatModel:
     """Build the hidden planner family with an omitted transport selector.
 
@@ -1056,7 +1062,7 @@ def build_summarizer_model(
     *,
     primary_model: str,
     fallback_model: str,
-    request_timeout: float = 120.0,
+    request_timeout: float | None = None,
 ) -> OpenCodeChatModel:
     """Build the hidden conversation summarizer with an omitted selector.
 
@@ -1085,7 +1091,7 @@ def build_judge_model(
     client: OpenCodeClient,
     *,
     primary_model: str,
-    request_timeout: float = 120.0,
+    request_timeout: float | None = None,
 ) -> OpenCodeChatModel:
     """Build the independent whole-turn helpfulness judge (kodmial/aa#372).
 
@@ -1120,7 +1126,7 @@ def build_verifier_model(
     client: OpenCodeClient,
     *,
     primary_model: str,
-    request_timeout: float = 120.0,
+    request_timeout: float | None = None,
 ) -> OpenCodeChatModel:
     """Build the Muse-only grounding verifier (kodmial/aa#202).
 

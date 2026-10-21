@@ -32,7 +32,6 @@ import ast
 import asyncio
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -75,6 +74,7 @@ from aa.opencode.errors import (
     OpenCodeTimeoutError,
     OpenCodeTransientError,
 )
+from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.verifier")
 
@@ -1524,7 +1524,7 @@ async def _verify_single_unit(
         else _verifier_prefers_text(model)
     )
     if callable(structured_invoke) and not prefer_text:
-        attempt_budget = VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S
+        attempt_budget = float(current_time_policy().verifier_structured_attempt_budget_s)
         attempt_started = time.monotonic()
         try:
             structured_call = structured_invoke(
@@ -1535,7 +1535,7 @@ async def _verify_single_unit(
             )
             raw = (
                 await structured_call
-                if _diagnostic_no_turn_limits()
+                if _turn_time_limits_disabled()
                 else await asyncio.wait_for(structured_call, timeout=attempt_budget)
             )
         except TimeoutError:
@@ -1693,9 +1693,9 @@ VERIFIER_TURN_BUDGET_S = 40.0
 VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S = 6.0
 
 
-def _diagnostic_no_turn_limits() -> bool:
-    """Bypass AA-owned verifier deadlines only for controlled manual diagnosis."""
-    return os.environ.get("AA_DIAGNOSTIC_NO_TURN_LIMITS", "") == "1"
+def _turn_time_limits_disabled() -> bool:
+    """Whether AA-owned verifier time limits are disabled by policy."""
+    return not current_time_policy().turn_time_limits_enabled
 
 
 def _first_fatal_outcome(done: set[asyncio.Task[UnitVerdict]]) -> BaseException | None:
@@ -1746,11 +1746,15 @@ async def _verify_per_unit_concurrent(
     verified units for deterministic narrowing. Provider 429 always
     propagates promptly for runner retire/restart.
     """
-    budget = VERIFIER_TURN_BUDGET_S if turn_budget_s is None else float(turn_budget_s)
+    budget = (
+        float(current_time_policy().verifier_turn_budget_s)
+        if turn_budget_s is None
+        else float(turn_budget_s)
+    )
     if not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
     loop = asyncio.get_running_loop()
-    deadline = None if _diagnostic_no_turn_limits() else loop.time() + budget
+    deadline = None if _turn_time_limits_disabled() else loop.time() + budget
     prefer_text_snapshot = _verifier_prefers_text(model)
     tasks = [
         asyncio.ensure_future(
@@ -1923,7 +1927,11 @@ async def run_batched_verifier(
         validate_book_pack_for_model_use(passages)
     except EvidencePackIntegrityError as exc:
         raise VerifierValidationError(f"evidence integrity failure: {exc}") from exc
-    budget = VERIFIER_TURN_BUDGET_S if turn_budget_s is None else float(turn_budget_s)
+    budget = (
+        float(current_time_policy().verifier_turn_budget_s)
+        if turn_budget_s is None
+        else float(turn_budget_s)
+    )
     if not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
 
@@ -1961,7 +1969,7 @@ async def run_batched_verifier(
         prefer_text = _verifier_prefers_text(model)
         structured_invoke = getattr(model, "ainvoke_structured", None)
         if callable(structured_invoke) and not prefer_text:
-            attempt_budget = VERIFIER_STRUCTURED_ATTEMPT_BUDGET_S
+            attempt_budget = float(current_time_policy().verifier_structured_attempt_budget_s)
             attempt_started = time.monotonic()
             try:
                 structured_call = structured_invoke(
@@ -1972,7 +1980,7 @@ async def run_batched_verifier(
                 )
                 raw = (
                     await structured_call
-                    if _diagnostic_no_turn_limits()
+                    if _turn_time_limits_disabled()
                     else await asyncio.wait_for(structured_call, timeout=attempt_budget)
                 )
             except TimeoutError:
@@ -2037,7 +2045,7 @@ async def run_batched_verifier(
         )
 
     try:
-        if _diagnostic_no_turn_limits():
+        if _turn_time_limits_disabled():
             ordered = await _round()
         else:
             ordered = await asyncio.wait_for(_round(), timeout=budget)
