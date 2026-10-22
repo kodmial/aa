@@ -284,8 +284,10 @@ async def test_quiesce_abort_records_cleanup_without_restart() -> None:
         grace_s=0.05,
         reason="no-real-progress",
     )
-    assert seam.quiescing_reason != ""
+    # Quarantine is released after cleanup, including for a final scenario.
+    assert seam.quiescing_reason == ""
     assert cleanup["quiesced"] is True
+    assert cleanup["quiescence_released"] is True
     assert cleanup["chat_cancelled"] is True
     assert cleanup["non_cooperative"] is False
     assert cleanup.get("runtime_retired") is not True

@@ -3017,9 +3017,10 @@ async def run_live_telegram_evidence_lane(
                             # cannot resume a wedged remote session or carry
                             # stale per-chat state into the next scenario.
                             sessions = getattr(app, "sessions", None)
-                            if sessions is not None:
+                            reset_session = getattr(sessions, "reset", None)
+                            if callable(reset_session):
                                 try:
-                                    sessions.reset(abandoned_chat_id)
+                                    reset_session(abandoned_chat_id)
                                 except Exception:
                                     logger.warning(
                                         "stalled-turn session reset failed",

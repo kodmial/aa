@@ -177,9 +177,11 @@ async def quiesce_and_abort_stalled_turn(
     recovery must not crash the lane itself.
     """
     cleanup: dict[str, Any] = {"reason": str(reason)[:32], "chat_cancelled": False}
+    quiesced = False
     try:
         if seam is not None:
             seam.begin_quiescence(reason)
+            quiesced = True
             cleanup["quiesced"] = True
         try:
             result = await app.cancel_pending_turns(int(chat_id), grace_s=grace_s)
@@ -224,6 +226,16 @@ async def quiesce_and_abort_stalled_turn(
         )
         cleanup["cleanup_failed"] = True
         cleanup["cleanup_error"] = type(exc).__name__
+    finally:
+        # Quarantine is scoped to this cleanup pass. Always release it,
+        # including on failure and when the stalled scenario is the last
+        # one, so the lane is never left fenced indefinitely.
+        if quiesced:
+            try:
+                seam.end_quiescence()
+                cleanup["quiescence_released"] = True
+            except Exception:
+                cleanup["quiescence_released"] = False
     return cleanup
 
 
