@@ -277,12 +277,17 @@ class _FakeApp:
 async def test_quiesce_abort_records_cleanup_without_restart() -> None:
     seam = _FakeQuiesceSeam()
     app = _FakeApp(had_worker=True)
+    # kodmial/aa#431: a cooperative cancel only avoids the runtime retire
+    # when the caller proves the HTTP attempt is quiesced; the probe here is
+    # the attempt ledger's proven-quiescence verdict, checked AFTER the
+    # cancellation landed.
     cleanup = await quiesce_and_abort_stalled_turn(
         app=app,
         chat_id=CHAT,
         seam=seam,
         grace_s=0.05,
         reason="no-real-progress",
+        quiescence_probe=lambda: True,
     )
     # Quarantine is released after cleanup, including for a final scenario.
     assert seam.quiescing_reason == ""
@@ -290,6 +295,8 @@ async def test_quiesce_abort_records_cleanup_without_restart() -> None:
     assert cleanup["quiescence_released"] is True
     assert cleanup["chat_cancelled"] is True
     assert cleanup["non_cooperative"] is False
+    assert cleanup["http_quiescence_proven"] is True
+    assert cleanup.get("orphan_http_attempt_isolated", False) is not True
     assert cleanup.get("runtime_retired") is not True
 
 

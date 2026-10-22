@@ -36,6 +36,11 @@ on:
         description: "Exact current main SHA to qualify (defaults to current main)"
         required: false
         type: string
+      qualification_mode:
+        description: "Transient campaign mode: empty = automatic default (gate-c-focus), or full (owner choice)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -133,9 +138,17 @@ jobs:
           # Never dispatch generic Continuum/OpenCode qualification for AA:
           # it does not own the Telegram/book/provider secrets and therefore
           # cannot produce authoritative Product Contract evidence.
+          # kodmial/aa#431: forward an owner-set explicit qualification mode
+          # when provided; an empty value lets the qualification workflow
+          # apply its typed automatic default (gate-c-focus transient mode).
+          mode_args=()
+          if [[ -n "${{ inputs.qualification_mode }}" ]]; then
+            mode_args=(-f "qualification_mode=${{ inputs.qualification_mode }}")
+          fi
           gh workflow run aa-self-proving-qualification.yml \
             --ref main \
-            -f required_sha="$REQUIRED_SHA"
+            -f required_sha="$REQUIRED_SHA" \
+            "${mode_args[@]}"
           echo "dispatched repository-owned AA self-proving qualification at $REQUIRED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record manual relay on qualification tracker

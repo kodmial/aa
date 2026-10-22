@@ -20,14 +20,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from types import TracebackType
+from typing import BinaryIO
 
 from aa.opencode.client import FakeOpenCodeClient, HttpOpenCodeClient, OpenCodeClient
 from aa.opencode.errors import (
@@ -37,6 +40,90 @@ from aa.opencode.errors import (
 )
 
 logger = logging.getLogger("aa.opencode.runtime")
+
+# Filtered runtime event capture (kodmial/aa#431): bounded allow-listed
+# server events replace ``DEVNULL``. Raw OpenCode stdout/stderr streams are
+# drained continuously in daemon threads but only allow-listed event lines
+# are ever retained, so no prompt, reply, book text, secret, or session id
+# can leak into diagnostics.
+_FILTER_EVENT_RE = re.compile(
+    r"(error|panic|fatal|critical|exception|denied|unauthorized|refused"
+    r"|timed\s*out|timeout|failed|exited|exit|listen|bind|port|version|429"
+    r"|overloaded|rate[- ]limit|quota|crash)",
+    re.IGNORECASE,
+)
+_MAX_FILTERED_EVENTS = 128
+_MAX_EVENT_LINE_LEN = 200
+
+
+class RuntimeEventCapture:
+    """Bounded, allow-listed OpenCode server event capture.
+
+    stdout/stderr of the spawned ``opencode serve`` process are drained via
+    daemon threads; each line is dropped unless it matches the bounded
+    event filter. Process exit is recorded as an event as well. Callers
+    read only :meth:`filtered_events` — raw lines are never retained.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[dict[str, object]] = []
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        self._stopped = False
+
+    def attach(self, process: subprocess.Popen[bytes] | None) -> None:
+        """Start bounded draining of one spawned process (idempotent)."""
+        if process is None or self._stopped:
+            return
+        for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if pipe is None:
+                continue
+            thread = threading.Thread(
+                target=self._drain,
+                args=(pipe, name),
+                name=f"aa-opencode-{name}-drain",
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def _drain(self, pipe: BinaryIO | None, source: str) -> None:
+        if pipe is None:
+            return
+        try:
+            for raw in iter(pipe.readline, b""):
+                try:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line or not _FILTER_EVENT_RE.search(line):
+                    continue
+                self._record({"source": source, "line_hint": line[:_MAX_EVENT_LINE_LEN]})
+        except Exception:
+            return
+
+    def _record(self, extra: dict[str, object]) -> None:
+        with self._lock:
+            if len(self._events) >= _MAX_FILTERED_EVENTS:
+                del self._events[: len(self._events) - _MAX_FILTERED_EVENTS]
+            event: dict[str, object] = {
+                "event": "server-line-matched-filter",
+                "bounded": True,
+            }
+            event.update(extra)
+            self._events.append(event)
+
+    def record_process_exit(self, *, exit_code: int | None) -> None:
+        bounded_code = -1 if exit_code is None else int(exit_code)
+        self._record({"source": "supervisor", "exit_code": bounded_code, "event": "process-exit"})
+
+    def filtered_events(self) -> tuple[dict[str, object], ...]:
+        """Snapshot of allow-listed server events (privacy-safe)."""
+        with self._lock:
+            return tuple(dict(event) for event in self._events)
+
+    def close(self) -> None:
+        self._stopped = True
 
 
 @dataclass(frozen=True)
@@ -183,6 +270,7 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         self._ready_timeout = ready_timeout
         self._shutdown_timeout = shutdown_timeout
         self._process: subprocess.Popen[bytes] | None = None
+        self._capture = RuntimeEventCapture()
         self._running = False
         self._ready = False
 
@@ -202,6 +290,39 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
     def owns_process(self) -> bool:
         """Whether this runtime spawned (and must reap) the server."""
         return self._process is not None
+
+    @property
+    def process_alive(self) -> bool | None:
+        """Bounded liveness of the supervised server (None when not owned)."""
+        process = self._process
+        if process is None:
+            return None
+        return process.poll() is None
+
+    @property
+    def process_exit_code(self) -> int | None:
+        """Last observed exit code of the supervised server (None when alive)."""
+        process = self._process
+        if process is None:
+            return None
+        return process.poll()
+
+    @property
+    def runtime_events(self) -> tuple[dict[str, object], ...]:
+        """Allow-listed server events; raw stdout/stderr is never retained."""
+        return self._capture.filtered_events()
+
+    @property
+    def runtime_state(self) -> dict[str, object]:
+        """Bounded process state for stall attribution (privacy-safe)."""
+        process = self._process
+        if process is None:
+            return {"owned_by_runtime": False}
+        return {
+            "owned_by_runtime": True,
+            "alive": process.poll() is None,
+            "exit_code": process.poll(),
+        }
 
     async def _wait_healthy(self, timeout: float) -> tuple[bool, str]:
         """Poll health until healthy or the deadline; returns last state."""
@@ -243,15 +364,23 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         host, port = split_base_url(self.config.base_url)
         args = [binary, "serve", "--port", str(port), "--hostname", host]
         try:
+            # Bounded filtered capture (kodmial/aa#431): the server's
+            # stdout/stderr no longer vanish into DEVNULL. Daemon threads
+            # drain both pipes continuously (preventing any pipe deadlock)
+            # and only allow-listed event lines are ever retained.
             self._process = subprocess.Popen(
                 args,
                 cwd=self.config.workdir or ".",
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
             )
         except OSError as exc:
             raise OpenCodeStartupError("failed to launch opencode serve") from exc
+        self._capture.close()
+        self._capture = RuntimeEventCapture()
+        self._capture.attach(self._process)
         logger.info("launched opencode serve")
 
     async def ensure_ready(self, timeout: float | None = None) -> None:
@@ -284,6 +413,8 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         if process is None:
             return
         if process.poll() is not None:
+            self._capture.record_process_exit(exit_code=process.returncode)
+            self._capture.close()
             return
         process.terminate()
         try:
@@ -294,6 +425,8 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
                 await asyncio.wait_for(asyncio.to_thread(process.wait), self._shutdown_timeout)
             except TimeoutError:
                 logger.warning("opencode serve did not exit after SIGKILL")
+        self._capture.record_process_exit(exit_code=process.returncode)
+        self._capture.close()
 
     async def __aenter__(self) -> LocalOpenCodeRuntime:
         await self.start()

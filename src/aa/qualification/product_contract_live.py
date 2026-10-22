@@ -2618,6 +2618,31 @@ async def run_live_telegram_evidence_lane(
         app = Application(settings, transport=transport)
         await app.start()
 
+        # kodmial/aa#431: independent stall-snapshot sidecar. It reads the
+        # OpenCode client's in-flight attempt ledger from OUTSIDE the
+        # dispatcher and persists 10/25/45/75/110s snapshots plus terminal
+        # traces under live-out/attempt-observer even while the wedged
+        # worker thread is stuck inside a blocking socket read. A process
+        # snapshot (bounded) travels with each store without any prompt,
+        # reply, or session text. Snapshot payloads are input-typed and
+        # never interpreted as provider progress.
+        attempt_observer: Any = None
+        try:
+            from aa.opencode.observer import StallSnapshotObserver
+
+            _audit_client = getattr(app.opencode_runtime, "client", None)
+            _audit_accessor = getattr(_audit_client, "attempt_audit", None)
+            if callable(_audit_accessor):
+                attempt_observer = StallSnapshotObserver(
+                    attempt_source=_audit_accessor,
+                    out_dir=Path("live-out") / "attempt-observer",
+                    process_state_source=getattr(app.opencode_runtime, "runtime_state", None),
+                    register_atexit_flush=True,
+                )
+                await attempt_observer.start()
+        except Exception:
+            attempt_observer = None
+
         # Per-turn causality attribution (kodmial/aa#417): each dispatched
         # turn executes in its own task, so the causality id must be bound
         # inside that task. The wrapper stamps only opaque scenario ids;
@@ -3051,6 +3076,26 @@ async def run_live_telegram_evidence_lane(
                                     )
                             await app.start()
 
+                        def _http_quiescence_probe(
+                            causality_id: str = scenario_causality_id,
+                        ) -> Any:
+                            # Evaluate lazily AFTER the cancellation landed:
+                            # the attempt ledger's proven-quiescence verdict
+                            # for THIS scenario's causality is the only
+                            # acceptable proof that no HTTP thread can still
+                            # complete the abandoned request (kodmial/aa#431).
+                            probe = getattr(
+                                app.opencode_runtime.client,
+                                "quiescence_proven",
+                                None,
+                            )
+                            if not callable(probe):
+                                return False
+                            try:
+                                return bool(probe(str(causality_id)))
+                            except Exception:
+                                return False
+
                         stall_cleanup = await quiesce_and_abort_stalled_turn(
                             app=app,
                             chat_id=chat_id,
@@ -3058,6 +3103,7 @@ async def run_live_telegram_evidence_lane(
                             grace_s=float(scenario_grace_s()),
                             reason=stop_reason or "unknown",
                             restart=_retire_runtime,
+                            quiescence_probe=_http_quiescence_probe,
                         )
                         stage_progress_state["last_monotonic"] = time.monotonic()
                         stage_progress_state["last_stage"] = ""
@@ -4240,6 +4286,11 @@ async def run_live_telegram_evidence_lane(
                 voice_elapsed = 0.0
         finally:
             set_stage_observer(None)
+            if attempt_observer is not None:
+                try:
+                    await attempt_observer.stop(flush_reason="lane-finish")
+                except Exception:
+                    attempt_observer.flush("lane-finish-flush", sync=True)
             await app.stop()
     except OpenCodeRateLimitError:
         raise
@@ -4398,6 +4449,20 @@ async def run_live_telegram_evidence_lane(
                 "max": round(max(values), 1),
             }
 
+    # kodmial/aa#431: privacy-safe per-attempt audit travels with the live
+    # summary, so providers of evidence can enumerate terminal/late/in-flight
+    # attempt states even without the on-disk observer directory.
+    attempt_audit_entries: list[dict[str, Any]] = []
+    try:
+        from aa.opencode.observer import attempt_view
+
+        _attempt_audit_source = getattr(app.opencode_runtime.client, "attempt_audit", ())
+        for _entry in _attempt_audit_source:
+            if isinstance(_entry, dict):
+                attempt_audit_entries.append(attempt_view(_entry))
+    except Exception:
+        attempt_audit_entries = []
+
     token_usage_by_agent = _token_usage_by_agent(app.opencode_runtime.client)
     try:
         from aa.conversation.whole_turn_judge import JUDGE_INDEPENDENCE_LIMITATION as _LIMIT
@@ -4476,6 +4541,14 @@ async def run_live_telegram_evidence_lane(
         "repair_metrics": repair_metrics,
         "verifier_metrics": verifier_metrics,
         "opencode_request_latency_ms": request_latency_ms,
+        # kodmial/aa#431: typed attempt-start/in-flight audit in the summary.
+        "opencode_attempt_audit": attempt_audit_entries,
+        "opencode_attempt_in_flight_count": sum(
+            1 for entry in attempt_audit_entries if entry.get("state") == "in-flight"
+        ),
+        "opencode_attempt_late_count": sum(
+            1 for entry in attempt_audit_entries if entry.get("late_outcome")
+        ),
         "opencode_token_usage_by_agent": token_usage_by_agent,
         "voice_readiness": dict(voice_readiness),
         "voice_end_to_end_ms": (

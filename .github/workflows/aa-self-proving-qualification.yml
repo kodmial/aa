@@ -37,6 +37,11 @@ on:
         description: "Exact current main SHA to qualify (defaults to current main)"
         required: false
         type: string
+      qualification_mode:
+        description: "Transient campaign mode: gate-c-focus (automatic default) or full (owner choice)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -52,7 +57,105 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-mode:
+    # Transient Gate C focus mode resolution (kodmial/aa#431): one typed
+    # decision resolves the campaign mode for every downstream job. The
+    # workflow_dispatch input has priority, then the repository variable,
+    # then the automatic default. Automatic triggers (push, lifecycle
+    # dispatches, workflow-run recovery) default to `gate-c-focus` and can
+    # never enter `full` hidden behind the default; `full` requires an
+    # owner choice via the dispatch input or the repository variable. An
+    # invalid explicit value fails closed here, never half-runs a gate mix.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      campaign_mode: ${{ steps.mode.outputs.campaign_mode }}
+      campaign_source: ${{ steps.mode.outputs.campaign_source }}
+      campaign_full: ${{ steps.mode.outputs.campaign_full }}
+    steps:
+      - name: Checkout workflow and resolver modules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.required_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Resolve campaign mode (typed, fail closed)
+        id: mode
+        shell: bash
+        env:
+          AA_RESOLVER_DISPATCH_INPUT: ${{ inputs.qualification_mode }}
+          AA_RESOLVER_REPO_VARIABLE: ${{ vars.AA_QUALIFICATION_MODE }}
+          AA_RESOLVER_AUTOMATIC_EVENT: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          # checkout required: the resolver module lives in src/aa.
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path("src").resolve()))
+          from aa.qualification.campaign_mode import (
+              CampaignModeError,
+              automatic_trigger_uses_full_mode,
+              resolve_campaign_mode,
+          )
+          # The workflow_dispatch input is always treated as the owner's
+          # explicit choice (including the lifecycle/recovery dispatch paths
+          # that forward their own mode value); an empty input defers to the
+          # repository variable and then the automatic default.
+          try:
+              decision = resolve_campaign_mode(
+                  dispatch_input=os.environ.get("AA_RESOLVER_DISPATCH_INPUT", ""),
+                  repo_variable=os.environ.get("AA_RESOLVER_REPO_VARIABLE", ""),
+              )
+          except CampaignModeError as exc:
+              print(f"campaign mode BLOCKED: {exc}", file=sys.stderr)
+              sys.exit(2)
+          if (
+              os.environ.get("AA_RESOLVER_AUTOMATIC_EVENT") == "true"
+              and decision.source == "dispatch-input"
+              and automatic_trigger_uses_full_mode(decision)
+          ):
+              print(
+                  "campaign mode BLOCKED: automatic trigger cannot inherit the "
+                  "full mode from a default-less dispatch input",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          print(f"campaign mode resolved: mode={decision.mode} source={decision.source}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"campaign_mode={decision.mode}\n")
+              handle.write(f"campaign_source={decision.source}\n")
+              handle.write(
+                  f"campaign_full={'true' if decision.mode == 'full' else 'false'}\n"
+              )
+          with open("campaign-mode.json", "w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "campaign_mode": decision.mode,
+                      "campaign_source": decision.source,
+                  },
+                  handle,
+                  sort_keys=True,
+              )
+
+          summary = Path(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"))
+          if summary.parent.exists() and summary.name != "/dev/null":
+              with summary.open("a", encoding="utf-8") as handle:
+                  handle.write("| Resolved campaign mode | Value |\n")
+                  handle.write("| --- | --- |\n")
+                  handle.write(f"| mode | `{decision.mode}` |\n")
+                  handle.write(f"| source | `{decision.source}` |\n")
+          PY
+
   qualify:
+    needs: resolve-mode
+    # Transient Gate C focus mode (kodmial/aa#431): the A/B preflight job
+    # only runs in explicit full mode. In gate-c-focus mode this job is
+    # skipped entirely (no placeholders, no fake evidence) and the live job
+    # consumes the already-resolved model policy plus the campaign mode.
+    if: ${{ needs.resolve-mode.outputs.campaign_full == 'true' }}
     runs-on: ubuntu-latest
     # AA qualification only (kodmial/aa#412): the effective Actions cap is at
     # least the owner-required 135 minutes. A repository variable may raise it
@@ -354,8 +457,14 @@ jobs:
           overwrite: true
 
   qualify-live:
-    needs: qualify
-    if: always()
+    needs:
+      - qualify
+      - resolve-mode
+    # kodmial/aa#431: the live lane also runs in gate-c-focus mode where the
+    # A/B preflight job is skipped, hence always(). A/B result != success is
+    # tolerated for a skipped (not failed) job; fail-closed A/B failures in
+    # full mode still take priority and clear below.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     # The complete live Gate C -> E -> F qualification may legitimately run
     # for at least 135 minutes. A 45/60/120-minute Actions hard cancel used to
@@ -414,7 +523,7 @@ jobs:
           echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up prepared environment (no toolchain reinstall)
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         # Issue #429: same prepared environment/pin checks as Gate A/B.
         # Pin drift fails closed; no per-job toolchain reinstall.
         shell: bash
@@ -434,16 +543,19 @@ jobs:
           echo "prepared environment OK (OpenCode $pin, dev toolchain baked)"
 
       - name: Install worker in prepared environment
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
         run: pip install -e . --no-deps
 
-      - name: Restore exact AA conversation models from preflight
+      - name: Restore exact AA conversation models
         id: bot_model
-        if: ${{ needs.qualify.result == 'success' }}
+        # kodmial/aa#431: in gate-c-focus mode the A/B preflight job is
+        # skipped, so the live lane falls back to the repository-owned
+        # model variables. aa.bot_models still validates format/messages.
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         env:
-          AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model }}
-          AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback }}
+          AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model || vars.AA_BOT_PRIMARY_MODEL }}
+          AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback || vars.AA_BOT_FALLBACK_MODEL }}
         shell: bash
         run: |
           set -euo pipefail
@@ -451,7 +563,7 @@ jobs:
           python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
 
       - name: Export AA conversation model policy
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         env:
           PRIMARY_MODEL: ${{ steps.bot_model.outputs.primary }}
           FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
@@ -465,7 +577,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install system voice media dependency
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -487,7 +599,7 @@ jobs:
         # otherwise lose completed-gate checkpoints. Persist them as a
         # run-scoped artifact and restore them here so the next runner
         # resumes from the last completed gate instead of rerunning Gate A.
-        if: ${{ needs.qualify.result == 'success' && github.run_attempt > 1 }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' && github.run_attempt > 1 }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -497,7 +609,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Stage restored gate checkpoints
-        if: ${{ needs.qualify.result == 'success' && github.run_attempt > 1 }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' && github.run_attempt > 1 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -545,7 +657,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Bootstrap exact production book/index for Gate C only
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
         env:
           AA_ALLOW_NETWORK_FETCH: "0"
@@ -593,7 +705,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
-        if: ${{ needs.qualify.result == 'success' }}
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -651,10 +763,118 @@ jobs:
           # below only reduces its already-produced live-out artifact into
           # the ONE authoritative gate-C-evidence.json plus typed
           # checkpoint. No second provider run, no index rebuild here.
-          python scripts/run_self_proving_qualification.py \
-            --main-sha "${{ steps.sha.outputs.sha }}" \
-            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
-            --checkpoint-dir "$CKPT_DIR" --emit-gate C
+          # kodmial/aa#431: in gate-c-focus mode the same emit additionally
+          # publishes the typed c-focus-result.json (PASS/FAIL/BLOCKED with
+          # C_PASS/C_FAIL/C_BLOCKED, a_b_executed=false, product_qualified=
+          # false) and the Gate E diagnostic metric over the C samples
+          # (percentiles only, no SLO thresholds). A/B always stay skipped,
+          # the trusted E/F reducers must never be fed, and no automatic
+          # path can ever publish a C-only PASS as a full qualification.
+          CAMPAIGN_MODE="${{ needs.resolve-mode.outputs.campaign_mode }}"
+          case "$CAMPAIGN_MODE" in
+            gate-c-focus)
+              # Explicit typed arg: the focused trigger never mixes A/B.
+              python scripts/run_self_proving_qualification.py \
+                --main-sha "${{ steps.sha.outputs.sha }}" \
+                --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+                --checkpoint-dir "$CKPT_DIR" --emit-gate C \
+                --qualification-mode gate-c-focus \
+                --emit-c-focus-result --emit-e-diagnostic
+              ;;
+            full)
+              python scripts/run_self_proving_qualification.py \
+                --main-sha "${{ steps.sha.outputs.sha }}" \
+                --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+                --checkpoint-dir "$CKPT_DIR" --emit-gate C \
+                --qualification-mode full
+              ;;
+            *)
+              echo "::error::campaign mode unresolved: refuse the Gate C emit."
+              exit 2
+              ;;
+          esac
+
+      - name: Gate C focus - typed terminal verdict (not a trusted qualification)
+        # kodmial/aa#431: the honest C-only outcome. PASS maps to C_PASS,
+        # FAIL to C_FAIL, BLOCKED/STALE/missing evidence to C_BLOCKED.
+        # This verdict object is terminal for the focus mode: it never
+        # issues the trusted Gate E/F reducers, never publishes a full
+        # qualification, never flips lifecycle labels and never closes #7.
+        # The fail verdict keeps the same repair-publisher pipeline alive.
+        id: gate-c-focus
+        if: ${{ always() && needs.resolve-mode.outputs.campaign_mode == 'gate-c-focus' && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          result_path = Path("self-proving-out/c-focus-result.json")
+          if not result_path.is_file():
+              print(
+                  "gate C focus BLOCKED: no typed c-focus-result.json artifact",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          try:
+              result = json.loads(result_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              print(
+                  f"gate C focus BLOCKED: unreadable c-focus-result.json: {exc}",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          schema = str(result.get("schema_version", ""))
+          if schema != "aa-gate-c-focus-result/1":
+              print(
+                  f"gate C focus BLOCKED: unexpected schema {schema!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          status = str(result.get("status", "BLOCKED")).upper()
+          verdict = str(result.get("verdict", "C_BLOCKED")).upper()
+          diagnostics = result.get("privacy_safe_diagnostics") or {}
+          # Fail-closed typing: the verdict must match the status, and the
+          # product-qualified flag must stay false in focus mode.
+          if status not in ("PASS", "FAIL", "BLOCKED"):
+              print(f"gate C focus BLOCKED: invalid status {status!r}", file=sys.stderr)
+              sys.exit(2)
+          if diagnostics.get("product_qualified") is not False:
+              print(
+                  "gate C focus BLOCKED: focus result must never be product-qualified",
+                  file=sys.stderr,
+              )
+              sys.exit(2)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"c_focus_status={status}\n")
+              handle.write(f"c_focus_verdict={verdict}\n")
+          summary = Path(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"))
+          if summary.name != "/dev/null":
+              with summary.open("a", encoding="utf-8") as handle:
+                  handle.write("## Gate C focus terminal verdict\n\n")
+                  handle.write(f"- Verdict: **{verdict}**\n")
+                  handle.write(f"- Status: `{status}`\n")
+                  handle.write(
+                      "- Scope: gate-c-focus only; not a full trusted "
+                      "qualification and never a Product Contract close-out.\n"
+                  )
+                  stage = str(diagnostics.get("stage_of_failure", ""))
+                  if stage:
+                      handle.write(f"- Stage of failure: `{stage[:64]}`\n")
+                  handle.write(
+                      f"- Latency p95: `{diagnostics.get('latency_p95_ms', 'n/a')}` ms "
+                      f"(diagnostic percentile, no SLO thresholds)\n"
+                  )
+          if status == "FAIL":
+              print(f"gate C focus FAIL (verdict={verdict})", file=sys.stderr)
+              sys.exit(1)
+          if status == "BLOCKED":
+              print(f"gate C focus BLOCKED (verdict={verdict})", file=sys.stderr)
+              sys.exit(2)
+          print(f"gate C focus PASS (verdict={verdict}); trusted full qualification NOT issued")
+          PY
 
       - name: Gate E - live performance/SLO
         # Gate E owns latency independently of Gate C functional correctness.
@@ -664,7 +884,10 @@ jobs:
         # evidence plus the live-out C-series exactly once. No Gate C rerun,
         # no A/B bootstrap, no provider calls, no D network operations here
         # (no secrets are even configured on this step by construction).
-        if: ${{ always() && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        # Transient gate-c-focus mode (kodmial/aa#431): the trusted Gate E
+        # SLO reducer is skipped and the diagnostic-only percentile metric
+        # is emitted by the Gate C step's --emit-e-diagnostic instead.
+        if: ${{ always() && needs.resolve-mode.outputs.campaign_mode != 'gate-c-focus' && (steps.gate-c.outcome == 'success' || steps.gate-c.outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -790,10 +1013,10 @@ jobs:
         # cannot replace a real Gate C live-path-failed with
         # live-execution-not-enabled; the runner additionally prefers the
         # persisted live-out artifact regardless of env.
-        # An interrupted/failed dependency-install step is infrastructure
-        # failure, not a product Gate A/B failure. Do not synthesize gate
-        # evidence before Gate A had a chance to run.
-        if: ${{ always() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') }}
+        # Transient gate-c-focus mode (kodmial/aa#431): the trusted full
+        # reducer is never issued there; the typed Gate C focus verdict
+        # step carries the honest C-only outcome instead.
+        if: ${{ always() && needs.resolve-mode.outputs.campaign_mode != 'gate-c-focus' && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') }}
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -819,6 +1042,9 @@ jobs:
       - name: Upload per-gate evidence and failure matrix
         # Privacy-safe full per-gate evidence (issue #339): atomic validated
         # A/B/C/E artifacts plus the typed failure matrix for the final verdict.
+        # kodmial/aa#431: the typed Gate C focus artifacts and the bounded
+        # stall-snapshot/attempt-audit evidence (per-attempt in-flight
+        # diagnostics, filtered runtime events) travel in the same artifact.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -827,11 +1053,14 @@ jobs:
             self-proving-out/gate-A-evidence.json
             self-proving-out/gate-B-evidence.json
             self-proving-out/gate-C-evidence.json
-                        self-proving-out/gate-E-evidence.json
-                        self-proving-out/failure-matrix.json
+            self-proving-out/gate-E-evidence.json
+            self-proving-out/failure-matrix.json
             self-proving-out/self-proving-summary.json
             self-proving-out/result.json
+            self-proving-out/c-focus-result.json
+            self-proving-out/gate-E-diagnostic.json
             live-out/live-watchdog-progress.json
+            live-out/attempt-observer/
           retention-days: 14
           if-no-files-found: warn
           overwrite: true
@@ -910,7 +1139,10 @@ jobs:
         # from the persisted gate checkpoints.
         # Missing setup/checkout proof is an infrastructure failure, not an
         # implementation defect. Never open code-repair tasks for it.
-        if: ${{ failure() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        # Transient gate-c-focus mode (kodmial/aa#431): A/B are skipped
+        # there (empty outcomes, not failure), so the publisher also admits
+        # the campaign mode context where the typed Gate C verdict failed.
+        if: ${{ failure() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure' || needs.resolve-mode.outputs.campaign_mode == 'gate-c-focus') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           FAILED_SHA: ${{ steps.sha.outputs.sha }}
@@ -1951,7 +2183,11 @@ jobs:
       - name: Publish authoritative Product Contract result
         # Publish only when Gate A actually executed. A setup cancellation
         # must never record a trusted product FAIL on missing artifacts.
-        if: ${{ always() && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        # Transient gate-c-focus mode (kodmial/aa#431): never publish a
+        # trusted qualification and never close #7 from a C-only run; the
+        # typed Gate C focus outcome is annotated by the dedicated focus
+        # publisher step below instead.
+        if: ${{ always() && needs.resolve-mode.outputs.campaign_mode != 'gate-c-focus' && (needs.qualify.outputs.gate_a_outcome == 'success' || needs.qualify.outputs.gate_a_outcome == 'failure') && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         uses: actions/github-script@v7
         env:
           QUAL_SHA: ${{ steps.sha.outputs.sha }}
@@ -2143,6 +2379,119 @@ jobs:
                 `Product Contract remains unqualified at exact main ${sha}; self-proving repair loop continues from Gate ${blocking}.`
               );
             }
+
+      - name: Publish Gate C focus outcome (never a trusted qualification)
+        # kodmial/aa#431: a C-only run MUST NOT mutate the Product Contract
+        # lifecycle. This step only annotates #7 with a distinct focus
+        # marker that can never be confused with the authoritative
+        # `continuum-qualification-result` comment above, never issues a
+        # `result=pass` lifecycle marker, never closes #7/#6, and never
+        # changes labels. Stale-SHA outcomes are dropped (fresh main may
+        # already differ).
+        if: ${{ always() && needs.resolve-mode.outputs.campaign_mode == 'gate-c-focus' && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
+        uses: actions/github-script@v7
+        env:
+          QUAL_SHA: ${{ steps.sha.outputs.sha }}
+          C_FOCUS_STATUS: ${{ steps.gate-c-focus.outputs.c_focus_status }}
+          C_FOCUS_VERDICT: ${{ steps.gate-c-focus.outputs.c_focus_verdict }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
+            const status = String(process.env.C_FOCUS_STATUS || '').toUpperCase();
+            const verdict = String(process.env.C_FOCUS_VERDICT || 'C_BLOCKED').toUpperCase();
+            if (!['PASS', 'FAIL', 'BLOCKED'].includes(status)) {
+              core.notice(`No typed Gate C focus outcome available (status=${status}); nothing annotated on #7.`);
+              return;
+            }
+            if (!['C_PASS', 'C_FAIL', 'C_BLOCKED'].includes(verdict)) {
+              core.setFailed('Gate C focus verdict is not typed: ' + verdict);
+              return;
+            }
+            const resultPath = 'self-proving-out/c-focus-result.json';
+            let result = null;
+            try {
+              result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+            } catch (error) {
+              core.setFailed('Typed Gate C focus artifact missing or unreadable: ' + error.message);
+              return;
+            }
+            if (String(result.schema_version || '') !== 'aa-gate-c-focus-result/1') {
+              core.setFailed('Unexpected Gate C focus schema: ' + String(result.schema_version || ''));
+              return;
+            }
+            if (result.privacy_safe_diagnostics && result.privacy_safe_diagnostics.product_qualified !== false) {
+              core.setFailed('Gate C focus artifact must never be product-qualified.');
+              return;
+            }
+            const sha = String(result.sha || process.env.QUAL_SHA || '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(sha)) {
+              core.setFailed('Gate C focus artifact has no valid exact SHA.');
+              return;
+            }
+            const { data: main } = await apiRetry('resolve current main', () =>
+              github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: 'main',
+              })
+            );
+            const currentMain = String(main.commit.sha || '').toLowerCase();
+            if (sha !== currentMain) {
+              core.notice(
+                `Gate C focus outcome is stale at publish time (tested=${sha}, current=${currentMain}); lifecycle unchanged.`
+              );
+              return;
+            }
+            const marker =
+              `<!-- continuum-gate-c-focus-outcome issue=7 sha=${sha} result=${verdict.toLowerCase()} -->`;
+            const body = [
+              marker,
+              '',
+              '## AA Gate C focus outcome (diagnostic-only mode)',
+              '',
+              `Exact current main: \`${sha}\``,
+              `Workflow run: \`${context.runId}\``,
+              `Verdict: **${verdict}**`,
+              `Gates executed: Gate C only (the 18 unchanged real-model scenarios)`,
+              `A/B executed: \`${String((result.privacy_safe_diagnostics || {}).a_b_executed === false ? 'false' : 'false')}\``,
+              '',
+              'This is a bounded diagnostic run (issue #431): it intentionally skips Gates A/B and the trusted Gate E latency/SLO and Gate F reducers. A C_PASS is NOT a full qualification, does not qualify the Product Contract, and does not close this tracker. The full mode remains available explicitly through the workflow dispatch input or the repository variable.',
+            ].join('\n');
+            const comments = await apiRetry('list focus outcome comments', () =>
+              github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: 7,
+                per_page: 100,
+              })
+            );
+            if (!comments.some(c => String(c.body || '').includes(marker))) {
+              await apiRetry('publish Gate C focus outcome comment', () =>
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: 7,
+                  body,
+                })
+              );
+            }
+            core.notice(`Gate C focus outcome ${verdict} annotated on #7 WITHOUT any trusted qualification side effect.`);
 
       - name: Reconcile stale repair reservations
         # kodmial/aa#417: a repair issue marked automation:in-progress that

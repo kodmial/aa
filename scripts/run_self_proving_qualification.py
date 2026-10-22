@@ -3000,6 +3000,107 @@ def _write_verdict_outputs(
     return EXIT_BLOCKED
 
 
+def _combine_exit(current: int, extra: int) -> int:
+    """Worst-of exit composition for the C-focus artifact writers."""
+    if current == extra:
+        return current
+    severity = {EXIT_PASS: 0, EXIT_FAIL: 1, EXIT_BLOCKED: 2, EXIT_STALE: 2, EXIT_429_RESTART: 3}
+    return current if severity.get(current, 2) >= severity.get(extra, 2) else extra
+
+
+def _load_live_summary_payload() -> dict[str, Any] | None:
+    """Load the privacy-safe live summary produced by the Gate C runner."""
+    for candidate in (
+        ROOT / "live-out" / "product-contract-live-summary.json",
+        ROOT / "live-out" / "self-proving-summary.json",
+        ROOT / "self-proving-out" / "product-contract-live-summary.json",
+    ):
+        if not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _write_c_focus_result(out_dir: Path, *, expected: str, run_id: str) -> int:
+    """Write c-focus-result.json from the just-published Gate C evidence."""
+    from aa.qualification.c_focus import build_c_focus_result
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    evidence_payload: dict[str, Any] | None = None
+    reason = "gate-c-evidence-missing"
+    try:
+        evidence_payload = load_and_validate_evidence(
+            out_dir / "gate-C-evidence.json",
+            expected_gate="C",
+            expected_sha=expected,
+            expected_run_id=run_id,
+        )
+    except SelfProvingError as exc:
+        reason = f"gate-c-evidence-invalid:{type(exc).__name__}"
+        evidence_payload = None
+    except Exception:
+        reason = "gate-c-evidence-unreadable"
+        evidence_payload = None
+    live_summary = _load_live_summary_payload()
+    result = build_c_focus_result(
+        main_sha=expected,
+        run_id=run_id,
+        gate_c_evidence=evidence_payload,
+        live_summary=live_summary,
+    )
+    payload = dict(result)
+    (out_dir / "c-focus-result.json").write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if evidence_payload is None and not isinstance(payload.get("privacy_safe_diagnostics"), dict):
+        return EXIT_BLOCKED
+    verdict = str(payload.get("verdict", "C_BLOCKED"))
+    print(json.dumps({"c_focus_result": payload.get("status"), "verdict": verdict}))
+    if evidence_payload is None and isinstance(payload.get("privacy_safe_diagnostics"), dict):
+        payload["privacy_safe_diagnostics"].setdefault("block_reason", reason)
+        (out_dir / "c-focus-result.json").write_text(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    if payload.get("status") == "PASS":
+        return EXIT_PASS
+    if payload.get("status") == "FAIL":
+        return EXIT_FAIL
+    return EXIT_BLOCKED
+
+
+def _write_gate_e_diagnostic(out_dir: Path, *, expected: str, run_id: str) -> int:
+    """Write the Gate E diagnostic metric over C samples (no SLO thresholds)."""
+    from aa.qualification.c_focus import build_gate_e_diagnostic
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    live_summary = _load_live_summary_payload()
+    payload = build_gate_e_diagnostic(main_sha=expected, run_id=run_id, live_summary=live_summary)
+    (out_dir / "gate-E-diagnostic.json").write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if payload.get("latency_sample_count", 0) == 0:
+        print("gate E diagnostic BLOCKED: no C latency samples", file=sys.stderr)
+        return EXIT_BLOCKED
+    print(
+        json.dumps(
+            {
+                "gate_e_diagnostic": "published",
+                "samples": payload.get("latency_sample_count"),
+                "slo_thresholds_applied": False,
+            }
+        )
+    )
+    return EXIT_PASS
+
+
 def _run_emit_gate(
     *,
     gate: str,
@@ -3438,6 +3539,30 @@ def main(argv: list[str] | None = None) -> int:
             "binding, no stale reuse); exit 1 otherwise."
         ),
     )
+    parser.add_argument(
+        "--qualification-mode",
+        choices=("auto", "gate-c-focus", "full"),
+        default="auto",
+        help=(
+            "Transient campaign mode. In gate-c-focus mode Gate A/B and the "
+            "trusted full reducer are never executed and typed C-focus "
+            "artifacts are produced instead; auto defers to the workflow's "
+            "own resolution."
+        ),
+    )
+    parser.add_argument(
+        "--emit-c-focus-result",
+        action="store_true",
+        help="Write c-focus-result.json (schema aa-gate-c-focus-result/1) after the Gate C emit.",
+    )
+    parser.add_argument(
+        "--emit-e-diagnostic",
+        action="store_true",
+        help=(
+            "Write gate-E-diagnostic.json (schema aa-gate-e-diagnostic/1) computed "
+            "from C samples as a diagnostic metric only; no SLO thresholds apply."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -3450,6 +3575,60 @@ def main(argv: list[str] | None = None) -> int:
     run_id = str(args.run_id)
     if args.checkpoint_dir is not None:
         os.environ["AA_GATE_CHECKPOINT_DIR"] = str(args.checkpoint_dir)
+    try:
+        from aa.qualification.campaign_mode import (
+            CampaignModeDecision,
+            CampaignModeError,
+            resolve_campaign_mode,
+        )
+    except ImportError:  # pragma: no cover - packaging guard
+        CampaignModeDecision = None  # type: ignore[misc,assignment]
+        CampaignModeError = None  # type: ignore[misc,assignment]
+        resolve_campaign_mode = None  # type: ignore[assignment]
+    resolved_mode = ""
+    if resolve_campaign_mode is not None and CampaignModeDecision is not None:
+        try:
+            if args.qualification_mode != "auto":
+                resolved = resolve_campaign_mode(
+                    dispatch_input=args.qualification_mode,
+                    automatic_default="gate-c-focus",
+                )
+                resolved_mode = resolved.mode
+            # "auto" defers to the workflow's own mode resolution; the
+            # workflow must pass an explicit --qualification-mode so the
+            # runner's fail-closed C-focus guards below take effect.
+        except CampaignModeError as exc:
+            print(f"self-proving qualification BLOCKED: {exc}", file=sys.stderr)
+            return EXIT_BLOCKED
+    if resolved_mode == "gate-c-focus":
+        # D3/D4 (kodmial/aa#431): C-focus never executes A/B and never
+        # issues the trusted full reducer; failing closed beats any silent
+        # hidden-FULL.
+        if args.emit_gate in ("A", "B"):
+            print(
+                "self-proving qualification BLOCKED: gate-c-focus mode never executes "
+                f"Gate {args.emit_gate}; run explicit full mode for A/B evidence",
+                file=sys.stderr,
+            )
+            return EXIT_BLOCKED
+        if args.final_only:
+            print(
+                "self-proving qualification BLOCKED: the trusted full reducer is "
+                "not available in gate-c-focus mode (C-only PASS is never a "
+                "product qualification)",
+                file=sys.stderr,
+            )
+            return EXIT_BLOCKED
+    if (args.emit_c_focus_result or args.emit_e_diagnostic) and args.emit_gate != "C":
+        # The focus artifacts are built from the ONE Gate C evidence
+        # artifact; combining them with A/B/full emits is a type error,
+        # not a silent no-op.
+        flag = "--emit-c-focus-result" if args.emit_c_focus_result else "--emit-e-diagnostic"
+        print(
+            f"self-proving qualification BLOCKED: {flag} is only valid with --emit-gate C",
+            file=sys.stderr,
+        )
+        return EXIT_BLOCKED
 
     if args.check_skip is not None:
         allowed = checkpoint_allows_skip(
@@ -3481,7 +3660,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             shell_status = _normalize_shell_status(str(args.shell_b_status))
             shell_detail = str(args.shell_b_detail or "")
-        return _run_emit_gate(
+        exit_code = _run_emit_gate(
             gate=args.emit_gate,
             expected=expected,
             run_id=run_id,
@@ -3490,6 +3669,22 @@ def main(argv: list[str] | None = None) -> int:
             shell_detail=shell_detail,
             shell_results_path=args.shell_a_results if args.emit_gate == "A" else None,
         )
+        if args.emit_gate == "C":
+            # C-focus terminal artifacts (kodmial/aa#431): produced from the
+            # ONE Gate C evidence artifact the emit above just published.
+            if args.emit_c_focus_result:
+                c_focus_exit = _write_c_focus_result(
+                    out_dir,
+                    expected=expected,
+                    run_id=run_id,
+                )
+                exit_code = _combine_exit(exit_code, c_focus_exit)
+            if args.emit_e_diagnostic:
+                diagnostic_exit = _write_gate_e_diagnostic(
+                    out_dir, expected=expected, run_id=run_id
+                )
+                exit_code = _combine_exit(exit_code, diagnostic_exit)
+        return exit_code
     shell_a_status = _normalize_shell_status(str(args.shell_a_status))
     shell_a_detail = str(args.shell_a_detail or "")
     shell_b_status = _normalize_shell_status(str(args.shell_b_status))

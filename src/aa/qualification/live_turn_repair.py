@@ -21,6 +21,7 @@ cleared the active stage. This module owns the typed stall recovery:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -45,6 +46,37 @@ _LAST_ACTIVE_STAGE = "last_active_stage"
 _OBSERVABILITY = "request_progress_observable"
 _PROGRESS_UNOBSERVABLE = "progress-unobservable"
 
+# Closed stall-cause vocabulary (kodmial/aa#431): every stalled OpenCode
+# operation is attributed to exactly one of these kinds. Heartbeats
+# (Telegram typing, SSE events, health probes) are never direct provider
+# progress evidence and can therefore never upgrade a classification.
+STALL_KIND_HTTP_IN_FLIGHT = "http-in-flight"
+STALL_KIND_PROCESS_DEAD = "opencode-process-dead"
+STALL_KIND_SERVER_ALIVE_SESSION_UNOBSERVED = "opencode-server-alive-but-session-unobserved"
+STALL_KIND_PROVIDER_ERROR_CONFIRMED = "provider-error-confirmed"
+STALL_KIND_GRAPH_STALL = "graph-stall"
+STALL_KIND_DELIVERY_STALL = "delivery-stall"
+STALL_KIND_UNKNOWN = "unknown"
+STALL_KINDS: tuple[str, ...] = (
+    STALL_KIND_HTTP_IN_FLIGHT,
+    STALL_KIND_PROCESS_DEAD,
+    STALL_KIND_SERVER_ALIVE_SESSION_UNOBSERVED,
+    STALL_KIND_PROVIDER_ERROR_CONFIRMED,
+    STALL_KIND_GRAPH_STALL,
+    STALL_KIND_DELIVERY_STALL,
+    STALL_KIND_UNKNOWN,
+)
+
+_TERMINAL_REQUEST_STATES = ("completed", "failed", "cancelled", "aborted")
+_ATTEMPT_STATES = ("in-flight", "completed", "failed", "cancelled", "aborted")
+# Classified error kinds that prove an actual provider-side error, as
+# opposed to a local transport/socket result.
+_PROVIDER_ERROR_KINDS = frozenset(
+    {"rate-limit", "deterministic", "provider-access", "transient", "session-not-found"}
+)
+_DELIVERY_STAGES = frozenset({"delivery", "telegram", "seam", "post", "transport"})
+_UNKNOWN_STATE = "none"
+
 
 def derive_timeout_category(stage: str) -> str:
     """Map one observed active stage to the closed-vocabulary category.
@@ -66,11 +98,18 @@ def derive_timeout_category(stage: str) -> str:
 def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict[str, Any]:
     """Classify OpenCode request evidence for one causality id.
 
-    ``audit`` is the OpenCode client's privacy-safe per-request latency
-    audit. The classification is honest about observability: the pinned
-    synchronous request API exposes only local completion/failure — not
-    server-side streaming — so whenever no request completed the report
-    says ``progress-unobservable`` instead of guessing an upstream cause.
+    ``audit`` is the OpenCode client's privacy-safe per-request attempt
+    audit. The NEWEST attempt always wins: an earlier completed request
+    never stands in as proof that the newest (still running) request is
+    finished (kodmial/aa#431). Rows recorded by the current client carry
+    ``attempt_id`` plus an explicit ``state``; a row that touched the
+    ``attempt-start`` boundary with no terminal state is honestly reported
+    as ``http-in-flight``. Legacy rows without attempt ids keep the old
+    conservative classification. The classification is honest about
+    observability: the pinned synchronous request API exposes only local
+    completion/failure — not server-side streaming — so when nothing
+    directly proves a request state the report says
+    ``progress-unobservable`` instead of guessing an upstream cause.
     """
     entries = [item for item in audit if isinstance(item, Mapping)]
     matched = [
@@ -84,30 +123,110 @@ def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict
             "last_confirmed_request": "",
             _OBSERVABILITY: _PROGRESS_UNOBSERVABLE,
         }
-    completed = [item for item in matched if item.get("success") is True]
-    if completed:
-        state = "request-completed"
-    else:
-        in_flight = [item for item in matched if item.get("success") is not False]
-        if in_flight:
-            # No terminal failure recorded: the request may still be in
-            # socket silence. Honest classification keeps progress
-            # unobservable instead of guessing a failure cause.
-            state = "unconfirmed-in-flight"
-        elif all(str(item.get("failure_category", "")) == "cancelled" for item in matched):
-            state = "request-cancelled"
+    attempt_rows = [(index, item) for index, item in enumerate(matched) if item.get("attempt_id")]
+    if attempt_rows:
+        ordered = sorted(
+            attempt_rows,
+            key=lambda pair: (pair[1].get("attempt_started_monotonic", pair[0]), pair[0]),
+        )
+        _index, newest = ordered[-1]
+        state = str(newest.get("state", "in-flight"))
+        if state == "in-flight":
+            state_name = "http-in-flight"
+        elif state == "completed":
+            state_name = "request-completed"
+        elif state == "failed":
+            state_name = "request-failed"
+        elif state == "cancelled":
+            state_name = "request-cancelled"
+        elif state == "aborted":
+            state_name = "request-aborted"
         else:
-            state = "request-failed"
-    last = dict(matched[-1])
+            state_name = _legacy_request_state(matched)
+        last = dict(newest)
+    else:
+        state_name = _legacy_request_state(matched)
+        last = dict(matched[-1])
     return {
         "request_started": True,
-        "request_state": state,
+        "request_state": state_name,
         "http_request_count": len(matched),
         "last_confirmed_request": str(last.get("operation", ""))[:48],
+        "last_request_state": str(last.get("state", ""))[:48],
+        "last_attempt_id": str(last.get("attempt_id", ""))[:64],
+        "late_outcome": str(last.get("late_outcome", ""))[:32],
         "last_request_failure_category": str(last.get("failure_category", ""))[:48],
+        "last_request_error_kind": str(last.get("error_kind", ""))[:48],
         "last_request_latency_ms": last.get("latency_ms"),
         _OBSERVABILITY: _PROGRESS_UNOBSERVABLE,
     }
+
+
+def _legacy_request_state(matched: Sequence[Mapping[str, Any]]) -> str:
+    """Pre-#431 classification for audit rows without attempt ids."""
+    completed = [item for item in matched if item.get("success") is True]
+    if completed:
+        return "request-completed"
+    in_flight = [item for item in matched if item.get("success") is not False]
+    if in_flight:
+        # No terminal failure recorded: the request may still be in
+        # socket silence. Honest classification keeps progress
+        # unobservable instead of guessing a failure cause.
+        return "unconfirmed-in-flight"
+    if all(str(item.get("failure_category", "")) == "cancelled" for item in matched):
+        return "request-cancelled"
+    return "request-failed"
+
+
+def classify_stall_kind(
+    *,
+    causality_id: str,
+    request_audit: Sequence[object],
+    last_active_stage: str = "",
+    process_alive: bool | None = None,
+    session_progress_observed: bool | None = None,
+) -> str:
+    """Attribute one stalled turn to exactly one closed stall kind.
+
+    The decision uses DIRECT evidence only:
+
+    - a live ``attempt-start`` row without a terminal state is
+      ``http-in-flight`` (the HTTP request is provably still running);
+    - a confirmed provider-side classified error overrides everything;
+    - a proven worker thread without a finished request, when the OpenCode
+      process is gone, is ``opencode-process-dead``;
+    - a request that locally finished without any session progress
+      (server alive) is ``opencode-server-alive-but-session-unobserved``;
+    - a completed request whose graph never advanced is ``graph-stall``
+      or, at the last delivery stage, ``delivery-stall``.
+
+    Heartbeats (typing, SSE, health probes) are never passed in as
+    ``session_progress_observed``: they are not provider token progress.
+    An honestly unknown combination stays ``unknown``.
+    """
+    report = request_state_from_audit(request_audit, causality_id)
+    request_state = str(report.get("request_state", ""))
+    newest_state = str(report.get("last_request_state", ""))
+    provider_error = (
+        newest_state == "failed"
+        and str(report.get("last_request_error_kind", "")) in _PROVIDER_ERROR_KINDS
+    )
+    if provider_error:
+        return STALL_KIND_PROVIDER_ERROR_CONFIRMED
+    if request_state == "http-in-flight":
+        return STALL_KIND_HTTP_IN_FLIGHT
+    if request_state == "none" or request_state == "unconfirmed-in-flight":
+        return STALL_KIND_UNKNOWN
+    if process_alive is False:
+        return STALL_KIND_PROCESS_DEAD
+    if session_progress_observed is not True:
+        return STALL_KIND_SERVER_ALIVE_SESSION_UNOBSERVED
+    if request_state == "request-completed":
+        normalized = str(last_active_stage or "").strip().lower()
+        if normalized in _DELIVERY_STAGES:
+            return STALL_KIND_DELIVERY_STALL
+        return STALL_KIND_GRAPH_STALL
+    return STALL_KIND_UNKNOWN
 
 
 def build_timeout_attribution(
@@ -119,6 +238,8 @@ def build_timeout_attribution(
     started_monotonic: float,
     request_audit: Sequence[object],
     timeout_reason: str,
+    process_alive: bool | None = None,
+    session_progress_observed: bool | None = None,
 ) -> dict[str, Any]:
     """Build the privacy-safe stalled-turn attribution block."""
     elapsed_ms = max(0.0, time.monotonic() - started_monotonic) * 1000.0
@@ -138,6 +259,15 @@ def build_timeout_attribution(
     }
     attribution.update(request_state_from_audit(request_audit, causality_id))
     attribution[_OBSERVABILITY] = _PROGRESS_UNOBSERVABLE
+    attribution["stall_kind"] = classify_stall_kind(
+        causality_id=causality_id,
+        request_audit=request_audit,
+        last_active_stage=last_active_stage,
+        process_alive=process_alive,
+        session_progress_observed=session_progress_observed,
+    )
+    if attribution.get("stall_kind") == STALL_KIND_UNKNOWN:
+        attribution["stall_kind_uncertain"] = True
     return attribution
 
 
@@ -150,6 +280,29 @@ class QuiesceSeamProtocol:
     def end_quiescence(self) -> None: ...
 
 
+async def _evaluate_quiescence_probe(
+    probe: Callable[[], Any] | None,
+) -> bool:
+    """Evaluate the quiescence probe lazily, after cancellation has run.
+
+    Supported probe result forms: falsy (not proven), truthy, or an
+    awaitable resolving to one of those. Any probe failure degrades to
+    ``False`` (not proven) so the fail-closed isolation path wins.
+    """
+    if probe is None:
+        return False
+    try:
+        result = probe()
+    except Exception:
+        return False
+    if inspect.isawaitable(result):
+        try:
+            result = await result
+        except Exception:
+            return False
+    return bool(result)
+
+
 async def quiesce_and_abort_stalled_turn(
     *,
     app: Any,
@@ -158,6 +311,7 @@ async def quiesce_and_abort_stalled_turn(
     grace_s: float,
     reason: str,
     restart: Callable[[], Awaitable[None]] | None = None,
+    quiescence_probe: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Stop, cancel and isolate one abandoned scenario turn (kodmial/aa#417).
 
@@ -169,9 +323,15 @@ async def quiesce_and_abort_stalled_turn(
     2. cancel the per-chat dispatcher worker and drain its queue, awaiting
        shutdown for ``grace_s`` (the OpenCode client issues a best-effort
        ``POST /session/{id}/abort`` on cancellation);
-    3. when the turn is non-cooperative (blocking thread survived the
-       grace), retire the runtime via ``restart`` so no task in the
-       process can deliver stale output afterwards.
+    3. when the turn is non-cooperative, OR the abandoned turn's HTTP
+       attempt is not PROVEN quiesced, retire the runtime via ``restart``
+       so no task or worker thread in the process can deliver stale
+       output afterwards (kodmial/aa#431): ``asyncio.Task.done()`` proves
+       nothing about the underlying HTTP thread; the attempt ledger's
+       proven-quiescence verdict (or the absence of any in-flight
+       attempt) is the only acceptable proof. When the caller cannot
+       supply proof, the runtime is isolated by default — a late response
+       can never satisfy a different scenario.
 
     The summary is fixed-vocabulary and privacy-safe. Never raises:
     recovery must not crash the lane itself.
@@ -199,6 +359,14 @@ async def quiesce_and_abort_stalled_turn(
         except Exception:
             in_flight = False
         if not cleanup.get("non_cooperative") and in_flight:
+            cleanup["non_cooperative"] = True
+        http_quiescence_proven = await _evaluate_quiescence_probe(quiescence_probe)
+        cleanup["http_quiescence_proven"] = http_quiescence_proven
+        if http_quiescence_proven is not True:
+            # Task.done() never proves the HTTP thread stopped (kodmial/aa#431).
+            # An absent or failed probe counts as NOT proven: the runtime is
+            # isolated by default so no orphan worker can leak stale output.
+            cleanup["orphan_http_attempt_isolated"] = True
             cleanup["non_cooperative"] = True
         if cleanup.get("non_cooperative") and restart is not None:
             try:
@@ -259,7 +427,16 @@ async def _settle(grace_s: float) -> None:
 
 
 __all__ = [
+    "STALL_KINDS",
+    "STALL_KIND_DELIVERY_STALL",
+    "STALL_KIND_GRAPH_STALL",
+    "STALL_KIND_HTTP_IN_FLIGHT",
+    "STALL_KIND_PROCESS_DEAD",
+    "STALL_KIND_PROVIDER_ERROR_CONFIRMED",
+    "STALL_KIND_SERVER_ALIVE_SESSION_UNOBSERVED",
+    "STALL_KIND_UNKNOWN",
     "build_timeout_attribution",
+    "classify_stall_kind",
     "derive_timeout_category",
     "quiesce_and_abort_stalled_turn",
     "request_state_from_audit",

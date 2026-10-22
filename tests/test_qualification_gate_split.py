@@ -135,11 +135,24 @@ def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None
     )
     assert "timeout-minutes: 45" not in workflow
     assert "qualify-live:" in workflow
-    assert "needs: qualify" in workflow
+    # kodmial/aa#431: the live lane needs the typed campaign-mode decision
+    # as well, and the A/B preflight job is skipped in gate-c-focus mode.
+    assert "needs:" in workflow
+    assert "- qualify" in workflow
+    assert "- resolve-mode" in workflow
+    assert "campaign_full == 'true'" in workflow
     assert "verified_model: ${{ steps.bot_model.outputs.primary }}" in workflow
     assert "verified_fallback: ${{ steps.bot_model.outputs.fallback }}" in workflow
-    assert "AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model }}" in workflow
-    assert "AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback }}" in workflow
+    primary_model_env = (
+        "AA_BOT_PRIMARY_MODEL: ${{ needs.qualify.outputs.verified_model"
+        " || vars.AA_BOT_PRIMARY_MODEL }}"
+    )
+    fallback_model_env = (
+        "AA_BOT_FALLBACK_MODEL: ${{ needs.qualify.outputs.verified_fallback"
+        " || vars.AA_BOT_FALLBACK_MODEL }}"
+    )
+    assert primary_model_env in workflow
+    assert fallback_model_env in workflow
     assert "aa-preflight-evidence" in workflow
     assert "--deterministic-only" in workflow
     assert "--gate-c-only" in workflow
