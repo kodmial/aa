@@ -328,7 +328,8 @@ def test_slow_model_call_completes_and_is_recorded_delivered(
                 {"_id": "session-opaque"},
             )
         assert path.endswith("/message")
-        assert op_timeout is None, "the model call must carry NO total deadline"
+        assert op_timeout == diag._model_inactivity_timeout_s()
+        assert op_timeout is not None and op_timeout > 900.0
         clock["offset"] += model_seconds  # virtual remote inference delay
         return (
             True,

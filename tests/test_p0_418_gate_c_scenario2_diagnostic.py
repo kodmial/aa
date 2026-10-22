@@ -23,8 +23,10 @@ import io
 import json
 import pathlib
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -558,8 +560,9 @@ def test_run_probe_a_bounds_bootstrap_and_times_http_phases(
                 {"_id": "session-opaque"},
             )
         if path == "/session/session-opaque/message":
-            # kodmial/aa#424: the model call carries NO op timeout at all.
-            assert op_timeout is None
+            # kodmial/aa#424: the model call has no total-response deadline,
+            # only the production-equivalent socket inactivity bound.
+            assert op_timeout == diag._model_inactivity_timeout_s()
             return (
                 True,
                 False,
@@ -609,6 +612,47 @@ def test_run_probe_a_bounds_bootstrap_and_times_http_phases(
     assert model_event["write_ms"] == 5.0
     assert model_event["read_ms"] == 6.0
     assert model_event["ok"] is True
+
+
+def test_timed_request_bounds_a_silent_read_phase(diag: Any) -> None:
+    """A provider that never sends a byte cannot block forever."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+    accepted = threading.Event()
+    release = threading.Event()
+
+    def silent_server() -> None:
+        try:
+            connection, _ = server.accept()
+        except OSError:
+            return
+        accepted.set()
+        release.wait(5.0)
+        connection.close()
+
+    thread = threading.Thread(target=silent_server, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        ok, provider_error, timings, _extra = diag._timed_request(
+            f"http://127.0.0.1:{port}",
+            "GET",
+            "/session",
+            None,
+            1.0,
+            0.2,
+        )
+    finally:
+        release.set()
+        thread.join(timeout=1.0)
+        server.close()
+    assert accepted.is_set()
+    assert ok is False
+    assert provider_error is False
+    assert timings["fail_category"] == "read-timeout"
+    assert time.monotonic() - started < 3.0
 
 
 def test_run_probe_a_proven_provider_error_from_real_payload(

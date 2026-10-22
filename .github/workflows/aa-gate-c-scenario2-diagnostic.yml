@@ -11,7 +11,8 @@ name: AA Gate C scenario2 diagnostic
 # no full 18-case Gate C rerun. Two probes under one shared campaign
 # allowance):
 #   A) direct OpenCode model call with connect/write/read phase timing
-#      (no response deadline; only the TCP connect phase is bounded)
+#      (no total response deadline; the TCP connect phase and per-socket
+#      inactivity are bounded, mirroring production HttpOpenCodeClient)
 #   B) the exact production Application turn for scenario #2 via the
 #      qualification lane's in-process Telegram seam
 # One idempotent progress comment on issue #418; verdicts are truthful:

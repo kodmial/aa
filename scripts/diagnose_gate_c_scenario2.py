@@ -41,7 +41,9 @@ kodmial/aa#424 policy (hard contract):
   experiment, never a ``model-provider`` root cause.
 - Bounded diagnostics-only infrastructure bounds remain explicitly typed:
   OpenCode spawn/bootstrap/connect health and observation probes are
-  finite; answer/model calls are never deadline-capped.
+  finite. Answer/model calls have NO total-response deadline; they mirror
+  production ``HttpOpenCodeClient`` with a separate per-socket inactivity
+  bound so a silent provider connection cannot block forever.
 - Truthful verdicts only: ``delivered``, ``provider-error-proven``,
   ``server-error-proven``, ``harness-error``, ``unresolved-at-campaign-end``,
   ``boundary-localized-root-unknown`` (BOUNDARY LOCALIZED / ROOT UNKNOWN),
@@ -129,8 +131,15 @@ DEFAULT_PROBE_A_PORT = "4097"
 DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S = 60.0
 DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S = 90.0
 # Explicitly typed, answer-unrelated infrastructure bound: loopback TCP
-# connect to the local OpenCode server. The model response is NEVER capped.
+# connect to the local OpenCode server. The model response has no total
+# deadline; only the separate inactivity bound below applies after connect.
 DEFAULT_PROBE_A_CONNECT_TIMEOUT_S = 10.0
+# Mirror production ``HttpOpenCodeClient.request_timeout`` (AA_TRANSPORT_TIMEOUT_S):
+# a per-socket-operation inactivity bound for model calls, never an
+# end-to-end response deadline. A silent provider connection therefore
+# cannot block forever, while a slow inference that keeps transferring
+# bytes (or completes before the bound) still finishes normally.
+DEFAULT_MODEL_INACTIVITY_TIMEOUT_S = 1800.0
 
 SUPERVISOR_POLL_S = 0.25
 STACK_DUMP_EVERY_S = 20.0
@@ -816,6 +825,25 @@ def _health_probe_phased(base_url: str, method: str, path: str) -> dict[str, flo
 # ---------------------------------------------------------------------------
 
 
+def _model_inactivity_timeout_s() -> float:
+    """Production-equivalent socket inactivity bound for model calls.
+
+    Mirrors ``HttpOpenCodeClient.request_timeout`` (``AA_TRANSPORT_TIMEOUT_S``).
+    This is a per-socket-operation inactivity bound, not an end-to-end
+    response deadline: a genuinely slow provider that keeps the connection
+    active is not failed merely for exceeding a wall-clock window.
+    """
+    try:
+        from aa.time_policy import current_time_policy
+
+        value = float(current_time_policy().transport_timeout_s)
+    except Exception:
+        value = DEFAULT_MODEL_INACTIVITY_TIMEOUT_S
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_MODEL_INACTIVITY_TIMEOUT_S
+    return value
+
+
 def _timed_request(
     base_url: str,
     method: str,
@@ -827,20 +855,16 @@ def _timed_request(
     """One instrumented loopback HTTP call with connect/write/read phases.
 
     kodmial/aa#424: the connect bound covers ONLY the TCP establishment
-    phase of the loopback infrastructure. ``op_timeout=None`` mirrors the
-    production ``HttpOpenCodeClient`` semantics exactly: there is NO
-    total-response deadline and no per-read wall clock, so a healthy slow
-    inference can never be falsely failed by this diagnostic. Response
-    payloads are never returned or logged. The returned ``extra`` may hold
-    internal opaque values (session id reference, sanitized counts) for
-    the very next request; identifiers are never emitted.
-
-    Accepted risk: a provider connection that accepts TCP but never sends
-    a byte is indistinguishable from a very slow inference and is therefore
-    bounded only by the campaign allowance. Probe A compensates with an
-    observation-only ``model-in-flight-liveness`` probe that keeps proving
-    the LOCAL server responsive during the pending POST; it never alters
-    the request's production-identical unbounded read semantics.
+    phase of the loopback infrastructure. The read phase has a finite
+    per-socket inactivity bound (production ``HttpOpenCodeClient``
+    ``request_timeout`` semantics), but there is NO total-response deadline:
+    a healthy slow inference that keeps the connection alive is never
+    falsely failed merely for taking long. A provider connection that
+    accepts TCP but never sends a byte therefore times out with a typed
+    ``read-timeout`` instead of blocking until the campaign allowance.
+    Response payloads are never returned or logged. The returned ``extra``
+    may hold internal opaque values (session id reference, sanitized
+    counts) for the very next request; identifiers are never emitted.
     """
     try:
         host, port = http_split_probe_base_url(base_url)
@@ -849,15 +873,19 @@ def _timed_request(
     timings: dict[str, float] = {}
     extra: dict[str, Any] = {}
     connection: http.client.HTTPConnection | None = None
+    phase = "connect"
     try:
         start = time.perf_counter()
         connection = http.client.HTTPConnection(host, port, timeout=connect_timeout)
         connection.connect()
         timings["connect_ms"] = round((time.perf_counter() - start) * 1000.0, 1)
-        if op_timeout is None and connection.sock is not None:
-            # Production identity: an in-flight model response has no
-            # socket inactivity deadline either.
-            connection.sock.settimeout(None)
+        inactivity_timeout = (
+            float(op_timeout) if op_timeout is not None else _model_inactivity_timeout_s()
+        )
+        if connection.sock is not None:
+            connection.sock.settimeout(inactivity_timeout)
+            timings["inactivity_timeout_s"] = round(inactivity_timeout, 1)
+        phase = "write"
         write_start = time.perf_counter()
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Accept": "application/json"}
@@ -865,6 +893,7 @@ def _timed_request(
             headers["Content-Type"] = "application/json"
         connection.request(method, path, body=payload, headers=headers)
         timings["write_ms"] = round((time.perf_counter() - write_start) * 1000.0, 1)
+        phase = "read"
         read_start = time.perf_counter()
         response = connection.getresponse()
         raw = response.read()
@@ -890,7 +919,7 @@ def _timed_request(
         return ok, False, timings, extra
     except (TimeoutError, OSError) as exc:
         timings["fail_category"] = (
-            "connect-timeout" if isinstance(exc, TimeoutError) else "network-error"
+            f"{phase}-timeout" if isinstance(exc, TimeoutError) else "network-error"
         )
         return False, False, timings, extra
     finally:
@@ -1094,8 +1123,9 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     """Probe A child: health, session create, one message on the AA model.
 
     kodmial/aa#424: the model message has NO wall-clock cutoff (production
-    ``HttpOpenCodeClient`` semantics: no total-response deadline); a real
-    call of 46/75/300/900 s completes and is recorded with its timing.
+    ``HttpOpenCodeClient`` semantics: only a per-socket inactivity bound,
+    no total-response deadline); a real call of 46/75/300/900 s completes
+    and is recorded with its timing.
     """
     from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig
 
@@ -1112,6 +1142,7 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         argv.get("probe_a_bootstrap_timeout_s", DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S)
     )
     connect_timeout = float(argv.get("connect_timeout_s", DEFAULT_PROBE_A_CONNECT_TIMEOUT_S))
+    model_inactivity_timeout = _model_inactivity_timeout_s()
     session_state = {"id": ""}
     anchor = threading.Event()
     watchdog = ChildWatchdog(
@@ -1209,11 +1240,17 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             )
             return EXIT_SERVER_ERROR_PROVEN
 
-        # 3) One real model message with NO wall-clock cutoff: only the TCP
-        #    connect phase is bounded (typed infrastructure bound). A real
-        #    response of any duration is awaited on a daemon thread and
-        #    recorded with full phase timing.
-        sink.emit("model-send-start", probe=PROBE_DIRECT_MODEL, model=str(model)[:96])
+        # 3) One real model message with NO wall-clock cutoff: the TCP
+        #    connect phase and per-socket inactivity are bounded (typed
+        #    infrastructure bounds), never total response time. A real
+        #    response is awaited on a daemon thread and recorded with full
+        #    phase timing.
+        sink.emit(
+            "model-send-start",
+            probe=PROBE_DIRECT_MODEL,
+            model=str(model)[:96],
+            read_inactivity_s=round(model_inactivity_timeout, 1),
+        )
         counters["last_real_event"] = "model-send-start"
         counters["last_real_monotonic"] = time.monotonic()
         anchor.set()
@@ -1239,7 +1276,7 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
                 f"/session/{urllib.parse.quote(session_id)}/message",
                 _probe_a_message_body(model),
                 connect_timeout,
-                None,
+                model_inactivity_timeout,
             )
         finally:
             liveness_stop.set()
