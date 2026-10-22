@@ -1094,8 +1094,8 @@ jobs:
                           `Timeout reason: \`${String((stall.timeout_reason || 'unknown')).slice(0, 32)}\``,
                           `Request state: \`${String((stall.request_state || 'unconfirmed-in-flight')).slice(0, 48)}\``,
                           `Request progress: \`${String((stall.request_progress_observable || 'progress-unobservable')).slice(0, 48)}\``,
-                          `Stage elapsed ms: \`${Math.round(Number(stall.stage_elapsed_ms || 0))}\``,
-                          `Delivery latency ms: \`${Math.round(Number(stall.delivery_latency_ms || 0))}\``,
+                          stallMeasurementLine('Stage elapsed ms', stall.stage_elapsed_ms),
+                          stallMeasurementLine('Delivery latency ms', stall.delivery_latency_ms),
                           cleanupLine(stall),
                         ].filter(Boolean).join('\n')
                       : '- Typed stall evidence unavailable in the live lane summary.',
@@ -1200,6 +1200,17 @@ jobs:
                 }
               }
               return;
+              function stallMeasurementLine(label, raw) {
+                // Absent measurements are rendered as unavailable, never as a
+                // fabricated 0 ms (kodmial/aa#427): a preemption before the
+                // child published timing evidence must read as missing data,
+                // not as a measured zero-delay stall.
+                const value = raw === undefined || raw === null || raw === '' ? Number.NaN : Number(raw);
+                if (!Number.isFinite(value)) {
+                  return label + ': `unavailable`';
+                }
+                return label + ': `' + Math.round(value) + '`';
+              }
               function cleanupLine(entry) {
                 const cleanup = entry && entry.cleanup;
                 if (!cleanup || typeof cleanup !== 'object') {

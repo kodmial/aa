@@ -485,6 +485,11 @@ def _timeout_lane(
         "watchdog_timeout": True,
         "timeout_category": category,
         "watchdog_trigger": trigger,
+        # Honest attribution: the parent publishes the bounded condition it
+        # actually observed (the same closed vocabulary as the child-side
+        # ``timeout_reason``). Leaving this absent forced diagnostic issues
+        # to render the invented placeholder "unknown" (kodmial/aa#427).
+        "timeout_reason": str(trigger)[:32],
         "completed_scenario_count": completed,
         "scenario_total": scenario_total,
         "elapsed_ms": round(elapsed_s * 1000.0, 1),

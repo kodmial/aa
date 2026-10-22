@@ -3001,6 +3001,29 @@ async def run_live_telegram_evidence_lane(
                         record_live_progress(
                             "scenario-abort-start",
                             scenario_index=position,
+                            # Carry THIS scenario's staged attribution with the
+                            # abort declaration: the parent's bounded recovery
+                            # hold reads the same marker, and if the recovery
+                            # is preempted mid-cleanup (campaign budget), the
+                            # persisted evidence must describe the preempted
+                            # stall, never the previous one (kodmial/aa#427).
+                            family=family,
+                            scenario_total=len(scenarios),
+                            timeout_category=stalled_attribution["timeout_category"],
+                            timeout_reason=stop_reason or "unknown",
+                            last_active_stage=last_active_stage,
+                            request_state=stalled_attribution["request_state"],
+                            request_started=stalled_attribution["request_started"],
+                            request_progress_observable=stalled_attribution[
+                                "request_progress_observable"
+                            ],
+                            # The pre-cleanup state: the bounded cleanup has
+                            # not run yet, so "skipped" (with the reason) is
+                            # the honest pending state, not a fake success.
+                            cleanup=stall_cleanup,
+                            completed_scenario_count=len(scenario_diagnostics),
+                            scenario_diagnostics=scenario_diagnostics,
+                            latency_samples=latency_samples,
                             stall_recovery_in_progress=True,
                             stall_recovery_started_monotonic=time.monotonic(),
                             real_progress=False,
