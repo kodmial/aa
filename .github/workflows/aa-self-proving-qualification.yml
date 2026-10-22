@@ -2083,7 +2083,10 @@ jobs:
         # deterministic (open PR head branch prefix, in-flight/queued
         # continuum runs, bounded freshness window) and carries no message
         # content.
-        if: ${{ always() }}
+        # Never reconcile after cancellation: a cancelled run can leave
+        # queued/not-yet-visible continuum work that still owns the
+        # reservation. Successful and failed runs still reconcile.
+        if: ${{ always() && !cancelled() }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}

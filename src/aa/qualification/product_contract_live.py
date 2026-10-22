@@ -3006,8 +3006,25 @@ async def run_live_telegram_evidence_lane(
                             real_progress=False,
                         )
 
-                        async def _retire_runtime() -> None:
+                        async def _retire_runtime(
+                            abandoned_chat_id: int = int(chat_id),
+                        ) -> None:
                             await app.stop()
+                            # ``Application.stop/start`` recreates the
+                            # transport and dispatcher workers, but the
+                            # session coordinator retains its chat map. Drop
+                            # the abandoned binding so the restarted runtime
+                            # cannot resume a wedged remote session or carry
+                            # stale per-chat state into the next scenario.
+                            sessions = getattr(app, "sessions", None)
+                            if sessions is not None:
+                                try:
+                                    sessions.reset(abandoned_chat_id)
+                                except Exception:
+                                    logger.warning(
+                                        "stalled-turn session reset failed",
+                                        extra={"chat_id": abandoned_chat_id},
+                                    )
                             await app.start()
 
                         stall_cleanup = await quiesce_and_abort_stalled_turn(

@@ -61,7 +61,10 @@ ENV_RECOVERY_ALLOWANCE_S = "AA_QUALIFICATION_WATCHDOG_RECOVERY_ALLOWANCE_S"
 # marker, that recovery is in progress (kodmial/aa#417). The child's own
 # per-scenario no-progress abort fires first; the parent escalates only if
 # the declared recovery never lands. Both layers share one lifecycle.
-DEFAULT_RECOVERY_ALLOWANCE_S = 150.0
+# Keep this window smaller than the scenario grace plus restart cost: it is
+# additive to every stall, so a large value lets serial stalls consume the
+# campaign budget before the remaining scenarios run.
+DEFAULT_RECOVERY_ALLOWANCE_S = 60.0
 
 # 135-minute campaign minus the 900-second finalisation reserve. The parent
 # never consumes the reserve, so Gate E/F, artifacts and #7 publication still

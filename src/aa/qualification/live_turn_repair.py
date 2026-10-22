@@ -21,9 +21,12 @@ cleared the active stage. This module owns the typed stall recovery:
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
+
+logger = logging.getLogger("aa.qualification.live_turn_repair")
 
 STUCK_PROVIDER_STAGES = frozenset(
     {
@@ -210,19 +213,37 @@ async def quiesce_and_abort_stalled_turn(
                 cleanup["quarantined_delivery_count"] = len(seam.quarantined_texts)
             except Exception:
                 pass
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "stall cleanup failed",
+            extra={
+                "chat_id": chat_id,
+                "reason": str(reason)[:32],
+                "error": type(exc).__name__,
+            },
+        )
         cleanup["cleanup_failed"] = True
+        cleanup["cleanup_error"] = type(exc).__name__
     return cleanup
 
 
+_SETTLE_CAP_S = 1.0
+
+
 async def _settle(grace_s: float) -> None:
-    """Short bounded yield so queued seam deliveries observably reconcile."""
+    """Bounded yield so queued seam deliveries observably reconcile.
+
+    The cap is deliberately larger than a single event-loop tick: late
+    deliveries already inside the Telegram seam need time to reach the
+    quarantine before the next scenario starts. It stays well below the
+    scenario grace so it can never meaningfully extend a stall.
+    """
     import asyncio
 
     if grace_s <= 0:
         await asyncio.sleep(0)
         return
-    await asyncio.sleep(min(grace_s, 0.05))
+    await asyncio.sleep(min(grace_s, _SETTLE_CAP_S))
 
 
 __all__ = [

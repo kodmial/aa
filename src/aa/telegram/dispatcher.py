@@ -207,7 +207,7 @@ class ChatTurnDispatcher:
         """
         if grace_s <= 0:
             raise ValueError("grace_s must be > 0")
-        worker = self._workers.pop(chat_id, None)
+        worker = self._workers.get(chat_id)
         dropped = 0
         if worker is None:
             return {
@@ -237,6 +237,13 @@ class ChatTurnDispatcher:
             await asyncio.wait({worker.task}, timeout=grace_s)
             stopped_within_grace = worker.task.done()
             non_cooperative = not stopped_within_grace
+        if stopped_within_grace:
+            # Forget the worker only after cancellation actually completed.
+            # A non-cooperative task stays tracked so the caller can observe
+            # it, re-cancel it, and escalate to runtime retirement instead of
+            # losing the only reference to live work.
+            if self._workers.get(chat_id) is worker:
+                self._workers.pop(chat_id, None)
         return {
             "had_worker": True,
             "cancelled": cancelled,

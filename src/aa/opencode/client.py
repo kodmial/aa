@@ -374,7 +374,7 @@ class HttpOpenCodeClient(OpenCodeClient):
             )
             raise
         except TimeoutError as exc:
-            failure_category = type(OpenCodeTimeoutError).__name__
+            failure_category = type(exc).__name__
             raise OpenCodeTimeoutError("opencode request timed out") from exc
         except OpenCodeError as exc:
             failure_category = type(exc).__name__
