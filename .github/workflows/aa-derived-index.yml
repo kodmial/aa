@@ -1,0 +1,242 @@
+name: AA derived index publishing
+
+# Trusted persistent L2 publisher (issue #429): only the main branch push
+# over index-affecting paths and an owner-only manual dispatch may publish
+# the encrypted E5+FAISS bundle as the immutable GHCR OCI artifact
+# (ghcr.io/kodmial/aa-index, tag idx-<cache_digest>). Low-trust pull-request
+# workflows never touch the artifact. The job runs inside the already
+# promoted AA runtime container: the prepared environment must exist BEFORE
+# publication is allowed (no bootstrap reimplementations in trusted paths).
+run-name: AA derived index L2 publishing
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Index-content inputs: canonical artifacts, structure, retrieval
+      # production config, planner/golden, embedding lock, explicit E5
+      # model/revision pinning.
+      - "corpus/canonical/**"
+      - "corpus/generated/retrieval/**"
+      - "corpus/retrieval/**"
+      - "corpus/embedding.lock.json"
+      - "corpus/embedding_r40.lock.json"
+      - ".opencode/prompts/**"
+      - ".opencode/tools/**"
+      - "src/aa/retrieval/**"
+      - "scripts/build_corpus_structure.py"
+      - "scripts/build_retrieval_index.py"
+      - "scripts/manage_derived_cache.py"
+      - "scripts/restore_canonical.py"
+      - "scripts/promote_derived_index.py"
+      - "docker/Dockerfile.aa-runtime"
+      - ".github/workflows/aa-derived-index.yml"
+  workflow_dispatch:
+
+permissions:
+  # Cache save needs write; publish writes the ghcr.io/kodmial/aa-index
+  # package; the promotion job opens the reviewed digest-pin PR.
+  actions: write
+  contents: read
+  packages: write
+
+concurrency:
+  group: aa-index-publishing
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      # Same promoted environment as every AA job kind (issue #429): the
+      # runtime image carries the pinned dev toolchain and native deps, so
+      # publish runs the exact qualified qualification/code stack.
+      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        # Packages write for the L2 blob/manifest upload; never leaked.
+        AA_INDEX_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        AA_ALLOW_NETWORK_FETCH: "0"
+        AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+    outputs:
+      digest: ${{ steps.publish.outputs.l2_digest }}
+      fingerprint: ${{ steps.publish.outputs.cache_fingerprint }}
+    steps:
+      - name: Checkout exact current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Validate promoted dependency-image provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_runtime_image.py --pins-only
+          test $(git rev-parse HEAD) = ${{ github.sha }}
+
+      - name: Install worker (prepared environment, no resolution)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image already carries the pinned dependency layer; only the
+          # exact checked-out application source is installed. A stale image
+          # (mismatched pins) fails closed via verify_runtime_image --pins-only.
+          pip install -e . --no-deps
+
+      - name: Build and validate AA knowledge runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Production activation (#28): restore the verified EN + RU canonical
+          # artifacts from the committed encrypted snapshots. RU fails closed
+          # when the qualified snapshot cannot be restored/validated.
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
+          python scripts/build_corpus_structure.py
+
+      - name: Compute derived retrieval cache key
+        id: derived-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          echo "derived-dir=$derived_dir" >> "$GITHUB_OUTPUT"
+          # L1 acceleration (best effort) with the rotation-aware Actions key.
+          payload=$(python scripts/manage_derived_cache.py --mode print-key \
+            --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
+            --cache-dir "$derived_dir")
+          echo "$payload"
+          python - "$payload" >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          payload = json.loads(sys.argv[1])
+          print(f"actions-key={payload['actions_key']}")
+          print(f"fingerprint={payload['cache_fingerprint']}")
+          PY
+
+      - name: Restore encrypted derived retrieval cache
+        id: restore-derived
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.actions-key }}
+          fail-on-cache-miss: false
+
+      - name: Build strict E5 production index and publish L2
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Strict E5 only: publish refuses any non-E5 backend outright
+          # (restore-or-rebuild --backend e5 --require-backend e5).
+          python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache" \
+            --backend e5 --require-backend e5
+          # Trusted publication: idempotent content-addressed artifact
+          # (HEAD-before-push), retried on transient transport failures.
+          python scripts/manage_derived_cache.py --mode publish-l2 \
+            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache" \
+            --require-backend e5 \
+            --status-file "derived-publish-status.json"
+          echo "l2_digest=$(python -c "import json; print(json.load(open('derived-publish-status.json'))['l2_digest'])")" >> "$GITHUB_OUTPUT"
+          echo "cache_fingerprint=$(python -c "import json; print(json.load(open('derived-publish-status.json'))['cache_fingerprint'])")" >> "$GITHUB_OUTPUT"
+          digest_value="$(python -c "import json; print(json.load(open('derived-publish-status.json'))['l2_digest'])")"
+          fingerprint_value="$(python -c "import json; print(json.load(open('derived-publish-status.json'))['cache_fingerprint'])")"
+          {
+            echo "## AA derived-index L2 publication"
+            echo "- digest: \`ghcr.io/kodmial/aa-index@$digest_value\`"
+            echo "- cache fingerprint: \`$fingerprint_value\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save trusted L1 acceleration (rotation-aware key)
+        if: success() && steps.restore-derived.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          # Best-effort L1 save only for the same exact content key; failure
+          # never affects the already-published immutable L2 artifact.
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.actions-key }}
+
+      - name: Upload bootstrap metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-index-bootstrap-metrics
+          path: derived-publish-status.json
+          retention-days: 30
+          if-no-files-found: error
+
+  propose-index-promotion:
+    needs: publish
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout exact published main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # The PR must trigger ordinary CI and Continuum review workflows;
+          # GITHUB_TOKEN-authored PRs do not trigger the required events.
+          token: ${{ secrets.TAP_PAT || github.token }}
+
+      - name: Create reviewed index digest-pin PR
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          TAP_PAT_AVAILABLE: ${{ secrets.TAP_PAT != '' }}
+          L2_DIGEST: ${{ needs.publish.outputs.digest }}
+          # Fingerprint is carried through the publish job outputs; only the
+          # 16-hex content fingerprint is non-secret annotation data.
+          L2_FINGERPRINT: ${{ needs.publish.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAP_PAT_AVAILABLE" != "true" ]]; then
+            echo "::error::TAP_PAT needed for activation PR to trigger CI/review; no direct main writes."
+            exit 1
+          fi
+          [[ "$L2_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::Missing immutable L2 digest"; exit 1
+          }
+          python scripts/promote_derived_index.py --digest "$L2_DIGEST" --fingerprint "$L2_FINGERPRINT" --apply
+          if git diff --quiet -- docker/aa-index.digest; then
+            echo "L2 digest pin already active. No promotion PR needed."
+            exit 0
+          fi
+          branch="index/aa-derived-index-${L2_DIGEST#sha256:}"
+          branch="${branch:0:36}"
+          already="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$already" ]]; then
+            echo "Promotion PR #$already already exists; not duplicating."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add docker/aa-index.digest
+          git commit -m "chore: pin validated AA derived-index L2 artifact digest"
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore: activate validated AA derived-index L2 artifact (issue #429)" \
+            --body "Pins exactly one immutable GHCR L2 artifact \`ghcr.io/kodmial/aa-index@$L2_DIGEST\` (content-addressed \`idx-<cache_digest>\` tag, idempotent push). Runtime jobs fail closed against placeholder pins and fall back to the bounded emergency rebuild until merged. No book text, secrets, or ephemeral identity enters the artifact or the pin."
+
+      - name: Publish promotion summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## AA derived-index L2 promotion PR"
+            echo "- pinned digest: \`ghcr.io/kodmial/aa-index@$L2_DIGEST\`"
+            echo "- cache fingerprint: \`$L2_FINGERPRINT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          L2_DIGEST: ${{ needs.publish.outputs.digest }}
+          L2_FINGERPRINT: ${{ needs.publish.outputs.fingerprint }}

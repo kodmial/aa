@@ -83,7 +83,11 @@ def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
     assert "Reject duplicate runtime" in workflow
     assert "verify_runtime_image.py" in _read(WORKFLOWS / "aa-runtime-image.yml")
     assert "git rev-parse HEAD" in workflow
-    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow
+    # Issue #429: the pinned OpenCode CLI comes from the prepared GHCR
+    # image; the workflow verifies the pin against docker/opencode.version.
+    assert "uses: ./.github/actions/aa-opencode-toolchain" not in workflow
+    assert "$(cat docker/opencode.version)" in workflow
+    assert "$(opencode --version)" in workflow
     assert "opencode --version" in _read(ROOT / ".github/actions/aa-opencode-toolchain/action.yml")
     assert "encoder=libopus" in workflow
 
@@ -91,7 +95,9 @@ def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
 def test_runtime_hot_path_skips_redundant_installs() -> None:
     workflow = _read(WORKFLOWS / "aa-runtime.yml")
     assert "pip install -e . --no-deps" in workflow
-    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow
+    # Issue #429: pin verification happens against the baked image pin.
+    assert "uses: ./.github/actions/aa-opencode-toolchain" not in workflow
+    assert "$(cat docker/opencode.version)" in workflow
     toolchain = _read(ROOT / ".github/actions/aa-opencode-toolchain/action.yml")
     assert "docker/opencode.version" in toolchain
     assert "opencode --version" in toolchain

@@ -15,13 +15,19 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 ACTION = ROOT / ".github" / "actions" / "aa-opencode-toolchain" / "action.yml"
 PIN = ROOT / "docker" / "opencode.version"
 
+# Issue #429: these two workflows consume the pinned OpenCode CLI through
+# the prepared GHCR runtime image (digest-pinned container) instead of the
+# reusable local toolchain action; their pin is verified in-workflow.
+OPEN_CODE_PREPARED_IMAGE_WORKFLOWS = (
+    "aa-self-proving-qualification.yml",
+    "aa-runtime.yml",
+)
+
 OPEN_CODE_WORKFLOWS = (
     "ci.yml",
     "aa-gate-c-heldout-bootstrap.yml",
-    "aa-self-proving-qualification.yml",
     "aa-canary.yml",
     "aa-real-book-retrieval-qualification.yml",
-    "aa-runtime.yml",
     "aa-opencode-model-route-e2e.yml",
 )
 
@@ -50,6 +56,36 @@ def test_all_aa_live_runners_share_verified_toolchain() -> None:
         assert "opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in text, name
         assert "https://opencode.ai/install" not in text, name
         assert not re.search(r"bash -s -- --version\s+[0-9]", text), name
+
+
+def test_prepared_environment_workflows_pin_the_runtime_image() -> None:
+    # Issue #429: aa-runtime.yml and the qualification workflow must run
+    # inside the exact digest-pinned prepared GHCR image, which carries the
+    # same OpenCode version pin (docker/opencode.version), and must verify
+    # the pin explicitly instead of parsing a workflow input.
+    pin = PIN.read_text(encoding="utf-8").strip()
+    for name in OPEN_CODE_PREPARED_IMAGE_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "container:" in text, name
+        assert "ghcr.io/kodmial/aa-runtime@sha256:" in text, name
+        assert "ghcr.io/kodmial/aa-runtime@${{" not in text, name
+        assert "$(cat docker/opencode.version)" in text, name
+        assert "uses: ./.github/actions/aa-opencode-toolchain" not in text, name
+        assert "https://opencode.ai/install" not in text, name
+    assert (
+        "ghcr.io/kodmial/aa-runtime@"
+        + "8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409"
+        not in (WORKFLOWS / "aa-runtime.yml")
+        .read_text(encoding="utf-8")
+        .replace("@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409", "")
+    )
+    docker_pin_matches = [
+        workflow
+        for workflow in OPEN_CODE_PREPARED_IMAGE_WORKFLOWS
+        if pin in (WORKFLOWS / workflow).read_text(encoding="utf-8")
+        or "docker/opencode.version" in (WORKFLOWS / workflow).read_text(encoding="utf-8")
+    ]
+    assert docker_pin_matches, "prepared-image workflows must read the repo pin"
 
 
 def test_aa_toolchain_reads_only_pin_and_verifies_real_binary() -> None:

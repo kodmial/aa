@@ -77,4 +77,8 @@ def test_qualification_uses_chatbot_policy_not_continuum_coder_route() -> None:
     assert "task-class: coder" not in workflow
     assert "model-route@" not in workflow
     assert "1.18.34" not in workflow
-    assert "uses: ./.github/actions/aa-opencode-toolchain" in workflow
+    # Issue #429: the toolchain action was replaced by the digest-pinned
+    # prepared runtime image whose OpenCode pin is verified in-workflow.
+    assert "uses: ./.github/actions/aa-opencode-toolchain" not in workflow
+    assert "ghcr.io/kodmial/aa-runtime@sha256:" in workflow
+    assert "$(cat docker/opencode.version)" in workflow

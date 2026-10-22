@@ -84,6 +84,27 @@ RUN set -eux; \
         "huggingface_hub>=0.23"; \
     python -c "import torch, sherpa_onnx, onnxruntime, faiss, transformers; print('deps ok')"
 
+# Prepared qualification toolchain layer (issue #429): the same immutable
+# environment serves the bot runtime, Gate A/B preflight (ruff/mypy/pytest)
+# and Gate C/E/F (spacy RU model). Dev pins must stay compatible with the
+# selector ranges in pyproject.toml [project.optional-dependencies]; CI
+# fails closed on drift.
+RUN set -eux; \
+    pip install --no-cache-dir \
+        "pytest==9.1.1" \
+        "pytest-asyncio==1.4.0" \
+        "ruff==0.17.2" \
+        "mypy==2.4.0" \
+        "click==8.5.0" \
+        "typer-slim==0.24.0" \
+        "typer==0.25.1" \
+        "spacy==3.8.7" \
+        "ru-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_sm-3.8.0/ru_core_news_sm-3.8.0-py3-none-any.whl"; \
+    pytest --version; \
+    ruff --version; \
+    mypy --version; \
+    python -c "import spacy; spacy.load('ru_core_news_sm'); print('dev toolchain ok')"
+
 # OpenCode version is provided by the Actions variable through an exact build
 # argument; when absent, use the same reviewed repository default as every job.
 ARG AA_OPENCODE_VERSION=""
@@ -113,7 +134,12 @@ RUN set -eux; \
         echo -n "python="; python --version; \
         echo -n "ffmpeg="; ffmpeg -version 2>&1 | head -n 1; \
         echo -n "opencode="; /root/.opencode/bin/opencode --version 2>&1 | head -n 1; \
-        echo "--- pip freeze (pinned) ---"; pip freeze | sort; \
+        echo -n "pytest="; pytest --version 2>&1 | head -n 1; \
+        echo -n "ruff="; ruff --version 2>&1 | head -n 1; \
+        echo -n "mypy="; mypy --version 2>&1 | head -n 1; \
+        python -c "import spacy; spacy.load('ru_core_news_sm')"; \
+        echo "spacy-model=ru_core_news_sm-3.8.0"; \
+        echo "--- pip freeze (pinned) ---"; pip freeze | grep -E '^(pytest|ruff|mypy|click|typer|spacy|ru-core-news-sm)==' | sort; \
         echo "--- native imports ---"; \
         python -c "import torch, sherpa_onnx, onnxruntime; print('native ok')"; \
     } > /opt/aa/provenance.txt; \

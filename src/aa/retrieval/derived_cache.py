@@ -42,6 +42,7 @@ from typing import Any
 import zstandard as zstd
 
 from aa.corpus.age_v1 import AgeError, decrypt_bytes, encrypt_bytes
+from aa.retrieval.dense import E5_BACKEND_NAME
 
 DERIVED_CACHE_SCHEMA_VERSION = 1
 DERIVED_CACHE_FORMAT = "aa-derived-retrieval-cache/1"
@@ -51,6 +52,14 @@ BUNDLE_FILES = ("index.json", "lexical.db", "dense.json")
 ENCRYPTED_NAME = "derived-retrieval.tar.zst.age"
 META_NAME = "derived-retrieval.meta.json"
 MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+
+# Production dense backend (issue #429): runtime/Gate B/Gate C must use one
+# strict E5/FAISS index. A restored bundle whose recorded dense backend is
+# the offline hashing substrate never satisfies the requirement, so the
+# backend name and the model dimension are bound into the cache key and into
+# every restore validation (no semantic cache hit from hashing is possible).
+E5_PRODUCTION_DIM = 768
+REQUIRE_BACKEND_CHOICES = ("none", "hashing", "e5")
 
 IDENTITY_ENV = "AA_BOOK_AGE_IDENTITY"
 ENABLE_ENV = "AA_DERIVED_CACHE_ENABLED"
@@ -315,6 +324,8 @@ def read_bindings(
         "embedding_lock_sha256": sha256_canonical_json(
             {str(key): lock[key] for key in sorted(lock)}
         ),
+        "production_dense_backend": E5_BACKEND_NAME,
+        "production_dense_dim": E5_PRODUCTION_DIM,
         "abi": retrieval_abi(),
         "os": normalized_os,
         "arch": normalized_arch,
@@ -487,8 +498,53 @@ def decrypt_package(encrypted: bytes, identity: str) -> bytes:
         raise DerivedCacheError(f"derived cache decryption failed: {exc}") from exc
 
 
+def assert_required_backend(files: dict[str, bytes], *, require_backend: str) -> None:
+    """Fail closed when a restored bundle is not the required dense backend.
+
+    Production passes ``require_backend="e5"``: a bundle whose index
+    metadata declares the offline hashing backend (or a non-production
+    dimension) can never satisfy runtime/Gate B/Gate C, so it is rejected
+    with a ``wrong-backend`` category instead of being trusted.
+    """
+    if require_backend == "none":
+        return
+    from aa.retrieval.dense import HASHING_BACKEND_NAME, HASHING_DIM
+    from aa.retrieval.index import INDEX_FORMAT
+
+    mapping: dict[str, tuple[str, int]] = {
+        "e5": (E5_BACKEND_NAME, E5_PRODUCTION_DIM),
+        "hashing": (HASHING_BACKEND_NAME, HASHING_DIM),
+    }
+    expected = mapping.get(require_backend)
+    if expected is None or len(mapping) == 0:
+        raise DerivedCacheError(f"unsupported required backend: {require_backend!r}")
+    raw = files.get("index.json")
+    if raw is None:
+        raise DerivedCacheError("restored bundle is missing index.json")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        type_name = type(exc).__name__
+        raise DerivedCacheError(f"restored index.json is not readable: {type_name}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
+        raise DerivedCacheError("restored index.json metadata is malformed")
+    metadata = payload["metadata"]
+    got_backend = str(metadata.get("embedding_backend", ""))
+    got_dim_raw = metadata.get("embedding_dim", -1)
+    got_dim = int(got_dim_raw) if str(got_dim_raw).isdigit() else -1
+    want_backend, want_dim = expected
+    if got_backend != want_backend or got_dim != want_dim:
+        raise DerivedCacheError(
+            f"restored bundle backend mismatch: want {want_backend}/{want_dim}, "
+            f"got {got_backend}/{got_dim} (format {INDEX_FORMAT})"
+        )
+
+
 def verify_manifest(
-    manifest: dict[str, Any], *, live_bindings: dict[str, Any], expected_key: str
+    manifest: dict[str, Any],
+    *,
+    live_bindings: dict[str, Any],
+    expected_key: str,
 ) -> None:
     """Verify the internal manifest against the live bindings (fails closed)."""
     if manifest.get("format") != DERIVED_CACHE_FORMAT:

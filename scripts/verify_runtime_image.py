@@ -35,10 +35,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "docker" / "Dockerfile.aa-runtime"
 OPENCODE_VERSION_FILE = ROOT / "docker" / "opencode.version"
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
+INDEX_DIGEST_FILE = ROOT / "docker" / "aa-index.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 DIGEST_RE = re.compile(r"^ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}$")
+INDEX_REFERENCE_RE = re.compile(r"^ghcr\.io/kodmial/aa-index@sha256:[0-9a-f]{64}$")
 ZERO_DIGEST = "0" * 64
 
 EXPECTED_PINS = (
@@ -127,6 +129,125 @@ def check_pins() -> list[str]:
         for line in copy_lines:
             if forbidden in line:
                 errors.append(f"Dockerfile must not COPY {forbidden}")
+    errors += check_dev_pins(docker_text=docker_text, project_text=project_text)
+    return errors
+
+
+_DEV_PIN_RE = re.compile(r'"([A-Za-z0-9_.-]+)==([0-9a-zA-Z.]+)"')
+_REQUIREMENT_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$")
+_CONSTRAINT_RE = re.compile(r"(===|==|!=|>=|<=|~=|>|<)\s*([^\s,;\"']+)")
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    numbers: list[int] = []
+    for part in value.strip().split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        numbers.append(int(digits) if digits else 0)
+    return tuple(numbers)
+
+
+def _compare_version(left: str, right: str) -> int:
+    left_tuple = list(_version_tuple(left)) or [0]
+    right_tuple = list(_version_tuple(right)) or [0]
+    width = max(len(left_tuple), len(right_tuple))
+    left_tuple += [0] * (width - len(left_tuple))
+    right_tuple += [0] * (width - len(right_tuple))
+    return (tuple(left_tuple) > tuple(right_tuple)) - (tuple(left_tuple) < tuple(right_tuple))
+
+
+def _compatible_release(want: str, got: str) -> bool:
+    """PEP 440 compatible-release (~=) check for numeric versions."""
+    if _compare_version(got, want) < 0:
+        return False
+    want_parts = want.split(".")
+    got_parts = got.split(".")
+    prefix_len = max(1, len(want_parts) - 1)
+    want_prefix = _version_tuple(".".join(want_parts[:prefix_len]))
+    got_prefix = _version_tuple(".".join(got_parts[:prefix_len]))
+    return got_prefix == want_prefix
+
+
+def _op_satisfied(op: str, want: str, got: str) -> bool:
+    order = _compare_version(got, want)
+    if op == "===":
+        return got == want
+    if op == "==":
+        if want.endswith(".*"):
+            prefix = want[:-2]
+            return got == prefix or got.startswith(prefix + ".")
+        return order == 0
+    if op == "!=":
+        if want.endswith(".*"):
+            prefix = want[:-2]
+            return not (got == prefix or got.startswith(prefix + "."))
+        return order != 0
+    if op == ">=":
+        return order >= 0
+    if op == "<=":
+        return order <= 0
+    if op == ">":
+        return order > 0
+    if op == "<":
+        return order < 0
+    if op == "~=":
+        return _compatible_release(want, got)
+    return False
+
+
+def _parse_dev_selectors(dev_section: str) -> list[tuple[str, str, str]]:
+    """Extract every version constraint, including extras and multi-clause ranges."""
+    selectors: list[tuple[str, str, str]] = []
+    for raw_line in dev_section.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("["):
+            continue
+        line = line.strip('"').strip("'").rstrip(",").strip()
+        if " @ " in line:
+            # Direct URL requirements carry no comparable version selector.
+            continue
+        match = _REQUIREMENT_RE.match(line)
+        if match is None:
+            continue
+        name = match.group(1)
+        rest = match.group(2)
+        for op, version in _CONSTRAINT_RE.findall(rest):
+            selectors.append((name, op, version))
+    return selectors
+
+
+def check_dev_pins(*, docker_text: str, project_text: str) -> list[str]:
+    """Verify the baked dev/qualification pins stay within the pyproject ranges.
+
+    The prepared environment serves Gate A/B (ruff/mypy/pytest) and Gate C
+    (spacy RU model). Drift between an exact image pin and a relaxed
+    selector range must be visible, never silently stale.
+    """
+    errors: list[str] = []
+    if "[project.optional-dependencies]" not in project_text:
+        return ["pyproject.toml optional-dependencies section is missing"]
+    remainder = project_text.split("[project.optional-dependencies]", 1)[1]
+    dev_lines: list[str] = []
+    for line in remainder.splitlines():
+        if line.strip().startswith("["):
+            break
+        dev_lines.append(line)
+    dev_section = "\n".join(dev_lines)
+    selectors = _parse_dev_selectors(dev_section)
+    if not selectors:
+        return ["pyproject.toml dev selectors are unreadable"]
+    pins: dict[str, str] = {}
+    for name, version in _DEV_PIN_RE.findall(docker_text):
+        pins[name.lower()] = version
+    for name, op, want in selectors:
+        got = pins.get(name.lower())
+        if got is None:
+            errors.append(f"Dockerfile dev layer lacks pin for {name}")
+            continue
+        if not _op_satisfied(op, want, got):
+            errors.append(f"Dockerfile dev pin {name}=={got} violates selector {name}{op}{want}")
+    for required in ("pytest", "ruff", "mypy", "spacy"):
+        if required not in pins:
+            errors.append(f"Dockerfile dev layer lacks {required}")
     return errors
 
 
@@ -158,6 +279,46 @@ def check_digest_wiring(*, allow_placeholder: bool) -> list[str]:
     if "group: aa-bot-runtime" not in workflow_text:
         errors.append("AA must keep the single-poller concurrency group")
     return errors
+
+
+def check_index_digest_wiring() -> list[str]:
+    """Fail closed on a malformed persistent derived-index L2 pin (issue #429)."""
+    errors: list[str] = []
+    if not INDEX_DIGEST_FILE.is_file():
+        return ["docker/aa-index.digest metadata file is missing"]
+    lines = INDEX_DIGEST_FILE.read_text(encoding="utf-8").strip().splitlines()
+    reference = lines[-1].strip() if lines else ""
+    if not INDEX_REFERENCE_RE.fullmatch(reference):
+        return [f"index digest file malformed: {reference!r}"]
+    if reference.endswith(":" + ZERO_DIGEST):
+        # Placeholder is the honest pre-publication state; verify the
+        # consumer client's actual behavior instead of grepping for a
+        # fragile error-message string.
+        errors += _check_placeholder_rejected()
+
+    if not (ROOT / ".github" / "workflows" / "aa-derived-index.yml").is_file():
+        errors.append("trusted aa-derived-index publisher workflow is missing")
+    return errors
+
+
+def _check_placeholder_rejected() -> list[str]:
+    try:
+        from aa.retrieval.oci_artifact import ArtifactError, parse_pinned_digest
+    except ImportError:
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from aa.retrieval.oci_artifact import ArtifactError, parse_pinned_digest
+        except ImportError:
+            return ["cannot import oci_artifact module for placeholder check"]
+    try:
+        parse_pinned_digest(INDEX_DIGEST_FILE)
+    except ArtifactError as exc:
+        if exc.category != "l2-unpublished":
+            return [f"placeholder pin rejected with wrong category: {exc.category}"]
+        return []
+    return ["consumer client does not reject placeholder L2 pin"]
 
 
 def check_ffmpeg(*, started_ms: dict[str, int]) -> list[str]:
@@ -279,6 +440,39 @@ def check_head_match() -> list[str]:
     return []
 
 
+def check_dev_toolchain() -> list[str]:
+    """Prepared qualification toolchain works (issue #429): no reinstall."""
+    errors: list[str] = []
+    for tool in ("pytest", "ruff", "mypy"):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", tool, "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"dev toolchain {tool} failed: {exc.__class__.__name__}")
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import spacy; spacy.load('ru_core_news_sm'); print('ok')",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if "ok" not in proc.stdout:
+            errors.append("spacy RU model check produced no confirmation")
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"spacy RU model check failed: {exc.__class__.__name__}")
+    return errors
+
+
 def run_check_only_prefetch() -> list[str]:
     errors: list[str] = []
     commands = (
@@ -311,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     errors = check_pins()
     if not args.canary:
         errors += check_digest_wiring(allow_placeholder=args.allow_placeholder_digest)
+    errors += check_index_digest_wiring()
     if errors:
         print(json.dumps({"status": "fail", "errors": errors}, sort_keys=True))
         return 1
@@ -318,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     errors += check_ffmpeg(started_ms=timings)
     errors += check_native_imports(started_ms=timings)
     errors += check_opencode()
+    errors += check_dev_toolchain()
     errors += check_head_match()
     # Identity checks only: --check-only never downloads and prunes nothing
     # except stale local content; the bounded download path stays in workflow.
