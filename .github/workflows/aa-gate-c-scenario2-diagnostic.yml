@@ -1,0 +1,176 @@
+name: AA Gate C scenario2 diagnostic
+
+# kodmial/aa#418 (P0 diagnostic, bounded): run ONLY Gate C scenario #2
+# (substantive-drinking) through the real production path on an Actions runner
+# to isolate the observed ~30m stall (delivery_latency_ms=1940597.8,
+# timeout_reason=no-real-progress in run 39715421348).
+#
+# Strictly diagnostic: NOT qualification evidence, no product-path edits,
+# no full 18-case Gate C rerun. Two bounded probes:
+#   A) direct OpenCode model call with connect/write/read phase timing
+#   B) the exact production Application turn for scenario #2 via the
+#      qualification lane's in-process Telegram seam
+# One idempotent progress comment on issue #418; final root-cause report is
+# posted there. Diagnostic-only artifacts carry an explicit
+# "diagnostic" framing. INCONCLUSIVE / still-in-progress-at-probe-end is
+# diagnostic-only and never means the product failed a requirement.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/aa-gate-c-scenario2-diagnostic.yml"
+      - "scripts/diagnose_gate_c_scenario2.py"
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "Exact SHA to diagnose (defaults to current main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: aa-gate-c-scenario2-diagnostic-${{ inputs.target_sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    # Hard ceiling: 20 minutes (spec). The diagnostic itself runs ~recorded
+    # 2 probes with a ~130s scenario cutoff plus environment setup.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Verify exact SHA
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "run-id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run-url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "main-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "$GITHUB_RUN_ID $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install AA pinned OpenCode via verified Continuum toolchain
+        uses: ./.github/actions/aa-opencode-toolchain
+        with:
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
+
+      - name: Resolve AA-owned conversation models
+        id: bot_model
+        env:
+          AA_BOT_PRIMARY_MODEL: ${{ vars.AA_BOT_PRIMARY_MODEL }}
+          AA_BOT_FALLBACK_MODEL: ${{ vars.AA_BOT_FALLBACK_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m aa.bot_models --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore offline canonical corpus and build retrieval index
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/restore_canonical.py --no-network-fallback
+          python scripts/restore_canonical.py --lang ru --no-network-fallback
+          python scripts/build_corpus_structure.py
+          python scripts/prefetch_public_assets.py
+          # Text scenario only: NO voice prefetch for this diagnostic run.
+          python scripts/build_retrieval_index.py --backend e5
+
+      - name: Run bounded scenario2 diagnostic (probes A + B)
+        id: diag
+        env:
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/diagnose_gate_c_scenario2.py \
+            --main-sha "${{ steps.sha.outputs.main-sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --issue 418 \
+            --owner kodmial \
+            --repo aa \
+            --out-dir diagnostic-scenario2-out
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-gate-c-scenario2-diagnostic-${{ github.run_id }}-scenario2
+          path: diagnostic-scenario2-out/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Notify on failed diagnostic lifecycle
+        # Fallback only: the script itself owns the idempotent #418 comment.
+        # This step never creates a second comment if the marker comment for
+        # this run already exists.
+        if: always() && steps.diag.outcome != 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = "${{ github.run_id }}";
+            const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/" + runId;
+            const sha = "${{ steps.sha.outputs.main-sha }}";
+            const marker = "<!-- aa-scenario2-diagnostic run=" + runId + " -->";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 418,
+              per_page: 100
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              core.info("Comment for run " + runId + " already exists; not duplicating.");
+              return;
+            }
+            // Sanitized notice only (never log bot tokens or payloads).
+            const body = [
+              "<!-- aa-scenario2-diagnostic run=" + runId + " -->",
+              "**AA Gate C scenario #2 diagnostic (P0, kodmial/aa#418)**",
+              "",
+              "Status: `workflow-degraded-before-or-around-diagnostic` (sanitized notice).",
+              "- Run URL: " + runUrl,
+              "- Exact SHA: `" + sha + "`",
+              "- Failed step: `" + "${{ steps.diag.outcome }}" + "`",
+              "",
+              "The diagnostic script failed to publish its own final report. Check the",
+              "run log and the uploaded artifacts for sanitized evidence.",
+              "_Diagnostic-only: not qualification evidence._"
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 418,
+              body
+            });
