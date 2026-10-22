@@ -31,6 +31,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from aa.conversation.turn_causality import stamp as _causality_stamp
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
     OpenCodeError,
@@ -121,6 +122,15 @@ def _extract_structured(payload: object) -> dict[str, object] | None:
 
 class OpenCodeClient(ABC):
     """Interface for the local OpenCode HTTP boundary (fakeable for tests)."""
+
+    @property
+    def request_latency_audit(self) -> tuple[dict[str, object], ...]:
+        """Return privacy-safe local OpenCode HTTP timing evidence.
+
+        The base client has no request audit; only the real HTTP boundary
+        records bounded-censored local timing (kodmial/aa#417).
+        """
+        return ()
 
     @abstractmethod
     async def health(self) -> HealthInfo:
@@ -276,14 +286,27 @@ class HttpOpenCodeClient(OpenCodeClient):
             return "session-delete"
         return "other"
 
-    def _record_request_latency(self, *, operation: str, elapsed_ms: float, success: bool) -> None:
-        self._request_latency_audit.append(
-            {
-                "operation": operation,
-                "latency_ms": round(max(0.0, elapsed_ms), 1),
-                "success": bool(success),
-            }
-        )
+    def _record_request_latency(
+        self,
+        *,
+        operation: str,
+        elapsed_ms: float,
+        success: bool,
+        failure_category: str = "",
+    ) -> None:
+        entry: dict[str, object] = {
+            "operation": operation,
+            "latency_ms": round(max(0.0, elapsed_ms), 1),
+            "success": bool(success),
+        }
+        if failure_category:
+            entry["failure_category"] = failure_category[:64]
+        # Per-turn causality attribution (kodmial/aa#417): audit entries
+        # carry the privacy-safe causality id of the turn context that
+        # issued this request, so a stalled scenario can prove whether a
+        # request actually started and whether it completed or failed.
+        entry = _causality_stamp(entry)
+        self._request_latency_audit.append(entry)
         if len(self._request_latency_audit) > 2048:
             del self._request_latency_audit[:-2048]
 
@@ -322,6 +345,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         operation = self._request_operation(method, path, body)
         started = time.perf_counter()
         success = False
+        failure_category = ""
+        recorded = False
         worker = asyncio.ensure_future(
             asyncio.to_thread(self._sync_request, method, path, body, effective_timeout)
         )
@@ -330,26 +355,43 @@ class HttpOpenCodeClient(OpenCodeClient):
             success = True
             return result
         except asyncio.CancelledError:
+            # Cancellation attribution (kodmial/aa#417): a cancelled turn
+            # request is bounded evidence; the underlying worker thread may
+            # keep running until the socket bound or process isolation
+            # applies, which the caller owns.
+            failure_category = "cancelled"
             worker.cancel()
+            self._record_request_latency(
+                operation=operation,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                success=False,
+                failure_category=failure_category,
+            )
+            recorded = True
             abort_task = asyncio.create_task(self._best_effort_abort(path))
             abort_task.add_done_callback(
                 lambda task: task.exception() if not task.cancelled() else None
             )
             raise
         except TimeoutError as exc:
+            failure_category = type(exc).__name__
             raise OpenCodeTimeoutError("opencode request timed out") from exc
-        except OpenCodeError:
+        except OpenCodeError as exc:
+            failure_category = type(exc).__name__
             raise
         except OSError as exc:
+            failure_category = type(exc).__name__
             # Connection refused/reset against the loopback server: the
             # runtime is down or unreachable; retryable once it is back.
             raise OpenCodeTransientError("opencode runtime is unreachable") from exc
         finally:
-            self._record_request_latency(
-                operation=operation,
-                elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                success=success,
-            )
+            if not recorded:
+                self._record_request_latency(
+                    operation=operation,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    success=success,
+                    failure_category=failure_category,
+                )
 
     async def health(self) -> HealthInfo:
         payload = await self._call("GET", "/global/health")

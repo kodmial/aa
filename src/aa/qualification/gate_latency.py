@@ -57,6 +57,10 @@ CLOCK_MONOTONIC = "monotonic-perf_counter"
 UNITS_MS = "ms"
 
 MISSING_LIVE_SAMPLES = "missing-live-samples"
+# kodmial/aa#417 Gate E honesty: when real bounded-censored samples exist
+# but the C lane cannot hand them to the SLO as trustworthy success
+# evidence, the blocked category must not claim that samples are missing.
+INSUFFICIENT_COMPLETED_TURNS = "insufficient-completed-turns"
 SLO_EXCEEDED = "latency-budget-exceeded"
 RELIABILITY_FAILED = "ordinary-turn-failed"
 
@@ -613,6 +617,7 @@ __all__ = [
     "EXTERNAL_OPTIONAL_SERIES",
     "EXTERNAL_UNVERIFIED",
     "LATENCY_EVIDENCE_SCHEMA",
+    "INSUFFICIENT_COMPLETED_TURNS",
     "MISSING_LIVE_SAMPLES",
     "RELIABILITY_FAILED",
     "SLO_EXCEEDED",

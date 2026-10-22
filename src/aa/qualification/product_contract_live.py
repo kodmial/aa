@@ -38,9 +38,14 @@ from pathlib import Path
 from typing import Any
 
 from aa.opencode.errors import OpenCodeRateLimitError
+from aa.qualification.live_turn_repair import (
+    build_timeout_attribution,
+    quiesce_and_abort_stalled_turn,
+)
 from aa.qualification.live_watchdog import (
     live_total_deadline_s,
     record_live_progress,
+    scenario_grace_s,
 )
 from aa.time_policy import current_time_policy
 
@@ -93,6 +98,11 @@ class ProductContractLiveError(ValueError):
 # when they appear as dict keys under a forbidden key. Every other string
 # under a forbidden key stays a leak.
 _STRUCTURAL_STAT_KEYS = frozenset({"p50", "p95", "max", "count"})
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    """Coerce an untyped progress-marker value to float (privacy-safe)."""
+    return float(value) if isinstance(value, (int, float)) else default
 
 
 def _dict_key_holds_text(key: Any) -> bool:
@@ -2512,6 +2522,18 @@ async def run_live_telegram_evidence_lane(
                 self.download_count = 0
                 self.voice_fixture = b""
                 self.pending_updates: list[dict[str, Any]] = []
+                # Stalled-turn quiescence (kodmial/aa#417): while active,
+                # deliveries from an abandoned turn are diverted into a
+                # privacy-safe quarantine and can never satisfy the next
+                # scenario's wait or leak into ``sent_texts``.
+                self.quiescing_reason = ""
+                self.quarantined_texts: list[dict[str, Any]] = []
+
+            def begin_quiescence(self, reason: str) -> None:
+                self.quiescing_reason = str(reason or "unknown")[:32]
+
+            def end_quiescence(self) -> None:
+                self.quiescing_reason = ""
 
             async def call(self, method: str, payload: dict[str, Any]) -> Any:
                 self.calls.append((method, dict(payload)))
@@ -2535,6 +2557,18 @@ async def run_live_telegram_evidence_lane(
                     self.chat_actions += 1
                     return True
                 if method == "sendMessage":
+                    if self.quiescing_reason:
+                        # The abandoned turn's late delivery: recorded as
+                        # counts/identity only, never handed to scenario
+                        # waits, never attributed to any later scenario.
+                        try:
+                            chat_id = int(payload.get("chat_id", 0))
+                        except (TypeError, ValueError):
+                            chat_id = 0
+                        self.quarantined_texts.append(
+                            {"chat_id": chat_id, "reason": self.quiescing_reason}
+                        )
+                        return {"message_id": 900000 + len(self.quarantined_texts)}
                     value = payload.get("text")
                     self.sent_texts.append(value if isinstance(value, str) else "")
                     return {"message_id": len(self.sent_texts)}
@@ -2564,6 +2598,16 @@ async def run_live_telegram_evidence_lane(
             bot_session_duration_seconds=0.0,
             typing_heartbeat_seconds=0.05,
         )
+        import uuid as _lane_uuid
+
+        from aa.conversation.turn_causality import clear_turn_causality, set_turn_causality
+
+        causality_by_chat: dict[int, str] = {}
+        stage_progress_state: dict[str, object] = {
+            "last_monotonic": time.monotonic(),
+            "last_stage": "",
+            "stage_changed_at": time.monotonic(),
+        }
         transport = PollingTelegramTransport(
             token="qualification-telegram-network-seam",
             api=api,
@@ -2574,16 +2618,40 @@ async def run_live_telegram_evidence_lane(
         app = Application(settings, transport=transport)
         await app.start()
 
+        # Per-turn causality attribution (kodmial/aa#417): each dispatched
+        # turn executes in its own task, so the causality id must be bound
+        # inside that task. The wrapper stamps only opaque scenario ids;
+        # no prompt, reply or user text ever flows through it.
+        def _attribute_turn(processor: Any) -> Any:
+            async def attributed(incoming: Any) -> None:
+                causality = causality_by_chat.get(int(incoming.chat_id), "")
+                if causality:
+                    set_turn_causality(causality, stage="graph-turn")
+                try:
+                    await processor(incoming)
+                finally:
+                    clear_turn_causality()
+
+            return attributed
+
+        app.dispatcher.set_process_wrapper(_attribute_turn)
+
         from aa.conversation.semantic_work_plan import set_stage_observer
 
         # Meaningful progress, not a polling timer: every production stage
         # transition advances both the persisted marker and the in-child
         # inactivity clock. A 20-second "still awaiting delivery" heartbeat
-        # deliberately does not.
-        stage_progress_state = {"last_monotonic": time.monotonic()}
+        # deliberately does not. The last stage name stays available after
+        # any timeout so the stalled stage itself, not an arbitrary clock
+        # cutoff, supplies the typed diagnostic category (kodmial/aa#417).
+        stage_progress_state["last_monotonic"] = time.monotonic()
 
         def _record_active_stage(stage: str) -> None:
             stage_progress_state["last_monotonic"] = time.monotonic()
+            stage_name = str(stage)[:64]
+            if stage_progress_state.get("last_stage") != stage_name:
+                stage_progress_state["last_stage"] = stage_name
+                stage_progress_state["stage_changed_at"] = time.monotonic()
             record_live_progress(
                 "scenario-stage",
                 active_stage=stage,
@@ -2828,6 +2896,12 @@ async def run_live_telegram_evidence_lane(
                 relevant_for_scenario: bool | None = None
                 helpful_for_scenario: bool | None = None
                 prior_prompts = list(prior_by_chat.get(chat_id, []))
+                scenario_causality_id = _lane_uuid.uuid4().hex
+                causality_by_chat[int(chat_id)] = scenario_causality_id
+                # Release the stall quarantine for this scenario: cleanup for
+                # any prior abandon has completed, so no stale task can
+                # deliver into this scenario's wait window.
+                api.end_quiescence()
                 before = len(api.sent_texts)
                 before_typing = api.chat_actions
                 before_received = len(transport.received)
@@ -2852,7 +2926,7 @@ async def run_live_telegram_evidence_lane(
                         break
                     last_real = max(
                         scenario_started_monotonic,
-                        stage_progress_state["last_monotonic"],
+                        _as_float(stage_progress_state["last_monotonic"]),
                     )
                     if time.monotonic() - last_real >= scenario_inactivity_limit_s:
                         stop_reason = "no-real-progress"
@@ -2882,33 +2956,121 @@ async def run_live_telegram_evidence_lane(
                         1,
                     )
                     failed.append(f"live-delivery-{family}-timeout")
-                    scenario_diagnostics.append(
-                        {
-                            "scenario_index": position,
-                            "family": family,
-                            "delivery_timeout": True,
-                            # Never infer a provider/retrieval cause without
-                            # stage evidence; "unknown" is the honest category
-                            # for an unresponsive turn (kodmial/aa#411).
-                            "timeout_category": "unknown",
-                            "timeout_reason": stop_reason or "unknown",
-                            "completed_scenario_count": len(scenario_diagnostics),
-                            "scenario_total": len(scenarios),
-                            # Preserve the actually observed elapsed wait for
-                            # legacy/aggregate consumers; never cap it at the
-                            # old product SLO.
-                            "delivery_latency_ms": timeout_elapsed_ms,
-                        }
+                    # Stalled-turn attribution (kodmial/aa#417): derive the
+                    # typed category from the actually observed active stage
+                    # and the OpenCode request audit; never report a
+                    # bare "unknown" while stage evidence exists. The stage
+                    # is preserved on the persisted marker (never cleared on
+                    # timeout) so the outer watchdog classifies identically.
+                    last_active_stage = str(stage_progress_state.get("last_stage", ""))[:64]
+                    stage_changed_at = stage_progress_state.get("stage_changed_at")
+                    stage_changed_at_f = (
+                        float(stage_changed_at)
+                        if isinstance(stage_changed_at, (int, float))
+                        else None
+                    )
+                    request_audit = app.opencode_runtime.client.request_latency_audit
+                    stalled_attribution = build_timeout_attribution(
+                        causality_id=scenario_causality_id,
+                        family=family,
+                        last_active_stage=last_active_stage,
+                        stage_changed_at=stage_changed_at_f,
+                        started_monotonic=scenario_started_monotonic,
+                        request_audit=request_audit,
+                        timeout_reason=stop_reason or "unknown",
+                    )
+                    timeout_entry: dict[str, Any] = {
+                        "scenario_index": position,
+                        "family": family,
+                        "delivery_timeout": True,
+                        "completed_scenario_count": len(scenario_diagnostics),
+                        "scenario_total": len(scenarios),
+                        # Preserve the actually observed elapsed wait for
+                        # legacy/aggregate consumers; never cap it at the
+                        # old product SLO.
+                        "delivery_latency_ms": timeout_elapsed_ms,
+                    }
+                    timeout_entry.update(stalled_attribution)
+                    stall_cleanup: dict[str, Any] = {"skipped": stop_reason or "unknown"}
+                    scenario_diagnostics.append(timeout_entry)
+                    # No orphan work between scenarios (kodmial/aa#417): the
+                    # abandoned turn must be stopped, quarantined and, when
+                    # non-cooperative, isolated by a bounded runtime restart
+                    # before the loop advances.
+                    if stop_reason in ("no-real-progress", "campaign-budget"):
+                        record_live_progress(
+                            "scenario-abort-start",
+                            scenario_index=position,
+                            stall_recovery_in_progress=True,
+                            stall_recovery_started_monotonic=time.monotonic(),
+                            real_progress=False,
+                        )
+
+                        async def _retire_runtime(
+                            abandoned_chat_id: int = int(chat_id),
+                        ) -> None:
+                            await app.stop()
+                            # ``Application.stop/start`` recreates the
+                            # transport and dispatcher workers, but the
+                            # session coordinator retains its chat map. Drop
+                            # the abandoned binding so the restarted runtime
+                            # cannot resume a wedged remote session or carry
+                            # stale per-chat state into the next scenario.
+                            sessions = getattr(app, "sessions", None)
+                            reset_session = getattr(sessions, "reset", None)
+                            if callable(reset_session):
+                                try:
+                                    reset_session(abandoned_chat_id)
+                                except Exception:
+                                    logger.warning(
+                                        "stalled-turn session reset failed",
+                                        extra={"chat_id": abandoned_chat_id},
+                                    )
+                            await app.start()
+
+                        stall_cleanup = await quiesce_and_abort_stalled_turn(
+                            app=app,
+                            chat_id=chat_id,
+                            seam=api,
+                            grace_s=float(scenario_grace_s()),
+                            reason=stop_reason or "unknown",
+                            restart=_retire_runtime,
+                        )
+                        stage_progress_state["last_monotonic"] = time.monotonic()
+                        stage_progress_state["last_stage"] = ""
+                        stage_progress_state["stage_changed_at"] = time.monotonic()
+                        timeout_entry["cleanup"] = stall_cleanup
+                    record_live_progress(
+                        "scenario-timeout",
+                        scenario_index=position,
+                        family=family,
+                        clear_scenario_deadline=True,
+                        # Keep the observed stage: an unknown category from an
+                        # erased marker hid the diagnosis (kodmial/aa#417).
+                        clear_active_stage=False,
+                        completed_scenario_count=len(scenario_diagnostics),
+                        scenario_diagnostics=scenario_diagnostics,
+                        latency_samples=latency_samples,
+                        timeout_category=stalled_attribution["timeout_category"],
+                        timeout_reason=stop_reason or "unknown",
+                        last_active_stage=last_active_stage,
+                        request_state=stalled_attribution["request_state"],
+                        request_started=stalled_attribution["request_started"],
+                        request_progress_observable=stalled_attribution[
+                            "request_progress_observable"
+                        ],
+                        cleanup=stall_cleanup,
+                        real_progress=False,
                     )
                     # Bounded-censored latency: a timed-out ordinary turn is
                     # measured evidence (never dropped). Gate E counts it in
-                    # reliability and p50/p95/max.
+                    # reliability and p50/p95/max. The scenario's own
+                    # causality id links the sample to the staged
+                    # attribution above.
                     if family in ordinary_families:
-                        import uuid as _uuid
-
                         latency_samples.append(
                             {
-                                "causality_id": _uuid.uuid4().hex,
+                                "causality_id": scenario_causality_id,
                                 "family": family,
                                 "mode": "text",
                                 "outcome": "timeout",
@@ -2921,26 +3083,27 @@ async def run_live_telegram_evidence_lane(
                                 "censored": True,
                             }
                         )
-                    record_live_progress(
-                        "scenario-timeout",
-                        scenario_index=position,
-                        family=family,
-                        clear_scenario_deadline=True,
-                        clear_active_stage=True,
-                        completed_scenario_count=len(scenario_diagnostics),
-                        scenario_diagnostics=scenario_diagnostics,
-                        latency_samples=latency_samples,
-                        timeout_category="unknown",
-                        timeout_reason=stop_reason or "unknown",
-                        real_progress=False,
-                    )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} "
-                        f"family={family} phase=delivery-timeout",
+                        f"family={family} phase=delivery-timeout "
+                        f"category={stalled_attribution['timeout_category']} "
+                        f"request_state={stalled_attribution['request_state']}",
                         flush=True,
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
+                    # Mark the end of the bounded stall recovery: the parent
+                    # watchdog stops holding its allowance at this point. This
+                    # is a lifecycle event, never provider progress.
+                    record_live_progress(
+                        "scenario-abort-done",
+                        scenario_index=position,
+                        stall_recovery_in_progress=False,
+                        real_progress=False,
+                    )
                     continue
+                # Release the causality binding on a served turn: no later
+                # global probe may claim this scenario identity.
+                clear_turn_causality()
                 record_live_progress(
                     "scenario-response",
                     scenario_index=position,
@@ -2955,11 +3118,9 @@ async def run_live_telegram_evidence_lane(
                 elapsed = time.perf_counter() - started
                 if family in ordinary_families:
                     latencies.append(elapsed)
-                    import uuid as _uuid
-
                     latency_samples.append(
                         {
-                            "causality_id": _uuid.uuid4().hex,
+                            "causality_id": scenario_causality_id,
                             "family": family,
                             "mode": "text",
                             "outcome": "served",
@@ -3204,6 +3365,8 @@ async def run_live_telegram_evidence_lane(
             # plus its own telemetry snapshot: no fallback template and no
             # unrelated cited fact may count as success.
             async def _send_raw_text(chat_id: int, text: str, update_id: int) -> str | None:
+                raw_causality_id = _lane_uuid.uuid4().hex
+                causality_by_chat[int(chat_id)] = raw_causality_id
                 before = len(api.sent_texts)
                 raw_turn = {
                     "update_id": update_id,
@@ -3217,22 +3380,39 @@ async def run_live_telegram_evidence_lane(
                 started_raw = time.perf_counter()
                 api.pending_updates.append(raw_turn)
                 stage_progress_state["last_monotonic"] = time.monotonic()
+                raw_stop_reason = ""
                 while len(api.sent_texts) <= before:
                     if time.monotonic() >= campaign_deadline:
+                        raw_stop_reason = "campaign-budget"
                         break
                     if (
-                        time.monotonic() - stage_progress_state["last_monotonic"]
+                        time.monotonic() - _as_float(stage_progress_state["last_monotonic"])
                         >= scenario_inactivity_limit_s
                     ):
+                        raw_stop_reason = "no-real-progress"
                         break
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
-                    import uuid as _uuid
-
+                    # The same no-orphan-work contract applies to the folded
+                    # multi-turn checks (kodmial/aa#417): quarantine and
+                    # cancel the abandoned turn before the next raw turn.
+                    if raw_stop_reason in ("no-real-progress", "campaign-budget"):
+                        await quiesce_and_abort_stalled_turn(
+                            app=app,
+                            chat_id=chat_id,
+                            seam=api,
+                            grace_s=float(scenario_grace_s()),
+                            reason=raw_stop_reason,
+                        )
+                        stage_progress_state["last_monotonic"] = time.monotonic()
+                    # Cleanup has eliminated every task owned by the
+                    # abandoned turn; release the quarantine so the next
+                    # raw turn's own deliveries are never fenced out.
+                    api.end_quiescence()
                     elapsed_raw = time.perf_counter() - started_raw
                     latency_samples.append(
                         {
-                            "causality_id": _uuid.uuid4().hex,
+                            "causality_id": raw_causality_id,
                             "family": "ordinary-text",
                             "mode": "text",
                             "outcome": "timeout",
@@ -3246,6 +3426,9 @@ async def run_live_telegram_evidence_lane(
                         }
                     )
                     return None
+                # end-quiescence: the served turn proves the recovered lane is
+                # delivering again; abandon any quarantined residue.
+                api.end_quiescence()
                 record_live_progress("scenario-response", real_progress=True)
                 elapsed_raw = time.perf_counter() - started_raw
                 latencies.append(elapsed_raw)
@@ -4012,7 +4195,7 @@ async def run_live_telegram_evidence_lane(
                         if time.monotonic() >= campaign_deadline:
                             break
                         if (
-                            time.monotonic() - stage_progress_state["last_monotonic"]
+                            time.monotonic() - _as_float(stage_progress_state["last_monotonic"])
                             >= scenario_inactivity_limit_s
                         ):
                             break
@@ -4178,11 +4361,11 @@ async def run_live_telegram_evidence_lane(
         "other",
     ):
         values = [
-            float(item.get("latency_ms", 0.0))
+            float(sample)
             for item in request_audit
             if isinstance(item, dict)
             and item.get("operation") == operation
-            and isinstance(item.get("latency_ms"), (int, float))
+            and isinstance(sample := item.get("latency_ms"), (int, float))
         ]
         if values:
             request_latency_ms[operation] = {

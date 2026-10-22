@@ -759,6 +759,21 @@ class Application:
             await self.controller.stop()
             raise
 
+    async def cancel_pending_turns(self, chat_id: int, *, grace_s: float = 5.0) -> dict[str, Any]:
+        """Cancel the abandoned turn work for one chat (kodmial/aa#417).
+
+        Used by the live qualification harness when a scenario turn stalls:
+        the per-chat dispatcher worker is cancelled, the pending queue is
+        dropped, and termination is awaited for ``grace_s``. A bounded
+        privacy-safe summary comes back; a non-cooperative blocking call
+        must be isolated by the caller (isolate/restart escalation).
+        """
+        return await self.dispatcher.cancel_chat(int(chat_id), grace_s=grace_s)
+
+    def turn_in_flight(self, chat_id: int) -> bool:
+        """Whether a queued or active turn still exists for ``chat_id``."""
+        return self.dispatcher.in_flight(int(chat_id))
+
     async def _handle_start_command(self, incoming: TelegramIncoming) -> None:
         await self.transport.send(TelegramReply(chat_id=incoming.chat_id, text=_START_REPLY))
 
