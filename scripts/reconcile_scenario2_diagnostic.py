@@ -31,7 +31,6 @@ import subprocess
 import tempfile
 import time
 import zipfile
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -230,7 +229,6 @@ def _compare_cache_store(key: str, unchanged: bool, *, ttl_s: float) -> None:
         pass
 
 
-@lru_cache(maxsize=64)
 def _machinery_unchanged_cached(owner: str, repo: str, older: str, newer: str) -> bool:
     if older == newer:
         return True
