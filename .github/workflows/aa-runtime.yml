@@ -44,7 +44,7 @@ jobs:
     # Telegram/OpenCode cleanup always has headroom.
     timeout-minutes: 330
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:ee18703a765a087f2dd6e79840cb6c06f96f09917a4a7095d8f8e99aec48e054
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
