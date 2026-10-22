@@ -73,8 +73,11 @@ def test_defaults_disable_runtime_limits_and_observe_gate_e(
     assert policy.latency_gate_mode == "observe"
     assert policy.latency_p95_target_ms == 60_000.0
     assert policy.latency_max_turn_ms == 120_000.0
-    assert policy.transport_timeout_s == 300.0
-    assert policy.qualification_scenario_wait_s == 300.0
+    assert policy.transport_timeout_s > 900.0
+    assert policy.qualification_campaign_s == 8100.0
+    assert policy.qualification_finalisation_reserve_s == 900.0
+    assert policy.qualification_scenario_wait_s == 8100.0
+    assert policy.qualification_scenario_inactivity_s > 900.0
     settings = Settings.from_env({})
     assert settings.time_policy == policy
 
@@ -90,6 +93,13 @@ def test_invalid_time_policy_is_rejected() -> None:
         TimePolicy.from_env({"AA_LATENCY_MAX_TURN_MS": "10"})
     with pytest.raises(TimePolicyError):
         Settings.from_env({"AA_TRANSPORT_TIMEOUT_S": "-1"})
+    with pytest.raises(TimePolicyError):
+        TimePolicy.from_env(
+            {
+                "AA_QUALIFICATION_CAMPAIGN_S": "900",
+                "AA_QUALIFICATION_FINALISATION_RESERVE_S": "900",
+            }
+        )
 
 
 def test_disabled_budget_crosses_all_old_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:

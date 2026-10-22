@@ -133,16 +133,19 @@ jobs:
   qualify:
     needs: resolve
     runs-on: ubuntu-latest
-    # Long-running AA real-book qualification only (kodmial/aa#411): the
-    # complete retrieval run may legitimately need up to two hours. Use the
-    # qualification-only repository variable with a safe 120-minute default.
-    timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
+    # Long-running AA real-book qualification only (kodmial/aa#411/#412):
+    # the complete retrieval run may legitimately need at least 135 minutes.
+    # The effective Actions cap may be raised for exceptional runs but cannot
+    # be silently lowered by a stale repository variable.
+    timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
     permissions:
       contents: read
       issues: write
       actions: read
     env:
       EXACT_SHA: ${{ needs.resolve.outputs.exact_sha }}
+      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
+      AA_QUALIFICATION_CAMPAIGN_S: "8100"
     steps:
       - name: Check out exact main SHA
         uses: actions/checkout@v4

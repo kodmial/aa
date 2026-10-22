@@ -54,11 +54,14 @@ concurrency:
 jobs:
   qualify:
     runs-on: ubuntu-latest
-    # AA qualification only (kodmial/aa#411): a repository variable with a
-    # safe 120-minute default. Unrelated coder/reviewer jobs keep 45 minutes.
-    timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
+    # AA qualification only (kodmial/aa#412): the effective Actions cap is at
+    # least the owner-required 135 minutes. A repository variable may raise it
+    # for exceptional runs but can never lower it below the campaign allowance.
+    timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
     env:
-      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
+      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
+      AA_QUALIFICATION_CAMPAIGN_S: "8100"
+      AA_QUALIFICATION_FINALISATION_RESERVE_S: "900"
     outputs:
       gate_a_outcome: ${{ steps.gate-a.outcome }}
       gate_b_outcome: ${{ steps.gate-b.outcome }}
@@ -66,11 +69,15 @@ jobs:
       verified_fallback: ${{ steps.bot_model.outputs.fallback }}
     steps:
       - name: Record qualification job start
-        # The outer live watchdog uses this wall-clock marker to reserve time
-        # for Gate E/F, artifact upload and repair publication before the
-        # configured job timeout (kodmial/aa#411).
+        # The outer live watchdog uses these paired wall-clock and monotonic
+        # markers to reserve time for Gate E/F, artifact upload and repair
+        # publication before the configured job timeout (kodmial/aa#411). The
+        # monotonic value is host-wide, so a later step can compare against it
+        # without being affected by a system clock jump.
         shell: bash
-        run: echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        run: |
+          echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          echo "AA_QUALIFICATION_JOB_STARTED_MONOTONIC=$(python3 -c 'import time; print(time.monotonic())')" >> "$GITHUB_ENV"
 
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -338,19 +345,25 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     # The complete live Gate C -> E -> F qualification may legitimately run
-    # for two hours. A 45/60-minute Actions hard cancel used to destroy the
-    # terminal verdict (kodmial/aa#411). Qualification-only repository
-    # variable, safe default 120; unrelated jobs are unchanged.
-    timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
+    # for at least 135 minutes. A 45/60/120-minute Actions hard cancel used to
+    # destroy the terminal verdict (kodmial/aa#411/#412). The parent watchdog
+    # leaves a real finalisation reserve for Gate E/F, artifacts and #7
+    # publication. The repository variable may raise, never lower, the cap.
+    timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
     env:
-      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
+      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
+      AA_QUALIFICATION_CAMPAIGN_S: "8100"
       # Keep enough time after the outer live watchdog fires to run Gate E/F,
       # upload artifacts and publish an exact-SHA negative verdict.
       AA_QUALIFICATION_FINALISATION_RESERVE_S: "900"
     steps:
       - name: Record qualification job start
+        # Write both clocks so the outer watchdog never depends on a stable
+        # wall clock between job start and supervisor startup.
         shell: bash
-        run: echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        run: |
+          echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          echo "AA_QUALIFICATION_JOB_STARTED_MONOTONIC=$(python3 -c 'import time; print(time.monotonic())')" >> "$GITHUB_ENV"
 
       - name: Checkout exact main SHA
         uses: actions/checkout@v4

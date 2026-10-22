@@ -10,10 +10,15 @@ deadline.
 
 Recovery contract:
 
-- per-scenario deadline: the child publishes a deadline when a scenario
-  starts; the parent escalates only after that deadline and a small grace;
-- total deadline: derived from the Actions job start/timeout when available,
+- real-progress inactivity: the child publishes a *meaningful* progress
+  marker only on stage transitions, delivered responses and completed
+  scenarios. Polling timer heartbeats never reset this bound, so a wedged
+  model/retrieval call is stopped even though the event loop is alive;
+- total deadline: derived from the 135-minute Actions job start/timeout,
   leaving an explicit finalisation reserve for Gate E/F and artifact upload;
+- no per-scenario wall-clock cutoff: a healthy slow response may exceed the
+  former fixed walls as long as real progress or the whole campaign budget
+  still allows it;
 - kill escalation: SIGTERM to the child's process group, then SIGKILL, so
   descendants started by the live runtime are reaped;
 - typed negative evidence: completed per-scenario diagnostics are persisted
@@ -42,16 +47,37 @@ if TYPE_CHECKING:
 ENV_PROGRESS_PATH = "AA_QUALIFICATION_LIVE_PROGRESS_PATH"
 ENV_TOTAL_DEADLINE_S = "AA_QUALIFICATION_LIVE_DEADLINE_S"
 ENV_SCENARIO_GRACE_S = "AA_QUALIFICATION_WATCHDOG_SCENARIO_GRACE_S"
+ENV_SCENARIO_INACTIVITY_S = "AA_QUALIFICATION_SCENARIO_INACTIVITY_S"
+ENV_CAMPAIGN_S = "AA_QUALIFICATION_CAMPAIGN_S"
 ENV_FINALISATION_RESERVE_S = "AA_QUALIFICATION_FINALISATION_RESERVE_S"
 ENV_JOB_STARTED_AT = "AA_QUALIFICATION_JOB_STARTED_AT"
+ENV_JOB_STARTED_MONOTONIC = "AA_QUALIFICATION_JOB_STARTED_MONOTONIC"
 ENV_JOB_TIMEOUT_MINUTES = "AA_QUALIFICATION_JOB_TIMEOUT_MINUTES"
 ENV_DISABLE_WATCHDOG = "AA_QUALIFICATION_WATCHDOG_DISABLED"
 
-DEFAULT_TOTAL_DEADLINE_S = 5400.0
+# 135-minute campaign minus the 900-second finalisation reserve. The parent
+# never consumes the reserve, so Gate E/F, artifacts and #7 publication still
+# finish inside the Actions job.
+DEFAULT_CAMPAIGN_S = 8100.0
+DEFAULT_TOTAL_DEADLINE_S = 7200.0
 DEFAULT_SCENARIO_GRACE_S = 30.0
 DEFAULT_FINALISATION_RESERVE_S = 900.0
-DEFAULT_JOB_TIMEOUT_MINUTES = 120.0
-DEFAULT_SCENARIO_WAIT_S = 300.0
+DEFAULT_JOB_TIMEOUT_MINUTES = 135.0
+DEFAULT_SCENARIO_WAIT_S = DEFAULT_TOTAL_DEADLINE_S
+DEFAULT_SCENARIO_INACTIVITY_S = 1800.0
+
+# Only these markers prove that model/retrieval work advanced. A periodic
+# "the polling loop is alive" heartbeat is deliberately excluded.
+REAL_PROGRESS_PHASES = frozenset(
+    {
+        "scenarios-start",
+        "scenario-start",
+        "scenario-stage",
+        "scenario-response",
+        "scenario-complete",
+        "post-scenario-checks",
+    }
+)
 DEFAULT_KILL_GRACE_S = 5.0
 _POLL_INTERVAL_S = 0.2
 
@@ -90,36 +116,90 @@ def finalisation_reserve_s() -> float:
     return _positive_float(ENV_FINALISATION_RESERVE_S, DEFAULT_FINALISATION_RESERVE_S)
 
 
-def live_total_deadline_s(now: float | None = None) -> float:
+def scenario_inactivity_s() -> float:
+    """Maximum silence between two *real* progress events.
+
+    Timer heartbeats do not count as progress. This is not a per-response
+    wall-clock cap: a request that keeps producing verified stage/response
+    events survives, while a non-cooperative hang is surfaced as typed
+    negative evidence.
+    """
+    return _positive_float(ENV_SCENARIO_INACTIVITY_S, DEFAULT_SCENARIO_INACTIVITY_S)
+
+
+def qualification_campaign_s() -> float:
+    """The single 135-minute exact-main campaign allowance."""
+    return _positive_float(ENV_CAMPAIGN_S, DEFAULT_CAMPAIGN_S)
+
+
+def live_total_deadline_s(now: float | None = None, *, monotonic_now: float | None = None) -> float:
     """Resolve the maximum live-lane duration in seconds.
 
-    A configured ``AA_QUALIFICATION_LIVE_DEADLINE_S`` is authoritative but
-    still capped by the remaining Actions job budget. Without a job-start
-    marker the conservative repository default is used.
+    The effective job allowance is the 135-minute campaign minus the
+    finalisation reserve. A configured ``AA_QUALIFICATION_LIVE_DEADLINE_S``
+    may shorten it, but never makes it exceed the remaining Actions job
+    budget when a start marker is present. Without a job-start marker the
+    conservative campaign-minus-reserve fallback is used.
+
+    The workflow writes the job start as both an epoch timestamp and a
+    host-wide monotonic clock value. When the monotonic marker is available
+    it is authoritative for the initial allowance, so a system clock jump
+    between job start and supervisor startup cannot distort it. The epoch
+    marker remains a compatibility fallback; that path resolves the remaining
+    budget once against wall time at startup and assumes no clock jump in the
+    interval. The returned duration is always anchored to
+    ``time.monotonic()`` for ongoing deadline/inactivity comparisons.
     """
     current = time.time() if now is None else now
     explicit = os.environ.get(ENV_TOTAL_DEADLINE_S, "").strip()
-    total = (
-        _positive_float(ENV_TOTAL_DEADLINE_S, DEFAULT_TOTAL_DEADLINE_S)
-        if explicit
-        else DEFAULT_TOTAL_DEADLINE_S
-    )
+    campaign_allowance = max(1.0, qualification_campaign_s() - finalisation_reserve_s())
+    if explicit:
+        total = min(
+            _positive_float(ENV_TOTAL_DEADLINE_S, campaign_allowance),
+            campaign_allowance,
+        )
+    else:
+        total = campaign_allowance
 
     job_started_raw = os.environ.get(ENV_JOB_STARTED_AT, "").strip()
-    if job_started_raw:
+    job_started_monotonic_raw = os.environ.get(ENV_JOB_STARTED_MONOTONIC, "").strip()
+    if not job_started_raw and not job_started_monotonic_raw:
+        return max(1.0, total)
+
+    # The owner-required 135-minute cap is a floor for qualification: a stale
+    # repository variable can never silently shrink it.
+    timeout_minutes = max(
+        DEFAULT_JOB_TIMEOUT_MINUTES,
+        _positive_float(ENV_JOB_TIMEOUT_MINUTES, DEFAULT_JOB_TIMEOUT_MINUTES),
+    )
+    timeout_s = timeout_minutes * 60.0
+    remaining: float | None = None
+
+    try:
+        job_started_monotonic = (
+            float(job_started_monotonic_raw) if job_started_monotonic_raw else 0.0
+        )
+    except (TypeError, ValueError):
+        job_started_monotonic = 0.0
+    if job_started_monotonic > 0.0:
+        current_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+        remaining = job_started_monotonic + timeout_s - finalisation_reserve_s() - current_monotonic
+    else:
         try:
-            job_started = float(job_started_raw)
+            job_started = float(job_started_raw) if job_started_raw else 0.0
         except (TypeError, ValueError):
             job_started = 0.0
         if job_started > 0.0:
-            timeout_s = _positive_float(ENV_JOB_TIMEOUT_MINUTES, DEFAULT_JOB_TIMEOUT_MINUTES) * 60.0
             remaining = job_started + timeout_s - finalisation_reserve_s() - current
-            if remaining <= 0.0:
-                return 1.0
-            # With a real Actions job-start marker the remaining budget is
-            # authoritative; the static default is only the fallback for
-            # direct/local invocation.
-            total = min(total, remaining) if explicit else remaining
+
+    if remaining is None:
+        return max(1.0, total)
+    if remaining <= 0.0:
+        return 1.0
+    # With a real Actions job-start marker the remaining budget is
+    # authoritative; the static default is only the fallback for direct/local
+    # invocation.
+    total = min(total, remaining)
     return max(1.0, total)
 
 
@@ -164,6 +244,7 @@ def record_live_progress(
     *,
     scenario_index: int | None = None,
     family: str | None = None,
+    real_progress: bool = False,
     scenario_deadline_at: float | None = None,
     clear_scenario_deadline: bool = False,
     clear_active_stage: bool = False,
@@ -175,23 +256,34 @@ def record_live_progress(
 ) -> None:
     """Persist one privacy-safe progress marker for the parent watchdog.
 
-    Markers are merged so a heartbeat does not clear the active scenario
-    deadline. Failures are swallowed: progress persistence must never break
-    the actual qualification lane.
+    Markers are merged. ``updated_at`` proves only that the writer is alive;
+    ``last_real_progress_at`` advances only for meaningful stage/response
+    events (or an explicit ``real_progress=True``). The wall-clock values are
+    persisted as evidence, while ``last_real_progress_monotonic`` is the
+    authoritative inactivity bound so a system clock jump cannot trigger a
+    false timeout. Failures are swallowed: progress persistence must never
+    break the actual qualification lane.
     """
     target = progress_path_from_env()
     if target is None:
         return
     try:
         payload = read_live_progress(target)
+        now = time.time()
+        now_monotonic = time.monotonic()
         payload.update(
             {
                 "schema_version": PROGRESS_SCHEMA_VERSION,
                 "pid": os.getpid(),
                 "phase": str(phase)[:64],
-                "updated_at": time.time(),
+                "updated_at": now,
+                "updated_monotonic": now_monotonic,
             }
         )
+        if real_progress or str(phase)[:64] in REAL_PROGRESS_PHASES:
+            payload["last_real_progress_at"] = now
+            payload["last_real_progress_monotonic"] = now_monotonic
+            payload["last_real_progress_phase"] = str(phase)[:64]
         if scenario_index is not None:
             payload["scenario_index"] = int(scenario_index)
         if family is not None:
@@ -399,8 +491,12 @@ def _timeout_lane(
         "watchdog_trigger": trigger,
         "watchdog_elapsed_ms": round(elapsed_s * 1000.0, 1),
         "watchdog_deadline_s": round(deadline_s, 3),
+        "watchdog_scenario_inactivity_s": scenario_inactivity_s(),
         "watchdog_last_progress_phase": str(progress.get("phase", ""))[:64],
         "watchdog_last_progress_at": progress.get("updated_at"),
+        "watchdog_last_real_progress_at": progress.get("last_real_progress_at"),
+        "watchdog_last_real_progress_monotonic": progress.get("last_real_progress_monotonic"),
+        "watchdog_last_real_progress_phase": str(progress.get("last_real_progress_phase", ""))[:64],
         "exact_sha": main_sha,
         "scenario_diagnostics": diagnostics,
         "turn_latency_samples": samples,
@@ -467,6 +563,7 @@ def supervise_live_gate_c(
     started_monotonic = time.monotonic()
     total_deadline_s = live_total_deadline_s()
     deadline_monotonic = started_monotonic + total_deadline_s
+    inactivity_s = scenario_inactivity_s()
     trigger = ""
     last_progress: dict[str, Any] = {}
     proc.start()
@@ -482,11 +579,16 @@ def supervise_live_gate_c(
             if now_monotonic >= deadline_monotonic:
                 trigger = "total-deadline"
                 break
-            scenario_deadline = last_progress.get("scenario_deadline_at")
-            if isinstance(scenario_deadline, (int, float)):
-                if time.time() >= float(scenario_deadline):
-                    trigger = "scenario-deadline"
-                    break
+            last_real = last_progress.get("last_real_progress_monotonic")
+            last_real_at = (
+                float(last_real) if isinstance(last_real, (int, float)) else started_monotonic
+            )
+            # A scenario deadline written by the child is intentionally
+            # ignored (kodmial/aa#412): only real progress or the campaign
+            # budget can end a healthy slow response.
+            if now_monotonic - last_real_at >= inactivity_s:
+                trigger = "no-real-progress"
+                break
         if trigger:
             elapsed = time.monotonic() - started_monotonic
             _terminate_process_group(proc)
@@ -540,22 +642,29 @@ def supervise_live_gate_c(
 
 
 __all__ = [
+    "DEFAULT_CAMPAIGN_S",
     "DEFAULT_FINALISATION_RESERVE_S",
     "DEFAULT_SCENARIO_GRACE_S",
+    "DEFAULT_SCENARIO_INACTIVITY_S",
     "DEFAULT_TOTAL_DEADLINE_S",
     "ENV_DISABLE_WATCHDOG",
     "ENV_FINALISATION_RESERVE_S",
     "ENV_JOB_STARTED_AT",
+    "ENV_JOB_STARTED_MONOTONIC",
     "ENV_JOB_TIMEOUT_MINUTES",
+    "ENV_CAMPAIGN_S",
     "ENV_PROGRESS_PATH",
     "ENV_SCENARIO_GRACE_S",
+    "ENV_SCENARIO_INACTIVITY_S",
     "ENV_TOTAL_DEADLINE_S",
     "finalisation_reserve_s",
     "live_total_deadline_s",
     "progress_path_from_env",
+    "qualification_campaign_s",
     "read_live_progress",
     "record_live_progress",
     "scenario_grace_s",
+    "scenario_inactivity_s",
     "supervise_live_gate_c",
     "watchdog_enabled",
 ]

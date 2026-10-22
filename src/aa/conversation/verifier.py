@@ -1751,7 +1751,7 @@ async def _verify_per_unit_concurrent(
         if turn_budget_s is None
         else float(turn_budget_s)
     )
-    if not budget > 0:
+    if not _turn_time_limits_disabled() and not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
     loop = asyncio.get_running_loop()
     deadline = None if _turn_time_limits_disabled() else loop.time() + budget
@@ -1932,7 +1932,7 @@ async def run_batched_verifier(
         if turn_budget_s is None
         else float(turn_budget_s)
     )
-    if not budget > 0:
+    if not _turn_time_limits_disabled() and not budget > 0:
         raise VerifierValidationError("verifier turn budget must be > 0")
 
     system_text = load_verifier_system_v2()

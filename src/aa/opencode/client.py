@@ -207,10 +207,14 @@ class OpenCodeClient(ABC):
 class HttpOpenCodeClient(OpenCodeClient):
     """Real loopback HTTP client for ``opencode serve`` (stdlib only)."""
 
-    def __init__(self, base_url: str, *, request_timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, *, request_timeout: float | None = None) -> None:
         self._base_url = base_url.rstrip("/")
-        if request_timeout <= 0:
+        if request_timeout is not None and request_timeout <= 0:
             raise ValueError("request_timeout must be > 0")
+        # ``request_timeout`` is an inactivity/connect bound for one blocking
+        # socket operation, never an end-to-end response deadline. The
+        # independently supervised qualification campaign owns the only
+        # justified overall wall clock.
         self._request_timeout = request_timeout
         self._served_model_audit: list[dict[str, str]] = []
         self._token_usage_audit: list[dict[str, object]] = []
@@ -226,9 +230,18 @@ class HttpOpenCodeClient(OpenCodeClient):
         return self._base_url
 
     def _sync_request(
-        self, method: str, path: str, body: dict[str, object] | None, timeout: float
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None,
+        timeout: float | None,
     ) -> object:
-        """Perform one blocking HTTP request and return the decoded JSON."""
+        """Perform one blocking HTTP request and return the decoded JSON.
+
+        ``timeout`` is handed to the socket layer as an inactivity/connect
+        bound. A server that keeps a request alive is never rejected by an
+        arbitrary total response timer.
+        """
         url = f"{self._base_url}{path}"
         data: bytes | None = None
         headers = {"Accept": "application/json"}
@@ -236,6 +249,8 @@ class HttpOpenCodeClient(OpenCodeClient):
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # The inactivity/connect bound is enforced directly by the socket
+        # layer on this blocking call; no asyncio timer wraps the response.
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
@@ -255,6 +270,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         if path.startswith("/session/") and path.endswith("/message") and method == "POST":
             fmt = body.get("format") if isinstance(body, dict) else None
             return "message-structured" if isinstance(fmt, dict) else "message-text"
+        if path.startswith("/session/") and path.endswith("/abort") and method == "POST":
+            return "session-abort"
         if path.startswith("/session/") and method == "DELETE":
             return "session-delete"
         return "other"
@@ -275,18 +292,50 @@ class HttpOpenCodeClient(OpenCodeClient):
         """Return privacy-safe local OpenCode HTTP timing evidence."""
         return tuple(dict(item) for item in self._request_latency_audit)
 
-    async def _call(self, method: str, path: str, body: dict[str, object] | None = None) -> object:
-        timeout = self._request_timeout
+    async def _best_effort_abort(self, path: str) -> None:
+        """Ask OpenCode to abort work after asynchronous cancellation."""
+        parts = path.split("/")
+        if len(parts) >= 3 and parts[1] == "session" and parts[2]:
+            try:
+                await self.abort(urllib.parse.unquote(parts[2]))
+            except Exception:
+                logger.info("opencode best-effort abort failed")
+
+    async def _call(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None = None,
+        timeout: float | None = None,
+    ) -> object:
+        """Run one HTTP request without any shared or total wall-clock race.
+
+        The timeout is resolved once and passed as an immutable argument to
+        the worker thread. Concurrent callers therefore never overwrite each
+        other's bound. There is intentionally no ``asyncio.wait_for`` around
+        the whole response: a healthy slow model is not a timeout merely
+        because it exceeded an arbitrary constant.
+        """
+        effective_timeout = self._request_timeout if timeout is None else timeout
+        if effective_timeout is not None and effective_timeout <= 0:
+            raise ValueError("timeout must be > 0")
         operation = self._request_operation(method, path, body)
         started = time.perf_counter()
         success = False
+        worker = asyncio.ensure_future(
+            asyncio.to_thread(self._sync_request, method, path, body, effective_timeout)
+        )
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._sync_request, method, path, body, timeout),
-                timeout,
-            )
+            result = await asyncio.shield(worker)
             success = True
             return result
+        except asyncio.CancelledError:
+            worker.cancel()
+            abort_task = asyncio.create_task(self._best_effort_abort(path))
+            abort_task.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
+            raise
         except TimeoutError as exc:
             raise OpenCodeTimeoutError("opencode request timed out") from exc
         except OpenCodeError:
@@ -455,15 +504,9 @@ class HttpOpenCodeClient(OpenCodeClient):
         parsed_model = model_payload(model)
         if parsed_model is not None:
             body["model"] = parsed_model
-        saved_timeout = self._request_timeout
-        if timeout is not None:
-            if timeout <= 0:
-                raise ValueError("timeout must be > 0")
-            self._request_timeout = timeout
-        try:
-            payload = await self._call("POST", f"/session/{quoted}/message", body)
-        finally:
-            self._request_timeout = saved_timeout
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        payload = await self._call("POST", f"/session/{quoted}/message", body, timeout=timeout)
         if not isinstance(payload, dict):
             raise OpenCodeDeterministicError("opencode prompt returned invalid data")
         info = payload.get("info")
@@ -506,15 +549,9 @@ class HttpOpenCodeClient(OpenCodeClient):
         parsed_model = model_payload(model)
         if parsed_model is not None:
             body["model"] = parsed_model
-        saved_timeout = self._request_timeout
-        if timeout is not None:
-            if timeout <= 0:
-                raise ValueError("timeout must be > 0")
-            self._request_timeout = timeout
-        try:
-            payload = await self._call("POST", f"/session/{quoted}/message", body)
-        finally:
-            self._request_timeout = saved_timeout
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        payload = await self._call("POST", f"/session/{quoted}/message", body, timeout=timeout)
         if not isinstance(payload, dict):
             raise OpenCodeDeterministicError("opencode prompt returned invalid data")
         info = payload.get("info")
@@ -548,6 +585,11 @@ class HttpOpenCodeClient(OpenCodeClient):
         return messages
 
     async def abort(self, session_id: str) -> bool:
+        """Cancel in-flight server work via ``POST /session/{id}/abort``.
+
+        This is the concrete HTTP transport implementation; the abstract
+        method exists only so test fakes can share the same boundary.
+        """
         quoted = urllib.parse.quote(session_id, safe="")
         await self._call("POST", f"/session/{quoted}/abort")
         return True

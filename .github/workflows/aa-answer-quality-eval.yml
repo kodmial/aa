@@ -337,7 +337,7 @@ jobs:
     needs: readiness
     if: needs.readiness.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 135
     permissions:
       contents: read
       issues: write

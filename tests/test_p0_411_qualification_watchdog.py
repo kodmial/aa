@@ -19,9 +19,11 @@ from aa.opencode.errors import OpenCodeRateLimitError
 from aa.qualification.live_watchdog import (
     ENV_FINALISATION_RESERVE_S,
     ENV_JOB_STARTED_AT,
+    ENV_JOB_STARTED_MONOTONIC,
     ENV_JOB_TIMEOUT_MINUTES,
     ENV_PROGRESS_PATH,
     ENV_SCENARIO_GRACE_S,
+    ENV_SCENARIO_INACTIVITY_S,
     ENV_TOTAL_DEADLINE_S,
     live_total_deadline_s,
     read_live_progress,
@@ -61,6 +63,7 @@ def test_blocking_scenario_8_is_preempted_with_typed_negative_evidence(
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "30")
     monkeypatch.setenv(ENV_SCENARIO_GRACE_S, "0.2")
+    monkeypatch.setenv(ENV_SCENARIO_INACTIVITY_S, "1")
 
     async def blocking_lane(run_id: str) -> LaneResult:
         assert run_id == "watchdog-run"
@@ -110,7 +113,7 @@ def test_blocking_scenario_8_is_preempted_with_typed_negative_evidence(
     assert result.failed == ("live-scenario-watchdog-timeout-unknown",)
     metrics = result.metrics
     assert metrics["watchdog_triggered"] is True
-    assert metrics["watchdog_trigger"] == "scenario-deadline"
+    assert metrics["watchdog_trigger"] == "no-real-progress"
     assert metrics["timeout_category"] == "unknown"
     assert metrics["scenario_timeout"] is True
     assert metrics["completed_scenario_count"] == 7
@@ -203,11 +206,26 @@ def test_total_deadline_reserves_finalisation_time_from_actions_job(
 ) -> None:
     now = 1_000_000.0
     monkeypatch.setenv(ENV_JOB_STARTED_AT, str(now - 600.0))
-    monkeypatch.setenv(ENV_JOB_TIMEOUT_MINUTES, "120")
+    monkeypatch.setenv(ENV_JOB_TIMEOUT_MINUTES, "135")
     monkeypatch.setenv(ENV_FINALISATION_RESERVE_S, "900")
     monkeypatch.delenv(ENV_TOTAL_DEADLINE_S, raising=False)
-    # 7200s job budget - 900s reserve - 600s already elapsed = 5700s.
-    assert live_total_deadline_s(now=now) == 5700.0
+    # 8100s job budget - 900s reserve - 600s already elapsed = 6600s.
+    assert live_total_deadline_s(now=now) == 6600.0
+
+
+def test_total_deadline_prefers_monotonic_start_over_wall_clock_jump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000.0
+    # The epoch marker is deliberately stale enough to exhaust the budget if
+    # wall time were used; the monotonic pair must remain authoritative.
+    monkeypatch.setenv(ENV_JOB_STARTED_AT, str(now - 10_000.0))
+    monkeypatch.setenv(ENV_JOB_STARTED_MONOTONIC, "4000.0")
+    monkeypatch.setenv(ENV_JOB_TIMEOUT_MINUTES, "135")
+    monkeypatch.setenv(ENV_FINALISATION_RESERVE_S, "900")
+    monkeypatch.delenv(ENV_TOTAL_DEADLINE_S, raising=False)
+    # 8100s job budget - 900s reserve - 600s monotonic elapsed = 6600s.
+    assert live_total_deadline_s(now=now, monotonic_now=4600.0) == 6600.0
 
 
 def test_progress_evidence_is_privacy_safe_and_checkpointed(
@@ -301,10 +319,13 @@ def test_workflows_use_two_hour_qualification_limit_and_watchdog_markers() -> No
     self_proving = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(
         encoding="utf-8"
     )
-    expected = "timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}"
+    expected = (
+        "timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135"
+    )
     assert self_proving.count(expected) == 2
     assert "timeout-minutes: 45" not in self_proving
     assert "AA_QUALIFICATION_JOB_STARTED_AT" in self_proving
+    assert "AA_QUALIFICATION_JOB_STARTED_MONOTONIC" in self_proving
     assert "AA_QUALIFICATION_FINALISATION_RESERVE_S" in self_proving
     assert "AA_QUALIFICATION_LIVE_PROGRESS_PATH" in self_proving
     assert "live-out/live-watchdog-progress.json" in self_proving
@@ -314,3 +335,4 @@ def test_workflows_use_two_hour_qualification_limit_and_watchdog_markers() -> No
     )
     assert expected in real_book
     assert "timeout-minutes: 60" not in real_book
+    assert "timeout-minutes: 120" not in real_book
