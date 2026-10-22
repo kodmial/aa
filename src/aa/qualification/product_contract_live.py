@@ -38,7 +38,10 @@ from pathlib import Path
 from typing import Any
 
 from aa.opencode.errors import OpenCodeRateLimitError
-from aa.qualification.live_watchdog import record_live_progress, scenario_grace_s
+from aa.qualification.live_watchdog import (
+    live_total_deadline_s,
+    record_live_progress,
+)
 from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.qualification.product_contract_live")
@@ -2419,7 +2422,12 @@ async def run_live_telegram_evidence_lane(
     scenario_diagnostics: list[dict[str, Any]] = []
     # Resolve the configurable operational wait once, before the harness can
     # fail, so timeout evidence stays available for a pre-scenario crash too.
-    scenario_wait_s = float(current_time_policy().qualification_scenario_wait_s)
+    _policy = current_time_policy()
+    # Legacy projection only: no per-scenario wall-clock cutoff exists any
+    # more (kodmial/aa#412). The real bounds are the whole campaign budget
+    # and silence between verified progress events.
+    scenario_wait_s = float(_policy.qualification_scenario_wait_s)
+    scenario_inactivity_limit_s = float(_policy.qualification_scenario_inactivity_s)
     served_models_by_agent: dict[str, list[str]] = {}
     voice_readiness: dict[str, Any] = {
         "voice_available": False,
@@ -2455,6 +2463,8 @@ async def run_live_telegram_evidence_lane(
             "latency_units": "ms",
             "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
             "qualification_scenario_wait_s": float(scenario_wait_s),
+            "qualification_campaign_budget_s": float(live_total_deadline_s()),
+            "qualification_scenario_inactivity_s": float(scenario_inactivity_limit_s),
             "live_prerequisites_present": False,
             "production_boundary": "PollingTelegramTransport.getUpdates->_process_raw_update",
         }
@@ -2566,8 +2576,19 @@ async def run_live_telegram_evidence_lane(
 
         from aa.conversation.semantic_work_plan import set_stage_observer
 
+        # Meaningful progress, not a polling timer: every production stage
+        # transition advances both the persisted marker and the in-child
+        # inactivity clock. A 20-second "still awaiting delivery" heartbeat
+        # deliberately does not.
+        stage_progress_state = {"last_monotonic": time.monotonic()}
+
         def _record_active_stage(stage: str) -> None:
-            record_live_progress("scenario-stage", active_stage=stage)
+            stage_progress_state["last_monotonic"] = time.monotonic()
+            record_live_progress(
+                "scenario-stage",
+                active_stage=stage,
+                real_progress=True,
+            )
 
         set_stage_observer(_record_active_stage)
         try:
@@ -2761,6 +2782,7 @@ async def run_live_telegram_evidence_lane(
                 family in book_grounded_families for family, _, _ in scenarios
             )
             loop = asyncio.get_running_loop()
+            campaign_deadline = loop.time() + max(1.0, live_total_deadline_s())
             # Prior prompts per Telegram chat for contextual follow-up
             # relevance (generic, turn-independent): a terse follow-up in
             # an ongoing conversation carries little topical content on
@@ -2785,19 +2807,21 @@ async def run_live_telegram_evidence_lane(
                     f"Gate C scenario {position}/{len(scenarios)} family={family} phase=start",
                     flush=True,
                 )
-                # Persist a wall-clock deadline before entering downstream
-                # work. The parent watchdog can preempt a synchronous hang
-                # even when this event loop never regains control.
+                # The parent watches real progress, never a fixed scenario
+                # wall clock. Persist the last meaningful event before
+                # entering downstream work so a synchronous hang can still
+                # be distinguished from a healthy slow model.
+                stage_progress_state["last_monotonic"] = time.monotonic()
                 record_live_progress(
                     "scenario-start",
                     scenario_index=position,
                     family=family,
                     scenario_total=len(scenarios),
                     completed_scenario_count=len(scenario_diagnostics),
-                    scenario_deadline_at=time.time() + scenario_wait_s + scenario_grace_s(),
                     scenario_diagnostics=scenario_diagnostics,
                     latency_samples=latency_samples,
                     active_stage="planner",
+                    real_progress=True,
                 )
                 active_judge_metrics: dict[str, Any] = {}
                 snapshot: dict[str, Any] = {}
@@ -2818,14 +2842,26 @@ async def run_live_telegram_evidence_lane(
                     },
                 }
                 started = time.perf_counter()
+                scenario_started_monotonic = time.monotonic()
                 api.pending_updates.append(raw)
-                deadline = loop.time() + scenario_wait_s
                 last_progress_tick = loop.time()
-                while len(api.sent_texts) <= before and loop.time() < deadline:
+                stop_reason = ""
+                while len(api.sent_texts) <= before:
+                    now = loop.time()
+                    if now >= campaign_deadline:
+                        stop_reason = "campaign-budget"
+                        break
+                    last_real = max(
+                        scenario_started_monotonic,
+                        stage_progress_state["last_monotonic"],
+                    )
+                    if time.monotonic() - last_real >= scenario_inactivity_limit_s:
+                        stop_reason = "no-real-progress"
+                        break
                     await asyncio.sleep(0.02)
                     if loop.time() - last_progress_tick >= 20.0:
-                        # Heartbeat distinguishes a slow live model from a
-                        # stalled Actions worker without logging any text.
+                        # Liveness-only heartbeat. It never resets the real
+                        # progress/inactivity watchdog.
                         print(
                             f"Gate C scenario {position}/{len(scenarios)} "
                             f"family={family} phase=awaiting-delivery "
@@ -2856,6 +2892,7 @@ async def run_live_telegram_evidence_lane(
                             # stage evidence; "unknown" is the honest category
                             # for an unresponsive turn (kodmial/aa#411).
                             "timeout_category": "unknown",
+                            "timeout_reason": stop_reason or "unknown",
                             "completed_scenario_count": len(scenario_diagnostics),
                             "scenario_total": len(scenarios),
                             # Preserve the actually observed elapsed wait for
@@ -2895,6 +2932,8 @@ async def run_live_telegram_evidence_lane(
                         scenario_diagnostics=scenario_diagnostics,
                         latency_samples=latency_samples,
                         timeout_category="unknown",
+                        timeout_reason=stop_reason or "unknown",
+                        real_progress=False,
                     )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} "
@@ -2903,6 +2942,12 @@ async def run_live_telegram_evidence_lane(
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
                     continue
+                record_live_progress(
+                    "scenario-response",
+                    scenario_index=position,
+                    family=family,
+                    real_progress=True,
+                )
                 _check(
                     f"live-transport-{family}-accepted",
                     len(transport.received) > before_received,
@@ -3172,8 +3217,15 @@ async def run_live_telegram_evidence_lane(
                 }
                 started_raw = time.perf_counter()
                 api.pending_updates.append(raw_turn)
-                deadline_turn = loop.time() + scenario_wait_s
-                while len(api.sent_texts) <= before and loop.time() < deadline_turn:
+                stage_progress_state["last_monotonic"] = time.monotonic()
+                while len(api.sent_texts) <= before:
+                    if loop.time() >= campaign_deadline:
+                        break
+                    if (
+                        time.monotonic() - stage_progress_state["last_monotonic"]
+                        >= scenario_inactivity_limit_s
+                    ):
+                        break
                     await asyncio.sleep(0.02)
                 if len(api.sent_texts) <= before:
                     import uuid as _uuid
@@ -3195,6 +3247,7 @@ async def run_live_telegram_evidence_lane(
                         }
                     )
                     return None
+                record_live_progress("scenario-response", real_progress=True)
                 elapsed_raw = time.perf_counter() - started_raw
                 latencies.append(elapsed_raw)
                 import uuid as _uuid
@@ -3955,12 +4008,15 @@ async def run_live_telegram_evidence_lane(
                     before_received = len(transport.received)
                     voice_started = time.perf_counter()
                     api.pending_updates.append(raw_voice)
-                    voice_deadline = loop.time() + 120.0
-                    while (
-                        api.sent_voices <= before_voice
-                        and len(api.sent_texts) <= before_text
-                        and loop.time() < voice_deadline
-                    ):
+                    stage_progress_state["last_monotonic"] = time.monotonic()
+                    while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:
+                        if loop.time() >= campaign_deadline:
+                            break
+                        if (
+                            time.monotonic() - stage_progress_state["last_monotonic"]
+                            >= scenario_inactivity_limit_s
+                        ):
+                            break
                         await asyncio.sleep(0.02)
                     voice_elapsed = time.perf_counter() - voice_started
                     _check(
@@ -4189,6 +4245,8 @@ async def run_live_telegram_evidence_lane(
         "latency_provider_id": str(getattr(settings, "opencode_model", ""))[:64],
         "latency_budget_s": LIVE_TEXT_LATENCY_BUDGET_S,
         "qualification_scenario_wait_s": float(scenario_wait_s),
+        "qualification_campaign_budget_s": float(live_total_deadline_s()),
+        "qualification_scenario_inactivity_s": float(scenario_inactivity_limit_s),
         "independent_judge_calls": _judge_calls,
         "independent_judge_helpful": _judge_helpful,
         "independent_judge_unavailable": _judge_unavailable,

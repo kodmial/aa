@@ -491,7 +491,7 @@ async def run_planner(
     user_text = str(messages[1].content)
     policy = current_time_policy()
     budget = float(policy.planner_time_budget_s) if time_budget_s is None else float(time_budget_s)
-    if not budget > 0:
+    if not _turn_time_limits_disabled() and not budget > 0:
         raise QueryPlanValidationError("planner time budget must be > 0")
 
     async def _provider_plan() -> QueryPlan:

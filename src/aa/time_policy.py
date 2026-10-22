@@ -21,8 +21,24 @@ DEFAULT_TURN_TIME_LIMITS_ENABLED = False
 DEFAULT_LATENCY_GATE_MODE = "observe"
 DEFAULT_LATENCY_P95_TARGET_MS = 60_000.0
 DEFAULT_LATENCY_MAX_TURN_MS = 120_000.0
-DEFAULT_TRANSPORT_TIMEOUT_S = 300.0
-DEFAULT_QUALIFICATION_SCENARIO_WAIT_S = 300.0
+# Transport policy (kodmial/aa#412): ``transport_timeout_s`` is a
+# connect/inactivity bound for one blocking socket operation, never an
+# end-to-end response deadline. A healthy slow model may stay silent well
+# past the former fixed walls; only the independently supervised
+# qualification campaign deadline (with finalisation reserve) can end it.
+DEFAULT_TRANSPORT_TIMEOUT_S = 1800.0
+DEFAULT_TRANSPORT_CONNECT_TIMEOUT_S = 30.0
+# One coherent 135-minute exact-main campaign. The parent watchdog subtracts
+# the explicit finalisation reserve before using this allowance.
+DEFAULT_QUALIFICATION_CAMPAIGN_S = 8100.0
+DEFAULT_QUALIFICATION_FINALISATION_RESERVE_S = 900.0
+# A scenario is stopped only when no *real* progress event (stage
+# transition, delivered response, completed scenario) has been observed for
+# this long. A polling heartbeat never resets this bound.
+DEFAULT_QUALIFICATION_SCENARIO_INACTIVITY_S = 1800.0
+# Legacy projection retained for evidence consumers; it is a campaign hint,
+# never a per-scenario hard cutoff.
+DEFAULT_QUALIFICATION_SCENARIO_WAIT_S = DEFAULT_QUALIFICATION_CAMPAIGN_S
 DEFAULT_TURN_END_TO_END_BUDGET_S = 105.0
 DEFAULT_ANSWER_DRAFT_ATTEMPT_BUDGET_S = 35.0
 DEFAULT_REPAIR_TIME_BUDGET_S = 50.0
@@ -42,7 +58,12 @@ _TIME_POLICY_ENV_NAMES: tuple[str, ...] = (
     "AA_LATENCY_P95_TARGET_MS",
     "AA_LATENCY_MAX_TURN_MS",
     "AA_TRANSPORT_TIMEOUT_S",
+    "AA_TRANSPORT_CONNECT_TIMEOUT_S",
+    "AA_QUALIFICATION_CAMPAIGN_S",
+    "AA_QUALIFICATION_JOB_TIMEOUT_MINUTES",
+    "AA_QUALIFICATION_FINALISATION_RESERVE_S",
     "AA_QUALIFICATION_SCENARIO_WAIT_S",
+    "AA_QUALIFICATION_SCENARIO_INACTIVITY_S",
     "AA_TURN_END_TO_END_BUDGET_S",
     "AA_ANSWER_DRAFT_ATTEMPT_BUDGET_S",
     "AA_REPAIR_TIME_BUDGET_S",
@@ -70,7 +91,11 @@ class TimePolicy:
     latency_p95_target_ms: float = DEFAULT_LATENCY_P95_TARGET_MS
     latency_max_turn_ms: float = DEFAULT_LATENCY_MAX_TURN_MS
     transport_timeout_s: float = DEFAULT_TRANSPORT_TIMEOUT_S
+    transport_connect_timeout_s: float = DEFAULT_TRANSPORT_CONNECT_TIMEOUT_S
+    qualification_campaign_s: float = DEFAULT_QUALIFICATION_CAMPAIGN_S
+    qualification_finalisation_reserve_s: float = DEFAULT_QUALIFICATION_FINALISATION_RESERVE_S
     qualification_scenario_wait_s: float = DEFAULT_QUALIFICATION_SCENARIO_WAIT_S
+    qualification_scenario_inactivity_s: float = DEFAULT_QUALIFICATION_SCENARIO_INACTIVITY_S
     turn_end_to_end_budget_s: float = DEFAULT_TURN_END_TO_END_BUDGET_S
     answer_draft_attempt_budget_s: float = DEFAULT_ANSWER_DRAFT_ATTEMPT_BUDGET_S
     repair_time_budget_s: float = DEFAULT_REPAIR_TIME_BUDGET_S
@@ -90,7 +115,11 @@ class TimePolicy:
             "latency_p95_target_ms",
             "latency_max_turn_ms",
             "transport_timeout_s",
+            "transport_connect_timeout_s",
+            "qualification_campaign_s",
+            "qualification_finalisation_reserve_s",
             "qualification_scenario_wait_s",
+            "qualification_scenario_inactivity_s",
             "turn_end_to_end_budget_s",
             "answer_draft_attempt_budget_s",
             "repair_time_budget_s",
@@ -108,6 +137,10 @@ class TimePolicy:
                 raise TimePolicyError(f"{name} must be finite positive")
         if self.latency_max_turn_ms < self.latency_p95_target_ms:
             raise TimePolicyError("latency_max_turn_ms must be >= latency_p95_target_ms")
+        if self.qualification_finalisation_reserve_s >= self.qualification_campaign_s:
+            raise TimePolicyError(
+                "qualification_finalisation_reserve_s must be smaller than qualification_campaign_s"
+            )
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> TimePolicy:
@@ -129,10 +162,26 @@ class TimePolicy:
             transport_timeout_s=_env_float(
                 source, "AA_TRANSPORT_TIMEOUT_S", DEFAULT_TRANSPORT_TIMEOUT_S
             ),
+            transport_connect_timeout_s=_env_float(
+                source, "AA_TRANSPORT_CONNECT_TIMEOUT_S", DEFAULT_TRANSPORT_CONNECT_TIMEOUT_S
+            ),
+            qualification_campaign_s=_env_float(
+                source, "AA_QUALIFICATION_CAMPAIGN_S", DEFAULT_QUALIFICATION_CAMPAIGN_S
+            ),
+            qualification_finalisation_reserve_s=_env_float(
+                source,
+                "AA_QUALIFICATION_FINALISATION_RESERVE_S",
+                DEFAULT_QUALIFICATION_FINALISATION_RESERVE_S,
+            ),
             qualification_scenario_wait_s=_env_float(
                 source,
                 "AA_QUALIFICATION_SCENARIO_WAIT_S",
                 DEFAULT_QUALIFICATION_SCENARIO_WAIT_S,
+            ),
+            qualification_scenario_inactivity_s=_env_float(
+                source,
+                "AA_QUALIFICATION_SCENARIO_INACTIVITY_S",
+                DEFAULT_QUALIFICATION_SCENARIO_INACTIVITY_S,
             ),
             turn_end_to_end_budget_s=_env_float(
                 source, "AA_TURN_END_TO_END_BUDGET_S", DEFAULT_TURN_END_TO_END_BUDGET_S
@@ -183,7 +232,11 @@ class TimePolicy:
             "latency_p95_target_ms": self.latency_p95_target_ms,
             "latency_max_turn_ms": self.latency_max_turn_ms,
             "transport_timeout_s": self.transport_timeout_s,
+            "transport_connect_timeout_s": self.transport_connect_timeout_s,
+            "qualification_campaign_s": self.qualification_campaign_s,
+            "qualification_finalisation_reserve_s": self.qualification_finalisation_reserve_s,
             "qualification_scenario_wait_s": self.qualification_scenario_wait_s,
+            "qualification_scenario_inactivity_s": self.qualification_scenario_inactivity_s,
         }
 
 
@@ -276,12 +329,16 @@ __all__ = [
     "DEFAULT_LATENCY_GATE_MODE",
     "DEFAULT_LATENCY_MAX_TURN_MS",
     "DEFAULT_LATENCY_P95_TARGET_MS",
+    "DEFAULT_QUALIFICATION_CAMPAIGN_S",
+    "DEFAULT_QUALIFICATION_FINALISATION_RESERVE_S",
+    "DEFAULT_QUALIFICATION_SCENARIO_INACTIVITY_S",
     "DEFAULT_PLANNER_STRUCTURED_ATTEMPT_BUDGET_S",
     "DEFAULT_PLANNER_TIME_BUDGET_S",
     "DEFAULT_QUALIFICATION_SCENARIO_WAIT_S",
     "DEFAULT_REPAIR_TIME_BUDGET_S",
     "DEFAULT_RETRIEVAL_PER_CALL_BUDGET_S",
     "DEFAULT_RETRIEVAL_SEMANTIC_STAGE_BUDGET_S",
+    "DEFAULT_TRANSPORT_CONNECT_TIMEOUT_S",
     "DEFAULT_TRANSPORT_TIMEOUT_S",
     "DEFAULT_TURN_END_TO_END_BUDGET_S",
     "DEFAULT_TURN_TIME_LIMITS_ENABLED",
