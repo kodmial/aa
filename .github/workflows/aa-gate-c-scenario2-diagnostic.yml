@@ -113,14 +113,23 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
-          set -o pipefail
+          set -uo pipefail
+          status=0
           python scripts/diagnose_gate_c_scenario2.py \
             --main-sha "${{ steps.sha.outputs.main-sha }}" \
             --run-id "${{ github.run_id }}" \
             --issue 418 \
             --owner kodmial \
             --repo aa \
-            --out-dir diagnostic-scenario2-out
+            --out-dir diagnostic-scenario2-out || status=$?
+          # Exit 3 is the valid INCONCLUSIVE diagnostic outcome (cutoff
+          # reached with no delivery). Only real lifecycle failures fail
+          # the workflow step and trigger the fallback notice.
+          if [ "$status" -eq 0 ] || [ "$status" -eq 3 ]; then
+            echo "Scenario2 diagnostic completed with exit code $status (0=complete, 3=inconclusive)."
+            exit 0
+          fi
+          exit "$status"
 
       - name: Upload diagnostic artifacts
         if: always()

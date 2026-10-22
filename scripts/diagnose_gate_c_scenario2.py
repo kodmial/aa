@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import faulthandler
 import http.client
 import json
@@ -85,6 +86,8 @@ DEFAULT_DIAGNOSTIC_CUTOFF_S = 130.0
 DEFAULT_PROBE_A_SNAPSHOTS = (5.0, 15.0, 30.0, 50.0, 70.0)
 DEFAULT_PROBE_A_CUTOFF_S = 75.0
 DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S = 45.0
+DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S = 60.0
+DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S = 90.0
 DEFAULT_PROBE_A_PORT = "4097"
 CHILD_CUTOFF_SLACK_S = 10.0
 SUPERVISOR_POLL_S = 0.25
@@ -428,19 +431,7 @@ class ChildWatchdog(threading.Thread):
                 frames.append(sanitize_frame(frame.f_code))
                 frame = frame.f_back
             threads.append({"name": thread.name[:48], "frames": frames})
-        tasks: list[dict[str, Any]] = []
-        loop = self.main_loop
-        if loop is not None and not loop.is_closed():
-            try:
-                pending = list(asyncio.all_tasks(loop))[: self._MAX_TASKS]
-            except RuntimeError:
-                pending = []
-            for task in pending:
-                try:
-                    label = sanitize_frame(task.get_coro().cr_code)
-                except Exception:
-                    label = "<opaque-task>"
-                tasks.append({"name": task.get_name()[:48], "coro": label, "done": task.done()})
+        tasks = self._collect_async_tasks()
         health_ok: Any = None
         health_elapsed_ms: Any = None
         try:
@@ -466,6 +457,48 @@ class ChildWatchdog(threading.Thread):
             "sockets": summarize_loopback_sockets(),
             "opencode_processes": count_opencode_processes(),
         }
+
+    def _collect_async_tasks(self) -> list[dict[str, Any]]:
+        """Inspect tasks from the event-loop thread (never from this thread).
+
+        ``asyncio.all_tasks`` is only safe inside the loop thread. The
+        watchdog therefore schedules the read with ``call_soon_threadsafe``
+        and waits for a bounded result; a wedged loop simply yields an empty
+        list instead of touching loop state from the background thread.
+        """
+        loop = self.main_loop
+        if loop is None:
+            return []
+        future: concurrent.futures.Future[list[dict[str, Any]]] = concurrent.futures.Future()
+
+        def collect() -> None:
+            if future.cancelled():
+                return
+            try:
+                pending = list(asyncio.all_tasks(loop))[: self._MAX_TASKS]
+            except Exception:
+                pending = []
+            result: list[dict[str, Any]] = []
+            for task in pending:
+                try:
+                    label = sanitize_frame(task.get_coro().cr_code)
+                except Exception:
+                    label = "<opaque-task>"
+                result.append({"name": task.get_name()[:48], "coro": label, "done": task.done()})
+            try:
+                future.set_result(result)
+            except Exception:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(collect)
+        except RuntimeError:
+            return []
+        try:
+            return future.result(timeout=0.5)
+        except TimeoutError:
+            future.cancel()
+            return []
 
     def _audit_summary(self) -> dict[str, Any]:
         """Privacy-safe OpenCode client operation audit (counts + latency)."""
@@ -705,6 +738,7 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         opencode_base_url=base_url,
         counters=counters,
     )
+    watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
     sink.emit("probe-start", probe=PROBE_DIRECT_MODEL, model=str(model)[:96])
     counters["last_real_event"] = "probe-start"
@@ -714,11 +748,14 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     try:
         # 1) Pre-probe: attach vs spawn evidence (production startup path).
         attached, _ = await asyncio.to_thread(_health_probe, base_url, 1.0)
+        bootstrap_timeout = float(
+            argv.get("probe_a_bootstrap_timeout_s", DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S)
+        )
         try:
             started = time.perf_counter()
-            await runtime.start()
+            await asyncio.wait_for(runtime.start(), timeout=bootstrap_timeout)
             health_ok = bool(runtime.running and runtime.ready)
-            await runtime.ensure_ready(5.0)
+            await asyncio.wait_for(runtime.ensure_ready(5.0), timeout=bootstrap_timeout)
         except Exception as exc:
             sink.emit(
                 "server-health",
@@ -941,6 +978,7 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         opencode_base_url=base_url,
         counters=counters,
     )
+    watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
 
     stage_state = {"prev": "", "start": 0.0}
@@ -993,8 +1031,11 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         counters["last_real_event"] = "bootstrap-start"
         counters["last_real_monotonic"] = time.monotonic()
         started = time.perf_counter()
+        bootstrap_timeout = float(
+            argv.get("probe_b_bootstrap_timeout_s", DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S)
+        )
         try:
-            await app.start()
+            await asyncio.wait_for(app.start(), timeout=bootstrap_timeout)
         except Exception as exc:
             sink.emit(
                 "bootstrap-end",
@@ -1305,11 +1346,14 @@ def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
     env = os.environ.copy()
     env["SCENARIO2_DIAG_ARGS"] = child_argv
     env["PYTHONUNBUFFERED"] = "1"
+    # The child inherits stdout (safe JSONL) and writes its own artifact
+    # file. Never use a pipe here: a slow reader could fill the pipe buffer
+    # and block the child, defeating the diagnostic cutoff.
     return subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
         [sys.executable, str(Path(__file__).resolve()), "--child"],
         cwd=str(REPO_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=None,
         stderr=subprocess.DEVNULL,
         text=True,
         bufsize=1,
@@ -1333,77 +1377,131 @@ def child_argv_from_env() -> dict[str, Any]:
             os.environ.get("SCENARIO2_DIAG_PROBE_A_MESSAGE_TIMEOUT_S", "")
             or DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S
         ),
+        "probe_a_bootstrap_timeout_s": float(
+            os.environ.get("SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S", "")
+            or DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S
+        ),
+        "probe_b_bootstrap_timeout_s": float(
+            os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
+            or DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
+        ),
     }
 
 
-def _reader_loop(stdout: Any, evidence: ProbeEvidence, sink: EventSink) -> None:
-    """Consume child stdout JSONL into the Actions log + probe state."""
+def _child_events_path(out_dir: Path, probe: str) -> Path:
+    """Artifact file the child writes its safe JSONL events to."""
+    return out_dir / f"probe-{probe}-events.jsonl"
+
+
+def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> bool:
+    """Parse one child JSONL line; return ``False`` at a terminal bound."""
+    line = line.strip()
+    if not line:
+        return True
+    sink.passthrough(line)
     try:
-        for line in stdout:
-            line = line.strip()
-            if not line:
-                continue
-            sink.passthrough(line)
-            try:
-                payload = json.loads(line)
-            except ValueError:
-                evidence.raw_lines += 1
-                continue
-            kind = str(payload.get("event", ""))
-            if kind in REAL_ACTIVITY_KINDS:
-                evidence.last_real_event = kind[:48]
-                evidence.last_real_ts = str(payload.get("ts", ""))
-            if kind == "snapshot":
-                evidence.snapshots += 1
-                stage = str(payload.get("stage", "") or "")[:64]
-                if stage:
-                    evidence.last_stage = stage
-                evidence.last_stage_at_s = payload.get("stage_at_s")
-                evidence.seconds_since_last_stage = payload.get("seconds_since_last_stage")
-                if len(evidence.timeline) < 48:
-                    evidence.timeline.append(
-                        {
-                            "at_s": payload.get("at_s"),
-                            "stage": evidence.last_stage,
-                            "since_stage_s": evidence.seconds_since_last_stage,
-                            "typing_sends": payload.get("typing_sends", 0),
-                            "delivered": bool(payload.get("delivered", False)),
-                        }
-                    )
-            elif kind == "server-health":
-                evidence.server_ready_ms = payload.get("elapsed_ms")
-                if payload.get("ok") is False:
-                    evidence.fail_category = "server-health-failed"
-            elif kind == "model-send-end":
-                evidence.model_elapsed_ms = payload.get("elapsed_ms")
-                evidence.connect_ms = payload.get("connect_ms")
-                evidence.write_ms = payload.get("write_ms")
-                evidence.read_ms = payload.get("read_ms")
-                if not payload.get("ok"):
-                    evidence.fail_category = str(
-                        payload.get("fail_category", "") or "model-request-failed"
-                    )[:48]
-            elif kind == "delivery":
-                evidence.delivered = True
-                evidence.delivered_elapsed_ms = payload.get("elapsed_ms")
-                evidence.reply_len = payload.get("reply_len")
-                evidence.reply_signature = str(payload.get("reply_signature", ""))[:32]
-            elif kind == "bootstrap-end" and payload.get("ok") is False:
-                evidence.fail_category = (
-                    "bootstrap:" + str(payload.get("fail_category", "unknown"))[:48]
-                )
-                evidence.status = "bootstrap-failed"
-            elif kind == "delivery-timeout":
-                evidence.fail_category = "still-in-progress-at-probe-end"
-            elif kind == "probe-end":
-                evidence.status = str(payload.get("status", ""))[:48]
-            elif kind == "child-exit":
-                break
-            if evidence.raw_lines > 200:  # bounded raw non-JSON capture
+        payload = json.loads(line)
+    except ValueError:
+        evidence.raw_lines += 1
+        return evidence.raw_lines <= 200  # bounded raw non-JSON capture
+    kind = str(payload.get("event", ""))
+    if kind in REAL_ACTIVITY_KINDS:
+        evidence.last_real_event = kind[:48]
+        evidence.last_real_ts = str(payload.get("ts", ""))
+    if kind == "snapshot":
+        evidence.snapshots += 1
+        stage = str(payload.get("stage", "") or "")[:64]
+        if stage:
+            evidence.last_stage = stage
+        evidence.last_stage_at_s = payload.get("stage_at_s")
+        evidence.seconds_since_last_stage = payload.get("seconds_since_last_stage")
+        if len(evidence.timeline) < 48:
+            evidence.timeline.append(
+                {
+                    "at_s": payload.get("at_s"),
+                    "stage": evidence.last_stage,
+                    "since_stage_s": evidence.seconds_since_last_stage,
+                    "typing_sends": payload.get("typing_sends", 0),
+                    "delivered": bool(payload.get("delivered", False)),
+                }
+            )
+    elif kind == "server-health":
+        evidence.server_ready_ms = payload.get("elapsed_ms")
+        if payload.get("ok") is False:
+            evidence.fail_category = "server-health-failed"
+    elif kind == "model-send-end":
+        evidence.model_elapsed_ms = payload.get("elapsed_ms")
+        evidence.connect_ms = payload.get("connect_ms")
+        evidence.write_ms = payload.get("write_ms")
+        evidence.read_ms = payload.get("read_ms")
+        if not payload.get("ok"):
+            evidence.fail_category = str(
+                payload.get("fail_category", "") or "model-request-failed"
+            )[:48]
+    elif kind == "delivery":
+        evidence.delivered = True
+        evidence.delivered_elapsed_ms = payload.get("elapsed_ms")
+        evidence.reply_len = payload.get("reply_len")
+        evidence.reply_signature = str(payload.get("reply_signature", ""))[:32]
+    elif kind == "bootstrap-end" and payload.get("ok") is False:
+        evidence.fail_category = "bootstrap:" + str(payload.get("fail_category", "unknown"))[:48]
+        evidence.status = "bootstrap-failed"
+    elif kind == "delivery-timeout":
+        evidence.fail_category = "still-in-progress-at-probe-end"
+    elif kind == "probe-end":
+        evidence.status = str(payload.get("status", ""))[:48]
+    elif kind == "child-exit":
+        return False
+    return True
+
+
+def _tail_events_file(
+    path: Path,
+    evidence: ProbeEvidence,
+    sink: EventSink,
+    proc: subprocess.Popen | None,
+) -> None:
+    """Tail the child artifact file without ever writing into a child pipe.
+
+    Reading a regular file never applies backpressure to the child, so even
+    a burst of JSONL events cannot block it or delay the supervisor cutoff.
+    """
+    while not path.exists():
+        if proc is not None and proc.poll() is not None:
+            return
+        time.sleep(0.02)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            while True:
+                line = stream.readline()
+                if line:
+                    if not _consume_child_line(line, evidence, sink):
+                        return
+                    continue
+                if proc is None or proc.poll() is not None:
+                    return
+                time.sleep(0.02)
+    except OSError:
+        return
+
+
+def _reader_loop(
+    source: Any,
+    evidence: ProbeEvidence,
+    sink: EventSink,
+    proc: subprocess.Popen | None = None,
+) -> None:
+    """Consume child JSONL events into the Actions log + probe state."""
+    if isinstance(source, (str, os.PathLike)):
+        _tail_events_file(Path(source), evidence, sink, proc)
+        return
+    try:
+        for line in source:
+            if not _consume_child_line(str(line), evidence, sink):
                 break
     finally:
         try:
-            stdout.close()
+            source.close()
         except Exception:
             pass
 
@@ -1525,7 +1623,11 @@ def _run_one_probe(
         snapshot_schedule=list(plan.schedule),
     )
     proc = _spawn_child(plan=plan, out_dir=out_dir)
-    reader = threading.Thread(target=_reader_loop, args=(proc.stdout, evidence, sink), daemon=True)
+    reader = threading.Thread(
+        target=_reader_loop,
+        args=(_child_events_path(out_dir, plan.probe), evidence, sink, proc),
+        daemon=True,
+    )
     reader.start()
     try:
         pgid = os.getpgid(proc.pid)
@@ -1533,7 +1635,9 @@ def _run_one_probe(
         pgid = None
     sink.emit("supervisor-child-spawn", probe=plan.probe, has_group=pgid is not None)
     started = time.monotonic()
-    last_stack_request = 0.0
+    # Never signal before the child installed its SIGUSR1 faulthandler
+    # (the default SIGUSR1 action terminates the child).
+    last_stack_request = started
     stack_dumps = 0
     last_publish = started
     supervision_limit = plan.child_cutoff_s + CHILD_CUTOFF_SLACK_S
@@ -1797,6 +1901,8 @@ def parent_main(args: argparse.Namespace) -> int:
     probe_b = ProbeEvidence(probe=PROBE_SCENARIO2, status="not-run")
     os.environ["SCENARIO2_DIAG_PROBE_A_PORT"] = str(args.probe_a_port)
     os.environ["SCENARIO2_DIAG_PROBE_A_MESSAGE_TIMEOUT_S"] = str(args.probe_a_message_timeout_s)
+    os.environ["SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_a_bootstrap_timeout_s)
+    os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_b_bootstrap_timeout_s)
     try:
         if args.probe in ("both", PROBE_DIRECT_MODEL):
             probe_a = _run_one_probe(
@@ -1896,6 +2002,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-a-port", default=DEFAULT_PROBE_A_PORT)
     parser.add_argument(
         "--probe-a-message-timeout-s", type=float, default=DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S
+    )
+    parser.add_argument(
+        "--probe-a-bootstrap-timeout-s",
+        type=float,
+        default=DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S,
+    )
+    parser.add_argument(
+        "--probe-b-bootstrap-timeout-s",
+        type=float,
+        default=DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S,
     )
     return parser
 
