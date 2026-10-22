@@ -61,6 +61,7 @@ def test_blocking_scenario_8_is_preempted_with_typed_negative_evidence(
     progress_path = tmp_path / "live-watchdog-progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "30")
     monkeypatch.setenv(ENV_SCENARIO_GRACE_S, "0.2")
     monkeypatch.setenv(ENV_SCENARIO_INACTIVITY_S, "1")
@@ -133,6 +134,7 @@ def test_slow_but_responsive_lane_assesses_all_18_without_false_timeout(
     progress_path = tmp_path / "live-watchdog-progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "30")
     monkeypatch.setenv(ENV_SCENARIO_GRACE_S, "5")
 
@@ -180,6 +182,7 @@ def test_total_deadline_kills_stalled_lane_without_progress(
     progress_path = tmp_path / "live-watchdog-progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "0.8")
 
     async def stalled_lane(run_id: str) -> LaneResult:
@@ -206,6 +209,7 @@ def test_total_deadline_reserves_finalisation_time_from_actions_job(
 ) -> None:
     now = 1_000_000.0
     monkeypatch.setenv(ENV_JOB_STARTED_AT, str(now - 600.0))
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_JOB_TIMEOUT_MINUTES, "135")
     monkeypatch.setenv(ENV_FINALISATION_RESERVE_S, "900")
     monkeypatch.delenv(ENV_TOTAL_DEADLINE_S, raising=False)
@@ -255,6 +259,7 @@ def test_watchdog_preserves_provider_429_runner_retirement(
     progress_path = tmp_path / "live-watchdog-progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "30")
 
     async def rate_limited_lane(run_id: str) -> LaneResult:
@@ -278,6 +283,7 @@ def test_watchdog_timeout_maps_to_authoritative_gate_c_fail(
     progress_path = tmp_path / "live-watchdog-progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv(ENV_JOB_STARTED_AT, raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "0.8")
 
     async def stalled_lane(run_id: str) -> LaneResult:
