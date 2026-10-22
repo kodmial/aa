@@ -126,7 +126,13 @@ def test_c_and_deterministic_flags_are_mutually_exclusive(monkeypatch: pytest.Mo
 def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/aa-self-proving-qualification.yml").read_text()
-    assert workflow.count("timeout-minutes: 135") == 2
+    assert (
+        workflow.count(
+            "timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES "
+            "|| '135') > 135"
+        )
+        == 2
+    )
     assert "timeout-minutes: 45" not in workflow
     assert "qualify-live:" in workflow
     assert "needs: qualify" in workflow

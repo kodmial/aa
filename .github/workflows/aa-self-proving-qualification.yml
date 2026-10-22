@@ -54,12 +54,12 @@ concurrency:
 jobs:
   qualify:
     runs-on: ubuntu-latest
-    # AA qualification only (kodmial/aa#412): the effective Actions cap is
-    # deterministically the owner-required 135 minutes. A repository variable
-    # can no longer silently lower it below the campaign allowance.
-    timeout-minutes: 135
+    # AA qualification only (kodmial/aa#412): the effective Actions cap is at
+    # least the owner-required 135 minutes. A repository variable may raise it
+    # for exceptional runs but can never lower it below the campaign allowance.
+    timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
     env:
-      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "135"
+      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
       AA_QUALIFICATION_CAMPAIGN_S: "8100"
       AA_QUALIFICATION_FINALISATION_RESERVE_S: "900"
     outputs:
@@ -341,12 +341,13 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     # The complete live Gate C -> E -> F qualification may legitimately run
-    # for 135 minutes. A 45/60/120-minute Actions hard cancel used to destroy
-    # the terminal verdict (kodmial/aa#411/#412). The parent watchdog leaves a
-    # real finalisation reserve for Gate E/F, artifacts and #7 publication.
-    timeout-minutes: 135
+    # for at least 135 minutes. A 45/60/120-minute Actions hard cancel used to
+    # destroy the terminal verdict (kodmial/aa#411/#412). The parent watchdog
+    # leaves a real finalisation reserve for Gate E/F, artifacts and #7
+    # publication. The repository variable may raise, never lower, the cap.
+    timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
     env:
-      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "135"
+      AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
       AA_QUALIFICATION_CAMPAIGN_S: "8100"
       # Keep enough time after the outer live watchdog fires to run Gate E/F,
       # upload artifacts and publish an exact-SHA negative verdict.

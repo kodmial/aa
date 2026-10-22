@@ -303,7 +303,9 @@ def test_workflows_use_two_hour_qualification_limit_and_watchdog_markers() -> No
     self_proving = (ROOT / ".github/workflows/aa-self-proving-qualification.yml").read_text(
         encoding="utf-8"
     )
-    expected = "timeout-minutes: 135"
+    expected = (
+        "timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135"
+    )
     assert self_proving.count(expected) == 2
     assert "timeout-minutes: 45" not in self_proving
     assert "AA_QUALIFICATION_JOB_STARTED_AT" in self_proving

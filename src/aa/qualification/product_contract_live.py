@@ -2781,8 +2781,7 @@ async def run_live_telegram_evidence_lane(
             book_grounded_expected = sum(
                 family in book_grounded_families for family, _, _ in scenarios
             )
-            loop = asyncio.get_running_loop()
-            campaign_deadline = loop.time() + max(1.0, live_total_deadline_s())
+            campaign_deadline = time.monotonic() + max(1.0, live_total_deadline_s())
             # Prior prompts per Telegram chat for contextual follow-up
             # relevance (generic, turn-independent): a terse follow-up in
             # an ongoing conversation carries little topical content on
@@ -2844,10 +2843,10 @@ async def run_live_telegram_evidence_lane(
                 started = time.perf_counter()
                 scenario_started_monotonic = time.monotonic()
                 api.pending_updates.append(raw)
-                last_progress_tick = loop.time()
+                last_progress_tick = time.monotonic()
                 stop_reason = ""
                 while len(api.sent_texts) <= before:
-                    now = loop.time()
+                    now = time.monotonic()
                     if now >= campaign_deadline:
                         stop_reason = "campaign-budget"
                         break
@@ -2859,7 +2858,7 @@ async def run_live_telegram_evidence_lane(
                         stop_reason = "no-real-progress"
                         break
                     await asyncio.sleep(0.02)
-                    if loop.time() - last_progress_tick >= 20.0:
+                    if time.monotonic() - last_progress_tick >= 20.0:
                         # Liveness-only heartbeat. It never resets the real
                         # progress/inactivity watchdog.
                         print(
@@ -2868,7 +2867,7 @@ async def run_live_telegram_evidence_lane(
                             f"elapsed_s={round(time.perf_counter() - started)}",
                             flush=True,
                         )
-                        last_progress_tick = loop.time()
+                        last_progress_tick = time.monotonic()
                         record_live_progress(
                             "scenario-heartbeat",
                             scenario_index=position,
@@ -3219,7 +3218,7 @@ async def run_live_telegram_evidence_lane(
                 api.pending_updates.append(raw_turn)
                 stage_progress_state["last_monotonic"] = time.monotonic()
                 while len(api.sent_texts) <= before:
-                    if loop.time() >= campaign_deadline:
+                    if time.monotonic() >= campaign_deadline:
                         break
                     if (
                         time.monotonic() - stage_progress_state["last_monotonic"]
@@ -4010,7 +4009,7 @@ async def run_live_telegram_evidence_lane(
                     api.pending_updates.append(raw_voice)
                     stage_progress_state["last_monotonic"] = time.monotonic()
                     while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:
-                        if loop.time() >= campaign_deadline:
+                        if time.monotonic() >= campaign_deadline:
                             break
                         if (
                             time.monotonic() - stage_progress_state["last_monotonic"]

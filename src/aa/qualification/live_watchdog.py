@@ -139,6 +139,11 @@ def live_total_deadline_s(now: float | None = None) -> float:
     may shorten it, but never makes it exceed the remaining Actions job
     budget when a start marker is present. Without a job-start marker the
     conservative campaign-minus-reserve fallback is used.
+
+    The Actions start marker is an epoch timestamp, so the remaining budget is
+    resolved once against wall time at supervisor startup. The returned
+    duration is then anchored to ``time.monotonic()`` for all ongoing
+    deadline/inactivity comparisons, keeping later clock jumps harmless.
     """
     current = time.time() if now is None else now
     explicit = os.environ.get(ENV_TOTAL_DEADLINE_S, "").strip()
@@ -230,8 +235,11 @@ def record_live_progress(
 
     Markers are merged. ``updated_at`` proves only that the writer is alive;
     ``last_real_progress_at`` advances only for meaningful stage/response
-    events (or an explicit ``real_progress=True``). Failures are swallowed:
-    progress persistence must never break the actual qualification lane.
+    events (or an explicit ``real_progress=True``). The wall-clock values are
+    persisted as evidence, while ``last_real_progress_monotonic`` is the
+    authoritative inactivity bound so a system clock jump cannot trigger a
+    false timeout. Failures are swallowed: progress persistence must never
+    break the actual qualification lane.
     """
     target = progress_path_from_env()
     if target is None:
@@ -239,16 +247,19 @@ def record_live_progress(
     try:
         payload = read_live_progress(target)
         now = time.time()
+        now_monotonic = time.monotonic()
         payload.update(
             {
                 "schema_version": PROGRESS_SCHEMA_VERSION,
                 "pid": os.getpid(),
                 "phase": str(phase)[:64],
                 "updated_at": now,
+                "updated_monotonic": now_monotonic,
             }
         )
         if real_progress or str(phase)[:64] in REAL_PROGRESS_PHASES:
             payload["last_real_progress_at"] = now
+            payload["last_real_progress_monotonic"] = now_monotonic
             payload["last_real_progress_phase"] = str(phase)[:64]
         if scenario_index is not None:
             payload["scenario_index"] = int(scenario_index)
@@ -461,6 +472,7 @@ def _timeout_lane(
         "watchdog_last_progress_phase": str(progress.get("phase", ""))[:64],
         "watchdog_last_progress_at": progress.get("updated_at"),
         "watchdog_last_real_progress_at": progress.get("last_real_progress_at"),
+        "watchdog_last_real_progress_monotonic": progress.get("last_real_progress_monotonic"),
         "watchdog_last_real_progress_phase": str(progress.get("last_real_progress_phase", ""))[:64],
         "exact_sha": main_sha,
         "scenario_diagnostics": diagnostics,
@@ -526,7 +538,6 @@ def supervise_live_gate_c(
         daemon=True,
     )
     started_monotonic = time.monotonic()
-    started_wall = time.time()
     total_deadline_s = live_total_deadline_s()
     deadline_monotonic = started_monotonic + total_deadline_s
     inactivity_s = scenario_inactivity_s()
@@ -545,12 +556,14 @@ def supervise_live_gate_c(
             if now_monotonic >= deadline_monotonic:
                 trigger = "total-deadline"
                 break
-            last_real = last_progress.get("last_real_progress_at")
-            last_real_at = float(last_real) if isinstance(last_real, (int, float)) else started_wall
+            last_real = last_progress.get("last_real_progress_monotonic")
+            last_real_at = (
+                float(last_real) if isinstance(last_real, (int, float)) else started_monotonic
+            )
             # A scenario deadline written by the child is intentionally
             # ignored (kodmial/aa#412): only real progress or the campaign
             # budget can end a healthy slow response.
-            if time.time() - last_real_at >= inactivity_s:
+            if now_monotonic - last_real_at >= inactivity_s:
                 trigger = "no-real-progress"
                 break
         if trigger:

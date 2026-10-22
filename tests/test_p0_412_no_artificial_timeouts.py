@@ -58,10 +58,13 @@ def test_a_repository_variable_cannot_shrink_the_effective_135m_workflow_cap() -
     real_book = (ROOT / ".github/workflows/aa-real-book-retrieval-qualification.yml").read_text(
         encoding="utf-8"
     )
-    assert self_proving.count("timeout-minutes: 135") == 2
+    floored = (
+        "timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135"
+    )
+    assert self_proving.count(floored) == 2
     assert "timeout-minutes: 120" not in self_proving
     assert "|| 120" not in self_proving
-    assert real_book.count("timeout-minutes: 135") == 1
+    assert real_book.count(floored) == 1
     assert "timeout-minutes: 120" not in real_book
 
 
