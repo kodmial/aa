@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aa.opencode.errors import OpenCodeRateLimitError  # noqa: E402
+from aa.qualification.live_watchdog import ENV_PROGRESS_PATH  # noqa: E402
 from aa.qualification.product_contract_live import (  # noqa: E402
     EXIT_BY_STATUS,
     ProductContractLiveError,
@@ -89,6 +90,16 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BY_STATUS["STALE"]
     if not working_tree_clean(ROOT):
         return _fail_incomplete(out_dir, reason="working tree is not clean", main_sha=expected_sha)
+
+    # Persist privacy-safe live progress next to the result so an outer
+    # watchdog timeout can retain completed scenario diagnostics and Gate E
+    # latency samples instead of losing the verdict with the child process.
+    progress_path = out_dir / "live-watchdog-progress.json"
+    os.environ[ENV_PROGRESS_PATH] = str(progress_path)
+    try:
+        progress_path.unlink()
+    except FileNotFoundError:
+        pass
 
     try:
         summary = evaluate_live(

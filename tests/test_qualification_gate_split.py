@@ -20,13 +20,15 @@ def _setup(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _setup(monkeypatch)
-    calls = []
+    marker = tmp_path / "gate-c-calls.txt"
 
     async def model_lane(run_id: str) -> live.LaneResult:
-        calls.append(("real", run_id))
+        # The live lane now runs in a supervised child process, so record the
+        # call on disk instead of relying on parent-process memory.
+        marker.write_text(f"real:{run_id}", encoding="utf-8")
         return _fake_lane("live-telegram-evidence")
 
     async def forbidden() -> None:
@@ -40,7 +42,7 @@ def test_gate_c_only_calls_real_conversation_once_and_no_deterministic_lanes(
     result = live.evaluate_live(SHA, repo_root=Path("."), run_id="r1", gate_c_only=True)
     assert result.status == "PASS"
     assert [lane.lane for lane in result.lanes] == ["live-telegram-evidence"]
-    assert calls == [("real", "r1")]
+    assert marker.read_text(encoding="utf-8") == "real:r1"
 
 
 def test_gate_b_runs_all_product_1_to_41_and_voice_without_real_provider(
@@ -124,8 +126,11 @@ def test_c_and_deterministic_flags_are_mutually_exclusive(monkeypatch: pytest.Mo
 def test_workflow_uses_two_bounded_jobs_and_exact_run_evidence_handoff() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/aa-self-proving-qualification.yml").read_text()
-    assert "timeout-minutes: 120" not in workflow
-    assert workflow.count("timeout-minutes: 45") == 2
+    assert (
+        workflow.count("timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}")
+        == 2
+    )
+    assert "timeout-minutes: 45" not in workflow
     assert "qualify-live:" in workflow
     assert "needs: qualify" in workflow
     assert "verified_model: ${{ steps.bot_model.outputs.primary }}" in workflow

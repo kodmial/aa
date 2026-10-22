@@ -1907,6 +1907,9 @@ async def run_v2_answer_turn(
             )
         except Exception:
             _evidence_chars_for_answer = 0
+        from aa.conversation.semantic_work_plan import notify_stage as _notify_stage
+
+        _notify_stage("answer")
         _dag.start_op("answer")
         _dag.provider_attempt(
             "answer",
@@ -2033,6 +2036,9 @@ async def run_v2_answer_turn(
             )
         except Exception:
             _verify_evidence_chars = 0
+        from aa.conversation.semantic_work_plan import notify_stage as _notify_stage
+
+        _notify_stage("verifier")
         _dag.start_op("verifier")
         _dag.provider_attempt(
             "verifier",

@@ -35,6 +35,7 @@ import hashlib
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -112,6 +113,35 @@ def estimate_tokens_for_chars(char_count: int) -> int:
         return max(1, count // 4)
 
 
+_StageObserver = Callable[[str], None]
+_stage_observer: _StageObserver | None = None
+
+
+def set_stage_observer(observer: _StageObserver | None) -> None:
+    """Install (or clear) a live stage observer for qualification evidence.
+
+    The observer receives only fixed-vocabulary stage names. It is a no-op
+    when unset, so production behavior and telemetry stay unchanged.
+    """
+    global _stage_observer
+    _stage_observer = observer
+
+
+def _notify_stage(stage: str) -> None:
+    observer = _stage_observer
+    if observer is None:
+        return
+    try:
+        observer(stage)
+    except Exception:
+        return
+
+
+def notify_stage(stage: str) -> None:
+    """Publish one fixed-vocabulary stage marker to the installed observer."""
+    _notify_stage(str(stage or "").strip()[:64] or "unknown")
+
+
 @dataclass
 class _OpRecord:
     """One critical-path operation (in-flight until finished)."""
@@ -160,7 +190,8 @@ class SemanticTurnDAG:
                     self._ops[clean] = _OpRecord(name=clean)
                     self._order.append(clean)
         except Exception:
-            pass
+            return
+        _notify_stage(clean)
 
     def finish_op(self, name: str, *, ok: bool, category: str = "") -> None:
         """Mark one semantic operation done (never raises)."""
@@ -607,7 +638,9 @@ __all__ = [
     "estimate_tokens_for_chars",
     "new_turn_dag_id",
     "new_work_plan",
+    "notify_stage",
     "remaining_turn_s",
     "repair_made_progress",
     "register_dag",
+    "set_stage_observer",
 ]

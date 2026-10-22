@@ -265,6 +265,9 @@ async def judge_whole_turn(
             contains_substantive_claim=False,
             model_identity=identity,
         )
+    from aa.conversation.semantic_work_plan import notify_stage
+
+    notify_stage("whole_turn_judge")
     prompt = build_whole_turn_judge_prompt(
         resolved_intent=resolved_intent, reply=reply, context=context
     )

@@ -133,7 +133,10 @@ jobs:
   qualify:
     needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Long-running AA real-book qualification only (kodmial/aa#411): the
+    # complete retrieval run may legitimately need up to two hours. Use the
+    # qualification-only repository variable with a safe 120-minute default.
+    timeout-minutes: ${{ vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || 120 }}
     permissions:
       contents: read
       issues: write
