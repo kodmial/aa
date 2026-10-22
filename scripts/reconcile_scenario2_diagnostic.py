@@ -26,8 +26,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
-import sys
 import tempfile
 import time
 import zipfile
@@ -37,8 +37,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from aa.control import scenario2_triage as triage  # noqa: E402
 
@@ -171,11 +169,21 @@ def collect_artifact(owner: str, repo: str, run_id: int) -> tuple[int | None, bo
     return None, False
 
 
+def _is_rate_limit_error(exc: GhError) -> bool:
+    message = str(exc).lower()
+    return "rate limit" in message or re.search(r"\b403\b", message) is not None
+
+
 @lru_cache(maxsize=64)
 def _machinery_unchanged_cached(owner: str, repo: str, older: str, newer: str) -> bool:
     if older == newer:
         return True
-    payload = _gh_api_json([f"repos/{owner}/{repo}/compare/{older}...{newer}"])
+    try:
+        payload = _gh_api_json([f"repos/{owner}/{repo}/compare/{older}...{newer}"])
+    except GhError as exc:
+        if _is_rate_limit_error(exc):
+            return False
+        raise
     files = payload.get("files") if isinstance(payload, dict) else []
     for item in files or []:
         if isinstance(item, dict) and str(item.get("filename", "")) in triage.MACHINERY_FILES:
@@ -377,11 +385,9 @@ MAIN_BRANCH = "main"
 def _sorted_completed(runs: list[triage.DiagnosticRun]) -> list[triage.DiagnosticRun]:
     def sort_key(run: triage.DiagnosticRun) -> tuple[bool, float, int]:
         created_epoch = triage.parse_iso_epoch(run.created_at)
-        return (
-            created_epoch is not None,
-            created_epoch if created_epoch is not None else 0.0,
-            run.run_id,
-        )
+        if created_epoch is not None:
+            return (True, created_epoch, run.run_id)
+        return (False, 0.0, run.run_id)
 
     return sorted(
         (run for run in runs if run.is_completed),

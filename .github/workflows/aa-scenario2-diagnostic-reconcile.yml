@@ -49,6 +49,7 @@ jobs:
       - name: Reconcile scenario2 diagnostic evidence
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ github.workspace }}/src
           # workflow_run trigger: precisely the just-completed diagnostic
           # run's SHA is a valid evidence target (it may predate main head).
           TRIAGE_EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
