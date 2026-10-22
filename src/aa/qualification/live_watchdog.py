@@ -51,6 +51,7 @@ ENV_SCENARIO_INACTIVITY_S = "AA_QUALIFICATION_SCENARIO_INACTIVITY_S"
 ENV_CAMPAIGN_S = "AA_QUALIFICATION_CAMPAIGN_S"
 ENV_FINALISATION_RESERVE_S = "AA_QUALIFICATION_FINALISATION_RESERVE_S"
 ENV_JOB_STARTED_AT = "AA_QUALIFICATION_JOB_STARTED_AT"
+ENV_JOB_STARTED_MONOTONIC = "AA_QUALIFICATION_JOB_STARTED_MONOTONIC"
 ENV_JOB_TIMEOUT_MINUTES = "AA_QUALIFICATION_JOB_TIMEOUT_MINUTES"
 ENV_DISABLE_WATCHDOG = "AA_QUALIFICATION_WATCHDOG_DISABLED"
 
@@ -131,7 +132,7 @@ def qualification_campaign_s() -> float:
     return _positive_float(ENV_CAMPAIGN_S, DEFAULT_CAMPAIGN_S)
 
 
-def live_total_deadline_s(now: float | None = None) -> float:
+def live_total_deadline_s(now: float | None = None, *, monotonic_now: float | None = None) -> float:
     """Resolve the maximum live-lane duration in seconds.
 
     The effective job allowance is the 135-minute campaign minus the
@@ -140,10 +141,14 @@ def live_total_deadline_s(now: float | None = None) -> float:
     budget when a start marker is present. Without a job-start marker the
     conservative campaign-minus-reserve fallback is used.
 
-    The Actions start marker is an epoch timestamp, so the remaining budget is
-    resolved once against wall time at supervisor startup. The returned
-    duration is then anchored to ``time.monotonic()`` for all ongoing
-    deadline/inactivity comparisons, keeping later clock jumps harmless.
+    The workflow writes the job start as both an epoch timestamp and a
+    host-wide monotonic clock value. When the monotonic marker is available
+    it is authoritative for the initial allowance, so a system clock jump
+    between job start and supervisor startup cannot distort it. The epoch
+    marker remains a compatibility fallback; that path resolves the remaining
+    budget once against wall time at startup and assumes no clock jump in the
+    interval. The returned duration is always anchored to
+    ``time.monotonic()`` for ongoing deadline/inactivity comparisons.
     """
     current = time.time() if now is None else now
     explicit = os.environ.get(ENV_TOTAL_DEADLINE_S, "").strip()
@@ -157,26 +162,44 @@ def live_total_deadline_s(now: float | None = None) -> float:
         total = campaign_allowance
 
     job_started_raw = os.environ.get(ENV_JOB_STARTED_AT, "").strip()
-    if job_started_raw:
+    job_started_monotonic_raw = os.environ.get(ENV_JOB_STARTED_MONOTONIC, "").strip()
+    if not job_started_raw and not job_started_monotonic_raw:
+        return max(1.0, total)
+
+    # The owner-required 135-minute cap is a floor for qualification: a stale
+    # repository variable can never silently shrink it.
+    timeout_minutes = max(
+        DEFAULT_JOB_TIMEOUT_MINUTES,
+        _positive_float(ENV_JOB_TIMEOUT_MINUTES, DEFAULT_JOB_TIMEOUT_MINUTES),
+    )
+    timeout_s = timeout_minutes * 60.0
+    remaining: float | None = None
+
+    try:
+        job_started_monotonic = (
+            float(job_started_monotonic_raw) if job_started_monotonic_raw else 0.0
+        )
+    except (TypeError, ValueError):
+        job_started_monotonic = 0.0
+    if job_started_monotonic > 0.0:
+        current_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+        remaining = job_started_monotonic + timeout_s - finalisation_reserve_s() - current_monotonic
+    else:
         try:
-            job_started = float(job_started_raw)
+            job_started = float(job_started_raw) if job_started_raw else 0.0
         except (TypeError, ValueError):
             job_started = 0.0
         if job_started > 0.0:
-            # The owner-required 135-minute cap is a floor for qualification:
-            # a stale repository variable can never silently shrink it.
-            timeout_minutes = max(
-                DEFAULT_JOB_TIMEOUT_MINUTES,
-                _positive_float(ENV_JOB_TIMEOUT_MINUTES, DEFAULT_JOB_TIMEOUT_MINUTES),
-            )
-            timeout_s = timeout_minutes * 60.0
             remaining = job_started + timeout_s - finalisation_reserve_s() - current
-            if remaining <= 0.0:
-                return 1.0
-            # With a real Actions job-start marker the remaining budget is
-            # authoritative; the static default is only the fallback for
-            # direct/local invocation.
-            total = min(total, remaining)
+
+    if remaining is None:
+        return max(1.0, total)
+    if remaining <= 0.0:
+        return 1.0
+    # With a real Actions job-start marker the remaining budget is
+    # authoritative; the static default is only the fallback for direct/local
+    # invocation.
+    total = min(total, remaining)
     return max(1.0, total)
 
 
@@ -627,6 +650,7 @@ __all__ = [
     "ENV_DISABLE_WATCHDOG",
     "ENV_FINALISATION_RESERVE_S",
     "ENV_JOB_STARTED_AT",
+    "ENV_JOB_STARTED_MONOTONIC",
     "ENV_JOB_TIMEOUT_MINUTES",
     "ENV_CAMPAIGN_S",
     "ENV_PROGRESS_PATH",

@@ -249,6 +249,8 @@ class HttpOpenCodeClient(OpenCodeClient):
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # The inactivity/connect bound is enforced directly by the socket
+        # layer on this blocking call; no asyncio timer wraps the response.
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
@@ -268,6 +270,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         if path.startswith("/session/") and path.endswith("/message") and method == "POST":
             fmt = body.get("format") if isinstance(body, dict) else None
             return "message-structured" if isinstance(fmt, dict) else "message-text"
+        if path.startswith("/session/") and path.endswith("/abort") and method == "POST":
+            return "session-abort"
         if path.startswith("/session/") and method == "DELETE":
             return "session-delete"
         return "other"
@@ -293,7 +297,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         parts = path.split("/")
         if len(parts) >= 3 and parts[1] == "session" and parts[2]:
             try:
-                await self.abort(parts[2])
+                await self.abort(urllib.parse.unquote(parts[2]))
             except Exception:
                 logger.info("opencode best-effort abort failed")
 
@@ -581,6 +585,11 @@ class HttpOpenCodeClient(OpenCodeClient):
         return messages
 
     async def abort(self, session_id: str) -> bool:
+        """Cancel in-flight server work via ``POST /session/{id}/abort``.
+
+        This is the concrete HTTP transport implementation; the abstract
+        method exists only so test fakes can share the same boundary.
+        """
         quoted = urllib.parse.quote(session_id, safe="")
         await self._call("POST", f"/session/{quoted}/abort")
         return True

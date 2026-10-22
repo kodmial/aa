@@ -20,6 +20,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from typing import Any
 
 import pytest
@@ -357,6 +358,14 @@ async def test_http_contract_as_expected_by_opencode() -> None:
         reply = await client.send_message(created.id, "hello")
         assert reply == "server-reply"
         assert await client.abort(created.id) is True
+        abort_requests = [
+            entry
+            for entry in server.state["requests"]
+            if entry["path"] == f"/session/{created.id}/abort"
+        ]
+        assert abort_requests == [
+            {"method": "POST", "path": f"/session/{created.id}/abort", "body": None}
+        ]
         assert await client.delete_session(created.id) is True
 
         # The worker posts the narrow prompt shape and nothing else.
@@ -427,6 +436,29 @@ async def test_http_served_model_mismatch_fails_closed() -> None:
     finally:
         server.shutdown()
         thread.join(timeout=5.0)
+
+
+def test_sync_request_hands_timeout_to_urlopen(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, float | None] = {}
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(request: urllib.request.Request, *, timeout: float | None = None) -> _Response:
+        seen["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = HttpOpenCodeClient("http://127.0.0.1:1")
+    assert client._sync_request("GET", "/global/health", None, 12.5) == {}
+    assert seen["timeout"] == 12.5
 
 
 async def test_http_timeout_is_transient() -> None:

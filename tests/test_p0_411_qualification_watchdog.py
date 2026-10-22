@@ -19,6 +19,7 @@ from aa.opencode.errors import OpenCodeRateLimitError
 from aa.qualification.live_watchdog import (
     ENV_FINALISATION_RESERVE_S,
     ENV_JOB_STARTED_AT,
+    ENV_JOB_STARTED_MONOTONIC,
     ENV_JOB_TIMEOUT_MINUTES,
     ENV_PROGRESS_PATH,
     ENV_SCENARIO_GRACE_S,
@@ -212,6 +213,21 @@ def test_total_deadline_reserves_finalisation_time_from_actions_job(
     assert live_total_deadline_s(now=now) == 6600.0
 
 
+def test_total_deadline_prefers_monotonic_start_over_wall_clock_jump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000.0
+    # The epoch marker is deliberately stale enough to exhaust the budget if
+    # wall time were used; the monotonic pair must remain authoritative.
+    monkeypatch.setenv(ENV_JOB_STARTED_AT, str(now - 10_000.0))
+    monkeypatch.setenv(ENV_JOB_STARTED_MONOTONIC, "4000.0")
+    monkeypatch.setenv(ENV_JOB_TIMEOUT_MINUTES, "135")
+    monkeypatch.setenv(ENV_FINALISATION_RESERVE_S, "900")
+    monkeypatch.delenv(ENV_TOTAL_DEADLINE_S, raising=False)
+    # 8100s job budget - 900s reserve - 600s monotonic elapsed = 6600s.
+    assert live_total_deadline_s(now=now, monotonic_now=4600.0) == 6600.0
+
+
 def test_progress_evidence_is_privacy_safe_and_checkpointed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -309,6 +325,7 @@ def test_workflows_use_two_hour_qualification_limit_and_watchdog_markers() -> No
     assert self_proving.count(expected) == 2
     assert "timeout-minutes: 45" not in self_proving
     assert "AA_QUALIFICATION_JOB_STARTED_AT" in self_proving
+    assert "AA_QUALIFICATION_JOB_STARTED_MONOTONIC" in self_proving
     assert "AA_QUALIFICATION_FINALISATION_RESERVE_S" in self_proving
     assert "AA_QUALIFICATION_LIVE_PROGRESS_PATH" in self_proving
     assert "live-out/live-watchdog-progress.json" in self_proving

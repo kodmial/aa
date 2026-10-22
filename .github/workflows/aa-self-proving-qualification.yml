@@ -69,11 +69,15 @@ jobs:
       verified_fallback: ${{ steps.bot_model.outputs.fallback }}
     steps:
       - name: Record qualification job start
-        # The outer live watchdog uses this wall-clock marker to reserve time
-        # for Gate E/F, artifact upload and repair publication before the
-        # configured job timeout (kodmial/aa#411).
+        # The outer live watchdog uses these paired wall-clock and monotonic
+        # markers to reserve time for Gate E/F, artifact upload and repair
+        # publication before the configured job timeout (kodmial/aa#411). The
+        # monotonic value is host-wide, so a later step can compare against it
+        # without being affected by a system clock jump.
         shell: bash
-        run: echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        run: |
+          echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          echo "AA_QUALIFICATION_JOB_STARTED_MONOTONIC=$(python3 -c 'import time; print(time.monotonic())')" >> "$GITHUB_ENV"
 
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
@@ -354,8 +358,12 @@ jobs:
       AA_QUALIFICATION_FINALISATION_RESERVE_S: "900"
     steps:
       - name: Record qualification job start
+        # Write both clocks so the outer watchdog never depends on a stable
+        # wall clock between job start and supervisor startup.
         shell: bash
-        run: echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        run: |
+          echo "AA_QUALIFICATION_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          echo "AA_QUALIFICATION_JOB_STARTED_MONOTONIC=$(python3 -c 'import time; print(time.monotonic())')" >> "$GITHUB_ENV"
 
       - name: Checkout exact main SHA
         uses: actions/checkout@v4
