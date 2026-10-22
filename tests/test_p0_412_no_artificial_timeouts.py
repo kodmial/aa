@@ -16,6 +16,7 @@ import pytest
 
 from aa.opencode.client import HttpOpenCodeClient
 from aa.qualification.live_watchdog import (
+    ENV_JOB_STARTED_MONOTONIC,
     ENV_PROGRESS_PATH,
     ENV_SCENARIO_INACTIVITY_S,
     ENV_TOTAL_DEADLINE_S,
@@ -183,7 +184,7 @@ def test_parent_ignores_fixed_scenario_deadline_when_real_progress_continues(
     progress_path = tmp_path / "progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv("AA_QUALIFICATION_JOB_STARTED_AT", raising=False)
-    monkeypatch.delenv("AA_QUALIFICATION_JOB_STARTED_MONOTONIC", raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "5")
     monkeypatch.setenv(ENV_SCENARIO_INACTIVITY_S, "0.3")
 
@@ -223,7 +224,7 @@ def test_fake_heartbeats_without_real_progress_are_still_killed(
     progress_path = tmp_path / "progress.json"
     monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
     monkeypatch.delenv("AA_QUALIFICATION_JOB_STARTED_AT", raising=False)
-    monkeypatch.delenv("AA_QUALIFICATION_JOB_STARTED_MONOTONIC", raising=False)
+    monkeypatch.delenv(ENV_JOB_STARTED_MONOTONIC, raising=False)
     monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "20")
     monkeypatch.setenv(ENV_SCENARIO_INACTIVITY_S, "0.4")
 
