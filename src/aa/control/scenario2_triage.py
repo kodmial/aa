@@ -718,9 +718,16 @@ _SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"(?i)authorization[: ]*bearer\s+[A-Za-z0-9\-._~+/=]{10,}",
         r"(?i)[?&](key|token|access_token|api_key)=[^&\s]{8,}",
         (
-            r"(?<![A-Za-z0-9_-])(?:bot)?\d{8,10}:"
+            r"(?<![A-Za-z0-9_-])bot\d{8,10}:"
             r"(?=[A-Za-z0-9_-]{35,}(?![A-Za-z0-9_-]))"
             r"(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])"
+            r"[A-Za-z0-9_-]{35,}(?![A-Za-z0-9_-])"
+        ),
+        (
+            r"(?<![A-Za-z0-9_-])\d{8,10}:"
+            r"(?=[A-Za-z0-9_-]{35,}(?![A-Za-z0-9_-]))"
+            r"(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])"
+            r"(?=[A-Za-z0-9_-]*\d)"
             r"[A-Za-z0-9_-]{35,}(?![A-Za-z0-9_-])"
         ),
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",

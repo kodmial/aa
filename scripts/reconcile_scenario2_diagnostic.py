@@ -57,6 +57,14 @@ MISSING_PERMISSION_MARKERS = (
 
 ARTIFACT_CACHE_DIR = Path(tempfile.gettempdir()) / f"aa-scenario2-triage-artifacts-{os.getpid()}"
 
+_COMPARE_CACHE_PATH = (
+    Path(tempfile.gettempdir())
+    / f"aa-scenario2-triage-compare-cache-{getattr(os, 'getuid', lambda: 0)()}.json"
+)
+_COMPARE_CACHE_TTL_S = 6 * 60 * 60
+_COMPARE_CACHE_RATE_LIMIT_TTL_S = 5 * 60
+_COMPARE_CACHE_MAX_ENTRIES = 512
+
 
 # ---------------------------------------------------------------------------
 # Small scoped gh calls (the only authenticated boundary)
@@ -174,20 +182,75 @@ def _is_rate_limit_error(exc: GhError) -> bool:
     return "rate limit" in message or re.search(r"\b403\b", message) is not None
 
 
+def _compare_cache_key(owner: str, repo: str, older: str, newer: str) -> str:
+    return f"{owner}/{repo}/{older}...{newer}"
+
+
+def _compare_cache_read() -> dict[str, Any]:
+    try:
+        payload = json.loads(_COMPARE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _compare_cache_lookup(key: str) -> bool | None:
+    entry = _compare_cache_read().get(key)
+    if not isinstance(entry, dict):
+        return None
+    unchanged = entry.get("unchanged")
+    expires_at = entry.get("expires_at")
+    if not isinstance(unchanged, bool) or not isinstance(expires_at, (int, float)):
+        return None
+    if float(expires_at) < time.time():
+        return None
+    return unchanged
+
+
+def _compare_cache_store(key: str, unchanged: bool, *, ttl_s: float) -> None:
+    now = time.time()
+    payload = {
+        item_key: item
+        for item_key, item in _compare_cache_read().items()
+        if isinstance(item, dict)
+        and isinstance(item.get("expires_at"), (int, float))
+        and float(item["expires_at"]) >= now
+    }
+    payload[key] = {"unchanged": unchanged, "expires_at": now + ttl_s}
+    if len(payload) > _COMPARE_CACHE_MAX_ENTRIES:
+        newest = sorted(payload.items(), key=lambda entry: float(entry[1]["expires_at"]))
+        payload = dict(newest[-_COMPARE_CACHE_MAX_ENTRIES:])
+    try:
+        _COMPARE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _COMPARE_CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.chmod(0o600)
+        tmp_path.replace(_COMPARE_CACHE_PATH)
+    except OSError:
+        pass
+
+
 @lru_cache(maxsize=64)
 def _machinery_unchanged_cached(owner: str, repo: str, older: str, newer: str) -> bool:
     if older == newer:
         return True
+    cache_key = _compare_cache_key(owner, repo, older, newer)
+    cached = _compare_cache_lookup(cache_key)
+    if cached is not None:
+        return cached
     try:
         payload = _gh_api_json([f"repos/{owner}/{repo}/compare/{older}...{newer}"])
     except GhError as exc:
         if _is_rate_limit_error(exc):
+            _compare_cache_store(cache_key, False, ttl_s=_COMPARE_CACHE_RATE_LIMIT_TTL_S)
             return False
         raise
     files = payload.get("files") if isinstance(payload, dict) else []
     for item in files or []:
         if isinstance(item, dict) and str(item.get("filename", "")) in triage.MACHINERY_FILES:
+            _compare_cache_store(cache_key, False, ttl_s=_COMPARE_CACHE_TTL_S)
             return False
+    _compare_cache_store(cache_key, True, ttl_s=_COMPARE_CACHE_TTL_S)
     return True
 
 
@@ -383,11 +446,11 @@ MAIN_BRANCH = "main"
 
 
 def _sorted_completed(runs: list[triage.DiagnosticRun]) -> list[triage.DiagnosticRun]:
-    def sort_key(run: triage.DiagnosticRun) -> tuple[bool, float, int]:
+    def sort_key(run: triage.DiagnosticRun) -> tuple[int, float, int]:
         created_epoch = triage.parse_iso_epoch(run.created_at)
         if created_epoch is not None:
-            return (True, created_epoch, run.run_id)
-        return (False, 0.0, run.run_id)
+            return (1, created_epoch, run.run_id)
+        return (0, 0.0, run.run_id)
 
     return sorted(
         (run for run in runs if run.is_completed),
