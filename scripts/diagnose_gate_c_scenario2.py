@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Gate C scenario #2 focused diagnostic (issue #418) — P0 isolated probe.
+"""Gate C scenario #2 focused diagnostic (issues #418, #424) — P0 isolated probe.
 
 DIAGNOSTIC ONLY. This script never decides Gate A-F qualification, never
 touches the product criteria of issue #7 and never reruns the full 18-case
-Gate C. It runs exactly two fast, separable probes against the real
-production runtime on the exact checked-out SHA:
+Gate C. It runs exactly two separable probes against the real production
+runtime on the exact checked-out SHA:
 
 - Probe A (``direct-model``): real local ``opencode serve`` (spawned by the
   production ``LocalOpenCodeRuntime``), the approved AA model pointer, one
   simple session + one short message. Per-phase HTTP timing (connect /
-  write / read) is captured so a direct model/provider stall is proven
-  before anything else is blamed;
+  write / read) is captured so a direct model/provider error is PROVEN
+  from a real response, never guessed from a wall clock;
 - Probe B (``scenario2``): the exact production scenario #2
   (``substantive-drinking``) through the unchanged production boundary
   (``PollingTelegramTransport`` -> ``Application`` -> per-chat dispatcher ->
@@ -18,39 +18,60 @@ production runtime on the exact checked-out SHA:
   in-process Telegram ``getUpdates``/``sendMessage`` seam (NO external
   Telegram network) and the unchanged scenario #2 prompt.
 
+kodmial/aa#424 policy (hard contract):
+
+- There is **NO per-answer wall-clock cutoff anywhere**: no 45s message
+  timeout, no 75s direct-probe window and no 130s scenario window. A real
+  model call that continues past 45/75/130/300/900 s is OBSERVED, not
+  killed. A long pending OpenCode response with no events is an
+  UNOBSERVED in-flight request, not proof of provider failure.
+- Observation is progress/liveness-driven. It ends only on: delivery, a
+  PROVEN provider error (real error payload from a real response), a
+  PROVEN local server failure (spawn/health/transport evidence), a
+  diagnostic-harness fault, or the single configurable campaign physical
+  allowance. A typing/polling heartbeat alone is never treated as
+  progress.
+- The one finite operational boundary is the **campaign allowance** (one
+  job-level ceiling plus a finalisation reserve), default 1800 s — the
+  same order as the AA qualification's real-progress scenario inactivity
+  allowance (``live_watchdog.DEFAULT_SCENARIO_INACTIVITY_S``) — reconciled
+  with the remaining Actions job budget so artifact upload always
+  completes. A turn at the allowance is reported
+  ``unresolved-at-campaign-end``: evidence plus an optional resumable
+  experiment, never a ``model-provider`` root cause.
+- Bounded diagnostics-only infrastructure bounds remain explicitly typed:
+  OpenCode spawn/bootstrap/connect health and observation probes are
+  finite. Answer/model calls have NO total-response deadline; they mirror
+  production ``HttpOpenCodeClient`` with a separate per-socket inactivity
+  bound so a silent provider connection cannot block forever.
+- Truthful verdicts only: ``delivered``, ``provider-error-proven``,
+  ``server-error-proven``, ``harness-error``, ``unresolved-at-campaign-end``,
+  ``boundary-localized-root-unknown`` (BOUNDARY LOCALIZED / ROOT UNKNOWN),
+  ``stage-unobserved``. An in-flight ``opencode`` stage is NEVER mapped
+  to a proven provider root cause.
+
 Privacy: no user text, no book text, no model payloads, no tokens, no
 session ids, no URLs with credentials and no raw environment is ever
 printed or written. Events carry ids, categories, counts, latencies and
 code identifiers only. The scenario prompt itself is never logged.
 
-Progressive evidence: line-buffered timestamped JSONL stage START/END,
-provider lifecycle and last-real-progress events stream to stdout (the
-GitHub Actions log) and to privacy-safe artifact files. An in-child
-watchdog thread plus the parent supervisor take snapshots at fixed offsets
-(default 10/25/45/75/110 s of the target turn); each snapshot also writes
-a small privacy-safe checkpoint JSON. The workflow additionally updates
-exactly one diagnostic issue comment, idempotent per run.
-
-Stack evidence integrity (P0 fix): the supervisor requests whole-process
-faulthandler stacks via SIGUSR1 only after the child wrote its
-``stack-handler-ready-<probe>.txt`` sentinel (handler registered with
-``chain=False``, so the dump never kills the probe). A child that still
-terminates by an unexpected signal is classified
-``diagnostic-infrastructure-failure``: it is NEVER reported as a
-successful workflow and its last stage marker is NOT used as root cause.
-The most recent in-flight ``stage-start`` (including ``opencode``) from
-the child JSONL is tracked separately from the last completed stage.
-
-Diagnostic cutoff: after ``--diagnostic-cutoff-s`` (default 130 s) without
-a delivered turn, the supervisor captures one final stack + process +
-socket + server snapshot and then SIGTERM/SIGKILLs the child's whole
-process group. A slow but genuinely progressing turn is reported
-``still-in-progress-at-probe-end`` (INCONCLUSIVE) — this observation
-window is NOT a new product qualification timeout.
+Progressive evidence: line-buffered timestamped JSONL lifecycle events
+stream to stdout (the GitHub Actions log) and to privacy-safe artifact
+files. The phase anchor turns into a periodic cadence: an in-child
+watchdog thread snapshots full in-process state (threads, tasks, last
+real progress vs typing heartbeat, OpenCode request audit, socket table)
+plus sanitized incremental OpenCode internal status (sessions/messages/
+part-kind counts when the pinned server version supports them) on
+cadence; independent whole-process faulthandler stacks are requested by
+the supervisor via SIGUSR1 after the child published its readiness
+sentinel.
 
 Usage (workflow):
   python scripts/diagnose_gate_c_scenario2.py \
-    --main-sha <sha> --run-id <run_id> --issue 418 --out-dir diagnostic-scenario2-out
+    --main-sha <sha> --run-id <run_id> --issue 418 \
+    --campaign-allowance-s 1800 --job-timeout-minutes 60 \
+    --job-started-epoch <job_start_epoch> \
+    --out-dir diagnostic-scenario2-out
 """
 
 from __future__ import annotations
@@ -61,6 +82,7 @@ import concurrent.futures
 import faulthandler
 import http.client
 import json
+import math
 import os
 import signal
 import subprocess
@@ -68,6 +90,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -82,7 +105,7 @@ DEFAULT_OWNER = "kodmial"
 DEFAULT_REPO = "aa"
 DEFAULT_ISSUE = 418
 
-SCHEMA_VERSION = "aa-gate-c-scenario2-diagnostic/1"
+SCHEMA_VERSION = "aa-gate-c-scenario2-diagnostic/2"
 PROBE_DIRECT_MODEL = "direct-model"
 PROBE_SCENARIO2 = "scenario2"
 SCENARIO_2_FAMILY = "substantive-drinking"
@@ -91,29 +114,92 @@ SCENARIO_2_CHAT_ID = 920002
 # Privacy: never logged; travels only through the production update seam.
 SCENARIO_2_PROMPT = "К вечеру очень тянет выпить, как с этим обходиться?"
 
-DEFAULT_SNAPSHOTS = (10.0, 25.0, 45.0, 75.0, 110.0)
-DEFAULT_DIAGNOSTIC_CUTOFF_S = 130.0
-DEFAULT_PROBE_A_SNAPSHOTS = (5.0, 15.0, 30.0, 50.0, 70.0)
-DEFAULT_PROBE_A_CUTOFF_S = 75.0
-DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S = 45.0
+# kodmial/aa#424: campaign-level finite operational boundary (ONE ceiling for
+# both probes; there is NO per-answer wall-clock cutoff). Mirrors the AA
+# qualification's real-progress scenario allowance of 1800 s.
+DEFAULT_CAMPAIGN_ALLOWANCE_S = 1800.0
+# Lowest allowance that still permits meaningful observation plus artifact
+# finalisation. When the remaining job budget is already inside the
+# finalisation reserve, the allowance must not collapse to a token 1s.
+MIN_CAMPAIGN_ALLOWANCE_S = 30.0
+# Time kept for report/comment publication and artifact upload, reconciled
+# against the Actions job budget when a job-start marker is provided.
+DEFAULT_FINALISATION_RESERVE_S = 600.0
+DEFAULT_SNAPSHOT_CADENCE_S = 15.0
+DEFAULT_MAX_SNAPSHOTS = 480
+DEFAULT_PROBE_A_PORT = "4097"
 DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S = 60.0
 DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S = 90.0
-DEFAULT_PROBE_A_PORT = "4097"
-CHILD_CUTOFF_SLACK_S = 10.0
+# Explicitly typed, answer-unrelated infrastructure bound: loopback TCP
+# connect to the local OpenCode server. The model response has no total
+# deadline; only the separate inactivity bound below applies after connect.
+DEFAULT_PROBE_A_CONNECT_TIMEOUT_S = 10.0
+# Mirror production ``HttpOpenCodeClient.request_timeout`` (AA_TRANSPORT_TIMEOUT_S):
+# a per-socket-operation inactivity bound for model calls, never an
+# end-to-end response deadline. A silent provider connection therefore
+# cannot block forever, while a slow inference that keeps transferring
+# bytes (or completes before the bound) still finishes normally.
+DEFAULT_MODEL_INACTIVITY_TIMEOUT_S = 1800.0
+
 SUPERVISOR_POLL_S = 0.25
 STACK_DUMP_EVERY_S = 20.0
-MAX_STACK_DUMPS = 8
+MAX_STACK_DUMPS = 16
 COMMENT_CADENCE_S = 30.0
 DEFAULT_TERMINATE_GRACE_S = 5.0
+# Sustained local-server non-responsiveness (genuinely nonresponsive, proven
+# by consecutive failed health probes) that allows typed cleanup instead of
+# waiting for the campaign allowance. Local-infrastructure evidence only —
+# never provider evidence.
+NONRESPONSIVE_SNAPSHOTS_REQUIRED = 4
+# A bounded loopback observation-probe bind (health/internal status only,
+# never an answer/model call).
+OBSERVATION_HTTP_TIMEOUT_S = 2.0
+# Observation-only cadence while a model POST is in flight. This NEVER
+# cancels or shortens the pending request; it records whether the local
+# OpenCode server still answers bounded status probes.
+MODEL_IN_FLIGHT_LIVENESS_INTERVAL_S = 15.0
+
+# Diagnostic observability: continuity marker thresholds. Crossing these with
+# the turn still undelivered is RECORDED, never enforced: the old 45/75/130
+# answer windows are now evidence checkpoints instead of kill switches.
+OBSERVATION_CONTINUITY_THRESHOLD_S: tuple[float, ...] = (45.0, 75.0, 130.0, 300.0, 900.0)
+OBSERVATION_CONTINUITY_REPEAT_S = 900.0
 
 # Internal child/supervisor contract only (diagnostic, never a Gate verdict):
-# 0 evidence produced, 2 bootstrap failed, 3 still-in-progress at cutoff,
-# 4 report could not be produced, 5 unexpected child exception.
+# 0 delivered, 2 child bootstrap failed (root unproven),
+# 3 inconclusive (unresolved/boundary-localized/stage-unobserved),
+# 4 report could not be produced, 5 unexpected child exception,
+# 6 proven provider error, 7 proven local server error.
 EXIT_OK = 0
 EXIT_BOOTSTRAP_FAILED = 2
-EXIT_STILL_IN_PROGRESS = 3
+EXIT_INCONCLUSIVE = 3
 EXIT_REPORT_FAILED = 4
 EXIT_CHILD_UNEXPECTED = 5
+EXIT_PROVIDER_ERROR_PROVEN = 6
+EXIT_SERVER_ERROR_PROVEN = 7
+
+# Truthful classification labels (kodmial/aa#424 Definition of Done).
+CLASS_DELIVERED = "delivered"
+CLASS_PROVIDER_ERROR_PROVEN = "provider-error-proven"
+CLASS_SERVER_ERROR_PROVEN = "server-error-proven"
+CLASS_HARNESS_ERROR = "harness-error"
+CLASS_UNRESOLVED = "unresolved-at-campaign-end"
+CLASS_BOUNDARY_LOCALIZED = "boundary-localized-root-unknown"
+CLASS_STAGE_UNOBSERVED = "stage-unobserved"
+
+_EXIT_BY_CLASSIFICATION: dict[str, int] = {
+    CLASS_DELIVERED: EXIT_OK,
+    CLASS_PROVIDER_ERROR_PROVEN: EXIT_PROVIDER_ERROR_PROVEN,
+    CLASS_SERVER_ERROR_PROVEN: EXIT_SERVER_ERROR_PROVEN,
+    CLASS_HARNESS_ERROR: EXIT_CHILD_UNEXPECTED,
+    CLASS_UNRESOLVED: EXIT_INCONCLUSIVE,
+    CLASS_BOUNDARY_LOCALIZED: EXIT_INCONCLUSIVE,
+    CLASS_STAGE_UNOBSERVED: EXIT_INCONCLUSIVE,
+}
+
+INCONCLUSIVE_CLASSIFICATIONS = frozenset(
+    {CLASS_UNRESOLVED, CLASS_BOUNDARY_LOCALIZED, CLASS_STAGE_UNOBSERVED}
+)
 
 # Event kinds marking confirmed REAL progress; typing/polling heartbeats are
 # deliberately excluded, mirroring the live watchdog semantics.
@@ -132,21 +218,34 @@ REAL_ACTIVITY_KINDS = frozenset(
         "delivery",
         "scenario-start",
         "scenario-end",
+        # Sanitized OpenCode internal status changes (session/message counts)
+        # observed only when they CHANGE between snapshots: real provider-side
+        # progress evidence, not a heartbeat.
+        "opencode-internal",
     }
 )
 
-# Observed production semantic-DAG op names -> root-cause component.
-_STAGE_COMPONENT: dict[str, str] = {
-    "opencode": "model-provider",
-    "provider": "model-provider",
-    "planner": "aa-graph-planner",
-    "index": "aa-retrieval-index",
-    "retrieval": "aa-retrieval",
-    "answer": "aa-graph-answer",
-    "verifier": "aa-graph-verifier",
-    "whole_turn_judge": "aa-graph-judge",
-    "finalize": "aa-graph-finalization",
-    "turn": "aa-graph-orchestration",
+# Observed production semantic-DAG stage names. These name the OBSERVED
+# boundary only; none of them (including ``opencode``) ever implies a proven
+# provider root cause (kodmial/aa#424).
+_STAGE_HINTS: dict[str, str] = {
+    "opencode": (
+        "Inspect the in-flight OpenCode send using the recorded session "
+        "status/message part evidence: a pending response with zero "
+        "provider events is UNOBSERVED, not proven provider failure."
+    ),
+    "provider": (
+        "Inspect the in-flight model adapter send; provider failure must be "
+        "proven from a real response payload before attribution."
+    ),
+    "planner": "Add bounded planner structured-output telemetry for the in-flight call.",
+    "index": "Profile the RAM E5/FAISS index open captured in the snapshots.",
+    "retrieval": "Profile the in-flight retrieval call and RRF/selection path.",
+    "answer": "Inspect the in-flight answer synthesis call and its structured output handling.",
+    "verifier": "Inspect the in-flight verifier turn and its structured output handling.",
+    "whole_turn_judge": "Inspect the in-flight whole-turn judge call.",
+    "finalize": "Inspect answer finalization/envelope handling at the observed stage.",
+    "turn": "Inspect the LangGraph turn-boundary transitions in the snapshot stacks.",
 }
 
 # Privacy: keys that must never carry any text in diagnostic payloads.
@@ -239,22 +338,6 @@ class EventSink:
             self._file.close()
         except Exception:
             pass
-
-
-def parse_schedule(raw: str) -> tuple[float, ...]:
-    """Parse "10,25,45,75,110" into ascending positive floats."""
-    values: list[float] = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        try:
-            value = float(chunk)
-        except ValueError:
-            continue
-        if value > 0:
-            values.append(value)
-    return tuple(sorted(values))
 
 
 def sanitize_frame(code: Any) -> str:
@@ -354,8 +437,8 @@ def _install_stack_handler(
     disposition terminates the process right after the stack dump. That
     killed BOTH diagnostic probes at ~20s of child lifetime in the real
     run 39767853106 (both children exit code -10 == SIGUSR1), truncating
-    the 75s/130s observation windows. The handler must ONLY dump stacks
-    and return; the probe keeps running until its own diagnostic cutoff.
+    the observation windows. The handler must ONLY dump stacks and return;
+    the probe keeps running until it reaches its own typed end state.
 
     Returns ``True`` when the handler is registered. On failure the caller
     is warned (never silent) and the supervisor's readiness sentinel is NOT
@@ -385,13 +468,77 @@ def _stack_handler_ready_path(out_dir: Path, probe: str) -> Path:
     return out_dir / f"stack-handler-ready-{probe}.txt"
 
 
+def _summarize_messages(payload: Any) -> tuple[int | None, list[str]]:
+    """Sanitized message-list summary: counts + part kinds (no text, no ids)."""
+    if not isinstance(payload, list):
+        return None, []
+    kinds: list[str] = []
+    for message in payload:
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict):
+                kind = part.get("type")
+                if isinstance(kind, str) and len(kinds) < 8 and kind not in kinds:
+                    kinds.append(kind[:24])
+    return len(payload), kinds
+
+
+def _opencode_internal_observation(
+    base_url: str, session_id: str, *, timeout: float = OBSERVATION_HTTP_TIMEOUT_S
+) -> dict[str, Any]:
+    """Sanitized OpenCode internal status snapshot (bounded, fail-soft).
+
+    kodmial/aa#424: discriminate live inference from server HTTP-wait by
+    observing the pinned OpenCode server's own state when supported:
+    sessions count and (when the diagnostic owns a session id) the
+    pending assistant message part kinds. Counts and part kinds only —
+    never message text, never session identifiers.
+    """
+    result: dict[str, Any] = {"responsive": False, "sessions_endpoint_supported": None}
+    ok, _provider_error, timings, extra = _timed_request(
+        base_url, "GET", "/session", None, timeout, timeout
+    )
+    result["responsive"] = ok
+    result["sessions_endpoint_supported"] = ok
+    if not ok:
+        result["fail_category"] = str(timings.get("fail_category", "http-error"))[:48]
+        return result
+    sessions = extra.get("_list")
+    result["sessions_seen"] = len(sessions) if isinstance(sessions, list) else None
+    if not session_id:
+        return result
+    ok_messages, _err, mtimings, mextra = _timed_request(
+        base_url,
+        "GET",
+        f"/session/{urllib.parse.quote(session_id)}/message",
+        None,
+        timeout,
+        timeout,
+    )
+    if ok_messages:
+        result["messages_endpoint_supported"] = True
+        result["messages_seen"] = mextra.get("_messages_seen")
+        result["part_kinds"] = mextra.get("_part_kinds")
+    else:
+        result["messages_endpoint_supported"] = False
+        result["messages_fail_category"] = str(mtimings.get("fail_category", ""))[:48]
+    return result
+
+
 class ChildWatchdog(threading.Thread):
     """Independent in-child snapshot thread (survives event-loop wedges).
 
-    Fires at each scheduled offset relative to the phase anchor (the target
-    turn start). Emits JSONL ``snapshot`` events and writes one privacy-safe
-    checkpoint JSON per snapshot. Whole-process faulthandler stacks are
-    separately requested by the supervisor via SIGUSR1.
+    kodmial/aa#424: fixed 10/25/45/75/110 s offsets were replaced by a
+    bounded periodic cadence, so the whole observation window receives
+    incremental snapshots up to the campaign allowance while keeping
+    bounded log volume. Each snapshot records full in-process state, the
+    OpenCode request audit and sanitized internal server status;
+    whole-process faulthandler stacks are separately requested by the
+    supervisor via SIGUSR1.
     """
 
     _MAX_THREADS = 12
@@ -402,7 +549,8 @@ class ChildWatchdog(threading.Thread):
         self,
         *,
         probe: str,
-        schedule: tuple[float, ...],
+        cadence_s: float,
+        max_snapshots: int,
         anchor: threading.Event,
         anchor_wait_timeout_s: float,
         sink: EventSink,
@@ -410,10 +558,12 @@ class ChildWatchdog(threading.Thread):
         opencode_base_url: str,
         counters: dict[str, Any],
         audit_provider: Callable[[], list[dict[str, Any]]] | None = None,
+        internal_probe: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(name=f"scenario2-diag-watchdog-{probe}", daemon=True)
         self.probe = probe
-        self.schedule = sorted(float(value) for value in schedule)
+        self.cadence_s = max(0.05, float(cadence_s))
+        self.max_snapshots = max(1, int(max_snapshots))
         self.anchor = anchor
         self.anchor_wait_timeout_s = max(1.0, float(anchor_wait_timeout_s))
         self.sink = sink
@@ -421,28 +571,26 @@ class ChildWatchdog(threading.Thread):
         self.opencode_base_url = opencode_base_url
         self.counters = counters
         self.audit_provider = audit_provider
+        self.internal_probe = internal_probe
         self.main_loop: asyncio.AbstractEventLoop | None = None
-        self._stop = threading.Event()
+        self._stop_requested = threading.Event()
+        self._consecutive_health_failures = 0
+        self._last_internal: dict[str, Any] = {"_baseline": None}
 
     def run(self) -> None:
-        first_offset = self.schedule[0] if self.schedule else self.anchor_wait_timeout_s
-        if not self.anchor.wait(timeout=max(first_offset, 1.0) + self.anchor_wait_timeout_s):
+        if not self.anchor.wait(timeout=self.anchor_wait_timeout_s):
             return
         start = time.monotonic()
-        for index, offset in enumerate(self.schedule, start=1):
-            while True:
-                if self._stop.is_set():
-                    return
-                remaining = offset - (time.monotonic() - start)
-                if remaining <= 0:
-                    break
-                self._stop.wait(timeout=min(0.2, remaining))
-            if self._stop.is_set():
+        for index in range(1, self.max_snapshots + 1):
+            delay = start + index * self.cadence_s - time.monotonic()
+            if delay > 0 and self._stop_requested.wait(timeout=delay):
+                return
+            if self._stop_requested.is_set() or not self.anchor.is_set():
                 return
             self._snapshot(index=index, at_s=round(time.monotonic() - start, 2))
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_requested.set()
 
     def _snapshot(self, *, index: int, at_s: float) -> None:
         payload = {"type": "snapshot", "snapshot_index": index, **self._collect(at_s=at_s)}
@@ -476,27 +624,77 @@ class ChildWatchdog(threading.Thread):
         health_elapsed_ms: Any = None
         try:
             probe_start = time.monotonic()
-            health_ok, _ = _health_probe(self.opencode_base_url, 2.0)
+            health_ok, _ = _health_probe(self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S)
             health_elapsed_ms = round((time.monotonic() - probe_start) * 1000.0, 1)
         except Exception:
             health_ok = None
+        if health_ok:
+            self._consecutive_health_failures = 0
+            self.counters["last_health_ok_at_s"] = round(time.monotonic(), 2)
+        else:
+            self._consecutive_health_failures += 1
+            if self._consecutive_health_failures >= NONRESPONSIVE_SNAPSHOTS_REQUIRED:
+                # Genuinely nonresponsive LOCAL server (proven local
+                # infrastructure failure, never provider evidence).
+                self.counters["server_nonresponsive_sustained"] = True
+                try:
+                    self.sink.emit(
+                        "server-nonresponsive-sustained",
+                        consecutive_failures=self._consecutive_health_failures,
+                        last_health_ok_at_s=self.counters.get("last_health_ok_at_s"),
+                    )
+                except Exception:
+                    pass
+        last_stage_mono = self.counters.get("last_stage_monotonic")
+        seconds_since_last_stage = (
+            round(time.monotonic() - float(last_stage_mono), 2)
+            if isinstance(last_stage_mono, (int, float))
+            else None
+        )
+        last_real_mono = self.counters.get("last_real_monotonic")
+        seconds_since_last_real = (
+            round(time.monotonic() - float(last_real_mono), 2)
+            if isinstance(last_real_mono, (int, float))
+            else None
+        )
+        internal = self._internal_observation()
         return {
             "probe": self.probe,
             "at_s": at_s,
             "stage": str(self.counters.get("last_stage", "") or "")[:64],
             "stage_at_s": self.counters.get("last_stage_at_s"),
-            "seconds_since_last_stage": self.counters.get("seconds_since_last_stage"),
+            "seconds_since_last_stage": seconds_since_last_stage,
             "last_real_event": str(self.counters.get("last_real_event", "") or "")[:64],
-            "seconds_since_last_real": self.counters.get("seconds_since_last_real"),
+            "seconds_since_last_real": seconds_since_last_real,
             "typing_sends": int(self.counters.get("typing_sends", 0)),
             "delivered": bool(self.counters.get("delivered", False)),
+            "consecutive_health_failures": self._consecutive_health_failures,
             "threads": threads,
             "asyncio_tasks": tasks,
             "opencode_health": {"ok": health_ok, "elapsed_ms": health_elapsed_ms},
+            "opencode_internal": internal,
             "opencode_request_audit": self._audit_summary(),
             "sockets": summarize_loopback_sockets(),
             "opencode_processes": count_opencode_processes(),
         }
+
+    def _internal_observation(self) -> dict[str, Any]:
+        """Periodic sanitized OpenCode internal status (fail-soft, bounded)."""
+        if self.internal_probe is None:
+            return {}
+        try:
+            internal = self.internal_probe()
+        except Exception:
+            return {"responsive": False}
+        internal = internal if isinstance(internal, dict) else {}
+        baseline = (internal.get("sessions_seen"), internal.get("messages_seen"))
+        if self._last_internal.get("_baseline") != baseline:
+            # Actual provider-side work moved (session/message counts
+            # changed): genuine progress evidence, never a heartbeat.
+            self._last_internal["_baseline"] = baseline
+            self.counters["last_real_event"] = "opencode-internal"
+            self.counters["last_real_monotonic"] = time.monotonic()
+        return internal
 
     def _collect_async_tasks(self) -> list[dict[str, Any]]:
         """Inspect tasks from the event-loop thread (never from this thread).
@@ -596,7 +794,7 @@ def _split_base(base_url: str) -> tuple[str, int]:
 
 
 def probe_health(base_url: str, timeout: float) -> tuple[bool, str]:
-    """Public alias so the worker module owns one health implementation."""
+    """Public alias so the diagnostic owns one health implementation."""
     return _health_probe(base_url, timeout)
 
 
@@ -627,19 +825,46 @@ def _health_probe_phased(base_url: str, method: str, path: str) -> dict[str, flo
 # ---------------------------------------------------------------------------
 
 
+def _model_inactivity_timeout_s() -> float:
+    """Production-equivalent socket inactivity bound for model calls.
+
+    Mirrors ``HttpOpenCodeClient.request_timeout`` (``AA_TRANSPORT_TIMEOUT_S``).
+    This is a per-socket-operation inactivity bound, not an end-to-end
+    response deadline: a genuinely slow provider that keeps the connection
+    active is not failed merely for exceeding a wall-clock window.
+    """
+    try:
+        from aa.time_policy import current_time_policy
+
+        value = float(current_time_policy().transport_timeout_s)
+    except Exception:
+        value = DEFAULT_MODEL_INACTIVITY_TIMEOUT_S
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_MODEL_INACTIVITY_TIMEOUT_S
+    return value
+
+
 def _timed_request(
     base_url: str,
     method: str,
     path: str,
     body: dict[str, object] | None,
-    timeout: float,
+    connect_timeout: float,
+    op_timeout: float | None,
 ) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
     """One instrumented loopback HTTP call with connect/write/read phases.
 
-    Diagnostic-only helper mirroring the exact production wire shape
-    (stdlib ``http.client``). Response payloads are never returned or
-    logged. The returned ``extra`` may hold an internal opaque ``_id``
-    for the very next request; it is never emitted.
+    kodmial/aa#424: the connect bound covers ONLY the TCP establishment
+    phase of the loopback infrastructure. The read phase has a finite
+    per-socket inactivity bound (production ``HttpOpenCodeClient``
+    ``request_timeout`` semantics), but there is NO total-response deadline:
+    a healthy slow inference that keeps the connection alive is never
+    falsely failed merely for taking long. A provider connection that
+    accepts TCP but never sends a byte therefore times out with a typed
+    ``read-timeout`` instead of blocking until the campaign allowance.
+    Response payloads are never returned or logged. The returned ``extra``
+    may hold internal opaque values (session id reference, sanitized
+    counts) for the very next request; identifiers are never emitted.
     """
     try:
         host, port = http_split_probe_base_url(base_url)
@@ -648,11 +873,19 @@ def _timed_request(
     timings: dict[str, float] = {}
     extra: dict[str, Any] = {}
     connection: http.client.HTTPConnection | None = None
+    phase = "connect"
     try:
         start = time.perf_counter()
-        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection = http.client.HTTPConnection(host, port, timeout=connect_timeout)
         connection.connect()
         timings["connect_ms"] = round((time.perf_counter() - start) * 1000.0, 1)
+        inactivity_timeout = (
+            float(op_timeout) if op_timeout is not None else _model_inactivity_timeout_s()
+        )
+        if connection.sock is not None:
+            connection.sock.settimeout(inactivity_timeout)
+            timings["inactivity_timeout_s"] = round(inactivity_timeout, 1)
+        phase = "write"
         write_start = time.perf_counter()
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Accept": "application/json"}
@@ -660,18 +893,25 @@ def _timed_request(
             headers["Content-Type"] = "application/json"
         connection.request(method, path, body=payload, headers=headers)
         timings["write_ms"] = round((time.perf_counter() - write_start) * 1000.0, 1)
+        phase = "read"
         read_start = time.perf_counter()
         response = connection.getresponse()
         raw = response.read()
         timings["read_ms"] = round((time.perf_counter() - read_start) * 1000.0, 1)
         timings["status"] = int(response.status)
         ok = response.status == 200
-        if ok and method == "POST" and path == "/session":
-            session = json.loads(raw.decode("utf-8"))
-            session_id = session.get("id")
-            if isinstance(session_id, str) and session_id:
-                extra["_id"] = session_id
         if ok:
+            if method == "POST" and path == "/session":
+                session = json.loads(raw.decode("utf-8"))
+                session_id = session.get("id")
+                if isinstance(session_id, str) and session_id:
+                    extra["_id"] = session_id
+            elif method == "GET" and path == "/session":
+                listed = json.loads(raw.decode("utf-8"))
+                extra["_list"] = listed if isinstance(listed, list) else None
+            elif method == "GET" and path.endswith("/message"):
+                listed = json.loads(raw.decode("utf-8"))
+                extra["_messages_seen"], extra["_part_kinds"] = _summarize_messages(listed)
             decision = _classify_opencode_payload(raw)
             extra.update(decision)
             return ok, decision.get("provider_error", False), timings, extra
@@ -679,7 +919,7 @@ def _timed_request(
         return ok, False, timings, extra
     except (TimeoutError, OSError) as exc:
         timings["fail_category"] = (
-            "inactivity-timeout" if isinstance(exc, TimeoutError) else "network-error"
+            f"{phase}-timeout" if isinstance(exc, TimeoutError) else "network-error"
         )
         return False, False, timings, extra
     finally:
@@ -688,6 +928,94 @@ def _timed_request(
                 connection.close()
             except Exception:
                 pass
+
+
+async def _timed_request_async(
+    base_url: str,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+    connect_timeout: float,
+    op_timeout: float | None,
+) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
+    """Run ``_timed_request`` on a DAEMON thread (bounded child lifetime).
+
+    The default asyncio executor joins non-daemon threads at interpreter
+    shutdown, so a hung unbounded response could leak the child past the
+    campaign boundary. A dedicated daemon thread lets the child exit
+    normally right after bounded cleanup while the blocked socket dies
+    with the process.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[bool, bool, dict[str, float], dict[str, Any]]] = (
+        loop.create_future()
+    )
+
+    def deliver(ok: bool, value: Any) -> None:
+        if future.done():
+            return
+        if ok:
+            future.set_result(value)
+        else:
+            future.set_exception(value)
+
+    def runner() -> None:
+        try:
+            outcome = _timed_request(base_url, method, path, body, connect_timeout, op_timeout)
+        except BaseException as exc:  # noqa: BLE001 (fail-soft delivery)
+            try:
+                loop.call_soon_threadsafe(deliver, False, exc)
+            except RuntimeError:
+                pass
+            return
+        try:
+            loop.call_soon_threadsafe(deliver, True, outcome)
+        except RuntimeError:
+            pass
+
+    threading.Thread(target=runner, name="diag-timed-request", daemon=True).start()
+    return await future
+
+
+def _observe_model_in_flight_liveness(
+    *,
+    sink: EventSink,
+    base_url: str,
+    session_id_provider: Callable[[], str],
+    started_monotonic: float,
+    stop_event: threading.Event,
+    interval_s: float = MODEL_IN_FLIGHT_LIVENESS_INTERVAL_S,
+) -> None:
+    """Observe local-server liveness while a model POST is pending.
+
+    Observation-only: this thread never cancels, times out or otherwise
+    changes the in-flight request. It periodically proves whether the local
+    OpenCode server (and, when available, the session/message status
+    endpoints) still answers bounded probes, so a wedged local server is
+    distinguishable from a slow provider. A provider that accepts TCP but
+    sends no bytes remains unobservable here and is the documented
+    campaign-allowance-bounded accepted risk.
+    """
+    interval = max(1.0, float(interval_s))
+    while not stop_event.wait(interval):
+        try:
+            health_ok, _ = _health_probe(base_url, OBSERVATION_HTTP_TIMEOUT_S)
+            internal = _opencode_internal_observation(
+                base_url,
+                str(session_id_provider() or ""),
+                timeout=OBSERVATION_HTTP_TIMEOUT_S,
+            )
+            sink.emit(
+                "model-in-flight-liveness",
+                elapsed_ms=round((time.monotonic() - started_monotonic) * 1000.0, 1),
+                server_healthy=bool(health_ok),
+                sessions_responsive=bool(internal.get("responsive")),
+                sessions_seen=internal.get("sessions_seen"),
+                messages_seen=internal.get("messages_seen"),
+                part_kinds=internal.get("part_kinds"),
+            )
+        except Exception:
+            return
 
 
 def _classify_opencode_payload(raw: bytes) -> dict[str, Any]:
@@ -754,8 +1082,51 @@ def _probe_a_message_body(model: str) -> dict[str, object]:
     return body
 
 
+async def _bounded_async_stop(item: Any, timeout_s: float) -> bool:
+    """Bounded best-effort shutdown of runtime/app (never blocks forever)."""
+    try:
+        await asyncio.wait_for(item.stop(), timeout=max(1.0, float(timeout_s)))
+        return True
+    except Exception:
+        return False
+
+
+def _forced_bounded_exit(sink: EventSink, probe: str, exit_code: int) -> None:
+    """Terminate the child probe process group AFTER evidence is flushed.
+
+    Required when graceful teardown timed out because the production-path
+    resources could not be released: normal interpreter shutdown joins the
+    executor threads, so a stuck drain would leak the child past the
+    campaign boundary. This documented bounded end targets the CHILD'S OWN
+    process group — ``start_new_session=True`` makes the child a session
+    leader, so this includes the spawned OpenCode server and never the
+    supervisor/parent group. Event ids are already on disk and in the
+    Actions log.
+    """
+    sink.emit("child-forced-exit", probe=probe, exit_code=int(exit_code))
+    sink.close()
+    sys.stdout.flush()
+    try:
+        own_pgid = os.getpgid(os.getpid())
+    except OSError:
+        own_pgid = None
+    if own_pgid is not None:
+        try:
+            os.killpg(own_pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    os._exit(int(exit_code))
+
+
 async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str, Any]) -> int:
-    """Probe A child: health, session create, one message on the AA model."""
+    """Probe A child: health, session create, one message on the AA model.
+
+    kodmial/aa#424: the model message has NO wall-clock cutoff (production
+    ``HttpOpenCodeClient`` semantics: only a per-socket inactivity bound,
+    no total-response deadline); a real call of 46/75/300/900 s completes
+    and is recorded with its timing.
+    """
     from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig
 
     model = (os.environ.get("OPENCODE_MODEL", "") or "").strip()
@@ -767,16 +1138,24 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         model=model,
     )
     runtime = LocalOpenCodeRuntime(config, ready_timeout=45.0)
+    bootstrap_timeout = float(
+        argv.get("probe_a_bootstrap_timeout_s", DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S)
+    )
+    connect_timeout = float(argv.get("connect_timeout_s", DEFAULT_PROBE_A_CONNECT_TIMEOUT_S))
+    model_inactivity_timeout = _model_inactivity_timeout_s()
+    session_state = {"id": ""}
     anchor = threading.Event()
     watchdog = ChildWatchdog(
         probe=PROBE_DIRECT_MODEL,
-        schedule=argv["snapshot_schedule"],
+        cadence_s=float(argv.get("snapshot_cadence_s", DEFAULT_SNAPSHOT_CADENCE_S)),
+        max_snapshots=int(argv.get("max_snapshots", DEFAULT_MAX_SNAPSHOTS)),
         anchor=anchor,
-        anchor_wait_timeout_s=15.0,
+        anchor_wait_timeout_s=max(90.0, bootstrap_timeout + 30.0),
         sink=sink,
         checkpoint_dir=Path(argv["out_dir"]),
         opencode_base_url=base_url,
         counters=counters,
+        internal_probe=lambda: _opencode_internal_observation(base_url, session_state["id"]),
     )
     watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
@@ -788,11 +1167,8 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     try:
         # 1) Pre-probe: attach vs spawn evidence (production startup path).
         attached, _ = await asyncio.to_thread(_health_probe, base_url, 1.0)
-        bootstrap_timeout = float(
-            argv.get("probe_a_bootstrap_timeout_s", DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S)
-        )
+        started = time.perf_counter()
         try:
-            started = time.perf_counter()
             await asyncio.wait_for(runtime.start(), timeout=bootstrap_timeout)
             health_ok = bool(runtime.running and runtime.ready)
             await asyncio.wait_for(runtime.ensure_ready(5.0), timeout=bootstrap_timeout)
@@ -804,8 +1180,8 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
                 attached=attached,
                 fail_category=type(exc).__name__[:48],
             )
-            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status="bootstrap-failed")
-            return EXIT_BOOTSTRAP_FAILED
+            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=CLASS_SERVER_ERROR_PROVEN)
+            return EXIT_SERVER_ERROR_PROVEN
         health_elapsed = round((time.perf_counter() - started) * 1000.0, 1)
         counters["server_ready_ms"] = health_elapsed
         counters["last_real_event"] = "server-health"
@@ -817,8 +1193,8 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             attached=attached,
         )
         if not health_ok:
-            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status="bootstrap-failed")
-            return EXIT_BOOTSTRAP_FAILED
+            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=CLASS_SERVER_ERROR_PROVEN)
+            return EXIT_SERVER_ERROR_PROVEN
         try:
             health_phases = await asyncio.to_thread(
                 _health_probe_phased, base_url, "GET", "/global/health"
@@ -832,15 +1208,16 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         sink.emit("session-create-start", probe=PROBE_DIRECT_MODEL)
         counters["last_real_event"] = "session-create-start"
         counters["last_real_monotonic"] = time.monotonic()
-        ok, _provider_error, timings, extra = await asyncio.to_thread(
-            _timed_request,
+        ok, _provider_error, timings, extra = await _timed_request_async(
             base_url,
             "POST",
             "/session",
             {"title": "aa-scenario2-diagnostic"},
+            connect_timeout,
             10.0,
         )
         session_id = str(extra.get("_id", "")) if ok else ""
+        session_state["id"] = session_id
         sink.emit(
             "session-create-end",
             ok=ok,
@@ -853,31 +1230,59 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         counters["last_real_event"] = "session-create-end"
         counters["last_real_monotonic"] = time.monotonic()
         if not ok or not session_id:
-            fail = str(timings.get("fail_category", "") or "session-create-failed")[:48]
-            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=fail)
-            return EXIT_BOOTSTRAP_FAILED
+            # Session creation is bounded startup infrastructure; a
+            # transport failure here is proven local-server evidence.
+            sink.emit(
+                "probe-end",
+                probe=PROBE_DIRECT_MODEL,
+                status=CLASS_SERVER_ERROR_PROVEN,
+                fail_category=str(timings.get("fail_category", "") or "session-create-failed")[:48],
+            )
+            return EXIT_SERVER_ERROR_PROVEN
 
-        # 3) One real model message with per-phase timing; anchor snapshots.
-        sink.emit("model-send-start", probe=PROBE_DIRECT_MODEL, model=str(model)[:96])
+        # 3) One real model message with NO wall-clock cutoff: the TCP
+        #    connect phase and per-socket inactivity are bounded (typed
+        #    infrastructure bounds), never total response time. A real
+        #    response is awaited on a daemon thread and recorded with full
+        #    phase timing.
+        sink.emit(
+            "model-send-start",
+            probe=PROBE_DIRECT_MODEL,
+            model=str(model)[:96],
+            read_inactivity_s=round(model_inactivity_timeout, 1),
+        )
         counters["last_real_event"] = "model-send-start"
         counters["last_real_monotonic"] = time.monotonic()
         anchor.set()
         started = time.perf_counter()
-        ok, provider_error, timings, _extra = await asyncio.to_thread(
-            _timed_request,
-            base_url,
-            "POST",
-            f"/session/{session_id}/message",
-            _probe_a_message_body(model),
-            float(argv["probe_a_message_timeout_s"]),
+        liveness_stop = threading.Event()
+        liveness = threading.Thread(
+            target=_observe_model_in_flight_liveness,
+            kwargs={
+                "sink": sink,
+                "base_url": base_url,
+                "session_id_provider": lambda: session_state["id"],
+                "started_monotonic": time.monotonic(),
+                "stop_event": liveness_stop,
+            },
+            name="diag-model-in-flight-liveness",
+            daemon=True,
         )
+        liveness.start()
+        try:
+            ok, provider_error, timings, _extra = await _timed_request_async(
+                base_url,
+                "POST",
+                f"/session/{urllib.parse.quote(session_id)}/message",
+                _probe_a_message_body(model),
+                connect_timeout,
+                model_inactivity_timeout,
+            )
+        finally:
+            liveness_stop.set()
+            liveness.join(timeout=2.0)
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
         fail_category = str(timings.get("fail_category", "") or "")
-        if not fail_category and not ok:
-            if provider_error:
-                fail_category = "provider-error"
-            else:
-                fail_category = "model-request-failed"
         counters["last_real_event"] = "model-send-end"
         counters["last_real_monotonic"] = time.monotonic()
         sink.emit(
@@ -895,41 +1300,66 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         if ok:
             sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status="completed")
             exit_code = EXIT_OK
-        elif fail_category in ("inactivity-timeout", "network-error"):
-            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=fail_category)
-            exit_code = EXIT_STILL_IN_PROGRESS
+        elif provider_error:
+            # PROVEN from a real error response payload.
+            sink.emit(
+                "probe-end",
+                probe=PROBE_DIRECT_MODEL,
+                status=CLASS_PROVIDER_ERROR_PROVEN,
+                fail_category=fail_category,
+            )
+            exit_code = EXIT_PROVIDER_ERROR_PROVEN
         else:
-            sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=fail_category or "failed")
-            exit_code = EXIT_CHILD_UNEXPECTED
+            # Transport-level failure against the LOCAL server: proven
+            # local infrastructure evidence, never provider blame.
+            sink.emit(
+                "probe-end",
+                probe=PROBE_DIRECT_MODEL,
+                status=CLASS_SERVER_ERROR_PROVEN,
+                fail_category=fail_category or "model-request-failed",
+            )
+            exit_code = EXIT_SERVER_ERROR_PROVEN
         return exit_code
     finally:
         # Bounded best-effort cleanup; the production runtime reaps its child.
         if session_id:
             try:
-                await asyncio.to_thread(
-                    _timed_request,
-                    base_url,
-                    "POST",
-                    f"/session/{session_id}/abort",
-                    None,
-                    5.0,
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _timed_request,
+                        base_url,
+                        "POST",
+                        f"/session/{urllib.parse.quote(session_id)}/abort",
+                        None,
+                        connect_timeout,
+                        5.0,
+                    ),
+                    timeout=6.0,
                 )
             except Exception:
                 pass
             try:
-                await asyncio.to_thread(
-                    _timed_request, base_url, "DELETE", f"/session/{session_id}", None, 5.0
+                await asyncio.wait_for(
+                    _timed_request_async(
+                        base_url,
+                        "DELETE",
+                        f"/session/{urllib.parse.quote(session_id)}",
+                        None,
+                        connect_timeout,
+                        5.0,
+                    ),
+                    timeout=7.0,
                 )
             except Exception:
                 pass
-        session_id = ""
-        try:
-            await runtime.stop()
-        except Exception:
-            pass
+            session_id = ""
+            session_state["id"] = ""
+        stopped = await _bounded_async_stop(runtime, 10.0)
         anchor.set()
-        sink.emit("child-exit", probe=PROBE_DIRECT_MODEL, exit_code=exit_code)
+        sink.emit("child-exit", probe=PROBE_DIRECT_MODEL, exit_code=exit_code, cleanup_done=stopped)
         watchdog.stop()
+        if not stopped:
+            _forced_bounded_exit(sink, PROBE_DIRECT_MODEL, exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -943,17 +1373,24 @@ class _DiagnosticTelegramApi:
     Minimal standalone diagnostic mirror of the qualification lane seam:
     the production ``PollingTelegramTransport`` stays entirely real and
     only this Bot API surface is replaced by an in-process recorder.
+    Polling volume is bounded in memory and frequency (kodmial/aa#424).
     """
+
+    _MAX_RECORDED_CALLS = 500
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.get_updates_count = 0
         self.sent_texts: list[str] = []
         self.chat_actions = 0
         self.pending_updates: list[dict[str, Any]] = []
         self._counter = 0
 
     async def call(self, method: str, payload: dict[str, Any]) -> Any:
-        self.calls.append((method, dict(payload)))
+        if method == "getUpdates":
+            self.get_updates_count += 1
+        elif len(self.calls) < self._MAX_RECORDED_CALLS:
+            self.calls.append((method, dict(payload)))
         if method == "getMe":
             return {"id": 700000001, "is_bot": True, "username": "aa_scenario2_diag_bot"}
         if method in {
@@ -968,7 +1405,7 @@ class _DiagnosticTelegramApi:
                 batch = list(self.pending_updates)
                 self.pending_updates.clear()
                 return batch
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             return []
         if method == "sendChatAction":
             self.chat_actions += 1
@@ -995,8 +1432,55 @@ def _reply_signature(reply: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def _emit_observation_continuity(
+    sink: EventSink,
+    counters: dict[str, Any],
+    turn_started: float,
+    state: dict[str, Any],
+) -> None:
+    """Record that observation continues past legacy answer windows.
+
+    kodmial/aa#424: crossing 45/75/130/300/900 s is pure evidence: the
+    turn is still observed and continues — no cutoff exists anywhere.
+    After the named thresholds the markers repeat at a bounded cadence.
+    """
+    elapsed = time.monotonic() - turn_started
+    index = int(state.get("index", 0))
+    thresholds = OBSERVATION_CONTINUITY_THRESHOLD_S
+    if index < len(thresholds):
+        if elapsed < thresholds[index]:
+            return
+        threshold = thresholds[index]
+        state["index"] = index + 1
+        state["next_at"] = elapsed + OBSERVATION_CONTINUITY_REPEAT_S
+    else:
+        if elapsed < float(state.get("next_at", 0.0)):
+            return
+        threshold = elapsed
+        state["next_at"] = elapsed + OBSERVATION_CONTINUITY_REPEAT_S
+    last_real_mono = counters.get("last_real_monotonic")
+    sink.emit(
+        "observation-continues",
+        elapsed_s=round(elapsed, 1),
+        threshold_s=round(float(threshold), 1),
+        last_stage=str(counters.get("last_stage", "") or "")[:64],
+        last_real_event=str(counters.get("last_real_event", "") or "")[:64],
+        seconds_since_last_real=(
+            round(time.monotonic() - float(last_real_mono), 1)
+            if isinstance(last_real_mono, (int, float))
+            else None
+        ),
+        delivered=bool(counters.get("delivered", False)),
+    )
+
+
 async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str, Any]) -> int:
-    """Probe B child: exact production scenario #2 (unchanged prompt)."""
+    """Probe B child: exact production scenario #2 (unchanged prompt).
+
+    kodmial/aa#424: the turn observation has NO wall-clock cutoff. The
+    child observes until delivery, proven local-server non-responsiveness,
+    or the parent's campaign allowance (parent-side bounded shutdown).
+    """
     from dataclasses import replace
 
     from aa.app import Application
@@ -1008,15 +1492,20 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     out_dir = Path(argv["out_dir"])
     counters["snapshot_index"] = 0
     anchor = threading.Event()
+    bootstrap_timeout = float(
+        argv.get("probe_b_bootstrap_timeout_s", DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S)
+    )
     watchdog = ChildWatchdog(
         probe=PROBE_SCENARIO2,
-        schedule=argv["snapshot_schedule"],
+        cadence_s=float(argv.get("snapshot_cadence_s", DEFAULT_SNAPSHOT_CADENCE_S)),
+        max_snapshots=int(argv.get("max_snapshots", DEFAULT_MAX_SNAPSHOTS)),
         anchor=anchor,
-        anchor_wait_timeout_s=30.0,
+        anchor_wait_timeout_s=max(120.0, bootstrap_timeout + 30.0),
         sink=sink,
         checkpoint_dir=out_dir,
         opencode_base_url=base_url,
         counters=counters,
+        internal_probe=lambda: _opencode_internal_observation(base_url, ""),
     )
     watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
@@ -1066,14 +1555,12 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     counters["last_real_event"] = "probe-start"
     counters["last_real_monotonic"] = time.monotonic()
     exit_code = EXIT_OK
+    continuity_state: dict[str, Any] = {"index": 0, "next_at": 0.0}
     try:
         sink.emit("bootstrap-start", probe=PROBE_SCENARIO2)
         counters["last_real_event"] = "bootstrap-start"
         counters["last_real_monotonic"] = time.monotonic()
         started = time.perf_counter()
-        bootstrap_timeout = float(
-            argv.get("probe_b_bootstrap_timeout_s", DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S)
-        )
         try:
             await asyncio.wait_for(app.start(), timeout=bootstrap_timeout)
         except Exception as exc:
@@ -1118,26 +1605,22 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         api.pending_updates.append(raw)
         scenario_started = time.monotonic()
         anchor.set()
-        cutoff = float(argv["cutoff_s"])
+        # kodmial/aa#424: no cutoff. Observe until delivery, until the child
+        # proves the LOCAL server non-responsive, or until the parent ends
+        # the observation at the campaign allowance (bounded tidy shutdown).
         while len(api.sent_texts) <= before:
             counters["typing_sends"] = api.chat_actions
-            elapsed = time.monotonic() - scenario_started
-            if elapsed >= cutoff:
+            if counters.get("server_nonresponsive_sustained"):
                 sink.emit(
-                    "delivery-timeout",
-                    cutoff_s=cutoff,
-                    last_stage=str(counters.get("last_stage", "") or "")[:64],
-                    seconds_since_last_stage=max(
-                        0.0, time.monotonic() - float(counters.get("last_stage_monotonic") or 0)
-                    ),
-                    elapsed_ms=round((time.monotonic() - scenario_started) * 1000.0, 1),
+                    "probe-end",
+                    probe=PROBE_SCENARIO2,
+                    status=CLASS_SERVER_ERROR_PROVEN,
+                    fail_category="server-nonresponsive-sustained",
                 )
-                sink.emit(
-                    "probe-end", probe=PROBE_SCENARIO2, status="still-in-progress-at-probe-end"
-                )
-                exit_code = EXIT_STILL_IN_PROGRESS
+                exit_code = EXIT_SERVER_ERROR_PROVEN
                 return exit_code
-            await asyncio.sleep(0.02)
+            _emit_observation_continuity(sink, counters, scenario_started, continuity_state)
+            await asyncio.sleep(0.05)
         elapsed_ms = round((time.monotonic() - scenario_started) * 1000.0, 1)
         counters["delivered"] = True
         counters["last_real_event"] = "delivery"
@@ -1152,18 +1635,18 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         )
         stage_values = _collect_stage_telemetry(graph)
         sink.emit("scenario-end", family=SCENARIO_2_FAMILY, stage_values=len(stage_values))
+
         sink.emit("probe-end", probe=PROBE_SCENARIO2, status="delivered")
         exit_code = EXIT_OK
         return exit_code
     finally:
         set_stage_observer(None)
-        try:
-            await app.stop()
-        except Exception:
-            pass
+        stopped = await _bounded_async_stop(app, bootstrap_timeout)
         anchor.set()
-        sink.emit("child-exit", probe=PROBE_SCENARIO2, exit_code=exit_code)
+        sink.emit("child-exit", probe=PROBE_SCENARIO2, exit_code=exit_code, cleanup_done=stopped)
         watchdog.stop()
+        if not stopped:
+            _forced_bounded_exit(sink, PROBE_SCENARIO2, exit_code)
 
 
 def _collect_stage_telemetry(graph: Any) -> list[dict[str, Any]]:
@@ -1342,7 +1825,7 @@ class IssueProgressPublisher:
 
 
 # ---------------------------------------------------------------------------
-# Parent mode: child supervision, cadence comments and the final report
+# Parent mode: campaign supervision, cadence comments and the final report
 # ---------------------------------------------------------------------------
 
 
@@ -1354,9 +1837,16 @@ class ProbeEvidence:
     status: str = "not-run"
     exit_code: int | None = None
     killed: bool = False
-    # True only when the child was still alive at the supervisor's bound and
-    # the supervisor itself ended it (bounded cutoff shutdown, not abnormal).
-    terminated_at_cutoff: bool = False
+    # True only when the child was still alive at the campaign physical
+    # allowance and the supervisor itself ended it (bounded tidy shutdown,
+    # not abnormal): the outcome is unresolved-at-campaign-end.
+    terminated_at_campaign_end: bool = False
+    # True when the child itself requested a documented bounded process-group
+    # end (cleanup could not be released); never a harness fault.
+    forced_exit: bool = False
+    # Sustained (proven) local-server non-responsiveness observed by the
+    # child watchdog; local infrastructure evidence, never provider evidence.
+    server_nonresponsive_sustained: bool = False
     last_stage: str = ""
     last_stage_at_s: float | None = None
     seconds_since_last_stage: float | None = None
@@ -1392,14 +1882,53 @@ class ProbeEvidence:
             return -int(code)
         return None
 
+    @property
+    def last_boundary_stage(self) -> str:
+        """The most recent observed boundary stage (never a root cause)."""
+        return (self.active_stage or self.last_stage or "").strip()
+
 
 @dataclass
 class ProbePlan:
-    """One probe's bounded supervision parameters."""
+    """One probe's supervision parameters (NO per-answer cutoff exists)."""
 
     probe: str
-    schedule: tuple[float, ...]
-    child_cutoff_s: float
+    snapshot_cadence_s: float
+    max_snapshots: int
+    connect_timeout_s: float
+
+
+def effective_campaign_allowance_s(
+    *,
+    campaign_allowance_s: float,
+    finalisation_reserve_s: float,
+    job_timeout_minutes: float = 0.0,
+    job_started_epoch: float = 0.0,
+    now_epoch: float | None = None,
+) -> float:
+    """The ONE finite campaign ceiling (no per-answer wall clock anywhere).
+
+    Reconciled with the remaining Actions job budget when a job-start
+    marker is provided so the finalisation reserve and artifact upload
+    always complete inside the job. If that budget is already inside the
+    finalisation reserve, the allowance keeps a minimum viable observation
+    window instead of collapsing to a token one second.
+    """
+    configured = float(campaign_allowance_s)
+    if not math.isfinite(configured):
+        configured = MIN_CAMPAIGN_ALLOWANCE_S
+    configured = max(MIN_CAMPAIGN_ALLOWANCE_S, configured)
+    timeout_minutes = float(job_timeout_minutes or 0.0)
+    started_epoch = float(job_started_epoch or 0.0)
+    if timeout_minutes <= 0.0 or started_epoch <= 0.0:
+        return configured
+    current = time.time() if now_epoch is None else now_epoch
+    remaining = started_epoch + timeout_minutes * 60.0 - float(finalisation_reserve_s) - current
+    if not math.isfinite(remaining):
+        return configured
+    if remaining <= 0.0:
+        return MIN_CAMPAIGN_ALLOWANCE_S
+    return max(MIN_CAMPAIGN_ALLOWANCE_S, min(configured, remaining))
 
 
 def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
@@ -1408,8 +1937,9 @@ def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
         {
             "probe": plan.probe,
             "out": str(out_dir),
-            "snapshots": list(plan.schedule),
-            "cutoff": plan.child_cutoff_s,
+            "snapshot_cadence_s": plan.snapshot_cadence_s,
+            "max_snapshots": plan.max_snapshots,
+            "connect_timeout_s": plan.connect_timeout_s,
         }
     )
     env = os.environ.copy()
@@ -1417,7 +1947,7 @@ def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
     env["PYTHONUNBUFFERED"] = "1"
     # The child inherits stdout (safe JSONL) and writes its own artifact
     # file. Never use a pipe here: a slow reader could fill the pipe buffer
-    # and block the child, defeating the diagnostic cutoff.
+    # and block the child.
     return subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
         [sys.executable, str(Path(__file__).resolve()), "--child"],
         cwd=str(REPO_ROOT),
@@ -1439,13 +1969,12 @@ def child_argv_from_env() -> dict[str, Any]:
     return {
         "probe": str(decoded.get("probe", "")),
         "out_dir": str(decoded.get("out", "")),
-        "snapshot_schedule": tuple(float(v) for v in decoded.get("snapshots", ())),
-        "cutoff_s": float(decoded.get("cutoff", 0.0)),
-        "probe_a_port": str(os.environ.get("SCENARIO2_DIAG_PROBE_A_PORT", DEFAULT_PROBE_A_PORT)),
-        "probe_a_message_timeout_s": float(
-            os.environ.get("SCENARIO2_DIAG_PROBE_A_MESSAGE_TIMEOUT_S", "")
-            or DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S
+        "snapshot_cadence_s": float(decoded.get("snapshot_cadence_s", DEFAULT_SNAPSHOT_CADENCE_S)),
+        "max_snapshots": int(decoded.get("max_snapshots", DEFAULT_MAX_SNAPSHOTS)),
+        "connect_timeout_s": float(
+            decoded.get("connect_timeout_s", DEFAULT_PROBE_A_CONNECT_TIMEOUT_S)
         ),
+        "probe_a_port": str(os.environ.get("SCENARIO2_DIAG_PROBE_A_PORT", DEFAULT_PROBE_A_PORT)),
         "probe_a_bootstrap_timeout_s": float(
             os.environ.get("SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S", "")
             or DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S
@@ -1463,7 +1992,7 @@ def _child_events_path(out_dir: Path, probe: str) -> Path:
 
 
 def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> bool:
-    """Parse one child JSONL line; return ``False`` at a terminal bound."""
+    """Parse one child JSONL line; return ``False`` on a terminal event."""
     line = line.strip()
     if not line:
         return True
@@ -1494,15 +2023,25 @@ def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> 
                     "delivered": bool(payload.get("delivered", False)),
                 }
             )
+    elif kind == "observation-continues":
+        # Evidence checkpoint: observation continued past a legacy window.
+        if len(evidence.timeline) < 48:
+            evidence.timeline.append(
+                {
+                    "at_s": payload.get("threshold_s"),
+                    "stage": "observation-continues",
+                    "since_stage_s": payload.get("seconds_since_last_real"),
+                    "typing_sends": None,
+                    "delivered": bool(payload.get("delivered", False)),
+                }
+            )
     elif kind == "server-health":
         evidence.server_ready_ms = payload.get("elapsed_ms")
         if payload.get("ok") is False:
             evidence.fail_category = "server-health-failed"
     elif kind == "stage-start":
-        # In-flight stage marker from the child graph observer: this is the
-        # freshest stage evidence (e.g. ``opencode`` while the OpenCode HTTP
-        # reply is still pending) and is tracked apart from the possibly
-        # stale checkpoint stage.
+        # In-flight stage marker from the child graph observer: the
+        # freshest boundary evidence. NEVER a proven root cause by itself.
         stage = str(payload.get("stage", ""))[:64]
         if stage:
             evidence.active_stage = stage
@@ -1531,8 +2070,12 @@ def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> 
     elif kind == "bootstrap-end" and payload.get("ok") is False:
         evidence.fail_category = "bootstrap:" + str(payload.get("fail_category", "unknown"))[:48]
         evidence.status = "bootstrap-failed"
-    elif kind == "delivery-timeout":
-        evidence.fail_category = "still-in-progress-at-probe-end"
+    elif kind == "server-nonresponsive-sustained":
+        evidence.server_nonresponsive_sustained = True
+        if not evidence.fail_category:
+            evidence.fail_category = "server-nonresponsive-sustained"
+    elif kind == "child-forced-exit":
+        evidence.forced_exit = True
     elif kind == "probe-end":
         evidence.status = str(payload.get("status", ""))[:48]
     elif kind == "child-exit":
@@ -1549,7 +2092,7 @@ def _tail_events_file(
     """Tail the child artifact file without ever writing into a child pipe.
 
     Reading a regular file never applies backpressure to the child, so even
-    a burst of JSONL events cannot block it or delay the supervisor cutoff.
+    a burst of JSONL events cannot block it.
     """
     while not path.exists():
         if proc is not None and proc.poll() is not None:
@@ -1691,7 +2234,7 @@ def _probe_comment_lines(evidence: ProbeEvidence) -> list[str]:
         else:
             rows.append(f"- last_stage: `{evidence.last_stage}`")
     if evidence.active_stage:
-        rows.append(f"- active_stage: `{evidence.active_stage}` (in-flight)")
+        rows.append(f"- active_stage: `{evidence.active_stage}` (in-flight; boundary only)")
         if evidence.active_stage_ts:
             rows.append(f"- active_stage_started_at: `{evidence.active_stage_ts}`")
     if evidence.last_completed_stage:
@@ -1700,15 +2243,17 @@ def _probe_comment_lines(evidence: ProbeEvidence) -> list[str]:
         rows.append(f"- last_completed_stage_ms: {evidence.last_completed_stage_elapsed_ms}")
     if evidence.fail_category:
         rows.append(f"- fail_category: `{evidence.fail_category}`")
+    if evidence.server_nonresponsive_sustained:
+        rows.append("- server_nonresponsive_sustained: true (proven local-infra)")
     if evidence.last_real_event:
         rows.append(f"- last_real_event: `{evidence.last_real_event}`")
     rows.append(f"- snapshots: {evidence.snapshots}")
     rows.append(f"- killed: {str(evidence.killed).lower()}")
     signal_number = evidence.exit_signal
-    if signal_number is not None:
+    if signal_number is not None and not evidence.forced_exit:
         rows.append(f"- exited_by_signal: SIG{signal_number}")
-    elif evidence.terminated_at_cutoff:
-        rows.append("- terminated_at_cutoff: true (bounded diagnostic shutdown)")
+    elif evidence.terminated_at_campaign_end:
+        rows.append("- terminated_at_campaign_end: true (campaign allowance; evidence kept)")
     return rows
 
 
@@ -1717,21 +2262,65 @@ def _publish_probe_update(publisher: IssueProgressPublisher, evidence: ProbeEvid
     publisher.publish(f"Scenario #2 diagnostic: {evidence.probe}", body)
 
 
+def _parent_observation_continuity(
+    sink: EventSink,
+    evidence: ProbeEvidence,
+    started: float,
+    state: dict[str, Any],
+) -> None:
+    """Parent-side observability: observation continues past old windows."""
+    elapsed = time.monotonic() - started
+    index = int(state.get("index", 0))
+    thresholds = OBSERVATION_CONTINUITY_THRESHOLD_S
+    if index < len(thresholds):
+        if elapsed < thresholds[index]:
+            return
+        threshold = thresholds[index]
+        state["index"] = index + 1
+        state["next_at"] = elapsed + OBSERVATION_CONTINUITY_REPEAT_S
+    else:
+        if elapsed < float(state.get("next_at", 0.0)):
+            return
+        threshold = elapsed
+        state["next_at"] = elapsed + OBSERVATION_CONTINUITY_REPEAT_S
+    sink.emit(
+        "observation-continues",
+        probe=evidence.probe,
+        elapsed_s=round(elapsed, 1),
+        threshold_s=round(float(threshold), 1),
+        last_real_event=str(evidence.last_real_event)[:48],
+    )
+
+
 def _run_one_probe(
     plan: ProbePlan,
     *,
     out_dir: Path,
     sink: EventSink,
     publisher: IssueProgressPublisher | None,
+    campaign_deadline_s: float | None,
 ) -> ProbeEvidence:
-    """Supervise one probe child end-to-end (bounded, isolated)."""
+    """Supervise one probe child end-to-end (isolated, campaign-bounded).
+
+    kodmial/aa#424: the supervisor NEVER interrupts a live child with a
+    wall-clock answer cutoff. The only bounded physical enforcement is the
+    shared campaign deadline (tidy shutdown + evidence upload); a
+    genuinely progressing turn at that boundary is reported
+    ``unresolved-at-campaign-end`` — evidence plus a resumable allowance,
+    never a component verdict.
+    """
     evidence = ProbeEvidence(probe=plan.probe)
     evidence.status = "running"
     sink.emit(
         "supervisor-probe-start",
         probe=plan.probe,
-        child_cutoff_s=plan.child_cutoff_s,
-        snapshot_schedule=list(plan.schedule),
+        campaign_time_left_s=(
+            None
+            if campaign_deadline_s is None
+            else round(campaign_deadline_s - time.monotonic(), 1)
+        ),
+        snapshot_cadence_s=plan.snapshot_cadence_s,
+        snapshot_max=plan.max_snapshots,
     )
     proc = _spawn_child(plan=plan, out_dir=out_dir)
     reader = threading.Thread(
@@ -1753,15 +2342,18 @@ def _run_one_probe(
     last_stack_request = started
     stack_dumps = 0
     last_publish = started
-    supervision_limit = plan.child_cutoff_s + CHILD_CUTOFF_SLACK_S
+    continuity_state: dict[str, Any] = {"index": 0, "next_at": 0.0}
     while proc.poll() is None:
         now = time.monotonic()
-        if now - started >= supervision_limit:
+        if not evidence.delivered:
+            _parent_observation_continuity(sink, evidence, started, continuity_state)
+        if campaign_deadline_s is not None and now >= campaign_deadline_s:
             sink.emit(
-                "supervisor-cutoff",
+                "campaign-end",
                 probe=plan.probe,
                 elapsed_s=round(now - started, 1),
-                limit_s=round(supervision_limit, 1),
+                delivered=evidence.delivered,
+                last_boundary_stage=evidence.last_boundary_stage[:64],
             )
             _final_supervisor_snapshot(
                 out_dir,
@@ -1771,11 +2363,7 @@ def _run_one_probe(
                 ready_path=stack_ready_path,
             )
             evidence.killed = _kill_group(proc, DEFAULT_TERMINATE_GRACE_S)
-            evidence.terminated_at_cutoff = True
-            if not evidence.delivered and plan.probe == PROBE_SCENARIO2:
-                evidence.status = "still-in-progress-at-probe-end"
-            elif evidence.status in ("", "running"):
-                evidence.status = f"child-exit-{proc.returncode}"
+            evidence.terminated_at_campaign_end = True
             break
         if stack_dumps < MAX_STACK_DUMPS and now - last_stack_request >= STACK_DUMP_EVERY_S:
             _send_sigusr1(proc, ready_path=stack_ready_path)
@@ -1790,7 +2378,12 @@ def _run_one_probe(
     reader.join(timeout=3.0)
     evidence.exit_code = proc.returncode
     if evidence.status in ("", "running"):
-        evidence.status = f"child-exit-{proc.returncode}"
+        if evidence.delivered:
+            evidence.status = "delivered"
+        elif evidence.terminated_at_campaign_end:
+            evidence.status = CLASS_UNRESOLVED
+        else:
+            evidence.status = f"child-exit-{proc.returncode}"
     if publisher is not None:
         _publish_probe_update(publisher, evidence)
     sink.emit(
@@ -1799,8 +2392,9 @@ def _run_one_probe(
         status=evidence.status,
         exit_code=None if evidence.exit_code is None else int(evidence.exit_code),
         exited_by_signal=evidence.exit_signal,
-        terminated_at_cutoff=evidence.terminated_at_cutoff,
+        terminated_at_campaign_end=evidence.terminated_at_campaign_end,
         killed=evidence.killed,
+        delivered=evidence.delivered,
         snapshots=evidence.snapshots,
         active_stage=evidence.active_stage,
         last_completed_stage=evidence.last_completed_stage,
@@ -1813,161 +2407,116 @@ def _run_one_probe(
 # ---------------------------------------------------------------------------
 
 
-INFRASTRUCTURE_FAILURE = "diagnostic-infrastructure-failure"
+INFRASTRUCTURE_FAILURE = CLASS_HARNESS_ERROR
 
 
 def _abnormal_child_exit(evidence: ProbeEvidence) -> bool:
-    """True when a child died by an unexpected signal (infrastructure fault).
+    """True when a child died by an unexpected signal or crash (harness fault).
 
-    A supervisor cutoff shutdown (``SIGTERM``/``SIGKILL`` of the whole group
-    at the bounded diagnostic cutoff) is NOT abnormal: it is the documented
-    INCONCLUSIVE observation boundary. A negative non-cutoff exit code
-    (e.g. ``-10`` == SIGUSR1 from the old chained handler) means the
-    diagnostic infrastructure killed its own probe — the observation window
-    was truncated and stage markers from that child are NOT proven cause
-    evidence.
+    A campaign-allowance shutdown (``SIGTERM``/``SIGKILL`` of the whole
+    group at the finite physical boundary) is NOT abnormal: it is the
+    documented evidence-keeping INCONCLUSIVE path. A documented forced
+    bounded child exit (cleanup timeout, event already flushed) is also
+    not abnormal. A negative non-forced exit code (e.g. ``-10`` == a
+    chained SIGUSR1 disposition) or an unexpected crash exit means the
+    diagnostic harness truncated its own probe — stage markers from that
+    child are NOT proven cause evidence.
     """
-    if evidence.terminated_at_cutoff or evidence.status in ("not-run", ""):
+    if evidence.terminated_at_campaign_end or evidence.status in ("not-run", ""):
         return False
     code = evidence.exit_code
-    return code is not None and code < 0
+    if code is None:
+        return False
+    if code < 0:
+        return not evidence.forced_exit
+    return code in (EXIT_CHILD_UNEXPECTED, EXIT_REPORT_FAILED)
 
 
 def classify_cause(probe_a: ProbeEvidence, probe_b: ProbeEvidence) -> str:
-    """Evidence-driven classification; 'stage-unobserved' is named, never guessed.
+    """Evidence-driven classification — truthful verdict taxonomy (#424).
 
-    Direct-model evidence comes first: if a direct model call itself stalls
-    or errors, the provider/OpenCode boundary is proven without blaming
-    retrieval downstream.
-
-    Children terminated by an unexpected signal (infrastructure fault) are
-    reported ``diagnostic-infrastructure-failure`` — never success and never
-    an evidence-based stage attribution: the observation was truncated, so
-    the retained stage marker is unproven. Stage attribution uses the most
-    recent in-flight ``stage-start`` tracker (e.g. ``opencode``) rather
-    than a stale last-completed checkpoint stage.
+    Never blames model/provider from a stage name: an in-flight
+    ``opencode`` stage with no observed event is an UNOBSERVED request —
+    BOUNDARY LOCALIZED / ROOT UNKNOWN, never ``model-provider``.
     """
-    if probe_a.status in ("bootstrap-failed", "not-run"):
-        return "local-opencode-server"
-    if probe_a.status in ("inactivity-timeout", "network-error", "provider-error"):
-        return "model-provider"
-    if _abnormal_child_exit(probe_a):
-        return INFRASTRUCTURE_FAILURE
+    # HARNESS ERROR: the diagnostic harness truncated its own probes.
+    if _abnormal_child_exit(probe_a) or _abnormal_child_exit(probe_b):
+        return CLASS_HARNESS_ERROR
+    # DELIVERED: the scenario turn itself delivered (probe evidence kept).
+    if probe_b.delivered or probe_b.status == "delivered":
+        return CLASS_DELIVERED
+    # PROVEN provider error: a real error payload was observed by the
+    # direct probe while the turn was undelivered.
+    if probe_a.status == CLASS_PROVIDER_ERROR_PROVEN:
+        return CLASS_PROVIDER_ERROR_PROVEN
+    # PROVEN local server error (spawn/health/transport evidence only).
+    if probe_a.status == CLASS_SERVER_ERROR_PROVEN or probe_b.status == (CLASS_SERVER_ERROR_PROVEN):
+        return CLASS_SERVER_ERROR_PROVEN
+    # B-probe bootstrap failure: the production path failed before the
+    # scenario could be observed; the root is unproven.
     if probe_b.status == "bootstrap-failed":
-        return "bootstrap-dependency"
-    if _abnormal_child_exit(probe_b):
-        return INFRASTRUCTURE_FAILURE
-    if probe_b.delivered:
-        return "delivered"
-    if probe_b.fail_category.startswith("bootstrap:"):
-        return "bootstrap-dependency"
-    if probe_a.terminated_at_cutoff:
-        # Direct-model probe still in flight at its own cutoff: honest
-        # INCONCLUSIVE boundary, no component may be blamed from it.
-        return "still-in-progress-at-probe-end"
-    stage = (probe_b.active_stage or probe_b.last_stage or "").strip()
-    if not stage:
-        return "stage-unobserved"
-    return _STAGE_COMPONENT.get(stage.casefold(), "stage-unobserved")
+        return CLASS_BOUNDARY_LOCALIZED
+    # UNRESOLVED AT CAMPAIGN END: the physical allowance was reached with
+    # no delivered answer and no proven failure — live-but-uncertain.
+    if (
+        probe_a.terminated_at_campaign_end
+        or probe_b.terminated_at_campaign_end
+        or probe_a.status == CLASS_UNRESOLVED
+        or probe_b.status == CLASS_UNRESOLVED
+    ):
+        return CLASS_UNRESOLVED
+    # Boundary localization only: name the observed boundary, never a
+    # component root cause.
+    if not probe_b.last_boundary_stage:
+        return CLASS_STAGE_UNOBSERVED
+    return CLASS_BOUNDARY_LOCALIZED
 
 
 def overall_exit_code(probe_a: ProbeEvidence, probe_b: ProbeEvidence) -> int:
-    """Truthful supervisor exit code (see the supervisor contract codes).
-
-    0 only for a completed diagnostic, 3 for the legitimate INCONCLUSIVE
-    cutoff observation, 2 for bootstrap lifecycle failures and 5 when the
-    diagnostic infrastructure itself terminated a probe (never success).
-    """
-    if probe_a.status in ("bootstrap-failed",) or probe_b.status in ("bootstrap-failed",):
-        return EXIT_BOOTSTRAP_FAILED
+    """Truthful supervisor exit code derived from the classification."""
     classification = classify_cause(probe_a, probe_b)
-    if classification == INFRASTRUCTURE_FAILURE:
-        return EXIT_CHILD_UNEXPECTED
-    inconclusive = (
-        probe_a.terminated_at_cutoff
-        or probe_b.terminated_at_cutoff
-        or probe_b.status == "still-in-progress-at-probe-end"
-        or probe_b.fail_category == "still-in-progress-at-probe-end"
-        or probe_a.status in ("inactivity-timeout", "network-error")
-        or probe_a.status == "still-in-progress-at-probe-end"
-    )
-    if inconclusive and not probe_b.delivered:
-        return EXIT_STILL_IN_PROGRESS
-    return EXIT_OK
+    return _EXIT_BY_CLASSIFICATION.get(classification, EXIT_INCONCLUSIVE)
 
 
 _NEXT_FIX: dict[str, str] = {
-    "local-opencode-server": (
-        "Inspect the supervised `opencode serve` spawn/health path "
+    CLASS_SERVER_ERROR_PROVEN: (
+        "Inspect the supervised `opencode serve` spawn/health/transport path "
         "(LocalOpenCodeRuntime) on this runner: verify the pinned binary "
-        "version and full health timing; only then consider a bounded "
-        "attach fallback. No product timeout changes."
+        "version and health timing. Proven local-server failure only; no "
+        "product timeout changes."
     ),
-    "model-provider": (
-        "Direct model call itself stalled/failed, so investigate the "
-        "provider/model boundary for the approved AA bot model "
+    CLASS_PROVIDER_ERROR_PROVEN: (
+        "The direct model call returned a real error payload; investigate "
+        "the provider/model boundary for the approved AA bot model "
         "(quota/429 handling and served-model identity) before touching "
         "retrieval. No product timeout changes."
     ),
-    "bootstrap-dependency": (
-        "Fix the failing bootstrap step first (corpus restore or index "
-        "build per the workflow step name in the run log); do not "
-        "misattribute this as case-2 execution."
+    CLASS_HARNESS_ERROR: (
+        "The diagnostic harness truncated its own probe (unexpected signal "
+        "or exit). Re-run this diagnostic unchanged; never attribute any "
+        "component from this run."
     ),
-    "aa-graph-planner": (
-        "Add bounded planner structured-output attempt telemetry and "
-        "inspect the in-flight planner call; the stall was observed before "
-        "downstream stages could start."
+    CLASS_UNRESOLVED: (
+        "Campaign allowance reached while the turn stayed live-but-uncertain. "
+        "Recorded evidence (snapshots, audit, internal OpenCode status) plus "
+        "one optional resumable experiment with the configurable "
+        "--campaign-allowance-s raised. INCONCLUSIVE is not a product FAIL."
     ),
-    "aa-retrieval-index": (
-        "Profile the RAM E5/FAISS index open; evidence shows the index "
-        "stage as the last observed activity."
+    CLASS_BOUNDARY_LOCALIZED: (
+        "The turn did not deliver and no provider/server error was proven: "
+        "BOUNDARY LOCALIZED / ROOT UNKNOWN. Use the last observed boundary "
+        "as the starting point; do not assign an unproven root cause."
     ),
-    "aa-retrieval": (
-        "Profile the in-flight retrieval call and RRF/selection path; "
-        "evidence shows delivery stalled inside or after retrieval."
-    ),
-    "aa-graph-answer": (
-        "Inspect the in-flight answer synthesis call and its structured output handling."
-    ),
-    "aa-graph-verifier": (
-        "Inspect the in-flight verifier turn and its structured output handling."
-    ),
-    "aa-graph-judge": ("Inspect the in-flight whole-turn judge call."),
-    "aa-graph-finalization": (
-        "Inspect answer finalization/envelope handling at the observed stage."
-    ),
-    "aa-graph-orchestration": (
-        "Inspect the LangGraph turn-boundary transitions captured in the "
-        "snapshot stacks before the first substantive stage."
-    ),
-    "telegram-dispatch": (
-        "Inspect the in-process sendMessage serialization/wait path in the "
-        "production PollingTelegramTransport."
-    ),
-    "stage-unobserved": (
+    CLASS_STAGE_UNOBSERVED: (
         "The turn produced NO observed stage marker. Use the captured "
         "thread stacks/task states and OpenCode request audit to identify "
         "the exact in-flight call; rerun with deeper stage hooks only if "
         "stacks are not enough. Do not assign an upstream cause."
     ),
-    "diagnostic-infrastructure-failure": (
-        "The diagnostic infrastructure itself terminated the probe (child "
-        "died by an unexpected signal or left no exit record). The "
-        "observation window was truncated, so stage markers in this run "
-        "are NOT proven cause evidence. Re-run this diagnostic unchanged "
-        "to collect a complete window; do not blame model, provider or "
-        "retrieval from this run."
-    ),
-    "still-in-progress-at-probe-end": (
-        "Extend this diagnostic observation window with one rerun; the "
-        "turn may still genuinely progress after the cutoff. INCONCLUSIVE "
-        "is not a product FAIL."
-    ),
-    "delivered": (
-        "No isolated fix is indicated: the scenario delivered within the "
-        "diagnostic window; attach this timing evidence to the broad "
-        "repair analysis (kodmial/aa#417)."
+    CLASS_DELIVERED: (
+        "No isolated fix is indicated: the scenario delivered in the "
+        "observable window with no per-answer cutoff; attach timing "
+        "evidence to the broad repair analysis (kodmial/aa#417)."
     ),
 }
 
@@ -1980,19 +2529,32 @@ def _run_url() -> str:
     return f"{server}/{repository}/actions/runs/{run_id}".strip()
 
 
+def _summary_banner(classification: str) -> str:
+    """Prominent, non-deceptive one-line outcome for step summaries."""
+    if classification == CLASS_DELIVERED:
+        return "> **outcome: delivered — full scenario #2 answer delivered**"
+    if classification in INCONCLUSIVE_CLASSIFICATIONS:
+        return (
+            f"> **outcome: INCONCLUSIVE ({classification}) — NOT a success; "
+            "this run did not reach a truthful root-cause verdict.**"
+        )
+    return f"> **outcome: failure ({classification})**"
+
+
 def build_final_report(meta: dict[str, Any], probe_a: ProbeEvidence, probe_b: ProbeEvidence) -> str:
-    """Compact actionable root-cause report (privacy-safe, one screen)."""
+    """Compact actionable truthful report (privacy-safe, one screen)."""
     classification = classify_cause(probe_a, probe_b)
-    next_fix = _NEXT_FIX.get(
-        classification, "One more focused diagnostic run with deeper evidence is required."
-    )
+    next_fix = _NEXT_FIX.get(classification, "")
+    inconclusive = classification in INCONCLUSIVE_CLASSIFICATIONS
     lines = [
+        _summary_banner(classification),
+        "",
         "Single scenario #2 (`substantive-drinking`) diagnostic; NOT a Gate C "
         "PASS/FAIL, no full 18-case rerun and no product criterion changed.",
-        "",
-        "The bounded diagnostic observation window is NOT a product "
-        "qualification timeout: `still-in-progress-at-probe-end` means "
-        "INCONCLUSIVE, never a product FAIL.",
+        "No per-answer wall-clock cutoff exists: a model call continuing "
+        "past 45/75/130/300/900 s is observed, not killed; observation ends "
+        "only on delivery, a proven error, sustained local-server "
+        "non-responsiveness or the campaign physical allowance.",
         f"Run: `{meta['run_url']}` (exact SHA `{meta['main_sha']}`)",
         "",
         "### Probe A — direct model (OpenCode server + approved model)",
@@ -2004,27 +2566,44 @@ def build_final_report(meta: dict[str, Any], probe_a: ProbeEvidence, probe_b: Pr
         "### Root-cause classification",
         f"- classification: `{classification}`",
     ]
-    if probe_b.last_stage:
-        lines.append(f"- last observed stage: `{probe_b.last_stage}`")
-    if probe_b.active_stage:
-        lines.append(f"- in-flight stage: `{probe_b.active_stage}` (stage-start evidence)")
+    if inconclusive:
+        lines.append("- verdict: INCONCLUSIVE — this is NOT a success")
+    boundary_b = probe_b.last_boundary_stage
+    boundary_a = probe_a.last_boundary_stage
+    if classification == CLASS_STAGE_UNOBSERVED:
+        lines.append("- stage=unobserved (explicit: no stage markers arrived)")
+    else:
+        if boundary_a:
+            lines.append(f"- probe A last boundary: `{boundary_a}` (boundary only)")
+        if boundary_b:
+            lines.append(f"- probe B last boundary: `{boundary_b}` (boundary only)")
+        hint = _STAGE_HINTS.get(boundary_b, "")
+        if hint:
+            lines.append(f"- boundary hint: {hint}")
     if probe_b.last_completed_stage:
         lines.append(f"- last completed stage: `{probe_b.last_completed_stage}`")
     if probe_b.last_real_event:
         lines.append(f"- last confirmed REAL activity: `{probe_b.last_real_event}`")
-    if classification == INFRASTRUCTURE_FAILURE:
+    if classification == CLASS_UNRESOLVED:
         lines.append(
-            "- evidence integrity: a probe was terminated by an unexpected "
-            "signal; the observation window is truncated and NO stage-level "
-            "or component-level cause is proven by this run"
+            "- instrumentation gap: the run-recorded evidence cannot "
+            "discriminate a live-but-slow inference from a hung request at "
+            "the observed boundary, so no component is attributed"
         )
-    if classification == "stage-unobserved":
-        lines.append("- stage=unobserved (explicit: no stage markers arrived)")
+    if classification == CLASS_HARNESS_ERROR:
+        lines.append(
+            "- evidence integrity: a probe was truncated by the diagnostic "
+            "harness itself; NO stage-level or component-level cause is "
+            "proven by this run"
+        )
     lines.append(f"- snapshots captured: A={probe_a.snapshots}, B={probe_b.snapshots}")
     lines.append(
         f"- child killed by supervisor: A={str(probe_a.killed).lower()}, "
         f"B={str(probe_b.killed).lower()}"
     )
+    budget = meta.get("effective_campaign_allowance_s")
+    if isinstance(budget, (int, float)) and budget > 0:
+        lines.append(f"- campaign allowance applied: {round(float(budget), 1)}s")
     lines.append("")
     lines.append("### Narrow next step")
     lines.append(next_fix)
@@ -2038,7 +2617,9 @@ def _evidence_dict(evidence: ProbeEvidence) -> dict[str, Any]:
         "status": evidence.status,
         "exit_code": evidence.exit_code,
         "exited_by_signal": evidence.exit_signal,
-        "terminated_at_cutoff": evidence.terminated_at_cutoff,
+        "terminated_at_campaign_end": evidence.terminated_at_campaign_end,
+        "forced_exit": evidence.forced_exit,
+        "server_nonresponsive_sustained": evidence.server_nonresponsive_sustained,
         "killed": evidence.killed,
         "last_stage": evidence.last_stage,
         "active_stage": evidence.active_stage,
@@ -2076,6 +2657,12 @@ def parent_main(args: argparse.Namespace) -> int:
     """Supervise both probes, collect evidence and publish the report."""
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    allowance = effective_campaign_allowance_s(
+        campaign_allowance_s=float(args.campaign_allowance_s),
+        finalisation_reserve_s=float(args.finalisation_reserve_s),
+        job_timeout_minutes=float(args.job_timeout_minutes),
+        job_started_epoch=float(args.job_started_epoch),
+    )
     meta = {
         "schema": SCHEMA_VERSION,
         "main_sha": args.main_sha or git_head_sha(),
@@ -2084,14 +2671,26 @@ def parent_main(args: argparse.Namespace) -> int:
         "target_owner": args.owner,
         "target_repo": args.repo,
         "run_url": _run_url(),
-        "diagnostic_cutoff_s": float(args.diagnostic_cutoff_s),
-        "snapshots": list(parse_schedule(args.snapshots)),
+        # kodmial/aa#424: no per-answer cutoff exists in this diagnostic.
+        "per_answer_wall_clock_cutoff_s": None,
+        "campaign_allowance_s": float(args.campaign_allowance_s),
+        "effective_campaign_allowance_s": allowance,
+        "finalisation_reserve_s": float(args.finalisation_reserve_s),
+        "job_timeout_minutes": float(args.job_timeout_minutes),
+        "snapshot_cadence_s": float(args.snapshot_cadence_s),
+        "max_snapshots": int(args.max_snapshots),
     }
     (out_dir / "run-meta.json").write_text(
         json.dumps(meta, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     sink = EventSink(out_dir / "supervisor-events.jsonl", echo=False)
-    sink.emit("supervisor-start", run_id=meta["run_id"], sha=meta["main_sha"])
+    sink.emit(
+        "supervisor-start",
+        run_id=meta["run_id"],
+        sha=meta["main_sha"],
+        policy="no-per-answer-cutoff",
+        effective_campaign_allowance_s=round(allowance, 1),
+    )
 
     token = (os.environ.get("GITHUB_TOKEN", "") or "").strip()
     publisher = IssueProgressPublisher(
@@ -2100,13 +2699,14 @@ def parent_main(args: argparse.Namespace) -> int:
     if token:
         publisher.publish(
             "Scenario #2 diagnostic started",
-            f"- run: `{meta['run_url']}`\n- sha: `{meta['main_sha']}`",
+            f"- run: `{meta['run_url']}`\n- sha: `{meta['main_sha']}`\n"
+            f"- campaign allowance: {round(allowance)}s (no per-answer cutoff)",
         )
 
+    campaign_deadline = time.monotonic() + allowance
     probe_a = ProbeEvidence(probe=PROBE_DIRECT_MODEL, status="not-run")
     probe_b = ProbeEvidence(probe=PROBE_SCENARIO2, status="not-run")
     os.environ["SCENARIO2_DIAG_PROBE_A_PORT"] = str(args.probe_a_port)
-    os.environ["SCENARIO2_DIAG_PROBE_A_MESSAGE_TIMEOUT_S"] = str(args.probe_a_message_timeout_s)
     os.environ["SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_a_bootstrap_timeout_s)
     os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_b_bootstrap_timeout_s)
     try:
@@ -2114,33 +2714,45 @@ def parent_main(args: argparse.Namespace) -> int:
             probe_a = _run_one_probe(
                 ProbePlan(
                     probe=PROBE_DIRECT_MODEL,
-                    schedule=parse_schedule(args.probe_a_snapshots),
-                    child_cutoff_s=float(args.probe_a_cutoff_s),
+                    snapshot_cadence_s=float(args.snapshot_cadence_s),
+                    max_snapshots=int(args.max_snapshots),
+                    connect_timeout_s=float(args.probe_a_connect_timeout_s),
                 ),
                 out_dir=out_dir,
                 sink=sink,
                 publisher=publisher,
+                campaign_deadline_s=campaign_deadline,
             )
         if args.probe in ("both", PROBE_SCENARIO2):
+            sink.emit(
+                "supervisor-campaign-budget-check",
+                remaining_s=round(campaign_deadline - time.monotonic(), 1),
+            )
             probe_b = _run_one_probe(
                 ProbePlan(
                     probe=PROBE_SCENARIO2,
-                    schedule=parse_schedule(args.snapshots),
-                    child_cutoff_s=float(args.diagnostic_cutoff_s),
+                    snapshot_cadence_s=float(args.snapshot_cadence_s),
+                    max_snapshots=int(args.max_snapshots),
+                    connect_timeout_s=float(args.probe_a_connect_timeout_s),
                 ),
                 out_dir=out_dir,
                 sink=sink,
                 publisher=publisher,
+                campaign_deadline_s=campaign_deadline,
             )
     finally:
         sink.emit("supervisor-stray-check", opencode_processes_leftover=count_opencode_processes())
 
+    classification = classify_cause(probe_a, probe_b)
+    exit_code = _EXIT_BY_CLASSIFICATION.get(classification, EXIT_INCONCLUSIVE)
+    outcome = {
+        CLASS_DELIVERED: "delivered",
+        CLASS_PROVIDER_ERROR_PROVEN: "failure",
+        CLASS_SERVER_ERROR_PROVEN: "failure",
+        CLASS_HARNESS_ERROR: "failure",
+    }.get(classification, "inconclusive")
     report = build_final_report(meta, probe_a, probe_b)
     (out_dir / "final-report.md").write_text(report + "\n", encoding="utf-8")
-    exit_code = overall_exit_code(probe_a, probe_b)
-    outcome = {EXIT_OK: "complete", EXIT_STILL_IN_PROGRESS: "inconclusive"}.get(
-        exit_code, "failure"
-    )
     result = {
         "schema": SCHEMA_VERSION,
         "run_id": meta["run_id"],
@@ -2151,14 +2763,16 @@ def parent_main(args: argparse.Namespace) -> int:
         "target_repo": meta["target_repo"],
         "probe_direct_model": _evidence_dict(probe_a),
         "probe_scenario2": _evidence_dict(probe_b),
-        "classification": classify_cause(probe_a, probe_b),
-        "next_fix": _NEXT_FIX.get(classify_cause(probe_a, probe_b), ""),
+        "classification": classification,
+        "next_fix": _NEXT_FIX.get(classification, ""),
         "exit_code": exit_code,
         "outcome": outcome,
+        "campaign_allowance_s": meta["effective_campaign_allowance_s"],
+        "per_answer_wall_clock_cutoff_s": None,
         "diagnostic_note": (
-            "Diagnostic observation window only; not a product qualification "
-            "timeout and not a Gate C PASS/FAIL. Still-in-progress at the end "
-            "is INCONCLUSIVE, never a product FAIL."
+            "Diagnostic observation only; not a product qualification "
+            "timeout and not a Gate C PASS/FAIL. INCONCLUSIVE is never a "
+            "product FAIL and is never reported as a success."
         ),
     }
     (out_dir / "result.json").write_text(
@@ -2171,7 +2785,8 @@ def parent_main(args: argparse.Namespace) -> int:
     if step_summary:
         try:
             with Path(step_summary).open("a", encoding="utf-8") as stream:
-                stream.write("## AA Gate C scenario2 diagnostic\n\n```markdown\n")
+                stream.write("## AA Gate C scenario2 diagnostic\n\n")
+                stream.write(_summary_banner(classification) + "\n\n```markdown\n")
                 stream.write(report)
                 stream.write("\n```\n")
         except OSError:
@@ -2182,7 +2797,7 @@ def parent_main(args: argparse.Namespace) -> int:
             {
                 "outcome": outcome,
                 "exit_code": exit_code,
-                "classification": result["classification"],
+                "classification": classification,
                 "final_report": str(out_dir / "final-report.md"),
                 "artifact": f"aa-gate-c-scenario2-diagnostic-{meta['run_id']}-scenario2",
             }
@@ -2195,7 +2810,11 @@ def parent_main(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """CLI surface for the parent mode (child params travel via env)."""
     parser = argparse.ArgumentParser(
-        description="Isolated Gate C scenario #2 diagnostic (issue #418)."
+        description=(
+            "Isolated Gate C scenario #2 diagnostic; progress/liveness-driven "
+            "observation with one finite campaign allowance (no per-answer "
+            "cutoff, kodmial/aa#424)."
+        )
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -2209,13 +2828,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--owner", default=DEFAULT_OWNER)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--out-dir", default="diagnostic-scenario2-out")
-    parser.add_argument("--snapshots", default="10,25,45,75,110")
-    parser.add_argument("--diagnostic-cutoff-s", type=float, default=DEFAULT_DIAGNOSTIC_CUTOFF_S)
-    parser.add_argument("--probe-a-snapshots", default="5,15,30,50,70")
-    parser.add_argument("--probe-a-cutoff-s", type=float, default=DEFAULT_PROBE_A_CUTOFF_S)
+    # kodmial/aa#424: the ONE finite campaign ceiling + finalisation reserve.
+    parser.add_argument(
+        "--campaign-allowance-s",
+        type=float,
+        default=DEFAULT_CAMPAIGN_ALLOWANCE_S,
+        help=(
+            "Job-level physical ceiling shared by both probes (default "
+            "1800s, mirroring the AA qualification's real-progress "
+            "scenario allowance); never a per-answer timeout."
+        ),
+    )
+    parser.add_argument(
+        "--finalisation-reserve-s",
+        type=float,
+        default=DEFAULT_FINALISATION_RESERVE_S,
+        help="Time kept for artifacts/upload inside the job budget.",
+    )
+    parser.add_argument(
+        "--job-timeout-minutes",
+        type=float,
+        default=0.0,
+        help="Actions job timeout, used ONLY with --job-started-epoch.",
+    )
+    parser.add_argument(
+        "--job-started-epoch",
+        type=float,
+        default=0.0,
+        help="Epoch seconds when the Actions job started (job reconciliation).",
+    )
+    parser.add_argument(
+        "--snapshot-cadence-s",
+        type=float,
+        default=DEFAULT_SNAPSHOT_CADENCE_S,
+        help="Periodic incremental snapshot cadence (bounded log volume).",
+    )
+    parser.add_argument(
+        "--max-snapshots",
+        type=int,
+        default=DEFAULT_MAX_SNAPSHOTS,
+        help="Bounded snapshot count per probe (log-volume cap).",
+    )
     parser.add_argument("--probe-a-port", default=DEFAULT_PROBE_A_PORT)
     parser.add_argument(
-        "--probe-a-message-timeout-s", type=float, default=DEFAULT_PROBE_A_MESSAGE_TIMEOUT_S
+        "--probe-a-connect-timeout-s",
+        type=float,
+        default=DEFAULT_PROBE_A_CONNECT_TIMEOUT_S,
+        help=(
+            "Explicitly-typed loopback TCP-connect bound only; NEVER a response/answer deadline."
+        ),
     )
     parser.add_argument(
         "--probe-a-bootstrap-timeout-s",

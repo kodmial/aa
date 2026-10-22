@@ -1,19 +1,27 @@
 name: AA Gate C scenario2 diagnostic
 
-# kodmial/aa#418 (P0 diagnostic, bounded): run ONLY Gate C scenario #2
-# (substantive-drinking) through the real production path on an Actions runner
-# to isolate the observed ~30m stall (delivery_latency_ms=1940597.8,
-# timeout_reason=no-real-progress in run 39715421348).
+# kodmial/aa#418 + kodmial/aa#424 (P0 diagnostic, progress/liveness-driven):
+# run ONLY Gate C scenario #2 (substantive-drinking) through the real
+# production path on an Actions runner to reproduce the answer flow
+# truthfully, with NO per-answer wall-clock cutoff anywhere (the old
+# 45s/75s/130s answer windows are removed; a real model call continuing
+# past 45/75/130/300/900 s is observed, not killed).
 #
 # Strictly diagnostic: NOT qualification evidence, no product-path edits,
-# no full 18-case Gate C rerun. Two bounded probes:
+# no full 18-case Gate C rerun. Two probes under one shared campaign
+# allowance):
 #   A) direct OpenCode model call with connect/write/read phase timing
+#      (no total response deadline; the TCP connect phase and per-socket
+#      inactivity are bounded, mirroring production HttpOpenCodeClient)
 #   B) the exact production Application turn for scenario #2 via the
 #      qualification lane's in-process Telegram seam
-# One idempotent progress comment on issue #418; final root-cause report is
-# posted there. Diagnostic-only artifacts carry an explicit
-# "diagnostic" framing. INCONCLUSIVE / still-in-progress-at-probe-end is
-# diagnostic-only and never means the product failed a requirement.
+# One idempotent progress comment on issue #418; verdicts are truthful:
+# delivered / provider-error-proven / server-error-proven / harness-error /
+# unresolved-at-campaign-end / boundary-localized-root-unknown /
+# stage-unobserved. INCONCLUSIVE is never reported as a success: the
+# diagnostic step exits nonzero so the run is visibly inconclusive.
+# Diagnostic-only artifacts carry an explicit "diagnostic" framing and are
+# never product qualification evidence.
 
 on:
   push:
@@ -40,9 +48,12 @@ concurrency:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    # Hard ceiling: 20 minutes (spec). The diagnostic itself runs ~recorded
-    # 2 probes with a ~130s scenario cutoff plus environment setup.
-    timeout-minutes: 20
+    # One finite physical job ceiling (kodmial/aa#424): measured setup
+    # (~20m incl. corpus restore/index) + 1800s campaign allowance + 600s
+    # publication/upload reserve. The script additionally reconciles its
+    # campaign allowance with the remaining job budget via the job-start
+    # epoch, so artifacts always upload before this cap.
+    timeout-minutes: 60
     steps:
       - name: Checkout exact SHA
         uses: actions/checkout@v4
@@ -58,6 +69,7 @@ jobs:
           echo "run-id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "run-url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "main-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "job-start-epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           echo "$GITHUB_RUN_ID $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Python 3.12
@@ -101,7 +113,7 @@ jobs:
           # Text scenario only: NO voice prefetch for this diagnostic run.
           python scripts/build_retrieval_index.py --backend e5
 
-      - name: Run bounded scenario2 diagnostic (probes A + B)
+      - name: Run scenario2 diagnostic (no per-answer cutoff; campaign allowance)
         id: diag
         env:
           OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
@@ -121,14 +133,29 @@ jobs:
             --issue 418 \
             --owner kodmial \
             --repo aa \
+            --campaign-allowance-s 1800 \
+            --finalisation-reserve-s 600 \
+            --job-timeout-minutes 60 \
+            --job-started-epoch "${{ steps.sha.outputs.job-start-epoch }}" \
             --out-dir diagnostic-scenario2-out || status=$?
-          # Exit 3 is the valid INCONCLUSIVE diagnostic outcome (cutoff
-          # reached with no delivery). Only real lifecycle failures fail
-          # the workflow step and trigger the fallback notice.
-          if [ "$status" -eq 0 ] || [ "$status" -eq 3 ]; then
-            echo "Scenario2 diagnostic completed with exit code $status (0=complete, 3=inconclusive)."
+          if [ -f diagnostic-scenario2-out/result.json ]; then
+            echo "result-published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result-published=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Truthful, non-deceptive conclusion (kodmial/aa#424): exit 0 is
+          # only the DELIVERED outcome. Exit 3 = INCONCLUSIVE
+          # (unresolved-at-campaign-end / boundary-localized): the run is
+          # NOT reported as success and the step summary names it.
+          if [ "$status" -eq 0 ]; then
             exit 0
           fi
+          if [ "$status" -eq 3 ]; then
+            echo "outcome: INCONCLUSIVE (unresolved-at-campaign-end or boundary-localized) — NOT a success."
+            echo "::warning::scenario2 diagnostic ended INCONCLUSIVE; artifact holds the evidence"
+            exit 3
+          fi
+          echo "::error::scenario2 diagnostic failed with exit code $status"
           exit "$status"
 
       - name: Upload diagnostic artifacts
@@ -140,11 +167,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Notify on failed diagnostic lifecycle
+      - name: Notify on unpublished diagnostic lifecycle
         # Fallback only: the script itself owns the idempotent #418 comment.
-        # This step never creates a second comment if the marker comment for
-        # this run already exists.
-        if: always() && steps.diag.outcome != 'success'
+        # Fires ONLY when the script could not even publish result.json --
+        # an INCONCLUSIVE-but-published run must not trigger a degraded
+        # notice (the script already posted its final report).
+        if: always() && steps.diag.outcome == 'failure' && steps.diag.outputs.result-published != 'true'
         uses: actions/github-script@v7
         with:
           script: |
