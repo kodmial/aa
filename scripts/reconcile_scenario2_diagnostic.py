@@ -31,13 +31,20 @@ import sys
 import tempfile
 import time
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+SRC_ROOT = ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from aa.control import scenario2_triage as triage  # noqa: E402
+
+_TRIAGE_MODULE = Path(triage.__file__).resolve()
+if not _TRIAGE_MODULE.is_relative_to(SRC_ROOT):
+    raise ImportError(f"aa.control.scenario2_triage resolved outside repo: {_TRIAGE_MODULE}")
 
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
@@ -50,7 +57,7 @@ MISSING_PERMISSION_MARKERS = (
     "issues write access",
 )
 
-ARTIFACT_CACHE_DIR = Path("/tmp/aa-scenario2-triage-artifacts")
+ARTIFACT_CACHE_DIR = Path(tempfile.gettempdir()) / f"aa-scenario2-triage-artifacts-{os.getpid()}"
 
 
 # ---------------------------------------------------------------------------
@@ -92,18 +99,29 @@ def _gh_api_bytes(endpoint: str) -> bytes:
 
 
 def collect_runs(owner: str, repo: str) -> list[triage.DiagnosticRun]:
-    payload = _gh_api_json(
-        [
-            f"repos/{owner}/{repo}/actions/workflows/"
-            f"{triage.DIAGNOSTIC_WORKFLOW_FILE}/runs?branch=main&per_page=100"
-        ]
-    )
-    return triage.parse_runs(payload)
+    runs: list[triage.DiagnosticRun] = []
+    page = 1
+    while True:
+        payload = _gh_api_json(
+            [
+                f"repos/{owner}/{repo}/actions/workflows/"
+                f"{triage.DIAGNOSTIC_WORKFLOW_FILE}/runs"
+                f"?branch=main&per_page=100&page={page}"
+            ]
+        )
+        page_runs = triage.parse_runs(payload)
+        runs.extend(page_runs)
+        items = payload.get("workflow_runs") if isinstance(payload, dict) else payload
+        if not isinstance(items, list) or len(items) < 100:
+            break
+        page += 1
+    return runs
 
 
 def collect_issue_comments(owner: str, repo: str, issue: int) -> list[tuple[int, str]]:
     pairs: list[tuple[int, str]] = []
-    for page in (1, 2, 3):
+    page = 1
+    while True:
         payload = _gh_api_json(
             [f"repos/{owner}/{repo}/issues/{issue}/comments?per_page=100&page={page}"]
         )
@@ -117,6 +135,7 @@ def collect_issue_comments(owner: str, repo: str, issue: int) -> list[tuple[int,
                 continue
         if len(items) < 100:
             break
+        page += 1
     return pairs
 
 
@@ -152,8 +171,8 @@ def collect_artifact(owner: str, repo: str, run_id: int) -> tuple[int | None, bo
     return None, False
 
 
-def machinery_unchanged_between(owner: str, repo: str, *, older: str, newer: str) -> bool:
-    """True when no diagnostic machinery file differs between two SHAs."""
+@lru_cache(maxsize=64)
+def _machinery_unchanged_cached(owner: str, repo: str, older: str, newer: str) -> bool:
     if older == newer:
         return True
     payload = _gh_api_json([f"repos/{owner}/{repo}/compare/{older}...{newer}"])
@@ -162,6 +181,11 @@ def machinery_unchanged_between(owner: str, repo: str, *, older: str, newer: str
         if isinstance(item, dict) and str(item.get("filename", "")) in triage.MACHINERY_FILES:
             return False
     return True
+
+
+def machinery_unchanged_between(owner: str, repo: str, *, older: str, newer: str) -> bool:
+    """True when no diagnostic machinery file differs between two SHAs."""
+    return _machinery_unchanged_cached(owner, repo, older, newer)
 
 
 # ---------------------------------------------------------------------------
@@ -351,9 +375,17 @@ MAIN_BRANCH = "main"
 
 
 def _sorted_completed(runs: list[triage.DiagnosticRun]) -> list[triage.DiagnosticRun]:
+    def sort_key(run: triage.DiagnosticRun) -> tuple[bool, float, int]:
+        created_epoch = triage.parse_iso_epoch(run.created_at)
+        return (
+            created_epoch is not None,
+            created_epoch if created_epoch is not None else 0.0,
+            run.run_id,
+        )
+
     return sorted(
         (run for run in runs if run.is_completed),
-        key=lambda run: (triage.parse_iso_epoch(run.created_at) or 0.0, run.run_id),
+        key=sort_key,
         reverse=True,
     )
 
