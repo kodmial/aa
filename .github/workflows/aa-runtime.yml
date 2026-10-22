@@ -83,6 +83,15 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Bootstrap container Git trust (exact workspace)
+        # kodmial/aa#435: this container job reads git HEAD further down
+        # (provenance validation and the STARTING/READY/STOPPED markers);
+        # actions/checkout only writes safe.directory into a temporary HOME,
+        # so ordinary later steps here need the exact-workspace bootstrap.
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
+
       - name: Validate promoted dependency-image provenance
         shell: bash
         run: |

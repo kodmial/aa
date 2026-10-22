@@ -241,6 +241,13 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Bootstrap container Git trust (exact workspace)
+        # kodmial/aa#435: the fresh-runner canary below reads git HEAD after
+        # checkout; bootstrap exact-workspace trust in the job's persistent
+        # HOME first (checkout's temporary HOME config is never read again).
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
+
       - name: Fresh-runner image canary (no Telegram poller)
         shell: bash
         run: |
