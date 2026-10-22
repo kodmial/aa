@@ -6,9 +6,11 @@ cache eviction (L1) can no longer cost a full E5 re-embedding. This module
 implements the small registry-v2 subset AA needs with Python stdlib only:
 
 - Bearer-token authentication driven by the standard ``WWW-Authenticate``
-  challenge (realm host must match the registry host, fail closed);
+  challenge (realm host must belong to the registry domain, fail closed);
 - manifest push with idempotent no-op when the exact same manifest digest
-  already exists at the content-addressed tag;
+  already exists at the content-addressed tag, and blob-existence checks
+  plus an in-process publish lock so parallel publishers do not duplicate
+  identical content-addressed uploads;
 - digest-pinned manifest pull where every blob and the manifest bytes
   themselves are verified against their sha256 digests before writing.
 
@@ -28,6 +30,8 @@ import base64
 import hashlib
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +51,18 @@ ZERO_DIGEST = "sha256:" + "0" * 64
 LAYER_FILE_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 MAX_LAYER_BYTES = 1024 * 1024 * 1024
 _FLOW_ATTEMPTS = 3
+# Serializes the manifest HEAD -> blob upload -> manifest PUT sequence in
+# this process. Cross-process publishers remain idempotent because every
+# object is content-addressed and blob existence is checked before upload.
+_PUBLISH_LOCK = threading.Lock()
+# Explicit, reviewed token services for registries that delegate auth to a
+# host outside their own DNS subtree (GHCR currently advertises ghcr.io/token,
+# but this keeps documented alternates working without accepting arbitrary
+# challenge hosts).
+_KNOWN_TOKEN_HOSTS: dict[str, frozenset[str]] = {
+    "ghcr.io": frozenset({"ghcr.io", "token.actions.githubusercontent.com"}),
+    "registry-1.docker.io": frozenset({"auth.docker.io"}),
+}
 
 
 class ArtifactError(ValueError):
@@ -141,6 +157,10 @@ class _AuthSession:
         self._username = username
         self._password = password
         self._token: str | None = None
+        self._token_expiry: float = 0.0
+        self._token_scope: str | None = None
+        self._challenge: _Challenge | None = None
+        self._token_lock = threading.Lock()
 
     def credentials_header(self) -> str | None:
         if self._username is None or self._password is None:
@@ -149,11 +169,28 @@ class _AuthSession:
         encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
         return "Basic " + encoded
 
+    def _realm_host_allowed(self, host: str) -> bool:
+        """Accept the registry host and its subdomains (GHCR token service).
+
+        GHCR advertises ``https://ghcr.io/token`` today, but registries may
+        delegate token issuance to a sibling subdomain. Restricting the
+        realm to the registry's own domain keeps the challenge fail-closed
+        against SSRF-style redirects to unrelated hosts.
+        """
+        registry_host = self._registry.host.lower()
+        candidate = host.lower()
+        allowed = _KNOWN_TOKEN_HOSTS.get(registry_host, frozenset())
+        return (
+            candidate == registry_host
+            or candidate in allowed
+            or candidate.endswith("." + registry_host)
+        )
+
     def _token_url(self, challenge: _Challenge, scope: str) -> str:
         parsed = urllib.parse.urlparse(challenge.realm)
         if parsed.scheme not in {"https", "http"}:
             raise ArtifactError("l2-authentication", "invalid token realm scheme")
-        if parsed.netloc.lower() != self._registry.host.lower():
+        if not self._realm_host_allowed(parsed.netloc):
             raise ArtifactError("l2-authentication", "token realm host does not match the registry")
         params: dict[str, str] = {"scope": scope}
         if challenge.service:
@@ -179,7 +216,44 @@ class _AuthSession:
         raw = payload.get("token") if isinstance(payload, dict) else None
         if not isinstance(raw, str) or not raw:
             raise ArtifactError("l2-authentication", "token response carried no token")
+        expires_in = payload.get("expires_in", 300) if isinstance(payload, dict) else 300
+        try:
+            lifetime = float(expires_in)
+        except (TypeError, ValueError):
+            # GHCR does not always advertise expiry; assume a conservative
+            # default rather than caching the token indefinitely.
+            lifetime = 300.0
+        if lifetime <= 0:
+            lifetime = 300.0
+        margin = min(30.0, lifetime / 2.0)
+        self._token_expiry = time.time() + lifetime - margin
+        self._challenge = challenge
+        self._token_scope = scope
         return raw
+
+    def _ensure_valid_token(
+        self,
+        challenge: _Challenge,
+        scope: str,
+        *,
+        stale_token: str | None = None,
+    ) -> str:
+        """Return a live token, refreshing once under the token lock.
+
+        ``stale_token`` is the token the caller just saw rejected. If another
+        thread already replaced it, reuse that fresh token instead of causing
+        a thundering herd of token fetches.
+        """
+        with self._token_lock:
+            if (
+                self._token is not None
+                and time.time() < self._token_expiry
+                and self._token != stale_token
+            ):
+                return self._token
+            token = self._fetch_token(challenge, scope)
+            self._token = token
+            return token
 
     def request(
         self,
@@ -196,8 +270,19 @@ class _AuthSession:
         attempt_headers = dict(headers or {})
         for _hop in range(max_redirects + 2):
             request_headers = dict(attempt_headers)
+            if (
+                auth_scope is not None
+                and self._challenge is not None
+                and self._token_scope == auth_scope
+                and self._token is not None
+                and time.time() >= self._token_expiry
+            ):
+                # Refresh proactively so a long upload never starts with an
+                # already-expired token.
+                self._token = self._ensure_valid_token(self._challenge, auth_scope)
             if self._token is not None:
                 request_headers.setdefault("Authorization", "Bearer " + self._token)
+            sent_token = self._token
             request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=timeout_s) as response:
@@ -210,7 +295,9 @@ class _AuthSession:
                         challenge_raw, repository=self._registry.repository
                     )
                     if challenge is not None:
-                        self._token = self._fetch_token(challenge, auth_scope)
+                        self._token = self._ensure_valid_token(
+                            challenge, auth_scope, stale_token=sent_token
+                        )
                         continue
                 return int(exc.code), {k: v for k, v in exc.headers.items()}, exc.read()
             except (urllib.error.URLError, OSError) as exc:
@@ -326,37 +413,52 @@ def push_artifact(
     manifest_bytes = _canonical_json(manifest_payload)
     manifest_digest = digest_bytes(manifest_bytes)
 
-    head_status, head_headers, _ = session.request(
-        registry.api_url(f"/manifests/{tag}"),
-        method="HEAD",
-        headers={"Accept": MANIFEST_MEDIA_TYPE},
-        auth_scope="pull",
-    )
-    if head_status == 200 and head_headers.get("Docker-Content-Digest") == manifest_digest:
+    with _PUBLISH_LOCK:
+        head_status, head_headers, _ = session.request(
+            registry.api_url(f"/manifests/{tag}"),
+            method="HEAD",
+            headers={"Accept": MANIFEST_MEDIA_TYPE},
+            auth_scope="pull",
+        )
+        if head_status == 200 and head_headers.get("Docker-Content-Digest") == manifest_digest:
+            return manifest_digest
+
+        _upload_blob(registry, session, config_payload, config_digest)
+        for layer in layers:
+            name = layer["annotations"][FILE_NAME_ANNOTATION]
+            payload = files[name]
+            _upload_blob(registry, session, payload, layer["digest"])
+
+        status, headers, _ = session.request(
+            registry.api_url(f"/manifests/{tag}"),
+            method="PUT",
+            data=manifest_bytes,
+            headers={"Content-Type": MANIFEST_MEDIA_TYPE},
+            auth_scope="push,pull",
+        )
+        if status not in (201, 202):
+            raise ArtifactError("l2-push-failed", f"manifest push failed with http {status}")
+        location_digest = headers.get("Docker-Content-Digest", manifest_digest)
+        if location_digest != manifest_digest:
+            raise ArtifactError("l2-push-failed", "registry assigned an unexpected manifest digest")
         return manifest_digest
 
-    _upload_blob(registry, session, config_payload, config_digest)
-    for layer in layers:
-        name = layer["annotations"][FILE_NAME_ANNOTATION]
-        payload = files[name]
-        _upload_blob(registry, session, payload, layer["digest"])
 
-    status, headers, _ = session.request(
-        registry.api_url(f"/manifests/{tag}"),
-        method="PUT",
-        data=manifest_bytes,
-        headers={"Content-Type": MANIFEST_MEDIA_TYPE},
-        auth_scope="push,pull",
+def _blob_exists(registry: OCIRegistry, session: _AuthSession, digest: str) -> bool:
+    status, _, _ = session.request(
+        registry.api_url(f"/blobs/{digest}"),
+        method="HEAD",
+        auth_scope="pull",
     )
-    if status not in (201, 202):
-        raise ArtifactError("l2-push-failed", f"manifest push failed with http {status}")
-    location_digest = headers.get("Docker-Content-Digest", manifest_digest)
-    if location_digest != manifest_digest:
-        raise ArtifactError("l2-push-failed", "registry assigned an unexpected manifest digest")
-    return manifest_digest
+    return status == 200
 
 
 def _upload_blob(registry: OCIRegistry, session: _AuthSession, blob: bytes, digest: str) -> None:
+    # Content-addressed blobs are shared by all publishers. Skipping an
+    # already-present blob removes the duplicate bandwidth that two
+    # concurrent publishers would otherwise spend on identical uploads.
+    if _blob_exists(registry, session, digest):
+        return
     status, headers, _ = session.request(
         registry.api_url("/blobs/uploads/"), method="POST", auth_scope="push,pull", data=b""
     )

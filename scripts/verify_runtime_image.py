@@ -134,7 +134,8 @@ def check_pins() -> list[str]:
 
 
 _DEV_PIN_RE = re.compile(r'"([A-Za-z0-9_.-]+)==([0-9a-zA-Z.]+)"')
-_DEV_SELECTOR_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*([=<>~!]+)\s*([0-9a-zA-Z.]+)")
+_REQUIREMENT_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$")
+_CONSTRAINT_RE = re.compile(r"(===|==|!=|>=|<=|~=|>|<)\s*([^\s,;\"']+)")
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -146,15 +147,40 @@ def _version_tuple(value: str) -> tuple[int, ...]:
 
 
 def _compare_version(left: str, right: str) -> int:
-    left_tuple = _version_tuple(left) or (0,)
-    right_tuple = _version_tuple(right) or (0,)
-    return (left_tuple > right_tuple) - (left_tuple < right_tuple)
+    left_tuple = list(_version_tuple(left)) or [0]
+    right_tuple = list(_version_tuple(right)) or [0]
+    width = max(len(left_tuple), len(right_tuple))
+    left_tuple += [0] * (width - len(left_tuple))
+    right_tuple += [0] * (width - len(right_tuple))
+    return (tuple(left_tuple) > tuple(right_tuple)) - (tuple(left_tuple) < tuple(right_tuple))
+
+
+def _compatible_release(want: str, got: str) -> bool:
+    """PEP 440 compatible-release (~=) check for numeric versions."""
+    if _compare_version(got, want) < 0:
+        return False
+    want_parts = want.split(".")
+    got_parts = got.split(".")
+    prefix_len = max(1, len(want_parts) - 1)
+    want_prefix = _version_tuple(".".join(want_parts[:prefix_len]))
+    got_prefix = _version_tuple(".".join(got_parts[:prefix_len]))
+    return got_prefix == want_prefix
 
 
 def _op_satisfied(op: str, want: str, got: str) -> bool:
     order = _compare_version(got, want)
-    if op == "==":
+    if op == "===":
         return got == want
+    if op == "==":
+        if want.endswith(".*"):
+            prefix = want[:-2]
+            return got == prefix or got.startswith(prefix + ".")
+        return order == 0
+    if op == "!=":
+        if want.endswith(".*"):
+            prefix = want[:-2]
+            return not (got == prefix or got.startswith(prefix + "."))
+        return order != 0
     if op == ">=":
         return order >= 0
     if op == "<=":
@@ -164,8 +190,29 @@ def _op_satisfied(op: str, want: str, got: str) -> bool:
     if op == "<":
         return order < 0
     if op == "~=":
-        return order >= 0
+        return _compatible_release(want, got)
     return False
+
+
+def _parse_dev_selectors(dev_section: str) -> list[tuple[str, str, str]]:
+    """Extract every version constraint, including extras and multi-clause ranges."""
+    selectors: list[tuple[str, str, str]] = []
+    for raw_line in dev_section.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("["):
+            continue
+        line = line.strip('"').strip("'").rstrip(",").strip()
+        if " @ " in line:
+            # Direct URL requirements carry no comparable version selector.
+            continue
+        match = _REQUIREMENT_RE.match(line)
+        if match is None:
+            continue
+        name = match.group(1)
+        rest = match.group(2)
+        for op, version in _CONSTRAINT_RE.findall(rest):
+            selectors.append((name, op, version))
+    return selectors
 
 
 def check_dev_pins(*, docker_text: str, project_text: str) -> list[str]:
@@ -178,14 +225,14 @@ def check_dev_pins(*, docker_text: str, project_text: str) -> list[str]:
     errors: list[str] = []
     if "[project.optional-dependencies]" not in project_text:
         return ["pyproject.toml optional-dependencies section is missing"]
-    dev_section = project_text.split("[project.optional-dependencies]")[1].split("[tool.")[0]
-    selectors = [
-        (name, op, version)
-        for name, op, version in re.findall(
-            r'(?m)^\s*"?([A-Za-z0-9_.-]+)\s*(>=|<=|~=?|==|>|<)\s*([0-9][0-9a-zA-Z.]*)',
-            dev_section,
-        )
-    ]
+    remainder = project_text.split("[project.optional-dependencies]", 1)[1]
+    dev_lines: list[str] = []
+    for line in remainder.splitlines():
+        if line.strip().startswith("["):
+            break
+        dev_lines.append(line)
+    dev_section = "\n".join(dev_lines)
+    selectors = _parse_dev_selectors(dev_section)
     if not selectors:
         return ["pyproject.toml dev selectors are unreadable"]
     pins: dict[str, str] = {}
@@ -244,16 +291,34 @@ def check_index_digest_wiring() -> list[str]:
     if not INDEX_REFERENCE_RE.fullmatch(reference):
         return [f"index digest file malformed: {reference!r}"]
     if reference.endswith(":" + ZERO_DIGEST):
-        # Placeholder is the honest pre-publication state; the consumer
-        # client refuses it (bounded emergency rebuild policy, issue #429)
-        # so production can never silently trust an unpublished L2 pin.
-        if "L2 publication pin is still a placeholder" not in (
-            ROOT / "src" / "aa" / "retrieval" / "oci_artifact.py"
-        ).read_text(encoding="utf-8"):
-            errors.append("consumer client lacks the fail-closed placeholder policy")
+        # Placeholder is the honest pre-publication state; verify the
+        # consumer client's actual behavior instead of grepping for a
+        # fragile error-message string.
+        errors += _check_placeholder_rejected()
+
     if not (ROOT / ".github" / "workflows" / "aa-derived-index.yml").is_file():
         errors.append("trusted aa-derived-index publisher workflow is missing")
     return errors
+
+
+def _check_placeholder_rejected() -> list[str]:
+    try:
+        from aa.retrieval.oci_artifact import ArtifactError, parse_pinned_digest
+    except ImportError:
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from aa.retrieval.oci_artifact import ArtifactError, parse_pinned_digest
+        except ImportError:
+            return ["cannot import oci_artifact module for placeholder check"]
+    try:
+        parse_pinned_digest(INDEX_DIGEST_FILE)
+    except ArtifactError as exc:
+        if exc.category != "l2-unpublished":
+            return [f"placeholder pin rejected with wrong category: {exc.category}"]
+        return []
+    return ["consumer client does not reject placeholder L2 pin"]
 
 
 def check_ffmpeg(*, started_ms: dict[str, int]) -> list[str]:
