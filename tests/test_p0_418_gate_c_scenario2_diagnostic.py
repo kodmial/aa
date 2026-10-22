@@ -162,9 +162,10 @@ def test_effective_campaign_allowance_reconciles_job_budget(diag: Any) -> None:
 
 
 def test_effective_campaign_allowance_job_budget_exhausted(diag: Any) -> None:
-    # Job already inside its finalisation reserve: tiny but finite value.
+    # Job already inside its finalisation reserve: keep the minimum viable
+    # observation window rather than collapsing to a token 1s.
     # (job_started_epoch must stay positive — the static guard ignores
-    # unset markers; elapsed 3100s > 3600 - 600 reserve → 1.0s floor.)
+    # unset markers; elapsed 3100s > 3600 - 600 reserve.)
     now = 100_000.0
     assert (
         diag.effective_campaign_allowance_s(
@@ -174,7 +175,7 @@ def test_effective_campaign_allowance_job_budget_exhausted(diag: Any) -> None:
             job_started_epoch=now - 3100.0,
             now_epoch=now,
         )
-        == 1.0
+        == diag.MIN_CAMPAIGN_ALLOWANCE_S
     )
 
 

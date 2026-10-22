@@ -80,6 +80,7 @@ import concurrent.futures
 import faulthandler
 import http.client
 import json
+import math
 import os
 import signal
 import subprocess
@@ -115,6 +116,10 @@ SCENARIO_2_PROMPT = "К вечеру очень тянет выпить, как 
 # both probes; there is NO per-answer wall-clock cutoff). Mirrors the AA
 # qualification's real-progress scenario allowance of 1800 s.
 DEFAULT_CAMPAIGN_ALLOWANCE_S = 1800.0
+# Lowest allowance that still permits meaningful observation plus artifact
+# finalisation. When the remaining job budget is already inside the
+# finalisation reserve, the allowance must not collapse to a token 1s.
+MIN_CAMPAIGN_ALLOWANCE_S = 30.0
 # Time kept for report/comment publication and artifact upload, reconciled
 # against the Actions job budget when a job-start marker is provided.
 DEFAULT_FINALISATION_RESERVE_S = 600.0
@@ -140,6 +145,10 @@ NONRESPONSIVE_SNAPSHOTS_REQUIRED = 4
 # A bounded loopback observation-probe bind (health/internal status only,
 # never an answer/model call).
 OBSERVATION_HTTP_TIMEOUT_S = 2.0
+# Observation-only cadence while a model POST is in flight. This NEVER
+# cancels or shortens the pending request; it records whether the local
+# OpenCode server still answers bounded status probes.
+MODEL_IN_FLIGHT_LIVENESS_INTERVAL_S = 15.0
 
 # Diagnostic observability: continuity marker thresholds. Crossing these with
 # the turn still undelivered is RECORDED, never enforced: the old 45/75/130
@@ -825,6 +834,13 @@ def _timed_request(
     payloads are never returned or logged. The returned ``extra`` may hold
     internal opaque values (session id reference, sanitized counts) for
     the very next request; identifiers are never emitted.
+
+    Accepted risk: a provider connection that accepts TCP but never sends
+    a byte is indistinguishable from a very slow inference and is therefore
+    bounded only by the campaign allowance. Probe A compensates with an
+    observation-only ``model-in-flight-liveness`` probe that keeps proving
+    the LOCAL server responsive during the pending POST; it never alters
+    the request's production-identical unbounded read semantics.
     """
     try:
         host, port = http_split_probe_base_url(base_url)
@@ -932,6 +948,47 @@ async def _timed_request_async(
     return await future
 
 
+def _observe_model_in_flight_liveness(
+    *,
+    sink: EventSink,
+    base_url: str,
+    session_id_provider: Callable[[], str],
+    started_monotonic: float,
+    stop_event: threading.Event,
+    interval_s: float = MODEL_IN_FLIGHT_LIVENESS_INTERVAL_S,
+) -> None:
+    """Observe local-server liveness while a model POST is pending.
+
+    Observation-only: this thread never cancels, times out or otherwise
+    changes the in-flight request. It periodically proves whether the local
+    OpenCode server (and, when available, the session/message status
+    endpoints) still answers bounded probes, so a wedged local server is
+    distinguishable from a slow provider. A provider that accepts TCP but
+    sends no bytes remains unobservable here and is the documented
+    campaign-allowance-bounded accepted risk.
+    """
+    interval = max(1.0, float(interval_s))
+    while not stop_event.wait(interval):
+        try:
+            health_ok, _ = _health_probe(base_url, OBSERVATION_HTTP_TIMEOUT_S)
+            internal = _opencode_internal_observation(
+                base_url,
+                str(session_id_provider() or ""),
+                timeout=OBSERVATION_HTTP_TIMEOUT_S,
+            )
+            sink.emit(
+                "model-in-flight-liveness",
+                elapsed_ms=round((time.monotonic() - started_monotonic) * 1000.0, 1),
+                server_healthy=bool(health_ok),
+                sessions_responsive=bool(internal.get("responsive")),
+                sessions_seen=internal.get("sessions_seen"),
+                messages_seen=internal.get("messages_seen"),
+                part_kinds=internal.get("part_kinds"),
+            )
+        except Exception:
+            return
+
+
 def _classify_opencode_payload(raw: bytes) -> dict[str, Any]:
     """Classify one response without keeping any payload text."""
     try:
@@ -1011,17 +1068,26 @@ def _forced_bounded_exit(sink: EventSink, probe: str, exit_code: int) -> None:
     Required when graceful teardown timed out because the production-path
     resources could not be released: normal interpreter shutdown joins the
     executor threads, so a stuck drain would leak the child past the
-    campaign boundary. This documented bounded end kills the child's own
-    process group (including the spawned OpenCode server) — event ids are
-    already on disk and in the Actions log.
+    campaign boundary. This documented bounded end targets the CHILD'S OWN
+    process group — ``start_new_session=True`` makes the child a session
+    leader, so this includes the spawned OpenCode server and never the
+    supervisor/parent group. Event ids are already on disk and in the
+    Actions log.
     """
     sink.emit("child-forced-exit", probe=probe, exit_code=int(exit_code))
     sink.close()
     sys.stdout.flush()
     try:
-        os.killpg(os.getpgrp(), signal.SIGKILL)
+        own_pgid = os.getpgid(os.getpid())
     except OSError:
-        os._exit(int(exit_code))
+        own_pgid = None
+    if own_pgid is not None:
+        try:
+            os.killpg(own_pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    os._exit(int(exit_code))
 
 
 async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str, Any]) -> int:
@@ -1152,14 +1218,32 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         counters["last_real_monotonic"] = time.monotonic()
         anchor.set()
         started = time.perf_counter()
-        ok, provider_error, timings, _extra = await _timed_request_async(
-            base_url,
-            "POST",
-            f"/session/{urllib.parse.quote(session_id)}/message",
-            _probe_a_message_body(model),
-            connect_timeout,
-            None,
+        liveness_stop = threading.Event()
+        liveness = threading.Thread(
+            target=_observe_model_in_flight_liveness,
+            kwargs={
+                "sink": sink,
+                "base_url": base_url,
+                "session_id_provider": lambda: session_state["id"],
+                "started_monotonic": time.monotonic(),
+                "stop_event": liveness_stop,
+            },
+            name="diag-model-in-flight-liveness",
+            daemon=True,
         )
+        liveness.start()
+        try:
+            ok, provider_error, timings, _extra = await _timed_request_async(
+                base_url,
+                "POST",
+                f"/session/{urllib.parse.quote(session_id)}/message",
+                _probe_a_message_body(model),
+                connect_timeout,
+                None,
+            )
+        finally:
+            liveness_stop.set()
+            liveness.join(timeout=2.0)
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
         fail_category = str(timings.get("fail_category", "") or "")
         counters["last_real_event"] = "model-send-end"
@@ -1789,18 +1873,25 @@ def effective_campaign_allowance_s(
 
     Reconciled with the remaining Actions job budget when a job-start
     marker is provided so the finalisation reserve and artifact upload
-    always complete inside the job.
+    always complete inside the job. If that budget is already inside the
+    finalisation reserve, the allowance keeps a minimum viable observation
+    window instead of collapsing to a token one second.
     """
-    configured = max(1.0, float(campaign_allowance_s))
+    configured = float(campaign_allowance_s)
+    if not math.isfinite(configured):
+        configured = MIN_CAMPAIGN_ALLOWANCE_S
+    configured = max(MIN_CAMPAIGN_ALLOWANCE_S, configured)
     timeout_minutes = float(job_timeout_minutes or 0.0)
     started_epoch = float(job_started_epoch or 0.0)
     if timeout_minutes <= 0.0 or started_epoch <= 0.0:
         return configured
     current = time.time() if now_epoch is None else now_epoch
     remaining = started_epoch + timeout_minutes * 60.0 - float(finalisation_reserve_s) - current
+    if not math.isfinite(remaining):
+        return configured
     if remaining <= 0.0:
-        return 1.0
-    return max(1.0, min(configured, remaining))
+        return MIN_CAMPAIGN_ALLOWANCE_S
+    return max(MIN_CAMPAIGN_ALLOWANCE_S, min(configured, remaining))
 
 
 def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:

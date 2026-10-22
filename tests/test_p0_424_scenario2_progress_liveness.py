@@ -467,7 +467,8 @@ def test_effective_campaign_allowance_reconciles_actions_job(
         )
         == 3000.0
     )
-    # Job budget consumed inside the reserve → tiny-but-finite floor of 1.0s.
+    # Job budget consumed inside the reserve → minimum viable observation
+    # window, never a token 1s that cannot produce useful evidence.
     assert (
         diag.effective_campaign_allowance_s(
             campaign_allowance_s=5000.0,
@@ -476,7 +477,7 @@ def test_effective_campaign_allowance_reconciles_actions_job(
             job_started_epoch=now - 3500.0,
             now_epoch=now,
         )
-        == 1.0
+        == diag.MIN_CAMPAIGN_ALLOWANCE_S
     )
 
 
