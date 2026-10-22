@@ -40,7 +40,11 @@ def test_unconfirmed_answer_is_removed_without_touching_other_history(status: st
     answer = provisional_answer("Фиктивный ответ.", "cert")
     receipts = _receipts(str(answer.content))
     receipts[0]["status"] = status
-    history: list[BaseMessage] = [HumanMessage(content="Вопрос."), AIMessage(content="Ранее."), answer]
+    history: list[BaseMessage] = [
+        HumanMessage(content="Вопрос."),
+        AIMessage(content="Ранее."),
+        answer,
+    ]
     updates = delivery_history_updates(history, receipts, thread="thread", drop_unconfirmed=True)
     assert len(updates) == 1
     assert isinstance(updates[0], RemoveMessage)
