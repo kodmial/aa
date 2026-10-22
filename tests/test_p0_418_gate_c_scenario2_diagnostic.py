@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import signal
 import subprocess
 import sys
 import time
@@ -646,4 +647,304 @@ def test_evidence_collection_and_report_generation(diag: Any, tmp_path: pathlib.
     assert "classification: `delivered`" in report
     serialized = diag._evidence_dict(evidence)
     assert serialized["delivered"] is True
+    json.dumps(serialized)
+
+
+# ---------------------------------------------------------------------------
+# kodmial/aa#422: SIGUSR1 handler must be nonfatal (chain=False) and the
+# supervisor must never SIGUSR1 an unregistered child. Regression tests use
+# REAL subprocesses with short intervals (no tens-of-seconds CI sleeps).
+# ---------------------------------------------------------------------------
+
+
+def _diag_subprocess_source(stacks_path: pathlib.Path) -> str:
+    """Child program registering the script's nonfatal stack handler."""
+    return (
+        "import importlib.util, time\n"
+        f"spec = importlib.util.spec_from_file_location(\n"
+        f"    'diag_child_under_test', {str(SCRIPT_PATH)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "import sys\n"
+        "sys.modules['diag_child_under_test'] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "registered = module._install_stack_handler(\n"
+        f"    __import__('pathlib').Path({str(stacks_path)!r}))\n"
+        "assert registered is True, 'stack handler registration failed'\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+
+
+def _wait_stack_dump(stacks_path: pathlib.Path, proc: subprocess.Popen[str]) -> bool:
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if stacks_path.exists() and stacks_path.stat().st_size > 0:
+            return True
+        time.sleep(0.05)
+    return stacks_path.exists() and stacks_path.stat().st_size > 0
+
+
+def test_register_handler_survives_two_sigusr1_and_dumps_stacks(
+    tmp_path: pathlib.Path,
+) -> None:
+    """kodmial/aa#422: SIGUSR1 stack dump must NEVER kill the probe (P0)."""
+    stacks = tmp_path / "stacks-direct-model.txt"
+    proc = subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
+        [sys.executable, "-c", _diag_subprocess_source(stacks)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None  # stdout=PIPE (typed narrowing for mypy)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip() == "READY"
+        time.sleep(0.2)
+        proc.send_signal(signal.SIGUSR1)
+        assert _wait_stack_dump(stacks, proc), "faulthandler did not dump stacks"
+        assert proc.poll() is None, f"child died on SIGUSR1: {proc.returncode}"
+        proc.send_signal(signal.SIGUSR1)
+        time.sleep(0.4)
+        assert proc.poll() is None, f"child died on second SIGUSR1: {proc.returncode}"
+        stacks_content = stacks.read_text(encoding="utf-8")
+        # Two SIGUSR1-triggered faulthandler dumps are appended.
+        assert stacks_content.count("most recent call first") >= 2
+        # Normal bounded shutdown still works with plain SIGTERM.
+        proc.terminate()
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_chained_chain_true_handler_reproduces_original_probe_kill(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Negative deterministic reproduction of the original chain=True bug.
+
+    The old behavior (run 39767853106): each SIGUSR1 dumped stacks and then
+    chained into the default SIGUSR1 disposition, terminating the child
+    with exit code -10 at ~20s. This documents the regression that must
+    never come back.
+    """
+    stacks = tmp_path / "stacks-chained.txt"
+    code = (
+        "import faulthandler, signal, time\n"
+        f"stream = open({str(stacks)!r}, 'a', encoding='utf-8')\n"
+        "faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=True)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None  # stdout=PIPE (typed narrowing for mypy)
+    try:
+        assert proc.stdout.readline().strip() == "READY"
+        time.sleep(0.2)
+        proc.send_signal(signal.SIGUSR1)
+        deadline = time.monotonic() + 15.0
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.returncode == -signal.SIGUSR1, (
+            f"chained handler must terminate the child, got {proc.returncode}"
+        )
+        assert stacks.exists() and stacks.stat().st_size > 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_register_handler_registration_defaults_to_nonfatal_chain(diag: Any) -> None:
+    """The merged handler must be non-fatal: default chain=False (P0 fix)."""
+    import inspect
+
+    signature = inspect.signature(diag._install_stack_handler)
+    assert signature.parameters["chain"].default is False
+
+
+def test_send_sigusr1_requires_ready_sentinel(diag: Any, tmp_path: pathlib.Path) -> None:
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.signals: list[int] = []
+
+        def send_signal(self, sig: int) -> None:
+            self.signals.append(int(sig))
+
+    proc = _FakeProc()
+    ready_path = diag._stack_handler_ready_path(tmp_path, diag.PROBE_SCENARIO2)
+    assert ready_path.name == "stack-handler-ready-scenario2.txt"
+    assert diag._send_sigusr1(proc, ready_path=ready_path) is False
+    assert proc.signals == []
+    ready_path.write_text("registered\n", encoding="utf-8")
+    assert diag._send_sigusr1(proc, ready_path=ready_path) is True
+    assert proc.signals == [int(signal.SIGUSR1)]
+
+
+def test_stage_events_tracked_inflight_and_completed(diag: Any, tmp_path: pathlib.Path) -> None:
+    sink = diag.EventSink(tmp_path / "events.jsonl", echo=False)
+    evidence = diag.ProbeEvidence(probe=diag.PROBE_SCENARIO2)
+    for payload in (
+        {"event": "stage-start", "stage": "index", "ts": "2026-01-01T10:00:00Z"},
+        {"event": "stage-end", "stage": "index", "elapsed_ms": 5560.0},
+        {"event": "stage-start", "stage": "opencode", "ts": "2026-01-01T10:05:00Z"},
+    ):
+        assert diag._consume_child_line(json.dumps(payload), evidence, sink)
+    # The freshest in-flight marker (opencode) wins over the stale one.
+    assert evidence.active_stage == "opencode"
+    assert evidence.active_stage_ts == "2026-01-01T10:05:00Z"
+    assert evidence.last_completed_stage == "index"
+    assert evidence.last_completed_stage_elapsed_ms == 5560.0
+
+
+def test_classify_signal_killed_children_is_infrastructure_failure_not_index(
+    diag: Any,
+) -> None:
+    """Run 39767853106 falsified evidence shape: both children -10 at ~20s."""
+    probe_a = diag.ProbeEvidence(
+        probe=diag.PROBE_DIRECT_MODEL, status="child-exit--10", exit_code=-10
+    )
+    probe_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="child-exit--10",
+        exit_code=-10,
+        last_stage="index",
+    )
+    assert diag.classify_cause(probe_a, probe_b) == ("diagnostic-infrastructure-failure")
+    # Never success and no unproven stage attribution.
+    assert diag.classify_cause(probe_a, probe_b) not in ("delivered", "aa-retrieval-index")
+    assert diag.overall_exit_code(probe_a, probe_b) == diag.EXIT_CHILD_UNEXPECTED
+    overall = diag.overall_exit_code(probe_a, probe_b)
+    assert overall not in (diag.EXIT_OK, diag.EXIT_STILL_IN_PROGRESS)
+
+
+def test_classify_prefers_recent_inflight_stage_start_over_stale_stage(
+    diag: Any,
+) -> None:
+    """Production evidence: index COMPLETED, then stage-start:opencode."""
+    completed_a = diag.ProbeEvidence(probe=diag.PROBE_DIRECT_MODEL, status="completed")
+    stale_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="still-in-progress-at-probe-end",
+        last_stage="index",
+        active_stage="opencode",
+        fail_category="still-in-progress-at-probe-end",
+    )
+    assert diag.classify_cause(completed_a, stale_b) == "model-provider"
+    # Without an in-flight marker the last_stage evidence is still used.
+    legacy_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="still-in-progress-at-probe-end",
+        last_stage="retrieval",
+        fail_category="still-in-progress-at-probe-end",
+    )
+    assert diag.classify_cause(completed_a, legacy_b) == "aa-retrieval"
+
+
+def test_cutoff_terminated_children_are_not_infrastructure_failure(
+    diag: Any,
+) -> None:
+    """Bounded cutoff shutdown (-SIGTERM) is the expected INCONCLUSIVE path."""
+    completed_a = diag.ProbeEvidence(probe=diag.PROBE_DIRECT_MODEL, status="completed")
+    cutoff_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="still-in-progress-at-probe-end",
+        exit_code=-signal.SIGTERM,
+        terminated_at_cutoff=True,
+        last_stage="retrieval",
+        fail_category="still-in-progress-at-probe-end",
+    )
+    assert diag._abnormal_child_exit(cutoff_b) is False
+    assert diag.classify_cause(completed_a, cutoff_b) == "aa-retrieval"
+    assert diag.overall_exit_code(completed_a, cutoff_b) == diag.EXIT_STILL_IN_PROGRESS
+
+
+def test_direct_model_cutoff_is_inconclusive_not_infra(diag: Any) -> None:
+    probe_a = diag.ProbeEvidence(
+        probe=diag.PROBE_DIRECT_MODEL,
+        status="child-exit--15",
+        exit_code=-signal.SIGTERM,
+        terminated_at_cutoff=True,
+    )
+    probe_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="still-in-progress-at-probe-end",
+        exit_code=-signal.SIGTERM,
+        terminated_at_cutoff=True,
+        fail_category="still-in-progress-at-probe-end",
+    )
+    assert diag.classify_cause(probe_a, probe_b) == ("still-in-progress-at-probe-end")
+    assert diag.overall_exit_code(probe_a, probe_b) == diag.EXIT_STILL_IN_PROGRESS
+
+
+def test_delivered_run_reports_success_but_signal_killed_not(diag: Any) -> None:
+    delivered_a = diag.ProbeEvidence(probe=diag.PROBE_DIRECT_MODEL, status="completed")
+    delivered_b = diag.ProbeEvidence(probe=diag.PROBE_SCENARIO2, status="delivered", delivered=True)
+    assert diag.overall_exit_code(delivered_a, delivered_b) == diag.EXIT_OK
+
+
+def test_bootstrap_failure_exit_code_is_lifecycle_failure(diag: Any) -> None:
+    failed_a = diag.ProbeEvidence(probe=diag.PROBE_DIRECT_MODEL, status="bootstrap-failed")
+    failed_b = diag.ProbeEvidence(probe=diag.PROBE_SCENARIO2, status="bootstrap-failed")
+    assert diag.overall_exit_code(failed_a, failed_b) == diag.EXIT_BOOTSTRAP_FAILED
+
+
+def test_comment_lines_name_signal_death_and_stages(diag: Any) -> None:
+    evidence = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="child-exit--10",
+        exit_code=-10,
+        last_stage="index",
+        active_stage="opencode",
+        last_completed_stage="index",
+    )
+    lines = "\n".join(diag._probe_comment_lines(evidence))
+    assert "SIG10" in lines
+    assert "`opencode`" in lines
+    assert "last_completed_stage: `index`" in lines
+
+
+def test_infrastructure_failure_report_names_no_stage_cause(diag: Any) -> None:
+    meta = {"run_url": "https://github.com/kodmial/aa/actions/runs/39767853106", "main_sha": "abc"}
+    probe_a = diag.ProbeEvidence(
+        probe=diag.PROBE_DIRECT_MODEL, status="child-exit--10", exit_code=-10
+    )
+    probe_b = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="child-exit--10",
+        exit_code=-10,
+        last_stage="index",
+        active_stage="",
+    )
+    report = diag.build_final_report(meta, probe_a, probe_b)
+    assert "diagnostic-infrastructure-failure" in report
+    assert "NO stage-level" in report
+    assert "SIG10" in report
+    assert diag._NEXT_FIX["diagnostic-infrastructure-failure"]
+
+
+def test_evidence_dict_serializes_new_fields(diag: Any) -> None:
+    evidence = diag.ProbeEvidence(
+        probe=diag.PROBE_SCENARIO2,
+        status="child-exit--10",
+        exit_code=-10,
+        active_stage="opencode",
+        active_stage_ts="2026-01-01T10:05:00Z",
+        last_completed_stage="index",
+        last_completed_stage_elapsed_ms=5560.0,
+    )
+    serialized = diag._evidence_dict(evidence)
+    assert serialized["exited_by_signal"] == 10
+    assert serialized["terminated_at_cutoff"] is False
+    assert serialized["active_stage"] == "opencode"
+    assert serialized["last_completed_stage_ms"] == 5560.0
     json.dumps(serialized)

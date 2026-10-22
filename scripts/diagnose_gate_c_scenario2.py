@@ -31,6 +31,16 @@ watchdog thread plus the parent supervisor take snapshots at fixed offsets
 a small privacy-safe checkpoint JSON. The workflow additionally updates
 exactly one diagnostic issue comment, idempotent per run.
 
+Stack evidence integrity (P0 fix): the supervisor requests whole-process
+faulthandler stacks via SIGUSR1 only after the child wrote its
+``stack-handler-ready-<probe>.txt`` sentinel (handler registered with
+``chain=False``, so the dump never kills the probe). A child that still
+terminates by an unexpected signal is classified
+``diagnostic-infrastructure-failure``: it is NEVER reported as a
+successful workflow and its last stage marker is NOT used as root cause.
+The most recent in-flight ``stage-start`` (including ``opencode``) from
+the child JSONL is tracked separately from the last completed stage.
+
 Diagnostic cutoff: after ``--diagnostic-cutoff-s`` (default 130 s) without
 a delivered turn, the supervisor captures one final stack + process +
 socket + server snapshot and then SIGTERM/SIGKILLs the child's whole
@@ -118,6 +128,7 @@ REAL_ACTIVITY_KINDS = frozenset(
         "bootstrap-start",
         "bootstrap-end",
         "stage-start",
+        "stage-end",
         "delivery",
         "scenario-start",
         "scenario-end",
@@ -331,18 +342,47 @@ def http_split_probe_base_url(base_url: str) -> tuple[str, int]:
     return hostname, port
 
 
-def _install_stack_handler(path: Path) -> None:
-    """Turn SIGUSR1 into a whole-process faulthandler dump (append file)."""
+def _install_stack_handler(
+    path: Path,
+    *,
+    chain: bool = False,
+    warn: Callable[[str], None] | None = None,
+) -> bool:
+    """Turn SIGUSR1 into a nonfatal whole-process faulthandler dump (append).
+
+    ``chain=False`` is mandatory: chaining into the prior/default SIGUSR1
+    disposition terminates the process right after the stack dump. That
+    killed BOTH diagnostic probes at ~20s of child lifetime in the real
+    run 39767853106 (both children exit code -10 == SIGUSR1), truncating
+    the 75s/130s observation windows. The handler must ONLY dump stacks
+    and return; the probe keeps running until its own diagnostic cutoff.
+
+    Returns ``True`` when the handler is registered. On failure the caller
+    is warned (never silent) and the supervisor's readiness sentinel is NOT
+    written, so the supervisor never SIGUSR1s an unregistered child (the
+    default SIGUSR1 action would terminate it).
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         stream = path.open("a", encoding="utf-8")
-        faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=True)
+        faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=chain)
         _HELD_STACK_STREAMS.append(stream)
-    except (OSError, ValueError):
-        pass
+        return True
+    except (OSError, ValueError) as exc:
+        if warn is not None:
+            try:
+                warn("signal-handler-registration-failed:" + type(exc).__name__)
+            except Exception:
+                pass
+        return False
 
 
 _HELD_STACK_STREAMS: list[Any] = []
+
+
+def _stack_handler_ready_path(out_dir: Path, probe: str) -> Path:
+    """Sentinel file proving the child's SIGUSR1 handler is registered."""
+    return out_dir / f"stack-handler-ready-{probe}.txt"
 
 
 class ChildWatchdog(threading.Thread):
@@ -1147,7 +1187,17 @@ def _child_main(argv: dict[str, Any]) -> int:
     out_dir = Path(argv["out_dir"])
     probe = str(argv["probe"])
     sink = EventSink(out_dir / f"probe-{probe}-events.jsonl", process_start=time.monotonic())
-    _install_stack_handler(out_dir / f"stacks-{probe}.txt")
+    registered = _install_stack_handler(
+        out_dir / f"stacks-{probe}.txt",
+        warn=lambda message: sink.emit("stack-handler-failed", detail=str(message)[:64]),
+    )
+    # The parent may only SIGUSR1 the child AFTER this sentinel exists: an
+    # unregistered child would die by default SIGUSR1 disposition.
+    if registered:
+        try:
+            _stack_handler_ready_path(out_dir, probe).write_text(now_iso() + "\n", encoding="utf-8")
+        except OSError:
+            pass
     counters: dict[str, Any] = {"snapshot_index": 0}
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1304,9 +1354,20 @@ class ProbeEvidence:
     status: str = "not-run"
     exit_code: int | None = None
     killed: bool = False
+    # True only when the child was still alive at the supervisor's bound and
+    # the supervisor itself ended it (bounded cutoff shutdown, not abnormal).
+    terminated_at_cutoff: bool = False
     last_stage: str = ""
     last_stage_at_s: float | None = None
     seconds_since_last_stage: float | None = None
+    # Most recent IN-FLIGHT stage reported by a child ``stage-start`` event
+    # (e.g. ``opencode`` while its HTTP reply is pending) — separate from
+    # the snapshot/checkpoint stage, which may be stale.
+    active_stage: str = ""
+    active_stage_ts: str = ""
+    # Last stage the child closed with a ``stage-end`` event.
+    last_completed_stage: str = ""
+    last_completed_stage_elapsed_ms: float | None = None
     last_real_event: str = ""
     last_real_ts: str = ""
     delivered: bool = False
@@ -1322,6 +1383,14 @@ class ProbeEvidence:
     timeline: list[dict[str, Any]] = field(default_factory=list)
     snapshots: int = 0
     raw_lines: int = 0
+
+    @property
+    def exit_signal(self) -> int | None:
+        """Positive signal number when the child died by signal (POSIX)."""
+        code = self.exit_code
+        if code is not None and code < 0 and -int(code) <= 64:
+            return -int(code)
+        return None
 
 
 @dataclass
@@ -1429,6 +1498,22 @@ def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> 
         evidence.server_ready_ms = payload.get("elapsed_ms")
         if payload.get("ok") is False:
             evidence.fail_category = "server-health-failed"
+    elif kind == "stage-start":
+        # In-flight stage marker from the child graph observer: this is the
+        # freshest stage evidence (e.g. ``opencode`` while the OpenCode HTTP
+        # reply is still pending) and is tracked apart from the possibly
+        # stale checkpoint stage.
+        stage = str(payload.get("stage", ""))[:64]
+        if stage:
+            evidence.active_stage = stage
+            evidence.active_stage_ts = str(payload.get("ts", ""))[:20]
+    elif kind == "stage-end":
+        stage = str(payload.get("stage", ""))[:64]
+        if stage:
+            evidence.last_completed_stage = stage
+            elapsed = payload.get("elapsed_ms")
+            if isinstance(elapsed, (int, float)):
+                evidence.last_completed_stage_elapsed_ms = float(elapsed)
     elif kind == "model-send-end":
         evidence.model_elapsed_ms = payload.get("elapsed_ms")
         evidence.connect_ms = payload.get("connect_ms")
@@ -1537,19 +1622,32 @@ def _kill_group(proc: subprocess.Popen, grace_s: float) -> bool:
     return killed
 
 
-def _send_sigusr1(proc: subprocess.Popen) -> None:
-    """Request a whole-process faulthandler dump inside the child."""
+def _send_sigusr1(proc: subprocess.Popen, *, ready_path: Path | None = None) -> bool:
+    """Request a whole-process faulthandler dump inside the child.
+
+    Never signals a child that has not proven (via its ready sentinel) that
+    a SIGUSR1 handler is registered: an unregistered child dies by the
+    default SIGUSR1 termination disposition.
+    """
+    if ready_path is not None and not ready_path.exists():
+        return False
     try:
         proc.send_signal(signal.SIGUSR1)
+        return True
     except (ValueError, OSError):
-        pass
+        return False
 
 
 def _final_supervisor_snapshot(
-    out_dir: Path, proc: subprocess.Popen, evidence: ProbeEvidence, *, kind: str
+    out_dir: Path,
+    proc: subprocess.Popen,
+    evidence: ProbeEvidence,
+    *,
+    kind: str,
+    ready_path: Path | None = None,
 ) -> dict[str, Any]:
     """Terminal snapshot collected by the supervisor (independent of child)."""
-    _send_sigusr1(proc)
+    _send_sigusr1(proc, ready_path=ready_path)
     time.sleep(1.5)
     payload = {
         "type": kind,
@@ -1592,12 +1690,25 @@ def _probe_comment_lines(evidence: ProbeEvidence) -> list[str]:
             )
         else:
             rows.append(f"- last_stage: `{evidence.last_stage}`")
+    if evidence.active_stage:
+        rows.append(f"- active_stage: `{evidence.active_stage}` (in-flight)")
+        if evidence.active_stage_ts:
+            rows.append(f"- active_stage_started_at: `{evidence.active_stage_ts}`")
+    if evidence.last_completed_stage:
+        rows.append(f"- last_completed_stage: `{evidence.last_completed_stage}`")
+    if evidence.last_completed_stage_elapsed_ms is not None:
+        rows.append(f"- last_completed_stage_ms: {evidence.last_completed_stage_elapsed_ms}")
     if evidence.fail_category:
         rows.append(f"- fail_category: `{evidence.fail_category}`")
     if evidence.last_real_event:
         rows.append(f"- last_real_event: `{evidence.last_real_event}`")
     rows.append(f"- snapshots: {evidence.snapshots}")
     rows.append(f"- killed: {str(evidence.killed).lower()}")
+    signal_number = evidence.exit_signal
+    if signal_number is not None:
+        rows.append(f"- exited_by_signal: SIG{signal_number}")
+    elif evidence.terminated_at_cutoff:
+        rows.append("- terminated_at_cutoff: true (bounded diagnostic shutdown)")
     return rows
 
 
@@ -1635,8 +1746,10 @@ def _run_one_probe(
         pgid = None
     sink.emit("supervisor-child-spawn", probe=plan.probe, has_group=pgid is not None)
     started = time.monotonic()
-    # Never signal before the child installed its SIGUSR1 faulthandler
-    # (the default SIGUSR1 action terminates the child).
+    # The supervisor only SIGUSR1s the child after the child wrote its
+    # stack-handler-ready sentinel (faulthandler registered, chain=False);
+    # an unregistered child would die by default SIGUSR1 disposition.
+    stack_ready_path = _stack_handler_ready_path(out_dir, plan.probe)
     last_stack_request = started
     stack_dumps = 0
     last_publish = started
@@ -1651,16 +1764,21 @@ def _run_one_probe(
                 limit_s=round(supervision_limit, 1),
             )
             _final_supervisor_snapshot(
-                out_dir, proc, evidence, kind=f"supervisor-final-snapshot-{plan.probe}"
+                out_dir,
+                proc,
+                evidence,
+                kind=f"supervisor-final-snapshot-{plan.probe}",
+                ready_path=stack_ready_path,
             )
             evidence.killed = _kill_group(proc, DEFAULT_TERMINATE_GRACE_S)
+            evidence.terminated_at_cutoff = True
             if not evidence.delivered and plan.probe == PROBE_SCENARIO2:
                 evidence.status = "still-in-progress-at-probe-end"
             elif evidence.status in ("", "running"):
                 evidence.status = f"child-exit-{proc.returncode}"
             break
         if stack_dumps < MAX_STACK_DUMPS and now - last_stack_request >= STACK_DUMP_EVERY_S:
-            _send_sigusr1(proc)
+            _send_sigusr1(proc, ready_path=stack_ready_path)
             stack_dumps += 1
             last_stack_request = now
         if publisher is not None and now - last_publish >= COMMENT_CADENCE_S:
@@ -1680,8 +1798,12 @@ def _run_one_probe(
         probe=plan.probe,
         status=evidence.status,
         exit_code=None if evidence.exit_code is None else int(evidence.exit_code),
+        exited_by_signal=evidence.exit_signal,
+        terminated_at_cutoff=evidence.terminated_at_cutoff,
         killed=evidence.killed,
         snapshots=evidence.snapshots,
+        active_stage=evidence.active_stage,
+        last_completed_stage=evidence.last_completed_stage,
     )
     return evidence
 
@@ -1691,27 +1813,87 @@ def _run_one_probe(
 # ---------------------------------------------------------------------------
 
 
+INFRASTRUCTURE_FAILURE = "diagnostic-infrastructure-failure"
+
+
+def _abnormal_child_exit(evidence: ProbeEvidence) -> bool:
+    """True when a child died by an unexpected signal (infrastructure fault).
+
+    A supervisor cutoff shutdown (``SIGTERM``/``SIGKILL`` of the whole group
+    at the bounded diagnostic cutoff) is NOT abnormal: it is the documented
+    INCONCLUSIVE observation boundary. A negative non-cutoff exit code
+    (e.g. ``-10`` == SIGUSR1 from the old chained handler) means the
+    diagnostic infrastructure killed its own probe — the observation window
+    was truncated and stage markers from that child are NOT proven cause
+    evidence.
+    """
+    if evidence.terminated_at_cutoff or evidence.status in ("not-run", ""):
+        return False
+    code = evidence.exit_code
+    return code is not None and code < 0
+
+
 def classify_cause(probe_a: ProbeEvidence, probe_b: ProbeEvidence) -> str:
     """Evidence-driven classification; 'stage-unobserved' is named, never guessed.
 
     Direct-model evidence comes first: if a direct model call itself stalls
     or errors, the provider/OpenCode boundary is proven without blaming
     retrieval downstream.
+
+    Children terminated by an unexpected signal (infrastructure fault) are
+    reported ``diagnostic-infrastructure-failure`` — never success and never
+    an evidence-based stage attribution: the observation was truncated, so
+    the retained stage marker is unproven. Stage attribution uses the most
+    recent in-flight ``stage-start`` tracker (e.g. ``opencode``) rather
+    than a stale last-completed checkpoint stage.
     """
     if probe_a.status in ("bootstrap-failed", "not-run"):
         return "local-opencode-server"
     if probe_a.status in ("inactivity-timeout", "network-error", "provider-error"):
         return "model-provider"
+    if _abnormal_child_exit(probe_a):
+        return INFRASTRUCTURE_FAILURE
     if probe_b.status == "bootstrap-failed":
         return "bootstrap-dependency"
+    if _abnormal_child_exit(probe_b):
+        return INFRASTRUCTURE_FAILURE
     if probe_b.delivered:
         return "delivered"
     if probe_b.fail_category.startswith("bootstrap:"):
         return "bootstrap-dependency"
-    stage = (probe_b.last_stage or "").strip()
+    if probe_a.terminated_at_cutoff:
+        # Direct-model probe still in flight at its own cutoff: honest
+        # INCONCLUSIVE boundary, no component may be blamed from it.
+        return "still-in-progress-at-probe-end"
+    stage = (probe_b.active_stage or probe_b.last_stage or "").strip()
     if not stage:
         return "stage-unobserved"
     return _STAGE_COMPONENT.get(stage.casefold(), "stage-unobserved")
+
+
+def overall_exit_code(probe_a: ProbeEvidence, probe_b: ProbeEvidence) -> int:
+    """Truthful supervisor exit code (see the supervisor contract codes).
+
+    0 only for a completed diagnostic, 3 for the legitimate INCONCLUSIVE
+    cutoff observation, 2 for bootstrap lifecycle failures and 5 when the
+    diagnostic infrastructure itself terminated a probe (never success).
+    """
+    if probe_a.status in ("bootstrap-failed",) or probe_b.status in ("bootstrap-failed",):
+        return EXIT_BOOTSTRAP_FAILED
+    classification = classify_cause(probe_a, probe_b)
+    if classification == INFRASTRUCTURE_FAILURE:
+        return EXIT_CHILD_UNEXPECTED
+    inconclusive = (
+        probe_a.terminated_at_cutoff
+        or probe_b.terminated_at_cutoff
+        or probe_b.status == "still-in-progress-at-probe-end"
+        or probe_b.fail_category == "still-in-progress-at-probe-end"
+        or probe_a.status in ("inactivity-timeout", "network-error")
+        or probe_a.status == "still-in-progress-at-probe-end"
+    )
+    if inconclusive and not probe_b.delivered:
+        return EXIT_STILL_IN_PROGRESS
+    return EXIT_OK
 
 
 _NEXT_FIX: dict[str, str] = {
@@ -1769,6 +1951,14 @@ _NEXT_FIX: dict[str, str] = {
         "the exact in-flight call; rerun with deeper stage hooks only if "
         "stacks are not enough. Do not assign an upstream cause."
     ),
+    "diagnostic-infrastructure-failure": (
+        "The diagnostic infrastructure itself terminated the probe (child "
+        "died by an unexpected signal or left no exit record). The "
+        "observation window was truncated, so stage markers in this run "
+        "are NOT proven cause evidence. Re-run this diagnostic unchanged "
+        "to collect a complete window; do not blame model, provider or "
+        "retrieval from this run."
+    ),
     "still-in-progress-at-probe-end": (
         "Extend this diagnostic observation window with one rerun; the "
         "turn may still genuinely progress after the cutoff. INCONCLUSIVE "
@@ -1816,10 +2006,20 @@ def build_final_report(meta: dict[str, Any], probe_a: ProbeEvidence, probe_b: Pr
     ]
     if probe_b.last_stage:
         lines.append(f"- last observed stage: `{probe_b.last_stage}`")
-    if classification == "stage-unobserved":
-        lines.append("- stage=unobserved (explicit: no stage markers arrived)")
+    if probe_b.active_stage:
+        lines.append(f"- in-flight stage: `{probe_b.active_stage}` (stage-start evidence)")
+    if probe_b.last_completed_stage:
+        lines.append(f"- last completed stage: `{probe_b.last_completed_stage}`")
     if probe_b.last_real_event:
         lines.append(f"- last confirmed REAL activity: `{probe_b.last_real_event}`")
+    if classification == INFRASTRUCTURE_FAILURE:
+        lines.append(
+            "- evidence integrity: a probe was terminated by an unexpected "
+            "signal; the observation window is truncated and NO stage-level "
+            "or component-level cause is proven by this run"
+        )
+    if classification == "stage-unobserved":
+        lines.append("- stage=unobserved (explicit: no stage markers arrived)")
     lines.append(f"- snapshots captured: A={probe_a.snapshots}, B={probe_b.snapshots}")
     lines.append(
         f"- child killed by supervisor: A={str(probe_a.killed).lower()}, "
@@ -1837,8 +2037,14 @@ def _evidence_dict(evidence: ProbeEvidence) -> dict[str, Any]:
         "probe": evidence.probe,
         "status": evidence.status,
         "exit_code": evidence.exit_code,
+        "exited_by_signal": evidence.exit_signal,
+        "terminated_at_cutoff": evidence.terminated_at_cutoff,
         "killed": evidence.killed,
         "last_stage": evidence.last_stage,
+        "active_stage": evidence.active_stage,
+        "active_stage_ts": evidence.active_stage_ts,
+        "last_completed_stage": evidence.last_completed_stage,
+        "last_completed_stage_ms": evidence.last_completed_stage_elapsed_ms,
         "last_real_event": evidence.last_real_event,
         "delivered": evidence.delivered,
         "delivered_elapsed_ms": evidence.delivered_elapsed_ms,
@@ -1931,6 +2137,10 @@ def parent_main(args: argparse.Namespace) -> int:
 
     report = build_final_report(meta, probe_a, probe_b)
     (out_dir / "final-report.md").write_text(report + "\n", encoding="utf-8")
+    exit_code = overall_exit_code(probe_a, probe_b)
+    outcome = {EXIT_OK: "complete", EXIT_STILL_IN_PROGRESS: "inconclusive"}.get(
+        exit_code, "failure"
+    )
     result = {
         "schema": SCHEMA_VERSION,
         "run_id": meta["run_id"],
@@ -1943,6 +2153,8 @@ def parent_main(args: argparse.Namespace) -> int:
         "probe_scenario2": _evidence_dict(probe_b),
         "classification": classify_cause(probe_a, probe_b),
         "next_fix": _NEXT_FIX.get(classify_cause(probe_a, probe_b), ""),
+        "exit_code": exit_code,
+        "outcome": outcome,
         "diagnostic_note": (
             "Diagnostic observation window only; not a product qualification "
             "timeout and not a Gate C PASS/FAIL. Still-in-progress at the end "
@@ -1968,6 +2180,8 @@ def parent_main(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
+                "outcome": outcome,
+                "exit_code": exit_code,
                 "classification": result["classification"],
                 "final_report": str(out_dir / "final-report.md"),
                 "artifact": f"aa-gate-c-scenario2-diagnostic-{meta['run_id']}-scenario2",
@@ -1975,7 +2189,7 @@ def parent_main(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
-    return EXIT_OK
+    return exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:
