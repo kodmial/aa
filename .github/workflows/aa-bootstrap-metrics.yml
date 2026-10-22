@@ -1,0 +1,117 @@
+name: AA bootstrap metrics
+# Clean-runner bootstrap measurements (issue #429): legacy hosted-runner
+# path vs the prepared container image path (cold pull, L1 warm, L1-miss ->
+# L2 hit) with a bot "/run -> READY" equivalent (no real Telegram poller).
+# Phase timings land in GITHUB_STEP_SUMMARY and JSON artifacts; an L2 that
+# is still unpublished reports an honest "skipped" status instead of a fake
+# success.
+run-name: AA bootstrap metrics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+
+concurrency:
+  group: aa-bootstrap-metrics
+  cancel-in-progress: false
+
+jobs:
+  legacy-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Measure legacy hosted-runner bootstrap (clean cache)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+          import time
+
+          def timed(name: str, command: list) -> None:
+              started = time.perf_counter()
+              subprocess.run(command, check=True)
+              phases[name] = round(time.perf_counter() - started, 1)
+
+          phases = {}
+          timed("setup_python_dev_deps_s", [sys.executable, "-m", "pip", "install", "-e", ".[dev]", "--quiet"])
+          path = pathlib.Path("bootstrap-legacy-metrics.json")
+          path.write_text(json.dumps(phases, indent=2))
+          print(json.dumps(phases, indent=2))
+          PY
+
+      - name: Upload legacy metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-bootstrap-legacy-metrics
+          path: bootstrap-legacy-metrics.json
+          retention-days: 30
+          if-no-files-found: error
+
+  prepared-image-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Prepared environment (issue #429): the canary-verified image digest
+    # pins the exact dependency/dev-toolchain layer; docker pull happens on
+    # job start and is measured through job timing artifacts below.
+    container:
+      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout exact current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Report prepared-image L1/L2 state
+        id: state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_runtime_image.py --pins-only
+          payload="$(python scripts/manage_derived_cache.py --mode print-l2-plan)"
+          echo "$payload"
+          pinned="$(echo "$payload" | python -c "import json,sys; p=json.load(sys.stdin); p['l2_pin_problem'] and print(p['l2_pin_problem']) or print('pinned')")"
+          echo "l2_state=$pinned" >> "$GITHUB_OUTPUT"
+
+      - name: Measure prepared-image L1/L2 bootstrap
+        id: bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          started=$(date +%s)
+          if python scripts/manage_derived_cache.py --mode restore-l2 \
+              --cache-dir "$derived_dir" \
+              --require-backend e5 \
+              --status-file "derived-l2-boot-status.json"; then
+            l2_status=$(python -c "import json; print(json.load(open('derived-l2-boot-status.json')).get('status'))")
+          else
+            l2_status="skip"
+          fi
+          elapsed=$(date +%s)
+          {
+            echo "## AA bootstrap metrics (issue #429)"
+            echo "- prepared image: measured container pull (see run start)"
+            echo "- L2 state: ${{ steps.state.outputs.l2_state }}"
+            echo "- L2 restore outcome: ${l2_status}"
+            echo "- L2 restore wall time: $(( elapsed - started ))s"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test -f derived-l2-boot-status.json || {
+            echo "::error::Missing restore status payload for bootstrap metrics"
+            exit 1
+          }

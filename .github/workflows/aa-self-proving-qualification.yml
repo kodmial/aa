@@ -58,6 +58,15 @@ jobs:
     # least the owner-required 135 minutes. A repository variable may raise it
     # for exceptional runs but can never lower it below the campaign allowance.
     timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
+    # Issue #429: shared prepared environment. Gate A/B run inside the exact
+    # same canary-verified, digest-pinned GHCR image as the bot runtime and
+    # every other AA job kind; dev tooling (ruff/mypy/pytest) and the pinned
+    # OpenCode CLI are baked in, so no per-job reinstall.
+    container:
+      image: ghcr.io/kodmial/aa-runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
       AA_QUALIFICATION_CAMPAIGN_S: "8100"
@@ -107,22 +116,26 @@ jobs:
           echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
           echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install project and dev dependencies
+      - name: Set up prepared environment (no toolchain reinstall)
+        # Issue #429: the image already carries the exact pinned dev toolchain
+        # (ruff/mypy/pytest/spacy RU model) and the pinned OpenCode CLI; the
+        # app source is installed without resolution. Pin drift fails closed.
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Install AA pinned OpenCode via verified Continuum toolchain
-        uses: ./.github/actions/aa-opencode-toolchain
-        with:
-          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
+          python scripts/verify_runtime_image.py --pins-only
+          pip install -e . --no-deps
+          pin="$(cat docker/opencode.version)"
+          actual="$(opencode --version)"
+          if [[ "$actual" != "$pin" ]]; then
+            echo "::error::OpenCode pin mismatch: image=$actual repo=$pin"
+            exit 1
+          fi
+          pytest --version >/dev/null
+          ruff --version >/dev/null
+          mypy --version >/dev/null
+          python -c "import spacy; spacy.load('ru_core_news_sm')"
+          echo "prepared environment OK (OpenCode $pin, dev toolchain baked)"
 
       - name: Resolve AA-owned conversation models
         id: bot_model
@@ -350,6 +363,13 @@ jobs:
     # leaves a real finalisation reserve for Gate E/F, artifacts and #7
     # publication. The repository variable may raise, never lower, the cap.
     timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}
+    # Issue #429: shared prepared environment (same promoted digest as the
+    # aa-runtime.yml bot job and the Gate A/B job above).
+    container:
+      image: ghcr.io/kodmial/aa-runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       AA_QUALIFICATION_JOB_TIMEOUT_MINUTES: "${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') > 135 && fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES || '135') || 135 }}"
       AA_QUALIFICATION_CAMPAIGN_S: "8100"
@@ -393,23 +413,30 @@ jobs:
           echo "sha=$checked_sha" >> "$GITHUB_OUTPUT"
           echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install project and dev dependencies
+      - name: Set up prepared environment (no toolchain reinstall)
+        if: ${{ needs.qualify.result == 'success' }}
+        # Issue #429: same prepared environment/pin checks as Gate A/B.
+        # Pin drift fails closed; no per-job toolchain reinstall.
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          python scripts/verify_runtime_image.py --pins-only
+          pin="$(cat docker/opencode.version)"
+          actual="$(opencode --version)"
+          if [[ "$actual" != "$pin" ]]; then
+            echo "::error::OpenCode pin mismatch: image=$actual repo=$pin"
+            exit 1
+          fi
+          pytest --version >/dev/null
+          ruff --version >/dev/null
+          mypy --version >/dev/null
+          python -c "import spacy; spacy.load('ru_core_news_sm')"
+          echo "prepared environment OK (OpenCode $pin, dev toolchain baked)"
 
-      - name: Install AA pinned OpenCode via verified Continuum toolchain
+      - name: Install worker in prepared environment
         if: ${{ needs.qualify.result == 'success' }}
-        uses: ./.github/actions/aa-opencode-toolchain
-        with:
-          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
+        shell: bash
+        run: pip install -e . --no-deps
 
       - name: Restore exact AA conversation models from preflight
         id: bot_model
@@ -530,7 +557,40 @@ jobs:
           python scripts/build_corpus_structure.py
           python scripts/prefetch_public_assets.py
           python scripts/prefetch_voice_assets.py
-          python scripts/build_retrieval_index.py --backend e5
+          bootstrap_start=$(date +%s)
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          # Issue #429: strict production backend enforcement for Gate C.
+          # L2 GHCR artifact first (commit-pinned immutable digest only);
+          # on any miss/rejection fall back deterministically, with only a
+          # proven E5-backend index accepted as a hit (never hashing).
+          if python scripts/manage_derived_cache.py --mode restore-l2 \
+              --cache-dir "$derived_dir" \
+              --require-backend e5 \
+              --status-file "derived-l2-status.json"; then
+            l2_status=$(python -c "import json; print(json.load(open('derived-l2-status.json')).get('status'))")
+          else
+            l2_status="skip"
+          fi
+          if [[ "$l2_status" == "hit" ]]; then
+            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
+            {
+              echo "| Gate C bootstrap | outcome | seconds |"
+              echo "| --- | --- | --- |"
+              echo "| L2 GHCR restore (strict E5) | hit | $bootstrap_s |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+            --cache-dir "$derived_dir" \
+            --backend e5 --require-backend e5 \
+            --status-file "derived-l1-status.json"
+          bootstrap_s=$(( $(date +%s) - bootstrap_start ))
+          {
+            echo "| Gate C bootstrap | outcome | seconds |"
+            echo "| --- | --- | --- |"
+            echo "| L2 GHCR restore | ${l2_status} | - |"
+            echo "| L1 restore-or-rebuild (strict E5) | applied | $bootstrap_s |"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
         if: ${{ needs.qualify.result == 'success' }}

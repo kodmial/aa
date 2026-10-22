@@ -49,9 +49,12 @@ artifact and must be validated after restore.
 4. Following a successful image canary, the workflow (using the existing
    `TAP_PAT` required for PR-triggered CI) runs
    `scripts/promote_runtime_image.py --digest sha256:<digest> --apply`.
-   It creates a separate normal PR updating both
-   `docker/aa-runtime.digest` and `aa-runtime.yml` together. No direct
-   writes to protected `main`.
+   It creates a separate normal PR updating `docker/aa-runtime.digest`,
+   `aa-runtime.yml`, both qualification jobs in
+   `aa-self-proving-qualification.yml` and the trusted derived-index
+   publisher `aa-derived-index.yml` together (issue #429: every AA job kind
+   shares the exact same prepared environment — no mixed digests). No
+   direct writes to protected `main`.
 5. CI and automated review must pass before that PR merges. Until this
    stage merges, the **old ubuntu-latest AA runtime is unchanged** and
    `/run` continues to work.
@@ -62,6 +65,25 @@ artifact and must be validated after restore.
 7. A changed dependency manifest during canary triggers a fresh main image
    build rather than promoting stale bytes. Repeated promotion dispatches
    reuse an already open promotion PR for the same digest.
+
+## Prepared qualification/dev toolchain layer (issue #429)
+
+The runtime image also carries the exact pinned qualification toolchain:
+`pytest`, `pytest-asyncio`, `ruff`, `mypy`, `click`, `typer`, `spacy` and
+the `ru-core-news-sm` RU NLP model. Gate A/B (ruff/mypy/pytest) in
+`aa-self-proving-qualification.yml` runs inside the same image, so no
+qualification job reinstalls tools on the hot path. The baked versions
+must stay compatible with the selector ranges in
+`pyproject.toml [project.optional-dependencies]`; the image canary and
+`scripts/verify_runtime_image.py --pins-only` fail closed on drift.
+
+Both qualification jobs validate the prepared environment before work:
+pins check (`verify_runtime_image.py --pins-only`), the exact
+`docker/opencode.version` OpenCode pin, baked dev tool versions and the
+RU spacy model, then `pip install -e . --no-deps` (exact checked-out
+source only). The reusable `.github/actions/aa-opencode-toolchain` action
+remains for the legacy hosted-runner workflows only; `aa-runtime.yml` and
+`aa-self-proving-qualification.yml` consume the pin from the image.
 
 ## Rollback and failure behavior
 

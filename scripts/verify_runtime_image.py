@@ -35,10 +35,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "docker" / "Dockerfile.aa-runtime"
 OPENCODE_VERSION_FILE = ROOT / "docker" / "opencode.version"
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
+INDEX_DIGEST_FILE = ROOT / "docker" / "aa-index.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 DIGEST_RE = re.compile(r"^ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}$")
+INDEX_REFERENCE_RE = re.compile(r"^ghcr\.io/kodmial/aa-index@sha256:[0-9a-f]{64}$")
 ZERO_DIGEST = "0" * 64
 
 EXPECTED_PINS = (
@@ -127,6 +129,78 @@ def check_pins() -> list[str]:
         for line in copy_lines:
             if forbidden in line:
                 errors.append(f"Dockerfile must not COPY {forbidden}")
+    errors += check_dev_pins(docker_text=docker_text, project_text=project_text)
+    return errors
+
+
+_DEV_PIN_RE = re.compile(r'"([A-Za-z0-9_.-]+)==([0-9a-zA-Z.]+)"')
+_DEV_SELECTOR_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*([=<>~!]+)\s*([0-9a-zA-Z.]+)")
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    numbers: list[int] = []
+    for part in value.strip().split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        numbers.append(int(digits) if digits else 0)
+    return tuple(numbers)
+
+
+def _compare_version(left: str, right: str) -> int:
+    left_tuple = _version_tuple(left) or (0,)
+    right_tuple = _version_tuple(right) or (0,)
+    return (left_tuple > right_tuple) - (left_tuple < right_tuple)
+
+
+def _op_satisfied(op: str, want: str, got: str) -> bool:
+    order = _compare_version(got, want)
+    if op == "==":
+        return got == want
+    if op == ">=":
+        return order >= 0
+    if op == "<=":
+        return order <= 0
+    if op == ">":
+        return order > 0
+    if op == "<":
+        return order < 0
+    if op == "~=":
+        return order >= 0
+    return False
+
+
+def check_dev_pins(*, docker_text: str, project_text: str) -> list[str]:
+    """Verify the baked dev/qualification pins stay within the pyproject ranges.
+
+    The prepared environment serves Gate A/B (ruff/mypy/pytest) and Gate C
+    (spacy RU model). Drift between an exact image pin and a relaxed
+    selector range must be visible, never silently stale.
+    """
+    errors: list[str] = []
+    if "[project.optional-dependencies]" not in project_text:
+        return ["pyproject.toml optional-dependencies section is missing"]
+    dev_section = project_text.split("[project.optional-dependencies]")[1].split("[tool.")[0]
+    selectors = [
+        (name, op, version)
+        for name, op, version in re.findall(
+            r'(?m)^\s*"?([A-Za-z0-9_.-]+)\s*(>=|<=|~=?|==|>|<)\s*([0-9][0-9a-zA-Z.]*)',
+            dev_section,
+        )
+    ]
+    if not selectors:
+        return ["pyproject.toml dev selectors are unreadable"]
+    pins: dict[str, str] = {}
+    for name, version in _DEV_PIN_RE.findall(docker_text):
+        pins[name.lower()] = version
+    for name, op, want in selectors:
+        got = pins.get(name.lower())
+        if got is None:
+            errors.append(f"Dockerfile dev layer lacks pin for {name}")
+            continue
+        if not _op_satisfied(op, want, got):
+            errors.append(f"Dockerfile dev pin {name}=={got} violates selector {name}{op}{want}")
+    for required in ("pytest", "ruff", "mypy", "spacy"):
+        if required not in pins:
+            errors.append(f"Dockerfile dev layer lacks {required}")
     return errors
 
 
@@ -157,6 +231,28 @@ def check_digest_wiring(*, allow_placeholder: bool) -> list[str]:
             errors.append("runtime image job lacks GHCR read credentials")
     if "group: aa-bot-runtime" not in workflow_text:
         errors.append("AA must keep the single-poller concurrency group")
+    return errors
+
+
+def check_index_digest_wiring() -> list[str]:
+    """Fail closed on a malformed persistent derived-index L2 pin (issue #429)."""
+    errors: list[str] = []
+    if not INDEX_DIGEST_FILE.is_file():
+        return ["docker/aa-index.digest metadata file is missing"]
+    lines = INDEX_DIGEST_FILE.read_text(encoding="utf-8").strip().splitlines()
+    reference = lines[-1].strip() if lines else ""
+    if not INDEX_REFERENCE_RE.fullmatch(reference):
+        return [f"index digest file malformed: {reference!r}"]
+    if reference.endswith(":" + ZERO_DIGEST):
+        # Placeholder is the honest pre-publication state; the consumer
+        # client refuses it (bounded emergency rebuild policy, issue #429)
+        # so production can never silently trust an unpublished L2 pin.
+        if "L2 publication pin is still a placeholder" not in (
+            ROOT / "src" / "aa" / "retrieval" / "oci_artifact.py"
+        ).read_text(encoding="utf-8"):
+            errors.append("consumer client lacks the fail-closed placeholder policy")
+    if not (ROOT / ".github" / "workflows" / "aa-derived-index.yml").is_file():
+        errors.append("trusted aa-derived-index publisher workflow is missing")
     return errors
 
 
@@ -279,6 +375,39 @@ def check_head_match() -> list[str]:
     return []
 
 
+def check_dev_toolchain() -> list[str]:
+    """Prepared qualification toolchain works (issue #429): no reinstall."""
+    errors: list[str] = []
+    for tool in ("pytest", "ruff", "mypy"):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", tool, "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"dev toolchain {tool} failed: {exc.__class__.__name__}")
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import spacy; spacy.load('ru_core_news_sm'); print('ok')",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if "ok" not in proc.stdout:
+            errors.append("spacy RU model check produced no confirmation")
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"spacy RU model check failed: {exc.__class__.__name__}")
+    return errors
+
+
 def run_check_only_prefetch() -> list[str]:
     errors: list[str] = []
     commands = (
@@ -311,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     errors = check_pins()
     if not args.canary:
         errors += check_digest_wiring(allow_placeholder=args.allow_placeholder_digest)
+    errors += check_index_digest_wiring()
     if errors:
         print(json.dumps({"status": "fail", "errors": errors}, sort_keys=True))
         return 1
@@ -318,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     errors += check_ffmpeg(started_ms=timings)
     errors += check_native_imports(started_ms=timings)
     errors += check_opencode()
+    errors += check_dev_toolchain()
     errors += check_head_match()
     # Identity checks only: --check-only never downloads and prunes nothing
     # except stale local content; the bounded download path stays in workflow.

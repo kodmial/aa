@@ -88,6 +88,14 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/verify_runtime_image.py --pins-only
+          # Issue #429 container hot path: the pinned OpenCode CLI version
+          # always matches the checked-out repository pin (docker/opencode.version).
+          pin="$(cat docker/opencode.version)"
+          actual="$(opencode --version)"
+          if [[ "$actual" != "$pin" ]]; then
+            echo "::error::OpenCode pin mismatch: image=$actual repo=$pin"
+            exit 1
+          fi
           test $(git rev-parse HEAD) = ${{ github.sha }}
 
       - name: Compute public cache keys
@@ -388,8 +396,10 @@ jobs:
           echo "$payload"
           key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_key'])" "$payload")
           fingerprint=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_fingerprint'])" "$payload")
+          actions_key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['actions_key'])" "$payload")
           echo "derived-key=$key" >> "$GITHUB_OUTPUT"
           echo "derived-fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "derived-actions-key=$actions_key" >> "$GITHUB_OUTPUT"
 
       - name: Restore encrypted derived retrieval cache
         id: restore-derived
@@ -398,14 +408,12 @@ jobs:
         with:
           # Exact key only: a stale or foreign bundle must miss safely and
           # rebuild deterministically. No restore-keys fallback here.
+          # Issue #429: the key carries the AA_DERIVED_CACHE_ROTATION
+          # namespace suffix only for evictable L1 storage; the bundle's
+          # internal manifest cache_key stays the exact_content key.
           path: ${{ steps.derived-cache-key.outputs.derived-dir }}
-          key: ${{ steps.derived-cache-key.outputs.derived-key }}
+          key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}
           fail-on-cache-miss: false
-
-      - name: Install AA pinned OpenCode via verified Continuum toolchain
-        uses: ./.github/actions/aa-opencode-toolchain
-        with:
-          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION }}
 
       - name: Resolve AA-owned bot models (not Continuum coding routes)
         id: bot_model
@@ -448,8 +456,49 @@ jobs:
           # Issue #58: encrypted disposable derived retrieval cache.
           # Exact lookup only; miss/stale/corrupt/unavailable transparently
           # rebuilds from the canonical corpus. Disabled cache boots cleanly.
-          python scripts/manage_derived_cache.py --mode restore-or-rebuild \
-            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          # Issue #429: the persistent L2 GHCR artifact is the first lookup
+          # after an Actions-cache eviction (L1). Only a commit-pinned
+          # immutable digest (docker/aa-index.digest) may authorize a pull;
+          # a placeholder pin or any transport/verification failure falls
+          # back to the bounded deterministic emergency rebuild — never to a
+          # mutable tag. Restore is strict: only a proven E5-backend index
+          # (metadata in the restored index.json) counts as a production hit.
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          bootstrap_start=$(date +%s)
+          if python scripts/manage_derived_cache.py --mode restore-l2 \
+              --cache-dir "$derived_dir" \
+              --require-backend e5 \
+              --status-file "${RUNNER_TEMP:-/tmp}/derived-l2-status.json"; then
+            l2_status=$(python -c "import json; print(json.load(open('${RUNNER_TEMP:-/tmp}/derived-l2-status.json')).get('status'))")
+          else
+            l2_status="skip"
+          fi
+          if [[ "$l2_status" == "hit" ]]; then
+            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
+            {
+              echo "| Bootstrap phase (issue #429) | outcome | seconds |"
+              echo "| --- | --- | --- |"
+              echo "| L2 GHCR restore (strict E5) | hit | $bootstrap_s |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "AA derived cache bootstrap: verified L2 hit (strict E5)."
+          else
+            l2_reason="transport-error"
+            if [[ -f "${RUNNER_TEMP:-/tmp}/derived-l2-status.json" ]]; then
+              l2_reason=$(python -c "import json; print(json.load(open('${RUNNER_TEMP:-/tmp}/derived-l2-status.json')).get('reason'))")
+            fi
+            echo "L2 restore did not hit (reason ${l2_reason}); falling back to L1 or bounded emergency rebuild."
+            python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+              --cache-dir "$derived_dir" \
+              --backend e5 --require-backend e5 \
+              --status-file "${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
+            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
+            {
+              echo "| Bootstrap phase (issue #429) | outcome | seconds |"
+              echo "| --- | --- | --- |"
+              echo "| L2 GHCR restore | ${l2_status} | - |"
+              echo "| L1 restore-or-rebuild (strict E5) | applied | $bootstrap_s |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           for tool in book_search book_read book_expand book_section; do
             [[ -f ".opencode/tools/${tool}.ts" ]] || {
@@ -489,8 +538,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           # Exact content-addressed key only; no restore-keys fallback.
+          # Issue #429: rotation-suffixed L1 key namespaces only the
+          # evictable Actions cache; the internal manifest cache_key is the
+          # base content digest, so the bundle always self-validates.
           path: ${{ steps.derived-cache-key.outputs.derived-dir }}
-          key: ${{ steps.derived-cache-key.outputs.derived-key }}
+          key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}
 
       - name: Publish runtime STARTING marker
         shell: bash

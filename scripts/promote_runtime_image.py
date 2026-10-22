@@ -16,6 +16,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
+# Issue #429: every AA job kind must share the exact same prepared
+# environment; promotion propagates the validated digest to the two
+# qualification jobs (aa-self-proving-qualification.yml) and the trusted
+# L2 derived-index publisher in one reviewed PR (no mixed digests).
+QUALIFICATION_WORKFLOW = ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+PUBLISHER_WORKFLOW = ROOT / ".github" / "workflows" / "aa-derived-index.yml"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 IMAGE_RE = re.compile(r"ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}")
 ZERO = "0" * 64
@@ -89,15 +95,33 @@ def main(argv: list[str] | None = None) -> int:
     if new_workflow.count(image_ref) != 1:
         print("promotion must pin exactly one job container", file=sys.stderr)
         return 1
+    sibling_errors: list[str] = []
+    for sibling in (QUALIFICATION_WORKFLOW, PUBLISHER_WORKFLOW):
+        sibling_text = sibling.read_text(encoding="utf-8")
+        if "container:" not in sibling_text:
+            sibling_errors.append(f"{sibling.name} does not use the prepared runtime container")
+            continue
+        sibling_text = IMAGE_RE.sub(image_ref, sibling_text)
+        try:
+            sibling.write_text(sibling_text, encoding="utf-8")
+        except OSError as exc:
+            sibling_errors.append(f"{sibling.name} failed to persist updated digest: {exc}")
     old_digest = DIGEST_FILE.read_text(encoding="utf-8").strip().splitlines()[-1].strip()
     print(f"previous: {old_digest}")
     print(f"validated: {image_ref}")
+    if sibling_errors:
+        for error in sibling_errors:
+            print(error, file=sys.stderr)
+        return 1
     if not args.apply:
         print("dry-run pass; use --apply only after the image canary passed")
         return 0
     DIGEST_FILE.write_text(image_ref + "\n", encoding="utf-8")
     RUNTIME_WORKFLOW.write_text(new_workflow, encoding="utf-8")
-    print("activation files updated; open a PR, run CI/review and merge before /run")
+    print(
+        "activation files updated (runtime + qualification + derived-index "
+        "publisher); open a PR, run CI/review and merge before /run"
+    )
     return 0
 
 
