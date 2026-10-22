@@ -24,8 +24,10 @@ import logging
 import uuid
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
+
+from aa.conversation.delivery_history import provisional_answer
 
 logger = logging.getLogger("aa.conversation.finalization")
 
@@ -1129,7 +1131,7 @@ async def finalize_answer_node(state: Any) -> dict[str, Any]:
         "answer_candidate": candidate.model_dump(mode="json"),
         "verification_certificate": certificate.model_dump(mode="json"),
         "delivery_status": "provisional-certified",
-        "messages": [AIMessage(content=candidate.text)],
+        "messages": [provisional_answer(candidate.text, certificate.certificate_id)],
     }
 
 
