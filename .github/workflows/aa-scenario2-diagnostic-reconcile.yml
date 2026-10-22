@@ -1,0 +1,72 @@
+name: AA scenario2 diagnostic reconcile
+
+# kodmial/aa#425 — AA-owned post-run controller for the single Gate C
+# scenario #2 diagnostic (kodmial/aa#418/#424). Consumes only AA-owned
+# Actions evidence, publishes ONE deterministic privacy-safe triage comment
+# per (sha, run) on operations issue #419, creates at most ONE repair issue
+# per proven instrumentation fingerprint, and (only when no diagnostic run
+# exists for the exact SHA) dispatches the EXISTING diagnostic workflow
+# via workflow_dispatch with the `target_sha` input. There are ZERO
+# ChatGPT/external-LLM dependencies here; this is an operations control
+# plane, never product qualification evidence and never a Gate C verdict.
+
+on:
+  workflow_run:
+    workflows: ["AA Gate C scenario2 diagnostic"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+# Serialize overlapping wake-ups (workflow_run completion + cron + manual
+# dispatch) so a queued duplicate re-reads state and no-ops on idempotent
+# guards instead of creating a second triage comment, repair issue or
+# diagnostic dispatch.
+concurrency:
+  group: aa-scenario2-diagnostic-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout reconciler
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Reconcile scenario2 diagnostic evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # workflow_run trigger: precisely the just-completed diagnostic
+          # run's SHA is a valid evidence target (it may predate main head).
+          TRIAGE_EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY#*/}"
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          EVENT_ARGS=()
+          if [ -n "${TRIAGE_EVENT_SHA}" ]; then
+            EVENT_ARGS+=(--event-sha "${TRIAGE_EVENT_SHA}")
+          fi
+          # Any typed outcome (including blocked evidence and missing runs)
+          # is a successful, truthful reconcile; only lost GitHub access or
+          # malformed input fail this job.
+          python scripts/reconcile_scenario2_diagnostic.py \
+            --owner "${OWNER}" \
+            --repo "${REPO}" \
+            --triage-issue 419 \
+            "${EVENT_ARGS[@]}" \
+            --post
