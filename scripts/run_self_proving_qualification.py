@@ -58,12 +58,14 @@ from aa.qualification.gate_evidence import (  # noqa: E402
     write_evidence_atomic,
 )
 from aa.qualification.gate_latency import (  # noqa: E402
-    MISSING_LIVE_SAMPLES as LATENCY_MISSING_SAMPLES,
-)
-from aa.qualification.gate_latency import (  # noqa: E402
+    INSUFFICIENT_COMPLETED_TURNS,
+    GateLatencyError,
     build_c_series_from_live_summary,
     build_gate_e_evidence,
     evaluate_latency_report,
+)
+from aa.qualification.gate_latency import (  # noqa: E402
+    MISSING_LIVE_SAMPLES as LATENCY_MISSING_SAMPLES,
 )
 from aa.qualification.self_proving import (  # noqa: E402
     MANDATORY_GATES,
@@ -2643,8 +2645,43 @@ def _emit_gate_e_from_evidence(
             runtime,
         )
     # E runs even when C fails semantically: only trustworthy real turn
-    # samples matter, and only a live-trusted C lane owns them.
+    # samples matter, and normally only a live-trusted C lane owns them.
+    # When C is not live-trusted but the lane still carries real
+    # bounded-censored samples (kodmial/aa#417), the blocked category must
+    # honestly say there are no completed successful turns to evaluate —
+    # never that samples are missing.
     if not c_evidence.live_trusted:
+        live_payload_probe = _live_payload_for_gate_e()
+        untrusted_samples = 0
+        if (
+            live_payload_probe is not None
+            and str(live_payload_probe.get("main_sha", live_payload_probe.get("sha", "")) or "")
+            == expected
+            and str(live_payload_probe.get("run_id", live_payload_probe.get("run", "")) or "")
+            == run_id
+        ):
+            try:
+                probe_samples = build_c_series_from_live_summary(live_payload_probe)
+            except GateLatencyError:
+                probe_samples = []
+            untrusted_samples = len(probe_samples)
+        if untrusted_samples > 0:
+            return (
+                GateEvidence(
+                    gate="E",
+                    status="BLOCKED",
+                    sha=expected,
+                    product_fingerprint=product,
+                    runtime_fingerprint=runtime,
+                    failure_category=INSUFFICIENT_COMPLETED_TURNS,
+                    component="slo",
+                    run_id=run_id,
+                    detail=f"c-lane-not-live-trusted:{untrusted_samples}"
+                    " censored/contextual sample(s)",
+                ),
+                product,
+                runtime,
+            )
         return (
             GateEvidence(
                 gate="E",
@@ -2676,8 +2713,6 @@ def _emit_gate_e_from_evidence(
     )
     if external_status not in ("external_send_confirmed", "external_send_unverified"):
         external_status = "external_send_unverified"
-    from aa.qualification.gate_latency import GateLatencyError
-
     try:
         samples = build_c_series_from_live_summary(live_payload)
         report = evaluate_latency_report(

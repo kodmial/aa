@@ -54,6 +54,14 @@ ENV_JOB_STARTED_AT = "AA_QUALIFICATION_JOB_STARTED_AT"
 ENV_JOB_STARTED_MONOTONIC = "AA_QUALIFICATION_JOB_STARTED_MONOTONIC"
 ENV_JOB_TIMEOUT_MINUTES = "AA_QUALIFICATION_JOB_TIMEOUT_MINUTES"
 ENV_DISABLE_WATCHDOG = "AA_QUALIFICATION_WATCHDOG_DISABLED"
+ENV_RECOVERY_ALLOWANCE_S = "AA_QUALIFICATION_WATCHDOG_RECOVERY_ALLOWANCE_S"
+
+# Bounded extra allowance the parent gives the child to finish its own
+# stalled-turn abort/restart once the child declares, through the progress
+# marker, that recovery is in progress (kodmial/aa#417). The child's own
+# per-scenario no-progress abort fires first; the parent escalates only if
+# the declared recovery never lands. Both layers share one lifecycle.
+DEFAULT_RECOVERY_ALLOWANCE_S = 150.0
 
 # 135-minute campaign minus the 900-second finalisation reserve. The parent
 # never consumes the reserve, so Gate E/F, artifacts and #7 publication still
@@ -125,6 +133,11 @@ def scenario_inactivity_s() -> float:
     negative evidence.
     """
     return _positive_float(ENV_SCENARIO_INACTIVITY_S, DEFAULT_SCENARIO_INACTIVITY_S)
+
+
+def recovery_allowance_s() -> float:
+    """Extra time granted to a declared child-side stall recovery."""
+    return _positive_float(ENV_RECOVERY_ALLOWANCE_S, DEFAULT_RECOVERY_ALLOWANCE_S)
 
 
 def qualification_campaign_s() -> float:
@@ -461,6 +474,7 @@ def _timeout_lane(
     scenario_total = _safe_int(progress.get("scenario_total"), 18)
     last_index = _safe_int(progress.get("scenario_index"), 0)
     family = str(progress.get("family", "unknown"))[:64]
+    last_active_stage = str(progress.get("last_active_stage", ""))[:64]
     timeout_entry = {
         "scenario_index": last_index,
         "family": family,
@@ -471,6 +485,15 @@ def _timeout_lane(
         "completed_scenario_count": completed,
         "scenario_total": scenario_total,
         "elapsed_ms": round(elapsed_s * 1000.0, 1),
+        # The child-side attribution survives with the parent marker: the
+        # last observed stage and request evidence are the stall diagnosis,
+        # never an arbitrary wall-clock cutoff (kodmial/aa#417).
+        "last_active_stage": last_active_stage,
+        "request_state": str(progress.get("request_state", ""))[:48],
+        "request_started": bool(progress.get("request_started", False)),
+        "request_progress_observable": str(
+            progress.get("request_progress_observable", "progress-unobservable")
+        )[:48],
     }
     if not any(isinstance(item, Mapping) and item.get("watchdog_timeout") for item in diagnostics):
         diagnostics.append(timeout_entry)
@@ -497,6 +520,17 @@ def _timeout_lane(
         "watchdog_last_real_progress_at": progress.get("last_real_progress_at"),
         "watchdog_last_real_progress_monotonic": progress.get("last_real_progress_monotonic"),
         "watchdog_last_real_progress_phase": str(progress.get("last_real_progress_phase", ""))[:64],
+        # Child-owned stalled-turn recovery evidence (kodmial/aa#417): the
+        # last stage, request state and bounded cleanup summary of the
+        # scenario the watchdog had to preempt.
+        "watchdog_last_active_stage": last_active_stage,
+        "watchdog_request_state": str(progress.get("request_state", ""))[:48],
+        "watchdog_request_progress_observable": str(
+            progress.get("request_progress_observable", "progress-unobservable")
+        )[:48],
+        "watchdog_stall_cleanup": dict(progress.get("cleanup", {}))
+        if isinstance(progress.get("cleanup", {}), Mapping)
+        else {},
         "exact_sha": main_sha,
         "scenario_diagnostics": diagnostics,
         "turn_latency_samples": samples,
@@ -584,9 +618,21 @@ def supervise_live_gate_c(
                 float(last_real) if isinstance(last_real, (int, float)) else started_monotonic
             )
             # A scenario deadline written by the child is intentionally
-            # ignored (kodmial/aa#412): only real progress or the campaign
-            # budget can end a healthy slow response.
+            # ignored (kodmial/aa#412): only real progress, the declared
+            # child-side recovery window, or the campaign budget can end a
+            # healthy slow response.
             if now_monotonic - last_real_at >= inactivity_s:
+                recovery_active = bool(last_progress.get("stall_recovery_in_progress")) is True
+                recovery_started = last_progress.get("stall_recovery_started_monotonic")
+                recovery_age = 0.0
+                if isinstance(recovery_started, (int, float)):
+                    recovery_age = max(0.0, now_monotonic - float(recovery_started))
+                if recovery_active and recovery_age <= recovery_allowance_s():
+                    # The child owns this stall: it aborts at its own
+                    # scenario inactivity bound and publishes a typed
+                    # recovery marker; hold the trigger inside the
+                    # declared bounded window.
+                    continue
                 trigger = "no-real-progress"
                 break
         if trigger:
@@ -644,6 +690,7 @@ def supervise_live_gate_c(
 __all__ = [
     "DEFAULT_CAMPAIGN_S",
     "DEFAULT_FINALISATION_RESERVE_S",
+    "DEFAULT_RECOVERY_ALLOWANCE_S",
     "DEFAULT_SCENARIO_GRACE_S",
     "DEFAULT_SCENARIO_INACTIVITY_S",
     "DEFAULT_TOTAL_DEADLINE_S",
@@ -652,6 +699,7 @@ __all__ = [
     "ENV_JOB_STARTED_AT",
     "ENV_JOB_STARTED_MONOTONIC",
     "ENV_JOB_TIMEOUT_MINUTES",
+    "ENV_RECOVERY_ALLOWANCE_S",
     "ENV_CAMPAIGN_S",
     "ENV_PROGRESS_PATH",
     "ENV_SCENARIO_GRACE_S",
@@ -662,6 +710,7 @@ __all__ = [
     "progress_path_from_env",
     "qualification_campaign_s",
     "read_live_progress",
+    "recovery_allowance_s",
     "record_live_progress",
     "scenario_grace_s",
     "scenario_inactivity_s",

@@ -41,12 +41,14 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from aa.telegram.transport import TelegramIncoming
 
 logger = logging.getLogger("aa.telegram.dispatcher")
 
 TurnProcessor = Callable[[TelegramIncoming], Awaitable[None]]
+ProcessWrapper = Callable[[TurnProcessor], TurnProcessor]
 
 
 class ChatQueueFullError(Exception):
@@ -82,6 +84,7 @@ class ChatTurnDispatcher:
         if per_chat_queue_size <= 0:
             raise ValueError("per_chat_queue_size must be > 0")
         self._process = process
+        self._process_wrapper: ProcessWrapper | None = None
         self._max_concurrent_turns = max_concurrent_turns
         self._per_chat_queue_size = per_chat_queue_size
         self._semaphore = asyncio.Semaphore(max_concurrent_turns)
@@ -166,8 +169,85 @@ class ChatTurnDispatcher:
             raise ChatQueueFullError(f"chat queue is full for chat {incoming.chat_id}")
         worker.queue.put_nowait(incoming)
 
+    def _turn_processor(self) -> TurnProcessor:
+        """The effective turn processor (optional attribution wrapper applied)."""
+        processor = self._process
+        if self._process_wrapper is not None:
+            return self._process_wrapper(processor)
+        return processor
+
+    def set_process_wrapper(self, wrapper: ProcessWrapper | None) -> None:
+        """Bind a per-turn wrapper (attribution/cancellation seam).
+
+        Must only be called before the first worker starts or when no turn
+        is in flight; wrappers are applied to every subsequently started
+        per-chat worker. Used by qualification to stamp each turn with its
+        privacy-safe causality identity (kodmial/aa#417).
+        """
+        self._process_wrapper = wrapper
+
+    def in_flight(self, chat_id: int) -> bool:
+        """Whether a queued or active turn still exists for ``chat_id``."""
+        worker = self._workers.get(chat_id)
+        if worker is None:
+            return False
+        return worker.task is not None and not worker.task.done()
+
+    async def cancel_chat(self, chat_id: int, *, grace_s: float = 5.0) -> dict[str, Any]:
+        """Cancel the abandoned turn work for one chat (kodmial/aa#417).
+
+        Stops accepting further deliveries from an aborted/stalled
+        scenario turn: the per-chat worker task is cancelled, the pending
+        queue is drained (dropped, not backlogged), and termination is
+        awaited for ``grace_s``. Returns a bounded privacy-safe summary:
+        whether the worker stopped inside the grace, how many queued turns
+        were dropped, and whether an active task is still running after
+        the deadline (non-cooperative; the caller owns the isolate/restart
+        escalation).
+        """
+        if grace_s <= 0:
+            raise ValueError("grace_s must be > 0")
+        worker = self._workers.pop(chat_id, None)
+        dropped = 0
+        if worker is None:
+            return {
+                "had_worker": False,
+                "stopped_within_grace": True,
+                "dropped_queued_turns": 0,
+                "non_cooperative": False,
+            }
+        dropped = worker.queue.qsize()
+        while True:
+            try:
+                worker.queue.get_nowait()
+                worker.queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        cancelled = False
+        if worker.task is not None and not worker.task.done():
+            worker.task.cancel()
+            cancelled = True
+        stopped_within_grace = True
+        non_cooperative = False
+        if worker.task is not None and not worker.task.done():
+            # Bounded, cancellation-immune observation: ``asyncio.wait``
+            # never propagates cancellation into the observed task, so a
+            # turn that swallows its cancellation request cannot make this
+            # shutdown hang (kodmial/aa#417). The caller owns escalation.
+            await asyncio.wait({worker.task}, timeout=grace_s)
+            stopped_within_grace = worker.task.done()
+            non_cooperative = not stopped_within_grace
+        return {
+            "had_worker": True,
+            "cancelled": cancelled,
+            "stopped_within_grace": stopped_within_grace,
+            "dropped_queued_turns": dropped,
+            "non_cooperative": non_cooperative,
+        }
+
     async def _run_chat(self, worker: _ChatWorker) -> None:
         """Serialize one chat's turns FIFO, bounded globally by semaphore."""
+        processor = self._turn_processor()
         try:
             while True:
                 try:
@@ -177,7 +257,7 @@ class ChatTurnDispatcher:
                 try:
                     async with self._semaphore:
                         try:
-                            await self._process(incoming)
+                            await processor(incoming)
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -208,4 +288,9 @@ class ChatTurnDispatcher:
                 self._workers.pop(worker.chat_id, None)
 
 
-__all__ = ["ChatQueueFullError", "ChatTurnDispatcher", "TurnProcessor"]
+__all__ = [
+    "ChatQueueFullError",
+    "ChatTurnDispatcher",
+    "ProcessWrapper",
+    "TurnProcessor",
+]

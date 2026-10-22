@@ -982,7 +982,7 @@ jobs:
                 .filter(trustObservationComment)
                 .map(comment => String(comment.body || ''))
                 .filter(body => body.includes(prefix))
-                .map(body => Number(body.match(/(?:Repair|Systemic) recurrence: \`(\d+)\`/)?.[1] || 0));
+                .map(body => Number(body.match(/(?:Repair|Systemic|Diagnostic) recurrence: \`(\d+)\`/)?.[1] || 0));
               const recordedForCurrentRun = bodyRecordsRun(issue, kind) ||
                 comments
                   .filter(trustObservationComment)
@@ -1003,6 +1003,218 @@ jobs:
                 })
               );
               return true;
+            }
+            // kodmial/aa#417 P0 diagnostic infrastructure issues: a typed
+            // stalled-turn timeout is never a product-semantic verdict, so
+            // it must not spawn code-mutation searches. Exactly ONE
+            // idempotent diagnostic issue exists per diagnostic class
+            // (fingerprint excludes the main SHA); it starts
+            // automation:blocked and only auto-escalates to
+            // automation:ready after the same class is observed on a
+            // distinct main SHA. Bodies carry fixed-vocabulary evidence
+            // only: never prompts, message bodies, user text, or secrets.
+            async function ensureDiagnosticIssues(admission) {
+              const entries = Array.isArray(admission && admission.diagnostics)
+                ? admission.diagnostics
+                : [];
+              const classes = [];
+              for (const entry of entries) {
+                const diagnosticClass = String((entry && entry.diagnostic_class) || '').trim();
+                if (diagnosticClass && !classes.includes(diagnosticClass)) {
+                  classes.push(diagnosticClass);
+                }
+              }
+              if (!classes.length) return;
+              for (const diagnosticClass of classes) {
+                const marker = '<!-- aa-self-proving-diagnostic-infrastructure:v1 -->';
+                const fingerprint = diagnosticClass;
+                const failure = productFailures[
+                  Number(entries.find(item =>
+                    item && item.diagnostic_class === diagnosticClass
+                  )?.index ?? -1)
+                ] || null;
+                const gate = failure ? String(failure.gate || '') : '';
+                const failureCategory = failure
+                  ? String(failure.failure_category || '')
+                  : diagnosticClass;
+                const component = failure ? String(failure.component || '') : '';
+                // Newest typed stall evidence from the live lane (counts and
+                // closed vocabulary only).
+                let stall = null;
+                try {
+                  const live = JSON.parse(
+                    fs.readFileSync('live-out/product-contract-live-summary.json', 'utf8')
+                  );
+                  const lane = (live.lanes || []).find(
+                    item => item && item.lane === 'live-telegram-evidence'
+                  );
+                  const laneDiagnostics = (((lane || {}).metrics) || {}).scenario_diagnostics;
+                  const stallLike = (Array.isArray(laneDiagnostics) ? laneDiagnostics : [])
+                    .filter(item =>
+                      item &&
+                      (item.delivery_timeout === true ||
+                        String(item.timeout_reason || '').length > 0)
+                    )
+                    .filter(item =>
+                      diagnosticClass === 'infrastructure-timeout'
+                        ? item.timeout_category !== undefined
+                        : true
+                    );
+                  if (stallLike.length) stall = stallLike[stallLike.length - 1];
+                } catch (error) {
+                  core.info('No live stall evidence for diagnostic issue: ' + error.message);
+                }
+                let existing = issues
+                  .filter(issue => !issue.pull_request && String(issue.body || '').includes(marker))
+                  .find(issue =>
+                    String(issue.body || '').includes(`Diagnostic fingerprint: \`${fingerprint}\``)
+                  );
+                if (!existing) {
+                  // First observation: create the SINGLE bounded diagnostic
+                  // task, blocked so nothing dispatches code mutation.
+                  const body = [
+                    marker,
+                    '## P0 diagnostic infrastructure (non-mutating)',
+                    '',
+                    `Diagnostic class: \`${diagnosticClass}\``,
+                    `Diagnostic fingerprint: \`${fingerprint}\``,
+                    gate ? `Gate: \`${gate}\`` : 'Gate: `unknown`',
+                    `Latest failure category: \`${failureCategory}\``,
+                    component ? `Component: \`${component}\`` : null,
+                    `Main SHA: \`${sha}\``,
+                    `Qualification run: \`${runId}\``,
+                    'Diagnostic recurrence: `1`',
+                    '',
+                    '### Typed stall evidence',
+                    '',
+                    stall
+                      ? [
+                          `Last active stage: \`${String((stall.last_active_stage || 'unknown')).slice(0, 64)}\``,
+                          `Timeout category: \`${String((stall.timeout_category || 'unknown')).slice(0, 32)}\``,
+                          `Timeout reason: \`${String((stall.timeout_reason || 'unknown')).slice(0, 32)}\``,
+                          `Request state: \`${String((stall.request_state || 'unconfirmed-in-flight')).slice(0, 48)}\``,
+                          `Request progress: \`${String((stall.request_progress_observable || 'progress-unobservable')).slice(0, 48)}\``,
+                          `Stage elapsed ms: \`${Math.round(Number(stall.stage_elapsed_ms || 0))}\``,
+                          `Delivery latency ms: \`${Math.round(Number(stall.delivery_latency_ms || 0))}\``,
+                          cleanupLine(stall),
+                        ].filter(Boolean).join('\n')
+                      : '- Typed stall evidence unavailable in the live lane summary.',
+                    '',
+                    '### Required diagnostic behavior',
+                    '',
+                    '- This is an infrastructure/harness diagnosis task: do NOT mutate product code to chase this failure.',
+                    '- A stalled turn with `progress-unobservable` may reflect server-side streaming behavior that the pinned local request audit cannot observe; attribute honestly instead of inventing a cause.',
+                    '- Repair must preserve the no-fixed-wall-clock bounds and the bounded recovery lifecycle introduced for this failure class.',
+                    '- Include a generic regression test (real timing behavior), not a literal qualification prompt.',
+                    '',
+                    'This issue is generated and refreshed automatically; the same diagnostic class reopens this issue instead of creating another one.',
+                  ].filter(Boolean).join('\n');
+                  const created = await apiRetry('create P0 diagnostic infrastructure issue', () =>
+                    github.rest.issues.create({
+                      owner,
+                      repo,
+                      title: `P0 DIAGNOSTIC: ${diagnosticClass} (Gate ${gate || 'unknown'})`,
+                      body,
+                      labels: ['priority:p0', 'automation:blocked'],
+                    })
+                  );
+                  core.warning(
+                    `Created one P0 diagnostic infrastructure issue #${created.data.number}` +
+                    ` for class ${diagnosticClass}; currently blocked, auto-escapes on recurrence.`
+                  );
+                } else {
+                  const recorded = await runAlreadyRecorded(existing, 'diagnostic');
+                  if (recorded) {
+                    core.notice('Diagnostic observation already recorded for run ' + runId);
+                    continue;
+                  }
+                  const legacyRecurrence = Number(
+                    String(existing.body || '').match(/Diagnostic recurrence: \`(\d+)\`/)?.[1] || 1
+                  );
+                  const recurrence = await nextObservationRecurrence(existing, 'diagnostic', legacyRecurrence);
+                  // Distinct-SHA escalation: same diagnostic class seen again
+                  // on a different resolved main SHA means the infrastructure
+                  // repair need is real, not a one-off.
+                  const comments = await issueHistory(existing.number);
+                  const recordedShas = new Set(
+                    [String(existing.body || '')]
+                      .concat(comments.filter(trustObservationComment).map(c => String(c.body || '')))
+                      .map(body => body.match(/Main SHA: \`([0-9a-f]{40})\`/)?.[1])
+                      .filter(Boolean)
+                  );
+                  recordedShas.add(sha);
+                  const recurringDifferentSha = recordedShas.size >= 2;
+                  const labels = (issueLabelNames(existing) || [])
+                    .filter(name => name !== 'automation:ready')
+                    .filter(name => !recurringDifferentSha || name !== 'automation:blocked');
+                  if (recurringDifferentSha && !labels.includes('automation:ready')) {
+                    labels.push('automation:ready');
+                  }
+                  if (recurringDifferentSha) {
+                    core.warning(
+                      'Diagnostic class ' + diagnosticClass +
+                      ' recurred on a distinct main SHA; auto-eligible automation:ready.'
+                    );
+                  }
+                  await apiRetry('refresh P0 diagnostic issue labels', () =>
+                    github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: existing.number,
+                      state: 'open',
+                      labels,
+                    })
+                  );
+                  await postObservation(existing, 'diagnostic', [
+                    'Diagnostic recurrence: `' + recurrence + '`',
+                    gate ? 'Gate: `' + gate + '`' : 'Gate: `unknown`',
+                    'Latest failure category: `' + failureCategory + '`',
+                    component ? 'Component: `' + component + '`' : null,
+                    'Main SHA: `' + sha + '`',
+                    'Qualification run: `' + runId + '`',
+                    stall
+                      ? [
+                          'Last active stage: `' +
+                            String((stall.last_active_stage || 'unknown')).slice(0, 64) + '`',
+                          'Timeout category: `' +
+                            String((stall.timeout_category || 'unknown')).slice(0, 32) + '`',
+                          'Request state: `' +
+                            String((stall.request_state || 'unconfirmed-in-flight')).slice(0, 48) + '`',
+                          'Request progress: `' +
+                            String((stall.request_progress_observable || 'progress-unobservable'))
+                              .slice(0, 48) + '`',
+                          cleanupLine(stall),
+                        ].filter(Boolean).join('\n')
+                      : '- Typed stall evidence unavailable in the live lane summary.',
+                  ]);
+                  if (recurringDifferentSha) {
+                    await apiRetry('wake issue scheduler for P0 diagnostic', () =>
+                      github.rest.actions.createWorkflowDispatch({
+                        owner,
+                        repo,
+                        workflow_id: 'continuum-issue-scheduler.yml',
+                        ref: 'main',
+                      })
+                    );
+                  }
+                }
+              }
+              return;
+              function cleanupLine(entry) {
+                const cleanup = entry && entry.cleanup;
+                if (!cleanup || typeof cleanup !== 'object') {
+                  return '- Stall cleanup evidence: `unavailable`.';
+                }
+                const summary = [
+                  'chat_cancelled=' + (cleanup.chat_cancelled ? 'true' : 'false'),
+                  'non_cooperative=' + (cleanup.non_cooperative ? 'true' : 'false'),
+                  'runtime_restarted=' + (cleanup.runtime_restarted ? 'true' : 'false'),
+                  'quarantined_deliveries=' + Number(cleanup.quarantined_delivery_count || 0),
+                  'stopped_within_grace=' + (cleanup.stopped_within_grace ? 'true' : 'false'),
+                  'reason=' + String(cleanup.reason || 'unknown').slice(0, 32),
+                ].join(', ');
+                return '- Stall cleanup: `' + summary + '`.';
+              }
             }
             let category = 'unknown-gate-failure';
             let blocking = 'unknown';
@@ -1263,6 +1475,13 @@ jobs:
               admission.actionable.length + ' held=' + admission.held.length);
             for (const held of admission.held) {
               core.notice('repair-policy held gate ' + held.gate + ': ' + held.reason);
+            }
+            try {
+              await ensureDiagnosticIssues(admission);
+            } catch (error) {
+              // Diagnostic bookkeeping never blocks mutation routing or the
+              // verdict itself.
+              core.warning('P0 diagnostic issue maintenance failed: ' + error.message);
             }
             if (!Array.isArray(admission.actionable) || admission.actionable.length === 0) {
               core.notice('FAIL/UNQUALIFIED evidence is preserved. No proven new code mutation admitted.');
@@ -1852,6 +2071,138 @@ jobs:
               core.warning(
                 `Product Contract remains unqualified at exact main ${sha}; self-proving repair loop continues from Gate ${blocking}.`
               );
+            }
+
+      - name: Reconcile stale repair reservations
+        # kodmial/aa#417: a repair issue marked automation:in-progress that
+        # produced neither an open opencode/issue<N>-* pull request nor an
+        # in-flight continuum run is a stale reservation. Without
+        # reconciliation such a reservation permanently deadlocks the issue
+        # scheduler: no other repair can start. Return the issue to
+        # automation:ready so work resumes without owner action. Evidence is
+        # deterministic (open PR head branch prefix, in-flight/queued
+        # continuum runs, bounded freshness window) and carries no message
+        # content.
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const REPAIR_MARKERS = [
+              '<!-- aa-self-proving-repair:v1 -->',
+              '<!-- aa-self-proving-systemic-escalation:v1 -->',
+              '<!-- aa-self-proving-diagnostic-infrastructure:v1 -->',
+            ];
+            const FRESHNESS_MS = 15 * 60 * 1000;
+            const recoveryMarker = number =>
+              '<!-- aa-self-proving-reservation-recovery:v1 issue=' + number + ' -->';
+            async function apiRetry(label, fn) {
+              let delayMs = 5000;
+              for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                  return await fn();
+                } catch (error) {
+                  if (attempt === 5) throw error;
+                  core.warning(
+                    `${label} failed on attempt ${attempt}: ${error.message}; retrying in ${delayMs}ms.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, delayMs));
+                  delayMs = Math.min(delayMs * 2, 60000);
+                }
+              }
+            }
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', per_page: 100,
+            });
+            const reservations = issues.filter(issue =>
+              !issue.pull_request &&
+              (issue.labels || []).some(label => label.name === 'automation:in-progress') &&
+              REPAIR_MARKERS.some(marker => String(issue.body || '').includes(marker))
+            );
+            if (!reservations.length) {
+              core.info('No automation:in-progress repair reservations to reconcile.');
+              return;
+            }
+            const openPulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', per_page: 100,
+            });
+            // In-flight or queued continuum work is reservation evidence; the
+            // run name (e.g. "OpenCode issue #417") associates it with the
+            // issue deterministically instead of parsing prompt text.
+            const activeRuns = [];
+            for (const workflowId of ['continuum-opencode.yml', 'continuum-opencode-repair.yml']) {
+              for (const status of ['in_progress', 'queued']) {
+                try {
+                  const response = await github.rest.actions.listWorkflowRuns({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    workflow_id: workflowId, status, per_page: 100,
+                  });
+                  for (const run of response.data.workflow_runs || []) {
+                    activeRuns.push(String(run.name || '') + ' ' + String(run.head_branch || ''));
+                  }
+                } catch (error) {
+                  core.warning('Could not list ' + workflowId + ' runs (' + status + '): ' + error.message);
+                }
+              }
+            }
+            const activeRunsText = activeRuns.join(' | ');
+            for (const issue of reservations) {
+              const issueNumber = Number(issue.number);
+              const hasRelatedPull = openPulls.some(pull => {
+                const ref = String(pull?.head?.ref || '');
+                return ref.startsWith('opencode/issue' + issueNumber + '-');
+              });
+              const hasActiveRun = new RegExp(
+                'OpenCode issue #' + issueNumber + '(?![0-9])'
+              ).test(activeRunsText);
+              const reservationAgeMs = Date.now() - Date.parse(issue.updated_at);
+              if (hasRelatedPull || hasActiveRun || reservationAgeMs < FRESHNESS_MS) {
+                core.info(
+                  'Reservation on #' + issueNumber + ' still has live evidence: ' +
+                  (hasRelatedPull ? 'open opencode pull request' : '') +
+                  (hasActiveRun ? (hasRelatedPull ? ' + ' : '') + 'in-flight continuum run' : '') +
+                  (reservationAgeMs < FRESHNESS_MS ? ' + fresh reservation age' : '')
+                );
+                continue;
+              }
+              const commentSearch = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, per_page: 100,
+              });
+              const alreadyRecovered = commentSearch.some(comment =>
+                String(comment.body || '').includes(recoveryMarker(issueNumber)) &&
+                comment.user?.login === 'github-actions[bot]'
+              );
+              const labels = (issue.labels || [])
+                .map(label => label.name)
+                .filter(name => name !== 'automation:in-progress');
+              if (!labels.includes('automation:ready')) labels.push('automation:ready');
+              await apiRetry('release stale reservation on #' + issueNumber, () =>
+                github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, state: 'open', labels,
+                })
+              );
+              if (!alreadyRecovered) {
+                await apiRetry('record stale reservation recovery on #' + issueNumber, () =>
+                  github.rest.issues.createComment({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    body: [
+                      recoveryMarker(issueNumber),
+                      'Stale reservation reconciled automatically: the repair issue was marked' +
+                      ' `automation:in-progress` but produced no open `opencode/issue' + issueNumber +
+                      '-*` pull request and no in-flight continuum run for at least 15 minutes.',
+                      'Returned to `automation:ready` so the issue scheduler can re-dispatch it.',
+                    ].join('\n'),
+                  })
+                );
+              } else {
+                core.info('Recovery already recorded for #' + issueNumber + '; labels refreshed only.');
+              }
+              core.warning('Released stale reservation on repair issue #' + issueNumber + '.');
             }
 
       - name: Handle provider 429 runner retire

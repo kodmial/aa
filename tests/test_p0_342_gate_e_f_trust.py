@@ -425,6 +425,38 @@ def test_emit_e_blocked_when_c_not_live_trusted(
         expected=SHA, run_id="run-9", out_dir=out_dir
     )
     assert evidence.status == "BLOCKED"
+    # Real samples exist but the C lane is not live-trusted, so they cannot
+    # pass to the SLO: the blocked category must honestly report not enough
+    # trustworthy completed turns instead of claiming samples are missing
+    # (kodmial/aa#417).
+    assert evidence.failure_category == "insufficient-completed-turns"
+
+
+def test_emit_e_missing_samples_when_no_live_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    out_dir = tmp_path / "self-proving-out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    c_body = build_evidence_body(
+        gate="C",
+        status="BLOCKED",
+        sha=SHA,
+        product_fingerprint=PRODUCT,
+        runtime_fingerprint=RUNTIME,
+        component="live-production-path",
+        failure_category="live-evidence-required",
+        run_id="run-9",
+        subchecks=[],
+        live_trusted=False,
+    )
+    (out_dir / GATE_EVIDENCE_FILES["C"]).write_text(
+        json.dumps(sign_evidence_body(c_body)) + "\n", encoding="utf-8"
+    )
+    evidence, _, _ = runner._emit_gate_e_from_evidence(
+        expected=SHA, run_id="run-9", out_dir=out_dir
+    )
+    assert evidence.status == "BLOCKED"
     assert evidence.failure_category == "missing-live-samples"
 
 
