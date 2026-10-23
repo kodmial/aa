@@ -17,11 +17,12 @@ The live vocabulary is the closed tuple `_INTERNAL_TERMS` in
 `src/aa/conversation/turn_pipeline.py`. Matching is a casefolded,
 Unicode-token-bounded rule match performed BEFORE the semantic verifier
 is invoked, so no leaky draft ever reaches a verifier call and no draft
-text travels in telemetry: `matched_internal_rule` returns only the
+text travels in telemetry: `_matched_internal_rule` returns only the
 fixed rule id from the module's own vocabulary and `_verify_draft`
 attaches `detail=f"rule:{term}"` (`source=local`, stage `verification`).
-A rule matches only as a whole token or phrase, never embedded inside a
-longer ordinary word.
+A Latin rule matches only as a whole token or phrase, never embedded
+inside a longer ordinary word; Cyrillic rules also accept inflected
+continuations (see limitation 4).
 
 ## Audit tables
 
@@ -98,7 +99,10 @@ historical English rules (`corpus`, `retrieval`, `grounding`,
 block. The trailing boundary means Latin plurals are not matched
 morphologically, so `embeddings` is listed explicitly rather than
 widening the family (which would also match ordinary `providers` and
-`planners`).
+`planners`). This is the accepted product tradeoff: other Latin plurals
+such as `planners`, `qualifications` and `retrievals` remain outside the
+guard because the strict token boundary deliberately avoids blocking
+ordinary English word forms.
 
 ## Documented limitations (separate defects; #450 scope deliberately leaves them)
 
@@ -122,3 +126,12 @@ widening the family (which would also match ordinary `providers` and
 3. **No live-draft knowledge in CI.** The verdicts above are pinned on
    schematizations of the live reports; the actual live drafts after
    #450 are only observed in the next live-side qualification run.
+4. **Cyrillic stems accept inflected continuations.** Unlike the Latin
+   trailing boundary, Cyrillic rules match `(?<!\w)term\w*` so Russian
+   case endings (`эмбеддинги`, `риранка`, `фаиссе`) cannot bypass the
+   guard. This is intentionally broader than the Latin-side token
+   boundary; the audit samples found no ordinary book-grounded word
+   that shares a guarded stem, and unrelated prefix words such as
+   `корпус здания` / `векторный анализ` stay allowed (pinned in
+   `test_cyrillic_unrelated_prefix_allowed`). A future collision would
+   require narrowing the inflection set rather than removing the rule.

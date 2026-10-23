@@ -378,7 +378,7 @@ async def generate_dialogue_reply(
                 _Cause.bounded(_GUARD_LANG, "generation", "local", detail="output-language"),
             )
         return None
-    matched_rule = matched_internal_rule(text)
+    matched_rule = _matched_internal_rule(text)
     if matched_rule:
         if telemetry is not None:
             _attach(
@@ -662,7 +662,7 @@ def contains_cyrillic(text: str) -> bool:
     return _CYRILLIC_RE.search(text) is not None
 
 
-def matched_internal_rule(text: str) -> str:
+def _matched_internal_rule(text: str) -> str:
     """Return the closed-vocabulary internal-terms rule matched by ``text``.
 
     Issue #450 privacy contract: telemetry records only the fixed rule id
@@ -679,7 +679,7 @@ def matched_internal_rule(text: str) -> str:
 
 def leaks_internal_terms(text: str) -> bool:
     """Whether user-visible text exposes hidden mechanics."""
-    return matched_internal_rule(text) != ""
+    return _matched_internal_rule(text) != ""
 
 
 # Issue #450: closed vocabulary of typed causes that reject a draft
@@ -1273,7 +1273,7 @@ async def _verify_draft(
                 _Cause.bounded("guard-language", "verification", "local", detail="draft-language"),
             )
         return units, None, False
-    matched_rule = matched_internal_rule(draft)
+    matched_rule = _matched_internal_rule(draft)
     if matched_rule:
         logger.info("v2 draft failed language/leak guard")
         if telemetry is not None:
@@ -2667,7 +2667,8 @@ async def run_v2_answer_turn(
         on a regeneration that would then be skipped as a doomed
         ``failed`` repair. The actual verifier slice is recomputed after
         regeneration because the call itself consumes time; if it can no
-        longer serve a verifier call, the repair fails closed without
+        longer serve a verifier call, the repair fails closed and is
+        reported as ``budget-blocked`` (not as a content failure) without
         attempting a doomed re-verification.
         """
         return _remaining_budget_s() >= TURN_ANSWER_MIN_SLICE_S and _verifier_slice_ready(
@@ -3105,6 +3106,9 @@ async def run_v2_answer_turn(
                 },
             )
         else:
+            # ``wider`` only selects a generation window; the pre-provided
+            # pack is reused as-is and this call never re-plans or
+            # retrieves (the same-pack guarantee of issue #450).
             _guard_regen = await _draft_with_pack(
                 pack,
                 user_message,
@@ -3126,7 +3130,7 @@ async def run_v2_answer_turn(
                 # consumed time.
                 _guard_slice = _verifier_round_budget()
                 if not _verifier_slice_ready(_guard_slice):
-                    telemetry["local_guard_repair_status"] = "failed"
+                    telemetry["local_guard_repair_status"] = "budget-blocked"
                     logger.info(
                         "v2 local-guard repair re-verify skipped for end-to-end budget",
                         extra={"category": "local-guard-repair-budget"},
@@ -5370,7 +5374,6 @@ __all__ = [
     "keep_supported_text",
     "keep_supported_units",
     "leaks_internal_terms",
-    "matched_internal_rule",
     "merge_pack_dicts",
     "narrowed_grounding_state",
     "outbound_safety_category",

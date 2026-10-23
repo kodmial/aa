@@ -275,6 +275,35 @@ def test_guard_allows_containing_word_collisions(allowed: str) -> None:
     assert leaks_internal_terms(allowed) is False
 
 
+@pytest.mark.parametrize(
+    "blocked",
+    (
+        "эмбеддинги",  # plural inflection of guarded "эмбеддинг"
+        "риранка",  # genitive of "риранк"
+        "фаиссе",  # prepositional of "фаисс"
+    ),
+)
+def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
+    """Russian case endings on guarded terms are intentionally blocked."""
+    from aa.conversation.turn_pipeline import leaks_internal_terms
+
+    assert leaks_internal_terms(blocked) is True
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    (
+        "корпус здания",  # unrelated word sharing a prefix with "корпус текстов"
+        "векторный анализ",  # unrelated word sharing a prefix with "векторная база"
+    ),
+)
+def test_cyrillic_unrelated_prefix_allowed(allowed: str) -> None:
+    """Unrelated Russian words sharing a prefix with a guarded phrase are allowed."""
+    from aa.conversation.turn_pipeline import leaks_internal_terms
+
+    assert leaks_internal_terms(allowed) is False
+
+
 @pytest.mark.parametrize("term", _HISTORICAL_TERMS_KEEP_COVERAGE)
 def test_unmodified_terms_keep_blocking(term: str) -> None:
     from aa.conversation.turn_pipeline import leaks_internal_terms
@@ -327,7 +356,7 @@ async def test_guard_cause_records_closed_rule_id_only() -> None:
     """Typed cause detail carries the closed rule id, never draft text."""
     from aa.conversation.answer_causality import GUARD_INTERNAL_TERMS, TELEMETRY_CAUSE_KEY
     from aa.conversation.turn_pipeline import _INTERNAL_TERMS as rule_set
-    from aa.conversation.turn_pipeline import _verify_draft, matched_internal_rule
+    from aa.conversation.turn_pipeline import _matched_internal_rule, _verify_draft
 
     class _StubModel:
         pass
@@ -352,7 +381,7 @@ async def test_guard_cause_records_closed_rule_id_only() -> None:
     assert "_LEAKY_SEARCH_QUERY_DRAFT" not in detail
     assert "переписал" not in detail
     assert len(detail) <= 64
-    assert matched_internal_rule(_LEAKY_SEARCH_QUERY_DRAFT) == rule_id
+    assert _matched_internal_rule(_LEAKY_SEARCH_QUERY_DRAFT) == rule_id
 
 
 def test_language_gate_single_cyrillic_limitation_is_documented() -> None:
@@ -497,6 +526,49 @@ async def test_no_budget_blocks_regeneration_honestly(
     assert telemetry["verifier_outcome"] == "local-guard"
     assert telemetry["local_guard_repair_status"] == "budget-blocked"
     assert telemetry["local_guard_regen_attempts"] == 0
+    assert telemetry["turn_budget_exceeded"] is True
+
+
+async def test_budget_lost_during_regeneration_reports_budget_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission succeeds but the re-verify slice is gone after drafting.
+
+    The repair must report a budget boundary (``budget-blocked``), not a
+    content failure, and must not attempt a doomed verifier call.
+    """
+    import aa.conversation.turn_pipeline as turn_pipeline
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    state = {"budget": 105.0}
+
+    def _budget() -> float:
+        return state["budget"]
+
+    monkeypatch.setattr(turn_pipeline, "_effective_turn_budget_s", _budget)
+    counters = _forbid_planner_and_retrieval(monkeypatch)
+    answer = _ScriptedAnswer([_LEAKY_SEARCH_QUERY_DRAFT, _SAFE_HELP_1])
+    original_ainvoke = answer.ainvoke
+
+    async def _ainvoke(messages: Any) -> AIMessage:
+        result = await original_ainvoke(messages)
+        if answer.calls == 2:
+            # Regeneration succeeded, but it consumed the remaining
+            # end-to-end budget before re-verification.
+            state["budget"] = -1.0
+        return result
+
+    monkeypatch.setattr(answer, "ainvoke", _ainvoke)
+    verifier = _ScriptedVerifier([_supported_verdict()])
+    with pytest.raises(TurnFailed) as exc:
+        await run_v2_answer_turn(**_base_turn(answer=answer, verifier=verifier))
+
+    assert counters == {"planner": 0, "retrieval": 0}
+    assert verifier.calls == 0
+    telemetry = dict(exc.value.telemetry)
+    assert telemetry["local_guard_regen_attempts"] == 1
+    assert telemetry["local_guard_repair_status"] == "budget-blocked"
     assert telemetry["turn_budget_exceeded"] is True
 
 
