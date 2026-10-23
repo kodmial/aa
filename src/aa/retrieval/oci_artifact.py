@@ -468,6 +468,11 @@ def _upload_blob(registry: OCIRegistry, session: _AuthSession, blob: bytes, dige
     if not location:
         raise ArtifactError("l2-push-failed", "blob upload carried no upload location")
     for _hop in range(4):
+        # GHCR may return a registry-relative Location (RFC 7231), not an
+        # absolute URL. Resolve only a single-slash path against this registry;
+        # scheme-relative locations must not redirect uploads to another host.
+        if location.startswith("/") and not location.startswith("//"):
+            location = registry.base_url() + location
         separator = "&" if "?" in location else "?"
         put_url = f"{location}{separator}digest={urllib.parse.quote(digest)}"
         status, headers, _ = session.request(
