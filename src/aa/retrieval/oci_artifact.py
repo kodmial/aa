@@ -123,12 +123,17 @@ class _Challenge:
 
 
 def _parse_challenge(header: str, *, repository: str) -> _Challenge | None:
-    """Parse ``WWW-Authenticate: Bearer realm=...,service=...,scope=...``."""
+    """Parse ``WWW-Authenticate: Bearer realm=...,service=...,scope=...``.
+
+    kodmial/aa#462: values are quoted, and a quoted value may itself carry
+    commas (GHCR scopes such as ``"repository:org/pkg:push,pull"``), so
+    the field separator is only a comma outside double quotes.
+    """
     if not header.strip().lower().startswith("bearer"):
         return None
     body = header.strip()[len("bearer") :].strip()
     fields: dict[str, str] = {}
-    for part in body.split(","):
+    for part in re.split(r',(?=(?:[^"]*"[^"]*")*[^"]*$)', body):
         key_raw, sep, value_raw = part.partition("=")
         if not sep:
             continue
@@ -194,7 +199,14 @@ class _AuthSession:
             raise ArtifactError("l2-authentication", "invalid token realm scheme")
         if not self._realm_host_allowed(parsed.netloc):
             raise ArtifactError("l2-authentication", "token realm host does not match the registry")
-        params: dict[str, str] = {"scope": scope}
+        # kodmial/aa#462: the WWW-Authenticate challenge scope is
+        # authoritative. GHCR answers HTTP 403 when the token request uses
+        # an abstract capability such as ``scope=pull``; only the fully
+        # qualified documented scope (``repository:<name>:<actions>``
+        # asserted by the challenge itself) is valid at its token realm.
+        # The requested fallback scope is used only when a challenge
+        # carries no scope at all.
+        params: dict[str, str] = {"scope": challenge.scope or scope}
         if challenge.service:
             params["service"] = challenge.service
         query = urllib.parse.urlencode(params)
@@ -519,6 +531,10 @@ def pull_artifact(
     )
     if status == 404:
         raise ArtifactError("l2-manifest-missing", "pinned manifest does not exist")
+    if status == 403:
+        # kodmial/aa#462: an authenticated-but-denied pull is a package ACL
+        # result, not a transport failure; report the exact safe category.
+        raise ArtifactError("l2-access-denied", "registry denied the manifest pull: http 403")
     if status != 200:
         raise ArtifactError("l2-registry-unavailable", f"manifest get failed with http {status}")
     if digest_bytes(body) != digest:
@@ -552,6 +568,8 @@ def pull_artifact(
             method="GET",
             auth_scope="pull",
         )
+        if blob_status == 403:
+            raise ArtifactError("l2-access-denied", "registry denied the blob pull: http 403")
         if blob_status != 200:
             raise ArtifactError(
                 "l2-blob-missing", f"blob {layer_digest[:20]} failed with http {blob_status}"

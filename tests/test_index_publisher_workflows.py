@@ -134,3 +134,84 @@ def test_promotion_scripts_keep_digest_pin_consistency() -> None:
     )
     assert "aa-self-proving-qualification.yml" in promote_runtime
     assert "aa-derived-index.yml" in promote_runtime
+
+
+# --- kodmial/aa#462: scoped ephemeral packages token on trusted L2 steps ----
+
+
+def test_runtime_trusted_l2_step_exports_scoped_ephemeral_token() -> None:
+    text = RUNTIME.read_text(encoding="utf-8")
+    # The runtime keeps its existing named permissions including the
+    # packages pull grant for the prebuilt image and the aa-index package.
+    permissions_block = text.split("permissions:", 1)[1].split("\nconcurrency:", 1)[0]
+    assert "packages: read" in permissions_block
+    # Never a write grant for the read-only runtime path.
+    assert "packages: write" not in permissions_block
+    # Only the trusted L2 restore invocation step carries the scoped
+    # ephemeral repo token: exactly one occurrence, exported through the
+    # env of the step that performs the actual digest-pinned restore.
+    assert text.count("AA_INDEX_PACKAGES_TOKEN") == 1
+    env_index = text.index("AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}")
+    step_index = text.rindex("Build and validate AA knowledge runtime", 0, env_index)
+    l2_invocation_index = text.index("--mode restore-l2 \\", env_index)
+    assert step_index < env_index < l2_invocation_index
+    # Ephemeral github token only: never a PAT and never an Actions-cache
+    # style global env export near the L2 invocation.
+    line = text[env_index : env_index + 120].splitlines()[0]
+    assert line.strip() == "AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}"
+    assert "TAP_PAT" not in line
+    assert ">> $GITHUB_ENV" not in line
+
+
+def test_qualification_trusted_l2_step_exports_scoped_ephemeral_token() -> None:
+    text = QUALIFICATION.read_text(encoding="utf-8")
+    permissions_block = text.split("permissions:", 1)[1].split("\nconcurrency:", 1)[0]
+    # kodmial/aa#462: each pre-existing named permission is preserved and
+    # `packages: read` is added; nothing is removed and nothing escalated.
+    permission_lines = sorted(
+        line.strip()
+        for line in permissions_block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    assert permission_lines == [
+        "actions: write",
+        "contents: write",
+        "issues: write",
+        "packages: read",
+    ]
+    # Only the trusted Gate C bootstrap step carries the scoped token.
+    assert text.count("AA_INDEX_PACKAGES_TOKEN") == 1
+    env_index = text.index("AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}")
+    step_index = text.rindex("Bootstrap exact production book/index", 0, env_index)
+    l2_invocation_index = text.index("--mode restore-l2 \\", env_index)
+    assert step_index < env_index < l2_invocation_index
+    # Ephemeral github token only: never a PAT and never a global export.
+    line = text[env_index : env_index + 120].splitlines()[0]
+    assert line.strip() == "AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}"
+    assert "TAP_PAT" not in line
+    assert ">> $GITHUB_ENV" not in line
+
+
+def test_packages_token_export_scope_every_workflow() -> None:
+    # kodmial/aa#462: the scoped ephemeral token may only be exported on
+    # the trusted runtime L2 step, the trusted Gate C L2 step, and
+    # (pre-existing, issue #429) the trusted L2 publisher container. No
+    # other step carries it, and no PAT ever injects the token value.
+    allowed = {
+        "aa-runtime.yml": "${{ github.token }}",
+        "aa-self-proving-qualification.yml": "${{ github.token }}",
+        "aa-derived-index.yml": "${{ secrets.GITHUB_TOKEN }}",
+    }
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        count = text.count("AA_INDEX_PACKAGES_TOKEN")
+        expected = count > 0
+        assert expected == (path.name in allowed), path.name
+        if expected:
+            marker_index = text.index("AA_INDEX_PACKAGES_TOKEN:")
+            line = text[marker_index : marker_index + 120].splitlines()[0]
+            assert line.strip() == f"AA_INDEX_PACKAGES_TOKEN: {allowed[path.name]}", line
+            assert "TAP_PAT" not in line, line
+        for line in text.splitlines():
+            if "AA_INDEX_PACKAGES_TOKEN" in line:
+                assert ">> $GITHUB_ENV" not in line, line

@@ -601,6 +601,9 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
             args,
         )
     staging_dir = _l2_staging_dir(args)
+    # kodmial/aa#462: safe elapsed-ms diagnostics for the L2 attempt (pull
+    # duration only); never any credential, header, or response body data.
+    pull_started = time.perf_counter()
     registry, session = _l2_session(args)
     # Issue #461 staging isolation: only the L2-owned staging directory is
     # ever written or cleared by this command. The preexisting L1 cache
@@ -626,6 +629,7 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
                 "reason": exc.category,
                 "source": "l2",
                 "l2_digest": pinned_digest,
+                "l2_pull_ms": round((time.perf_counter() - pull_started) * 1000.0, 1),
                 "cache_fingerprint": key.fingerprint,
             },
             args,
@@ -642,6 +646,7 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = dict(result)
     payload["source"] = "l2"
     payload["l2_digest"] = pinned_digest
+    payload["l2_pull_ms"] = round((time.perf_counter() - pull_started) * 1000.0, 1)
     # Verified-hit staging is cleaned too: the bootstrap caller saves the
     # validated state into the L1 cache directory through the existing
     # save path, never by mutating it from this L2 command.
