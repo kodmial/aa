@@ -109,21 +109,23 @@ ordinary English word forms.
 
 Unlike the Latin trailing boundary, Cyrillic rules accept Russian case
 endings so `эмбеддинги`, `риранка` and `фаиссе` cannot bypass the guard.
-For a multi-word rule every word is matched by its conservative stem, so
-`векторной базе` and `корпуса текстов` are blocked as well as the exact
-phrases. The stemmer strips productive adjective/noun endings
-iteratively (longest first), so stacked and less common forms such as
-`векторною базою`, `корпусами текстами` and `векторного хранилища`
-reduce to the same guarded root; these forms are pinned in
-`test_cyrillic_inflected_forms_blocked` and
-`test_cyrillic_stem_reduces_stacked_endings`. It is a closed-vocabulary
-stemmer, not a general morphological analyzer: every guarded root is
-stable across its Russian forms. The audit samples found no ordinary
-book-grounded word that shares a guarded stem, and unrelated prefix
-words such as `корпус здания` / `векторный анализ` stay allowed (pinned
-in `test_cyrillic_unrelated_prefix_allowed`). A future ordinary-word
-collision would require narrowing the inflection set rather than
-removing the rule.
+For a multi-word rule every word is anchored on an explicit audited
+stable root from `_CYRILLIC_WORD_ROOTS` and accepts any word
+continuation, so `векторной базе`, `корпуса текстов` and `векторною
+базою` are blocked as well as the exact phrases. The suffix table is
+only used to normalize the canonical rule word; it is not re-applied to
+draft text. Consequently an inflectional ending that is absent from
+`_CYRILLIC_INFLECTION_SUFFIXES` (for example the diminutive
+`векторненькая` or the augmentative `корпусище`) still matches, as
+pinned in `test_cyrillic_endings_outside_suffix_table_blocked`. Every
+current guarded word has an explicit root, enforced by
+`test_cyrillic_word_roots_cover_every_guarded_phrase_word`, so a future
+rule word cannot silently rely on suffix stripping. The audit samples
+found no ordinary book-grounded word that shares a guarded root, and
+unrelated prefix words such as `корпус здания` / `векторный анализ`
+stay allowed (pinned in `test_cyrillic_unrelated_prefix_allowed`). A
+future ordinary-word collision would require narrowing the inflection
+set rather than removing the rule.
 
 ## Documented limitations (separate defects; #450 scope deliberately leaves them)
 
@@ -147,3 +149,10 @@ removing the rule.
 3. **No live-draft knowledge in CI.** The verdicts above are pinned on
    schematizations of the live reports; the actual live drafts after
    #450 are only observed in the next live-side qualification run.
+4. **Stem alternation needs an explicit audited root.** The matcher is
+   not a general morphological analyzer. A future guarded word whose
+   stem alternates (fleeting vowel or suppletion) must list every
+   alternant in `_CYRILLIC_WORD_ROOTS`. The audit test requires an
+   explicit entry for every current rule word, so an unaudited word
+   fails CI instead of silently bypassing the guard. The current closed
+   vocabulary contains no stem-alternating word.

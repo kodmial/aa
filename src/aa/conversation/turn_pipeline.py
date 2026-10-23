@@ -638,15 +638,14 @@ _INTERNAL_TERMS = (
     "корпус текстов",
 )
 
-# Conservative Russian inflection suffixes for the guarded words. The
-# guard strips productive adjective/noun endings iteratively (longest
-# first) so a multi-word phrase cannot be bypassed by inflecting any of
-# its words, including stacked or irregular-looking case endings such as
-# "векторною базою" or "корпусами текстами". Stems shorter than three
-# characters are left exact so short prepositions ("по") do not become
-# broad prefixes. This is a closed-vocabulary stemmer, not a general
-# morphological analyzer: every guarded root is stable across its Russian
-# forms and the full productive case set is pinned by regression tests.
+# Conservative Russian inflection suffixes for deriving the root of a
+# guarded word. The matcher below does not re-apply this table to draft
+# text: it anchors each word on an audited root and accepts any word
+# continuation, so an ending absent from this table cannot become a
+# bypass. The table only normalizes the canonical rule word itself.
+# Stems shorter than three characters are left exact so short
+# prepositions ("по") do not become broad prefixes. This is a
+# closed-vocabulary helper, not a general morphological analyzer.
 _CYRILLIC_INFLECTION_SUFFIXES = tuple(
     sorted(
         {
@@ -754,11 +753,42 @@ def _cyrillic_stem(word: str) -> str:
     return word
 
 
+# Audited stable roots for every word used by the closed Cyrillic
+# phrase vocabulary. Multi-word matching anchors each word on one of
+# these roots and accepts any continuation, so no inflectional ending
+# (including endings absent from _CYRILLIC_INFLECTION_SUFFIXES) can
+# bypass the guard. A word whose stem alternates (fleeting vowel or
+# suppletion) must list every alternant here; the audit test requires an
+# explicit entry for every current rule word, so a future rule word
+# cannot silently fall back to suffix stripping without review.
+_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
+    "база": ("баз",),
+    "бм25": ("бм25",),
+    "векторная": ("векторн",),
+    "векторное": ("векторн",),
+    "корпус": ("корпус",),
+    "корпусу": ("корпус",),
+    "по": ("по",),
+    "поиск": ("поиск",),
+    "риранк": ("риранк",),
+    "текстов": ("текст",),
+    "фаисс": ("фаисс",),
+    "хранилище": ("хранилищ",),
+    "эмбеддинг": ("эмбеддинг",),
+}
+
+
 def _cyrillic_word_fragment(word: str) -> str:
-    """Build one token fragment that accepts a Russian case ending."""
+    """Build one token fragment that accepts any Russian continuation."""
     if len(word) <= 3:
         return re.escape(word)
-    return rf"{re.escape(_cyrillic_stem(word))}\w*"
+    roots = _CYRILLIC_WORD_ROOTS.get(word)
+    if roots is None:
+        # Defensive fallback for a newly added word. The audit test
+        # below fails until it is given an explicit audited root.
+        roots = (_cyrillic_stem(word),)
+    alternation = "|".join(re.escape(root) for root in roots)
+    return rf"(?:{alternation})\w*"
 
 
 def _internal_term_pattern_source(term: str) -> str:
