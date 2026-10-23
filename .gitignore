@@ -53,3 +53,6 @@ runtime-status.json
 gate-*.done
 # Workflow-owned crash-recovery progress metadata (never product code).
 /.continuum-429-stage
+
+# Continuum cancellation helper is workflow-owned, never an AA submodule.
+/.continuum-cancel-engine/
