@@ -83,32 +83,28 @@ def redact_string(text: str) -> str:
     return _BEARER_PATTERN.sub(REDACTED, redacted)
 
 
+def _redact_value(value: Any) -> Any:
+    """Recursively redact strings and mappings inside nested sequences."""
+    if isinstance(value, dict):
+        return redact_mapping(value)
+    if isinstance(value, str):
+        return redact_string(value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item) for item in value]
+    return value
+
+
 def redact_mapping(data: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``data`` with sensitive values redacted."""
     redacted: dict[str, Any] = {}
     for key, value in data.items():
-        if key.lower() in PRIVATE_IDENTIFIER_KEYS:
+        lower_key = key.lower()
+        if lower_key in PRIVATE_IDENTIFIER_KEYS:
             redacted[key] = REDACTED
-        elif key.lower() in SENSITIVE_KEYS:
-            if isinstance(value, str):
-                redacted[key] = redact_secret(value)
-            else:
-                redacted[key] = REDACTED
-        elif isinstance(value, str):
-            redacted[key] = redact_string(value)
-        elif isinstance(value, dict):
-            redacted[key] = redact_mapping(value)
-        elif isinstance(value, (list, tuple)):
-            redacted[key] = [
-                redact_mapping(v)
-                if isinstance(v, dict)
-                else redact_string(v)
-                if isinstance(v, str)
-                else v
-                for v in value
-            ]
+        elif lower_key in SENSITIVE_KEYS:
+            redacted[key] = redact_secret(value) if isinstance(value, str) else REDACTED
         else:
-            redacted[key] = value
+            redacted[key] = _redact_value(value)
     return redacted
 
 
