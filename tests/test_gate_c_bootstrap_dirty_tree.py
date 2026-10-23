@@ -265,7 +265,9 @@ def test_placeholder_pin_rejected_inside_clean_repo(tmp_path: pathlib.Path) -> N
     committed_pin = _REPO / "docker" / "aa-index.digest"
     assert committed_pin.is_file(), "committed L2 pin file is part of the repository contract"
     placeholder_pin = tmp_path / "placeholder.digest"
-    placeholder_pin.write_text("ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8")
+    placeholder_pin.write_text(
+        "ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8"
+    )
     proc = _manager(
         "--mode",
         "restore-l2",
