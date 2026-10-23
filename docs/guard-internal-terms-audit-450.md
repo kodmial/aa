@@ -23,7 +23,7 @@ attaches `detail=f"rule:{term}"` (`source=local`, stage `verification`).
 A Latin rule matches only as a whole token or phrase, never embedded
 inside a longer ordinary word; Cyrillic rules also accept inflected
 continuations on every word of a phrase, not only the final one (see
-limitation 4).
+Cyrillic inflection handling).
 
 ## Audit tables
 
@@ -105,6 +105,26 @@ such as `planners`, `qualifications` and `retrievals` remain outside the
 guard because the strict token boundary deliberately avoids blocking
 ordinary English word forms.
 
+## Cyrillic inflection handling
+
+Unlike the Latin trailing boundary, Cyrillic rules accept Russian case
+endings so `эмбеддинги`, `риранка` and `фаиссе` cannot bypass the guard.
+For a multi-word rule every word is matched by its conservative stem, so
+`векторной базе` and `корпуса текстов` are blocked as well as the exact
+phrases. The stemmer strips productive adjective/noun endings
+iteratively (longest first), so stacked and less common forms such as
+`векторною базою`, `корпусами текстами` and `векторного хранилища`
+reduce to the same guarded root; these forms are pinned in
+`test_cyrillic_inflected_forms_blocked` and
+`test_cyrillic_stem_reduces_stacked_endings`. It is a closed-vocabulary
+stemmer, not a general morphological analyzer: every guarded root is
+stable across its Russian forms. The audit samples found no ordinary
+book-grounded word that shares a guarded stem, and unrelated prefix
+words such as `корпус здания` / `векторный анализ` stay allowed (pinned
+in `test_cyrillic_unrelated_prefix_allowed`). A future ordinary-word
+collision would require narrowing the inflection set rather than
+removing the rule.
+
 ## Documented limitations (separate defects; #450 scope deliberately leaves them)
 
 1. **Single-Cyrillic language gate.** `contains_cyrillic` accepts any
@@ -127,17 +147,3 @@ ordinary English word forms.
 3. **No live-draft knowledge in CI.** The verdicts above are pinned on
    schematizations of the live reports; the actual live drafts after
    #450 are only observed in the next live-side qualification run.
-4. **Cyrillic stems accept inflected continuations.** Unlike the Latin
-   trailing boundary, Cyrillic rules accept Russian case endings so
-   `эмбеддинги`, `риранка` and `фаиссе` cannot bypass the guard. For a
-   multi-word rule every word is matched by its conservative stem, so
-   `векторной базе` and `корпуса текстов` are blocked as well as the
-   exact phrases. This is intentionally broader than the Latin-side
-   token boundary; the audit samples found no ordinary book-grounded
-   word that shares a guarded stem, and unrelated prefix words such as
-   `корпус здания` / `векторный анализ` stay allowed (pinned in
-   `test_cyrillic_unrelated_prefix_allowed`). This is lightweight stem
-   truncation, not a morphological analyzer: an irregular form outside
-   the suffix table may still need an explicit rule, and a future
-   ordinary-word collision would require narrowing the inflection set
-   rather than removing the rule.

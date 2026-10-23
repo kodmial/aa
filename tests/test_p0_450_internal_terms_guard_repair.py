@@ -285,6 +285,10 @@ def test_guard_allows_containing_word_collisions(allowed: str) -> None:
         "векторном хранилище",  # inflected both words of "векторное хранилище"
         "поиска по корпусу",  # inflected first word of "поиск по корпусу"
         "корпуса текстов",  # inflected first word of "корпус текстов"
+        "векторною базою",  # instrumental case ending on both words
+        "векторного хранилища",  # genitive ending on both words
+        "поисками по корпусам",  # plural instrumental endings
+        "корпусами текстами",  # plural instrumental endings
     ),
 )
 def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
@@ -292,6 +296,23 @@ def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
     from aa.conversation.turn_pipeline import leaks_internal_terms
 
     assert leaks_internal_terms(blocked) is True
+
+
+@pytest.mark.parametrize(
+    ("word", "stem"),
+    (
+        ("базою", "баз"),
+        ("векторною", "векторн"),
+        ("корпусами", "корпус"),
+        ("текстами", "текст"),
+        ("хранилищами", "хранилищ"),
+    ),
+)
+def test_cyrillic_stem_reduces_stacked_endings(word: str, stem: str) -> None:
+    """Iterative stripping reduces stacked/less common endings to the root."""
+    from aa.conversation.turn_pipeline import _cyrillic_stem
+
+    assert _cyrillic_stem(word) == stem
 
 
 @pytest.mark.parametrize(

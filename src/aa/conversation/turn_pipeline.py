@@ -639,14 +639,19 @@ _INTERNAL_TERMS = (
 )
 
 # Conservative Russian inflection suffixes for the guarded words. The
-# guard is not a morphological analyzer: it strips one common adjective/
-# noun ending from each Cyrillic word so a multi-word phrase cannot be
-# bypassed by inflecting any of its words ("векторной базе", "корпуса
-# текстов"). Stems shorter than three characters are left exact so short
-# prepositions ("по") do not become broad prefixes.
+# guard strips productive adjective/noun endings iteratively (longest
+# first) so a multi-word phrase cannot be bypassed by inflecting any of
+# its words, including stacked or irregular-looking case endings such as
+# "векторною базою" or "корпусами текстами". Stems shorter than three
+# characters are left exact so short prepositions ("по") do not become
+# broad prefixes. This is a closed-vocabulary stemmer, not a general
+# morphological analyzer: every guarded root is stable across its Russian
+# forms and the full productive case set is pinned by regression tests.
 _CYRILLIC_INFLECTION_SUFFIXES = tuple(
     sorted(
-        (
+        {
+            "иями",
+            "ьями",
             "ыми",
             "ими",
             "ого",
@@ -655,6 +660,14 @@ _CYRILLIC_INFLECTION_SUFFIXES = tuple(
             "ему",
             "ами",
             "ями",
+            "ать",
+            "ять",
+            "еть",
+            "иях",
+            "иям",
+            "ьям",
+            "ьях",
+            "ием",
             "ая",
             "яя",
             "ое",
@@ -674,11 +687,32 @@ _CYRILLIC_INFLECTION_SUFFIXES = tuple(
             "им",
             "ов",
             "ев",
+            "ёв",
             "ей",
+            "ёй",
             "ам",
             "ям",
             "ах",
             "ях",
+            "ия",
+            "ии",
+            "ию",
+            "ью",
+            "ьи",
+            "ье",
+            "ья",
+            "ут",
+            "ют",
+            "ат",
+            "ят",
+            "ил",
+            "ыл",
+            "ел",
+            "ла",
+            "ло",
+            "ли",
+            "ею",
+            "ою",
             "а",
             "я",
             "о",
@@ -687,7 +721,9 @@ _CYRILLIC_INFLECTION_SUFFIXES = tuple(
             "ю",
             "ы",
             "и",
-        ),
+            "ь",
+            "й",
+        },
         key=len,
         reverse=True,
     )
@@ -695,15 +731,26 @@ _CYRILLIC_INFLECTION_SUFFIXES = tuple(
 
 
 def _cyrillic_stem(word: str) -> str:
-    """Strip one common Russian inflection ending from ``word``.
+    """Strip productive Russian inflection endings from ``word``.
 
-    Only endings that leave a stem of at least three characters are
-    removed, which keeps short function words exact and avoids reducing
-    every guarded word to an over-broad prefix.
+    Endings are removed iteratively (longest first) so a word carrying a
+    stacked or less common case ending reduces to the same stable root as
+    its base form. Only endings that leave a stem of at least three
+    characters are removed, which keeps short function words exact and
+    avoids reducing every guarded word to an over-broad prefix.
     """
-    for suffix in _CYRILLIC_INFLECTION_SUFFIXES:
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            return word[: -len(suffix)]
+    if len(word) <= 3:
+        return word
+    changed = True
+    while changed and len(word) > 3:
+        changed = False
+        for suffix in _CYRILLIC_INFLECTION_SUFFIXES:
+            if len(suffix) >= len(word):
+                continue
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[: -len(suffix)]
+                changed = True
+                break
     return word
 
 
