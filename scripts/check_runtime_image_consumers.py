@@ -239,7 +239,28 @@ def main(argv: list[str] | None = None) -> int:
             if name not in present:
                 continue
             text = workflows[name]
-            if "--pins-only" not in text or "--tools-only" not in text:
+            try:
+                data = yaml.safe_load(text)
+            except yaml.YAMLError as exc:
+                messages.append(f"{name}: workflow YAML invalid: {exc}")
+                continue
+            has_pins = False
+            has_tools = False
+            jobs = data.get("jobs", {}) if isinstance(data, dict) else {}
+            for job_body in jobs.values() if isinstance(jobs, dict) else ():
+                if not isinstance(job_body, dict):
+                    continue
+                steps = job_body.get("steps", [])
+                for step in steps if isinstance(steps, list) else ():
+                    if not isinstance(step, dict):
+                        continue
+                    run = step.get("run", "")
+                    if isinstance(run, str):
+                        if "--pins-only" in run:
+                            has_pins = True
+                        if "--tools-only" in run:
+                            has_tools = True
+            if not has_pins or not has_tools:
                 messages.append(
                     f"{name} must keep static --pins-only and actual "
                     "binary-availability --tools-only preflight"

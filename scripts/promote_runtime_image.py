@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
@@ -115,7 +117,16 @@ def main(argv: list[str] | None = None) -> int:
     sibling_updates: list[tuple[Path, str]] = []
     for sibling in CONSUMER_WORKFLOWS:
         sibling_text = sibling.read_text(encoding="utf-8")
-        if "container:" not in sibling_text:
+        try:
+            data = yaml.safe_load(sibling_text)
+        except yaml.YAMLError as exc:
+            sibling_errors.append(f"{sibling.name}: invalid YAML: {exc}")
+            continue
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        has_container = isinstance(jobs, dict) and any(
+            isinstance(job, dict) and "container" in job for job in jobs.values()
+        )
+        if not has_container:
             sibling_errors.append(f"{sibling.name} does not use the prepared runtime container")
             continue
         sibling_updates.append((sibling, IMAGE_RE.sub(image_ref, sibling_text)))
