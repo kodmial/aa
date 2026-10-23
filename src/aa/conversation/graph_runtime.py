@@ -693,11 +693,28 @@ class GraphTurnRuntime:
             pass
 
     async def _invoke_graph(self, graph: Any, thread: str, text: str) -> dict[str, Any]:
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import BaseMessage, HumanMessage
+
+        from aa.conversation.delivery_history import delivery_history_updates
 
         config = {"configurable": {"thread_id": thread}}
+        history_updates: list[BaseMessage] = []
+        # Stateless graphs have no prior history to reconcile. Production
+        # always has a checkpointer. Apply removals in the next graph input,
+        # before memory compaction and all model-facing context construction.
+        if getattr(graph, "checkpointer", None) is not None:
+            try:
+                snapshot = await graph.aget_state(config)
+                history_updates = delivery_history_updates(
+                    snapshot.values.get("messages", []),
+                    self._last_receipts.get(thread, []),
+                    thread=thread,
+                    drop_unconfirmed=True,
+                )
+            except Exception as exc:
+                raise GraphRuntimeError("delivery-history-unavailable", type(exc).__name__) from exc
         payload: dict[str, Any] = {
-            "messages": [HumanMessage(content=text)],
+            "messages": [*history_updates, HumanMessage(content=text)],
             "current_user_message": text,
         }
         result = await graph.ainvoke(payload, config=config)
@@ -771,18 +788,17 @@ class GraphTurnRuntime:
             return []
 
     async def apply_delivery_commit(self, thread: str) -> list[dict[str, Any]]:
-        """Persist receipt-confirmed quotes into checkpointer state.
+        """Persist confirmed dialogue history and receipt-confirmed quotes.
 
         Computes :meth:`commit_confirmed_delivery` and merges it into
         the thread's ``recent_quote_ranges`` via ``aupdate_state`` when
         a compiled graph is bound. Idempotent: replays deduplicate and
         session reset clears history. Returns the committed ranges.
         """
+        from aa.conversation.delivery_history import delivery_history_updates
         from aa.conversation.quote_state import merge_recent_ranges
 
         committed = self.commit_confirmed_delivery(thread)
-        if not committed:
-            return []
         graph = self._graph
         if graph is None:
             return committed
@@ -796,14 +812,26 @@ class GraphTurnRuntime:
                     snapshot = graph.get_state(config)
                     current_raw = snapshot.values.get("recent_quote_ranges", [])
                 except Exception:
-                    current_raw = []
+                    return committed
             current = [dict(item) for item in (current_raw or []) if isinstance(item, dict)]
-            merged = merge_recent_ranges(current, committed)
+            update: dict[str, Any] = {}
+            if committed:
+                update["recent_quote_ranges"] = merge_recent_ranges(current, committed)
+            history_updates = delivery_history_updates(
+                snapshot.values.get("messages", []),
+                self._last_receipts.get(thread, []),
+                thread=thread,
+                drop_unconfirmed=False,
+            )
+            if history_updates:
+                update["messages"] = history_updates
+            if not update:
+                return committed
             try:
-                await graph.aupdate_state(config, {"recent_quote_ranges": merged})
+                await graph.aupdate_state(config, update)
             except Exception:
                 try:
-                    graph.update_state(config, {"recent_quote_ranges": merged})
+                    graph.update_state(config, update)
                 except Exception:
                     pass
             return committed
