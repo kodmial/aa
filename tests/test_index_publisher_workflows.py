@@ -53,14 +53,13 @@ def test_placeholders_fail_closed_instead_of_hitting_l2() -> None:
     assert "@sha256:0000000000000000000000000000000000000000000000000000000000000000" not in (
         QUALIFICATION.read_text(encoding="utf-8") + RUNTIME.read_text(encoding="utf-8")
     )
-    # The committed pin file itself is allowed to be the placeholder while
-    # the artifact is unpublished; consumers never trust it (oci_artifact).
+    # A committed pin may be either the unpublished placeholder or a promoted
+    # immutable digest; placeholder rejection is tested with explicit fixtures.
     assert "L2 publication pin is still a placeholder" in pathlib.Path(
         REPO_ROOT / "src" / "aa" / "retrieval" / "oci_artifact.py"
     ).read_text(encoding="utf-8")
     placeholder = pathlib.Path(REPO_ROOT / "docker" / "aa-index.digest").read_text()
     assert re.fullmatch(r"ghcr\.io/kodmial/aa-index@sha256:[0-9a-f]{64}\n?", placeholder)
-    assert placeholder.startswith("ghcr.io/kodmial/aa-index@sha256:" + "0" * 64)
 
 
 def test_qualification_bootstrap_keeps_status_files_out_of_checkout() -> None:

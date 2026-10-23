@@ -324,7 +324,11 @@ def test_parse_pinned_digest_fail_closed(tmp_path: pathlib.Path) -> None:
     assert parse_pinned_digest(valid) == digest
 
 
-def test_restore_l2_placeholder_pin_is_rejected() -> None:
+def test_restore_l2_placeholder_pin_is_rejected(tmp_path: pathlib.Path) -> None:
+    placeholder_pin = tmp_path / "placeholder.digest"
+    placeholder_pin.write_text(
+        "ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8"
+    )
     proc = subprocess.run(
         [
             sys.executable,
@@ -334,7 +338,7 @@ def test_restore_l2_placeholder_pin_is_rejected() -> None:
             "--cache-dir",
             "unused-cache-dir",
             "--digest-file",
-            str(_REPO / "docker" / "aa-index.digest"),
+            str(placeholder_pin),
             "--require-backend",
             "e5",
         ],

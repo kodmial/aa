@@ -258,19 +258,23 @@ def test_p0_444_dirty_checkout_still_fails_closed(tmp_path: pathlib.Path) -> Non
     assert working_tree_clean(repo) is True
 
 
-def test_committed_placeholder_pin_rejected_inside_clean_repo(tmp_path: pathlib.Path) -> None:
+def test_placeholder_pin_rejected_inside_clean_repo(tmp_path: pathlib.Path) -> None:
     repo = tmp_path / "pin-checkout"
     repo.mkdir()
     _clean_checkout(repo)
     committed_pin = _REPO / "docker" / "aa-index.digest"
     assert committed_pin.is_file(), "committed L2 pin file is part of the repository contract"
+    placeholder_pin = tmp_path / "placeholder.digest"
+    placeholder_pin.write_text(
+        "ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8"
+    )
     proc = _manager(
         "--mode",
         "restore-l2",
         "--cache-dir",
         str(tmp_path / "l2-cache"),
         "--digest-file",
-        str(committed_pin),
+        str(placeholder_pin),
         "--require-backend",
         "e5",
         "--status-file",
