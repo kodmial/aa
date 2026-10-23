@@ -153,17 +153,20 @@ def _audit_committed_public(
             continue
         if committed == payload:
             continue
+        limit = min(len(committed), len(payload))
         offset = next(
-            (index for index, (a, b) in enumerate(zip(committed, payload, strict=False)) if a != b),
-            min(len(committed), len(payload)),
+            (index for index in range(limit) if committed[index] != payload[index]),
+            limit,
         )
-        line = committed[:offset].count(b"\n") + 1
+        committed_line = committed[:offset].count(b"\n") + 1
+        generated_line = payload[:offset].count(b"\n") + 1
         deviations.append(
             f"committed public artifact {label} differs from deterministic "
             f"generation (committed sha256={_sha256_bytes(committed)}, "
             f"generated sha256={_sha256_bytes(payload)}, "
             f"committed_bytes={len(committed)}, generated_bytes={len(payload)}, "
-            f"first difference at byte offset {offset}, committed line {line}); "
+            f"first difference at byte offset {offset}, committed line "
+            f"{committed_line}, generated line {generated_line}); "
             "regenerate public artifacts explicitly in a development commit "
             "before qualification"
         )

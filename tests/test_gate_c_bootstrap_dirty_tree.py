@@ -16,8 +16,6 @@ import pathlib
 import subprocess
 import sys
 
-import pytest
-
 from aa.qualification.product_contract_live import (
     _is_ephemeral_tree_path,
     working_tree_clean,
@@ -260,21 +258,19 @@ def test_p0_444_dirty_checkout_still_fails_closed(tmp_path: pathlib.Path) -> Non
     assert working_tree_clean(repo) is True
 
 
-@pytest.mark.skipif(
-    not (_REPO / "docker" / "aa-index.digest").is_file(),
-    reason="committed L2 pin file is part of the repository contract",
-)
 def test_committed_placeholder_pin_rejected_inside_clean_repo(tmp_path: pathlib.Path) -> None:
     repo = tmp_path / "pin-checkout"
     repo.mkdir()
     _clean_checkout(repo)
+    committed_pin = _REPO / "docker" / "aa-index.digest"
+    assert committed_pin.is_file(), "committed L2 pin file is part of the repository contract"
     proc = _manager(
         "--mode",
         "restore-l2",
         "--cache-dir",
         str(tmp_path / "l2-cache"),
         "--digest-file",
-        str(_REPO / "docker" / "aa-index.digest"),
+        str(committed_pin),
         "--require-backend",
         "e5",
         "--status-file",
