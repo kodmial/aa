@@ -536,6 +536,9 @@ jobs:
               bootstrap_status="l2-hit"
             else
               bootstrap_status="failed"
+              # ``--backend`` selects the deterministic rebuild backend;
+              # ``--require-backend`` is the separate strict-restore guard
+              # (see scripts/manage_derived_cache.py), so both are intended.
               if python scripts/manage_derived_cache.py --mode restore-or-rebuild \
                   --cache-dir "$derived_dir" \
                   --backend e5 --require-backend e5 \
