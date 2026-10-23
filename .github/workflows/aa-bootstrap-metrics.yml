@@ -67,7 +67,7 @@ jobs:
     # pins the exact dependency/dev-toolchain layer; docker pull happens on
     # job start and is measured through job timing artifacts below.
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
+      image: ghcr.io/kodmial/aa-runtime@sha256:bb822b6f696585b4f40f981382e5fc86516fd9d06a7c0c247c2aefb132df4abd
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
