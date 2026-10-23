@@ -382,7 +382,12 @@ async def generate_dialogue_reply(
         if telemetry is not None:
             _attach(
                 telemetry,
-                _Cause.bounded(_GUARD_TERMS, "generation", "local", detail="internal-terms"),
+                _Cause.bounded(
+                    _GUARD_TERMS,
+                    "generation",
+                    "local",
+                    detail=f"rule:{matched_internal_rule(text)}",
+                ),
             )
         return None
     if not envelope_passes(text):
@@ -574,6 +579,18 @@ def final_book_quote_chars(
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 
+# Issue #450 audit: the historical list matched only English spellings,
+# so a genuinely revealing Russian mechanics disclosure (for example
+# transliterated tooling vocabulary) passed the guard while a perfectly
+# ordinary Russian answer stayed silent-safe. Entries are additive only:
+# every new rule is unambiguous implementation jargon (no ordinary
+# book-grounded recovery wording contains it), and format variants were
+# added for the multi-word phrases so hyphen/case permutations cannot
+# bypass the prohibition (Product Contract #110 stays fail-closed).
+# No entry was removed or loosened: the audit found no ordinary
+# containing-word false positives for the existing terms, and the
+# historical conservative behavior (blocking benign standalone uses of
+# the common English words themselves) is preserved and documented.
 _INTERNAL_TERMS = (
     "corpus",
     "retrieval",
@@ -586,13 +603,30 @@ _INTERNAL_TERMS = (
     "qualification",
     "fail_closed",
     "fail closed",
+    "fail-closed",
     "search failure",
+    "search-failure",
     "structured output",
+    "structured-output",
     "json_schema",
     "json schema",
+    "json-schema",
     "rerank",
     "bm25",
+    "bm-25",
     "faiss",
+    # Russian mechanics jargon (issue #450): transliterated tooling names
+    # and explicit architecture phrases that never occur in ordinary
+    # book-grounded recovery answers but do occur in real implementation
+    # disclosures.
+    "эмбеддинг",
+    "риранк",
+    "фаисс",
+    "бм25",
+    "векторная база",
+    "векторное хранилище",
+    "поиск по корпусу",
+    "корпус текстов",
 )
 
 
@@ -601,10 +635,86 @@ def contains_cyrillic(text: str) -> bool:
     return _CYRILLIC_RE.search(text) is not None
 
 
+def matched_internal_rule(text: str) -> str:
+    """Return the closed-vocabulary internal-terms rule matched by ``text``.
+
+    Issue #450 privacy contract: telemetry records only the fixed rule id
+    from this module's own vocabulary and the stage, never user text,
+    draft content or the raw matched span. Empty string means no rule
+    matched.
+    """
+    lowered = text.casefold()
+    for term in _INTERNAL_TERMS:
+        if term in lowered:
+            return term
+    return ""
+
+
 def leaks_internal_terms(text: str) -> bool:
     """Whether user-visible text exposes hidden mechanics."""
-    lowered = text.casefold()
-    return any(term in lowered for term in _INTERNAL_TERMS)
+    return matched_internal_rule(text) != ""
+
+
+# Issue #450: closed vocabulary of typed causes that reject a draft
+# locally, BEFORE the semantic verifier is invoked. These rejections are
+# never verifier outages and must stay distinct in orchestration
+# telemetry from ``verifier-unavailable``, ``verifier-invalid-schema``,
+# negative verdicts, outbound-safety blocks, provider 429 and budget
+# exhaustion (the typed cause chain already distinguishes the rest).
+_LOCAL_GUARD_REJECTION_REASONS = frozenset(
+    {
+        "guard-language",
+        "guard-internal-terms",
+    }
+)
+
+# Bounded repair admission for an initial local guard rejection (issue
+# #450): at most one model regeneration, always from exactly the same
+# verified Evidence Pack, the original resolved intent and the unchanged
+# conversation history. No re-planning, no new retrieval, no third-party
+# provider, no additional unconditional calls on already-successful
+# turns, and every regenerated candidate rides the unchanged verifier +
+# final-gate contract.
+LOCAL_GUARD_REPAIR_MAX_REGENERATIONS = 1
+
+# Clearly scoped control instruction (kodmial/aa#300 channel): the
+# regeneration prompt stays the original request; the instruction travels
+# only in the separate <safety_policy> block and never becomes a search
+# query or user-visible text. Generic wording, never an exact live prompt.
+_LOCAL_GUARD_REPAIR_POLICY = (
+    "Сформулируй один естественный ответ на русском языке для пользователя "
+    "только по приведённым отрывкам книги: без упоминания внутренних "
+    "механик, источников, индексов и технических деталей устройства сервиса. "
+    "Если содержательный ответ по книге невозможен, дай краткое естественное "
+    "уточнение без технических формулировок."
+)
+
+
+def _typed_local_guard_reason(telemetry: dict[str, Any] | None) -> str:
+    """Return the typed reason when a draft was rejected before verification.
+
+    Reads the first recorded ``answer_failure_cause`` (first cause is
+    authoritative and never overwritten by later stages) and matches the
+    closed local-guard vocabulary. Empty string means the observed failure
+    was not a pre-verifier local guard rejection.
+    """
+    if not isinstance(telemetry, dict):
+        return ""
+    cause = telemetry.get("answer_failure_cause")
+    if not isinstance(cause, dict):
+        return ""
+    reason = str(cause.get("reason", "") or "")
+    return reason if reason in _LOCAL_GUARD_REJECTION_REASONS else ""
+
+
+def _latest_failure_reason(telemetry: dict[str, Any] | None) -> str:
+    """Return the most recent bounded cause reason in the failure chain."""
+    if not isinstance(telemetry, dict):
+        return ""
+    chain = telemetry.get("answer_failure_cause_chain")
+    if isinstance(chain, list) and chain and isinstance(chain[-1], dict):
+        return str(chain[-1].get("reason", "") or "")
+    return ""
 
 
 def verdict_by_id(result: GroundingResult) -> dict[str, Any]:
@@ -1139,10 +1249,15 @@ async def _verify_draft(
     if leaks_internal_terms(draft):
         logger.info("v2 draft failed language/leak guard")
         if telemetry is not None:
+            # Privacy-safe attribution only: the closed rule id and stage
+            # travel, never the draft text or the raw matched span.
             _attach(
                 telemetry,
                 _Cause.bounded(
-                    "guard-internal-terms", "verification", "local", detail="draft-internal-terms"
+                    "guard-internal-terms",
+                    "verification",
+                    "local",
+                    detail=f"rule:{matched_internal_rule(draft)}",
                 ),
             )
         return units, None, False
@@ -2888,15 +3003,127 @@ async def run_v2_answer_turn(
     units, result, passed = await _verify_with_telemetry(draft, pack, turn_budget_s=verifier_slice)
     if result is not None:
         telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
+    # Issue #450: a locally-guarded draft never reached the semantic
+    # verifier, so ``verifier_outcome`` must say so instead of flattening
+    # every ``result is None`` shape into ``unavailable``. The typed
+    # cause chain keeps the concrete boundary; only the status label
+    # changes here.
+    _initial_local_guard_reason = _typed_local_guard_reason(telemetry)
     if passed:
         telemetry["verifier_outcome"] = "passed"
     elif result is None:
-        telemetry["verifier_outcome"] = "unavailable"
+        telemetry["verifier_outcome"] = (
+            "local-guard" if _initial_local_guard_reason else "unavailable"
+        )
     elif result.unavailable_unit_ids:
         telemetry["verifier_outcome"] = "partial-unavailable"
     else:
         telemetry["verifier_outcome"] = "unsupported"
     current_draft: str = draft
+
+    # Bounded same-pack regeneration after an initial LOCAL guard
+    # rejection (issue #450): the historical path skipped all repair for
+    # every ``result is None`` turn, so a guard-rejected substantive draft
+    # collapsed to a generic service error while the already-fetched,
+    # integrity-verified Evidence Pack could still support a clean
+    # Russian answer. Admission is deliberately narrow: only a typed
+    # local-guard initial rejection, only a nonempty trustworthy pack,
+    # only when the remaining original per-turn budget permits, and at
+    # most one regeneration attempt. The regeneration reuses exactly this
+    # pack, the original resolved intent and the unchanged conversation
+    # history (no re-planning, no new retrieval, no third-party provider,
+    # no extra call on already-successful turns). The scoped instruction
+    # travels only in the separate <safety_policy> block, never merged
+    # into the user request. The regenerated candidate is reverified
+    # under the unchanged verifier and final answer gates and can fail
+    # closed like any other candidate; the original typed reason stays
+    # authoritative in the cause chain either way.
+    telemetry["local_guard_initial_rejection"] = bool(_initial_local_guard_reason)
+    telemetry["local_guard_regen_attempts"] = 0
+    telemetry["local_guard_repair_status"] = "none"
+    if (
+        not passed
+        and _initial_local_guard_reason
+        and pack
+        and telemetry["local_guard_regen_attempts"] < LOCAL_GUARD_REPAIR_MAX_REGENERATIONS
+    ):
+        if _remaining_budget_s() < TURN_ANSWER_MIN_SLICE_S:
+            telemetry["local_guard_repair_status"] = "budget-blocked"
+            _mark_turn_budget_exceeded()
+            logger.info(
+                "v2 local-guard repair skipped for end-to-end budget",
+                extra={
+                    "category": "local-guard-repair-budget",
+                },
+            )
+        else:
+            _guard_regen = await _draft_with_pack(
+                pack,
+                user_message,
+                wider=True,
+                safety_policy=_LOCAL_GUARD_REPAIR_POLICY,
+            )
+            if _guard_regen is None:
+                telemetry["local_guard_regen_attempts"] = 1
+                telemetry["local_guard_repair_status"] = "attempted"
+                logger.info(
+                    "v2 local-guard repair regeneration produced no draft",
+                    extra={"category": "local-guard-repair-no-draft"},
+                )
+            else:
+                telemetry["local_guard_regen_attempts"] = 1
+                telemetry["local_guard_repair_status"] = "attempted"
+                _guard_slice = _verifier_round_budget()
+                if _guard_slice is not None and _guard_slice < TURN_VERIFIER_MIN_SLICE_S:
+                    telemetry["local_guard_repair_status"] = "failed"
+                    logger.info(
+                        "v2 local-guard repair re-verify skipped for end-to-end budget",
+                        extra={"category": "local-guard-repair-budget"},
+                    )
+                    _mark_turn_budget_exceeded()
+                else:
+                    (
+                        _guard_units,
+                        _guard_result,
+                        _guard_passed,
+                    ) = await _verify_with_telemetry(_guard_regen, pack, turn_budget_s=_guard_slice)
+                    if _guard_result is not None:
+                        telemetry["verifier_unavailable_units"] = len(
+                            _guard_result.unavailable_unit_ids
+                        )
+                    if _guard_passed:
+                        # Served subset uses the same verified pack and the
+                        # same verifier verdicts; repair counted explicitly.
+                        current_draft = _guard_regen
+                        units, result, passed = _guard_units, _guard_result, True
+                        telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
+                        telemetry["local_guard_repair_status"] = "served"
+                        logger.info(
+                            "v2 local-guard repaired via one same-pack regeneration",
+                            extra={"category": "local-guard-repair-served"},
+                        )
+                    else:
+                        # Fail closed on the regenerated candidate too:
+                        # re-map only the status label; the earliest typed
+                        # cause (the original local guard) stays first in
+                        # the causal chain and the turn never delivers the
+                        # rejected draft or an unverified rewrite.
+                        telemetry["local_guard_repair_status"] = "failed"
+                        if _guard_result is None:
+                            telemetry["verifier_outcome"] = (
+                                "local-guard"
+                                if _latest_failure_reason(telemetry)
+                                in _LOCAL_GUARD_REJECTION_REASONS
+                                else "unavailable"
+                            )
+                        elif _guard_result.unavailable_unit_ids:
+                            telemetry["verifier_outcome"] = "partial-unavailable"
+                        else:
+                            telemetry["verifier_outcome"] = "unsupported"
+                        logger.info(
+                            "v2 local-guard repair did not recover; typed failure kept",
+                            extra={"category": "local-guard-repair-failed"},
+                        )
 
     # Bounded targeted retrieval/regeneration for unsupported claims.
     # Only a glue-judged turn (planner issued zero queries, hence an
@@ -2919,6 +3146,10 @@ async def run_v2_answer_turn(
     # Grounding is preserved: without a verifier verdict the turn cannot
     # be proven grounded, so it clarifies directly instead of burning
     # latency on futile repair.
+    # Issue #450 refinement: an initial LOCAL guard rejection that did not
+    # recover above never enters this replan loop either (one bounded
+    # same-pack regeneration was already attempted; full re-planning and
+    # new retrieval stay out of scope for that admission).
     # No silent empty-evidence success (kodmial/aa#251): a planner
     # error/timeout/invalid outcome is never legitimate glue, even with
     # zero queries. Only a positively proven contentless turn with an
@@ -2947,6 +3178,7 @@ async def run_v2_answer_turn(
     repair_allowed = (
         result is not None
         and not result.unavailable_unit_ids
+        and not _initial_local_guard_reason
         and (
             (not initial_pack_empty)
             or (initial_query_count is not None and initial_query_count > 0)
@@ -2972,10 +3204,23 @@ async def run_v2_answer_turn(
         # burns slow provider calls), but telemetry keeps the real
         # planner/retrieval state so the next failure attributes to the
         # concrete stage.
-        logger.info(
-            "v2 repair skipped for verifier-unavailable turn",
-            extra={"initial_pack_empty": initial_pack_empty},
-        )
+        # Issue #450: a local-guard turn reaching here means the bounded
+        # same-pack repair was impossible (no pack / exhausted budget) or
+        # failed; the log says so instead of claiming a verifier outage
+        # that never happened (the verifier was invoked only for
+        # non-local-guard failures).
+        if _initial_local_guard_reason:
+            logger.info(
+                "v2 local-guard turn kept typed failure after bounded repair boundary",
+                extra={
+                    "initial_pack_empty": initial_pack_empty,
+                },
+            )
+        else:
+            logger.info(
+                "v2 repair skipped for verifier-unavailable turn",
+                extra={"initial_pack_empty": initial_pack_empty},
+            )
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     # Bounded repair progression (#331): repair retrieval must not repeat
@@ -5044,6 +5289,7 @@ __all__ = [
     "ANSWER_FAST_RETRY_MAX_HISTORY",
     "ANSWER_FAST_RETRY_MAX_PASSAGES",
     "ANSWER_GENERATION_MAX_PASSAGES",
+    "LOCAL_GUARD_REPAIR_MAX_REGENERATIONS",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
     "OUTBOUND_RECOVERY_QUERIES",
@@ -5073,6 +5319,7 @@ __all__ = [
     "keep_supported_text",
     "keep_supported_units",
     "leaks_internal_terms",
+    "matched_internal_rule",
     "merge_pack_dicts",
     "narrowed_grounding_state",
     "outbound_safety_category",
