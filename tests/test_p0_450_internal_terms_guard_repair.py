@@ -281,6 +281,10 @@ def test_guard_allows_containing_word_collisions(allowed: str) -> None:
         "эмбеддинги",  # plural inflection of guarded "эмбеддинг"
         "риранка",  # genitive of "риранк"
         "фаиссе",  # prepositional of "фаисс"
+        "векторной базе",  # inflected first word of "векторная база"
+        "векторном хранилище",  # inflected both words of "векторное хранилище"
+        "поиска по корпусу",  # inflected first word of "поиск по корпусу"
+        "корпуса текстов",  # inflected first word of "корпус текстов"
     ),
 )
 def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
@@ -295,6 +299,8 @@ def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
     (
         "корпус здания",  # unrelated word sharing a prefix with "корпус текстов"
         "векторный анализ",  # unrelated word sharing a prefix with "векторная база"
+        "Поиск смысла помогает восстановиться.",  # no mechanics corpus phrase
+        "Корпусная мебель стоит в комнате.",  # no mechanics corpus phrase
     ),
 )
 def test_cyrillic_unrelated_prefix_allowed(allowed: str) -> None:
@@ -382,6 +388,32 @@ async def test_guard_cause_records_closed_rule_id_only() -> None:
     assert "переписал" not in detail
     assert len(detail) <= 64
     assert _matched_internal_rule(_LEAKY_SEARCH_QUERY_DRAFT) == rule_id
+
+
+def test_typed_local_guard_reason_keeps_the_immutable_first_cause() -> None:
+    """The repair admission reads the first cause only while ``_attach``
+    guarantees later stages never overwrite it."""
+    from aa.conversation.answer_causality import (
+        GUARD_INTERNAL_TERMS,
+        TELEMETRY_CAUSE_KEY,
+        TELEMETRY_CHAIN_KEY,
+        AnswerFailureCause,
+        attach_answer_failure_cause,
+    )
+    from aa.conversation.turn_pipeline import _typed_local_guard_reason
+
+    telemetry: dict[str, Any] = {}
+    attach_answer_failure_cause(
+        telemetry,
+        AnswerFailureCause.bounded(GUARD_INTERNAL_TERMS, "verification", "local"),
+    )
+    attach_answer_failure_cause(
+        telemetry,
+        AnswerFailureCause.bounded("verdict-unsupported", "verification", "verification"),
+    )
+    assert _typed_local_guard_reason(telemetry) == GUARD_INTERNAL_TERMS
+    assert telemetry[TELEMETRY_CAUSE_KEY]["reason"] == GUARD_INTERNAL_TERMS
+    assert telemetry[TELEMETRY_CHAIN_KEY][-1]["reason"] == "verdict-unsupported"
 
 
 def test_language_gate_single_cyrillic_limitation_is_documented() -> None:

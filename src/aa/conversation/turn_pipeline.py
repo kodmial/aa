@@ -638,21 +638,102 @@ _INTERNAL_TERMS = (
     "корпус текстов",
 )
 
+# Conservative Russian inflection suffixes for the guarded words. The
+# guard is not a morphological analyzer: it strips one common adjective/
+# noun ending from each Cyrillic word so a multi-word phrase cannot be
+# bypassed by inflecting any of its words ("векторной базе", "корпуса
+# текстов"). Stems shorter than three characters are left exact so short
+# prepositions ("по") do not become broad prefixes.
+_CYRILLIC_INFLECTION_SUFFIXES = tuple(
+    sorted(
+        (
+            "ыми",
+            "ими",
+            "ого",
+            "его",
+            "ому",
+            "ему",
+            "ами",
+            "ями",
+            "ая",
+            "яя",
+            "ое",
+            "ее",
+            "ые",
+            "ие",
+            "ых",
+            "их",
+            "ую",
+            "юю",
+            "ой",
+            "ый",
+            "ий",
+            "ом",
+            "ем",
+            "ым",
+            "им",
+            "ов",
+            "ев",
+            "ей",
+            "ам",
+            "ям",
+            "ах",
+            "ях",
+            "а",
+            "я",
+            "о",
+            "е",
+            "у",
+            "ю",
+            "ы",
+            "и",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _cyrillic_stem(word: str) -> str:
+    """Strip one common Russian inflection ending from ``word``.
+
+    Only endings that leave a stem of at least three characters are
+    removed, which keeps short function words exact and avoids reducing
+    every guarded word to an over-broad prefix.
+    """
+    for suffix in _CYRILLIC_INFLECTION_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _cyrillic_word_fragment(word: str) -> str:
+    """Build one token fragment that accepts a Russian case ending."""
+    if len(word) <= 3:
+        return re.escape(word)
+    return rf"{re.escape(_cyrillic_stem(word))}\w*"
+
+
+def _internal_term_pattern_source(term: str) -> str:
+    """Build the bounded matcher for one closed-vocabulary rule."""
+    if not _CYRILLIC_RE.search(term):
+        return rf"(?<!\w){re.escape(term)}(?!\w)"
+    words = term.split()
+    if len(words) == 1:
+        return rf"(?<!\w){re.escape(term)}\w*"
+    phrase = r"\s+".join(_cyrillic_word_fragment(word) for word in words)
+    return rf"(?<!\w){phrase}"
+
+
 # Compile longest terms first so specific phrases win over substrings.
 # Latin rules require a trailing word boundary so ordinary containing
 # words ("indexing", "providers") stay allowed. Cyrillic rules keep the
 # leading token boundary but allow an inflected continuation because
 # Russian mechanics disclosures naturally carry case endings
-# ("эмбеддинги"), which must not become a bypass.
+# ("эмбеддинги"), which must not become a bypass. Multi-word Cyrillic
+# rules inflect each word, not only the final one.
 _INTERNAL_TERM_PATTERNS = tuple(
-    (
-        term,
-        re.compile(
-            rf"(?<!\w){re.escape(term)}\w*"
-            if _CYRILLIC_RE.search(term)
-            else rf"(?<!\w){re.escape(term)}(?!\w)"
-        ),
-    )
+    (term, re.compile(_internal_term_pattern_source(term)))
     for term in sorted(_INTERNAL_TERMS, key=len, reverse=True)
 )
 
@@ -720,10 +801,14 @@ _LOCAL_GUARD_REPAIR_POLICY = (
 def _typed_local_guard_reason(telemetry: dict[str, Any] | None) -> str:
     """Return the typed reason when a draft was rejected before verification.
 
-    Reads the first recorded ``answer_failure_cause`` (first cause is
-    authoritative and never overwritten by later stages) and matches the
-    closed local-guard vocabulary. Empty string means the observed failure
-    was not a pre-verifier local guard rejection.
+    Reads the first recorded ``answer_failure_cause`` and matches the
+    closed local-guard vocabulary. ``attach_answer_failure_cause`` only
+    writes that key when it is absent/empty and appends every later
+    distinct cause to ``answer_failure_cause_chain``, so the first cause
+    stays authoritative (pinned by
+    ``test_first_cause_is_preserved_later_distinct_causes_extend_chain``).
+    Empty string means the observed failure was not a pre-verifier local
+    guard rejection.
     """
     if not isinstance(telemetry, dict):
         return ""
@@ -3130,6 +3215,10 @@ async def run_v2_answer_turn(
                 # consumed time.
                 _guard_slice = _verifier_round_budget()
                 if not _verifier_slice_ready(_guard_slice):
+                    # ``current_draft`` still holds the original leaky
+                    # draft, but ``passed`` remains False, so no
+                    # finalization path can serve it. The turn fails
+                    # closed on the original local-guard cause instead.
                     telemetry["local_guard_repair_status"] = "budget-blocked"
                     logger.info(
                         "v2 local-guard repair re-verify skipped for end-to-end budget",

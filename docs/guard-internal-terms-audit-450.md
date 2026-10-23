@@ -22,7 +22,8 @@ fixed rule id from the module's own vocabulary and `_verify_draft`
 attaches `detail=f"rule:{term}"` (`source=local`, stage `verification`).
 A Latin rule matches only as a whole token or phrase, never embedded
 inside a longer ordinary word; Cyrillic rules also accept inflected
-continuations (see limitation 4).
+continuations on every word of a phrase, not only the final one (see
+limitation 4).
 
 ## Audit tables
 
@@ -127,11 +128,16 @@ ordinary English word forms.
    schematizations of the live reports; the actual live drafts after
    #450 are only observed in the next live-side qualification run.
 4. **Cyrillic stems accept inflected continuations.** Unlike the Latin
-   trailing boundary, Cyrillic rules match `(?<!\w)term\w*` so Russian
-   case endings (`эмбеддинги`, `риранка`, `фаиссе`) cannot bypass the
-   guard. This is intentionally broader than the Latin-side token
-   boundary; the audit samples found no ordinary book-grounded word
-   that shares a guarded stem, and unrelated prefix words such as
+   trailing boundary, Cyrillic rules accept Russian case endings so
+   `эмбеддинги`, `риранка` and `фаиссе` cannot bypass the guard. For a
+   multi-word rule every word is matched by its conservative stem, so
+   `векторной базе` and `корпуса текстов` are blocked as well as the
+   exact phrases. This is intentionally broader than the Latin-side
+   token boundary; the audit samples found no ordinary book-grounded
+   word that shares a guarded stem, and unrelated prefix words such as
    `корпус здания` / `векторный анализ` stay allowed (pinned in
-   `test_cyrillic_unrelated_prefix_allowed`). A future collision would
-   require narrowing the inflection set rather than removing the rule.
+   `test_cyrillic_unrelated_prefix_allowed`). This is lightweight stem
+   truncation, not a morphological analyzer: an irregular form outside
+   the suffix table may still need an explicit rule, and a future
+   ordinary-word collision would require narrowing the inflection set
+   rather than removing the rule.
