@@ -52,6 +52,8 @@ _ATTEMPT_EXPORT_FIELDS = (
     "failure_category",
     "error_kind",
     "late_outcome",
+    "late_outcome_source",
+    "late_outcome_conflicts",
     "late_failure_category",
     "late_latency_ms",
     "worker_done",
@@ -109,7 +111,9 @@ class StallSnapshotObserver:
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._snapshot_attempts: dict[tuple[str, float], str] = {}
-        self._trace_written: set[str] = set()
+        # Insertion-ordered so eviction drops the OLDEST trace ids, not the
+        # alphabetically smallest ones.
+        self._trace_written: dict[str, None] = {}
         self._registered_atexit = False
         self._atexit_registered = False
         if register_atexit_flush:
@@ -246,10 +250,9 @@ class StallSnapshotObserver:
             "delays_s": list(self._delays),
         }
         path = self._index_path()
-        if sync:
-            _write_json(path, index)
-        elif self._task is None or self._stopping.is_set():
-            _write_json(path, index)
+        # The index is live progress evidence: external consumers must see
+        # new snapshots/traces without waiting for the observer to stop.
+        _write_json(path, index)
         return path
 
     async def start(self) -> None:
@@ -278,6 +281,7 @@ class StallSnapshotObserver:
     async def _run(self) -> None:
         while not self._stopping.is_set():
             await self._scan_once()
+            self.flush("observer-scan")
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=self._interval_s)
             except TimeoutError:
@@ -285,9 +289,14 @@ class StallSnapshotObserver:
 
     async def _scan_once(self) -> None:
         now = time.monotonic()
+        # Take one defensive copy per entry before inspecting it. A source
+        # may hand back rows that are still mutated in place by the writer;
+        # copying once keeps all fields of a scan consistent with each other.
+        snapshots: list[dict[str, Any]] = []
         for entry in self._attempt_source():
-            if not isinstance(entry, dict):
-                continue
+            if isinstance(entry, Mapping):
+                snapshots.append(dict(entry))
+        for entry in snapshots:
             attempt_id = str(entry.get("attempt_id", ""))
             if not attempt_id:
                 continue
@@ -305,9 +314,11 @@ class StallSnapshotObserver:
                 if attempt_id in self._trace_written:
                     continue
                 path = await self.trace_attempt(entry)
-                self._trace_written.add(attempt_id)
+                self._trace_written[attempt_id] = None
                 if len(self._trace_written) >= 1024:
-                    self._trace_written = set(sorted(self._trace_written)[-512:])
+                    stale = list(self._trace_written)[: len(self._trace_written) - 512]
+                    for old_id in stale:
+                        del self._trace_written[old_id]
                 _ = path
 
 

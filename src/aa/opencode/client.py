@@ -502,10 +502,24 @@ class HttpOpenCodeClient(OpenCodeClient):
                     # Clean cancellation before the thread ran: no orphan.
                     # The atomic ledger check also blocks a late worker claim.
                     self._attempts.mark_clean_cancel_if_not_started(attempt_id)
-                return
+                    return
+                # An exception completion still proves the worker future is
+                # terminal. The thread-side write is authoritative, but this
+                # corroborates it (and retrieves the exception so a cancelled
+                # await cannot leave an unobserved-future warning).
+                failure = done_future.exception()
+                if failure is not None:
+                    self._attempts.mark_worker_done(
+                        attempt_id,
+                        outcome="failed",
+                        failure_category=type(failure).__name__,
+                    )
             except Exception:  # noqa: BLE001 - never crash the loop on evidence
                 logger.info("opencode attempt late outcome recording failed")
 
+        # ``add_done_callback`` also runs for a future that already completed,
+        # so registration immediately after submission cannot miss a fast
+        # worker completion.
         inner.add_done_callback(_observe_worker_outcome)
         try:
             result = await asyncio.shield(inner)

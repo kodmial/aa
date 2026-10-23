@@ -34,10 +34,11 @@ error bodies.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, cast
 
 IN_FLIGHT_STATE = "in-flight"
 TERMINAL_ATTEMPT_STATES: tuple[str, ...] = ("completed", "failed", "cancelled", "aborted")
@@ -50,6 +51,7 @@ _MAX_CAUSALITY_LEN = 64
 _MAX_FIELD_LEN = 64
 _MAX_AGENT_LEN = 128
 _MAX_MODEL_LEN = 128
+_MAX_LATE_OUTCOME_CONFLICTS = 8
 
 
 def _truncate(value: object, limit: int) -> str:
@@ -123,17 +125,34 @@ class AttemptLedger:
         state: str,
         latency_ms: float | None,
         failure_category: str,
+        *,
+        source: str = "unknown",
     ) -> bool:
         """Write one late outcome idempotently (caller holds ``_lock``).
 
         The worker side and the loop side can both reach this write. The
         first terminal verdict wins, and both paths use the exact same
         field order, so the recorded evidence never depends on which path
-        wins the race.
+        wins the race. A rejected write records a bounded conflict marker
+        with its source so the losing verdict is never silently discarded.
         """
-        if entry.get("late_outcome") in LATE_OUTCOMES:
+        existing = entry.get("late_outcome")
+        if existing in LATE_OUTCOMES:
+            conflicts = entry.get("late_outcome_conflicts")
+            if not isinstance(conflicts, list):
+                conflicts = []
+                entry["late_outcome_conflicts"] = conflicts
+            if len(conflicts) < _MAX_LATE_OUTCOME_CONFLICTS:
+                conflicts.append(
+                    {
+                        "rejected_state": _truncate(state, _MAX_FIELD_LEN),
+                        "rejected_source": _truncate(source, _MAX_FIELD_LEN),
+                        "kept_state": _truncate(existing, _MAX_FIELD_LEN),
+                    }
+                )
             return False
         entry["late_outcome"] = state
+        entry["late_outcome_source"] = _truncate(source, _MAX_FIELD_LEN)
         if latency_ms is not None:
             entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
         if failure_category:
@@ -164,7 +183,7 @@ class AttemptLedger:
                 return False
             if late:
                 return self._write_late_outcome_unlocked(
-                    entry, normalized, latency_ms, failure_category
+                    entry, normalized, latency_ms, failure_category, source="loop"
                 )
             if entry.get("state") != IN_FLIGHT_STATE:
                 # A terminal state already exists; the recorded state stays the
@@ -201,7 +220,7 @@ class AttemptLedger:
             if entry.get("state") != "cancelled":
                 return False
             return self._write_late_outcome_unlocked(
-                entry, normalized, latency_ms, failure_category
+                entry, normalized, latency_ms, failure_category, source="worker"
             )
 
     def mark_worker_started(self, attempt_id: str) -> bool:
@@ -232,7 +251,9 @@ class AttemptLedger:
         with self._lock:
             entry = self._find(attempt_id)
             if entry is None:
-                return True
+                # Fail closed: a worker with no ledger entry cannot publish
+                # honest evidence, so it must not issue the request.
+                return False
             if entry.get("worker_started") is True:
                 return False
             if entry.get("clean_worker_cancel") is True and entry.get("worker_done") is True:
@@ -294,14 +315,14 @@ class AttemptLedger:
             outcome_state = _truncate(outcome, _MAX_FIELD_LEN)
             if outcome_state in LATE_OUTCOMES:
                 self._write_late_outcome_unlocked(
-                    entry, outcome_state, latency_ms, failure_category
+                    entry, outcome_state, latency_ms, failure_category, source="worker"
                 )
             return True
 
     def entries(self) -> tuple[dict[str, Any], ...]:
-        """Return a privacy-safe copy of the attempt recordings."""
+        """Return a privacy-safe, fully independent copy of the recordings."""
         with self._lock:
-            return tuple(dict(entry) for entry in self._entries)
+            return tuple(copy.deepcopy(entry) for entry in self._entries)
 
     def state_for(self, attempt_id: str) -> str:
         """Return the current state of one attempt (``""`` when unknown)."""
@@ -323,7 +344,7 @@ class AttemptLedger:
         for entry in reversed(self._entries):
             if wanted and str(entry.get("causality_id", "")) != wanted:
                 continue
-            return dict(entry)
+            return cast("dict[str, Any]", copy.deepcopy(entry))
         return None
 
     def newest_attempt(self, causality_id: str | None = None) -> dict[str, Any] | None:
