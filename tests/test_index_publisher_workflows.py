@@ -200,7 +200,7 @@ def test_packages_token_export_scope_every_workflow() -> None:
     allowed = {
         "aa-runtime.yml": "${{ github.token }}",
         "aa-self-proving-qualification.yml": "${{ github.token }}",
-        "aa-derived-index.yml": "${{ secrets.GITHUB_TOKEN }}",
+        "aa-derived-index.yml": "${{ github.token }}",
     }
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text(encoding="utf-8")

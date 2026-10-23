@@ -216,10 +216,13 @@ class _AuthSession:
         # qualified documented scope (``repository:<name>:<actions>``
         # asserted by the challenge itself) is valid at its token realm.
         # The requested fallback scope is used only when a challenge omits
-        # scope entirely; an explicitly empty challenge scope is honoured
-        # verbatim rather than silently replaced.
+        # scope entirely. An explicitly empty challenge scope asserts that
+        # no scope is needed; omit the parameter rather than sending the
+        # invalid ``scope=`` that GHCR rejects.
         challenge_scope = challenge.scope if challenge.scope is not None else scope
-        params: dict[str, str] = {"scope": challenge_scope}
+        params: dict[str, str] = {}
+        if challenge_scope:
+            params["scope"] = challenge_scope
         if challenge.service:
             params["service"] = challenge.service
         query = urllib.parse.urlencode(params)
@@ -286,26 +289,32 @@ class _AuthSession:
         """Classify an authenticated HTTP 403 without overclaiming a package ACL.
 
         A 403 can mean either that the package ACL denies this repository or
-        that the issued token lacks the requested action. When the challenge
-        scope (or a challenge returned with the 403 itself) does not grant
-        ``auth_scope`` -- including an explicitly empty challenge scope --
-        report an authentication failure; otherwise keep the ACL category.
+        that the issued token lacks the requested action. The challenge that
+        authorized the token is authoritative: when it granted ``auth_scope``,
+        the denial is an ACL result even if the 403 repeats a narrower or
+        different challenge. Only a token-issuing challenge that did not grant
+        the action -- including an explicitly empty challenge scope -- is an
+        authentication failure.
         """
         required = _scope_actions(auth_scope)
-        scopes: list[str | None] = []
+
+        def _grants(challenge_scope: str | None) -> bool:
+            actual_scope = challenge_scope if challenge_scope is not None else auth_scope
+            granted = _scope_actions(actual_scope)
+            return not required or "*" in granted or required.issubset(granted)
+
         if self._challenge is not None:
-            scopes.append(self._challenge.scope)
+            return "l2-access-denied" if _grants(self._challenge.scope) else "l2-authentication"
+
+        # No token-issuing challenge was recorded (for example an anonymous
+        # 403): classify from the challenge returned with the response when
+        # it is present.
         response_challenge = _parse_challenge(
             response_headers.get("WWW-Authenticate", ""),
             repository=self._registry.repository,
         )
-        if response_challenge is not None:
-            scopes.append(response_challenge.scope)
-        for challenge_scope in scopes:
-            actual_scope = challenge_scope if challenge_scope is not None else auth_scope
-            granted = _scope_actions(actual_scope)
-            if required and "*" not in granted and not required.issubset(granted):
-                return "l2-authentication"
+        if response_challenge is not None and not _grants(response_challenge.scope):
+            return "l2-authentication"
         return "l2-access-denied"
 
     def request(
