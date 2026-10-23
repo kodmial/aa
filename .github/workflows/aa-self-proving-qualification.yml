@@ -44,9 +44,15 @@ on:
         default: ""
 
 permissions:
+  # Issue #462: packages: read authorizes the digest-pinned E5 index pull
+  # from the ghcr.io/kodmial/aa-index package during the trusted Gate C L2
+  # restore (and keeps the existing container image pull working). All
+  # pre-existing named permissions are preserved; no packages: write and
+  # no PAT is introduced.
   contents: write
   actions: write
   issues: write
+  packages: read
 
 concurrency:
   # The push runner and the mandatory lifecycle dispatcher can both target
@@ -758,6 +764,12 @@ jobs:
         env:
           AA_ALLOW_NETWORK_FETCH: "0"
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          # Issue #462: only this trusted Gate C L2 restore invocation sees
+          # the repo-scoped ephemeral packages token, exported through this
+          # step's env (never a workflow-level env, never expanded into
+          # logs or summaries). A healthy L1 hit skips the L2 pull
+          # entirely, so the token is never used when L1 succeeds.
+          AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python scripts/restore_canonical.py --no-network-fallback

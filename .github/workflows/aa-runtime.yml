@@ -442,6 +442,12 @@ jobs:
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           AA_ALLOW_NETWORK_FETCH: "0"
+          # Issue #462: only this trusted L2 restore invocation sees the
+          # repo-scoped ephemeral packages token, exported through this
+          # step's env (never a workflow-level env, never expanded into
+          # logs or summaries). A healthy L1 hit skips the L2 pull
+          # entirely, so the token is never used when L1 succeeds.
+          AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
