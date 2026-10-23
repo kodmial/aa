@@ -59,7 +59,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
       env:
         # Packages write for the L2 blob/manifest upload; never leaked.
-        AA_INDEX_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}
         AA_ALLOW_NETWORK_FETCH: "0"
         AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
     outputs:

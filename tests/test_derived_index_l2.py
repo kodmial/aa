@@ -7,14 +7,17 @@ checks, rejected placeholder pins, and idempotent publication.
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
+import os
 import pathlib
 import socket
 import subprocess
 import sys
 import threading
 import typing
+import urllib.parse
 import uuid
 
 import pytest
@@ -48,10 +51,24 @@ def _server_state(server: typing.Any) -> dict[str, typing.Any]:
 
 
 class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
-    """Minimal registry-v2 subset with bearer auth and digest checks."""
+    """Minimal registry-v2 subset with bearer auth and digest checks.
+
+    Issue #462: the token endpoint mirrors the documented GHCR challenge
+    contract: the requested ``scope`` must be the exact fully qualified
+    scope asserted by the ``WWW-Authenticate`` challenge (an abstract
+    ``scope=pull`` is rejected with HTTP 403, exactly as the real GHCR
+    token realm behaves), and the Basic credential is validated as a
+    ``<username>:<password>`` pair without logging any secret material.
+    """
 
     def log_message(self, *args: object) -> None:  # noqa: D102
         pass
+
+    def _challenge(self) -> str:
+        state = _server_state(self.server)
+        host = f"http://127.0.0.1:{_server_port(self.server)}"
+        scope = state.get("challenge_scope", "repository:atest:push,pull")
+        return f'Bearer realm="{host}/token",service="fake",scope="{scope}"'
 
     def _auth_ok(self) -> bool:
         if _server_state(self.server).get("auth_reject"):
@@ -59,26 +76,49 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
             # standard bearer challenge, but the token endpoint itself
             # refuses, so the session can never resolve a usable token.
             self.send_response(401)
-            host = f"http://127.0.0.1:{_server_port(self.server)}"
-            self.send_header(
-                "WWW-Authenticate",
-                f'Bearer realm="{host}/token",service="fake",scope="repository:atest:pull"',
-            )
+            self.send_header("WWW-Authenticate", self._challenge())
             self.end_headers()
             return False
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic ") or header.startswith("Bearer "):
             return True
         self.send_response(401)
-        host = f"http://127.0.0.1:{_server_port(self.server)}"
-        self.send_header(
-            "WWW-Authenticate",
-            f'Bearer realm="{host}/token",service="fake",scope="repository:atest:push,pull"',
-        )
+        self.send_header("WWW-Authenticate", self._challenge())
         self.end_headers()
         return False
 
     def _token(self) -> None:
+        state = _server_state(self.server)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query or "")
+        requested_scope = query.get("scope", [""])[0]
+        # Record safe metadata for every token attempt (even rejected
+        # ones): scope string and the decoded Basic username/password
+        # pair, held only in test-local state and never printed.
+        state.setdefault("token_scopes", []).append(requested_scope)
+        basic = self.headers.get("Authorization", "")
+        if basic.startswith("Basic "):
+            raw = base64.b64decode(basic.split(" ", 1)[1]).decode("utf-8")
+            username, _, password = raw.partition(":")
+            state.setdefault("token_basic_credentials", []).append((username, password))
+        else:
+            state.setdefault("token_basic_credentials", []).append(("", ""))
+        # GHCR-faithful scope validation (kodmial/aa#462): only the exact
+        # challenge scope earns a token; anything else is HTTP 403. Safe
+        # metadata only is recorded (scope string and Basic username
+        # category), never the credential secret itself.
+        if state.get("auth_reject"):
+            # Simulated authentication failure: plain 401 without a
+            # follow-up challenge (token endpoint itself refuses).
+            self.send_response(401)
+            self.end_headers()
+            return
+        if state.get("enforce_challenge_scope", False) and requested_scope != state.get(
+            "challenge_scope", "repository:atest:push,pull"
+        ):
+            state["token_scope_rejections"] = state.get("token_scope_rejections", 0) + 1
+            self.send_response(403)
+            self.end_headers()
+            return
         payload = json.dumps({"token": "fake-token", "expires_in": 300}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -88,17 +128,21 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.startswith("/token"):
-            # The token endpoint rejects in the simulated auth-failure mode
-            # (plain 401 without a follow-up challenge).
-            if _server_state(self.server).get("auth_reject"):
-                self.send_response(401)
-                self.end_headers()
-                return
+            # kodmial/aa#462: record every token attempt (scope request and
+            # Basic credential category) even when auth is refused, mirroring
+            # the real GHCR token realm.
             self._token()
             return
         if not self._auth_ok():
             return
         state = _server_state(self.server)
+        if state.get("deny_403", False) and "/manifests/" in self.path:
+            # Simulated GHCR package ACL denial: a fully authenticated,
+            # correctly scoped request is answered with HTTP 403 instead of
+            # the content (kodmial/aa#462 safe category coverage).
+            self.send_response(403)
+            self.end_headers()
+            return
         if "/blobs/" in self.path:
             digest = self.path.rsplit("/", 1)[-1]
             blob = state["blobs"].get(digest)
@@ -186,6 +230,12 @@ class _RegistryFixture:
             "blobs": {},
             "manifests_by_tag": {},
             "manifests_by_digest": {},
+            "challenge_scope": "repository:atest:push,pull",
+            # Issue #462: enforce the documented GHCR token contract — a
+            # token request with any scope other than the exact challenge
+            # scope is answered with HTTP 403, so regressions back to an
+            # abstract "pull"/"push,pull" scope fail every test here.
+            "enforce_challenge_scope": True,
         }
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeRegistryHandler)
         self.server.state = self.state  # type: ignore[attr-defined]
@@ -213,12 +263,28 @@ def fake_registry() -> typing.Iterator[_RegistryFixture]:
 _MANAGER_SCRIPT = _REPO / "scripts" / "manage_derived_cache.py"
 
 
-def _run_restore_l2(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_restore_l2(
+    *args: str, env: dict[str, str | None] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run restore-l2 with optional explicit environment variables.
+
+    ``None`` removes the variable from the child environment (e.g. to
+    simulate a token-missing runtime); otherwise the value is injected on
+    top of the inherited environment. Credentials never enter ``stdout``,
+    ``stderr``, or any argument line.
+    """
+    child_env = dict(os.environ)
+    for key, value in (env or {}).items():
+        if value is None:
+            child_env.pop(key, None)
+        else:
+            child_env[key] = value
     return subprocess.run(
         [sys.executable, str(_MANAGER_SCRIPT), "--mode", "restore-l2", *args],
         capture_output=True,
         text=True,
         cwd=_REPO,
+        env=child_env,
         check=False,
     )
 
@@ -764,3 +830,289 @@ def test_publish_l2_refuses_non_e5_backend(tmp_path: pathlib.Path) -> None:
     )
     assert proc.returncode == 1
     assert "only the strict production E5 backend" in proc.stderr
+
+
+# --- Issue #462: GHCR challenge contract + scoped ephemeral token ------------
+
+
+def test_restore_l2_scoped_env_token_uses_challenge_scope_and_basic_username(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """A scoped ephemeral token resolves the documented GHCR challenge.
+
+    The token is read from the runtime-scoped environment variable only,
+    presented as the documented Basic credential against the actual bearer
+    challenge (exact challenge scope, ``x-access-token`` username), and
+    never appears in any log or process output. Manifest digest and every
+    layer digest are verified before the hit.
+    """
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    retrieval_dir = tmp_path / "retrieval"
+    proc = _run_restore_l2(
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--staging-dir",
+        str(tmp_path / "staging"),
+        "--retrieval-dir",
+        str(retrieval_dir),
+        "--identity-file",
+        str(identity_file),
+        "--digest-file",
+        str(pin_file),
+        "--oci-registry",
+        f"127.0.0.1:{fake_registry.port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "hashing",
+        env={"AA_INDEX_PACKAGES_TOKEN": "test-scoped-ephemeral-token"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "hit"
+    assert payload["source"] == "l2"
+    assert payload["l2_digest"] == digest
+    assert (retrieval_dir / "index.json").is_file()
+    assert dc.self_test_index(retrieval_dir)["chunk_count"] > 0
+    state = _server_state(fake_registry.server)
+    # GHCR challenge contract: the token request carries the exact fully
+    # qualified challenge scope (never an abstract "pull"/"push,pull").
+    assert state["token_scopes"], "no token request observed"
+    assert all(scope == state["challenge_scope"] for scope in state["token_scopes"])
+    # Documented Basic credential compatibility for the packages token.
+    assert ("x-access-token", "test-scoped-ephemeral-token") in state["token_basic_credentials"]
+    # The secret never enters any log or process output.
+    leaked = "test-scoped-ephemeral-token"
+    assert leaked not in proc.stdout
+    assert leaked not in proc.stderr
+
+
+def test_restore_l2_wrong_token_scope_is_denied_403(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """Direct client-level regression: an abstract scope fails closed.
+
+    Mirrors real GHCR (kodmial/aa#462): a token request with ``scope=pull``
+    gets HTTP 403 from the token realm; the session then reports the safe
+    authentication category and never produces a partial restore.
+    """
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+    staging_dir = tmp_path / "staging"
+    session = open_session(
+        fake_registry.registry, username="x-access-token", password="scoped-token"
+    )
+
+    # Rebuild the exact pre-fix client behavior: an abstract capability
+    # ("pull") replaces the challenge scope in the token request.
+    def _broken_token_url(challenge: typing.Any, scope: str) -> str:
+        return (
+            f"{challenge.realm}?service={urllib.parse.quote(str(challenge.service))}&"
+            f"scope={urllib.parse.quote(scope)}"
+        )
+
+    session._token_url = _broken_token_url  # type: ignore[method-assign]
+    with pytest.raises(ArtifactError) as excinfo:
+        pull_artifact(
+            fake_registry.registry,
+            reference=digest,
+            session=session,
+            dest_dir=staging_dir,
+        )
+    assert excinfo.value.category == "l2-authentication"
+    state = _server_state(fake_registry.server)
+    assert state.get("token_scope_rejections", 0) >= 1
+    assert state["token_scopes"][-1] == "pull"
+    # No partial files are left behind, and L1 stays intact.
+    assert _staging_clean_or_absent(staging_dir)
+    assert _l1_dir_digested(cache_dir) == before
+
+
+def test_restore_l2_acl_denial_403_reports_safe_category(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """Authenticated-but-denied digest pulls report exact ACL categories."""
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+    staging_dir = tmp_path / "staging"
+    _server_state(fake_registry.server)["deny_403"] = True
+    try:
+        proc = _run_restore_l2(
+            "--cache-dir",
+            str(cache_dir),
+            "--staging-dir",
+            str(staging_dir),
+            "--identity-file",
+            str(identity_file),
+            "--digest-file",
+            str(pin_file),
+            "--oci-registry",
+            f"127.0.0.1:{fake_registry.port}",
+            "--oci-repository",
+            "kodmial/aa-index",
+            "--oci-scheme",
+            "http",
+            "--require-backend",
+            "e5",
+            env={"AA_INDEX_PACKAGES_TOKEN": "test-scoped-ephemeral-token"},
+        )
+    finally:
+        _server_state(fake_registry.server)["deny_403"] = False
+    state = _server_state(fake_registry.server)
+    assert state["token_scopes"], "token request never reached the registry"
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "rejected"
+    assert payload["source"] == "l2"
+    assert payload["reason"] == "l2-access-denied"
+    assert payload["l2_digest"] == digest
+    assert "l2_pull_ms" in payload
+    assert _l1_dir_digested(cache_dir) == before
+    assert _staging_clean_or_absent(staging_dir)
+    assert "test-scoped-ephemeral-token" not in proc.stdout
+    assert "test-scoped-ephemeral-token" not in proc.stderr
+
+
+def test_restore_l2_denied_token_401_reports_authentication(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """A scoped token still reports fail-closed authentication denial."""
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+    staging_dir = tmp_path / "staging"
+    _server_state(fake_registry.server)["auth_reject"] = True
+    try:
+        proc = _run_restore_l2(
+            "--cache-dir",
+            str(cache_dir),
+            "--staging-dir",
+            str(staging_dir),
+            "--identity-file",
+            str(identity_file),
+            "--digest-file",
+            str(pin_file),
+            "--oci-registry",
+            f"127.0.0.1:{fake_registry.port}",
+            "--oci-repository",
+            "kodmial/aa-index",
+            "--oci-scheme",
+            "http",
+            "--require-backend",
+            "e5",
+            env={"AA_INDEX_PACKAGES_TOKEN": "test-scoped-ephemeral-token"},
+        )
+    finally:
+        _server_state(fake_registry.server)["auth_reject"] = False
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "rejected"
+    assert payload["reason"] == "l2-authentication"
+    assert payload["source"] == "l2"
+    assert _l1_dir_digested(cache_dir) == before
+    assert _staging_clean_or_absent(staging_dir)
+    assert "test-scoped-ephemeral-token" not in proc.stdout
+    assert "test-scoped-ephemeral-token" not in proc.stderr
+
+
+def test_restore_l2_token_missing_reports_anonymous_authentication_failure(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """Missing token env means an anonymous attempt: fail closed, never hit."""
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+    # Only the restore-l2 attempt is measured: drop credentials recorded
+    # by the push_artifact fixture setup above.
+    _server_state(fake_registry.server)["auth_reject"] = True
+    _server_state(fake_registry.server)["token_basic_credentials"] = []
+    try:
+        proc = _run_restore_l2(
+            "--cache-dir",
+            str(cache_dir),
+            "--digest-file",
+            str(pin_file),
+            "--oci-registry",
+            f"127.0.0.1:{fake_registry.port}",
+            "--oci-repository",
+            "kodmial/aa-index",
+            "--oci-scheme",
+            "http",
+            "--require-backend",
+            "e5",
+            env={"AA_INDEX_PACKAGES_TOKEN": None},
+        )
+    finally:
+        _server_state(fake_registry.server)["auth_reject"] = False
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "rejected"
+    assert payload["reason"] == "l2-authentication"
+    # The anonymous session never presented a Basic credential.
+    state = _server_state(fake_registry.server)
+    assert state["token_basic_credentials"]
+    assert all(username == "" for username, _password in state["token_basic_credentials"])
+    # The #461 fallback keeps the existing L1 intact.
+    assert _l1_dir_digested(cache_dir) == before
