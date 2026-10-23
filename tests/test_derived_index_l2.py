@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.server
 import json
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
@@ -42,8 +43,8 @@ def _server_port(server: typing.Any) -> int:
     return int(server.server_port)
 
 
-def _server_state(server: typing.Any) -> dict[str, dict[str, typing.Any]]:
-    return typing.cast("dict[str, dict[str, typing.Any]]", server.state)
+def _server_state(server: typing.Any) -> dict[str, typing.Any]:
+    return typing.cast("dict[str, typing.Any]", server.state)
 
 
 class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
@@ -53,6 +54,18 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _auth_ok(self) -> bool:
+        if _server_state(self.server).get("auth_reject"):
+            # Simulated authentication failure: API requests still carry the
+            # standard bearer challenge, but the token endpoint itself
+            # refuses, so the session can never resolve a usable token.
+            self.send_response(401)
+            host = f"http://127.0.0.1:{_server_port(self.server)}"
+            self.send_header(
+                "WWW-Authenticate",
+                f'Bearer realm="{host}/token",service="fake",scope="repository:atest:pull"',
+            )
+            self.end_headers()
+            return False
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic ") or header.startswith("Bearer "):
             return True
@@ -75,6 +88,12 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.startswith("/token"):
+            # The token endpoint rejects in the simulated auth-failure mode
+            # (plain 401 without a follow-up challenge).
+            if _server_state(self.server).get("auth_reject"):
+                self.send_response(401)
+                self.end_headers()
+                return
             self._token()
             return
         if not self._auth_ok():
@@ -163,7 +182,7 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
 
 class _RegistryFixture:
     def __init__(self) -> None:
-        self.state: dict[str, dict[str, typing.Any]] = {
+        self.state: dict[str, typing.Any] = {
             "blobs": {},
             "manifests_by_tag": {},
             "manifests_by_digest": {},
@@ -189,6 +208,49 @@ def fake_registry() -> typing.Iterator[_RegistryFixture]:
         yield fixture
     finally:
         fixture.shutdown()
+
+
+_MANAGER_SCRIPT = _REPO / "scripts" / "manage_derived_cache.py"
+
+
+def _run_restore_l2(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_MANAGER_SCRIPT), "--mode", "restore-l2", *args],
+        capture_output=True,
+        text=True,
+        cwd=_REPO,
+        check=False,
+    )
+
+
+def _seed_preexisting_l1(cache_dir: pathlib.Path, payload: bytes) -> dict[str, str]:
+    """Create a preexisting L1 cache directory with known bytes (issue #461)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    encrypted = cache_dir / dc.ENCRYPTED_NAME
+    meta = cache_dir / dc.META_NAME
+    marker = cache_dir / "l1-marker.txt"
+    encrypted.write_bytes(payload)
+    meta.write_bytes(b'{"cache_key": "preexisting-marker"}\n')
+    marker.write_bytes(b"l1-must-survive\n")
+    return {
+        dc.ENCRYPTED_NAME: dc.sha256_bytes(payload),
+        dc.META_NAME: dc.sha256_bytes(meta.read_bytes()),
+        "l1-marker.txt": dc.sha256_bytes(marker.read_bytes()),
+    }
+
+
+def _l1_dir_digested(cache_dir: pathlib.Path) -> dict[str, str]:
+    return {
+        name: dc.sha256_bytes(path.read_bytes())
+        for name in sorted(path.name for path in cache_dir.iterdir())
+        for path in (cache_dir / name,)
+        if path.is_file()
+    }
+
+
+def _staging_clean_or_absent(staging_dir: pathlib.Path) -> bool:
+    """Issue #461: staging cleanup leaves the directory empty (or created-back-to-absent)."""
+    return (not staging_dir.exists()) or list(staging_dir.iterdir()) == []
 
 
 def _encrypted_fixture(tmp_path: pathlib.Path) -> tuple[str, bytes, bytes, str]:
@@ -431,6 +493,256 @@ def test_restore_l2_roundtrip_via_registry(
     strict_payload = json.loads(strict.stdout)
     assert strict_payload["status"] == "rejected"
     assert strict_payload["reason"] == "wrong-backend"
+
+
+# --- Issue #461: L2 staging isolation + L1 -> L2 -> rebuild ordering -------
+
+
+def test_restore_l2_auth_and_transport_failures_never_touch_preexisting_l1(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """Simulated L2 failures can never mutate, overwrite or delete L1."""
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    files = {dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta}
+    digest = push_artifact(
+        fake_registry.registry,
+        files=files,
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+    # Seed stale bytes in the default staging sibling to prove it is the
+    # exactly targeted (and cleaned) L2-owned path.
+    default_staging = pathlib.Path(str(cache_dir) + ".l2-staging")
+    default_staging.mkdir(parents=True, exist_ok=True)
+    (default_staging / "stale-staging.bin").write_bytes(b"stale-staging-junk")
+
+    # Simulated authentication failure (401 on every request incl. token).
+    _server_state(fake_registry.server)["auth_reject"] = True
+    auth = _run_restore_l2(
+        "--cache-dir",
+        str(cache_dir),
+        "--identity-file",
+        str(identity_file),
+        "--digest-file",
+        str(pin_file),
+        "--oci-registry",
+        f"127.0.0.1:{fake_registry.port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "e5",
+    )
+    _server_state(fake_registry.server)["auth_reject"] = False
+
+    assert auth.returncode == 0, auth.stderr
+    auth_payload = json.loads(auth.stdout)
+    assert auth_payload["status"] == "rejected"
+    assert auth_payload["reason"] == "l2-authentication"
+    assert auth_payload["source"] == "l2"
+    assert _l1_dir_digested(cache_dir) == before
+    # The default staging sibling is used and cleaned up; L1 stays intact.
+    assert list(default_staging.iterdir()) == []
+
+    # Simulated transport failure (registry port closed).
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+    transport_pin = tmp_path / "transport-pin.digest"
+    transport_pin.write_text(f"127.0.0.1:{dead_port}/kodmial/aa-index@{digest}\n", encoding="utf-8")
+    transport = _run_restore_l2(
+        "--cache-dir",
+        str(cache_dir),
+        "--identity-file",
+        str(identity_file),
+        "--digest-file",
+        str(transport_pin),
+        "--oci-registry",
+        f"127.0.0.1:{dead_port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "e5",
+        "--staging-dir",
+        str(tmp_path / "staging-explicit"),
+    )
+    assert transport.returncode == 0, transport.stderr
+    transport_payload = json.loads(transport.stdout)
+    assert transport_payload["status"] == "rejected"
+    assert transport_payload["reason"] == "l2-registry-unavailable"
+    assert _l1_dir_digested(cache_dir) == before
+    staging_explicit = tmp_path / "staging-explicit"
+    assert _staging_clean_or_absent(staging_explicit)
+
+
+def test_restore_l2_bad_bundle_failures_never_touch_preexisting_l1(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """Digest mismatch and decryption failure are isolated to L2 staging."""
+    before_identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    files = {dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta}
+    digest = push_artifact(
+        fake_registry.registry,
+        files=files,
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"preexisting-l1-encrypted-bytes")
+
+    # Digest-mismatch failure: tamper a blob server-side.
+    manifest_bytes, _manifest_digest = _server_state(fake_registry.server)["manifests_by_digest"][
+        digest
+    ]
+    manifest = json.loads(manifest_bytes)
+    _server_state(fake_registry.server)["blobs"][manifest["layers"][0]["digest"]] = b"tampered"
+    mismatch = _run_restore_l2(
+        "--cache-dir",
+        str(cache_dir),
+        "--digest-file",
+        str(pin_file),
+        "--oci-registry",
+        f"127.0.0.1:{fake_registry.port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "e5",
+        "--staging-dir",
+        str(tmp_path / "staging-mismatch"),
+    )
+    assert mismatch.returncode == 0, mismatch.stderr
+    mismatch_payload = json.loads(mismatch.stdout)
+    assert mismatch_payload["status"] == "rejected"
+    assert mismatch_payload["reason"] in ("l2-blob-missing", "l2-blob-digest-mismatch")
+    assert _l1_dir_digested(cache_dir) == before
+    assert _staging_clean_or_absent(tmp_path / "staging-mismatch")
+
+    # Decryption failure: the artifact holds a bundle for another identity.
+    package = dc.decrypt_package(encrypted, before_identity)
+    other_identity, other_recipient = age_v1.generate_identity()
+    try:
+        other_encrypted = dc.encrypt_package(package, other_recipient)
+        other_meta = json.dumps(
+            dc.build_meta_payload(
+                cache_key=dc.derived_cache_key(
+                    dc.read_bindings(_REPO, os_name="Linux", arch="X64")
+                ),
+                encrypted_sha256=dc.sha256_bytes(other_encrypted),
+                encrypted_bytes=len(other_encrypted),
+                bindings=dc.read_bindings(_REPO, os_name="Linux", arch="X64"),
+            )
+        ).encode("utf-8")
+    finally:
+        other_identity = "destroyed"  # noqa: F841
+        other_recipient = "destroyed"  # noqa: F841
+    alt_digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: other_encrypted, dc.META_NAME: other_meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "fixture-identity.txt"
+    identity_file.write_text(before_identity, encoding="utf-8")
+    alt_pin = tmp_path / "alt-pin.digest"
+    alt_pin.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{alt_digest}\n", encoding="utf-8"
+    )
+    decrypt_fail = _run_restore_l2(
+        "--cache-dir",
+        str(cache_dir),
+        "--identity-file",
+        str(identity_file),
+        "--digest-file",
+        str(alt_pin),
+        "--oci-registry",
+        f"127.0.0.1:{fake_registry.port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "e5",
+        "--staging-dir",
+        str(tmp_path / "staging-decrypt"),
+    )
+    assert decrypt_fail.returncode == 0, decrypt_fail.stderr
+    decrypt_payload = json.loads(decrypt_fail.stdout)
+    assert decrypt_payload["status"] == "rejected"
+    assert decrypt_payload["reason"] == "decrypt-failed"
+    assert _l1_dir_digested(cache_dir) == before
+    assert _staging_clean_or_absent(tmp_path / "staging-decrypt")
+
+
+def test_restore_l2_hit_keeps_preexisting_l1_and_cleans_staging(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path
+) -> None:
+    """A verified L2 hit writes the staging/retrieval layers only."""
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    digest = push_artifact(
+        fake_registry.registry,
+        files={dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta},
+        tag=expected_l2_tag(cache_digest),
+        session=fake_registry.session,
+    )
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    pin_file = tmp_path / "pin.digest"
+    pin_file.write_text(
+        f"127.0.0.1:{fake_registry.port}/kodmial/aa-index@{digest}\n", encoding="utf-8"
+    )
+    cache_dir = tmp_path / "l1-cache"
+    before = _seed_preexisting_l1(cache_dir, payload=b"unrelated-preexisting-bytes")
+    retrieval_dir = tmp_path / "retrieval"
+    staging_dir = tmp_path / "explicit-staging"
+    hit = _run_restore_l2(
+        "--cache-dir",
+        str(cache_dir),
+        "--staging-dir",
+        str(staging_dir),
+        "--retrieval-dir",
+        str(retrieval_dir),
+        "--identity-file",
+        str(identity_file),
+        "--digest-file",
+        str(pin_file),
+        "--oci-registry",
+        f"127.0.0.1:{fake_registry.port}",
+        "--oci-repository",
+        "kodmial/aa-index",
+        "--oci-scheme",
+        "http",
+        "--require-backend",
+        "hashing",
+    )
+    assert hit.returncode == 0, hit.stderr
+    hit_payload = json.loads(hit.stdout)
+    assert hit_payload["status"] == "hit"
+    assert hit_payload["source"] == "l2"
+    assert hit_payload["l2_digest"] == digest
+    # Original L1 bytes are never mutated even by a verified L2 hit.
+    assert _l1_dir_digested(cache_dir) == before
+    # Staging is cleaned; the validated bundle lives in the retrieval dir.
+    assert list(staging_dir.iterdir()) == []
+    assert (retrieval_dir / "index.json").is_file()
+    assert (retrieval_dir / "lexical.db").is_file()
+    assert dc.self_test_index(retrieval_dir)["chunk_count"] > 0
 
 
 def test_publish_l2_refuses_non_e5_backend(tmp_path: pathlib.Path) -> None:

@@ -90,7 +90,6 @@ def test_gate_c_bootstrap_sequence_keeps_checkout_clean(tmp_path: pathlib.Path) 
     status_dir = tmp_path / "runner-temp"
     status_dir.mkdir()
     l2_status_file = status_dir / "derived-l2-status.json"
-    l1_status_file = status_dir / "derived-l1-status.json"
 
     assert working_tree_clean(repo) is True
 
@@ -193,6 +192,41 @@ def test_gate_c_bootstrap_sequence_keeps_checkout_clean(tmp_path: pathlib.Path) 
     finally:
         fixture.shutdown()
 
+    # L1 exact-validation branch (kodmial/aa#461): the bootstrap first
+    # validates the actual restored L1 with --mode restore; a hashing
+    # bundle is rejected under --require-backend e5 without touching the
+    # cached bytes, and every status lands in RUNNER_TEMP storage.
+    identity, encrypted, meta, _cache_digest = _encrypted_fixture(tmp_path)
+    l1_cache = tmp_path / "l1-cache"
+    l1_cache.mkdir()
+    from aa.retrieval.derived_cache import ENCRYPTED_NAME, META_NAME
+
+    (l1_cache / ENCRYPTED_NAME).write_bytes(encrypted)
+    (l1_cache / META_NAME).write_bytes(meta)
+    l1_before = {path.name: path.read_bytes() for path in sorted(l1_cache.iterdir())}
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    l1_validate = _manager(
+        "--mode",
+        "restore",
+        "--cache-dir",
+        str(l1_cache),
+        "--require-backend",
+        "e5",
+        "--identity-file",
+        str(identity_file),
+        "--status-file",
+        str(status_dir / "derived-l1-validation-status.json"),
+        cwd=repo,
+    )
+    assert l1_validate.returncode == 0, l1_validate.stderr
+    l1_payload = json.loads(l1_validate.stdout)
+    assert l1_payload["status"] == "rejected"
+    assert l1_payload["reason"] == "wrong-backend"
+    l1_after = {path.name: path.read_bytes() for path in sorted(l1_cache.iterdir())}
+    assert l1_after == l1_before
+    assert _porcelain(repo) == ""
+
     # L1 exact-restore branch (miss with an empty tmp cache): tmp status.
     miss = _manager(
         "--mode",
@@ -204,7 +238,9 @@ def test_gate_c_bootstrap_sequence_keeps_checkout_clean(tmp_path: pathlib.Path) 
         "--require-backend",
         "e5",
         "--status-file",
-        str(l1_status_file),
+        str(status_dir / "derived-l1-miss-status.json"),
+        "--retrieval-dir",
+        str(status_dir / "gate-c-l1-miss-retrieval"),
         cwd=repo,
     )
     assert miss.returncode == 0, miss.stderr
@@ -213,6 +249,82 @@ def test_gate_c_bootstrap_sequence_keeps_checkout_clean(tmp_path: pathlib.Path) 
     assert _porcelain(repo) == ""
 
     assert working_tree_clean(repo) is True
+
+
+def test_simulated_l2_failure_cannot_touch_preexisting_l1(
+    tmp_path: pathlib.Path,
+) -> None:
+    # kodmial/aa#461: a simulated L2 authentication failure directly
+    # preserves every preexisting L1 byte (the reproduced runtime incident
+    # in issue #39948028585 deleted the healthy restored L1 through
+    # clear_directory(args.cache_dir) on L2 authentication failure).
+    repo = tmp_path / "gate-c-checkout"
+    repo.mkdir()
+    _clean_checkout(repo)
+    status_dir = tmp_path / "runner-temp"
+    status_dir.mkdir()
+    identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
+    fixture = _RegistryFixture()
+    try:
+        from aa.retrieval.derived_cache import ENCRYPTED_NAME, META_NAME
+        from aa.retrieval.oci_artifact import expected_l2_tag, push_artifact
+
+        digest = push_artifact(
+            fixture.registry,
+            files={ENCRYPTED_NAME: encrypted, META_NAME: meta},
+            tag=expected_l2_tag(cache_digest),
+            session=fixture.session,
+        )
+        pin = tmp_path / "local-pin.digest"
+        pin.write_text(f"127.0.0.1:{fixture.port}/kodmial/aa-index@{digest}\n", encoding="utf-8")
+        cache_dir = tmp_path / "l1-cache"
+        cache_dir.mkdir()
+        preexisting = {path.name: path.read_bytes() for path in sorted(cache_dir.iterdir())}
+        assert preexisting == {}
+        healthy_l1 = b"healthy-restored-l1-encrypted-bytes"
+        (cache_dir / ENCRYPTED_NAME).write_bytes(healthy_l1)
+        (cache_dir / META_NAME).write_bytes(b'{"cache_key": "healthy-l1"}\n')
+        preexisting = {path.name: path.read_bytes() for path in sorted(cache_dir.iterdir())}
+
+        fixture.state["auth_reject"] = True
+        identity_file = tmp_path / "identity.txt"
+        identity_file.write_text(identity, encoding="utf-8")
+        failed = _manager(
+            "--mode",
+            "restore-l2",
+            "--cache-dir",
+            str(cache_dir),
+            "--staging-dir",
+            str(tmp_path / "l2-staging"),
+            "--identity-file",
+            str(identity_file),
+            "--digest-file",
+            str(pin),
+            "--oci-registry",
+            f"127.0.0.1:{fixture.port}",
+            "--oci-repository",
+            "kodmial/aa-index",
+            "--oci-scheme",
+            "http",
+            "--require-backend",
+            "e5",
+            "--status-file",
+            str(status_dir / "derived-l2-status.json"),
+            cwd=repo,
+        )
+        fixture.state["auth_reject"] = False
+        assert failed.returncode == 0, failed.stderr
+        payload = json.loads(failed.stdout)
+        assert payload["status"] == "rejected"
+        assert payload["reason"] == "l2-authentication"
+        after = {path.name: path.read_bytes() for path in sorted(cache_dir.iterdir())}
+        assert after == preexisting
+        staging = tmp_path / "l2-staging"
+        assert (not staging.exists()) or list(staging.iterdir()) == []
+        assert _porcelain(repo) == ""
+        assert working_tree_clean(repo) is True
+    finally:
+        fixture.shutdown()
 
 
 def test_relative_status_files_reproduce_checkout_pollution(tmp_path: pathlib.Path) -> None:

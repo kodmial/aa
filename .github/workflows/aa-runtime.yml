@@ -465,48 +465,129 @@ jobs:
           # Issue #58: encrypted disposable derived retrieval cache.
           # Exact lookup only; miss/stale/corrupt/unavailable transparently
           # rebuilds from the canonical corpus. Disabled cache boots cleanly.
-          # Issue #429: the persistent L2 GHCR artifact is the first lookup
-          # after an Actions-cache eviction (L1). Only a commit-pinned
+          # Issue #429: the persistent L2 GHCR artifact is a lookup after a
+          # verified L1 miss (Actions cache eviction). Only a commit-pinned
           # immutable digest (docker/aa-index.digest) may authorize a pull;
           # a placeholder pin or any transport/verification failure falls
-          # back to the bounded deterministic emergency rebuild — never to a
-          # mutable tag. Restore is strict: only a proven E5-backend index
+          # back to the bounded deterministic emergency rebuild — never to
+          # a mutable tag. Restore is strict: only a proven E5-backend index
           # (metadata in the restored index.json) counts as a production hit.
+          # Issue #461: correct bootstrap order L1 -> L2 -> rebuild.
+          # First validate the ACTUAL restored L1 directory (never merely the
+          # actions/cache restore output). If and only if L1 is missing or
+          # rejected, pull the digest-pinned L2 into an L2-owned staging
+          # directory (an L2 failure can never mutate the L1 directory).
+          # Only if both fail, run the bounded deterministic strict-E5
+          # rebuild. Verified L1/L2 hits skip redundant checks/embeddings.
           derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
-          bootstrap_start=$(date +%s)
-          if python scripts/manage_derived_cache.py --mode restore-l2 \
+          l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"
+          l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
+          l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"
+          rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"
+          l1_status="miss"
+          if python scripts/manage_derived_cache.py --mode restore \
               --cache-dir "$derived_dir" \
               --require-backend e5 \
-              --status-file "${RUNNER_TEMP:-/tmp}/derived-l2-status.json"; then
-            l2_status=$(python -c "import json; print(json.load(open('${RUNNER_TEMP:-/tmp}/derived-l2-status.json')).get('status'))")
-          else
-            l2_status="skip"
-          fi
-          if [[ "$l2_status" == "hit" ]]; then
-            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
-            {
-              echo "| Bootstrap phase (issue #429) | outcome | seconds |"
-              echo "| --- | --- | --- |"
-              echo "| L2 GHCR restore (strict E5) | hit | $bootstrap_s |"
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "AA derived cache bootstrap: verified L2 hit (strict E5)."
-          else
-            l2_reason="transport-error"
-            if [[ -f "${RUNNER_TEMP:-/tmp}/derived-l2-status.json" ]]; then
-              l2_reason=$(python -c "import json; print(json.load(open('${RUNNER_TEMP:-/tmp}/derived-l2-status.json')).get('reason'))")
+              --status-file "$l1_status_file"; then
+            if [[ -f "$l1_status_file" ]]; then
+              l1_status=$(python -c "import json; print(json.load(open('$l1_status_file')).get('status'))")
             fi
-            echo "L2 restore did not hit (reason ${l2_reason}); falling back to L1 or bounded emergency rebuild."
-            python scripts/manage_derived_cache.py --mode restore-or-rebuild \
-              --cache-dir "$derived_dir" \
-              --backend e5 --require-backend e5 \
-              --status-file "${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
-            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
-            {
-              echo "| Bootstrap phase (issue #429) | outcome | seconds |"
-              echo "| --- | --- | --- |"
-              echo "| L2 GHCR restore | ${l2_status} | - |"
-              echo "| L1 restore-or-rebuild (strict E5) | applied | $bootstrap_s |"
-            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            l1_status="failed"
+          fi
+          l2_status="skipped"
+          if [[ "$l1_status" == "hit" ]]; then
+            bootstrap_status="l1-hit"
+          else
+            python scripts/manage_derived_cache.py --mode restore-l2 \
+                --cache-dir "$derived_dir" \
+                --staging-dir "$l2_staging_dir" \
+                --require-backend e5 \
+                --status-file "$l2_status_file" || true
+            if [[ -f "$l2_status_file" ]]; then
+              l2_status=$(python -c "import json; print(json.load(open('$l2_status_file')).get('status'))")
+            else
+              l2_status="failed"
+            fi
+            if [[ "$l2_status" == "hit" ]]; then
+              bootstrap_status="l2-hit"
+            else
+              bootstrap_status="failed"
+              if python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+                  --cache-dir "$derived_dir" \
+                  --backend e5 --require-backend e5 \
+                  --status-file "$rebuild_status_file"; then
+                bootstrap_status="rebuilt"
+              fi
+            fi
+          fi
+          echo "AA derived cache bootstrap: ${bootstrap_status} (l1=${l1_status}, l2=${l2_status})."
+          python - "${bootstrap_status}" \
+              "${l1_status_file}" "${l2_status_file}" "${rebuild_status_file}" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+
+          from pathlib import Path
+
+          status = sys.argv[1]
+
+          def load(path: str):
+              try:
+                  return json.loads(Path(path).read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  return {}
+
+          def plain(value):
+              return "" if value is None else str(value)
+
+          l1 = load(sys.argv[2])
+          l2 = load(sys.argv[3])
+          rebuild = load(sys.argv[4])
+          fingerprint = plain(
+              l1.get("cache_fingerprint")
+              or l2.get("cache_fingerprint")
+              or rebuild.get("cache_fingerprint")
+          )
+          lines = [
+              "| AA derived-index bootstrap (issue #461) | source | outcome | ms |",
+              "| --- | --- | --- | --- |",
+              "| L1 exact-content Actions restore (validated, strict E5) | l1 "
+              f"| {plain(l1.get('status')) or 'absent'} | {plain(l1.get('restore_ms')) or '-'} |",
+              "| L2 digest-pinned GHCR restore (isolated staging, strict E5) | l2 "
+              f"| {plain(l2.get('status')) or 'skipped'} | {plain(l2.get('restore_ms')) or '-'} |",
+          ]
+          if rebuild:
+              rebuild_ms = plain(rebuild.get("build_ms")) or "-"
+              lines.append(
+                  "| Bounded deterministic rebuild (strict E5) | rebuild | "
+                  f"{plain(rebuild.get('status'))} | {rebuild_ms} |"
+              )
+          else:
+              lines.append("| Bounded deterministic rebuild (strict E5) | rebuild | skipped | - |")
+          lines.append(
+              f"Bootstrap status: **{status}**."
+              + (f" (fingerprint `{fingerprint}`)" if fingerprint else "")
+          )
+          reasons = "; ".join(
+              f"{name}-reason={str(item.get('reason'))}"
+              for name, item in (("l1", l1), ("l2", l2), ("rebuild", rebuild))
+              if item.get("reason")
+          )
+          if reasons:
+              lines.append(f"Bootstrap detail (non-secret categories only): {reasons}.")
+          l1_rejected = plain(l1.get("reason")) not in ("", "cache-miss")
+          if l1_rejected:
+              lines.append(
+                  "- The exact-key L1 content was rejected under its own key; "
+                  "no in-place overwrite is attempted and the immutable "
+                  "existing cache entry is left untouched (repair/rotation "
+                  "via AA_DERIVED_CACHE_ROTATION is an owner action only)."
+              )
+          print("\n".join(lines))
+          PY
+          if [[ "$bootstrap_status" == "failed" ]]; then
+            echo "::error::AA derived cache bootstrap failed after L1/L2 attempts (strict E5 rebuild unavailable)."
+            exit 1
           fi
 
           for tool in book_search book_read book_expand book_section; do
