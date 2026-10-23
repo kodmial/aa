@@ -140,6 +140,20 @@ jobs:
           key: ${{ steps.derived-cache-key.outputs.actions-key }}
           fail-on-cache-miss: false
 
+      - name: Prefetch pinned public E5 assets before any L2 rebuild
+        shell: bash
+        # kodmial/aa#444: this job runs inside the promoted prepared
+        # runtime container, which intentionally carries NO public model
+        # weights (see docker/Dockerfile.aa-runtime). Without the pinned
+        # E5 snapshot cached locally the strict-E5 rebuild fails with
+        # 'pinned e5 snapshot is not cached locally; refusing network
+        # fetch', publication never reached GHCR, and the committed
+        # docker/aa-index.digest stayed a zero placeholder (honest
+        # 'l2-unpublished' rejections in every qualification bootstrap).
+        run: |
+          set -euo pipefail
+          python scripts/prefetch_public_assets.py
+
       - name: Build strict E5 production index and publish L2
         id: publish
         shell: bash
@@ -152,14 +166,17 @@ jobs:
             --backend e5 --require-backend e5
           # Trusted publication: idempotent content-addressed artifact
           # (HEAD-before-push), retried on transient transport failures.
+          # kodmial/aa#444: the publication status file is also kept in
+          # RUNNER_TEMP, never in the repository checkout.
+          publish_status_file="${RUNNER_TEMP:-/tmp}/derived-publish-status.json"
           python scripts/manage_derived_cache.py --mode publish-l2 \
             --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache" \
             --require-backend e5 \
-            --status-file "derived-publish-status.json"
-          echo "l2_digest=$(python -c "import json; print(json.load(open('derived-publish-status.json'))['l2_digest'])")" >> "$GITHUB_OUTPUT"
-          echo "cache_fingerprint=$(python -c "import json; print(json.load(open('derived-publish-status.json'))['cache_fingerprint'])")" >> "$GITHUB_OUTPUT"
-          digest_value="$(python -c "import json; print(json.load(open('derived-publish-status.json'))['l2_digest'])")"
-          fingerprint_value="$(python -c "import json; print(json.load(open('derived-publish-status.json'))['cache_fingerprint'])")"
+            --status-file "$publish_status_file"
+          echo "l2_digest=$(python -c "import json; print(json.load(open('$publish_status_file'))['l2_digest'])")" >> "$GITHUB_OUTPUT"
+          echo "cache_fingerprint=$(python -c "import json; print(json.load(open('$publish_status_file'))['cache_fingerprint'])")" >> "$GITHUB_OUTPUT"
+          digest_value="$(python -c "import json; print(json.load(open('$publish_status_file'))['l2_digest'])")"
+          fingerprint_value="$(python -c "import json; print(json.load(open('$publish_status_file'))['cache_fingerprint'])")"
           {
             echo "## AA derived-index L2 publication"
             echo "- digest: \`ghcr.io/kodmial/aa-index@$digest_value\`"
@@ -180,7 +197,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: aa-index-bootstrap-metrics
-          path: derived-publish-status.json
+          path: ${{ runner.temp }}/derived-publish-status.json
           retention-days: 30
           if-no-files-found: error
 
