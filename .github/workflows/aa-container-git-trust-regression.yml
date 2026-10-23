@@ -1,0 +1,136 @@
+name: AA container Git trust regression
+run-name: AA container Git trust regression (issue #435)
+
+# Minimal real container regression for the post-checkout Git trust
+# bootstrap (kodmial/aa#435): checkout succeeds -> a separate normal step
+# runs scripts/ensure_container_git_safe_directory.sh (the checkout action's
+# temporary HOME config is not read by ordinary steps) -> an independent
+# later step runs `git rev-parse HEAD` / `git status --porcelain` inside the
+# pinned, verified GHCR runtime image on a fresh hosted runner. Read-only
+# job: contents/packages read permissions only, and NO book, index, model,
+# provider or Telegram secrets of any kind. This job never publishes and
+# never affects any qualification gate verdict; its only output is the
+# evidence below.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/ensure_container_git_safe_directory.sh"
+      - ".github/workflows/aa-container-git-trust-regression.yml"
+      - ".github/workflows/aa-self-proving-qualification.yml"
+      - ".github/workflows/aa-derived-index.yml"
+      - ".github/workflows/aa-runtime.yml"
+      - ".github/workflows/aa-runtime-image.yml"
+  workflow_dispatch:
+
+# Read-only: the pinned GHCR image is pulled from packages, nothing is
+# published, and no workflow state outside this job is touched.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  # A later commit on the same reference supersedes the regression run.
+  group: aa-container-git-trust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checkout-bootstrap-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      # Current verified/canary-pinned GHCR runtime image (same digest as
+      # the qualification jobs at the time of this change); pinned by
+      # immutable digest, never a mutable tag.
+      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Record pinned image provenance
+        # The digest is a pin (proof of the environment), not a credential.
+        shell: bash
+        run: |
+          {
+            echo "## AA container Git trust regression (issue #435)"
+            echo "- GHCR image: \`ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409\`"
+            echo "- workflow sha: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bootstrap exact-workspace Git trust (normal later step)
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
+
+      - name: Verify trusted git HEAD and status (independent step)
+        # Intentionally a SEPARATE ordinary step: proves the trust written by
+        # the bootstrap into the job's persistent HOME is read by later shell
+        # steps, exactly where the qualification workflow first runs
+        # git rev-parse/status with differing workspace ownership.
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_digest="ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409"
+          workspace="$GITHUB_WORKSPACE"
+          toplevel="$(git -C "$workspace" rev-parse --show-toplevel)"
+          head_sha="$(git -C "$workspace" rev-parse HEAD)"
+          status_count="$(git -C "$workspace" status --porcelain | wc -l)"
+          origin="$(git config --show-origin --get-all safe.directory || true)"
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git rev-parse HEAD did not return a full SHA: '$head_sha'"
+            exit 1
+          fi
+          if [[ "$toplevel" != "$workspace" ]]; then
+            echo "::error::Trusted workspace mismatch: toplevel=$toplevel workspace=$workspace"
+            exit 1
+          fi
+          trusted_line="file:${HOME}/.gitconfig"$'\t'"$workspace"
+          if ! printf '%s\n' "$origin" | grep -Fx -e "$trusted_line" \
+              -e "file:/etc/gitconfig"$'\t'"$workspace"; then
+            echo "::error::$workspace is not present with exact value in the job's trusted git config."
+            exit 1
+          fi
+          {
+            echo "- checkout -> bootstrap -> independent step \`git rev-parse HEAD\`/\`git status --porcelain\`: PASS"
+            echo "- trusted exact workspace: \`$workspace\` (\`git rev-parse --show-toplevel\` confirmed)"
+            echo "- HEAD at verification: \`$head_sha\`"
+            echo "- \`git status --porcelain\` entries (readable clean tree): $status_count"
+            echo "- image provenance: \`$image_digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify git config origin without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          redacted_origin="$(git config --show-origin --get-all safe.directory \
+            | sed -e "s#${HOME//\"/}#\$HOME#g")"
+          {
+            echo "- trusted config origin (redacted HOME, no credentials):"
+            echo ''
+            echo '```'
+            printf '%s\n' "$redacted_origin"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify repeated bootstrap is idempotent
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="$(git config --get-all safe.directory | wc -l)"
+          bash scripts/ensure_container_git_safe_directory.sh
+          after="$(git config --get-all safe.directory | wc -l)"
+          if [[ "$before" != "$after" ]]; then
+            echo "::error::Repeated bootstrap added safe.directory entries (before=$before after=$after)."
+            exit 1
+          fi
+          if git config --get-all safe.directory | grep -qF '*'; then
+            echo "::error::Wildcard safe.directory entry found; refusing wildcard trust."
+            exit 1
+          fi
+          {
+            echo "- repeated bootstrap idempotency: PASS (entry count unchanged, no wildcard entries)"
+            echo "- final safety trusted exact entries:"
+          } >> "$GITHUB_STEP_SUMMARY"
+          git config --get-all safe.directory | sed 's/^/  - /' >> "$GITHUB_STEP_SUMMARY"

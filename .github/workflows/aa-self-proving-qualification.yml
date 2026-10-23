@@ -200,6 +200,18 @@ jobs:
           ref: ${{ inputs.required_sha || github.sha }}
           fetch-depth: 0
 
+      - name: Bootstrap container Git trust (exact workspace)
+        # kodmial/aa#435: actions/checkout writes safe.directory into a
+        # temporary HOME, so ordinary later shell steps in this container
+        # still fail with `fatal: detected dubious ownership` (exit 128)
+        # when the mounted workspace UID differs. Restore trust for the
+        # EXACT workspace in the job's persistent HOME right after checkout
+        # and BEFORE the first ordinary Git command (rev-parse/status/fetch
+        # in the verification step below). Idempotent; exact
+        # GITHUB_WORKSPACE only (no wildcard, no static runner path).
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
+
       - name: Verify exact current main identity and clean tree
         id: sha
         shell: bash
@@ -502,6 +514,16 @@ jobs:
         with:
           ref: ${{ inputs.required_sha || github.sha }}
           fetch-depth: 0
+
+      - name: Bootstrap container Git trust (exact workspace)
+        # kodmial/aa#435: same independent bootstrap as the qualify job (this
+        # job runs in its own container, so the other job's persistent HOME
+        # config is not visible here). Runs in a normal step after checkout
+        # and before the first ordinary Git command (rev-parse/status/fetch
+        # in the verification step below). Idempotent; exact
+        # GITHUB_WORKSPACE only (no wildcard, no static runner path).
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
 
       - name: Verify exact current main identity and clean tree
         id: sha
