@@ -584,3 +584,198 @@ def test_builder_fails_closed_without_canonical(tmp_path: pathlib.Path) -> None:
     module = _load_builder_script()
     missing = tmp_path / "missing.json"
     assert module.main(["--en-canonical", str(missing)]) != 0
+
+
+def _write_builder_fixture_inputs(directory: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Write synthetic manifests/canonical artifacts for subprocess runs."""
+    en_sections, ru_sections = _fixture_inputs()
+    directory.mkdir(parents=True, exist_ok=True)
+    en_manifest = {
+        "format": "aa-canonical-manifest/1",
+        "builder_version": 1,
+        "edition": "en-edition",
+        "artifact_sha256": "e" * 64,
+        "sections": [
+            {"id": str(item["id"]), "title": str(item["title"]), "text_sha256": "0" * 64}
+            for item in en_sections
+        ],
+    }
+    ru_manifest = {
+        "format": "aa-canonical-manifest-ru/1",
+        "builder_version": 1,
+        "edition": "ru-edition",
+        "artifact_sha256": "f" * 64,
+        "sections": [
+            {
+                "id": str(item["id"]),
+                "title": str(item["title"]),
+                "text_sha256": "1" * 64,
+                "chars": len(str(item["text"])),
+            }
+            for item in ru_sections
+        ],
+    }
+    en_artifact = {
+        "format": "aa-canonical/1",
+        "sections": [
+            {
+                "id": str(item["id"]),
+                "title": str(item["title"]),
+                "text": str(item["text"]),
+                "source_id": str(item["source_id"]),
+                "source_file": str(item["source_file"]),
+                "source_sha256": str(item["source_sha256"]),
+            }
+            for item in en_sections
+        ],
+    }
+    ru_artifact = {
+        "format": "aa-canonical-ru/1",
+        "sections": [
+            {
+                "id": str(item["id"]),
+                "title": str(item["title"]),
+                "text": str(item["text"]),
+                "source_id": str(item["source_id"]),
+                "source_file": str(item["source_file"]),
+                "source_sha256": str(item["source_sha256"]),
+            }
+            for item in ru_sections
+        ],
+    }
+    paths = {
+        "en-manifest": directory / "en-manifest.json",
+        "ru-manifest": directory / "ru-manifest.json",
+        "en-canonical": directory / "canonical.json",
+        "ru-canonical": directory / "canonical.ru.json",
+    }
+    paths["en-manifest"].write_text(json.dumps(en_manifest), encoding="utf-8")
+    paths["ru-manifest"].write_text(json.dumps(ru_manifest), encoding="utf-8")
+    paths["en-canonical"].write_text(json.dumps(en_artifact), encoding="utf-8")
+    paths["ru-canonical"].write_text(json.dumps(ru_artifact), encoding="utf-8")
+    return paths
+
+
+def _build_corpus_structure(
+    *,
+    inputs: dict[str, pathlib.Path],
+    full_output: pathlib.Path,
+    public_output: pathlib.Path,
+    map_output: pathlib.Path,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    args = [
+        sys.executable,
+        str(_repo_root() / "scripts" / "build_corpus_structure.py"),
+        "--en-manifest",
+        str(inputs["en-manifest"]),
+        "--ru-manifest",
+        str(inputs["ru-manifest"]),
+        "--en-canonical",
+        str(inputs["en-canonical"]),
+        "--ru-canonical",
+        str(inputs["ru-canonical"]),
+        "--full-output",
+        str(full_output),
+        "--public-output",
+        str(public_output),
+        "--map-output",
+        str(map_output),
+        *(extra_args or []),
+    ]
+    return subprocess.run(args, capture_output=True, text=True, cwd=_repo_root(), check=False)
+
+
+def test_builder_audit_mode_passes_and_never_rewrites_public(tmp_path: pathlib.Path) -> None:
+    # kodmial/aa#444: qualification audit mode keeps the private full
+    # hierarchy generation but must NOT rewrite the tracked public
+    # artifacts; matching committed bytes pass byte-for-byte.
+    inputs = _write_builder_fixture_inputs(tmp_path / "inputs")
+    generated_dir = tmp_path / "generated"
+    committed = tmp_path / "committed"
+    committed.mkdir(parents=True)
+    generate = _build_corpus_structure(
+        inputs=inputs,
+        full_output=generated_dir / "corpus_structure.json",
+        public_output=committed / "structure.json",
+        map_output=committed / "book-map.md",
+    )
+    assert generate.returncode == 0, generate.stderr
+    committed_public = (committed / "structure.json").read_bytes()
+    committed_map = (committed / "book-map.md").read_bytes()
+    full_path = tmp_path / "audit" / "corpus_structure.json"
+    audit = _build_corpus_structure(
+        inputs=inputs,
+        full_output=full_path,
+        public_output=committed / "structure.json",
+        map_output=committed / "book-map.md",
+        extra_args=["--verify-committed-public"],
+    )
+    assert audit.returncode == 0, audit.stderr
+    payload = json.loads(audit.stdout)
+    assert payload["mode"] == "verify-committed-public"
+    assert payload["committed_public_match"] is True
+    assert full_path.is_file()
+    # The committed public artifacts are byte-identical and untouched.
+    assert (committed / "structure.json").read_bytes() == committed_public
+    assert (committed / "book-map.md").read_bytes() == committed_map
+    full_payload = json.loads(full_path.read_text(encoding="utf-8"))
+    assert full_payload["format"] == "aa-corpus-structure-full/2"
+
+
+def test_builder_audit_fails_closed_on_committed_public_deviation(
+    tmp_path: pathlib.Path,
+) -> None:
+    inputs = _write_builder_fixture_inputs(tmp_path / "inputs")
+    committed = tmp_path / "committed"
+    committed.mkdir(parents=True)
+    generate = _build_corpus_structure(
+        inputs=inputs,
+        full_output=tmp_path / "generated" / "corpus_structure.json",
+        public_output=committed / "structure.json",
+        map_output=committed / "book-map.md",
+    )
+    assert generate.returncode == 0, generate.stderr
+    # Simulate a stale committed public artifact (generator drift).
+    tampered_map = (committed / "book-map.md").read_bytes() + b"\nstale drift\n"
+    (committed / "book-map.md").write_bytes(tampered_map)
+    full_path = tmp_path / "audit" / "corpus_structure.json"
+    audit = _build_corpus_structure(
+        inputs=inputs,
+        full_output=full_path,
+        public_output=committed / "structure.json",
+        map_output=committed / "book-map.md",
+        extra_args=["--verify-committed-public"],
+    )
+    assert audit.returncode != 0
+    assert "BLOCKED" in audit.stderr
+    assert "corpus/book-map.md" in audit.stderr
+    assert "generated sha256=" in audit.stderr and "committed sha256=" in audit.stderr
+    assert "first difference at byte offset" in audit.stderr
+    # The mismatched committed file is never rewritten; the private full
+    # hierarchy is still produced for downstream index bootstrap.
+    assert (committed / "book-map.md").read_bytes() == tampered_map
+    assert full_path.is_file()
+
+
+def test_builder_audit_fails_closed_on_missing_committed_map(tmp_path: pathlib.Path) -> None:
+    inputs = _write_builder_fixture_inputs(tmp_path / "inputs")
+    structure_path = tmp_path / "structure.json"
+    generate = _build_corpus_structure(
+        inputs=inputs,
+        full_output=tmp_path / "generated" / "corpus_structure.json",
+        public_output=structure_path,
+        map_output=tmp_path / "book-map.md",
+    )
+    assert generate.returncode == 0, generate.stderr
+    audit = _build_corpus_structure(
+        inputs=inputs,
+        full_output=tmp_path / "audit" / "corpus_structure.json",
+        public_output=structure_path,
+        map_output=tmp_path / "nonexistent" / "book-map.md",
+        extra_args=["--verify-committed-public"],
+    )
+    assert audit.returncode != 0
+    assert "is missing" in audit.stderr
+    assert "never writes tracked files" in audit.stderr
+    assert structure_path.is_file()
