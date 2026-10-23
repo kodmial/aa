@@ -308,7 +308,15 @@ jobs:
             exit 0
           fi
           python scripts/promote_runtime_image.py --digest "$VALIDATED_IMAGE_DIGEST" --apply
-          if git diff --quiet -- docker/aa-runtime.digest .github/workflows/aa-runtime.yml; then
+          activation_paths=(
+            docker/aa-runtime.digest
+            .github/workflows/aa-runtime.yml
+            .github/workflows/aa-self-proving-qualification.yml
+            .github/workflows/aa-derived-index.yml
+            .github/workflows/aa-bootstrap-metrics.yml
+            .github/workflows/aa-container-git-trust-regression.yml
+          )
+          if git diff --quiet -- "${activation_paths[@]}"; then
             echo "Image digest already active. No activation PR needed."
             exit 0
           fi
@@ -322,7 +330,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add docker/aa-runtime.digest .github/workflows/aa-runtime.yml
+          git add -- "${activation_paths[@]}"
           git commit -m "chore: activate canary-verified AA runtime image"
           git push -u origin "$branch"
           gh pr create --base main --head "$branch" \

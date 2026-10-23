@@ -169,7 +169,7 @@ jobs:
     # every other AA job kind; dev tooling (ruff/mypy/pytest) and the pinned
     # OpenCode CLI are baked in, so no per-job reinstall.
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
+      image: ghcr.io/kodmial/aa-runtime@sha256:bb822b6f696585b4f40f981382e5fc86516fd9d06a7c0c247c2aefb132df4abd
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -498,7 +498,7 @@ jobs:
     # Issue #429: shared prepared environment (same promoted digest as the
     # aa-runtime.yml bot job and the Gate A/B job above).
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
+      image: ghcr.io/kodmial/aa-runtime@sha256:bb822b6f696585b4f40f981382e5fc86516fd9d06a7c0c247c2aefb132df4abd
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
