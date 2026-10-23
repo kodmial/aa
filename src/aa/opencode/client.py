@@ -22,6 +22,7 @@ here and prompt text is never logged.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -31,7 +32,9 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from aa.conversation.turn_causality import clear_turn_causality as _causality_clear
 from aa.conversation.turn_causality import stamp as _causality_stamp
+from aa.opencode.attempt_audit import AttemptLedger
 from aa.opencode.errors import (
     OpenCodeDeterministicError,
     OpenCodeError,
@@ -233,6 +236,11 @@ class HttpOpenCodeClient(OpenCodeClient):
         # provider error text. Gate E uses this to distinguish model latency
         # from local session lifecycle overhead.
         self._request_latency_audit: list[dict[str, object]] = []
+        # In-flight attempt ledger (kodmial/aa#431): attempt-start is written
+        # BEFORE any HTTP worker thread is spawned so a hung call is
+        # observable while it is still running, and terminal states are
+        # published honestly (including late outcomes of cancelled calls).
+        self._attempts = AttemptLedger()
 
     @property
     def base_url(self) -> str:
@@ -271,6 +279,43 @@ class HttpOpenCodeClient(OpenCodeClient):
             return None
         return json.loads(raw.decode("utf-8"))
 
+    def _worker_body(
+        self,
+        attempt_id: str,
+        method: str,
+        path: str,
+        body: dict[str, object] | None,
+        timeout: float | None,
+        started_perf: float,
+    ) -> object:
+        """Blocking worker body with THREAD-SIDE honest fate recording.
+
+        kodmial/aa#431: the worker thread records its own fate directly in
+        the attempt ledger (a plain data structure), independent of the
+        event loop. A coroutine abandoned by cancellation therefore still
+        receives the worker's real terminal state as ``late_outcome``
+        evidence, and the quiescence gate never confuses the asyncio-shim
+        cancellation with the thread's actual lifecycle.
+        """
+        if not self._attempts.claim_worker_start(attempt_id):
+            return None
+        try:
+            result = self._sync_request(method, path, body, timeout)
+        except Exception as exc:
+            elapsed_ms = round(max(0.0, (time.perf_counter() - started_perf) * 1000.0), 1)
+            failure = type(exc).__name__[:64]
+            self._attempts.mark_worker_done(
+                attempt_id, outcome="failed", latency_ms=elapsed_ms, failure_category=failure
+            )
+            self._attempts.record_late_outcome_if_cancelled(
+                attempt_id, "failed", elapsed_ms, failure
+            )
+            raise
+        elapse_net_ms = round(max(0.0, (time.perf_counter() - started_perf) * 1000.0), 1)
+        self._attempts.mark_worker_done(attempt_id, outcome="completed", latency_ms=elapse_net_ms)
+        self._attempts.record_late_outcome_if_cancelled(attempt_id, "completed", elapse_net_ms, "")
+        return result
+
     @staticmethod
     def _request_operation(method: str, path: str, body: dict[str, object] | None) -> str:
         if method == "GET" and path == "/global/health":
@@ -286,39 +331,103 @@ class HttpOpenCodeClient(OpenCodeClient):
             return "session-delete"
         return "other"
 
-    def _record_request_latency(
+    def _open_request_row(
         self,
         *,
         operation: str,
-        elapsed_ms: float,
-        success: bool,
+        agent: str,
+        audit_agent: str,
+        model: str,
+        fallback_model: str,
+    ) -> tuple[str, dict[str, object]]:
+        """Append the ``attempt-start`` audit row BEFORE the call runs.
+
+        The row starts ``in-flight`` and is finalized in place by the same
+        loop-side task; it never waits for the end of the blocking call, so
+        a hung request always leaves observable evidence. Only operation
+        category, bounded agent/model pointers and the causality stamp
+        travel here — never prompt text, replies, session ids, credentials,
+        or provider error bodies.
+        """
+        row: dict[str, object] = {
+            "operation": operation,
+            "state": "in-flight",
+            "success": None,
+            "latency_ms": 0.0,
+            "agent": str(agent or "")[:128],
+            "audit_agent": str(audit_agent or "")[:128],
+            "model": str(model or "")[:128],
+            "fallback_model": str(fallback_model or "")[:128],
+        }
+        row = _causality_stamp(dict(row))
+        attempt_id = self._attempts.register_start(
+            operation=operation,
+            causality_id=str(row.get("causality_id", "")),
+            stage=str(row.get("stage", "")),
+            agent=str(row.get("agent", "")),
+            audit_agent=str(row.get("audit_agent", "")),
+            model=str(row.get("model", "")),
+            fallback_model=str(row.get("fallback_model", "")),
+        )
+        row["attempt_id"] = attempt_id
+        self._request_latency_audit.append(row)
+        if len(self._request_latency_audit) > 2048:
+            del self._request_latency_audit[: len(self._request_latency_audit) - 2048]
+        return attempt_id, row
+
+    def _finalize_request_row(
+        self,
+        attempt_id: str,
+        row: dict[str, object],
+        started_perf: float,
+        *,
+        success: bool | None,
+        state: str,
         failure_category: str = "",
     ) -> None:
-        entry: dict[str, object] = {
-            "operation": operation,
-            "latency_ms": round(max(0.0, elapsed_ms), 1),
-            "success": bool(success),
-        }
+        """Transition the in-place audit row and ledger attempt to terminal."""
+        elapsed_ms = round(max(0.0, (time.perf_counter() - started_perf) * 1000.0), 1)
+        row["state"] = state
+        row["latency_ms"] = elapsed_ms
+        row["attempt_ended_monotonic"] = time.monotonic()
+        if success is not None:
+            row["success"] = success
         if failure_category:
-            entry["failure_category"] = failure_category[:64]
-        # Per-turn causality attribution (kodmial/aa#417): audit entries
-        # carry the privacy-safe causality id of the turn context that
-        # issued this request, so a stalled scenario can prove whether a
-        # request actually started and whether it completed or failed.
-        entry = _causality_stamp(entry)
-        self._request_latency_audit.append(entry)
-        if len(self._request_latency_audit) > 2048:
-            del self._request_latency_audit[:-2048]
+            row["failure_category"] = str(failure_category)[:64]
+        self._attempts.finish(
+            attempt_id, state=state, latency_ms=elapsed_ms, failure_category=failure_category
+        )
 
     @property
     def request_latency_audit(self) -> tuple[dict[str, object], ...]:
         """Return privacy-safe local OpenCode HTTP timing evidence."""
         return tuple(dict(item) for item in self._request_latency_audit)
 
+    @property
+    def attempt_audit(self) -> tuple[dict[str, object], ...]:
+        """Return the privacy-safe in-flight attempt registry (kodmial/aa#431)."""
+        return self._attempts.entries()
+
+    def quiescence_proven(self, causality_id: str = "") -> bool:
+        """Whether the newest attempt (for the causality id) provably ended.
+
+        Consumed by stall recovery gates: a bare ``Task.done()`` proves
+        nothing about the underlying HTTP thread; only a completed worker
+        future (or an attempt that observed its terminal result) counts.
+        """
+        return self._attempts.proven_quiesced(causality_id or None)
+
     async def _best_effort_abort(self, path: str) -> None:
-        """Ask OpenCode to abort work after asynchronous cancellation."""
+        """Ask OpenCode to abort work after asynchronous cancellation.
+
+        kodmial/aa#431: the recovery abort is recovery machinery, never the
+        abandoned turn itself. It must not inherit the turn-causality stamp
+        — otherwise its own in-flight attempt row would mask the stalled
+        turn's newest-attempt evidence at the quiescence gate.
+        """
         parts = path.split("/")
         if len(parts) >= 3 and parts[1] == "session" and parts[2]:
+            _causality_clear()
             try:
                 await self.abort(urllib.parse.unquote(parts[2]))
             except Exception:
@@ -330,6 +439,11 @@ class HttpOpenCodeClient(OpenCodeClient):
         path: str,
         body: dict[str, object] | None = None,
         timeout: float | None = None,
+        *,
+        agent: str = "",
+        audit_agent: str = "",
+        model: str = "",
+        fallback_model: str = "",
     ) -> object:
         """Run one HTTP request without any shared or total wall-clock race.
 
@@ -338,60 +452,138 @@ class HttpOpenCodeClient(OpenCodeClient):
         other's bound. There is intentionally no ``asyncio.wait_for`` around
         the whole response: a healthy slow model is not a timeout merely
         because it exceeded an arbitrary constant.
+
+        Attempt observability (kodmial/aa#431): the ``attempt-start`` audit
+        row is written before the worker thread is spawned, every terminal
+        outcome is written honestly, and a late worker completion after a
+        cancelled await is published as late evidence on the same attempt —
+        never as progress for a different turn.
         """
         effective_timeout = self._request_timeout if timeout is None else timeout
         if effective_timeout is not None and effective_timeout <= 0:
             raise ValueError("timeout must be > 0")
         operation = self._request_operation(method, path, body)
         started = time.perf_counter()
-        success = False
-        failure_category = ""
-        recorded = False
-        worker = asyncio.ensure_future(
-            asyncio.to_thread(self._sync_request, method, path, body, effective_timeout)
+        attempt_id, row = self._open_request_row(
+            operation=operation,
+            agent=agent,
+            audit_agent=audit_agent,
+            model=model,
+            fallback_model=fallback_model,
         )
+        loop = asyncio.get_running_loop()
+        inner: asyncio.Future[object] = loop.run_in_executor(
+            None,
+            functools.partial(
+                self._worker_body,
+                attempt_id,
+                method,
+                path,
+                body,
+                effective_timeout,
+                started,
+            ),
+        )
+
+        def _observe_worker_outcome(done_future: asyncio.Future[object]) -> None:
+            """Independent worker-observer callback (never touches loop state).
+
+            The worker thread records its own fate directly in the ledger
+            (thread-side, kodmial/aa#431); this callback only distinguishes
+            the CLEAN cancellation of the executor future (the item was
+            cancelled before any thread claimed it) from the asyncio-shim
+            situation where the wrapping future is cancelled while the
+            thread genuinely still runs. Thread-side recording is the only
+            source of late outcomes in that case, so quiescence stays
+            unproven until the thread itself reports a terminal state.
+            """
+            try:
+                if done_future.cancelled():
+                    # Clean cancellation before the thread ran: no orphan.
+                    # The atomic ledger check also blocks a late worker claim.
+                    self._attempts.mark_clean_cancel_if_not_started(attempt_id)
+                    return
+                # An exception completion still proves the worker future is
+                # terminal. The thread-side write is authoritative, but this
+                # corroborates it (and retrieves the exception so a cancelled
+                # await cannot leave an unobserved-future warning).
+                failure = done_future.exception()
+                if failure is not None:
+                    self._attempts.mark_worker_done(
+                        attempt_id,
+                        outcome="failed",
+                        failure_category=type(failure).__name__,
+                    )
+            except Exception:  # noqa: BLE001 - never crash the loop on evidence
+                logger.info("opencode attempt late outcome recording failed")
+
+        # ``add_done_callback`` also runs for a future that already completed,
+        # so registration immediately after submission cannot miss a fast
+        # worker completion.
+        inner.add_done_callback(_observe_worker_outcome)
         try:
-            result = await asyncio.shield(worker)
-            success = True
+            result = await asyncio.shield(inner)
+            self._finalize_request_row(attempt_id, row, started, success=True, state="completed")
             return result
         except asyncio.CancelledError:
             # Cancellation attribution (kodmial/aa#417): a cancelled turn
             # request is bounded evidence; the underlying worker thread may
             # keep running until the socket bound or process isolation
             # applies, which the caller owns.
-            failure_category = "cancelled"
-            worker.cancel()
-            self._record_request_latency(
-                operation=operation,
-                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            inner.cancel()
+            self._finalize_request_row(
+                attempt_id,
+                row,
+                started,
                 success=False,
-                failure_category=failure_category,
+                state="cancelled",
+                failure_category="cancelled",
             )
-            recorded = True
+            # The worker thread records its own real fate thread-side
+            # (kodmial/aa#431): late completion/failure visibility lives in
+            # _worker_body, and the executor callback above only classifies
+            # a pre-thread clean cancellation. The event loop must not
+            # reimplement worker evidence, and the recovery abort attempt
+            # below must not mask the newest stalled-turn attempt.
             abort_task = asyncio.create_task(self._best_effort_abort(path))
             abort_task.add_done_callback(
                 lambda task: task.exception() if not task.cancelled() else None
             )
             raise
         except TimeoutError as exc:
-            failure_category = type(exc).__name__
+            self._finalize_request_row(
+                attempt_id,
+                row,
+                started,
+                success=False,
+                state="failed",
+                failure_category=type(exc).__name__,
+            )
             raise OpenCodeTimeoutError("opencode request timed out") from exc
         except OpenCodeError as exc:
-            failure_category = type(exc).__name__
+            row["error_kind"] = str(getattr(exc, "kind", ""))[:64]
+            self._attempts.mark_error_kind(attempt_id, str(getattr(exc, "kind", "")))
+            self._finalize_request_row(
+                attempt_id,
+                row,
+                started,
+                success=False,
+                state="failed",
+                failure_category=type(exc).__name__,
+            )
             raise
         except OSError as exc:
-            failure_category = type(exc).__name__
+            self._finalize_request_row(
+                attempt_id,
+                row,
+                started,
+                success=False,
+                state="failed",
+                failure_category=type(exc).__name__,
+            )
             # Connection refused/reset against the loopback server: the
             # runtime is down or unreachable; retryable once it is back.
             raise OpenCodeTransientError("opencode runtime is unreachable") from exc
-        finally:
-            if not recorded:
-                self._record_request_latency(
-                    operation=operation,
-                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                    success=success,
-                    failure_category=failure_category,
-                )
 
     async def health(self) -> HealthInfo:
         payload = await self._call("GET", "/global/health")
@@ -548,7 +740,15 @@ class HttpOpenCodeClient(OpenCodeClient):
             body["model"] = parsed_model
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be > 0")
-        payload = await self._call("POST", f"/session/{quoted}/message", body, timeout=timeout)
+        payload = await self._call(
+            "POST",
+            f"/session/{quoted}/message",
+            body,
+            timeout=timeout,
+            agent=agent,
+            audit_agent=audit_agent,
+            model=model,
+        )
         if not isinstance(payload, dict):
             raise OpenCodeDeterministicError("opencode prompt returned invalid data")
         info = payload.get("info")
@@ -593,9 +793,17 @@ class HttpOpenCodeClient(OpenCodeClient):
             body["model"] = parsed_model
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be > 0")
-        payload = await self._call("POST", f"/session/{quoted}/message", body, timeout=timeout)
+        payload = await self._call(
+            "POST",
+            f"/session/{quoted}/message",
+            body,
+            timeout=timeout,
+            agent=agent,
+            audit_agent=audit_agent,
+            model=model,
+        )
         if not isinstance(payload, dict):
-            raise OpenCodeDeterministicError("opencode prompt returned invalid data")
+            raise OpenCodeDeterministicError("opencode structured output returned invalid data")
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error") not in (None, False):
             raise classify_provider_error(info.get("error"))
