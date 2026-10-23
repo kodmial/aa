@@ -428,7 +428,7 @@ jobs:
           gate_b_shell=pass
           python scripts/restore_canonical.py --no-network-fallback || gate_b_shell=fail
           python scripts/restore_canonical.py --lang ru --no-network-fallback || gate_b_shell=fail
-          python scripts/build_corpus_structure.py || gate_b_shell=fail
+          python scripts/build_corpus_structure.py --verify-committed-public || gate_b_shell=fail
           # Gate B must exercise the production dense substrate, never the
           # hermetic hashing fallback. Public model prefetch is allowed here;
           # a missing/unloadable pinned model is a qualification failure.
@@ -728,20 +728,31 @@ jobs:
           set -euo pipefail
           python scripts/restore_canonical.py --no-network-fallback
           python scripts/restore_canonical.py --lang ru --no-network-fallback
-          python scripts/build_corpus_structure.py
+          # kodmial/aa#444: qualification never rewrites the tracked public
+          # corpus artifacts (corpus/structure.json, corpus/book-map.md).
+          # The audit mode writes only the private ignored full hierarchy
+          # and verifies the committed public bytes deterministically;
+          # any deviation fails closed with the exact deviation report.
+          python scripts/build_corpus_structure.py --verify-committed-public
           python scripts/prefetch_public_assets.py
           python scripts/prefetch_voice_assets.py
           bootstrap_start=$(date +%s)
           derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
-          # Issue #429: strict production backend enforcement for Gate C.
+          # kodmial/aa#444: L1/L2 cache status files live outside the
+          # repository checkout (RUNNER_TEMP), exactly like the proven
+          # aa-runtime.yml pattern. Relative status paths dirtied the
+          # Git checkout with untracked JSON and blocked the product
+          # qualification with 'working tree is not clean'.
           # L2 GHCR artifact first (commit-pinned immutable digest only);
           # on any miss/rejection fall back deterministically, with only a
           # proven E5-backend index accepted as a hit (never hashing).
+          l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"
+          l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
           if python scripts/manage_derived_cache.py --mode restore-l2 \
               --cache-dir "$derived_dir" \
               --require-backend e5 \
-              --status-file "derived-l2-status.json"; then
-            l2_status=$(python -c "import json; print(json.load(open('derived-l2-status.json')).get('status'))")
+              --status-file "$l2_status_file"; then
+            l2_status=$(python -c "import json; print(json.load(open('$l2_status_file')).get('status'))")
           else
             l2_status="skip"
           fi
@@ -757,7 +768,7 @@ jobs:
           python scripts/manage_derived_cache.py --mode restore-or-rebuild \
             --cache-dir "$derived_dir" \
             --backend e5 --require-backend e5 \
-            --status-file "derived-l1-status.json"
+            --status-file "$l1_status_file"
           bootstrap_s=$(( $(date +%s) - bootstrap_start ))
           {
             echo "| Gate C bootstrap | outcome | seconds |"

@@ -63,6 +63,54 @@ def test_placeholders_fail_closed_instead_of_hitting_l2() -> None:
     assert placeholder.startswith("ghcr.io/kodmial/aa-index@sha256:" + "0" * 64)
 
 
+def test_qualification_bootstrap_keeps_status_files_out_of_checkout() -> None:
+    # kodmial/aa#444: relative L1/L2 status paths created two untracked
+    # JSON files in the repository root and blocked the product
+    # qualification with 'working tree is not clean'. Status files must
+    # live under RUNNER_TEMP exactly like the proven aa-runtime pattern.
+    text = QUALIFICATION.read_text(encoding="utf-8")
+    assert '--status-file "derived-l1-status.json"' not in text
+    assert '--status-file "derived-l2-status.json"' not in text
+    bootstrap_index = text.index("Bootstrap exact production book/index")
+    bootstrap_block = text[bootstrap_index : bootstrap_index + 3500]
+    assert "${RUNNER_TEMP:-/tmp}/derived-l2-status.json" in bootstrap_block
+    assert "${RUNNER_TEMP:-/tmp}/derived-l1-status.json" in bootstrap_block
+
+
+def test_qualification_bootstrap_verifies_committed_public() -> None:
+    # kodmial/aa#444: qualification must never rewrite tracked public
+    # corpus artifacts; the audit mode verifies byte equality instead.
+    text = QUALIFICATION.read_text(encoding="utf-8")
+    invocations = [
+        line.strip() for line in text.splitlines() if "scripts/build_corpus_structure.py" in line
+    ]
+    assert len(invocations) == 2
+    for line in invocations:
+        assert "--verify-committed-public" in line
+    assert not any(
+        line.startswith("python scripts/build_corpus_structure.py ")
+        and "--verify-committed-public" not in line
+        for line in invocations
+    )
+
+
+def test_publisher_prefetches_public_e5_assets_before_rebuild() -> None:
+    # kodmial/aa#444: the trusted publisher rebuilds inside the prepared
+    # runtime container, which intentionally carries no public model
+    # weights. Without the pinned E5 snapshot prefetch the strict-E5
+    # rebuild failed and L2 publication never activated (persistent zero
+    # digest pin, 'l2-unpublished' rejections in every bootstrap).
+    text = PUBLISHER.read_text(encoding="utf-8")
+    build_index = text.index("Build strict E5 production index and publish L2")
+    preamble = text[:build_index]
+    assert "scripts/prefetch_public_assets.py" in preamble
+    # The publication status file must also stay outside the checkout.
+    publish_block = text[build_index:]
+    assert "--status-file" in publish_block
+    assert '--status-file "derived-publish-status.json"' not in text
+    assert "${RUNNER_TEMP:-/tmp}/derived-publish-status.json" in text
+
+
 def test_runtime_actions_cache_key_is_rotation_aware() -> None:
     text = RUNTIME.read_text(encoding="utf-8")
     assert "AA_DERIVED_CACHE_ROTATION=" not in text, "rotation is read by the manager from env"
