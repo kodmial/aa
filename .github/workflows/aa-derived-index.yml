@@ -53,7 +53,7 @@ jobs:
       # Same promoted environment as every AA job kind (issue #429): the
       # runtime image carries the pinned dev toolchain and native deps, so
       # publish runs the exact qualified qualification/code stack.
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -83,7 +83,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # kodmial/aa#441: static pin declarations alone never validated the
+          # actual selected container. The publication MUST also confirm the
+          # pinned pytest/ruff/mypy binaries, spaCy RU model and OpenCode
+          # pin are really available in this image before it publishes L2.
           python scripts/verify_runtime_image.py --pins-only
+          python scripts/verify_runtime_image.py --tools-only
           test $(git rev-parse HEAD) = ${{ github.sha }}
 
       - name: Install worker (prepared environment, no resolution)

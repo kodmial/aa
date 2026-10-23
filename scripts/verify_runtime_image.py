@@ -14,6 +14,14 @@ canary, and the bot runtime preflight:
 - digest file format plus workflow container-pin consistency;
 - timing/size report without leaking private state.
 
+``--tools-only`` (kodmial/aa#441) checks the ACTUAL availability of the
+prepared dev toolchain (pytest/ruff/mypy, spaCy RU model, pinned OpenCode
+CLI) inside the currently selected container. It exists because a green
+``--pins-only`` result only validates source/pin declarations and never
+proved what binaries the selected image provides: run 39884474265 printed
+``{"pins":"pass","errors":[]}`` and then failed `pytest: command not
+found` with exit 127 before Gate C scenario 1.
+
 Never starts a Telegram poller, never touches secrets, book plaintext,
 decrypted indexes, audio, transcripts, or generated responses.
 """
@@ -473,6 +481,22 @@ def check_dev_toolchain() -> list[str]:
     return errors
 
 
+def check_console_scripts_on_path() -> list[str]:
+    """Console-script entries on PATH (kodmial/aa#441).
+
+    The Gate C incident evidence was `pytest: command not found` (exit 127):
+    the workflow runs the bare `pytest`/`ruff`/`mypy` console scripts and
+    the pinned `opencode` CLI, so a missing PATH entry is a real prepared
+    environment failure even when `-m<tool>` succeeds in some interpreter.
+    Static --pins-only reports pass without validating any of this.
+    """
+    errors: list[str] = []
+    for tool in ("pytest", "ruff", "mypy", "opencode"):
+        if shutil.which(tool) is None:
+            errors.append(f"console script {tool} not found on PATH")
+    return errors
+
+
 def run_check_only_prefetch() -> list[str]:
     errors: list[str] = []
     commands = (
@@ -492,6 +516,7 @@ def run_check_only_prefetch() -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify the prebuilt AA runtime image.")
     parser.add_argument("--pins-only", action="store_true")
+    parser.add_argument("--tools-only", action="store_true")
     parser.add_argument("--canary", action="store_true")
     parser.add_argument("--allow-placeholder-digest", action="store_true")
     args = parser.parse_args(argv)
@@ -499,6 +524,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.pins_only:
         errors = check_pins()
         print(json.dumps({"pins": "pass" if not errors else "fail", "errors": errors}))
+        return 0 if not errors else 1
+
+    if args.tools_only:
+        # kodmial/aa#441: actual binary availability in the SELECTED
+        # container, deliberately distinct from the static --pins-only
+        # declaration check. No network, no installs, no hot-path actions.
+        errors = check_console_scripts_on_path() + check_dev_toolchain() + check_opencode()
+        print(json.dumps({"tools": "pass" if not errors else "fail", "errors": errors}))
         return 0 if not errors else 1
 
     timings: dict[str, int] = {}
