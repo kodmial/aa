@@ -65,6 +65,16 @@ _GUARD_ALLOWED_SAMPLES: tuple[str, ...] = (
     "Ваш запрос важен; приходите на собрание и спрашивайте о прошлом опыте.",
 )
 
+# Review follow-up: token-bounded matching must not treat a rule embedded
+# inside a longer ordinary word as a mechanics disclosure.
+_GUARD_CONTAINING_WORD_SAMPLES: tuple[str, ...] = (
+    "The indexing of the group notes is complete.",
+    "Providers of support meet on Tuesdays.",
+    "Planners and coordinators share the schedule.",
+    "Qualifications for the volunteer role are simple.",
+    "Evidenced progress matters more than perfection.",
+)
+
 # Audit table A2: forbidden samples. Genuine technical disclosure in
 # English, Russian, mixed case, and hyphen/format variants; source-ID,
 # status and provider error echoes; mixed RU+EN disclosures. Each one
@@ -247,6 +257,14 @@ def test_guard_forbidden_samples_blocked(forbidden: str) -> None:
     from aa.conversation.turn_pipeline import leaks_internal_terms
 
     assert leaks_internal_terms(forbidden) is True
+
+
+@pytest.mark.parametrize("allowed", _GUARD_CONTAINING_WORD_SAMPLES)
+def test_guard_allows_containing_word_collisions(allowed: str) -> None:
+    """A rule embedded in a longer ordinary word is not a standalone leak."""
+    from aa.conversation.turn_pipeline import leaks_internal_terms
+
+    assert leaks_internal_terms(allowed) is False
 
 
 @pytest.mark.parametrize("term", _HISTORICAL_TERMS_KEEP_COVERAGE)

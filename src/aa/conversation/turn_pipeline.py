@@ -587,10 +587,12 @@ _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 # book-grounded recovery wording contains it), and format variants were
 # added for the multi-word phrases so hyphen/case permutations cannot
 # bypass the prohibition (Product Contract #110 stays fail-closed).
-# No entry was removed or loosened: the audit found no ordinary
-# containing-word false positives for the existing terms, and the
-# historical conservative behavior (blocking benign standalone uses of
-# the common English words themselves) is preserved and documented.
+# Review follow-up: matching is token-bounded, not an unbounded
+# substring scan, so a rule embedded inside a longer ordinary word (for
+# example "indexing", "providers", "planners") no longer trips the
+# guard. The rule set itself is unchanged and direct leaks still match.
+# Benign standalone uses of the common English terms themselves remain
+# conservatively blocked and are documented as a known limitation.
 _INTERNAL_TERMS = (
     "corpus",
     "retrieval",
@@ -629,6 +631,24 @@ _INTERNAL_TERMS = (
     "корпус текстов",
 )
 
+# Compile longest terms first so specific phrases win over substrings.
+# Latin rules require a trailing word boundary so ordinary containing
+# words ("indexing", "providers") stay allowed. Cyrillic rules keep the
+# leading token boundary but allow an inflected continuation because
+# Russian mechanics disclosures naturally carry case endings
+# ("эмбеддинги"), which must not become a bypass.
+_INTERNAL_TERM_PATTERNS = tuple(
+    (
+        term,
+        re.compile(
+            rf"(?<!\w){re.escape(term)}\w*"
+            if _CYRILLIC_RE.search(term)
+            else rf"(?<!\w){re.escape(term)}(?!\w)"
+        ),
+    )
+    for term in sorted(_INTERNAL_TERMS, key=len, reverse=True)
+)
+
 
 def contains_cyrillic(text: str) -> bool:
     """Whether user-visible text obeys the Russian-output contract."""
@@ -644,9 +664,8 @@ def matched_internal_rule(text: str) -> str:
     matched.
     """
     lowered = text.casefold()
-    # Match longest terms first so specific phrases win over substrings.
-    for term in sorted(_INTERNAL_TERMS, key=len, reverse=True):
-        if term in lowered:
+    for term, pattern in _INTERNAL_TERM_PATTERNS:
+        if pattern.search(lowered):
             return term
     return ""
 
@@ -2627,6 +2646,21 @@ async def run_v2_answer_turn(
             return None
         return max(0.0, remaining)
 
+    def _local_guard_repair_admitted() -> bool:
+        """Whether one same-pack repair can afford both of its phases.
+
+        Regeneration and its mandatory re-verification share the same
+        end-to-end budget, so admission requires the answer slice and the
+        verifier slice up front. This avoids spending the verifier budget
+        on a regeneration that would then be skipped as a doomed
+        ``failed`` repair. The actual verifier slice is recomputed after
+        regeneration because the call itself consumes time.
+        """
+        verifier_slice = _verifier_round_budget()
+        return _remaining_budget_s() >= TURN_ANSWER_MIN_SLICE_S and (
+            verifier_slice is None or verifier_slice >= TURN_VERIFIER_MIN_SLICE_S
+        )
+
     def _retry_cause_for_outcome(outcome: str) -> Any:
         """Typed local cause for a skipped verifier round (no guessing)."""
         from aa.conversation.answer_causality import AnswerFailureCause as _SkipCause
@@ -3048,7 +3082,7 @@ async def run_v2_answer_turn(
         and pack
         and telemetry["local_guard_regen_attempts"] < LOCAL_GUARD_REPAIR_MAX_REGENERATIONS
     ):
-        if _remaining_budget_s() < TURN_ANSWER_MIN_SLICE_S:
+        if not _local_guard_repair_admitted():
             telemetry["local_guard_repair_status"] = "budget-blocked"
             _mark_turn_budget_exceeded()
             logger.info(
@@ -3074,6 +3108,9 @@ async def run_v2_answer_turn(
             else:
                 telemetry["local_guard_regen_attempts"] = 1
                 telemetry["local_guard_repair_status"] = "attempted"
+                # Admission reserved both slices up front; refresh the
+                # verifier slice for the actual call because regeneration
+                # consumed time.
                 _guard_slice = _verifier_round_budget()
                 if _guard_slice is not None and _guard_slice < TURN_VERIFIER_MIN_SLICE_S:
                     telemetry["local_guard_repair_status"] = "failed"
