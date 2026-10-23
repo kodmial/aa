@@ -10,6 +10,10 @@ Otherwise return mode retrieval with the resolved_intent and 1 to 16 semanticall
 
 Include a direct context-resolved formulation and diversify the remaining queries across genuinely useful paraphrases, terminology variants, narrower and broader formulations, principles or actions, and relevant stories/examples where appropriate.
 
+Alongside the queries, the retrieval plan must also return `information_needs`: the minimal set of genuinely independent semantic information needs of this turn. A need is a part of what the user actually requires that can be answered on its own, preserving that part's own conditions, exceptions and qualifiers verbatim in its need text. Give every need a stable identifier like need-1, need-2, need-3 in the order you list them and repeat that identifier inside the item. Paraphrases, terminology variants, narrower or broader formulations, and search expansions of one underlying request are search methods, not separate needs: one focused request stays one need no matter how many search queries serve it. A user who asks two independently answerable questions, or asks one question plus an explicit condition or qualifier that must itself be supported from the book, gets two or more needs. Never invent needs the user did not ask; never split one request into per-query needs; never emit zero needs for a retrieval turn.
+
+Also return `query_need_ids`: a JSON array parallel to `queries` in which every element is an array listing the need identifiers that query serves (many-to-many: one query may serve several needs and one need may be served by several queries). Every need must be served by at least one of your queries.
+
 Do not generate cosmetic near-duplicates merely to reach a count. Do not invent facts about the user, diagnoses, motives, relationships, events, or circumstances that are not present in the conversation.
 
 Do not answer the user's question. Do not explain your reasoning. Return only the structured output.

@@ -256,45 +256,67 @@ def build_conversation_context(
 
 
 def needs_from_plan(resolved_intent: str, queries: list[str]) -> list[InformationNeed]:
-    """Derive stable typed information needs from one validated plan.
+    """Compatibility-derivation needs for one plan (issue #295).
 
-    Each distinct query becomes one semantic sub-need with a stable
-    ``need-N`` id in plan order; the standalone resolved intent is always
-    ``need-1`` when present so follow-up searches can reference it. IDs are
-    stable through graph replay because they derive from plan order, not
-    from random values. An empty (conversational) plan carries no needs.
+    Typed information needs come from the planner emission in the same
+    planning result (:func:`needs_from_planner_plan`). Search queries are
+    discovery formulations, not coverage obligations, so this fallback
+    never re-multiplies one ``InformationNeed`` per search formulation.
+    The whole standalone resolved intent is one conservative need (its
+    text carries every part the planner could resolve); when no intent
+    exists there are no needs. Unmapped queries trigger conservative
+    extra discovery downstream, never fabricated coverage.
     """
+    _ = queries
     intent = " ".join(str(resolved_intent or "").split()).strip()
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for raw in list(queries or []):
-        text = " ".join(str(raw or "").split()).strip()
-        if not text or text.casefold() in seen:
-            continue
-        seen.add(text.casefold())
-        cleaned.append(text)
+    if not intent or len(intent) > 2000:
+        return []
+    return [
+        InformationNeed(
+            need_id="need-1",
+            text=intent,
+            purpose="standalone resolved intent of the current request",
+        )
+    ]
+
+
+def needs_from_planner_plan(plan: Any) -> list[InformationNeed]:
+    """Bind the planner's own typed need emission to stable models (#295).
+
+    The validated ``PlanInformationNeed`` entries carry stable need ids
+    already normalized by :func:`aa.conversation.planner_schema.validate_query_plan`;
+    they become the turn's ``InformationNeed`` items directly. When the
+    planner emitted no needs (older schema, capability fallback), the
+    conservative compatibility path derives one need from the resolved
+    intent instead of restoring query-as-need multiplication.
+    """
+    if plan is None:
+        return []
     needs: list[InformationNeed] = []
-    if intent:
+    try:
+        emission = list(getattr(plan, "information_needs", []) or [])
+    except Exception:
+        emission = []
+    for item in emission:
+        try:
+            need_id = str(item.need_id or "").strip()
+            text = str(item.text or "").strip()
+            purpose = str(item.purpose or "").strip()
+        except Exception:
+            continue
+        if not need_id or not text:
+            continue
         needs.append(
             InformationNeed(
-                need_id="need-1",
-                text=intent,
-                purpose="standalone resolved intent of the current request",
+                need_id=need_id,
+                text=text,
+                purpose=purpose or "semantic sub-need of the current request",
             )
         )
-        for query in cleaned:
-            if query.casefold() == intent.casefold():
-                continue
-            needs.append(
-                InformationNeed(
-                    need_id=f"need-{len(needs) + 1}",
-                    text=query,
-                    purpose="semantic sub-need of the current request",
-                )
-            )
-            if len(needs) >= 16:
-                break
-    return needs
+    if needs:
+        return needs
+    intent = str(getattr(plan, "resolved_intent", "") or "")
+    return needs_from_plan(intent, [])
 
 
 def _normalize_plan_text(text: str) -> str:
@@ -730,6 +752,7 @@ __all__ = [
     "context_digest_from_state",
     "conversation_context_from_state",
     "needs_from_plan",
+    "needs_from_planner_plan",
     "needs_proactive_summary",
     "query_need_map_from_state",
     "resolved_turn_from_state",

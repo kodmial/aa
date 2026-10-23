@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from aa.conversation.graph_state import TurnState
 from aa.conversation.planner_schema import (
+    MAX_INFORMATION_NEEDS,
     MAX_QUERIES,
     MIN_NONEMPTY_QUERIES,
     PLANNER_MAX_ATTEMPTS,
@@ -147,8 +148,11 @@ def query_plan_json_schema() -> dict[str, Any]:
         {"minItems": MIN_NONEMPTY_QUERIES, "maxItems": MAX_QUERIES},
     ]
     properties["queries"] = queries
+    needs = dict(properties["information_needs"])
+    needs["maxItems"] = MAX_INFORMATION_NEEDS
+    properties["information_needs"] = needs
     schema["properties"] = properties
-    schema["required"] = ["mode", "resolved_intent", "queries"]
+    schema["required"] = ["mode", "resolved_intent", "queries", "information_needs"]
     return schema
 
 
@@ -355,14 +359,20 @@ def _reply_structured_content(reply: object) -> object:
 PLANNER_TEXT_JSON_SUFFIX = (
     "\n\nReturn ONLY a JSON object with exactly these keys: "
     '{"mode": "conversational"|"retrieval", '
-    '"resolved_intent": string, "queries": array of strings}. '
-    'Use {"mode": "conversational", "resolved_intent": "", "queries": []} '
-    "only for purely conversational turns; a greeting opener plus a substantive "
-    "request is retrieval, never conversational, with the intent and queries "
-    "focused on the substantive request; otherwise return "
+    '"resolved_intent": string, "queries": array of strings, '
+    '"information_needs": [{"need_id": string, "text": string}]}. '
+    'Use {"mode": "conversational", "resolved_intent": "", "queries": [], '
+    '"information_needs": []} only for purely conversational turns; a '
+    "greeting opener plus a substantive request is retrieval, never "
+    "conversational, with the intent and queries focused on the "
+    "substantive request; otherwise return "
     '{"mode": "retrieval", "resolved_intent": standalone intent, '
     '"queries": 1 to 16 distinct useful Russian search queries '
-    "(as many as genuinely help, never padded)}. "
+    "(as many as genuinely help, never padded), "
+    '"information_needs": the few genuinely independent semantic '
+    "information needs of the request, each with a stable id like "
+    '"need-1", "need-2" and one full standalone text (search paraphrases '
+    "of the same request are not separate needs)}. "
     "No other text, no markdown, no explanation."
 )
 
@@ -559,7 +569,13 @@ async def _run_planner_provider(
                         model, user_text=user_text, system_text=system_text
                     )
                     plan = validate_structured_plan(parse_planner_text_json(text_reply))
-                    logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+                    logger.info(
+                        "planner output accepted",
+                        extra={
+                            "queries": len(plan.queries),
+                            "needs": len(getattr(plan, "information_needs", []) or []),
+                        },
+                    )
                     return plan
             except Exception as exc:
                 from aa.opencode.errors import OpenCodeError as _ProviderError
@@ -630,7 +646,13 @@ async def _run_planner_provider(
                 model, user_text=user_text, system_text=system_text
             )
             plan = validate_structured_plan(parse_planner_text_json(text_reply))
-            logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+            logger.info(
+                "planner output accepted",
+                extra={
+                    "queries": len(plan.queries),
+                    "needs": len(getattr(plan, "information_needs", []) or []),
+                },
+            )
             return plan
         except Exception as exc:
             from aa.opencode.errors import OpenCodeRateLimitError
@@ -665,7 +687,13 @@ async def _run_planner_provider(
                 model, user_text=user_text, system_text=system_text
             )
             plan = validate_structured_plan(parse_planner_text_json(text_reply))
-            logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+            logger.info(
+                "planner output accepted",
+                extra={
+                    "queries": len(plan.queries),
+                    "needs": len(getattr(plan, "information_needs", []) or []),
+                },
+            )
             return plan
         plan = validate_structured_plan(raw)
         try:
@@ -677,14 +705,26 @@ async def _run_planner_provider(
                 record_omitted_structured_success(model)
             except Exception:
                 pass
-        logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+        logger.info(
+            "planner output accepted",
+            extra={
+                "queries": len(plan.queries),
+                "needs": len(getattr(plan, "information_needs", []) or []),
+            },
+        )
         return plan
     reply = await model.ainvoke(messages)
     content = _reply_structured_content(reply)
     if isinstance(content, str):
         raise QueryPlanValidationError("planner output is not a structured object")
     plan = validate_structured_plan(content)
-    logger.info("planner output accepted", extra={"queries": len(plan.queries)})
+    logger.info(
+        "planner output accepted",
+        extra={
+            "queries": len(plan.queries),
+            "needs": len(getattr(plan, "information_needs", []) or []),
+        },
+    )
     return plan
 
 
@@ -718,7 +758,7 @@ async def planner_node(
         conversation_context_from_state as _cc_from_state,
     )
     from aa.conversation.conversation_context import (
-        needs_from_plan as _needs_from_plan,
+        needs_from_planner_plan as _needs_from_plan,
     )
 
     user_message = str(state.get("current_user_message", ""))
@@ -754,11 +794,24 @@ async def planner_node(
         )
     else:
         plan = await run_planner(user_message, model=model, summary=summary, recent=recent)
-    needs = _needs_from_plan(str(plan.resolved_intent), list(plan.queries))
+    needs = _needs_from_plan(plan)
     try:
         planner_links = list(plan.query_need_ids) if plan.query_need_ids is not None else None
     except Exception:
         planner_links = None
+    if (
+        planner_links is None
+        and needs
+        and len(needs) == 1
+        and bool(plan.queries)
+        and plan.mode == "retrieval"
+    ):
+        # Issue #295 structural compat: with exactly one emitted need every
+        # search variant serves that sole genuine need; links are optional
+        # planner output, so the default association is attached without
+        # any lexical or fabricate-quota judgment (multiple needs without
+        # links stay conservative/default instead).
+        planner_links = [[needs[0].need_id] for _ in list(plan.queries)]
     try:
         query_need_map = _build_qmap(list(plan.queries), needs, planner_links=planner_links)
     except Exception:
