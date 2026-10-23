@@ -104,20 +104,29 @@ TOKEN_ENV = "AA_INDEX_PACKAGES_TOKEN"
 ROTATION_ENV = "AA_DERIVED_CACHE_ROTATION"
 
 
-def _fail(message: str) -> int:
+def _write_status(payload: dict[str, Any], args: argparse.Namespace | None = None) -> None:
+    if args is not None and getattr(args, "status_file", None):
+        try:
+            Path(args.status_file).write_text(
+                json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            # Metrics/status recording is never allowed to break the
+            # bootstrap itself; the printed JSON stays authoritative.
+            pass
+
+
+def _fail(message: str, args: argparse.Namespace | None = None) -> int:
     print(f"derived cache failed: {message}", file=sys.stderr)
+    # Issue #461 review: --status-file is a global option and must remain
+    # observable for every mode, including early restore failures.
+    _write_status({"status": "failed"}, args)
     return 1
 
 
 def _status(payload: dict[str, Any], args: argparse.Namespace | None = None) -> int:
     text = json.dumps(payload, sort_keys=True)
-    if args is not None and getattr(args, "status_file", None):
-        try:
-            Path(args.status_file).write_text(text + "\n", encoding="utf-8")
-        except OSError:
-            # Metrics/status recording is never allowed to break the
-            # bootstrap itself; the printed JSON stays authoritative.
-            pass
+    _write_status(payload, args)
     print(text)
     return 0
 
@@ -181,7 +190,7 @@ def _cmd_print_key(args: argparse.Namespace) -> int:
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     rotation = _l1_rotation(args)
     return _status(
         {
@@ -207,7 +216,7 @@ def _cmd_print_l2_plan(args: argparse.Namespace) -> int:
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     rotation = _l1_rotation(args)
     digest_file = args.digest_file
     pin_reference = _read_digest_reference_text(digest_file)
@@ -433,7 +442,7 @@ def _cmd_restore(args: argparse.Namespace) -> int:
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     identity = _read_identity(args.identity_file)
     result = _attempt_restore(
         cache_dir=args.cache_dir,
@@ -451,7 +460,7 @@ def _cmd_restore_or_rebuild(args: argparse.Namespace) -> int:
         try:
             rebuilt = _rebuild_index(retrieval_dir=args.retrieval_dir, backend=args.backend)
         except DerivedCacheError as exc:
-            return _fail(str(exc))
+            return _fail(str(exc), args)
         return _status(
             {
                 "status": "rebuilt",
@@ -466,7 +475,7 @@ def _cmd_restore_or_rebuild(args: argparse.Namespace) -> int:
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     identity = _read_identity(args.identity_file)
     result = _attempt_restore(
         cache_dir=args.cache_dir,
@@ -485,7 +494,7 @@ def _cmd_restore_or_rebuild(args: argparse.Namespace) -> int:
     try:
         rebuilt = _rebuild_index(retrieval_dir=args.retrieval_dir, backend=args.backend)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     return _status(
         {
             "status": "rebuilt",
@@ -540,7 +549,7 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     pin_reference = _read_digest_reference_text(args.digest_file)
     try:
         # The committed pin must already be an immutable sha256 digest;
@@ -705,11 +714,11 @@ def _cmd_publish_l2(args: argparse.Namespace) -> int:
     Failure is fatal in the trusted publisher job.
     """
     if args.require_backend != "e5":
-        return _fail("publish-l2 publishes only the strict production E5 backend")
+        return _fail("publish-l2 publishes only the strict production E5 backend", args)
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     identity = _read_identity(args.identity_file)
     result = _attempt_restore(
         cache_dir=args.cache_dir,
@@ -724,7 +733,7 @@ def _cmd_publish_l2(args: argparse.Namespace) -> int:
         try:
             rebuilt = _rebuild_index(retrieval_dir=args.retrieval_dir, backend="e5")
         except DerivedCacheError as exc:
-            return _fail(str(exc))
+            return _fail(str(exc), args)
         source = "rebuild"
     else:
         rebuilt = {
@@ -734,10 +743,10 @@ def _cmd_publish_l2(args: argparse.Namespace) -> int:
     try:
         assert_cache_paths_safe([str(args.cache_dir)])
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     saved = _save_bundle(args, bindings, key)
     if saved.get("status") != "saved":
-        return _fail(f"L2 publish staging failed: {saved.get('reason', 'unknown')}")
+        return _fail(f"L2 publish staging failed: {saved.get('reason', 'unknown')}", args)
 
     def _saved_int(field: str, fallback: int) -> int:
         raw = int(saved.get(field, fallback))
@@ -752,7 +761,7 @@ def _cmd_publish_l2(args: argparse.Namespace) -> int:
             args=args,
         )
     except ArtifactError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     payload = {
         "status": "published",
         "source": source,
@@ -887,11 +896,11 @@ def _cmd_save(args: argparse.Namespace) -> int:
     try:
         assert_cache_paths_safe([str(args.cache_dir)])
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     try:
         bindings, key = _live_key(root=ROOT, os_name=args.os, arch=args.arch)
     except DerivedCacheError as exc:
-        return _fail(str(exc))
+        return _fail(str(exc), args)
     return _status(_save_bundle(args, bindings, key), args)
 
 
@@ -941,7 +950,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Strict production backend enforcement restored bundles must "
         "prove in their index metadata (use ``e5`` in production workflows).",
     )
-    parser.add_argument("--status-file", type=Path, default=None)
+    parser.add_argument(
+        "--status-file",
+        type=Path,
+        default=None,
+        help="Write the operation status JSON to this path. Supported by every "
+        "--mode, including restore/restore-l2/restore-or-rebuild.",
+    )
     parser.add_argument(
         "--digest-file",
         type=Path,

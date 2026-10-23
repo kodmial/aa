@@ -226,6 +226,72 @@ def test_runtime_boots_with_cache_completely_disabled(tmp_path: pathlib.Path) ->
     assert checked["chunk_count"] == index.chunk_count
 
 
+def test_status_file_is_global_across_restore_modes(tmp_path: pathlib.Path) -> None:
+    # Regression for the #461 review: the workflows pass --status-file with
+    # --mode restore/restore-l2, so the global option must be accepted and
+    # emitted by every mode (including early command failures).
+    l1_status = tmp_path / "derived-l1-status.json"
+    restore = _run_manager(
+        [
+            "--mode",
+            "restore",
+            "--cache-dir",
+            str(tmp_path / "empty-cache"),
+            "--retrieval-dir",
+            str(tmp_path / "retrieval"),
+            "--require-backend",
+            "e5",
+            "--status-file",
+            str(l1_status),
+        ],
+        {"AA_DERIVED_CACHE_ENABLED": "1"},
+    )
+    assert restore.returncode == 0, restore.stderr
+    restore_payload = json.loads(restore.stdout)
+    assert restore_payload["status"] == "miss"
+    assert json.loads(l1_status.read_text(encoding="utf-8")) == restore_payload
+
+    pin = tmp_path / "placeholder.digest"
+    pin.write_text("ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8")
+    l2_status = tmp_path / "derived-l2-status.json"
+    restore_l2 = _run_manager(
+        [
+            "--mode",
+            "restore-l2",
+            "--cache-dir",
+            str(tmp_path / "l2-cache"),
+            "--digest-file",
+            str(pin),
+            "--require-backend",
+            "e5",
+            "--status-file",
+            str(l2_status),
+        ],
+        {"AA_DERIVED_CACHE_ENABLED": "1"},
+    )
+    assert restore_l2.returncode == 0, restore_l2.stderr
+    restore_l2_payload = json.loads(restore_l2.stdout)
+    assert restore_l2_payload["status"] == "rejected"
+    assert json.loads(l2_status.read_text(encoding="utf-8")) == restore_l2_payload
+
+    failed_status = tmp_path / "failed-status.json"
+    failed = _run_manager(
+        [
+            "--mode",
+            "publish-l2",
+            "--cache-dir",
+            str(tmp_path / "publish-cache"),
+            "--require-backend",
+            "hashing",
+            "--status-file",
+            str(failed_status),
+        ],
+        {"AA_DERIVED_CACHE_ENABLED": "1"},
+    )
+    assert failed.returncode == 1
+    assert json.loads(failed_status.read_text(encoding="utf-8")) == {"status": "failed"}
+
+
 def test_valid_hit_restores_ready_to_open_index(tmp_path: pathlib.Path) -> None:
     identity, recipient = age_v1.generate_identity()
     try:
