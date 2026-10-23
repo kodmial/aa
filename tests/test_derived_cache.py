@@ -483,6 +483,166 @@ def test_low_trust_workflows_cannot_poison_trusted_cache() -> None:
     assert "if: success()" in workflow
 
 
+def test_restore_validates_actual_l1_bytes_and_never_damages_them(
+    tmp_path: pathlib.Path,
+) -> None:
+    # kodmial/aa#461: the workflow validates the actual restored L1
+    # directory with --mode restore --require-backend e5; it must count
+    # real hits, reject non-E5 content, and leave the encrypted L1 bytes
+    # byte-for-byte identical in every case.
+    identity, recipient = age_v1.generate_identity()
+    try:
+        src = tmp_path / "src"
+        _build_fixture_index(src)
+        bindings = dc.read_bindings(_repo_root(), os_name="Linux", arch="X64")
+        key = dc.derived_cache_key(bindings)
+        digests = dc.bundle_file_digests(src)
+        checked = dc.self_test_index(src)
+        manifest = dc.build_cache_manifest(
+            cache_key=key,
+            bindings=bindings,
+            file_digests=digests,
+            chunk_count=int(checked["chunk_count"]),
+            index_version=int(checked["index_version"]),
+        )
+        encrypted = dc.encrypt_package(dc.create_package(src, manifest), recipient)
+        cache_dir = tmp_path / "l1-exact"
+        cache_dir.mkdir()
+        (cache_dir / dc.ENCRYPTED_NAME).write_bytes(encrypted)
+        meta = dc.build_meta_payload(
+            cache_key=key,
+            encrypted_sha256=dc.sha256_bytes(encrypted),
+            encrypted_bytes=len(encrypted),
+            bindings=bindings,
+        )
+        (cache_dir / dc.META_NAME).write_text(
+            json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        before = {path.name: dc.sha256_bytes(path.read_bytes()) for path in cache_dir.iterdir()}
+        common = [
+            "--cache-dir",
+            str(cache_dir),
+            "--retrieval-dir",
+        ]
+        identity_file = tmp_path / "identity.txt"
+        identity_file.write_text(identity, encoding="utf-8")
+        # A matching backend hits and restores the ready-to-open state.
+        hit = _run_manager(
+            [
+                "--mode",
+                "restore",
+                "--require-backend",
+                "hashing",
+                *common,
+                str(tmp_path / "retrieval"),
+                "--identity-file",
+                str(identity_file),
+            ],
+            {"AA_DERIVED_CACHE_ENABLED": "1"},
+        )
+        assert hit.returncode == 0, hit.stderr
+        hit_payload = json.loads(hit.stdout)
+        assert hit_payload["status"] == "hit"
+        assert dc.self_test_index(tmp_path / "retrieval")["chunk_count"] > 0
+        assert {p.name: dc.sha256_bytes(p.read_bytes()) for p in cache_dir.iterdir()} == before
+        # Strict production validation rejects a non-E5 bundle fail-closed
+        # and writes nothing into the retrieval workspace.
+        strict = _run_manager(
+            [
+                "--mode",
+                "restore",
+                "--require-backend",
+                "e5",
+                *common,
+                str(tmp_path / "retrieval-strict"),
+                "--identity-file",
+                str(identity_file),
+            ],
+            {"AA_DERIVED_CACHE_ENABLED": "1"},
+        )
+        assert strict.returncode == 0, strict.stderr
+        strict_payload = json.loads(strict.stdout)
+        assert strict_payload["status"] == "rejected"
+        assert strict_payload["reason"] == "wrong-backend"
+        assert not (tmp_path / "retrieval-strict" / "index.json").exists()
+        # The encrypted L1 stays untouched after the strict rejection.
+        assert {p.name: dc.sha256_bytes(p.read_bytes()) for p in cache_dir.iterdir()} == before
+    finally:
+        identity = "destroyed"  # noqa: F841
+        recipient = "destroyed"  # noqa: F841
+
+
+def test_runtime_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:
+    # kodmial/aa#461: aa-runtime.yml must validate the actual restored L1
+    # first (never merely trust the actions/cache restore output), pull the
+    # digest-pinned L2 only after a missing/rejected L1 into an isolated
+    # L2-owned staging directory, and run the bounded strict-E5 rebuild
+    # only when both failed.
+    workflow = (_repo_root() / ".github" / "workflows" / "aa-runtime.yml").read_text(
+        encoding="utf-8"
+    )
+    key_step = workflow.index("Compute derived retrieval cache key")
+    restore_step = workflow.index("Restore encrypted derived retrieval cache")
+    l1_validation = workflow.index("python scripts/manage_derived_cache.py --mode restore \\")
+    l2_pull = workflow.index("--mode restore-l2 \\")
+    rebuild = workflow.index("--mode restore-or-rebuild \\")
+    assert key_step < restore_step < l1_validation < l2_pull < rebuild
+    # The L1 hit branch short-circuits: no L2 pull and no rebuild marker
+    # appear unless the validated L1 missed.
+    hit_guard = workflow.index('if [[ "$l1_status" == "hit" ]]; then')
+    assert hit_guard > l1_validation and hit_guard < l2_pull
+    assert 'bootstrap_status="l1-hit"' in workflow
+    assert 'bootstrap_status="l2-hit"' in workflow
+    assert 'bootstrap_status="rebuilt"' in workflow
+    assert 'bootstrap_status="failed"' in workflow
+    # L2 staging is isolated and L2-owned; status files stay in RUNNER_TEMP.
+    assert 'l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"' in workflow
+    assert '--staging-dir "$l2_staging_dir"' in workflow
+    assert 'l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"' in workflow
+    assert 'l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"' in workflow
+    assert 'rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"' in workflow
+    # Strict production backend everywhere, per the issue #461 contract.
+    assert "--require-backend e5" in workflow
+    assert "--backend e5 --require-backend e5" in workflow
+    # A failed bootstrap after both sources is a typed failure, not a
+    # silent continuation.
+    assert '[[ "$bootstrap_status" == "failed" ]]' in workflow
+    # Trusted exact-key save still skips re-save on an Actions L1 hit and
+    # never overwrites the immutable key on an invalid hit.
+    assert workflow.count("steps.restore-derived.outputs.cache-hit != 'true'") == 2
+
+
+def test_gate_c_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:
+    # kodmial/aa#461: qualify-live gains the same L1 -> L2 -> rebuild order
+    # with an actual L1 restore step and isolated L2 staging.
+    workflow = (
+        _repo_root() / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    ).read_text(encoding="utf-8")
+    key_step = workflow.index("Compute derived retrieval cache key")
+    restore_step = workflow.index("Restore encrypted derived retrieval cache (L1)")
+    bootstrap_step = workflow.index("Bootstrap exact production book/index")
+    assert key_step < restore_step < bootstrap_step
+    assert "uses: actions/cache/restore@v4" in workflow
+    assert "key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}" in workflow
+    next_step = workflow.index("Gate C - LIVE exact production conversation path")
+    bootstrap_block = workflow[bootstrap_step:next_step]
+    l1_validation = bootstrap_block.index(
+        "python scripts/manage_derived_cache.py --mode restore \\"
+    )
+    l2_pull = bootstrap_block.index("--mode restore-l2 \\")
+    rebuild = bootstrap_block.index("--mode restore-or-rebuild \\")
+    assert l1_validation < l2_pull < rebuild
+    assert 'l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"' in bootstrap_block
+    assert '--staging-dir "$l2_staging_dir"' in bootstrap_block
+    for status in ("l1-hit", "l2-hit", "rebuilt", "failed"):
+        assert status in bootstrap_block
+    assert "--backend e5 --require-backend e5" in bootstrap_block
+    # kodmial/aa#444 (still required): status files live in RUNNER_TEMP.
+    assert "${RUNNER_TEMP:-/tmp}/derived-l2-status.json" in bootstrap_block
+    assert "${RUNNER_TEMP:-/tmp}/derived-l1-status.json" in bootstrap_block
+    assert "run: |" in bootstrap_block
+
+
 def test_startup_metrics_are_privacy_safe(tmp_path: pathlib.Path) -> None:
     identity, _ = age_v1.generate_identity()
     try:

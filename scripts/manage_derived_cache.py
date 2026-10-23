@@ -22,10 +22,13 @@ Modes:
   and validate the authoritative RU/EN canonical artifacts, build the
   final qualified retrieval state, and run integrity/self-tests;
 - ``--restore-l2`` — pull the digest-pinned encrypted bundle from the
-  persistent GHCR OCI artifact (L2, issue #429) into the cache directory
-  and validate it exactly like L1; a missing/placeholder/invalid pin,
-  registry failure, or digest mismatch is reported fail-closed and never
-  trusted;
+  persistent GHCR OCI artifact (L2, issue #429) into an L2-owned staging
+  directory and validate it exactly like L1; a missing/placeholder/invalid
+  pin, registry failure, or digest mismatch is reported fail-closed and
+  never trusted. Issue #461: download, decryption, verification and any
+  staging cleanup touch only the L2-owned staging directory — the
+  original L1 cache directory is never mutated, overwritten or deleted
+  by an L2 failure;
 - ``--publish-l2`` — package/encrypt the final production E5 index and
   publish it as one immutable GHCR OCI artifact. Publishing is
   idempotent: identical bindings converge to the same content-addressed
@@ -515,6 +518,22 @@ def _l2_session(args: argparse.Namespace) -> Any:
     return registry, open_session(registry, username=username, password=password)
 
 
+def _l2_staging_dir(args: argparse.Namespace) -> Path:
+    """Return the L2-owned staging directory for the pinned L2 pull.
+
+    Issue #461: the staging directory is never the L1 cache directory
+    itself. Download, decryption, verification, and any staging cleanup
+    touch only this L2-owned path, so an L2 401/403, transport failure,
+    partial blob, corrupt artifact, bad manifest/backend, decryption or
+    self-test failure can never mutate, overwrite, or delete the restored
+    L1 directory that consistently shares its path in production.
+    """
+    staging = getattr(args, "staging_dir", None)
+    if staging is not None:
+        return staging
+    return args.cache_dir.parent / f"{args.cache_dir.name}.l2-staging"
+
+
 def _cmd_restore_l2(args: argparse.Namespace) -> int:
     if not is_cache_enabled():
         return _status({"status": "disabled"}, args)
@@ -572,19 +591,26 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
             },
             args,
         )
+    staging_dir = _l2_staging_dir(args)
     registry, session = _l2_session(args)
+    # Issue #461 staging isolation: only the L2-owned staging directory is
+    # ever written or cleared by this command. The preexisting L1 cache
+    # directory stays byte-for-byte identical across every L2 failure mode
+    # (transport, 401/partial blob, digest mismatch, decrypt/validation).
+    clear_directory(staging_dir)
     try:
         pull_artifact(
             registry,
             reference=pinned_digest,
             session=session,
-            dest_dir=args.cache_dir,
+            dest_dir=staging_dir,
             expect_files=(ENCRYPTED_NAME, META_NAME),
         )
     except ArtifactError as exc:
-        # Fail closed: partial/untrusted pull content is removed and never
-        # used; the caller decides on the bounded emergency rebuild policy.
-        clear_directory(args.cache_dir)
+        # Fail closed on the staging directory only: partial/untrusted pull
+        # content is removed and never used; the caller decides on the
+        # L1/validation and bounded emergency rebuild policy.
+        clear_directory(staging_dir)
         return _status(
             {
                 "status": "rejected",
@@ -597,7 +623,7 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
         )
     identity = _read_identity(args.identity_file)
     result = _attempt_restore(
-        cache_dir=args.cache_dir,
+        cache_dir=staging_dir,
         retrieval_dir=args.retrieval_dir,
         bindings=bindings,
         key=key,
@@ -607,8 +633,10 @@ def _cmd_restore_l2(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = dict(result)
     payload["source"] = "l2"
     payload["l2_digest"] = pinned_digest
-    if result.get("status") not in ("hit",):
-        clear_directory(args.cache_dir)
+    # Verified-hit staging is cleaned too: the bootstrap caller saves the
+    # validated state into the L1 cache directory through the existing
+    # save path, never by mutating it from this L2 command.
+    clear_directory(staging_dir)
     return _status(payload, args)
 
 
@@ -885,6 +913,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Cache operation to perform.",
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--staging-dir",
+        type=Path,
+        default=None,
+        help="L2-owned staging directory for ``--mode restore-l2`` (issue "
+        "#461). Default: a ``.l2-staging`` sibling of ``--cache-dir``. The "
+        "L1 cache directory is never written or cleared through staging.",
+    )
     parser.add_argument("--retrieval-dir", type=Path, default=DEFAULT_RETRIEVAL_DIR)
     parser.add_argument("--recipient-file", type=Path, default=None)
     parser.add_argument("--identity-file", type=Path, default=None)
