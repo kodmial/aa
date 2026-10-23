@@ -48,6 +48,7 @@ from aa.conversation.planner_node import (
     validate_structured_plan,
 )
 from aa.conversation.planner_schema import (
+    MAX_INFORMATION_NEEDS,
     MAX_QUERIES,
     MIN_NONEMPTY_QUERIES,
     QueryPlan,
@@ -217,18 +218,23 @@ def test_planner_dedupes_whitespace_case_duplicates() -> None:
     )
 
 
-def test_planner_schema_has_only_queries_field() -> None:
+def test_planner_schema_field_contract() -> None:
     # #311 adds one optional trusted query->need mapping parallel to
-    # queries; the required structural contract stays mode/resolved_intent
-    # /queries and the mapping defaults to None (structural derivation).
+    # queries; #295 adds the planner's own bounded typed information-need
+    # emission in the same planning result. The required structural
+    # contract stays mode/resolved_intent/queries, the mapping defaults
+    # to None (structural derivation) and needs default to [] (the
+    # conservative compatibility path, never query-as-need re-multiplication).
     assert set(QueryPlan.model_fields) == {
         "mode",
         "resolved_intent",
         "queries",
         "query_need_ids",
+        "information_needs",
     }
     assert MIN_NONEMPTY_QUERIES == 1
     assert MAX_QUERIES == 16
+    assert MAX_INFORMATION_NEEDS == 8
 
 
 def test_validate_structured_plan_uses_native_object() -> None:
@@ -253,11 +259,13 @@ def test_query_plan_json_schema_derives_from_pydantic() -> None:
     assert "queries" in schema["properties"]
     assert "mode" in schema["properties"]
     assert "resolved_intent" in schema["properties"]
-    assert schema["required"] == ["mode", "resolved_intent", "queries"]
+    assert schema["required"] == ["mode", "resolved_intent", "queries", "information_needs"]
     queries = schema["properties"]["queries"]
     assert queries["items"]["type"] == "string"
     assert queries["items"]["pattern"] == r"\S"
     assert queries["uniqueItems"] is True
+    assert "information_needs" in schema["properties"]
+    assert schema["required"] == ["mode", "resolved_intent", "queries", "information_needs"]
 
 
 def test_planner_node_has_no_text_json_machinery() -> None:
