@@ -1829,27 +1829,20 @@ class Application:
         # the stage snapshot keeps both measurements independent and
         # available to Gate C/E evidence without any user or reply text.
         from aa.conversation.answer_causality import (
-            PRODUCT_SUCCESS_ANSWER_OUTCOMES as _product_success_outcomes,
+            product_outcome_for_answer_outcome as _product_outcome_for,
         )
         from aa.conversation.failures import is_service_error as _is_service_error_text
 
-        _stage_answer_outcome = str(stage.get("answer_outcome", "") or "")
+        _stage_answer_outcome = str(stage.get("answer_outcome", "") or "").strip()
         _delivered_service = bool(service_error or is_service) or _is_service_error_text(
             str(fitted or "")
         )
         if _delivered_service:
             _product_outcome = "service_error"
-        elif "answer_outcome" not in stage:
-            # Legacy/delegate paths without an ``answer_outcome`` field are
-            # inconclusive (#436): they stay ``unknown``, never an auto
-            # product success and never an invented rejection.
-            _product_outcome = "unknown"
         else:
-            _product_outcome = (
-                "answer_success"
-                if _stage_answer_outcome in _product_success_outcomes
-                else "rejected"
-            )
+            # Missing/legacy outcomes stay inconclusive, never an invented
+            # rejection; only explicit non-success outcomes are ``rejected``.
+            _product_outcome = _product_outcome_for(_stage_answer_outcome)
         if _product_outcome != "answer_success":
             from aa.conversation.answer_causality import failure_reason_from_telemetry as _reason
 

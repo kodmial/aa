@@ -172,6 +172,43 @@ def test_samples_from_legacy_latencies_stay_unknown() -> None:
     assert all(sample.delivery_status == "unknown" for sample in samples)
 
 
+def _legacy_payload(outcome: str = "served", **overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "causality_id": "legacy1",
+        "family": "ordinary-text",
+        "mode": "text",
+        "outcome": outcome,
+        "latency_ms": 100.0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_legacy_product_field_is_never_auto_promoted_or_invented() -> None:
+    # Served legacy samples without the explicit product field stay
+    # inconclusive, never answer_success.
+    assert TurnSample.from_dict(_legacy_payload()).product_outcome == "unknown"
+    # An invalid product value is still not promoted to success.
+    invalid = _legacy_payload(product_outcome="made-up")
+    assert TurnSample.from_dict(invalid).product_outcome == "unknown"
+    # Legacy timeout keeps its explicit product timeout.
+    timeout = _legacy_payload(outcome="timeout", censored=True)
+    assert TurnSample.from_dict(timeout).product_outcome == "timeout"
+    # An explicit success survives unchanged.
+    explicit = _legacy_payload(product_outcome="answer_success")
+    assert TurnSample.from_dict(explicit).product_outcome == "answer_success"
+
+
+def test_product_outcome_mapping_keeps_unknown_inconclusive() -> None:
+    from aa.conversation.answer_causality import product_outcome_for_answer_outcome
+
+    assert product_outcome_for_answer_outcome("served") == "answer_success"
+    assert product_outcome_for_answer_outcome("served-split") == "answer_success"
+    assert product_outcome_for_answer_outcome("") == "unknown"
+    assert product_outcome_for_answer_outcome("unknown") == "unknown"
+    assert product_outcome_for_answer_outcome("clarification-unavailable") == "rejected"
+
+
 def test_build_c_series_typed_samples() -> None:
     summary: dict[str, Any] = {
         "lanes": [
@@ -354,5 +391,37 @@ async def test_healthy_delegate_turn_is_never_invented_as_product_failure() -> N
         )
         assert not sample.product_failure
         assert not sample.product_success
+    finally:
+        await app.stop()
+
+
+async def test_application_propagates_rate_limit_instead_of_service_error() -> None:
+    from aa.app import Application
+    from aa.config import Settings
+    from aa.conversation.graph_runtime import GraphTurnRuntime
+    from aa.opencode.errors import OpenCodeRateLimitError
+    from aa.opencode.runtime import OpenCodeConfig, StubOpenCodeRuntime
+    from aa.telegram.transport import StubTelegramTransport
+
+    async def _rate_limited(graph: Any, thread: str, text: str) -> dict[str, Any]:
+        _ = (graph, thread, text)
+        raise OpenCodeRateLimitError("opencode request rate-limited: http=429")
+
+    settings = Settings.from_env({"TYPING_HEARTBEAT_SECONDS": "0.02"})
+    runtime = GraphTurnRuntime()
+    runtime.attach_graph(object())
+    runtime._invoke_graph = _rate_limited  # type: ignore[method-assign]
+    app = Application(
+        settings,
+        transport=StubTelegramTransport(),
+        opencode_runtime=StubOpenCodeRuntime(
+            OpenCodeConfig(base_url="http://127.0.0.1:4096", command="opencode", workdir=".")
+        ),
+        graph_runtime=runtime,
+    )
+    await app.start()
+    try:
+        with pytest.raises(OpenCodeRateLimitError):
+            await app.respond(923203, "тяга вечером, что делать?")
     finally:
         await app.stop()

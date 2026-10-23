@@ -225,13 +225,11 @@ class TurnSample:
             delivery_status = DELIVERY_UNKNOWN
         product_outcome = str(payload.get("product_outcome", "") or "").strip()[:32]
         if product_outcome not in VALID_PRODUCT_OUTCOMES:
-            product_outcome = (
-                PRODUCT_TIMEOUT
-                if outcome == "timeout"
-                else PRODUCT_SUCCESS
-                if outcome in ("served",) and payload.get("product_outcome") == PRODUCT_SUCCESS
-                else PRODUCT_UNKNOWN
-            )
+            # Legacy payloads only carry the coarse transport ``outcome``.
+            # An absent/invalid product field is never auto-promoted to
+            # ``answer_success`` (kodmial/aa#436); a timeout stays an
+            # explicit product timeout and everything else is inconclusive.
+            product_outcome = PRODUCT_TIMEOUT if outcome == "timeout" else PRODUCT_UNKNOWN
         failure_reason = str(payload.get("failure_reason", "") or "").strip()[:64]
         if not failure_reason:
             failure_reason = str(payload.get("failure_category", "") or "").strip()[:64]

@@ -1113,12 +1113,8 @@ async def _verify_draft(
     )
     from aa.conversation.answer_causality import cause_from_exception as _cause_from_exc
     from aa.conversation.answer_causality import (
-        verifier_locale_reason_for_message as _locale_message_reason,
+        guard_cause_for_verifier_locale_message as _locale,
     )
-
-    def _locale(message: str, stage: str = "verification") -> Any:
-        reason = str(_locale_message_reason(message) or "verifier-invalid-schema")
-        return _Cause.bounded(reason, stage, "local", detail="verifier-local")
 
     try:
         units = split_response_units(draft)

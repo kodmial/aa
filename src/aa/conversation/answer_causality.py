@@ -38,6 +38,7 @@ TELEMETRY_CHAIN_KEY = "answer_failure_cause_chain"
 PRODUCT_SUCCESS_ANSWER_OUTCOMES = frozenset(
     {
         "served",
+        "served-split",
         "narrowed-supported",
         "narrowed-compacted",
         "narrowed-adequacy",
@@ -45,6 +46,23 @@ PRODUCT_SUCCESS_ANSWER_OUTCOMES = frozenset(
         "conversational-generated",
     }
 )
+
+
+def product_outcome_for_answer_outcome(answer_outcome: Any) -> str:
+    """Map a delivered turn's production outcome to its product dimension.
+
+    Transport delivery and product success are independent (#436). A
+    missing/``unknown`` outcome is inconclusive and stays ``unknown``;
+    an explicit non-success outcome counts as ``rejected``. Delivered
+    service errors are classified before this mapping by the caller.
+    """
+    value = str(answer_outcome or "").strip()
+    if value in PRODUCT_SUCCESS_ANSWER_OUTCOMES:
+        return "answer_success"
+    if not value or value == "unknown":
+        return "unknown"
+    return "rejected"
+
 
 # Closed-vocabulary stages (attribution boundary).
 STAGE_GENERATION = "generation"
@@ -411,6 +429,7 @@ __all__ = [
     "KNOWN_REASONS",
     "MAX_CHAIN_LEN",
     "PRODUCT_SUCCESS_ANSWER_OUTCOMES",
+    "product_outcome_for_answer_outcome",
     "REPAIR_EXHAUSTED",
     "SOURCES",
     "SPLIT_INVALID",

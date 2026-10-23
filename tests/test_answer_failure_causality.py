@@ -406,6 +406,30 @@ async def test_verify_draft_verifier_budget_zero_recorded_pre_http(
     assert telemetry["answer_failure_cause"]["stage"] == "verification"
 
 
+async def test_verify_draft_unclassified_validation_stays_local_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aa.conversation.turn_pipeline import _verify_draft
+
+    telemetry: dict[str, Any] = {}
+
+    async def _run_verifier(*args: Any, **kwargs: Any) -> Any:
+        raise VerifierValidationError("unexpected validation detail")
+
+    monkeypatch.setattr(turn_pipeline, "run_verifier", _run_verifier)
+    units, result, ok = await _verify_draft(
+        "Первое предложение. Второе предложение.",
+        [{"source_id": "s1"}],
+        verifier_model=_StubModel(),
+        telemetry=telemetry,
+    )
+    assert not ok and result is None
+    assert units
+    assert telemetry["answer_failure_cause"]["reason"] == VERIFIER_SCHEMA_INVALID
+    assert telemetry["answer_failure_cause"]["source"] == "local"
+    assert telemetry["answer_failure_cause"]["stage"] == "verification"
+
+
 async def test_verify_draft_transport_error_maps_to_verifier_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
