@@ -678,6 +678,117 @@ def test_runtime_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:
     assert workflow.count("steps.restore-derived.outputs.cache-hit != 'true'") == 2
 
 
+def test_gate_b_bootstrap_reuses_verified_index_before_rebuild() -> None:
+    """kodmial/aa#463: the trusted Gate B qualify job reuses the verified
+    index provisioning path from kodmial/aa#461/#462 instead of an
+    unconditional production rebuild.
+
+    The deterministic workflow contract proves, on a clean job:
+
+    - the exact content key is computed and the encrypted Actions L1 is
+      restored before Gate B logic runs;
+    - the Gate B step validates the actual restored L1 bytes first, then
+      pulls the digest-pinned L2 only on a missing/rejected L1 into an
+      isolated L2-owned staging directory, and runs at most one bounded
+      strict-E5 rebuild only when both fail — never hashing;
+    - every Gate B correctness check (retrieval pytest suites and the
+      deterministic Product Contract) keeps running against the same
+      canonical index location unchanged;
+    - save wiring stores only the encrypted bundle under the exact key
+      after a non-L1 sourcing, and never re-saves on an L1 hit.
+    """
+    workflow_path = _repo_root() / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    workflow = workflow_path.read_text(encoding="utf-8")
+
+    # The compute-key and L1 restore steps precede Gate B in its own job.
+    qualify_scope = workflow.split("Gate B - deterministic component integration", 1)[0]
+    key_step = qualify_scope.index("Compute derived retrieval cache key")
+    restore_step = qualify_scope.index("Restore encrypted derived retrieval cache (L1)")
+    gate_b_start = len(qualify_scope)
+    assert key_step < restore_step < gate_b_start
+
+    restore_block = workflow.split("Restore encrypted derived retrieval cache (L1)", 1)[1].split(
+        "- name:", 1
+    )[0]
+    assert "uses: actions/cache/restore@v4" in restore_block
+    assert "path: ${{ steps.derived-cache-key.outputs.derived-dir }}" in restore_block
+    assert "key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}" in restore_block
+    # Exact key only: no stale/foreign bundle may ever enter reuse.
+    assert "restore-keys:" not in restore_block
+
+    gate_b_block = workflow.split("Gate B - deterministic component integration", 1)[1].split(
+        "Save encrypted derived retrieval cache", 1
+    )[0]
+
+    # The L2 packages token is scoped to this trusted step only.
+    gate_env = gate_b_block.split("run: |", 1)[0]
+    assert "AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}" in gate_env
+
+    # Bootstrap order L1 -> L2 -> at most one strict-E5 rebuild, with the
+    # failed state handled explicitly (fail-safe, no hashing fallback).
+    l1_validation = gate_b_block.index("python scripts/manage_derived_cache.py --mode restore \\")
+    l2_pull = gate_b_block.index("--mode restore-l2 \\")
+    rebuild = gate_b_block.index("--mode restore-or-rebuild \\")
+    assert l1_validation < l2_pull < rebuild
+    assert "--require-backend e5" in gate_b_block
+    assert "--backend e5 --require-backend e5" in gate_b_block
+    assert "--backend hashing" not in gate_b_block
+    for status in ("l1-hit", "l2-hit", "rebuilt", "failed"):
+        assert f'bootstrap_status="{status}"' in gate_b_block
+    failure_branch = gate_b_block.split('[[ "$bootstrap_status" == "failed" ]]', 1)[1]
+    assert "gate_b_shell=fail" in failure_branch.split("- name:", 1)[0]
+    assert "refusing silent hashing fallback" in failure_branch.split("- name:", 1)[0]
+
+    # L2 staging is isolated and L2-owned; status paths stay in RUNNER_TEMP
+    # and never dirty the checked-out tree.
+    assert 'l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"' in gate_b_block
+    assert '--staging-dir "$l2_staging_dir"' in gate_b_block
+    for path in (
+        'l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"',
+        'l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"',
+        'rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"',
+    ):
+        assert path in gate_b_block
+
+    # The metric step summary reports the typed outcome, SHA, fingerprint,
+    # verified backend and whether production embeddings were rebuilt.
+    assert "l1-hit/l2-hit/rebuilt/failed" in gate_b_block
+    assert "production embeddings rebuilt" in gate_b_block
+    assert "verified backend" in gate_b_block
+    assert "cache fingerprint" in gate_b_block
+    assert "steps.sha.outputs.sha" in gate_b_block
+
+    # The unconditional full-production rebuild step is gone: the builder
+    # script no longer runs inline in Gate B, while every downstream
+    # correctness check keeps executing against the canonical index.
+    assert "build_retrieval_index.py" not in gate_b_block
+    assert "corpus/generated/retrieval/index.json" in gate_b_block
+    for kept in (
+        "tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py",
+        "tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py",
+        "run_product_contract_live_qualification.py",
+        "--deterministic-only",
+        "--emit-gate B --shell-b-status",
+    ):
+        assert kept in gate_b_block
+
+    # Trusted save wiring: only the encrypted bundle enters the L1 cache,
+    # under the exact key and only after a verified L2 hit or rebuild (an
+    # Actions L1 hit never triggers a re-save).
+    save_block = workflow.split("Save encrypted derived retrieval cache", 1)[1].split("- name:", 1)[
+        0
+    ]
+    assert "manage_derived_cache.py --mode save" in save_block
+    upload_block = workflow.split("Upload encrypted derived retrieval cache", 1)[1].split(
+        "- name:", 1
+    )[0]
+    assert "uses: actions/cache/save@v4" in upload_block
+    assert "path: ${{ steps.derived-cache-key.outputs.derived-dir }}" in upload_block
+    assert "key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}" in upload_block
+    assert "restore-keys:" not in upload_block
+    assert workflow.count("steps.restore-derived.outputs.cache-hit != 'true'") == 2
+
+
 def test_gate_c_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:
     # kodmial/aa#461: qualify-live gains the same L1 -> L2 -> rebuild order
     # with an actual L1 restore step and isolated L2 staging.
