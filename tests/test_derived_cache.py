@@ -20,6 +20,7 @@ import sys
 from typing import Any
 
 import pytest
+import yaml
 
 from aa.corpus import age_v1
 from aa.retrieval import derived_cache as dc
@@ -79,6 +80,40 @@ RU_FIXTURES: dict[str, str] = {
 
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[1]
+
+
+def _workflow_document(path: pathlib.Path) -> dict[str, Any]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document
+
+
+def _job_steps(document: dict[str, Any], job_id: str) -> list[dict[str, Any]]:
+    jobs = document["jobs"]
+    assert isinstance(jobs, dict)
+    job = jobs[job_id]
+    assert isinstance(job, dict)
+    steps = job["steps"]
+    assert isinstance(steps, list)
+    return [step for step in steps if isinstance(step, dict)]
+
+
+def _step_named(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1, f"expected exactly one {name!r} step, found {len(matches)}"
+    return matches[0]
+
+
+def _all_job_steps(document: dict[str, Any]) -> list[dict[str, Any]]:
+    jobs = document["jobs"]
+    assert isinstance(jobs, dict)
+    return [
+        step
+        for job in jobs.values()
+        if isinstance(job, dict)
+        for step in job.get("steps", [])
+        if isinstance(step, dict)
+    ]
 
 
 def _fixture_full() -> dict[str, Any]:
@@ -676,6 +711,128 @@ def test_runtime_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:
     # Trusted exact-key save still skips re-save on an Actions L1 hit and
     # never overwrites the immutable key on an invalid hit.
     assert workflow.count("steps.restore-derived.outputs.cache-hit != 'true'") == 2
+
+
+def test_gate_b_bootstrap_reuses_verified_index_before_rebuild() -> None:
+    """kodmial/aa#463: the trusted Gate B qualify job reuses the verified
+    index provisioning path from kodmial/aa#461/#462 instead of an
+    unconditional production rebuild.
+
+    The deterministic workflow contract proves, on a clean job:
+
+    - the exact content key is computed and the encrypted Actions L1 is
+      restored before Gate B logic runs;
+    - the Gate B step validates the actual restored L1 bytes first, then
+      pulls the digest-pinned L2 only on a missing/rejected L1 into an
+      isolated L2-owned staging directory, and runs at most one bounded
+      strict-E5 rebuild only when both fail — never hashing;
+    - every Gate B correctness check (retrieval pytest suites and the
+      deterministic Product Contract) keeps running against the same
+      canonical index location unchanged;
+    - save wiring stores only the encrypted bundle under the exact key
+      after a non-L1 sourcing, and never re-saves on an L1 hit.
+    """
+    workflow_path = _repo_root() / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+    document = _workflow_document(workflow_path)
+    qualify_steps = _job_steps(document, "qualify")
+
+    # The compute-key and L1 restore steps precede Gate B in its own job.
+    step_names = [step.get("name") for step in qualify_steps]
+    key_step = step_names.index("Compute derived retrieval cache key")
+    restore_step = step_names.index("Restore encrypted derived retrieval cache (L1)")
+    gate_b_step = step_names.index("Gate B - deterministic component integration")
+    assert key_step < restore_step < gate_b_step
+
+    restore = _step_named(qualify_steps, "Restore encrypted derived retrieval cache (L1)")
+    assert restore.get("uses") == "actions/cache/restore@v4"
+    restore_with = restore.get("with")
+    assert isinstance(restore_with, dict)
+    assert restore_with.get("path") == "${{ steps.derived-cache-key.outputs.derived-dir }}"
+    assert restore_with.get("key") == "${{ steps.derived-cache-key.outputs.derived-actions-key }}"
+    # Exact key only: no stale/foreign bundle may ever enter reuse.
+    assert "restore-keys" not in restore_with
+
+    gate_b = _step_named(qualify_steps, "Gate B - deterministic component integration")
+    # The L2 packages token is scoped to this trusted step only.
+    gate_env = gate_b.get("env")
+    assert isinstance(gate_env, dict)
+    assert gate_env.get("AA_INDEX_PACKAGES_TOKEN") == "${{ github.token }}"
+
+    gate_b_run = gate_b.get("run")
+    assert isinstance(gate_b_run, str)
+
+    # Bootstrap order L1 -> L2 -> at most one strict-E5 rebuild, with the
+    # failed state handled explicitly (fail-safe, no hashing fallback).
+    l1_validation = gate_b_run.index("python scripts/manage_derived_cache.py --mode restore \\")
+    l2_pull = gate_b_run.index("--mode restore-l2 \\")
+    rebuild = gate_b_run.index("--mode restore-or-rebuild \\")
+    assert l1_validation < l2_pull < rebuild
+    assert "--require-backend e5" in gate_b_run
+    # The rebuild selects E5 explicitly and the separate restore-validation
+    # guard requires E5; each flag appears exactly once in that invocation.
+    rebuild_command = gate_b_run.split("--mode restore-or-rebuild", 1)[1].split("; then", 1)[0]
+    assert rebuild_command.count("--backend e5") == 1
+    assert rebuild_command.count("--require-backend e5") == 1
+    assert "--backend hashing" not in gate_b_run
+    for status in ("l1-hit", "l2-hit", "rebuilt", "failed"):
+        assert f'bootstrap_status="{status}"' in gate_b_run
+    failure_branch = gate_b_run.split('[[ "$bootstrap_status" == "failed" ]]', 1)[1]
+    assert "gate_b_shell=fail" in failure_branch
+    assert "refusing silent hashing fallback" in failure_branch
+
+    # L2 staging is isolated and L2-owned; status paths stay in RUNNER_TEMP
+    # and never dirty the checked-out tree.
+    assert 'l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"' in gate_b_run
+    assert '--staging-dir "$l2_staging_dir"' in gate_b_run
+    for path in (
+        'l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"',
+        'l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"',
+        'rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"',
+    ):
+        assert path in gate_b_run
+
+    # The metric step summary reports the typed outcome, SHA, fingerprint,
+    # verified backend and whether production embeddings were rebuilt.
+    assert "l1-hit/l2-hit/rebuilt/failed" in gate_b_run
+    assert "production embeddings rebuilt" in gate_b_run
+    assert "verified backend" in gate_b_run
+    assert "cache fingerprint" in gate_b_run
+    assert "steps.sha.outputs.sha" in gate_b_run
+
+    # The unconditional full-production rebuild step is gone: the builder
+    # script no longer runs inline in Gate B, while every downstream
+    # correctness check keeps executing against the canonical index.
+    assert "build_retrieval_index.py" not in gate_b_run
+    assert "corpus/generated/retrieval/index.json" in gate_b_run
+    for kept in (
+        "tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py",
+        "tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py",
+        "run_product_contract_live_qualification.py",
+        "--deterministic-only",
+        "--emit-gate B --shell-b-status",
+    ):
+        assert kept in gate_b_run
+
+    # Trusted save wiring: only the encrypted bundle enters the L1 cache,
+    # under the exact key and only after a verified L2 hit or rebuild (an
+    # Actions L1 hit never triggers a re-save).
+    save = _step_named(qualify_steps, "Save encrypted derived retrieval cache")
+    save_run = save.get("run")
+    assert isinstance(save_run, str)
+    assert "manage_derived_cache.py --mode save" in save_run
+    upload = _step_named(qualify_steps, "Upload encrypted derived retrieval cache")
+    assert upload.get("uses") == "actions/cache/save@v4"
+    upload_with = upload.get("with")
+    assert isinstance(upload_with, dict)
+    assert upload_with.get("path") == "${{ steps.derived-cache-key.outputs.derived-dir }}"
+    assert upload_with.get("key") == "${{ steps.derived-cache-key.outputs.derived-actions-key }}"
+    assert "restore-keys" not in upload_with
+    cache_hit_guards = [
+        str(step.get("if", ""))
+        for step in _all_job_steps(document)
+        if "steps.restore-derived.outputs.cache-hit != 'true'" in str(step.get("if", ""))
+    ]
+    assert len(cache_hit_guards) == 2
 
 
 def test_gate_c_bootstrap_is_validated_l1_then_l2_then_rebuild() -> None:

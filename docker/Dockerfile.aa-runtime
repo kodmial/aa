@@ -95,6 +95,8 @@ RUN set -eux; \
         "pytest-asyncio==1.4.0" \
         "ruff==0.17.2" \
         "mypy==2.4.0" \
+        "PyYAML==6.0.3" \
+        "types-PyYAML==6.0.12.20260906" \
         "click==8.5.0" \
         "typer-slim==0.24.0" \
         "typer==0.25.1" \
