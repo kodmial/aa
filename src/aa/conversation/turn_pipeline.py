@@ -24,7 +24,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage
 
 from aa.conversation.answer_causality import attach_answer_failure_cause as attach_failure_cause
-from aa.conversation.answer_causality import terminal_unknown_cause
+from aa.conversation.answer_causality import first_answer_failure_cause, terminal_unknown_cause
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.failures import TurnFailed
 from aa.conversation.output_limits import (
@@ -801,18 +801,19 @@ _LOCAL_GUARD_REPAIR_POLICY = (
 def _typed_local_guard_reason(telemetry: dict[str, Any] | None) -> str:
     """Return the typed reason when a draft was rejected before verification.
 
-    Reads the first recorded ``answer_failure_cause`` and matches the
-    closed local-guard vocabulary. ``attach_answer_failure_cause`` only
-    writes that key when it is absent/empty and appends every later
-    distinct cause to ``answer_failure_cause_chain``, so the first cause
-    stays authoritative (pinned by
-    ``test_first_cause_is_preserved_later_distinct_causes_extend_chain``).
+    Reads the earliest recorded cause through ``first_answer_failure_cause``
+    and matches the closed local-guard vocabulary. ``attach_answer_failure_cause``
+    keeps the first cause in ``answer_failure_cause`` and as the first
+    ``answer_failure_cause_chain`` entry, so later stages cannot replace
+    the local-guard attribution (pinned by
+    ``test_first_cause_is_preserved_later_distinct_causes_extend_chain``
+    and ``test_typed_local_guard_reason_keeps_the_immutable_first_cause``).
     Empty string means the observed failure was not a pre-verifier local
     guard rejection.
     """
     if not isinstance(telemetry, dict):
         return ""
-    cause = telemetry.get("answer_failure_cause")
+    cause = first_answer_failure_cause(telemetry)
     if not isinstance(cause, dict):
         return ""
     reason = str(cause.get("reason", "") or "")

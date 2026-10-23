@@ -24,6 +24,7 @@ from aa.conversation.answer_causality import (
     EVIDENCE_INTEGRITY_INVALID,
     GENERATION_EMPTY_CANDIDATE,
     GENERATION_PROVIDER_RATE_LIMIT,
+    GUARD_INTERNAL_TERMS,
     GUARD_LANGUAGE,
     KNOWN_REASONS,
     SOURCES,
@@ -39,6 +40,7 @@ from aa.conversation.answer_causality import (
     cause_for_empty_candidate,
     cause_from_exception,
     failure_reason_from_telemetry,
+    first_answer_failure_cause,
     guard_cause_for_verifier_locale_message,
     terminal_unknown_cause,
     verifier_locale_reason_for_message,
@@ -115,6 +117,58 @@ def test_first_cause_is_preserved_later_distinct_causes_extend_chain() -> None:
     assert chain[-1]["reason"] == VERIFIER_SKIPPED_BUDGET
 
 
+def test_attach_preserves_the_initial_local_guard_cause() -> None:
+    """Later fallback/repair causes cannot replace a local-guard attribution."""
+    telemetry: dict[str, Any] = {}
+    attach_answer_failure_cause(
+        telemetry,
+        AnswerFailureCause.bounded(GUARD_INTERNAL_TERMS, STAGE_VERIFICATION, "local"),
+    )
+    attach_answer_failure_cause(
+        telemetry,
+        AnswerFailureCause.bounded(VERIFIER_SKIPPED_BUDGET, STAGE_VERIFICATION, "local"),
+    )
+    attach_answer_failure_cause(
+        telemetry,
+        AnswerFailureCause.bounded("verdict-unsupported", STAGE_VERIFICATION, "verification"),
+    )
+    assert telemetry["answer_failure_cause"]["reason"] == GUARD_INTERNAL_TERMS
+    assert telemetry["answer_failure_cause_chain"][0]["reason"] == GUARD_INTERNAL_TERMS
+    earlier = first_answer_failure_cause(telemetry)
+    assert earlier is not None
+    assert earlier["reason"] == GUARD_INTERNAL_TERMS
+
+
+def test_first_answer_failure_cause_falls_back_to_the_chain() -> None:
+    telemetry = {
+        "answer_failure_cause_chain": [
+            AnswerFailureCause.bounded(GUARD_LANGUAGE, STAGE_VERIFICATION, "local").to_dict(),
+            AnswerFailureCause.bounded(SPLIT_INVALID, "split", "local").to_dict(),
+        ]
+    }
+    cause = first_answer_failure_cause(telemetry)
+    assert cause is not None
+    assert cause["reason"] == GUARD_LANGUAGE
+    assert first_answer_failure_cause({}) is None
+    assert first_answer_failure_cause(None) is None
+    assert first_answer_failure_cause({"answer_failure_cause": "junk"}) is None
+
+
+def test_local_guard_reason_survives_primary_key_replacement() -> None:
+    """The admission reads the immutable chain even if a caller replaces
+    the primary cause without going through ``_attach``."""
+    telemetry = {
+        "answer_failure_cause": AnswerFailureCause.bounded(
+            SPLIT_INVALID, "split", "local"
+        ).to_dict(),
+        "answer_failure_cause_chain": [
+            AnswerFailureCause.bounded(GUARD_INTERNAL_TERMS, STAGE_VERIFICATION, "local").to_dict(),
+            AnswerFailureCause.bounded(SPLIT_INVALID, "split", "local").to_dict(),
+        ],
+    }
+    assert turn_pipeline._typed_local_guard_reason(telemetry) == GUARD_INTERNAL_TERMS
+
+
 def test_chain_is_bounded_and_keeps_earliest() -> None:
     telemetry: dict[str, Any] = {}
     reasons = [
@@ -134,6 +188,8 @@ def test_chain_is_bounded_and_keeps_earliest() -> None:
         )
     chain = telemetry["answer_failure_cause_chain"]
     assert len(chain) <= 6
+    assert chain[0]["reason"] == GUARD_LANGUAGE
+    assert chain[-1]["reason"] == UNKNOWN
     assert telemetry["answer_failure_cause"]["reason"] == GUARD_LANGUAGE
 
 
