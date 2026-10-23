@@ -93,8 +93,13 @@ def test_telegram_identifiers_are_redacted_in_nested_json_extras() -> None:
     assert extras["scenario_index"] == 4
     assert extras["attempt_state"] == "in-flight"
     for identifier in (
-        "987654321", "987654322", "987654323", "987654324",
-        "private-callback-987654325", "987654326", "987654327",
+        "987654321",
+        "987654322",
+        "987654323",
+        "987654324",
+        "private-callback-987654325",
+        "987654326",
+        "987654327",
         "private-file-987654328",
     ):
         assert identifier not in stream.getvalue()
