@@ -644,7 +644,8 @@ def matched_internal_rule(text: str) -> str:
     matched.
     """
     lowered = text.casefold()
-    for term in _INTERNAL_TERMS:
+    # Match longest terms first so specific phrases win over substrings.
+    for term in sorted(_INTERNAL_TERMS, key=len, reverse=True):
         if term in lowered:
             return term
     return ""
