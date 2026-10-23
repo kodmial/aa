@@ -92,7 +92,9 @@ class OCIRegistry:
     scheme: str = "https"
 
     def base_url(self) -> str:
-        return f"{self.scheme}://{self.host}"
+        # Contract: no trailing slash, so callers can append a rooted path
+        # (``/v2/...``) without producing a doubled separator.
+        return f"{self.scheme}://{self.host.rstrip('/')}"
 
     def api_url(self, path: str) -> str:
         return f"{self.base_url()}/v2/{self.repository}{path}"
