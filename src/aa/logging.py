@@ -30,6 +30,34 @@ SENSITIVE_KEYS = frozenset(
     }
 )
 
+# Stable external Telegram/user identifiers are private even when represented
+# as integers. Do not emit value-derived hints or hashes in public CI logs.
+PRIVATE_IDENTIFIER_KEYS = frozenset(
+    {
+        "chat_id",
+        "update_id",
+        "message_id",
+        "sender_id",
+        "user_id",
+        "from_id",
+        "callback_id",
+        "callback_query_id",
+        "callback_message_id",
+        "chat_instance",
+        "file_id",
+        "file_unique_id",
+        "telegram_chat_id",
+        "telegram_update_id",
+        "telegram_message_id",
+        "telegram_sender_id",
+        "telegram_user_id",
+        "telegram_file_id",
+        "telegram_file_unique_id",
+        "voice_file_id",
+        "voice_file_unique_id",
+    }
+)
+
 # Telegram bot tokens look like ``123456:ABC-DEF...``. Also redact generic
 # long secret-looking substrings only when explicitly attached to a
 # sensitive key (handled in ``redact_mapping``); the pattern below targets
@@ -55,30 +83,28 @@ def redact_string(text: str) -> str:
     return _BEARER_PATTERN.sub(REDACTED, redacted)
 
 
+def _redact_value(value: Any) -> Any:
+    """Recursively redact strings and mappings inside nested sequences."""
+    if isinstance(value, dict):
+        return redact_mapping(value)
+    if isinstance(value, str):
+        return redact_string(value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item) for item in value]
+    return value
+
+
 def redact_mapping(data: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``data`` with sensitive values redacted."""
     redacted: dict[str, Any] = {}
     for key, value in data.items():
-        if key.lower() in SENSITIVE_KEYS:
-            if isinstance(value, str):
-                redacted[key] = redact_secret(value)
-            else:
-                redacted[key] = REDACTED
-        elif isinstance(value, str):
-            redacted[key] = redact_string(value)
-        elif isinstance(value, dict):
-            redacted[key] = redact_mapping(value)
-        elif isinstance(value, (list, tuple)):
-            redacted[key] = [
-                redact_mapping(v)
-                if isinstance(v, dict)
-                else redact_string(v)
-                if isinstance(v, str)
-                else v
-                for v in value
-            ]
+        lower_key = key.lower()
+        if lower_key in PRIVATE_IDENTIFIER_KEYS:
+            redacted[key] = REDACTED
+        elif lower_key in SENSITIVE_KEYS:
+            redacted[key] = redact_secret(value) if isinstance(value, str) else REDACTED
         else:
-            redacted[key] = value
+            redacted[key] = _redact_value(value)
     return redacted
 
 
