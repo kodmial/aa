@@ -34,12 +34,14 @@ error bodies.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from typing import Any
 
 IN_FLIGHT_STATE = "in-flight"
 TERMINAL_ATTEMPT_STATES: tuple[str, ...] = ("completed", "failed", "cancelled", "aborted")
+LATE_OUTCOMES: tuple[str, ...] = TERMINAL_ATTEMPT_STATES
 # A terminal state corroborated by the worker future's own outcome.
 QUIESCENCE_STATES: frozenset[str] = frozenset({"completed", "failed", "aborted"})
 
@@ -68,6 +70,7 @@ class AttemptLedger:
             raise ValueError("max_records must be > 0")
         self._entries: list[dict[str, Any]] = []
         self._max_records = max_records
+        self._lock = threading.Lock()
 
     def register_start(
         self,
@@ -83,25 +86,28 @@ class AttemptLedger:
     ) -> str:
         """Publish an ``attempt-start`` record and return its unique id."""
         attempt_id = uuid.uuid4().hex
-        self._entries.append(
-            {
-                "attempt_id": attempt_id,
-                "event": "attempt-start",
-                "operation": _truncate(operation, _MAX_FIELD_LEN),
-                "state": IN_FLIGHT_STATE,
-                "attempt_started_monotonic": (
-                    float(started_monotonic) if started_monotonic is not None else time.monotonic()
-                ),
-                "causality_id": _truncate(causality_id, _MAX_CAUSALITY_LEN),
-                "stage": _truncate(stage, _MAX_FIELD_LEN),
-                "agent": _truncate(agent, _MAX_AGENT_LEN),
-                "audit_agent": _truncate(audit_agent, _MAX_AGENT_LEN),
-                "model": _truncate(model, _MAX_MODEL_LEN),
-                "fallback_model": _truncate(fallback_model, _MAX_MODEL_LEN),
-            }
-        )
-        if len(self._entries) > self._max_records:
-            del self._entries[: len(self._entries) - self._max_records]
+        with self._lock:
+            self._entries.append(
+                {
+                    "attempt_id": attempt_id,
+                    "event": "attempt-start",
+                    "operation": _truncate(operation, _MAX_FIELD_LEN),
+                    "state": IN_FLIGHT_STATE,
+                    "attempt_started_monotonic": (
+                        float(started_monotonic)
+                        if started_monotonic is not None
+                        else time.monotonic()
+                    ),
+                    "causality_id": _truncate(causality_id, _MAX_CAUSALITY_LEN),
+                    "stage": _truncate(stage, _MAX_FIELD_LEN),
+                    "agent": _truncate(agent, _MAX_AGENT_LEN),
+                    "audit_agent": _truncate(audit_agent, _MAX_AGENT_LEN),
+                    "model": _truncate(model, _MAX_MODEL_LEN),
+                    "fallback_model": _truncate(fallback_model, _MAX_MODEL_LEN),
+                }
+            )
+            if len(self._entries) > self._max_records:
+                del self._entries[: len(self._entries) - self._max_records]
         return attempt_id
 
     def _find(self, attempt_id: str) -> dict[str, Any] | None:
@@ -129,10 +135,53 @@ class AttemptLedger:
         normalized = _truncate(state, _MAX_FIELD_LEN)
         if normalized not in LATE_OUTCOMES:
             raise ValueError(f"unknown terminal attempt state: {state}")
-        entry = self._find(attempt_id)
-        if entry is None:
-            return False
-        if late:
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None:
+                return False
+            if late:
+                if entry.get("late_outcome") in LATE_OUTCOMES:
+                    return False
+                entry["late_outcome"] = normalized
+                if latency_ms is not None:
+                    entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
+                if failure_category:
+                    entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
+                return True
+            if entry.get("state") != IN_FLIGHT_STATE:
+                # A terminal state already exists; the recorded state stays the
+                # authoritative newest verdict.
+                return False
+            entry["state"] = normalized
+            entry["attempt_ended_monotonic"] = time.monotonic()
+            if latency_ms is not None:
+                entry["latency_ms"] = round(max(0.0, float(latency_ms)), 1)
+            if failure_category:
+                entry["failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
+            return True
+
+    def record_late_outcome_if_cancelled(
+        self,
+        attempt_id: str,
+        state: str,
+        latency_ms: float | None = None,
+        failure_category: str = "",
+    ) -> bool:
+        """Atomically record a late outcome only for a cancelled attempt.
+
+        The worker thread's fate is recorded independently of the awaiting
+        coroutine. This single locked operation closes the check-then-act
+        window between observing ``cancelled`` and writing ``late_outcome``.
+        """
+        normalized = _truncate(state, _MAX_FIELD_LEN)
+        if normalized not in LATE_OUTCOMES:
+            raise ValueError(f"unknown terminal attempt state: {state}")
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None:
+                return False
+            if entry.get("state") != "cancelled":
+                return False
             if entry.get("late_outcome") in LATE_OUTCOMES:
                 return False
             entry["late_outcome"] = normalized
@@ -141,17 +190,6 @@ class AttemptLedger:
             if failure_category:
                 entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
             return True
-        if entry.get("state") != IN_FLIGHT_STATE:
-            # A terminal state already exists; the recorded state stays the
-            # authoritative newest verdict.
-            return False
-        entry["state"] = normalized
-        entry["attempt_ended_monotonic"] = time.monotonic()
-        if latency_ms is not None:
-            entry["latency_ms"] = round(max(0.0, float(latency_ms)), 1)
-        if failure_category:
-            entry["failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
-        return True
 
     def mark_worker_started(self, attempt_id: str) -> bool:
         """Record that the worker thread actually picked up one attempt.
@@ -162,16 +200,18 @@ class AttemptLedger:
         still running, so only the thread's own flag distinguishes a clean
         cancellation from an orphan-thread risk.
         """
-        entry = self._find(attempt_id)
-        if entry is None or entry.get("worker_started") is True:
-            return False
-        entry["worker_started"] = True
-        return True
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None or entry.get("worker_started") is True:
+                return False
+            entry["worker_started"] = True
+            return True
 
     def worker_started(self, attempt_id: str) -> bool:
         """Whether the worker thread began executing one attempt."""
-        entry = self._find(attempt_id)
-        return entry is not None and entry.get("worker_started") is True
+        with self._lock:
+            entry = self._find(attempt_id)
+            return entry is not None and entry.get("worker_started") is True
 
     def mark_worker_done(
         self,
@@ -190,47 +230,55 @@ class AttemptLedger:
         coroutine was abandoned. Only such corroboration can prove a
         ``cancelled`` attempt is quiesced.
         """
-        entry = self._find(attempt_id)
-        if entry is None or entry.get("worker_done") is True:
-            return False
-        entry["worker_done"] = True
-        if clean_cancel:
-            entry["clean_worker_cancel"] = True
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None or entry.get("worker_done") is True:
+                return False
+            entry["worker_done"] = True
+            if clean_cancel:
+                entry["clean_worker_cancel"] = True
+                return True
+            outcome_state = _truncate(outcome, _MAX_FIELD_LEN)
+            if outcome_state in LATE_OUTCOMES and entry.get("late_outcome") not in LATE_OUTCOMES:
+                entry["late_outcome"] = outcome_state
+                if latency_ms is not None:
+                    entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
+                if failure_category:
+                    entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
             return True
-        outcome_state = _truncate(outcome, _MAX_FIELD_LEN)
-        if outcome_state in LATE_OUTCOMES and entry.get("late_outcome") not in LATE_OUTCOMES:
-            entry["late_outcome"] = outcome_state
-            if latency_ms is not None:
-                entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
-            if failure_category:
-                entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
-        return True
 
     def entries(self) -> tuple[dict[str, Any], ...]:
         """Return a privacy-safe copy of the attempt recordings."""
-        return tuple(dict(entry) for entry in self._entries)
+        with self._lock:
+            return tuple(dict(entry) for entry in self._entries)
 
     def state_for(self, attempt_id: str) -> str:
         """Return the current state of one attempt (``""`` when unknown)."""
-        entry = self._find(attempt_id)
-        return str(entry.get("state", "")) if entry else ""
+        with self._lock:
+            entry = self._find(attempt_id)
+            return str(entry.get("state", "")) if entry else ""
 
     def mark_error_kind(self, attempt_id: str, error_kind: str) -> bool:
         """Attach the bounded classified error kind to one failed attempt."""
-        entry = self._find(attempt_id)
-        if entry is None:
-            return False
-        entry["error_kind"] = str(error_kind or "")[:64]
-        return True
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None:
+                return False
+            entry["error_kind"] = str(error_kind or "")[:64]
+            return True
 
-    def newest_attempt(self, causality_id: str | None = None) -> dict[str, Any] | None:
-        """Return the newest attempt record, optionally for one causality id."""
+    def _newest_attempt_unlocked(self, causality_id: str | None = None) -> dict[str, Any] | None:
         wanted = _truncate(causality_id, _MAX_CAUSALITY_LEN) if causality_id else ""
         for entry in reversed(self._entries):
             if wanted and str(entry.get("causality_id", "")) != wanted:
                 continue
             return dict(entry)
         return None
+
+    def newest_attempt(self, causality_id: str | None = None) -> dict[str, Any] | None:
+        """Return the newest attempt record, optionally for one causality id."""
+        with self._lock:
+            return self._newest_attempt_unlocked(causality_id)
 
     def newest_terminal_state(self, causality_id: str | None = None) -> str:
         """Return the newest attempt's state (``none`` when nothing recorded).
@@ -239,7 +287,8 @@ class AttemptLedger:
         ``attempt-start`` exists without a terminal record is genuinely
         still running inside a worker thread.
         """
-        entry = self.newest_attempt(causality_id)
+        with self._lock:
+            entry = self._newest_attempt_unlocked(causality_id)
         if entry is None:
             return "none"
         return str(entry.get("state", IN_FLIGHT_STATE))
@@ -254,31 +303,31 @@ class AttemptLedger:
         with a recorded late outcome. ``in-flight`` and unknown attempts
         are never proven quenched.
         """
-        entry = self.newest_attempt(causality_id)
-        if entry is None:
+        with self._lock:
+            entry = self._newest_attempt_unlocked(causality_id)
+            if entry is None:
+                return False
+            state = str(entry.get("state", IN_FLIGHT_STATE))
+            if state in QUIESCENCE_STATES:
+                return True
+            if state == "cancelled":
+                return entry.get("worker_done") is True
             return False
-        state = str(entry.get("state", IN_FLIGHT_STATE))
-        if state in QUIESCENCE_STATES:
-            return True
-        if state == "cancelled":
-            return entry.get("worker_done") is True
-        return False
 
     def has_unterminated(self, causality_id: str | None = None) -> bool:
         """Whether any attempt (or the newest one) still lacks a terminal state."""
         wanted = _truncate(causality_id, _MAX_CAUSALITY_LEN) if causality_id else ""
-        for entry in reversed(self._entries):
-            if wanted and str(entry.get("causality_id", "")) != wanted:
-                continue
-            return str(entry.get("state", IN_FLIGHT_STATE)) == IN_FLIGHT_STATE
-        return False
+        with self._lock:
+            for entry in reversed(self._entries):
+                if wanted and str(entry.get("causality_id", "")) != wanted:
+                    continue
+                return str(entry.get("state", IN_FLIGHT_STATE)) == IN_FLIGHT_STATE
+            return False
 
     def in_flight_count(self) -> int:
         """Count attempts that have not reached a terminal state yet."""
-        return sum(1 for entry in self._entries if entry.get("state") == IN_FLIGHT_STATE)
-
-
-LATE_OUTCOMES: tuple[str, ...] = TERMINAL_ATTEMPT_STATES
+        with self._lock:
+            return sum(1 for entry in self._entries if entry.get("state") == IN_FLIGHT_STATE)
 
 
 __all__ = [

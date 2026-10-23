@@ -306,21 +306,13 @@ class HttpOpenCodeClient(OpenCodeClient):
             self._attempts.mark_worker_done(
                 attempt_id, outcome="failed", latency_ms=elapsed_ms, failure_category=failure
             )
-            if self._attempts.state_for(attempt_id) == "cancelled":
-                self._attempts.finish(
-                    attempt_id,
-                    state="failed",
-                    latency_ms=elapsed_ms,
-                    failure_category=failure,
-                    late=True,
-                )
+            self._attempts.record_late_outcome_if_cancelled(
+                attempt_id, "failed", elapsed_ms, failure
+            )
             raise
         elapse_net_ms = round(max(0.0, (time.perf_counter() - started_perf) * 1000.0), 1)
         self._attempts.mark_worker_done(attempt_id, outcome="completed", latency_ms=elapse_net_ms)
-        if self._attempts.state_for(attempt_id) == "cancelled":
-            self._attempts.finish(
-                attempt_id, state="completed", latency_ms=elapse_net_ms, late=True
-            )
+        self._attempts.record_late_outcome_if_cancelled(attempt_id, "completed", elapse_net_ms, "")
         return result
 
     @staticmethod
