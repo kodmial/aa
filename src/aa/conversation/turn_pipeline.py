@@ -2341,11 +2341,19 @@ async def run_v2_answer_turn(
                 "end-to-end budget spent before conversational reply",
                 telemetry=dict(telemetry),
             )
+        # kodmial/aa#448: the fast conversational branch is the only
+        # ``generate_dialogue_reply`` call that historically dropped the
+        # telemetry sink, so the typed ``answer_failure_cause`` recorded
+        # for an empty candidate / provider exception / local guard was
+        # lost and the turn surfaced as a generic
+        # ``conversational-generation-failed``. Every dialogue-generation
+        # call must carry the same telemetry carrier.
         _fast_dialogue = await generate_dialogue_reply(
             user_message=user_message,
             summary=summary,
             recent=list(recent or []),
             answer_model=answer_model,
+            telemetry=telemetry,
         )
         if _fast_dialogue is None:
             telemetry["answer_outcome"] = "conversational-generation-failed"

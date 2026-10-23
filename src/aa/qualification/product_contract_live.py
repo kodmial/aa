@@ -33,6 +33,7 @@ import re
 import resource
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1692,6 +1693,12 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
 
 LIVE_TEXT_LATENCY_BUDGET_S = 120.0
 
+# kodmial/aa#448: an in-flight attempt that stayed un-snapshotted past the
+# 110-second horizon of the stall-snapshot observer (SNAPSHOT_DELAYS_S)
+# plus one observer scan margin is an explicit attempt-observer evidence
+# failure, never a silent diagnostic pass.
+SNAPSHOT_DELAY_EVIDENCE_S = 115.0
+
 # kodmial/aa#436: closed product-outcome vocabulary that fails reliability
 # accounting (synced with gate_latency so both lanes classify identically).
 try:
@@ -1825,7 +1832,7 @@ def _is_direct_meta_reply(
     return False
 
 
-def _snapshot_product_failure_reason(snapshot: dict[str, Any] | None) -> str:
+def _snapshot_product_failure_reason(snapshot: Mapping[str, Any] | None) -> str:
     """Bounded typed failure reason from one stage snapshot (no guessing)."""
     from aa.conversation.answer_causality import failure_reason_from_telemetry
 
@@ -1833,6 +1840,21 @@ def _snapshot_product_failure_reason(snapshot: dict[str, Any] | None) -> str:
         return failure_reason_from_telemetry(snapshot or {})
     except Exception:
         return ""
+
+
+def _completion_cause_suffix(snapshot: Mapping[str, Any], product_outcome: str) -> str:
+    """Scenario stdout suffix carrying the FIRST typed cause (kodmial/aa#448).
+
+    A delivered non-success may never print only its terminal outcome: the
+    primary recorded ``answer_failure_cause`` (for example
+    ``generation-empty-candidate``, the provider exception class, a local
+    safety guard or typed verifier unavailability) is the honest
+    attribution. Missing evidence stays the literal ``unknown``. A
+    product-success reply carries no cause by definition.
+    """
+    if str(product_outcome)[:48] == "answer_success":
+        return ""
+    return f" cause={_snapshot_product_failure_reason(snapshot) or 'unknown'}"
 
 
 def delivered_product_accounting(
@@ -2428,6 +2450,233 @@ async def assess_live_helpfulness_with_judge_metrics(
     return combined, metrics
 
 
+# --- Live real-time Gate C diagnostics (kodmial/aa#448) -------------------
+#
+# The Gate C run 39923515643 showed every observable: the bot really ran
+# scenarios, but the owner's stdout carried only timer heartbeats while
+# the stall-snapshot observer was silently disabled. The three wiring
+# defects fixed here are all interface-binding bugs, not missing
+# implementations:
+# 1. ``HttpOpenCodeClient.attempt_audit`` is a @property returning a
+#    tuple; the old wiring gated on ``callable(getattr(...))`` so the
+#    ``StallSnapshotObserver`` was never created.
+# 2. ``LocalOpenCodeRuntime.runtime_state`` is a @property returning a
+#    dict; the old wiring passed that dict as ``process_state_source``
+#    and a later call raised, masking the real process evidence.
+# 3. Both suppliers must therefore be lazy fresh reads that work when
+#    the runtime is restarted, and every accessor mismatch must surface
+#    as a typed ``observer=unavailable`` diagnostic, never a silent pass.
+
+_LIVE_ATTEMPT_MAX_STATE_LEN = 24
+_LIVE_ATTEMPT_FIELD_LIMIT = 64
+
+
+def _opencode_attempt_entries(runtime: object) -> tuple[dict[str, Any], ...]:
+    """Lazy fresh read of the OpenCode client's attempt ledger.
+
+    The real property is re-evaluated on every call, so a restarted
+    runtime supplies its new client automatically. Both interface forms
+    are accepted (property returning a sequence, or a plain callable
+    method). Any read failure or unexpected shape degrades to an empty
+    ledger — observation must never break the live lane — while the
+    never-created case is reported separately as a typed diagnostic.
+    """
+    try:
+        client = getattr(runtime, "client", None)
+        accessor = getattr(client, "attempt_audit", None)
+        result = accessor() if callable(accessor) else accessor
+    except Exception:
+        return ()
+    if isinstance(result, dict):
+        return (dict(result),)
+    if isinstance(result, (list, tuple)):
+        return tuple(dict(item) for item in result if isinstance(item, dict))
+    return ()
+
+
+def _opencode_process_state(runtime: object) -> dict[str, Any]:
+    """Lazy fresh read of the runtime's bounded privacy-safe process state.
+
+    Mirrors :class:`aa.opencode.observer.StallSnapshotObserver._process_state`
+    key-bounding while never interpreting the observed dict as a function.
+    Failures degrade to an explicit unavailable marker so uncertainty stays
+    honest instead of fabricating process liveness.
+    """
+    try:
+        accessor = getattr(runtime, "runtime_state", None)
+        payload = accessor() if callable(accessor) else accessor
+    except Exception:
+        return {"runtime_state_error": "unavailable"}
+    if not isinstance(payload, Mapping):
+        return {"runtime_state_error": "unavailable"}
+    bounded: dict[str, Any] = {}
+    for key in ("owned_by_runtime", "alive", "exit_code", "spawned", "started"):
+        if key in payload:
+            bounded[key] = payload[key]
+    return bounded
+
+
+def _live_attempt_snapshot_fields(
+    app: Any,
+    *,
+    causality_id: str = "",
+    last_active_stage: str = "",
+    last_real_progress_age_s: float | None = None,
+) -> dict[str, str]:
+    """Bounded privacy-safe machine-readable attempt snapshot fields.
+
+    Consumes only the local attempt ledger and the bounded runtime process
+    descriptors — never prompt, reply, book, HTTP-body, session-id or token
+    text. Absent evidence is explicitly reported as ``unobserved``; the
+    helper never fabricates server/provider progress. The newest attempt
+    for the supplied causality id wins, with the newest ledger attempt as
+    the honest fallback when a specific correlation carries no entry.
+    """
+    fields: dict[str, str] = {"last_active_stage": str(last_active_stage)[:64] or "unobserved"}
+    runtime = getattr(app, "opencode_runtime", None)
+    entries = _opencode_attempt_entries(runtime) if runtime is not None else ()
+    selected: dict[str, Any] | None = None
+    if entries:
+        wanted = str(causality_id or "")[:64]
+        if wanted:
+            matching = [entry for entry in entries if str(entry.get("causality_id", "")) == wanted]
+            selected = matching[-1] if matching else None
+        if selected is None:
+            selected = entries[-1]
+    if selected is None:
+        fields["attempt_state"] = "unobserved"
+        fields["attempt_operation"] = "unobserved"
+    else:
+        state = str(selected.get("state", ""))[:_LIVE_ATTEMPT_MAX_STATE_LEN] or "unobserved"
+        fields["attempt_state"] = state
+        fields["attempt_operation"] = (
+            str(selected.get("operation", ""))[:_LIVE_ATTEMPT_MAX_STATE_LEN] or "unobserved"
+        )
+        started = selected.get("attempt_started_monotonic")
+        if state == "in-flight" and isinstance(started, (int, float)):
+            fields["attempt_elapsed_s"] = f"{max(0.0, time.monotonic() - float(started)):.1f}"
+        else:
+            fields["attempt_elapsed_s"] = "unobserved"
+        worker_done = selected.get("worker_done")
+        fields["worker_done"] = (
+            "true" if worker_done is True else "false" if worker_done is False else "unobserved"
+        )
+        late_outcome = selected.get("late_outcome")
+        if isinstance(late_outcome, str) and late_outcome:
+            fields["late_outcome"] = late_outcome[:_LIVE_ATTEMPT_MAX_STATE_LEN]
+    process = _opencode_process_state(runtime) if runtime is not None else {}
+    if process.get("owned_by_runtime") is True:
+        alive = process.get("alive")
+        if alive is True:
+            fields["process_state"] = "alive"
+        elif alive is False:
+            code = process.get("exit_code")
+            fields["process_state"] = (
+                f"exit_code={code}" if isinstance(code, int) else "process_state=unobserved"
+            )
+        else:
+            fields["process_state"] = "unobserved"
+    else:
+        fields["process_state"] = "unobserved"
+    if last_real_progress_age_s is not None:
+        fields["last_real_progress_age_s"] = f"{max(0.0, float(last_real_progress_age_s)):.1f}"
+    return fields
+
+
+def _format_bounded_live_fields(fields: Mapping[str, str]) -> str:
+    """Render bounded ``key=value`` fields for one stdout diagnostic line."""
+    return " ".join(
+        f"{str(key)[:64]}={str(value)[:_LIVE_ATTEMPT_FIELD_LIMIT]}"
+        for key, value in fields.items()
+        if str(value)[:_LIVE_ATTEMPT_FIELD_LIMIT]
+    )
+
+
+_LIVE_ATTEMPT_EVENT_KEYS: tuple[str, ...] = (
+    "event",
+    "attempt_id",
+    "operation",
+    "state",
+    "causality_id",
+    "stage",
+    "agent",
+    "audit_agent",
+    "model",
+    "worker_done",
+    "clean_worker_cancel",
+    "late_outcome",
+    "error_kind",
+    "failure_category",
+    "delay_s",
+    "attempt_elapsed_s",
+    "snapshot_elapsed_s",
+    "trace_elapsed_s",
+)
+
+
+def _format_bounded_attempt_event(
+    payload: Mapping[str, Any],
+    scenario_by_causality: Mapping[str, int] | None = None,
+) -> str:
+    """Render one bounded privacy-safe OpenCode attempt event line.
+
+    Only allow-listed attempt fields travel to stdout; a causality id
+    resolves to the lane-consistent ``scenario_index`` when known, and is
+    bounded otherwise. No chat id, prompt, answer, book text, session id,
+    token or provider body can appear because the payload itself is the
+    observer's allow-listed projection.
+    """
+    parts: list[str] = []
+    for key in _LIVE_ATTEMPT_EVENT_KEYS:
+        value = payload.get(key)
+        if value is None or (isinstance(value, str) and not value):
+            continue
+        parts.append(f"{key}={str(value)[:_LIVE_ATTEMPT_FIELD_LIMIT]}")
+    if scenario_by_causality is not None:
+        causality = str(payload.get("causality_id", ""))[:64]
+        scenario_index = scenario_by_causality.get(causality)
+        if isinstance(scenario_index, int):
+            parts.append(f"scenario_index={scenario_index}")
+        else:
+            parts.append("scenario_index=unobserved")
+    return " ".join(parts)
+
+
+def _print_live_stage_change(
+    stage_name: str,
+    stage_state: Mapping[str, Any],
+    app: Any,
+) -> None:
+    """Print one bounded privacy-safe stage-transition diagnostic line.
+
+    Stage changes are the real-time proof that the pipeline advanced —
+    they must be visible in the Actions log, not only in the local
+    progress marker file. Fixed-vocabulary stage names plus the consistent
+    ``scenario_index`` and attempt causality only; no user text.
+    """
+    scenario_index = stage_state.get("scenario_index")
+    scenario_total = stage_state.get("scenario_total")
+    fields = _live_attempt_snapshot_fields(
+        app,
+        causality_id=str(stage_state.get("causality_id", "") or ""),
+        last_active_stage=stage_name,
+    )
+    progress_age = stage_state.get("last_monotonic")
+    if isinstance(progress_age, (int, float)):
+        fields["last_real_progress_age_s"] = (
+            f"{max(0.0, time.monotonic() - float(progress_age)):.1f}"
+        )
+    label = ""
+    if isinstance(scenario_index, int) and isinstance(scenario_total, int):
+        label = f" {scenario_index}/{scenario_total}"
+    stage_label = str(stage_name)[:_LIVE_ATTEMPT_FIELD_LIMIT]
+    print(
+        f"Gate C scenario{label or ''} phase=stage stage={stage_label} "
+        f"{_format_bounded_live_fields(fields)}",
+        flush=True,
+    )
+
+
 async def run_live_telegram_evidence_lane(
     repo_root: Path | None = None, run_id: str = "local"
 ) -> LaneResult:
@@ -2677,30 +2926,81 @@ async def run_live_telegram_evidence_lane(
         app = Application(settings, transport=transport)
         await app.start()
 
-        # kodmial/aa#431: independent stall-snapshot sidecar. It reads the
-        # OpenCode client's in-flight attempt ledger from OUTSIDE the
-        # dispatcher and persists 10/25/45/75/110s snapshots plus terminal
-        # traces under live-out/attempt-observer even while the wedged
-        # worker thread is stuck inside a blocking socket read. A process
-        # snapshot (bounded) travels with each store without any prompt,
-        # reply, or session text. Snapshot payloads are input-typed and
-        # never interpreted as provider progress.
+        # kodmial/aa#431 + #448: independent stall-snapshot sidecar. It
+        # reads the OpenCode client's in-flight attempt ledger from
+        # OUTSIDE the dispatcher and persists 10/25/45/75/110s snapshots
+        # plus terminal traces under live-out/attempt-observer even while
+        # the wedged worker thread is stuck inside a blocking socket
+        # read. A process snapshot (bounded) travels with each store
+        # without any prompt, reply, or session text. Snapshot payloads
+        # are input-typed and never interpreted as provider progress.
+        # kodmial/aa#448: the wiring below supplies LAZY FRESH READS —
+        # ``_opencode_attempt_entries``/``_opencode_process_state``
+        # re-read the real ``client.attempt_audit`` property and the
+        # ``runtime.runtime_state`` property on every call, so the
+        # observer works with the actual interface types and follows a
+        # restarted runtime instance instead of holding stale references.
+        # A failed setup is a typed diagnostic (``observer=unavailable
+        # reason=<safe-type>``), never a silent continuation, and must
+        # never break the live flow itself.
         attempt_observer: Any = None
-        try:
-            from aa.opencode.observer import StallSnapshotObserver
+        attempt_observer_reason = ""
+        causality_scenario_index: dict[str, int] = {}
 
-            _audit_client = getattr(app.opencode_runtime, "client", None)
-            _audit_accessor = getattr(_audit_client, "attempt_audit", None)
-            if callable(_audit_accessor):
-                attempt_observer = StallSnapshotObserver(
-                    attempt_source=_audit_accessor,
-                    out_dir=Path("live-out") / "attempt-observer",
-                    process_state_source=getattr(app.opencode_runtime, "runtime_state", None),
-                    register_atexit_flush=True,
-                )
-                await attempt_observer.start()
-        except Exception:
+        def _live_attempt_event_sink(payload: Mapping[str, Any]) -> None:
+            # Real-time bounded stdout evidence for attempt lifecycle
+            # events; the Actions log shows the hung operation while the
+            # job still runs, without waiting for the final artifact.
+            print(
+                "Gate C opencode-attempt "
+                + _format_bounded_attempt_event(
+                    payload,
+                    causality_scenario_index,
+                ),
+                flush=True,
+            )
+
+        try:
+            from aa.opencode.observer import SNAPSHOT_DELAYS_S, StallSnapshotObserver
+
+            attempt_observer = StallSnapshotObserver(
+                attempt_source=lambda: _opencode_attempt_entries(
+                    getattr(app, "opencode_runtime", None)
+                ),
+                out_dir=Path("live-out") / "attempt-observer",
+                process_state_source=lambda: _opencode_process_state(
+                    getattr(app, "opencode_runtime", None)
+                ),
+                event_sink=_live_attempt_event_sink,
+                register_atexit_flush=True,
+            )
+            await attempt_observer.start()
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break the lane
             attempt_observer = None
+            attempt_observer_reason = type(exc).__name__[:64]
+        if attempt_observer is not None:
+            print(
+                "Gate C diagnostics observer=active "
+                f"out=live-out/attempt-observer delays_s={SNAPSHOT_DELAYS_S}",
+                flush=True,
+            )
+            record_live_progress(
+                "observer-start",
+                attempt_observer_status="active",
+                real_progress=False,
+            )
+        else:
+            print(
+                "Gate C diagnostics observer=unavailable "
+                f"reason={attempt_observer_reason or 'unavailable'}",
+                flush=True,
+            )
+            record_live_progress(
+                "observer-start",
+                attempt_observer_status="unavailable",
+                attempt_observer_reason=attempt_observer_reason,
+                real_progress=False,
+            )
 
         # Per-turn causality attribution (kodmial/aa#417): each dispatched
         # turn executes in its own task, so the causality id must be bound
@@ -2736,6 +3036,12 @@ async def run_live_telegram_evidence_lane(
             if stage_progress_state.get("last_stage") != stage_name:
                 stage_progress_state["last_stage"] = stage_name
                 stage_progress_state["stage_changed_at"] = time.monotonic()
+                # kodmial/aa#448: a real stage transition is meaningful
+                # live evidence; the Actions log must show it (with the
+                # bounded attempt snapshot) instead of waiting for the
+                # final artifact. The 20-second waiting heartbeat below
+                # deliberately never triggers this line.
+                _print_live_stage_change(stage_name, stage_progress_state, app)
             record_live_progress(
                 "scenario-stage",
                 active_stage=stage,
@@ -2983,6 +3289,16 @@ async def run_live_telegram_evidence_lane(
                 helpful_for_scenario: bool | None = None
                 prior_prompts = list(prior_by_chat.get(chat_id, []))
                 scenario_causality_id = _lane_uuid.uuid4().hex
+                # kodmial/aa#448: one consistent causality→scenario_index
+                # identity (bounded to the current scenario) so attempt
+                # events and stage transitions resolve to the same
+                # scenario identity in the live log. Never a chat id or
+                # message text.
+                causality_scenario_index.clear()
+                causality_scenario_index[scenario_causality_id] = position
+                stage_progress_state["scenario_index"] = position
+                stage_progress_state["scenario_total"] = len(scenarios)
+                stage_progress_state["causality_id"] = scenario_causality_id
                 causality_by_chat[int(chat_id)] = scenario_causality_id
                 # Release the stall quarantine for this scenario: cleanup for
                 # any prior abandon has completed, so no stale task can
@@ -3020,11 +3336,26 @@ async def run_live_telegram_evidence_lane(
                     await asyncio.sleep(0.02)
                     if time.monotonic() - last_progress_tick >= 20.0:
                         # Liveness-only heartbeat. It never resets the real
-                        # progress/inactivity watchdog.
+                        # progress/inactivity watchdog. kodmial/aa#448: the
+                        # heartbeat line is still a bounded diagnostic
+                        # summary of the attempt/process reality, so a
+                        # waiting line is never only a timer: absent
+                        # evidence stays explicitly ``unobserved``.
+                        heartbeat_attempt_fields = _live_attempt_snapshot_fields(
+                            app,
+                            causality_id=scenario_causality_id,
+                            last_active_stage=str(stage_progress_state.get("last_stage", "")),
+                            last_real_progress_age_s=max(
+                                0.0,
+                                time.monotonic()
+                                - _as_float(stage_progress_state["last_monotonic"]),
+                            ),
+                        )
                         print(
                             f"Gate C scenario {position}/{len(scenarios)} "
                             f"family={family} phase=awaiting-delivery "
-                            f"elapsed_s={round(time.perf_counter() - started)}",
+                            f"elapsed_s={round(time.monotonic() - scenario_started_monotonic)} "
+                            f"{_format_bounded_live_fields(heartbeat_attempt_fields)}",
                             flush=True,
                         )
                         last_progress_tick = time.monotonic()
@@ -3521,7 +3852,16 @@ async def run_live_telegram_evidence_lane(
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} family={family} "
                         f"phase=completed latency_ms={round(elapsed * 1000)} "
-                        f"outcome={str(snapshot.get('answer_outcome', 'none'))[:48]}",
+                        f"outcome={str(snapshot.get('answer_outcome', 'none'))[:48]}"
+                        # kodmial/aa#448: a delivered non-success printing
+                        # its outcome alone lost the FIRST typed cause
+                        # (generation-empty-candidate, provider exception
+                        # class, local safety guard, typed verifier
+                        # unavailability). The primary recorded cause is
+                        # the honest attribution; an empty record is
+                        # printed as the literal ``unknown``, never as a
+                        # fabricated terminal-outcome root cause.
+                        + _completion_cause_suffix(snapshot, _delivered_po),
                         flush=True,
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
@@ -4587,19 +4927,58 @@ async def run_live_telegram_evidence_lane(
                 "max": round(max(values), 1),
             }
 
-    # kodmial/aa#431: privacy-safe per-attempt audit travels with the live
-    # summary, so providers of evidence can enumerate terminal/late/in-flight
-    # attempt states even without the on-disk observer directory.
+    # kodmial/aa#431 + #448: privacy-safe per-attempt audit travels with
+    # the live summary, so providers of evidence can enumerate
+    # terminal/late/in-flight attempt states even without the on-disk
+    # observer directory. The same lazy fresh-read supplier used by the
+    # observer is reused here.
     attempt_audit_entries: list[dict[str, Any]] = []
     try:
         from aa.opencode.observer import attempt_view
 
-        _attempt_audit_source = getattr(app.opencode_runtime.client, "attempt_audit", ())
-        for _entry in _attempt_audit_source:
-            if isinstance(_entry, dict):
-                attempt_audit_entries.append(attempt_view(_entry))
+        for _entry in _opencode_attempt_entries(app.opencode_runtime):
+            attempt_audit_entries.append(attempt_view(_entry))
     except Exception:
         attempt_audit_entries = []
+
+    # kodmial/aa#448: honest attempt-observer diagnostic status. The
+    # observer being merely "active" is not evidence: its persisted
+    # snapshot/trace counts travel with the summary, and an in-flight
+    # attempt that crossed the snapshot-delay horizon without any staged
+    # snapshot is an explicit diagnostic failure, never a quiet pass.
+    attempt_observer_status = "unavailable"
+    attempt_observer_metrics: dict[str, Any] = {
+        "status": "unavailable",
+        "unavailable_reason": attempt_observer_reason,
+    }
+    if attempt_observer is not None:
+        attempt_observer_status = "active"
+        attempt_observer_metrics = {
+            "status": "active",
+            "snapshot_attempt_count": int(getattr(attempt_observer, "snapshot_attempt_count", 0)),
+            "snapshot_file_count": int(getattr(attempt_observer, "snapshot_file_count", 0)),
+            "traced_attempt_count": int(getattr(attempt_observer, "traced_attempt_count", 0)),
+            "snapshot_attempt_ids": list(attempt_observer.snapshot_attempt_ids())[:64],
+        }
+        _check("live-attempt-observer-active", bool(attempt_observer.is_running()))
+    else:
+        _check("live-attempt-observer-active", False)
+    stalled_unobserved_attempts = [
+        entry
+        for entry in attempt_audit_entries
+        if entry.get("state") == "in-flight"
+        and isinstance(entry.get("attempt_started_monotonic"), (int, float))
+        and (
+            time.monotonic() - float(entry["attempt_started_monotonic"])
+            >= SNAPSHOT_DELAY_EVIDENCE_S
+        )
+        and (
+            attempt_observer is None
+            or not attempt_observer.has_snapshot_for(str(entry.get("attempt_id", "")))
+        )
+    ]
+    if attempt_observer is None or stalled_unobserved_attempts:
+        _check("live-attempt-observer-evidence", False)
 
     token_usage_by_agent = _token_usage_by_agent(app.opencode_runtime.client)
     try:
@@ -4671,6 +5050,11 @@ async def run_live_telegram_evidence_lane(
         "qualification_scenario_wait_s": float(scenario_wait_s),
         "qualification_campaign_budget_s": float(live_total_deadline_s()),
         "qualification_scenario_inactivity_s": float(scenario_inactivity_limit_s),
+        # kodmial/aa#448: the honest attempt-observer status travels next
+        # to the attempt audit: unavailable/missing snapshots after a real
+        # stalled attempt from this lane are typed in these fields.
+        "opencode_attempt_observer": attempt_observer_metrics,
+        "opencode_attempt_observer_status": attempt_observer_status,
         "independent_judge_calls": _judge_calls,
         "independent_judge_helpful": _judge_helpful,
         "independent_judge_unavailable": _judge_unavailable,
