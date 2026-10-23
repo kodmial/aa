@@ -360,6 +360,47 @@ jobs:
             echo "restored validated Gate evidence artifacts"
           fi
 
+      - name: Compute derived retrieval cache key
+        # kodmial/aa#463: Gate B reuses the exact verified index provisioning
+        # path from kodmial/aa#461/#462 (same helper, no duplicated logic).
+        # The key is the exact content-addressed encrypted derived bundle
+        # identity shared with the AA runtime and Gate C (schema + RU/EN
+        # canonical SHA + structure + retrieval config + embedding lock +
+        # ABI + OS/arch). No branch, run id, timestamp, hostname, or
+        # irrelevant source SHA enters the key.
+        id: derived-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          echo "derived-dir=$derived_dir" >> "$GITHUB_OUTPUT"
+          payload=$(python scripts/manage_derived_cache.py --mode print-key \
+            --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
+            --cache-dir "$derived_dir")
+          key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_key'])" "$payload")
+          fingerprint=$(python -c "import json,sys; print(json.loads(sys.argv[1])['cache_fingerprint'])" "$payload")
+          actions_key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['actions_key'])" "$payload")
+          echo "$payload"
+          echo "derived-key=$key" >> "$GITHUB_OUTPUT"
+          echo "derived-fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "derived-actions-key=$actions_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted derived retrieval cache (L1)
+        # kodmial/aa#463: this job restores its own encrypted Actions L1
+        # bundle with the exact content key (no restore-keys fallback). The
+        # restore output is NEVER trusted alone: the Gate B bootstrap step
+        # validates the actual restored bytes with
+        # manage_derived_cache.py --mode restore --require-backend e5
+        # (strict age/manifest/hash/backend E5/dim 768/index self-test)
+        # before any reuse.
+        id: restore-derived
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}
+          fail-on-cache-miss: false
+
       - name: Gate A - static/build
         id: gate-a
         shell: bash
@@ -409,6 +450,13 @@ jobs:
         env:
           AA_ALLOW_NETWORK_FETCH: "0"
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          # Issue #462 pattern: only this trusted Gate B L2 restore
+          # invocation sees the repo-scoped ephemeral packages token,
+          # exported through this step's env (never a workflow-level env,
+          # never expanded into logs or summaries). A healthy L1 hit skips
+          # the L2 pull entirely, so the token is never used when L1
+          # succeeds.
+          AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Checkpoint resume (kodmial/aa#342): validated typed checkpoint
@@ -443,7 +491,129 @@ jobs:
           # provision and verify the pinned GigaAM/Silero/presentation assets
           # rather than leaving the voice lane permanently INCOMPLETE.
           python scripts/prefetch_voice_assets.py || gate_b_shell=fail
-          python scripts/build_retrieval_index.py --backend e5 || gate_b_shell=fail
+          # kodmial/aa#463: verified index reuse instead of an unconditional
+          # full-production rebuild. Order L1 -> L2 -> one bounded strict-E5
+          # rebuild, re-exercising the exact shared helper and validation
+          # from kodmial/aa#461/#462 (no duplicated logic, no OCI client
+          # copy). The validated index always lands in the canonical
+          # corpus/generated/retrieval location consumed by the Gate B
+          # pytest/product-contract contract below. A hashing bundle can
+          # never count as a production hit; a failed rebuild marks Gate B
+          # fail (never silently skipped, never hashing-as-production).
+          # The L2 pull writes only into an L2-owned staging directory, so
+          # an L2 failure can never mutate or delete the L1 cache
+          # directory.
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"
+          l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
+          l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"
+          rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"
+          l1_status="miss"
+          if python scripts/manage_derived_cache.py --mode restore \
+              --cache-dir "$derived_dir" \
+              --require-backend e5 \
+              --status-file "$l1_status_file"; then
+            if [[ -f "$l1_status_file" ]]; then
+              l1_status=$(python -c "import json; print(json.load(open('$l1_status_file')).get('status'))")
+            fi
+          else
+            l1_status="failed"
+          fi
+          if [[ "$l1_status" == "hit" ]]; then
+            bootstrap_status="l1-hit"
+          else
+            python scripts/manage_derived_cache.py --mode restore-l2 \
+                --cache-dir "$derived_dir" \
+                --staging-dir "$l2_staging_dir" \
+                --require-backend e5 \
+                --status-file "$l2_status_file" || true
+            if [[ -f "$l2_status_file" ]]; then
+              l2_status=$(python -c "import json; print(json.load(open('$l2_status_file')).get('status'))")
+            else
+              l2_status="failed"
+            fi
+            if [[ "$l2_status" == "hit" ]]; then
+              bootstrap_status="l2-hit"
+            else
+              bootstrap_status="failed"
+              # ``--backend`` selects the deterministic rebuild backend;
+              # ``--require-backend`` is the separate strict-restore guard
+              # (see scripts/manage_derived_cache.py), so both are intended.
+              if python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+                  --cache-dir "$derived_dir" \
+                  --backend e5 --require-backend e5 \
+                  --status-file "$rebuild_status_file"; then
+                bootstrap_status="rebuilt"
+              fi
+            fi
+          fi
+          echo "Gate B index bootstrap: ${bootstrap_status} (l1=${l1_status})."
+          python - "${bootstrap_status}" \
+              "${{ steps.sha.outputs.sha }}" \
+              "$l1_status_file" "$l2_status_file" "$rebuild_status_file" \
+              <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+
+          from pathlib import Path
+
+          status = sys.argv[1]
+          sha = sys.argv[2]
+
+          def load(name):
+              try:
+                  return json.loads(Path(name).read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  return {}
+
+          def plain(value):
+              return "" if value is None else str(value)
+
+          l1 = load(sys.argv[3])
+          l2 = load(sys.argv[4])
+          rebuild = load(sys.argv[5])
+          fingerprint = plain(
+              l1.get("cache_fingerprint")
+              or l2.get("cache_fingerprint")
+              or rebuild.get("cache_fingerprint")
+          )
+          backend = ""
+          try:
+              payload = json.loads(
+                  Path("corpus/generated/retrieval/index.json").read_text(encoding="utf-8")
+              )
+              metadata = payload.get("metadata")
+              if isinstance(metadata, dict):
+                  backend = plain(metadata.get("embedding_backend"))
+          except (OSError, json.JSONDecodeError):
+              backend = ""
+          embeddings_rebuilt = "true" if status == "rebuilt" else "false"
+          rows = [
+              "| Gate B index bootstrap (kodmial/aa#463) | value |",
+              "| --- | --- |",
+              f"| outcome (l1-hit/l2-hit/rebuilt/failed) | **{status}** |",
+              f"| exact main SHA | `{sha}` |",
+              f"| verified backend | `{backend or 'unavailable'}` |",
+              f"| production embeddings rebuilt | {embeddings_rebuilt} |",
+              f"| L1 validated restore duration ms | {plain(l1.get('restore_ms')) or '-'} |",
+              f"| L2 validated restore duration ms | {plain(l2.get('restore_ms')) or '-'} |",
+              f"| strict-E5 rebuild duration ms | {plain(rebuild.get('build_ms')) or '-'} |",
+          ]
+          if fingerprint:
+              rows.append(f"| cache fingerprint | `{fingerprint}` |")
+          reasons = "; ".join(
+              f"{name}-reason={str(item.get('reason'))}"
+              for name, item in (("l1", l1), ("l2", l2), ("rebuild", rebuild))
+              if item.get("reason")
+          )
+          if reasons:
+              rows.append("Detail (non-secret categories only): " + reasons + ".")
+          print("\n".join(rows))
+          PY
+          if [[ "$bootstrap_status" == "failed" ]]; then
+            echo "::error::Gate B index bootstrap failed after L1/L2 attempts (strict E5 build unavailable); refusing silent hashing fallback."
+            gate_b_shell=fail
+          fi
           python -m pytest -q tests/test_p0_3_v2_retrieval.py tests/test_hybrid_retrieval.py \
             tests/test_aa_retrieval_qualification.py tests/test_conversation_runtime.py \
             tests/test_output_envelope.py tests/test_sessions_safety_control.py \
@@ -460,6 +630,36 @@ jobs:
             --emit-gate B --shell-b-status "$gate_b_shell" \
             --shell-b-detail "workflow-gate-b-shell-$gate_b_shell"
 
+      - name: Save encrypted derived retrieval cache
+        # kodmial/aa#463: trusted save only (this workflow never runs on low
+        # trust pull_request events). After a validated L2 hit or the strict
+        # E5 rebuild, the verified canonical index state (already proving
+        # strict age/manifest/hash/backend E5/dim 768/self-test through the
+        # #461/#462 helper) is packaged deterministically and encrypted into
+        # the L1 cache directory so the next run restores verified L1.
+        # An exact-key Actions L1 hit skips the re-save entirely; save
+        # failure is non-fatal (Gate B already ran on the valid index).
+        if: success() && steps.restore-derived.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/manage_derived_cache.py --mode save \
+            --cache-dir "${RUNNER_TEMP:-/tmp}/aa-derived-cache" || true
+
+      - name: Upload encrypted derived retrieval cache
+        if: success() && steps.restore-derived.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          # Exact content-addressed key only; no restore-keys fallback. The
+          # rotation-suffixed L1 key namespaces only the evictable Actions
+          # cache; the internal manifest cache_key stays the base content
+          # digest, so the bundle always self-validates. Only the encrypted
+          # package plus non-secret metadata enters the cache (never
+          # plaintext corpus/index, secrets or session state).
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}
 
       - name: Save exact-SHA A/B evidence for live qualification
         if: always()

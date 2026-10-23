@@ -179,17 +179,26 @@ def test_qualification_trusted_l2_step_exports_scoped_ephemeral_token() -> None:
         "issues: write",
         "packages: read",
     ]
-    # Only the trusted Gate C bootstrap step carries the scoped token.
-    assert text.count("AA_INDEX_PACKAGES_TOKEN") == 1
-    env_index = text.index("AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}")
-    step_index = text.rindex("Bootstrap exact production book/index", 0, env_index)
-    l2_invocation_index = text.index("--mode restore-l2 \\", env_index)
-    assert step_index < env_index < l2_invocation_index
+    # kodmial/aa#462 + kodmial/aa#463: two trusted steps carry the scoped
+    # token, one per L2 pull site — the Gate B qualification bootstrap and
+    # the Gate C live bootstrap. Each export precedes its own
+    # restore-l2 invocation, stays step-scoped, and is never global.
+    assert text.count("AA_INDEX_PACKAGES_TOKEN") == 2
+    first_env = text.index("AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}")
+    second_env = text.index("AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}", first_env + 1)
+    gate_b_index = text.rindex("Gate B - deterministic component integration", 0, first_env)
+    l2_first = text.index("--mode restore-l2 \\", first_env)
+    assert gate_b_index < first_env < l2_first
+    assert first_env < l2_first < second_env
+    gate_c_index = text.rindex("Bootstrap exact production book/index", 0, second_env)
+    l2_second = text.index("--mode restore-l2 \\", second_env)
+    assert gate_c_index < second_env < l2_second
     # Ephemeral github token only: never a PAT and never a global export.
-    line = text[env_index : env_index + 120].splitlines()[0]
-    assert line.strip() == "AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}"
-    assert "TAP_PAT" not in line
-    assert ">> $GITHUB_ENV" not in line
+    for env_index in (first_env, second_env):
+        line = text[env_index : env_index + 120].splitlines()[0]
+        assert line.strip() == "AA_INDEX_PACKAGES_TOKEN: ${{ github.token }}"
+        assert "TAP_PAT" not in line
+        assert ">> $GITHUB_ENV" not in line
 
 
 def test_packages_token_export_scope_every_workflow() -> None:
