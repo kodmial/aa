@@ -2049,6 +2049,9 @@ async def aretrieve_with_semantic_selection(
         "diverse_unique": _diverse_unique,
         "top_child_cap": active.top_child_cap,
         "selected_winners": len(read_child_order),
+        # Issue #295 counts (privacy-safe): genuine needs are the typed
+        # planner emission, independent of the search-query count.
+        "information_need_count": len(set(need_ids_ordered) or set(need_id_order)),
         "retrieval_backend": "rrf-only/1+semantic-selection+coverage-loop",
         "retrieval_loop": "discover/select_for_reading/read_exact/assess_coverage",
         "semantic_selection_model": selection_model is not None,
@@ -2163,6 +2166,7 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "diverse_unique",
         "top_child_cap",
         "selected_winners",
+        "information_need_count",
         "retrieval_backend",
         "retrieval_loop",
         "semantic_selection_model",

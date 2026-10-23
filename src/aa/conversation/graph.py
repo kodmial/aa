@@ -242,6 +242,8 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             elapsed_ms = (_time.perf_counter() - started) * 1000.0
             queries = result.get("search_queries", [])
             count = len(queries) if isinstance(queries, list) else 0
+            needs = result.get("information_needs", [])
+            need_count = len(needs) if isinstance(needs, list) else 0
             mode = str(result.get("planner_mode", "retrieval") or "retrieval")
             if _planner_dag is not None:
                 _planner_dag.finish_op("planner", ok=True, category="planned")
@@ -249,6 +251,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 "v2 planner done",
                 extra={
                     "queries": count,
+                    "needs": need_count,
                     "latency_ms": round(elapsed_ms, 1),
                 },
             )
@@ -256,6 +259,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
             retry = dict(update.get("retry_state", {}) or {})
             retry["planner_latency_ms"] = round(elapsed_ms, 1)
             retry["planner_query_count"] = count
+            retry["planner_need_count"] = need_count
             retry["planner_mode"] = mode
             retry["resolved_intent"] = str(result.get("resolved_intent", "") or "")
             if mode == "conversational":
@@ -297,6 +301,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _fallback = []
+            _f_needs_d: list[dict[str, Any]] = []
             try:
                 _f_cc_obj = _f_cc(state)
                 if _f_cc_obj is None:
@@ -344,6 +349,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_error": str(exc)[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
                     "planner_query_count": len(_fallback),
+                    "planner_need_count": len(_f_needs_d),
                     "planner_outcome": "invalid",
                     "planner_reason": "invalid",
                     "planner_mode": "retrieval",
@@ -395,6 +401,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _error_fallback = []
+            _e_needs_d: list[dict[str, Any]] = []
             try:
                 from aa.conversation.conversation_context import build_resolved_turn as _e_build
                 from aa.conversation.conversation_context import (
@@ -448,6 +455,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                     "planner_error": type(exc).__name__[:120],
                     "planner_latency_ms": round(elapsed_ms, 1),
                     "planner_query_count": len(_error_fallback),
+                    "planner_need_count": len(_e_needs_d),
                     "planner_outcome": outcome,
                     "planner_reason": _error_reason_for(len(_error_fallback), outcome),
                     "planner_mode": "retrieval",

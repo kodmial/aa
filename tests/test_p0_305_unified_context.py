@@ -188,10 +188,14 @@ def test_information_needs_are_typed_with_stable_ids() -> None:
         needs_from_plan,
     )
 
+    # Issue #295: search queries are discovery formulations, never
+    # separate coverage obligations. The compatibility derivation keeps
+    # one conservative need for the whole resolved intent instead of
+    # re-multiplicating query-as-need.
     needs = needs_from_plan("standalone intent", ["запрос один", "запрос два"])
-    assert [item.need_id for item in needs] == ["need-1", "need-2", "need-3"]
+    assert [item.need_id for item in needs] == ["need-1"]
     assert all(item.text.strip() for item in needs)
-    # Stable through replay: same plan order yields same ids.
+    # Stable through replay: same intent yields the same id.
     again = needs_from_plan("standalone intent", ["запрос один", "запрос два"])
     assert [item.need_id for item in again] == [item.need_id for item in needs]
     # Conversational plans carry no needs and never claim fulfillment.
@@ -210,11 +214,7 @@ def test_information_needs_are_typed_with_stable_ids() -> None:
     assert dumped["user_message"] == "привет"
     assert dumped["resolved_intent"] == "standalone intent"
     assert dumped["context_digest"]
-    assert [item["need_id"] for item in dumped["information_needs"]] == [
-        "need-1",
-        "need-2",
-        "need-3",
-    ]
+    assert [item["need_id"] for item in dumped["information_needs"]] == ["need-1"]
 
 
 def test_all_stages_prove_same_digest_and_mismatch_fails_closed() -> None:
