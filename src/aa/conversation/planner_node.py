@@ -360,7 +360,7 @@ PLANNER_TEXT_JSON_SUFFIX = (
     "\n\nReturn ONLY a JSON object with exactly these keys: "
     '{"mode": "conversational"|"retrieval", '
     '"resolved_intent": string, "queries": array of strings, '
-    '"information_needs": array of {"need_id": string, "text": string}}. '
+    '"information_needs": [{"need_id": string, "text": string}]}. '
     'Use {"mode": "conversational", "resolved_intent": "", "queries": [], '
     '"information_needs": []} only for purely conversational turns; a '
     "greeting opener plus a substantive request is retrieval, never "

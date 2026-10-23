@@ -301,6 +301,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _fallback = []
+            _f_needs_d: list[dict[str, Any]] = []
             try:
                 _f_cc_obj = _f_cc(state)
                 if _f_cc_obj is None:
@@ -400,6 +401,7 @@ def make_planner_node(*, planner_model: Runnable[list[BaseMessage], BaseMessage]
                 )
             except Exception:
                 _error_fallback = []
+            _e_needs_d: list[dict[str, Any]] = []
             try:
                 from aa.conversation.conversation_context import build_resolved_turn as _e_build
                 from aa.conversation.conversation_context import (
