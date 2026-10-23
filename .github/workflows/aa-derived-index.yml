@@ -71,6 +71,14 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Bootstrap container Git trust (exact workspace)
+        # kodmial/aa#435: this container job runs `git rev-parse` right
+        # after checkout (provenance validation below); restore trust for
+        # the EXACT workspace in the job's persistent HOME first, since
+        # actions/checkout only writes safe.directory in a temporary HOME.
+        shell: bash
+        run: bash scripts/ensure_container_git_safe_directory.sh
+
       - name: Validate promoted dependency-image provenance
         shell: bash
         run: |
