@@ -97,6 +97,7 @@ class StallSnapshotObserver:
         process_state_source: Callable[[], Mapping[str, Any]] | None = None,
         session_status_probe: Callable[[], Awaitable[Mapping[str, Any]]] | None = None,
         register_atexit_flush: bool = False,
+        event_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be > 0")
@@ -108,6 +109,16 @@ class StallSnapshotObserver:
         self._interval_s = float(interval_s)
         self._process_state_source = process_state_source
         self._session_status_probe = session_status_probe
+        # kodmial/aa#448: optional bounded privacy-safe event consumer.
+        # The sink receives one small mapping per attempt lifecycle event
+        # (attempt-start / attempt-finished / attempt-late-outcome) and
+        # per persisted snapshot/trace. It is a plain callable — never a
+        # network transport — and a failing sink never interrupts
+        # observation itself.
+        self._event_sink = event_sink
+        # Insertion-ordered event dedup state: attempt id -> (state,
+        # late_outcome) last emitted. Eviction always drops the oldest.
+        self._emitted: dict[str, tuple[str, object]] = {}
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._snapshot_attempts: dict[tuple[str, float], str] = {}
@@ -127,13 +138,68 @@ class StallSnapshotObserver:
         """The privacy-safe snapshot persistence directory."""
         return self._out_dir
 
+    # kodmial/aa#448: observable observer state for honest diagnostic
+    # status. Callers (the live Gate C lane) must be able to report that
+    # the observer exists and whether it actually persisted evidence —
+    # silence must never read as SUCCESS.
+
+    @property
+    def snapshot_attempt_count(self) -> int:
+        """Distinct attempts for which at least one snapshot was written."""
+        return len({key[0] for key in self._snapshot_attempts})
+
+    @property
+    def snapshot_file_count(self) -> int:
+        """Number of persisted per-delay snapshot markers."""
+        return sum(1 for _ in self._snapshot_attempts)
+
+    @property
+    def traced_attempt_count(self) -> int:
+        """Number of terminal attempts that persisted their trace."""
+        return len(self._trace_written)
+
+    def snapshot_attempt_ids(self) -> tuple[str, ...]:
+        """Bounded attempt ids that have at least one persisted snapshot."""
+        return tuple(dict.fromkeys(key[0] for key in self._snapshot_attempts))
+
+    def has_snapshot_for(self, attempt_id: str) -> bool:
+        """Whether at least one snapshot was persisted for one attempt."""
+        return any(key[0] == str(attempt_id) for key in self._snapshot_attempts)
+
+    def is_running(self) -> bool:
+        """Whether the observer task is alive (started and not done)."""
+        task = self._task
+        return task is not None and not task.done()
+
+    def _emit_event(self, event: str, entry: Mapping[str, Any], **extra: Any) -> None:
+        """Deliver one bounded privacy-safe attempt event to the sink.
+
+        The payload is the allow-listed attempt projection (the same
+        fields as persisted snapshots) plus the event name; a failing
+        sink never breaks observation. No prompt, reply, or session text
+        can travel here because ``attempt_view`` never exports it.
+        """
+        sink = self._event_sink
+        if sink is None:
+            return
+        payload: dict[str, Any] = {"event": str(event)[:64]}
+        payload.update(_attempt_view(entry))
+        payload.update({str(key)[:64]: extra[key] for key in extra})
+        try:
+            sink(payload)
+        except Exception:
+            return
+
     def _atexit_flush(self) -> None:
         """Interpreter-exit hook: flush the index without loop involvement."""
         self.flush("interpreter-exit", sync=True)
 
     def _snapshot_path(self, attempt_id: str, delay: float) -> Path:
         safe_id = str(attempt_id)[:64].replace("/", "_") or "unknown"
-        return self._out_dir / f"attempt-{safe_id}-snapshot-{int(delay)}s.json"
+        # Non-integer delays (e.g. accelerated tests) must not collapse to
+        # the same filename; integer production delays keep their names.
+        label = f"{delay:g}"
+        return self._out_dir / f"attempt-{safe_id}-snapshot-{label}s.json"
 
     def _trace_path(self, attempt_id: str) -> Path:
         safe_id = str(attempt_id)[:64].replace("/", "_") or "unknown"
@@ -302,6 +368,7 @@ class StallSnapshotObserver:
                 continue
             started = entry.get("attempt_started_monotonic")
             elapsed = max(0.0, now - float(started)) if isinstance(started, (int, float)) else 0.0
+            self._emit_attempt_lifecycle_events(attempt_id, entry, elapsed)
             if entry.get("state") == "in-flight":
                 for delay in self._delays:
                     key = (attempt_id, delay)
@@ -310,6 +377,14 @@ class StallSnapshotObserver:
                     if elapsed >= delay:
                         path = await self.snapshot_once(entry, delay=delay)
                         self._snapshot_attempts[key] = str(path)
+                        # kodmial/aa#448: the persisted snapshot is itself a
+                        # meaningful observable event for live consumers.
+                        self._emit_event(
+                            "stall-snapshot",
+                            entry,
+                            delay_s=delay,
+                            snapshot_elapsed_s=round(elapsed, 1),
+                        )
             elif entry.get("state") in ("completed", "failed", "cancelled", "aborted"):
                 if attempt_id in self._trace_written:
                     continue
@@ -319,7 +394,50 @@ class StallSnapshotObserver:
                     stale = list(self._trace_written)[: len(self._trace_written) - 512]
                     for old_id in stale:
                         del self._trace_written[old_id]
+                self._emit_event(
+                    "attempt-trace",
+                    entry,
+                    trace_elapsed_s=round(elapsed, 1),
+                )
                 _ = path
+
+    def _emit_attempt_lifecycle_events(
+        self, attempt_id: str, entry: Mapping[str, Any], elapsed: float
+    ) -> None:
+        """Emit deduplicated bounded attempt lifecycle events (kodmial/aa#448).
+
+        ``attempt-start`` fires exactly once per in-flight first sight;
+        ``attempt-finished`` once per terminal transition; and
+        ``attempt-late-outcome`` once per newly recorded late outcome.
+        A late outcome is never re-served as a fresh attempt-start, and
+        attempts that were already terminal before the observer first
+        saw them never replay historical events.
+        """
+        state = str(entry.get("state", ""))
+        late_outcome = entry.get("late_outcome")
+        seen = self._emitted.get(attempt_id)
+        if seen is None:
+            if state == "in-flight":
+                self._emit_event("attempt-start", entry, attempt_elapsed_s=round(elapsed, 1))
+        else:
+            seen_state, seen_late = seen
+            if state != seen_state:
+                if state in ("completed", "failed", "cancelled", "aborted"):
+                    self._emit_event("attempt-finished", entry, attempt_elapsed_s=round(elapsed, 1))
+                else:
+                    self._emit_event("attempt-transition", entry)
+            if (
+                late_outcome in ("completed", "failed", "cancelled", "aborted")
+                and late_outcome != seen_late
+            ):
+                self._emit_event("attempt-late-outcome", entry, late_outcome=late_outcome)
+        # Re-assignment refreshes insertion order so eviction below always
+        # drops the oldest observed attempts first.
+        self._emitted[attempt_id] = (state, late_outcome)
+        if len(self._emitted) > 2048:
+            stale = list(self._emitted)[: len(self._emitted) - 1024]
+            for old_id in stale:
+                del self._emitted[old_id]
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
