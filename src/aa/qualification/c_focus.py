@@ -279,6 +279,14 @@ def build_gate_e_diagnostic(
     values: list[float] = []
     censored_count = 0
     served_count = 0
+    product_failure_count = 0
+    delivered_service_error_count = 0
+    try:
+        from aa.qualification.gate_latency import PRODUCT_FAILURE_OUTCOMES
+
+        product_failure_vocab = PRODUCT_FAILURE_OUTCOMES
+    except Exception:  # pragma: no cover - defensive import fallback
+        product_failure_vocab = frozenset({"service_error", "rejected"})
     if isinstance(samples, Sequence):
         for sample in samples:
             if not isinstance(sample, Mapping):
@@ -290,6 +298,14 @@ def build_gate_e_diagnostic(
                 censored_count += 1
             if str(sample.get("outcome", "")) == "served":
                 served_count += 1
+            # kodmial/aa#436: delivered service errors and other product
+            # failures are counted separately from latency-only outcome;
+            # legacy samples (no product fields) stay inconclusive.
+            product_outcome = str(sample.get("product_outcome", ""))
+            if product_outcome in product_failure_vocab:
+                product_failure_count += 1
+            if product_outcome == "service_error":
+                delivered_service_error_count += 1
     diagnostic: dict[str, Any] = {
         "schema_version": SCHEMA_GATE_E_DIAGNOSTIC,
         "mode": "diagnostic-metric-on-c-samples",
@@ -300,6 +316,8 @@ def build_gate_e_diagnostic(
         "latency_sample_count": len(values),
         "served_turn_count": served_count,
         "censored_turn_count": censored_count,
+        "product_failure_turn_count": product_failure_count,
+        "delivered_service_error_count": delivered_service_error_count,
         "latency_boundary": _truncate(
             metrics.get("latency_boundary", "production-update-intake-to-simulated-handoff"), 64
         ),

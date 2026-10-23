@@ -64,6 +64,43 @@ INSUFFICIENT_COMPLETED_TURNS = "insufficient-completed-turns"
 SLO_EXCEEDED = "latency-budget-exceeded"
 RELIABILITY_FAILED = "ordinary-turn-failed"
 
+# kodmial/aa#436: delivery and product success are independent
+# measurements. A delivered service error (``SERVICE_ERROR_REPLY``) is
+# transport delivery success but a product failure and stays in
+# reliability accounting; legacy samples without the new fields are
+# never auto-promoted to product success.
+DELIVERY_DELIVERED = "delivered"
+DELIVERY_FAILED = "failed"
+DELIVERY_NOT_ATTEMPTED = "not_attempted"
+DELIVERY_UNKNOWN = "unknown"
+VALID_DELIVERY_STATUSES = (
+    DELIVERY_DELIVERED,
+    DELIVERY_FAILED,
+    DELIVERY_NOT_ATTEMPTED,
+    DELIVERY_UNKNOWN,
+)
+
+PRODUCT_SUCCESS = "answer_success"
+PRODUCT_SERVICE_ERROR = "service_error"
+PRODUCT_REJECTED = "rejected"
+PRODUCT_TIMEOUT = "timeout"
+PRODUCT_CANCELLED = "cancelled"
+PRODUCT_UNKNOWN = "unknown"
+VALID_PRODUCT_OUTCOMES = (
+    PRODUCT_SUCCESS,
+    PRODUCT_SERVICE_ERROR,
+    PRODUCT_REJECTED,
+    PRODUCT_TIMEOUT,
+    PRODUCT_CANCELLED,
+    PRODUCT_UNKNOWN,
+)
+# Explicit product failure set: unknown (legacy samples without the new
+# fields) stays inconclusive — never auto-success, never an auto
+# reliability failure.
+PRODUCT_FAILURE_OUTCOMES = frozenset(
+    {PRODUCT_SERVICE_ERROR, PRODUCT_REJECTED, PRODUCT_TIMEOUT, PRODUCT_CANCELLED}
+)
+
 EXTERNAL_CONFIRMED = "external_send_confirmed"
 EXTERNAL_UNVERIFIED = "external_send_unverified"
 
@@ -108,6 +145,9 @@ class TurnSample:
     boundary: str = "production-update-intake-to-simulated-handoff"
     receipt_kind: str = "simulated-in-process"
     censored: bool = False
+    delivery_status: str = DELIVERY_UNKNOWN
+    product_outcome: str = PRODUCT_UNKNOWN
+    failure_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,7 +162,20 @@ class TurnSample:
             "boundary": self.boundary,
             "receipt_kind": self.receipt_kind,
             "censored": bool(self.censored),
+            "delivery_status": self.delivery_status,
+            "product_outcome": self.product_outcome,
+            "failure_reason": self.failure_reason,
         }
+
+    @property
+    def product_failure(self) -> bool:
+        """Whether this sample counts as a product-level reliability failure."""
+        return self.product_outcome in PRODUCT_FAILURE_OUTCOMES
+
+    @property
+    def product_success(self) -> bool:
+        """Whether this sample proves a successful substantive answer."""
+        return self.outcome == "served" and self.product_outcome == PRODUCT_SUCCESS
 
     @staticmethod
     def from_dict(payload: Any) -> TurnSample:
@@ -163,6 +216,23 @@ class TurnSample:
         censored = bool(payload.get("censored", outcome in ("timeout", "failed")))
         if outcome in ("timeout", "failed") and not censored:
             censored = True
+        # kodmial/aa#436 delivery/product accounting. Legacy samples
+        # without the new fields degrade to explicit ``unknown`` product
+        # outcomes: never auto ``answer_success``, never an automatic
+        # reliability failure.
+        delivery_status = str(payload.get("delivery_status", "") or "").strip()[:32]
+        if delivery_status not in VALID_DELIVERY_STATUSES:
+            delivery_status = DELIVERY_UNKNOWN
+        product_outcome = str(payload.get("product_outcome", "") or "").strip()[:32]
+        if product_outcome not in VALID_PRODUCT_OUTCOMES:
+            # Legacy payloads only carry the coarse transport ``outcome``.
+            # An absent/invalid product field is never auto-promoted to
+            # ``answer_success`` (kodmial/aa#436); a timeout stays an
+            # explicit product timeout and everything else is inconclusive.
+            product_outcome = PRODUCT_TIMEOUT if outcome == "timeout" else PRODUCT_UNKNOWN
+        failure_reason = str(payload.get("failure_reason", "") or "").strip()[:64]
+        if not failure_reason:
+            failure_reason = str(payload.get("failure_category", "") or "").strip()[:64]
         return TurnSample(
             causality_id=causality_id,
             family=family,
@@ -175,6 +245,9 @@ class TurnSample:
             boundary=boundary,
             receipt_kind=receipt_kind,
             censored=censored,
+            delivery_status=delivery_status,
+            product_outcome=product_outcome,
+            failure_reason=failure_reason,
         )
 
 
@@ -189,6 +262,8 @@ class LatencyReport:
     p50_ms: float
     p95_ms: float
     max_ms: float
+    product_failure_count: int = 0
+    product_success_count: int = 0
     units: str = UNITS_MS
     boundary: str = "production-update-intake-to-simulated-handoff"
     provider_id: str = ""
@@ -208,6 +283,8 @@ class LatencyReport:
             "p50_ms": float(self.p50_ms),
             "p95_ms": float(self.p95_ms),
             "max_ms": float(self.max_ms),
+            "product_failure_count": int(self.product_failure_count),
+            "product_success_count": int(self.product_success_count),
             "units": self.units,
             "boundary": self.boundary,
             "provider_id": self.provider_id,
@@ -343,6 +420,9 @@ def build_c_series_from_live_summary(
                         latency_ms=float(entry.get("latency_ms", 0.0) or 0.0),
                         series=C_SERIES,
                         censored=True,
+                        delivery_status=DELIVERY_UNKNOWN,
+                        product_outcome=PRODUCT_UNKNOWN,
+                        failure_reason="harness-error",
                     )
                 )
                 continue
@@ -396,6 +476,9 @@ def build_c_series_from_live_summary(
                     latency_ms=latency_ms,
                     series=C_SERIES,
                     censored=True,
+                    delivery_status=DELIVERY_NOT_ATTEMPTED,
+                    product_outcome=PRODUCT_TIMEOUT,
+                    failure_reason=str(entry.get("timeout_category", "") or "")[:64],
                 )
             )
     # Lane-level timeout failures without a diagnostics row still count.
@@ -467,6 +550,11 @@ def evaluate_latency_report(
     latencies = [float(sample.latency_ms) for sample in samples]
     served_count = sum(1 for sample in samples if sample.outcome == "served")
     censored_count = sum(1 for sample in samples if sample.censored)
+    # Delivery vs product accounting (kodmial/aa#436): a delivered
+    # service error keeps its latency observation AND fails reliability.
+    # Legacy samples (product unknown) stay inconclusive, never success.
+    product_failures = sum(1 for sample in samples if sample.product_failure)
+    product_successes = sum(1 for sample in samples if sample.product_success)
     p50 = percentile_ms(latencies, 50)
     p95 = percentile_ms(latencies, 95)
     maximum = max(latencies)
@@ -480,6 +568,8 @@ def evaluate_latency_report(
             p50_ms=p50,
             p95_ms=p95,
             max_ms=maximum,
+            product_failure_count=product_failures,
+            product_success_count=product_successes,
             boundary=boundary,
             provider_id=provider_id[:64],
             source_proof_kind=source_proof_kind[:64],
@@ -489,11 +579,16 @@ def evaluate_latency_report(
             slo_evaluated=active.latency_gate_mode == "enforce",
         )
 
-    if censored_count > 0:
+    reliability_failures = censored_count + product_failures
+    if reliability_failures > 0:
+        detail_bits = [f"{censored_count} ordinary turn(s) timed out/failed"]
+        if product_failures:
+            detail_bits.append(f"{product_failures} delivered turn(s) failed the product outcome")
+        detail_bits.append("observed timing counted")
         return _report(
             "FAIL",
             failure_category=RELIABILITY_FAILED,
-            detail=f"{censored_count} ordinary turn(s) timed out/failed; observed timing counted",
+            detail="; ".join(detail_bits),
         )
     ok, detail = evaluate_latency_thresholds(p95, maximum, policy=active)
     if not ok:
@@ -530,6 +625,8 @@ def latency_evidence_checksum(report: LatencyReport, *, sha: str, run_id: str) -
             "p50_ms": report.p50_ms,
             "p95_ms": report.p95_ms,
             "max_ms": report.max_ms,
+            "product_failure_count": report.product_failure_count,
+            "product_success_count": report.product_success_count,
             "units": report.units,
             "boundary": report.boundary,
             "provider_id": report.provider_id,
@@ -619,9 +716,17 @@ __all__ = [
     "LATENCY_EVIDENCE_SCHEMA",
     "INSUFFICIENT_COMPLETED_TURNS",
     "MISSING_LIVE_SAMPLES",
+    "PRODUCT_FAILURE_OUTCOMES",
+    "PRODUCT_SERVICE_ERROR",
+    "PRODUCT_SUCCESS",
     "RELIABILITY_FAILED",
     "SLO_EXCEEDED",
     "UNITS_MS",
+    "VALID_DELIVERY_STATUSES",
+    "VALID_PRODUCT_OUTCOMES",
+    "DELIVERY_DELIVERED",
+    "DELIVERY_FAILED",
+    "DELIVERY_NOT_ATTEMPTED",
     "GateLatencyError",
     "LatencyReport",
     "TurnSample",

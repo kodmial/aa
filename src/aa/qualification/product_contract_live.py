@@ -1692,6 +1692,13 @@ def run_voice_lane(repo_root: Path | None = None) -> LaneResult:
 
 LIVE_TEXT_LATENCY_BUDGET_S = 120.0
 
+# kodmial/aa#436: closed product-outcome vocabulary that fails reliability
+# accounting (synced with gate_latency so both lanes classify identically).
+try:
+    from aa.qualification.gate_latency import PRODUCT_FAILURE_OUTCOMES
+except Exception:  # pragma: no cover - defensive import fallback
+    PRODUCT_FAILURE_OUTCOMES = frozenset({"service_error", "rejected"})
+
 
 def _live_prerequisites() -> tuple[bool, list[str]]:
     """Check real live prerequisites (fail-closed, privacy-safe)."""
@@ -1816,6 +1823,51 @@ def _is_direct_meta_reply(
         return True
     # Without a semantic verdict, fail closed instead of guessing from text.
     return False
+
+
+def _snapshot_product_failure_reason(snapshot: dict[str, Any] | None) -> str:
+    """Bounded typed failure reason from one stage snapshot (no guessing)."""
+    from aa.conversation.answer_causality import failure_reason_from_telemetry
+
+    try:
+        return failure_reason_from_telemetry(snapshot or {})
+    except Exception:
+        return ""
+
+
+def delivered_product_accounting(
+    reply: str,
+    snapshot: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Classify one delivered reply text into (product_outcome, failure_reason).
+
+    Delivery status is decided separately by the harness (a sent text is
+    ``delivered``), so only the product dimension is derived here:
+    the marked service error is a ``service_error`` product failure even
+    when transport delivery succeeded (#436). Typed causes recorded by
+    the pipeline win over generic fallbacks; an refused/unknown verdict
+    stays ``unknown``, never an auto ``answer_success``.
+    """
+    from aa.conversation.failures import is_service_error
+
+    cleaned = (reply or "").strip()
+    if is_service_error(cleaned):
+        reason = _snapshot_product_failure_reason(snapshot) or "service-error-delivered"
+        return "service_error", reason[:64]
+    recorded = ""
+    try:
+        recorded = str((snapshot or {}).get("product_outcome", "") or "").strip()
+    except Exception:
+        recorded = ""
+    if recorded in ("answer_success", "service_error", "rejected"):
+        reason = ""
+        if recorded != "answer_success":
+            reason = (
+                str((snapshot or {}).get("failure_reason", "") or "").strip()
+                or "unknown-product-failure"
+            )[:64]
+        return recorded, reason
+    return "unknown", ""
 
 
 def _is_grounded_substantive_reply(snapshot: dict[str, Any], reply: str) -> bool:
@@ -2414,6 +2466,13 @@ async def run_live_telegram_evidence_lane(
     # Timeout/failed turns are recorded here as bounded-censored samples and
     # never dropped.
     latency_samples: list[dict[str, Any]] = []
+    # Delivery vs product accounting (kodmial/aa#436): counts and outcome
+    # histograms travel with the latency samples so a delivered service
+    # error is never aggregated as a successful answer.
+    delivered_service_error_count = 0
+    product_outcome_counts: dict[str, int] = {}
+    scenarios_started = 0
+    scenarios_interrupted = 0
     collapsed_count = 0
     book_grounded_successes = 0
     book_grounded_expected = 0
@@ -2915,6 +2974,8 @@ async def run_live_telegram_evidence_lane(
                     active_stage="planner",
                     real_progress=True,
                 )
+                scenarios_started += 1
+
                 active_judge_metrics: dict[str, Any] = {}
                 snapshot: dict[str, Any] = {}
                 grounded_for_scenario: bool | None = None
@@ -3018,6 +3079,32 @@ async def run_live_telegram_evidence_lane(
                     timeout_entry.update(stalled_attribution)
                     stall_cleanup: dict[str, Any] = {"skipped": stop_reason or "unknown"}
                     scenario_diagnostics.append(timeout_entry)
+                    # kodmial/aa#436: persist THIS started-and-interrupted
+                    # scenario's failure and latency sample BEFORE the
+                    # potentially pre-emptible bounded cleanup, so a
+                    # campaign-budget interrupt of the recovery never
+                    # erases the evidence (and no later path double counts
+                    # this scenario).
+                    if family in ordinary_families:
+                        latency_samples.append(
+                            {
+                                "causality_id": scenario_causality_id,
+                                "family": family,
+                                "mode": "text",
+                                "outcome": "timeout",
+                                "latency_ms": timeout_elapsed_ms,
+                                "monotonic": True,
+                                "clock": "monotonic-perf_counter",
+                                "series": "c-series-simulated-handoff",
+                                "boundary": ("production-update-intake-to-simulated-handoff"),
+                                "receipt_kind": "simulated-in-process",
+                                "censored": True,
+                                "delivery_status": "not_attempted",
+                                "product_outcome": "timeout",
+                                "failure_reason": str(stop_reason or "unknown")[:64],
+                            }
+                        )
+                    scenarios_interrupted += 1
                     # No orphan work between scenarios (kodmial/aa#417): the
                     # abandoned turn must be stopped, quarantined and, when
                     # non-cooperative, isolated by a bounded runtime restart
@@ -3131,27 +3218,8 @@ async def run_live_telegram_evidence_lane(
                         cleanup=stall_cleanup,
                         real_progress=False,
                     )
-                    # Bounded-censored latency: a timed-out ordinary turn is
-                    # measured evidence (never dropped). Gate E counts it in
-                    # reliability and p50/p95/max. The scenario's own
-                    # causality id links the sample to the staged
-                    # attribution above.
-                    if family in ordinary_families:
-                        latency_samples.append(
-                            {
-                                "causality_id": scenario_causality_id,
-                                "family": family,
-                                "mode": "text",
-                                "outcome": "timeout",
-                                "latency_ms": timeout_elapsed_ms,
-                                "monotonic": True,
-                                "clock": "monotonic-perf_counter",
-                                "series": "c-series-simulated-handoff",
-                                "boundary": ("production-update-intake-to-simulated-handoff"),
-                                "receipt_kind": "simulated-in-process",
-                                "censored": True,
-                            }
-                        )
+                    # Bounded-censored latency for this interrupted ordinary
+                    # scenario was persisted above, before cleanup (#436).
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} "
                         f"family={family} phase=delivery-timeout "
@@ -3204,6 +3272,43 @@ async def run_live_telegram_evidence_lane(
                     )
                 reply = api.sent_texts[-1]
                 replies.append(reply)
+                # Delivery vs product accounting (kodmial/aa#436). Fetch the
+                # turn telemetry snapshot NOW, before semantic checks: a
+                # delivered service error still produced latency evidence,
+                # and its product outcome must be typed, honest and
+                # privacy-safe rather than aggregated as a served success.
+                _account_snapshot: dict[str, Any] = {}
+                try:
+                    _graph = app.graph_runtime
+                    if _graph is not None:
+                        _account_snapshot = _graph.last_telemetry_for_thread(
+                            _graph.thread_id(chat_id)
+                        )
+                except Exception:
+                    _account_snapshot = {}
+                _delivered_po, _delivered_fr = delivered_product_accounting(
+                    reply, _account_snapshot
+                )
+                if family in ordinary_families and latency_samples:
+                    _sample = latency_samples[-1]
+                    if _sample.get("causality_id") == scenario_causality_id:
+                        _sample["delivery_status"] = "delivered"
+                        _sample["product_outcome"] = _delivered_po
+                        if _delivered_fr:
+                            _sample["failure_reason"] = _delivered_fr
+                product_outcome_counts[_delivered_po] = (
+                    product_outcome_counts.get(_delivered_po, 0) + 1
+                )
+                if family in book_grounded_families and _delivered_po == "service_error":
+                    delivered_service_error_count += 1
+                    # Idempotent explicit reliability failure: this check is
+                    # what turns a delivered service error into a FAIL even
+                    # though latency evidence exists for the same turn and
+                    # every other delivery check passes.
+                    _check(
+                        f"live-delivery-product-service-error-{family}-{position}",
+                        False,
+                    )
                 _check(
                     f"live-delivery-{family}-russian-envelope",
                     bool(reply.strip())
@@ -3390,6 +3495,10 @@ async def run_live_telegram_evidence_lane(
                             "retrieval_outcome": str(snapshot.get("retrieval_outcome", ""))[:48],
                             "verifier_outcome": str(snapshot.get("verifier_outcome", ""))[:48],
                             "production_outcome": str(snapshot.get("answer_outcome", ""))[:48],
+                            # kodmial/aa#436: typed delivery/product split.
+                            "delivery_status": "delivered",
+                            "product_outcome": _delivered_po,
+                            "failure_reason": _delivered_fr,
                             "grounded": grounded_for_scenario,
                             "relevant": relevant_for_scenario,
                             "judge_helpful": helpful_for_scenario,
@@ -3434,6 +3543,7 @@ async def run_live_telegram_evidence_lane(
             # plus its own telemetry snapshot: no fallback template and no
             # unrelated cited fact may count as success.
             async def _send_raw_text(chat_id: int, text: str, update_id: int) -> str | None:
+                nonlocal delivered_service_error_count
                 raw_causality_id = _lane_uuid.uuid4().hex
                 causality_by_chat[int(chat_id)] = raw_causality_id
                 before = len(api.sent_texts)
@@ -3492,6 +3602,9 @@ async def run_live_telegram_evidence_lane(
                             "boundary": "production-update-intake-to-simulated-handoff",
                             "receipt_kind": "simulated-in-process",
                             "censored": True,
+                            "delivery_status": "not_attempted",
+                            "product_outcome": "timeout",
+                            "failure_reason": str(raw_stop_reason or "unknown")[:64],
                         }
                     )
                     return None
@@ -3518,6 +3631,31 @@ async def run_live_telegram_evidence_lane(
                         "censored": False,
                     }
                 )
+                # kodmial/aa#436: delivered service errors keep latency
+                # evidence but stay typed product failures, never answer
+                # successes (raw multi-turn lane).
+                raw_reply = api.sent_texts[-1]
+                raw_account_snapshot: dict[str, Any] = {}
+                try:
+                    raw_graph = app.graph_runtime
+                    if raw_graph is not None:
+                        raw_account_snapshot = raw_graph.last_telemetry_for_thread(
+                            raw_graph.thread_id(chat_id)
+                        )
+                except Exception:
+                    raw_account_snapshot = {}
+                raw_po, raw_fr = delivered_product_accounting(raw_reply, raw_account_snapshot)
+                if latency_samples:
+                    _raw_sample = latency_samples[-1]
+                    _raw_sample["delivery_status"] = "delivered"
+                    _raw_sample["product_outcome"] = raw_po
+                    if raw_fr:
+                        _raw_sample["failure_reason"] = raw_fr
+                _raw_causality = str(_raw_sample.get("causality_id", ""))
+                product_outcome_counts[raw_po] = product_outcome_counts.get(raw_po, 0) + 1
+                if raw_po == "service_error":
+                    delivered_service_error_count += 1
+                    _check(f"live-delivery-product-service-error-{_raw_causality}", False)
                 return api.sent_texts[-1]
 
             # Step continuity: the follow-up relies on the prior referent.
@@ -4507,6 +4645,22 @@ async def run_live_telegram_evidence_lane(
         "censored_turn_count": sum(
             1 for item in latency_samples if bool(item.get("censored", False))
         ),
+        # Delivery vs product accounting (kodmial/aa#436): a delivered
+        # service error is counted here as a product failure, never as a
+        # successful answer, even when its latency observation exists.
+        "delivered_service_error_count": delivered_service_error_count,
+        "product_outcome_counts": dict(product_outcome_counts),
+        "delivery_status_counts": {
+            str(status): sum(1 for item in latency_samples if item.get("delivery_status") == status)
+            for status in ("delivered", "failed", "not_attempted", "unknown")
+        },
+        "product_failure_turn_count": sum(
+            1
+            for item in latency_samples
+            if str(item.get("product_outcome", "")) in PRODUCT_FAILURE_OUTCOMES
+        ),
+        "scenarios_started": scenarios_started,
+        "scenarios_interrupted": scenarios_interrupted,
         "latency_clock": "monotonic-perf_counter",
         "latency_series": "c-series-simulated-handoff",
         "latency_boundary": "production-update-intake-to-simulated-handoff",

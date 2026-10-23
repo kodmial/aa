@@ -672,6 +672,34 @@ class GraphTurnRuntime:
         """Return the last privacy-safe stage snapshot for ``thread``."""
         return dict(self._last_telemetry.get(thread, {}))
 
+    def record_delivery_outcome(
+        self,
+        thread: str,
+        *,
+        product_outcome: str,
+        failure_reason: str = "",
+    ) -> None:
+        """Stamp the honest product outcome of one delivered turn.
+
+        Delivery and product success are independent measurements
+        (kodmial/aa#436): the application owns the transport verdict and
+        stamps ``product_outcome`` on this thread's last snapshot so
+        qualification evidence never mistakes a delivered service error
+        for a successful answer. The pipeline's typed failure cause wins
+        over an application-derived reason (the first cause stays
+        authoritative); nothing here carries user or reply text.
+        """
+        try:
+            snapshot = self._last_telemetry.get(thread)
+            if not isinstance(snapshot, dict):
+                return
+            snapshot["product_outcome"] = str(product_outcome or "")[:32]
+            reason = str(failure_reason or "")[:64]
+            if reason and not str(snapshot.get("failure_reason", "") or ""):
+                snapshot["failure_reason"] = reason
+        except Exception:
+            pass
+
     def last_certificate_for_thread(self, thread: str) -> dict[str, Any]:
         """Return the last certified candidate/certificate for ``thread``."""
         return dict(self._last_certificates.get(thread, {}))
