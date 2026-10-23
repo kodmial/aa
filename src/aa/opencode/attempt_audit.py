@@ -117,6 +117,29 @@ class AttemptLedger:
                 return candidate
         return None
 
+    @staticmethod
+    def _write_late_outcome_unlocked(
+        entry: dict[str, Any],
+        state: str,
+        latency_ms: float | None,
+        failure_category: str,
+    ) -> bool:
+        """Write one late outcome idempotently (caller holds ``_lock``).
+
+        The worker side and the loop side can both reach this write. The
+        first terminal verdict wins, and both paths use the exact same
+        field order, so the recorded evidence never depends on which path
+        wins the race.
+        """
+        if entry.get("late_outcome") in LATE_OUTCOMES:
+            return False
+        entry["late_outcome"] = state
+        if latency_ms is not None:
+            entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
+        if failure_category:
+            entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
+        return True
+
     def finish(
         self,
         attempt_id: str,
@@ -140,14 +163,9 @@ class AttemptLedger:
             if entry is None:
                 return False
             if late:
-                if entry.get("late_outcome") in LATE_OUTCOMES:
-                    return False
-                entry["late_outcome"] = normalized
-                if latency_ms is not None:
-                    entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
-                if failure_category:
-                    entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
-                return True
+                return self._write_late_outcome_unlocked(
+                    entry, normalized, latency_ms, failure_category
+                )
             if entry.get("state") != IN_FLIGHT_STATE:
                 # A terminal state already exists; the recorded state stays the
                 # authoritative newest verdict.
@@ -182,14 +200,9 @@ class AttemptLedger:
                 return False
             if entry.get("state") != "cancelled":
                 return False
-            if entry.get("late_outcome") in LATE_OUTCOMES:
-                return False
-            entry["late_outcome"] = normalized
-            if latency_ms is not None:
-                entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
-            if failure_category:
-                entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
-            return True
+            return self._write_late_outcome_unlocked(
+                entry, normalized, latency_ms, failure_category
+            )
 
     def mark_worker_started(self, attempt_id: str) -> bool:
         """Record that the worker thread actually picked up one attempt.
@@ -207,11 +220,49 @@ class AttemptLedger:
             entry["worker_started"] = True
             return True
 
+    def claim_worker_start(self, attempt_id: str) -> bool:
+        """Atomically claim one attempt for the worker thread.
+
+        Returns ``False`` when another claim already started the thread or
+        when a clean cancellation won the race first. In the latter case the
+        worker must return without issuing its blocking request, keeping the
+        ledger's clean-cancel verdict truthful even if the executor runs the
+        queued work item after the wrapped future was cancelled.
+        """
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None:
+                return True
+            if entry.get("worker_started") is True:
+                return False
+            if entry.get("clean_worker_cancel") is True and entry.get("worker_done") is True:
+                return False
+            entry["worker_started"] = True
+            return True
+
     def worker_started(self, attempt_id: str) -> bool:
         """Whether the worker thread began executing one attempt."""
         with self._lock:
             entry = self._find(attempt_id)
             return entry is not None and entry.get("worker_started") is True
+
+    def mark_clean_cancel_if_not_started(self, attempt_id: str) -> bool:
+        """Atomically record a clean cancellation when no worker started.
+
+        The check and the write happen under the ledger lock, so a worker
+        that wins the race first is never misreported as a clean cancel, and
+        a clean-cancel winner prevents a later worker claim from issuing the
+        request.
+        """
+        with self._lock:
+            entry = self._find(attempt_id)
+            if entry is None or entry.get("worker_done") is True:
+                return False
+            if entry.get("worker_started") is True:
+                return False
+            entry["worker_done"] = True
+            entry["clean_worker_cancel"] = True
+            return True
 
     def mark_worker_done(
         self,
@@ -228,7 +279,9 @@ class AttemptLedger:
         cancellation before the thread started (``clean_cancel=True``, no
         orphan thread exists) or a late completion after the awaiting
         coroutine was abandoned. Only such corroboration can prove a
-        ``cancelled`` attempt is quiesced.
+        ``cancelled`` attempt is quiesced. Late-outcome writes are idempotent
+        and share one locked field update with the loop-side cancellation
+        path, so the first terminal verdict wins consistently.
         """
         with self._lock:
             entry = self._find(attempt_id)
@@ -239,12 +292,10 @@ class AttemptLedger:
                 entry["clean_worker_cancel"] = True
                 return True
             outcome_state = _truncate(outcome, _MAX_FIELD_LEN)
-            if outcome_state in LATE_OUTCOMES and entry.get("late_outcome") not in LATE_OUTCOMES:
-                entry["late_outcome"] = outcome_state
-                if latency_ms is not None:
-                    entry["late_latency_ms"] = round(max(0.0, float(latency_ms)), 1)
-                if failure_category:
-                    entry["late_failure_category"] = _truncate(failure_category, _MAX_FIELD_LEN)
+            if outcome_state in LATE_OUTCOMES:
+                self._write_late_outcome_unlocked(
+                    entry, outcome_state, latency_ms, failure_category
+                )
             return True
 
     def entries(self) -> tuple[dict[str, Any], ...]:

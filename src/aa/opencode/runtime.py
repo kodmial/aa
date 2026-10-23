@@ -92,6 +92,8 @@ class RuntimeEventCapture:
             return
         try:
             for raw in iter(pipe.readline, b""):
+                if self._stopped:
+                    break
                 try:
                     line = raw.decode("utf-8", errors="replace").strip()
                 except Exception:

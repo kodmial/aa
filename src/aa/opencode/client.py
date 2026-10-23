@@ -297,7 +297,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         evidence, and the quiescence gate never confuses the asyncio-shim
         cancellation with the thread's actual lifecycle.
         """
-        self._attempts.mark_worker_started(attempt_id)
+        if not self._attempts.claim_worker_start(attempt_id):
+            return None
         try:
             result = self._sync_request(method, path, body, timeout)
         except Exception as exc:
@@ -497,9 +498,10 @@ class HttpOpenCodeClient(OpenCodeClient):
             unproven until the thread itself reports a terminal state.
             """
             try:
-                if done_future.cancelled() and not self._attempts.worker_started(attempt_id):
+                if done_future.cancelled():
                     # Clean cancellation before the thread ran: no orphan.
-                    self._attempts.mark_worker_done(attempt_id, clean_cancel=True)
+                    # The atomic ledger check also blocks a late worker claim.
+                    self._attempts.mark_clean_cancel_if_not_started(attempt_id)
                 return
             except Exception:  # noqa: BLE001 - never crash the loop on evidence
                 logger.info("opencode attempt late outcome recording failed")

@@ -74,9 +74,12 @@ jobs:
       campaign_full: ${{ steps.mode.outputs.campaign_full }}
     steps:
       - name: Checkout workflow and resolver modules
+        # The resolver must come from the workflow's own commit: a
+        # required_sha predating the resolver module must still be able to
+        # resolve a mode here. Downstream jobs still check out required_sha.
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.required_sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
 
       - name: Resolve campaign mode (typed, fail closed)

@@ -190,11 +190,12 @@ def classify_stall_kind(
 
     The decision uses DIRECT evidence only:
 
+    - a confirmed provider-side classified error overrides everything;
+    - if the OpenCode process is dead, the stall is
+      ``opencode-process-dead`` (a terminated worker cannot have a genuine
+      HTTP request in flight);
     - a live ``attempt-start`` row without a terminal state is
       ``http-in-flight`` (the HTTP request is provably still running);
-    - a confirmed provider-side classified error overrides everything;
-    - a proven worker thread without a finished request, when the OpenCode
-      process is gone, is ``opencode-process-dead``;
     - a request that locally finished without any session progress
       (server alive) is ``opencode-server-alive-but-session-unobserved``;
     - a completed request whose graph never advanced is ``graph-stall``
@@ -202,7 +203,9 @@ def classify_stall_kind(
 
     Heartbeats (typing, SSE, health probes) are never passed in as
     ``session_progress_observed``: they are not provider token progress.
-    An honestly unknown combination stays ``unknown``.
+    An unset ``session_progress_observed`` (``None``) is treated exactly
+    like ``False`` on purpose: progress stays unproven unless positively
+    observed. An honestly unknown combination stays ``unknown``.
     """
     report = request_state_from_audit(request_audit, causality_id)
     request_state = str(report.get("request_state", ""))
@@ -213,12 +216,12 @@ def classify_stall_kind(
     )
     if provider_error:
         return STALL_KIND_PROVIDER_ERROR_CONFIRMED
+    if process_alive is False:
+        return STALL_KIND_PROCESS_DEAD
     if request_state == "http-in-flight":
         return STALL_KIND_HTTP_IN_FLIGHT
     if request_state == "none" or request_state == "unconfirmed-in-flight":
         return STALL_KIND_UNKNOWN
-    if process_alive is False:
-        return STALL_KIND_PROCESS_DEAD
     if session_progress_observed is not True:
         return STALL_KIND_SERVER_ALIVE_SESSION_UNOBSERVED
     if request_state == "request-completed":
