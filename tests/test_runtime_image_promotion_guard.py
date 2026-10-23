@@ -188,13 +188,8 @@ def test_promotion_script_declares_and_retains_every_consumer() -> None:
 def test_activation_pr_stages_every_updated_runtime_consumer() -> None:
     release = (WORKFLOWS / "aa-runtime-image.yml").read_text(encoding="utf-8")
     assert release.count("activation_paths=(") == 1
-    staged = {
-        line.strip()
-        for line in release.split("activation_paths=(", 1)[1]
-        .split("\n          )", 1)[0]
-        .splitlines()
-        if line.strip()
-    }
+    block = release.split("activation_paths=(", 1)[1].split("\n          )", 1)[0]
+    staged = {line.strip() for line in block.splitlines() if line.strip()}
     expected = {"docker/aa-runtime.digest", ".github/workflows/aa-runtime.yml"}
     expected.update(f".github/workflows/{name}" for name in EXPECTED_CONSUMERS)
     assert staged == expected
