@@ -23,6 +23,8 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 
+from aa.conversation.answer_causality import attach_answer_failure_cause as attach_failure_cause
+from aa.conversation.answer_causality import terminal_unknown_cause
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.failures import TurnFailed
 from aa.conversation.output_limits import (
@@ -288,6 +290,7 @@ async def generate_dialogue_reply(
     summary: str,
     recent: list[Any],
     answer_model: Any,
+    telemetry: dict[str, Any] | None = None,
 ) -> str | None:
     """Generate one model-composed dialogue reply with no book evidence.
 
@@ -299,11 +302,50 @@ async def generate_dialogue_reply(
     language, leak, quote-budget and outbound-safety gates. Returns
     ``None`` when the model cannot produce a usable candidate (typed
     failure upstream, never a canned substitute).
+
+    Causality contract (kodmial/aa#436): when ``telemetry`` is
+    supplied, every candidate rejection or generation exception
+    attaches its typed privacy-safe cause. Provider 429 and task
+    cancellation always propagate instead of collapsing into ``None``
+    so the runner retire/restart contract stays intact.
     """
+    from aa.conversation.answer_causality import (
+        GUARD_ENVELOPE as _GUARD_ENV,
+    )
+    from aa.conversation.answer_causality import (
+        GUARD_INTERNAL_TERMS as _GUARD_TERMS,
+    )
+    from aa.conversation.answer_causality import (
+        GUARD_LANGUAGE as _GUARD_LANG,
+    )
+    from aa.conversation.answer_causality import (
+        GUARD_OUTBOUND_SAFETY as _GUARD_SAFETY,
+    )
+    from aa.conversation.answer_causality import (
+        GUARD_QUOTE_BUDGET as _GUARD_QUOTE,
+    )
+    from aa.conversation.answer_causality import (
+        AnswerFailureCause as _Cause,
+    )
+    from aa.conversation.answer_causality import attach_answer_failure_cause as _attach
+    from aa.conversation.answer_causality import (
+        cause_for_empty_candidate as _empty_candidate,
+    )
+    from aa.conversation.answer_causality import (
+        cause_from_exception as _cause_from_exc,
+    )
     from aa.conversation.answer_node import generate_draft
+    from aa.opencode.errors import OpenCodeRateLimitError as _ProviderRateLimit
 
     cleaned = " ".join(str(user_message or "").split()).strip()
     if not cleaned or answer_model is None:
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(
+                    "unknown", "generation", "unknown", detail="missing-model-or-request"
+                ),
+            )
         return None
     try:
         candidate = await generate_draft(
@@ -313,18 +355,56 @@ async def generate_dialogue_reply(
             passages=[],
             user_message=cleaned,
         )
-    except Exception:
+    except asyncio.CancelledError:
+        raise
+    except _ProviderRateLimit:
+        # Provider 429 retires the runner (existing retire/restart
+        # contract); it must never become None or a generic generation
+        # failure.
+        raise
+    except Exception as exc:
+        if telemetry is not None:
+            _attach(telemetry, _cause_from_exc(exc, stage="generation"))
         return None
     text = str(candidate or "").strip()
     if not text:
+        if telemetry is not None:
+            _attach(telemetry, _empty_candidate())
         return None
-    if not contains_cyrillic(text) or leaks_internal_terms(text):
+    if not contains_cyrillic(text):
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(_GUARD_LANG, "generation", "local", detail="output-language"),
+            )
+        return None
+    if leaks_internal_terms(text):
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(_GUARD_TERMS, "generation", "local", detail="internal-terms"),
+            )
         return None
     if not envelope_passes(text):
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(_GUARD_ENV, "generation", "local", detail="envelope"),
+            )
         return None
     if aggregate_quote_chars(text) > QUOTE_BUDGET_CHARS:
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(_GUARD_QUOTE, "generation", "local", detail="quote-budget"),
+            )
         return None
     if not certify_outbound_safety(text):
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(_GUARD_SAFETY, "generation", "local", detail="outbound-safety"),
+            )
         return None
     return text
 
@@ -1006,6 +1086,7 @@ async def _verify_draft(
     conversation_context: str = "",
     recent: Sequence[Any] | None = None,
     context_digest: str = "",
+    telemetry: dict[str, Any] | None = None,
 ) -> tuple[list[ResponseUnitDraft], GroundingResult | None, bool]:
     """Split and verify one draft; never raises verification errors.
 
@@ -1013,17 +1094,61 @@ async def _verify_draft(
     verdicts. ``turn_budget_s`` caps this verifier round with the
     remaining end-to-end turn budget; ``None`` keeps the verifier
     default. Provider 429 still propagates.
+
+    Causality contract (kodmial/aa#436): when ``telemetry`` is supplied,
+    every locally-provable rejection (split, language/leak guards,
+    pre-HTTP verifier validation) and every transport/unavailability or
+    negative-verdict result attaches distinct typed causes so
+    ``verifier_outcome=unavailable`` no longer hides *which* boundary
+    failed.
     """
+    from aa.conversation.answer_causality import (
+        AnswerFailureCause as _Cause,
+    )
+    from aa.conversation.answer_causality import (
+        attach_answer_failure_cause as _attach,
+    )
+    from aa.conversation.answer_causality import (
+        cause_for_empty_candidate as _empty_candidate,
+    )
+    from aa.conversation.answer_causality import cause_from_exception as _cause_from_exc
+    from aa.conversation.answer_causality import (
+        verifier_locale_reason_for_message as _locale_message_reason,
+    )
+
+    def _locale(message: str, stage: str = "verification") -> Any:
+        reason = str(_locale_message_reason(message) or "verifier-invalid-schema")
+        return _Cause.bounded(reason, stage, "local", detail="verifier-local")
+
     try:
         units = split_response_units(draft)
     except (ResponseUnitError, ValueError) as exc:
         logger.info("v2 draft split failed", extra={"category": "split-invalid"})
         _ = exc
+        if telemetry is not None:
+            _attach(telemetry, _Cause.bounded("split-invalid", "split", "local"))
         return [], None, False
     if not units:
+        if telemetry is not None:
+            _attach(telemetry, _empty_candidate(stage="split"))
         return [], None, False
-    if not contains_cyrillic(draft) or leaks_internal_terms(draft):
+    if not contains_cyrillic(draft):
         logger.info("v2 draft failed language/leak guard")
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded("guard-language", "verification", "local", detail="draft-language"),
+            )
+        return units, None, False
+    if leaks_internal_terms(draft):
+        logger.info("v2 draft failed language/leak guard")
+        if telemetry is not None:
+            _attach(
+                telemetry,
+                _Cause.bounded(
+                    "guard-internal-terms", "verification", "local", detail="draft-internal-terms"
+                ),
+            )
         return units, None, False
 
     async def _invoke_verifier() -> Any:
@@ -1093,6 +1218,10 @@ async def _verify_draft(
         # failures below never retry here (the model adapter already
         # exhausted primary/fallback).
         logger.info("v2 verification failed closed", extra={"category": "verifier-invalid"})
+        if telemetry is not None:
+            # Locally-provable pre-HTTP rejections stay distinct from
+            # model/parse validation failures (kodmial/aa#436).
+            _attach(telemetry, _locale(str(exc)))
         _ = exc
         return units, None, False
     except Exception as exc:  # provider/transient/timeout after fallback
@@ -1102,12 +1231,39 @@ async def _verify_draft(
             # Provider 429 retires the runner; never collapse to unavailable.
             raise
         logger.info("v2 verifier unavailable", extra={"category": type(exc).__name__})
+        if telemetry is not None:
+            _attach(telemetry, _cause_from_exc(exc, stage="verification"))
         return units, None, False
     if not result.all_required_supported:
+        if telemetry is not None:
+            unavailable_units = len(getattr(result, "unavailable_unit_ids", ()) or ())
+            if unavailable_units > 0 and unavailable_units == len(
+                getattr(result, "units", ()) or ()
+            ):
+                _attach(
+                    telemetry,
+                    _Cause.bounded("verdict-missing", "verification", "verification"),
+                )
+            else:
+                _attach(
+                    telemetry,
+                    _Cause.bounded(
+                        "verifier-incomplete-verdict",
+                        "verification",
+                        "verification",
+                        detail="required-support",
+                    ),
+                )
         return units, result, False
     if any(not verdict.supported for verdict in result.units):
+        if telemetry is not None:
+            _attach(
+                telemetry, _Cause.bounded("verdict-unsupported", "verification", "verification")
+            )
         return units, result, False
     if not bool(getattr(result, "answer_relevant", False)):
+        if telemetry is not None:
+            _attach(telemetry, _Cause.bounded("verdict-irrelevant", "verification", "verification"))
         return units, result, False
     return units, result, True
 
@@ -1205,9 +1361,26 @@ async def run_v2_answer_turn(
 
         validate_book_pack_for_model_use(pack)
     except Exception as exc:
+        from aa.conversation.answer_causality import AnswerFailureCause as _PackCause
         from aa.conversation.failures import TurnFailed as _PackTurnFailed
 
-        raise _PackTurnFailed("evidence-integrity", f"evidence pack invalid: {exc}") from exc
+        _ = exc
+        _pack_telemetry: dict[str, Any] = {
+            "answer_outcome": "failed",
+            "verifier_outcome": "skipped",
+            "failure_category": "evidence-integrity",
+        }
+        attach_failure_cause(
+            _pack_telemetry,
+            _PackCause.bounded(
+                "evidence-integrity-invalid", "evidence-integrity", "local", detail="pre-model"
+            ),
+        )
+        raise _PackTurnFailed(
+            "evidence-integrity",
+            "evidence pack invalid before any model call",
+            telemetry=_pack_telemetry,
+        ) from exc
     # Lexical discovery-hint ordering over the broad Evidence Pack
     # (issue #295 heuristic, #311 provenance, #306 discovery-only):
     # reorder by generic intent relevance without dropping any passage,
@@ -1897,6 +2070,12 @@ async def run_v2_answer_turn(
             )
             _mark_turn_budget_exceeded()
             telemetry["answer_outcome"] = "failed"
+            from aa.conversation.answer_causality import AnswerFailureCause as _BudgetCause
+
+            attach_failure_cause(
+                telemetry,
+                _BudgetCause.bounded("budget-exhausted", "generation", "budget", detail="pre-call"),
+            )
             return None
         attempt_budget = min(float(current_time_policy().answer_draft_attempt_budget_s), remaining)
         try:
@@ -1927,6 +2106,14 @@ async def run_v2_answer_turn(
                 extra={"category": type(exc).__name__},
             )
             telemetry["answer_outcome"] = "failed"
+            from aa.conversation.answer_causality import AnswerFailureCause as _PackCause
+
+            attach_failure_cause(
+                telemetry,
+                _PackCause.bounded(
+                    "evidence-integrity-invalid", "evidence-integrity", "local", detail="pre-model"
+                ),
+            )
             return None
         passages = state_passages_to_prompt(_generation_window(active_pack, wider=wider))
         started = time.perf_counter()
@@ -1986,12 +2173,23 @@ async def run_v2_answer_turn(
             )
             telemetry["answer_rounds"] = int(telemetry.get("answer_rounds", 0)) + 1
             telemetry["answer_outcome"] = "failed"
+            from aa.conversation.answer_causality import AnswerFailureCause as _TimeoutCause
+
+            attach_failure_cause(
+                telemetry,
+                _TimeoutCause.bounded(
+                    "provider-timeout", "generation", "provider", detail="attempt-deadline"
+                ),
+            )
             _dag.provider_timeout("answer")
             _dag.finish_op("answer", ok=False, category="attempt-timeout")
             return None
         except Exception as exc:
             logger.info("v2 answer generation failed", extra={"category": type(exc).__name__})
             telemetry["answer_outcome"] = "failed"
+            from aa.conversation.answer_causality import cause_from_exception as _exc_cause
+
+            attach_failure_cause(telemetry, _exc_cause(exc, stage="generation"))
             _dag.finish_op("answer", ok=False, category=type(exc).__name__)
             return None
 
@@ -2056,6 +2254,7 @@ async def run_v2_answer_turn(
                     conversation_context=_conversation_context,
                     recent=list(recent or []),
                     context_digest=_canonical_digest,
+                    telemetry=telemetry,
                 )
             except Exception as exc:
                 from aa.opencode.errors import OpenCodeRateLimitError as _VerifyRateLimit
@@ -2257,6 +2456,7 @@ async def run_v2_answer_turn(
                 summary=summary,
                 recent=list(recent or []),
                 answer_model=answer_model,
+                telemetry=telemetry,
             )
             if _dialogue is not None:
                 # Conversational delivery contract (kodmial/aa#362): a
@@ -2307,9 +2507,26 @@ async def run_v2_answer_turn(
             return None
         return max(0.0, remaining)
 
+    def _retry_cause_for_outcome(outcome: str) -> Any:
+        """Typed local cause for a skipped verifier round (no guessing)."""
+        from aa.conversation.answer_causality import AnswerFailureCause as _SkipCause
+
+        if "budget" in str(outcome or ""):
+            return _SkipCause.bounded(
+                "verifier-skipped-turn-budget",
+                "verification",
+                "budget",
+                detail="pre-round-slice",
+            )
+        return _SkipCause.bounded("unknown", "verification", "unknown", detail="round-skip")
+
     def _retry_outcome(*, verifier_outcome: str) -> dict[str, Any]:
         """Fail the turn as a typed unsuccessful outcome (never canned text)."""
         telemetry["verifier_outcome"] = verifier_outcome
+        attach_failure_cause(
+            telemetry,
+            _retry_cause_for_outcome(verifier_outcome),
+        )
         if not str(telemetry.get("failure_category", "") or "").strip():
             telemetry["failure_category"] = _FAIL_BUDGET
         _finish_telemetry()
@@ -4293,6 +4510,7 @@ async def run_v2_answer_turn(
             summary=summary,
             recent=list(recent or []),
             answer_model=answer_model,
+            telemetry=telemetry,
         )
         if _dialogue_fallback is None:
             telemetry["answer_outcome"] = "conversational-generation-failed"
@@ -4488,6 +4706,7 @@ async def run_v2_answer_turn(
             summary=summary,
             recent=list(recent or []),
             answer_model=answer_model,
+            telemetry=telemetry,
         )
         if _dialogue_tail is not None:
             # Conversational delivery contract (kodmial/aa#362): the
@@ -4553,6 +4772,14 @@ async def run_v2_answer_turn(
     telemetry["answer_outcome"] = "clarification-unavailable"
     if not str(telemetry.get("failure_category", "") or "").strip():
         telemetry["failure_category"] = _FAIL_REPAIR
+    # Preserve the typed causal chain (kodmial/aa#436): an earlier
+    # specific cause stays authoritative; when no specific cause was
+    # recorded the terminal boundary records an explicit local unknown
+    # instead of inventing one.
+    attach_failure_cause(
+        telemetry,
+        terminal_unknown_cause(telemetry.get("answer_failure_cause"), stage="finalization"),
+    )
     telemetry["adequacy_verdict"] = _ADEQ_FAIL
     telemetry["answers_request"] = False
     telemetry["technically_grounded"] = False

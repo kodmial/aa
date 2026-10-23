@@ -1823,6 +1823,48 @@ class Application:
                 service_error = True
                 is_service = True
         total_ms = (_time.perf_counter() - turn_started) * 1000.0
+        # Product outcome vs delivery (kodmial/aa#436): a delivered
+        # service error already proved transport delivery; it never
+        # counts as a successful substantive answer. The typed stamp on
+        # the stage snapshot keeps both measurements independent and
+        # available to Gate C/E evidence without any user or reply text.
+        from aa.conversation.answer_causality import (
+            PRODUCT_SUCCESS_ANSWER_OUTCOMES as _product_success_outcomes,
+        )
+        from aa.conversation.failures import is_service_error as _is_service_error_text
+
+        _stage_answer_outcome = str(stage.get("answer_outcome", "") or "")
+        _delivered_service = bool(service_error or is_service) or _is_service_error_text(
+            str(fitted or "")
+        )
+        if _delivered_service:
+            _product_outcome = "service_error"
+        elif "answer_outcome" not in stage:
+            # Legacy/delegate paths without an ``answer_outcome`` field are
+            # inconclusive (#436): they stay ``unknown``, never an auto
+            # product success and never an invented rejection.
+            _product_outcome = "unknown"
+        else:
+            _product_outcome = (
+                "answer_success"
+                if _stage_answer_outcome in _product_success_outcomes
+                else "rejected"
+            )
+        if _product_outcome != "answer_success":
+            from aa.conversation.answer_causality import failure_reason_from_telemetry as _reason
+
+            _product_reason = _reason(stage) or "unknown-delivery-product-failure"
+        else:
+            _product_reason = ""
+        try:
+            if self._graph_runtime is not None:
+                self._graph_runtime.record_delivery_outcome(
+                    thread,
+                    product_outcome=_product_outcome,
+                    failure_reason=_product_reason,
+                )
+        except Exception:
+            pass
         # Privacy-safe turn telemetry: stage outcomes come from the graph
         # runtime snapshot (counts/latencies/outcomes only); this log
         # carries no user text, reply text or identifiers.
@@ -1834,6 +1876,8 @@ class Application:
                 "fallback_used": service_error or is_service,
                 "is_clarification": False,
                 "is_service_error": is_service,
+                "product_outcome": _product_outcome,
+                "product_failure_reason": _product_reason,
                 "planner_outcome": str(stage.get("planner_outcome", "unknown")),
                 "retrieval_outcome": str(stage.get("retrieval_outcome", "unknown")),
                 "answer_outcome": str(stage.get("answer_outcome", "unknown")),
