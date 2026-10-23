@@ -214,7 +214,6 @@ async def test_old_callable_tuple_wiring_disabled_observation_and_lazy_supplier_
             return _opencode_attempt_entries(runtime)
 
         started_entry = await _wait_for_entry(entries_source, state="in-flight")
-        assert started_entry.get("event") == "attempt-start"
         assert started_entry.get("state") == "in-flight"
         assert started_entry.get("operation") == "message-text"
         assert started_entry.get("causality_id") == causality

@@ -3354,7 +3354,7 @@ async def run_live_telegram_evidence_lane(
                         print(
                             f"Gate C scenario {position}/{len(scenarios)} "
                             f"family={family} phase=awaiting-delivery "
-                            f"elapsed_s={round(time.perf_counter() - started)} "
+                            f"elapsed_s={round(time.monotonic() - scenario_started_monotonic)} "
                             f"{_format_bounded_live_fields(heartbeat_attempt_fields)}",
                             flush=True,
                         )

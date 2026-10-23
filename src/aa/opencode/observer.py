@@ -184,7 +184,9 @@ class StallSnapshotObserver:
             return
         payload: dict[str, Any] = {"event": str(event)[:64]}
         payload.update(_attempt_view(entry))
-        payload.update({str(key)[:64]: extra[key] for key in extra})
+        payload.update(
+            {str(key)[:64]: value for key, value in extra.items() if isinstance(key, str)}
+        )
         try:
             sink(payload)
         except Exception:
