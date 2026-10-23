@@ -378,7 +378,8 @@ async def generate_dialogue_reply(
                 _Cause.bounded(_GUARD_LANG, "generation", "local", detail="output-language"),
             )
         return None
-    if leaks_internal_terms(text):
+    matched_rule = matched_internal_rule(text)
+    if matched_rule:
         if telemetry is not None:
             _attach(
                 telemetry,
@@ -386,7 +387,7 @@ async def generate_dialogue_reply(
                     _GUARD_TERMS,
                     "generation",
                     "local",
-                    detail=f"rule:{matched_internal_rule(text)}",
+                    detail=f"rule:{matched_rule}",
                 ),
             )
         return None
@@ -590,9 +591,11 @@ _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 # Review follow-up: matching is token-bounded, not an unbounded
 # substring scan, so a rule embedded inside a longer ordinary word (for
 # example "indexing", "providers", "planners") no longer trips the
-# guard. The rule set itself is unchanged and direct leaks still match.
-# Benign standalone uses of the common English terms themselves remain
-# conservatively blocked and are documented as a known limitation.
+# guard. The explicit English plural "embeddings" was added because the
+# token boundary would otherwise skip it; every other historical rule
+# is unchanged and direct leaks still match. Benign standalone uses of
+# the common English terms themselves remain conservatively blocked and
+# are documented as a known limitation.
 _INTERNAL_TERMS = (
     "corpus",
     "retrieval",
@@ -600,6 +603,10 @@ _INTERNAL_TERMS = (
     "evidence",
     "index",
     "embedding",
+    # Latin rules stop at the token boundary, so the regular English
+    # plural is listed explicitly instead of widening the whole family
+    # (which would also block ordinary words such as "providers").
+    "embeddings",
     "planner",
     "provider",
     "qualification",
@@ -1266,7 +1273,8 @@ async def _verify_draft(
                 _Cause.bounded("guard-language", "verification", "local", detail="draft-language"),
             )
         return units, None, False
-    if leaks_internal_terms(draft):
+    matched_rule = matched_internal_rule(draft)
+    if matched_rule:
         logger.info("v2 draft failed language/leak guard")
         if telemetry is not None:
             # Privacy-safe attribution only: the closed rule id and stage
@@ -1277,7 +1285,7 @@ async def _verify_draft(
                     "guard-internal-terms",
                     "verification",
                     "local",
-                    detail=f"rule:{matched_internal_rule(draft)}",
+                    detail=f"rule:{matched_rule}",
                 ),
             )
         return units, None, False
@@ -2646,6 +2654,10 @@ async def run_v2_answer_turn(
             return None
         return max(0.0, remaining)
 
+    def _verifier_slice_ready(verifier_slice: float | None) -> bool:
+        """Whether a verifier slice can serve one call (``None`` = default)."""
+        return verifier_slice is None or verifier_slice >= TURN_VERIFIER_MIN_SLICE_S
+
     def _local_guard_repair_admitted() -> bool:
         """Whether one same-pack repair can afford both of its phases.
 
@@ -2654,11 +2666,12 @@ async def run_v2_answer_turn(
         verifier slice up front. This avoids spending the verifier budget
         on a regeneration that would then be skipped as a doomed
         ``failed`` repair. The actual verifier slice is recomputed after
-        regeneration because the call itself consumes time.
+        regeneration because the call itself consumes time; if it can no
+        longer serve a verifier call, the repair fails closed without
+        attempting a doomed re-verification.
         """
-        verifier_slice = _verifier_round_budget()
-        return _remaining_budget_s() >= TURN_ANSWER_MIN_SLICE_S and (
-            verifier_slice is None or verifier_slice >= TURN_VERIFIER_MIN_SLICE_S
+        return _remaining_budget_s() >= TURN_ANSWER_MIN_SLICE_S and _verifier_slice_ready(
+            _verifier_round_budget()
         )
 
     def _retry_cause_for_outcome(outcome: str) -> Any:
@@ -3112,7 +3125,7 @@ async def run_v2_answer_turn(
                 # verifier slice for the actual call because regeneration
                 # consumed time.
                 _guard_slice = _verifier_round_budget()
-                if _guard_slice is not None and _guard_slice < TURN_VERIFIER_MIN_SLICE_S:
+                if not _verifier_slice_ready(_guard_slice):
                     telemetry["local_guard_repair_status"] = "failed"
                     logger.info(
                         "v2 local-guard repair re-verify skipped for end-to-end budget",

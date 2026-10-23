@@ -67,12 +67,12 @@ schematized for the regression suite.
 
 ## Added rules (post-#450, additive only; nothing removed)
 
-Every addition is pinned by `test_added_rules_each_have_negative_and_positive_case`
-with a direct mixed-case/Cyrillic example, and the A1 corpus keeps the
-near-miss whitelist intact.
+Every addition is pinned by the audit tests with a direct example, and
+the A1 corpus keeps the near-miss whitelist intact.
 
 | Rule (casefold token/phrase) | Negative (allowed) | Positive (blocked) |
 | --- | --- | --- |
+| `embeddings` (explicit English plural of `embedding`) | ordinary `embedding`-free book phrasing | `Dense embeddings store the passages.` |
 | `эмбеддинг` | ordinary `поддержка`/`распорядок` answers | `...и проверяем эмбеддинги` |
 | `риранк` | — | `Риранк по корпусу текстов не дал ответа` |
 | `фаисс` | — | `Фаисс упал` (RU transliteration of `faiss`) |
@@ -95,7 +95,10 @@ historical English rules (`corpus`, `retrieval`, `grounding`,
 `qualification`, `fail_closed`, `fail closed`, `search failure`,
 `structured output`, `json_schema`, `json schema`, `rerank`, `bm25`,
 `faiss`) are unchanged; no rule was removed and direct rule tokens still
-block.
+block. The trailing boundary means Latin plurals are not matched
+morphologically, so `embeddings` is listed explicitly rather than
+widening the family (which would also match ordinary `providers` and
+`planners`).
 
 ## Documented limitations (separate defects; #450 scope deliberately leaves them)
 

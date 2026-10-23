@@ -87,6 +87,7 @@ _GUARD_FORBIDDEN_SAMPLES: tuple[str, ...] = (
     "Модель использует векторную базу из Faiss и Bm-25.",
     "Structured-Output parsing failed, повторите запрос позже.",
     "Диагностика: rerank внутри FAISS упал в выдаче.",
+    "Dense embeddings store the passages.",
     "code=ru-fourth-edition-txt, status unavailable, provider returned 429",
 )
 
@@ -121,6 +122,13 @@ def _pack_entry(passage_id: str = "chapter-3#exp0000", text: str = _SAFE_HELP_3)
         "source_sha256": "s" * 64,
         "corpus_version": "r" * 64,
     }
+
+
+def _unit_count(draft: str) -> int:
+    """Expected per-unit verifier calls for one scripted draft."""
+    from aa.conversation.response_units import split_response_units
+
+    return len(split_response_units(draft))
 
 
 class _ScriptedAnswer:
@@ -388,9 +396,10 @@ async def test_local_guard_rejection_recovered_by_one_same_pack_regeneration(
 
     assert counters == {"planner": 0, "retrieval": 0}
     # Original leaky draft never reached the semantic verifier. The
-    # per-unit concurrent fallback double verifies each response unit of
-    # the regenerated draft (two units -> two unit decisions).
-    assert verifier.calls == 2
+    # per-unit concurrent fallback verifies each response unit of the
+    # regenerated draft, so derive the count from the splitter rather
+    # than pinning today's unit count.
+    assert verifier.calls == _unit_count(_SAFE_HELP_1)
     assert answer.calls == 2
     assert outcome["text"] == _SAFE_HELP_1
     assert not is_service_error(outcome["text"])
@@ -510,7 +519,7 @@ async def test_unsupported_regeneration_fails_closed_without_replan(
         await run_v2_answer_turn(**_base_turn(answer=answer, verifier=verifier))
 
     assert counters == {"planner": 0, "retrieval": 0}
-    assert verifier.calls == 1
+    assert verifier.calls == _unit_count(_SAFE_HELP_2)
     assert exc.value.category == "clarification-unavailable"
     telemetry = dict(exc.value.telemetry)
     assert telemetry["verifier_outcome"] == "unsupported"
@@ -548,8 +557,8 @@ async def test_verifier_outage_during_regeneration_says_unavailable(
 
     assert counters == {"planner": 0, "retrieval": 0}
     # One structured attempt plus the bounded text fallback (which the
-    # double keeps failing) == two calls total.
-    assert verifier.calls == 2
+    # double keeps failing) per response unit.
+    assert verifier.calls == _unit_count(_SAFE_HELP_2) * 2
     assert exc.value.category == "clarification-unavailable"
     telemetry = dict(exc.value.telemetry)
     assert telemetry["verifier_outcome"] == "unavailable"
@@ -592,9 +601,9 @@ async def test_guard_language_rejection_also_gets_same_pack_regen(
     outcome = await run_v2_answer_turn(**_base_turn(answer=answer, verifier=verifier))
 
     assert counters == {"planner": 0, "retrieval": 0}
-    # Per-unit concurrent double: two response units of the regenerated
-    # draft -> two unit-verdict calls.
-    assert verifier.calls == 2
+    # Per-unit concurrent double: each response unit of the regenerated
+    # draft gets one unit verdict call.
+    assert verifier.calls == _unit_count(_SAFE_HELP_1)
     assert outcome["text"] == _SAFE_HELP_1
     telemetry = dict(outcome["telemetry"])
     assert telemetry[TELEMETRY_CAUSE_KEY]["reason"] == GUARD_LANGUAGE
@@ -617,9 +626,9 @@ async def test_normal_served_turn_costs_zero_extra_guard_calls(
 
     assert counters == {"planner": 0, "retrieval": 0}
     assert answer.calls == 1
-    # Per-unit concurrent double: the served draft's two response units
-    # -> two unit-verdict calls (fast path has no extra guard rounds).
-    assert verifier.calls == 2
+    # Per-unit concurrent double: one unit-verdict call per response
+    # unit of the served draft (fast path has no extra guard rounds).
+    assert verifier.calls == _unit_count(_SAFE_HELP_1)
     assert outcome["text"] == _SAFE_HELP_1
     telemetry = dict(outcome["telemetry"])
     assert telemetry["local_guard_initial_rejection"] is False
