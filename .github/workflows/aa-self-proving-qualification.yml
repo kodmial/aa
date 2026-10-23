@@ -718,6 +718,40 @@ jobs:
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
 
+      - name: Compute derived retrieval cache key
+        id: derived-cache-key
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # kodmial/aa#461: Gate C gains the same exact-content L1 Actions
+          # key as the bot runtime and the trusted publisher so a valid L1
+          # hit is reusable before any L2 pull or E5 embedding rebuild.
+          # No branch, run id, timestamp, or hostname enters the key.
+          derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
+          echo "derived-dir=$derived_dir" >> "$GITHUB_OUTPUT"
+          payload=$(python scripts/manage_derived_cache.py --mode print-key \
+            --os "${{ runner.os }}" --arch "${{ runner.arch }}" \
+            --cache-dir "$derived_dir")
+          echo "$payload"
+          actions_key=$(python -c "import json,sys; print(json.loads(sys.argv[1])['actions_key'])" "$payload")
+          echo "derived-actions-key=$actions_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted derived retrieval cache (L1)
+        id: restore-derived
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          # kodmial/aa#461: exact key only, no restore-keys fallback; a
+          # stale or foreign bundle must miss safely and rebuild
+          # deterministically. The restore output is NEVER trusted alone:
+          # the bootstrap step below validates the actual restored bytes
+          # with manage_derived_cache.py --mode restore --require-backend e5.
+          path: ${{ steps.derived-cache-key.outputs.derived-dir }}
+          key: ${{ steps.derived-cache-key.outputs.derived-actions-key }}
+          fail-on-cache-miss: false
+
       - name: Bootstrap exact production book/index for Gate C only
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
@@ -736,46 +770,168 @@ jobs:
           python scripts/build_corpus_structure.py --verify-committed-public
           python scripts/prefetch_public_assets.py
           python scripts/prefetch_voice_assets.py
-          bootstrap_start=$(date +%s)
           derived_dir="${RUNNER_TEMP:-/tmp}/aa-derived-cache"
           # kodmial/aa#444: L1/L2 cache status files live outside the
           # repository checkout (RUNNER_TEMP), exactly like the proven
           # aa-runtime.yml pattern. Relative status paths dirtied the
           # Git checkout with untracked JSON and blocked the product
           # qualification with 'working tree is not clean'.
-          # L2 GHCR artifact first (commit-pinned immutable digest only);
-          # on any miss/rejection fall back deterministically, with only a
-          # proven E5-backend index accepted as a hit (never hashing).
-          l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"
+          # kodmial/aa#461: bootstrap order L1 -> L2 -> rebuild. Validate the
+          # actual restored L1 directory first (never merely the Actions
+          # restore output); only a missing/rejected L1 authorizes the
+          # digest-pinned L2 pull, and only when both fail does the bounded
+          # deterministic strict-E5 rebuild run. The L2 pull uses an
+          # isolated L2-owned staging directory, so an L2 authentication,
+          # transport, digest, decrypt or self-test failure can never
+          # mutate or delete the L1 cache directory.
+          l2_staging_dir="${RUNNER_TEMP:-/tmp}/aa-derived-l2-staging"
           l1_status_file="${RUNNER_TEMP:-/tmp}/derived-l1-status.json"
-          if python scripts/manage_derived_cache.py --mode restore-l2 \
+          l2_status_file="${RUNNER_TEMP:-/tmp}/derived-l2-status.json"
+          rebuild_status_file="${RUNNER_TEMP:-/tmp}/derived-rebuild-status.json"
+          l1_status="miss"
+          if python scripts/manage_derived_cache.py --mode restore \
               --cache-dir "$derived_dir" \
               --require-backend e5 \
-              --status-file "$l2_status_file"; then
-            l2_status=$(python -c "import json; print(json.load(open('$l2_status_file')).get('status'))")
+              --status-file "$l1_status_file"; then
+            if [[ -f "$l1_status_file" ]]; then
+              l1_status=$(python -c "import json; print(json.load(open('$l1_status_file')).get('status'))")
+            fi
           else
-            l2_status="skip"
+            l1_status="failed"
           fi
-          if [[ "$l2_status" == "hit" ]]; then
-            bootstrap_s=$(( $(date +%s) - bootstrap_start ))
-            {
-              echo "| Gate C bootstrap | outcome | seconds |"
-              echo "| --- | --- | --- |"
-              echo "| L2 GHCR restore (strict E5) | hit | $bootstrap_s |"
-            } >> "$GITHUB_STEP_SUMMARY"
+          echo "Gate C L1 validation status: ${l1_status} (non-secret categories only in the summary)."
+          if [[ "$l1_status" == "hit" ]]; then
+            echo "Gate C bootstrap: valid L1 hit (strict E5); L2 and rebuild skipped."
+            python - "l1-hit" "$l1_status_file" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+
+          from pathlib import Path
+
+          status, path = sys.argv[1], sys.argv[2]
+          try:
+              l1 = json.loads(Path(path).read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              l1 = {}
+          fingerprint = str(l1.get("cache_fingerprint", "")) if isinstance(l1, dict) else ""
+          rows = [
+              "| Gate C bootstrap (kodmial/aa#461) | source | outcome | ms |",
+              "| --- | --- | --- | --- |",
+              f"| L1 exact-content Actions restore (validated, strict E5) | l1 "
+              f"| {str(l1.get('status', ''))} | {str(l1.get('restore_ms', '-'))} |",
+              "| L2 digest-pinned GHCR restore (isolated staging, strict E5) | l2 | skipped | - |",
+              "| Bounded deterministic rebuild (strict E5) | rebuild | skipped | - |",
+          ]
+          if fingerprint:
+              rows.append(f"Bootstrap status: **{status}** (fingerprint `{fingerprint}`).")
+          else:
+              rows.append(f"Bootstrap status: **{status}**.")
+          print("\n".join(rows))
+          PY
             exit 0
           fi
-          python scripts/manage_derived_cache.py --mode restore-or-rebuild \
-            --cache-dir "$derived_dir" \
-            --backend e5 --require-backend e5 \
-            --status-file "$l1_status_file"
-          bootstrap_s=$(( $(date +%s) - bootstrap_start ))
-          {
-            echo "| Gate C bootstrap | outcome | seconds |"
-            echo "| --- | --- | --- |"
-            echo "| L2 GHCR restore | ${l2_status} | - |"
-            echo "| L1 restore-or-rebuild (strict E5) | applied | $bootstrap_s |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python scripts/manage_derived_cache.py --mode restore-l2 \
+              --cache-dir "$derived_dir" \
+              --staging-dir "$l2_staging_dir" \
+              --require-backend e5 \
+              --status-file "$l2_status_file" || true
+          if [[ -f "$l2_status_file" ]]; then
+            l2_status=$(python -c "import json; print(json.load(open('$l2_status_file')).get('status'))")
+          else
+            l2_status="failed"
+          fi
+          echo "Gate C L2 restore status: ${l2_status}."
+          if [[ "$l2_status" == "hit" ]]; then
+            python - "l2-hit" "$l2_status_file" "$l1_status_file" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+
+          status, path, l1_path = sys.argv[1:4]
+          def load(name):
+              try:
+                  return json.loads(open(name, encoding="utf-8").read())
+              except (OSError, json.JSONDecodeError):
+                  return {}
+          l2 = load(path)
+          l1 = load(l1_path)
+          fingerprint = str((l2 if l2 else l1).get("cache_fingerprint", ""))
+          rows = [
+              "| Gate C bootstrap (kodmial/aa#461) | source | outcome | ms |",
+              "| --- | --- | --- | --- |",
+              f"| L1 exact-content Actions restore (validated, strict E5) | l1 "
+              f"| {str(l1.get('status', ''))} | {str(l1.get('restore_ms', '-'))} |",
+              "| L2 digest-pinned GHCR restore (isolated staging, strict E5) | l2 "
+              f"| {str(l2.get('status', ''))} | {str(l2.get('restore_ms', '-'))} |",
+              "| Bounded deterministic rebuild (strict E5) | rebuild | skipped | - |",
+          ]
+          rows.append(
+              f"Bootstrap status: **{status}**."
+              + (f" (fingerprint `{fingerprint}`)" if fingerprint else "")
+          )
+          reason = str(l1.get('reason', ''))
+          if reason and reason != "cache-miss":
+              rows.append(f"Bootstrap detail (non-secret categories only): l1-reason={reason}.")
+          print("\n".join(rows))
+          PY
+            exit 0
+          fi
+          if python scripts/manage_derived_cache.py --mode restore-or-rebuild \
+              --cache-dir "$derived_dir" \
+              --backend e5 --require-backend e5 \
+              --status-file "$rebuild_status_file"; then
+            bootstrap_status="rebuilt"
+          else
+            bootstrap_status="failed"
+          fi
+          python - "${bootstrap_status}" "$l1_status_file" \
+              "$l2_status_file" "$rebuild_status_file" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+
+          status = sys.argv[1]
+
+          def load(name):
+              try:
+                  return json.loads(open(name, encoding="utf-8").read())
+              except (OSError, json.JSONDecodeError):
+                  return {}
+
+          l1 = load(sys.argv[2])
+          l2 = load(sys.argv[3])
+          rebuild = load(sys.argv[4])
+          rows = [
+              "| Gate C bootstrap (kodmial/aa#461) | source | outcome | ms |",
+              "| --- | --- | --- | --- |",
+              f"| L1 exact-content Actions restore (validated, strict E5) | l1 "
+              f"| {str(l1.get('status', '') or 'absent')} | {str(l1.get('restore_ms', '-'))} |",
+              f"| L2 digest-pinned GHCR restore (isolated staging, strict E5) | l2 "
+              f"| {str(l2.get('status', '') or 'absent')} | {str(l2.get('restore_ms', '-'))} |",
+              f"| Bounded deterministic rebuild (strict E5) | rebuild "
+              f"| {str(rebuild.get('status', ''))} | {str(rebuild.get('build_ms', '-'))} |",
+          ]
+          rows.append(f"Bootstrap status: **{status}**.")
+          reasons = "; ".join(
+              f"{name}-reason={value}"
+              for name, payload_item in (("l1", l1), ("l2", l2), ("rebuild", rebuild))
+              for value in (str(payload_item.get("reason", "")),)
+              if value
+          )
+          if reasons:
+              rows.append("Bootstrap detail (non-secret categories only): " + reasons + ".")
+          l1_rejected = str(l1.get("reason", "")) != "cache-miss" and bool(l1.get("reason"))
+          if l1_rejected:
+              rows.append(
+                  "- The exact-key L1 content was rejected under its own key; "
+                  "no in-place overwrite is attempted and the immutable existing "
+                  "cache entry is left untouched (rotation via "
+                  "AA_DERIVED_CACHE_ROTATION is an owner action only)."
+              )
+          print("\n".join(rows))
+          PY
+          if [[ "$bootstrap_status" == "failed" ]]; then
+            echo "::error::Gate C bootstrap failed after L1/L2 attempts (strict E5 rebuild unavailable)."
+            exit 1
+          fi
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}

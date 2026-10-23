@@ -52,10 +52,26 @@ is never accepted as a production hit and is rejected with the reason
   `scripts/promote_derived_index.py` (TAP_PAT required; direct main
   writes are refused).
 - Consumers (`aa-runtime.yml`, both `aa-self-proving-qualification.yml`
-  jobs, and the measurement workflow) always attempt
-  `restore-or-rebuild`/`restore-l2` strict E5 first; before any Actions
-  miss is materialized, the fallback stays the deterministic bounded
-  emergency rebuild.
+  jobs, and the measurement workflow) bootstrap in the fixed
+  L1 -> L2 -> rebuild order (issue #461): the actual restored L1
+  directory is validated first with `--mode restore --require-backend
+  e5` (never merely trusted from the Actions-restore output), then —
+  only after a missing/rejected L1 — the digest-pinned L2 artifact is
+  pulled into an isolated L2-owned staging directory, and only when
+  both fail does `restore-or-rebuild --backend e5 --require-backend e5`
+  run the deterministic bounded emergency rebuild. Verified L1/L2 hits
+  skip redundant checks and embeddings; a verified hit emits the typed
+  statuses `l1-hit`/`l2-hit`/`rebuilt`/`failed` (plus non-secret reason
+  categories and per-source timings) into the step summary. L2
+  download, decryption, verification and cleanup only ever touch the
+  staging directory (`--staging-dir`, default `<cache-dir>.l2-staging`
+  outside the checkout): an L2 401/403, transport failure, partial
+  blob, corrupt artifact, bad manifest/backend, decryption or
+  self-test failure can never mutate, overwrite or delete the restored
+  L1 directory. `actions/cache/save` stays exact-key immutable: valid
+  L1 hits skip re-save, and a corrupt L1 entry is never claimed as
+  repaired by overwriting the same key (rotation via
+  `AA_DERIVED_CACHE_ROTATION` is an owner action only).
 - `docker/aa-index.digest` starts as the honest
   "L2 publication pin is still a placeholder" placeholder
   (`sha256:000…0`): `parse_pinned_digest` raises a fail-closed category,
