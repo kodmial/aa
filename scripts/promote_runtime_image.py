@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 DIGEST_FILE = ROOT / "docker" / "aa-runtime.digest"
 RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
@@ -24,6 +26,20 @@ RUNTIME_WORKFLOW = ROOT / ".github" / "workflows" / "aa-runtime.yml"
 QUALIFICATION_WORKFLOW = ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
 PUBLISHER_WORKFLOW = ROOT / ".github" / "workflows" / "aa-derived-index.yml"
 METRICS_WORKFLOW = ROOT / ".github" / "workflows" / "aa-bootstrap-metrics.yml"
+# kodmial/aa#441: the container Git trust regression also runs inside the
+# prepared runtime image; a promotion that skipped it left a stale digest
+# behind and broke the "one promoted source, all consumers equal" rule.
+TRUST_REGRESSION_WORKFLOW = ROOT / ".github" / "workflows" / "aa-container-git-trust-regression.yml"
+# Every AA runtime-image consumer the promotion contract must update and
+# retain (scripts/check_runtime_image_consumers.py enforces the same set
+# against the repository, so a newly added consumer cannot silently fall
+# back to an obsolete digest).
+CONSUMER_WORKFLOWS: tuple[Path, ...] = (
+    QUALIFICATION_WORKFLOW,
+    PUBLISHER_WORKFLOW,
+    METRICS_WORKFLOW,
+    TRUST_REGRESSION_WORKFLOW,
+)
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 IMAGE_RE = re.compile(r"ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}")
 ZERO = "0" * 64
@@ -99,9 +115,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     sibling_errors: list[str] = []
     sibling_updates: list[tuple[Path, str]] = []
-    for sibling in (QUALIFICATION_WORKFLOW, PUBLISHER_WORKFLOW, METRICS_WORKFLOW):
+    for sibling in CONSUMER_WORKFLOWS:
         sibling_text = sibling.read_text(encoding="utf-8")
-        if "container:" not in sibling_text:
+        try:
+            data = yaml.safe_load(sibling_text)
+        except yaml.YAMLError as exc:
+            sibling_errors.append(f"{sibling.name}: invalid YAML: {exc}")
+            continue
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        has_container = isinstance(jobs, dict) and any(
+            isinstance(job, dict) and "container" in job for job in jobs.values()
+        )
+        if not has_container:
             sibling_errors.append(f"{sibling.name} does not use the prepared runtime container")
             continue
         sibling_updates.append((sibling, IMAGE_RE.sub(image_ref, sibling_text)))
@@ -124,9 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     DIGEST_FILE.write_text(image_ref + "\n", encoding="utf-8")
     RUNTIME_WORKFLOW.write_text(new_workflow, encoding="utf-8")
     print(
-        "activation files updated (runtime + qualification + derived-index "
-        "publisher + bootstrap metrics); open a PR, run CI/review and merge "
-        "before /run"
+        "activation files updated (runtime + qualification x2 + derived-index "
+        "publisher + bootstrap metrics + container Git trust regression); "
+        "open a PR, run CI/review and merge before /run"
     )
     return 0
 

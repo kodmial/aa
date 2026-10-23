@@ -169,7 +169,7 @@ jobs:
     # every other AA job kind; dev tooling (ruff/mypy/pytest) and the pinned
     # OpenCode CLI are baked in, so no per-job reinstall.
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -238,10 +238,18 @@ jobs:
         # Issue #429: the image already carries the exact pinned dev toolchain
         # (ruff/mypy/pytest/spacy RU model) and the pinned OpenCode CLI; the
         # app source is installed without resolution. Pin drift fails closed.
+        # kodmial/aa#441: run 39884474265 proved a green static
+        # `--pins-only` result does NOT validate the selected container
+        # (the stale job image failed the later `pytest --version` with
+        # exit 127). The actual availability of pytest/ruff/mypy, the
+        # spaCy RU model and the pinned OpenCode CLI is therefore verified
+        # against THIS container through the same tool checks the image
+        # canary runs, before any gate may execute.
         shell: bash
         run: |
           set -euo pipefail
           python scripts/verify_runtime_image.py --pins-only
+          python scripts/verify_runtime_image.py --tools-only
           pip install -e . --no-deps
           pin="$(cat docker/opencode.version)"
           actual="$(opencode --version)"
@@ -490,7 +498,7 @@ jobs:
     # Issue #429: shared prepared environment (same promoted digest as the
     # aa-runtime.yml bot job and the Gate A/B job above).
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -548,13 +556,24 @@ jobs:
           echo "exact current main: $checked_sha" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up prepared environment (no toolchain reinstall)
+        id: preflight
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         # Issue #429: same prepared environment/pin checks as Gate A/B.
         # Pin drift fails closed; no per-job toolchain reinstall.
+        # kodmial/aa#441: a green static --pins-only result never validated
+        # the actual selected container (run 39884474265: the stale image
+        # printed pins-pass then failed `pytest: command not found` with
+        # exit 127 before scenario 1). The availability of the pinned
+        # pytest/ruff/mypy binaries, the spaCy RU model and the pinned
+        # OpenCode CLI is therefore verified AGAINST THIS container here;
+        # any missing tool fails this step closed and is classified as an
+        # infrastructure BLOCK by the typed Gate C focus verdict below
+        # (never a forged product PASS or a fabricated C verdict).
         shell: bash
         run: |
           set -euo pipefail
           python scripts/verify_runtime_image.py --pins-only
+          python scripts/verify_runtime_image.py --tools-only
           pin="$(cat docker/opencode.version)"
           actual="$(opencode --version)"
           if [[ "$actual" != "$pin" ]]; then
@@ -624,7 +643,11 @@ jobs:
         # otherwise lose completed-gate checkpoints. Persist them as a
         # run-scoped artifact and restore them here so the next runner
         # resumes from the last completed gate instead of rerunning Gate A.
-        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' && github.run_attempt > 1 }}
+        # kodmial/aa#441: explicit parentheses. Without them the && bound
+        # tighter than ||, so a `full` run with successful A/B attempted a
+        # checkpoint restore on ATTEMPT 1; `github.run_attempt > 1` is now
+        # required for either A/B outcome.
+        if: ${{ (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') && github.run_attempt > 1 }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -634,7 +657,10 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Stage restored gate checkpoints
-        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' && github.run_attempt > 1 }}
+        # kodmial/aa#441: same explicit parenthesization as the restore
+        # above so attempt 1 in either campaign mode never stages previous
+        # attempt artifacts (fresh runs always execute their own gates).
+        if: ${{ (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') && github.run_attempt > 1 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -672,7 +698,18 @@ jobs:
 
 
       - name: Restore trusted exact-run A/B evidence (never recompute on live runner)
-        if: always()
+        # kodmial/aa#441 mode-aware restoration: in gate-c-focus mode the
+        # A/B preflight job is skipped, so the C-only lane must neither
+        # demand nor download the `aa-preflight-evidence` artifact (the
+        # previous `if: always()` made every C-only run spuriously fail
+        # with 'Artifact not found for name: aa-preflight-evidence').
+        # In full mode BOTH A/B outcomes still restore the trusted
+        # exact-run evidence (successful A/B feeds the live gates; failed
+        # A/B evidence feeds the read-only Gate F reduction fail-closed).
+        # Missing or invalid evidence is never a PASS: Gate A/B/C/E/F
+        # single-owner reductors validate SHA/run/checksum binding and
+        # fail closed without any product verdict provenance.
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'failure' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -829,6 +866,13 @@ jobs:
         id: gate-c-focus
         if: ${{ always() && needs.resolve-mode.outputs.campaign_mode == 'gate-c-focus' && hashFiles('self-proving-out/restart-required.json') == '' && hashFiles('self-proving-out/stale-main.json') == '' }}
         shell: bash
+        env:
+          # kodmial/aa#441: honest infrastructure classification. A failed
+          # prepared-environment preflight (e.g. `pytest: command not
+          # found` before any scenario) means Gate C never started; this
+          # verdict must stay an explicit infrastructure BLOCK and never
+          # be reported as a product answer failure or a forged PASS.
+          C_PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -838,10 +882,20 @@ jobs:
           from pathlib import Path
           result_path = Path("self-proving-out/c-focus-result.json")
           if not result_path.is_file():
-              print(
-                  "gate C focus BLOCKED: no typed c-focus-result.json artifact",
-                  file=sys.stderr,
-              )
+              preflight = str(os.environ.get("C_PREFLIGHT_OUTCOME") or "").lower()
+              if preflight == "failure":
+                  print(
+                      "gate C focus BLOCKED: preflight tooling unavailable "
+                      "(infrastructure, not a product verdict); no "
+                      "c-focus-result.json artifact can exist without the "
+                      "prepared environment",
+                      file=sys.stderr,
+                  )
+              else:
+                  print(
+                      "gate C focus BLOCKED: no typed c-focus-result.json artifact",
+                      file=sys.stderr,
+                  )
               sys.exit(2)
           try:
               result = json.loads(result_path.read_text(encoding="utf-8"))

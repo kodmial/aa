@@ -67,7 +67,7 @@ jobs:
     # pins the exact dependency/dev-toolchain layer; docker pull happens on
     # job start and is measured through job timing artifacts below.
     container:
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -82,7 +82,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # kodmial/aa#441: distinguish static --pins-only from actual
+          # binary availability; the metric path must never succeed on a
+          # stale image whose tools are silently missing.
           python scripts/verify_runtime_image.py --pins-only
+          python scripts/verify_runtime_image.py --tools-only
           payload="$(python scripts/manage_derived_cache.py --mode print-l2-plan)"
           echo "$payload"
           pinned="$(echo "$payload" | python -c "import json,sys; p=json.load(sys.stdin); p['l2_pin_problem'] and print(p['l2_pin_problem']) or print('pinned')")"

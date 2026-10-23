@@ -27,10 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ensure_container_git_safe_directory.sh"
 WORKFLOWS = ROOT / ".github" / "workflows"
 BOOTSTRAP_RUN = "bash scripts/ensure_container_git_safe_directory.sh"
-VERIFIED_IMAGE_DIGEST = (
-    "ghcr.io/kodmial/aa-runtime@sha256:"
-    "8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409"
-)
+# kodmial/aa#441: the regression workflow pins the single promoted digest
+# from docker/aa-runtime.digest (the same source the promotion guard
+# enforces); a hardcoded digest here drifted from the promoted image.
+VERIFIED_IMAGE_DIGEST = (ROOT / "docker" / "aa-runtime.digest").read_text(encoding="utf-8").strip()
 
 # Every AA container job with confirmed post-checkout Git use (issue #435):
 # the two qualification jobs plus the other container jobs that read git

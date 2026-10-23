@@ -51,10 +51,17 @@ artifact and must be validated after restore.
    `scripts/promote_runtime_image.py --digest sha256:<digest> --apply`.
    It creates a separate normal PR updating `docker/aa-runtime.digest`,
    `aa-runtime.yml`, both qualification jobs in
-   `aa-self-proving-qualification.yml` and the trusted derived-index
-   publisher `aa-derived-index.yml` together (issue #429: every AA job kind
-   shares the exact same prepared environment — no mixed digests). No
-   direct writes to protected `main`.
+   `aa-self-proving-qualification.yml`, the trusted derived-index
+   publisher `aa-derived-index.yml`, the bootstrap metrics consumer
+   `aa-bootstrap-metrics.yml` and the container Git trust regression
+   `aa-container-git-trust-regression.yml` together (issues #429 and
+   #441: every AA job kind shares the exact same prepared environment —
+   no mixed digests). No direct writes to protected `main`.
+   `scripts/check_runtime_image_consumers.py` (run by the repository test
+   suite) fails the build when any AA workflow pins any other
+   `aa-runtime` digest, when a consumer is missing from the promotion
+   contract, or when the static `--pins-only` and actual
+   binary-availability `--tools-only` preflight pair is dropped.
 5. CI and automated review must pass before that PR merges. Until this
    stage merges, the **old ubuntu-latest AA runtime is unchanged** and
    `/run` continues to work.
@@ -78,10 +85,13 @@ must stay compatible with the selector ranges in
 `scripts/verify_runtime_image.py --pins-only` fail closed on drift.
 
 Both qualification jobs validate the prepared environment before work:
-pins check (`verify_runtime_image.py --pins-only`), the exact
-`docker/opencode.version` OpenCode pin, baked dev tool versions and the
-RU spacy model, then `pip install -e . --no-deps` (exact checked-out
-source only). The reusable `.github/actions/aa-opencode-toolchain` action
+static pins check (`verify_runtime_image.py --pins-only`), the actual
+binary availability check (`verify_runtime_image.py --tools-only`: pinned
+`pytest`/`ruff`/`mypy` console scripts, the spaCy RU model and the exact
+`docker/opencode.version` OpenCode pin — a green `--pins-only` alone never
+validated the selected container; issue #441), then
+`pip install -e . --no-deps` (exact checked-out source only). The reusable
+`.github/actions/aa-opencode-toolchain` action
 remains for the legacy hosted-runner workflows only; `aa-runtime.yml` and
 `aa-self-proving-qualification.yml` consume the pin from the image.
 

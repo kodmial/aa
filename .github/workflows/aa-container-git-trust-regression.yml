@@ -42,7 +42,7 @@ jobs:
       # Current verified/canary-pinned GHCR runtime image (same digest as
       # the qualification jobs at the time of this change); pinned by
       # immutable digest, never a mutable tag.
-      image: ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409
+      image: ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -53,7 +53,7 @@ jobs:
         run: |
           {
             echo "## AA container Git trust regression (issue #435)"
-            echo "- GHCR image: \`ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409\`"
+            echo "- GHCR image: \`ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc\`"
             echo "- workflow sha: \`${{ github.sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image_digest="ghcr.io/kodmial/aa-runtime@sha256:8d49898823e712076fe05bee961faa8812257306357ba0c2946058933740d409"
+          image_digest="ghcr.io/kodmial/aa-runtime@sha256:b295d56aeb47b87171b7e7737345b4b585a7fda2f5dc8caede10ffcc06dabacc"
           workspace="$GITHUB_WORKSPACE"
           toplevel="$(git -C "$workspace" rev-parse --show-toplevel)"
           head_sha="$(git -C "$workspace" rev-parse HEAD)"
