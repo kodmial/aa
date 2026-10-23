@@ -119,7 +119,17 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 class _Challenge:
     realm: str
     service: str
-    scope: str
+    # ``None`` means the challenge omitted the scope entirely; an empty
+    # string means the challenge explicitly asserted an empty scope.
+    scope: str | None
+
+
+def _scope_actions(scope: str) -> frozenset[str]:
+    """Return the action tokens of an OCI scope (or a bare action list)."""
+    _, separator, actions = scope.rpartition(":")
+    if not separator:
+        actions = scope
+    return frozenset(action.strip() for action in actions.split(",") if action.strip())
 
 
 def _parse_challenge(header: str, *, repository: str) -> _Challenge | None:
@@ -143,10 +153,11 @@ def _parse_challenge(header: str, *, repository: str) -> _Challenge | None:
     realm = fields.get("realm", "")
     if not realm:
         return None
+    raw_scope = fields.get("scope")
     return _Challenge(
         realm=realm,
         service=fields.get("service", ""),
-        scope=fields.get("scope", "").replace("$repository", repository),
+        scope=raw_scope.replace("$repository", repository) if raw_scope is not None else None,
     )
 
 
@@ -204,9 +215,11 @@ class _AuthSession:
         # an abstract capability such as ``scope=pull``; only the fully
         # qualified documented scope (``repository:<name>:<actions>``
         # asserted by the challenge itself) is valid at its token realm.
-        # The requested fallback scope is used only when a challenge
-        # carries no scope at all.
-        params: dict[str, str] = {"scope": challenge.scope or scope}
+        # The requested fallback scope is used only when a challenge omits
+        # scope entirely; an explicitly empty challenge scope is honoured
+        # verbatim rather than silently replaced.
+        challenge_scope = challenge.scope if challenge.scope is not None else scope
+        params: dict[str, str] = {"scope": challenge_scope}
         if challenge.service:
             params["service"] = challenge.service
         query = urllib.parse.urlencode(params)
@@ -268,6 +281,32 @@ class _AuthSession:
             token = self._fetch_token(challenge, scope)
             self._token = token
             return token
+
+    def denied_category(self, *, auth_scope: str, response_headers: dict[str, str]) -> str:
+        """Classify an authenticated HTTP 403 without overclaiming a package ACL.
+
+        A 403 can mean either that the package ACL denies this repository or
+        that the issued token lacks the requested action. When the challenge
+        scope (or a challenge returned with the 403 itself) does not grant
+        ``auth_scope`` -- including an explicitly empty challenge scope --
+        report an authentication failure; otherwise keep the ACL category.
+        """
+        required = _scope_actions(auth_scope)
+        scopes: list[str | None] = []
+        if self._challenge is not None:
+            scopes.append(self._challenge.scope)
+        response_challenge = _parse_challenge(
+            response_headers.get("WWW-Authenticate", ""),
+            repository=self._registry.repository,
+        )
+        if response_challenge is not None:
+            scopes.append(response_challenge.scope)
+        for challenge_scope in scopes:
+            actual_scope = challenge_scope if challenge_scope is not None else auth_scope
+            granted = _scope_actions(actual_scope)
+            if required and "*" not in granted and not required.issubset(granted):
+                return "l2-authentication"
+        return "l2-access-denied"
 
     def request(
         self,
@@ -532,9 +571,12 @@ def pull_artifact(
     if status == 404:
         raise ArtifactError("l2-manifest-missing", "pinned manifest does not exist")
     if status == 403:
-        # kodmial/aa#462: an authenticated-but-denied pull is a package ACL
-        # result, not a transport failure; report the exact safe category.
-        raise ArtifactError("l2-access-denied", "registry denied the manifest pull: http 403")
+        # An authenticated 403 may be a package ACL denial or a token that
+        # lacks the requested action; classify it without overclaiming.
+        raise ArtifactError(
+            session.denied_category(auth_scope="pull", response_headers=headers),
+            "registry denied the manifest pull: http 403",
+        )
     if status != 200:
         raise ArtifactError("l2-registry-unavailable", f"manifest get failed with http {status}")
     if digest_bytes(body) != digest:
@@ -563,13 +605,16 @@ def pull_artifact(
         name = str(annotations.get(FILE_NAME_ANNOTATION, ""))
         if not LAYER_FILE_RE.fullmatch(name):
             raise ArtifactError("l2-manifest-invalid", f"layer file name rejected: {name!r}")
-        blob_status, _, blob = session.request(
+        blob_status, blob_headers, blob = session.request(
             registry.api_url(f"/blobs/{layer_digest}"),
             method="GET",
             auth_scope="pull",
         )
         if blob_status == 403:
-            raise ArtifactError("l2-access-denied", "registry denied the blob pull: http 403")
+            raise ArtifactError(
+                session.denied_category(auth_scope="pull", response_headers=blob_headers),
+                "registry denied the blob pull: http 403",
+            )
         if blob_status != 200:
             raise ArtifactError(
                 "l2-blob-missing", f"blob {layer_digest[:20]} failed with http {blob_status}"
