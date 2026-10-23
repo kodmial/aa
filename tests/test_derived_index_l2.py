@@ -326,7 +326,9 @@ def test_parse_pinned_digest_fail_closed(tmp_path: pathlib.Path) -> None:
 
 def test_restore_l2_placeholder_pin_is_rejected(tmp_path: pathlib.Path) -> None:
     placeholder_pin = tmp_path / "placeholder.digest"
-    placeholder_pin.write_text("ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8")
+    placeholder_pin.write_text(
+        "ghcr.io/kodmial/aa-index@sha256:" + "0" * 64 + "\n", encoding="utf-8"
+    )
     proc = subprocess.run(
         [
             sys.executable,
