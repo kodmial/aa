@@ -126,7 +126,10 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
         host = f"http://127.0.0.1:{_server_port(self.server)}"
         upload_id = uuid.uuid4().hex
         self.send_response(202)
-        self.send_header("Location", f"{host}/v2/atest/blobs/uploads/{upload_id}")
+        location = f"/v2/atest/blobs/uploads/{upload_id}"
+        if not getattr(self.server, "relative_upload_location", False):
+            location = host + location
+        self.send_header("Location", location)
         self.end_headers()
 
     def do_PUT(self) -> None:
@@ -219,7 +222,11 @@ def _encrypted_fixture(tmp_path: pathlib.Path) -> tuple[str, bytes, bytes, str]:
     )
 
 
-def test_push_pull_roundtrip(fake_registry: _RegistryFixture, tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("relative_upload_location", [False, True])
+def test_push_pull_roundtrip(
+    fake_registry: _RegistryFixture, tmp_path: pathlib.Path, relative_upload_location: bool
+) -> None:
+    fake_registry.server.relative_upload_location = relative_upload_location  # type: ignore[attr-defined]
     identity, encrypted, meta, cache_digest = _encrypted_fixture(tmp_path)
     files = {dc.ENCRYPTED_NAME: encrypted, dc.META_NAME: meta}
     tag = expected_l2_tag(cache_digest)
