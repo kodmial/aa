@@ -523,6 +523,31 @@ def test_cyrillic_suppletive_alternant_matches_without_shared_stem(
     assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("человек"), "люди") is not None
 
 
+def test_cyrillic_suppletive_stems_are_merged_for_future_rule_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audited suppletion table is part of the matcher automatically."""
+    from aa.conversation import turn_pipeline
+
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_PRODUCTIVE_STEMS, "человек", ("человек",))
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_WORD_FORMS, "человек", ("человек",))
+    roots = turn_pipeline._build_cyrillic_word_roots()
+    assert "люд" in roots["человек"]
+    monkeypatch.setattr(turn_pipeline, "_CYRILLIC_WORD_ROOTS", roots)
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("человек"), "люди") is not None
+
+
+def test_cyrillic_suppletion_survives_a_base_only_root_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A base-only root table cannot drop an audited irregular alternant."""
+    from aa.conversation import turn_pipeline
+
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_WORD_ROOTS, "человек", ("человек",))
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("человек"), "люди") is not None
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("год"), "лет") is not None
+
+
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     """Every closed-vocabulary word has an explicit audited stable root."""
     from aa.conversation.turn_pipeline import (
@@ -589,7 +614,7 @@ def test_unmodified_terms_keep_blocking(term: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "blocked",
+    "allowed",
     (
         "We need evidence to continue.",
         "Ask your provider about the plan.",
@@ -598,8 +623,27 @@ def test_unmodified_terms_keep_blocking(term: str) -> None:
         "The index lists all chapters.",
     ),
 )
-def test_standalone_english_rule_words_remain_conservatively_blocked(blocked: str) -> None:
-    """Known limitation 2: benign standalone rule tokens stay blocked."""
+def test_standalone_english_rule_words_allowed_in_benign_context(allowed: str) -> None:
+    """Ordinary English prose is not a mechanics disclosure."""
+    from aa.conversation.turn_pipeline import leaks_internal_terms
+
+    assert leaks_internal_terms(allowed) is False
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    (
+        "We need evidence to continue; retrieval failed.",
+        "Ask your provider about the status.",
+        "The qualification process failed.",
+        "The planner is unavailable.",
+        "The index returned 429.",
+        "The evidence is at code=ru-fourth-edition-txt.",
+        "index",
+    ),
+)
+def test_standalone_english_rule_words_still_block_in_mechanics_context(blocked: str) -> None:
+    """The benign allowance never weakens a genuine mechanics context."""
     from aa.conversation.turn_pipeline import leaks_internal_terms
 
     assert leaks_internal_terms(blocked) is True
@@ -704,13 +748,13 @@ def test_typed_local_guard_reason_keeps_the_immutable_first_cause() -> None:
     assert telemetry[TELEMETRY_CHAIN_KEY][-1]["reason"] == "verdict-unsupported"
 
 
-def test_language_gate_single_cyrillic_limitation_is_documented() -> None:
-    """Known separate defect (unmodified): one Cyrillic symbol passes the
-    Russian-output language check. Documented in the #450 audit only; no
-    behavior change in this issue."""
+def test_language_gate_rejects_single_cyrillic_in_english() -> None:
+    """A mostly-English draft cannot pass on a single Cyrillic symbol."""
     from aa.conversation.turn_pipeline import contains_cyrillic
 
-    assert contains_cyrillic("Please say something. Раз.") is True
+    assert contains_cyrillic("Please say something. Раз.") is False
+    assert contains_cyrillic("Раз.") is True
+    assert contains_cyrillic("Alcoholics Anonymous — история сообщества.") is True
 
 
 # ---------------------------------------------------------------------------

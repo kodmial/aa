@@ -593,9 +593,10 @@ _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 # example "indexing", "providers", "planners") no longer trips the
 # guard. The explicit English plural "embeddings" was added because the
 # token boundary would otherwise skip it; every other historical rule
-# is unchanged and direct leaks still match. Benign standalone uses of
-# the common English terms themselves remain conservatively blocked and
-# are documented as a known limitation.
+# is unchanged and direct leaks still match. A small closed set of
+# ordinary English words is allowed only in an unambiguously benign
+# sentence context; every mechanics-bearing use (Cyrillic text, another
+# rule, technical/status vocabulary, code-shaped tokens) stays blocked.
 _INTERNAL_TERMS = (
     "corpus",
     "retrieval",
@@ -637,6 +638,34 @@ _INTERNAL_TERMS = (
     "поиск по корпусу",
     "корпус текстов",
 )
+
+# Ordinary English words that also occur in benign prose. They are
+# evaluated contextually: a standalone rule word in an ordinary English
+# sentence is not a mechanics disclosure, while the same token in a
+# Russian draft or alongside technical/status vocabulary still blocks.
+_AMBIGUOUS_ENGLISH_TERMS = frozenset(
+    {
+        "evidence",
+        "index",
+        "planner",
+        "provider",
+        "qualification",
+    }
+)
+
+# Non-vocabulary context that makes an otherwise ambiguous English word a
+# mechanics disclosure. These markers never include the ambiguous rule
+# words themselves, so a plain benign sentence remains allowed.
+_MECHANICS_MARKER_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"pipeline|vector|query|queries|status|error|failed|failure|unavailable|"
+    r"timeout|http|api|database|dataset|ranking|ranked|rerank|schema|json|"
+    r"search|indexing|indexed|embeddings|retrieval|corpus|grounding|code|"
+    r"passage|passages|chunk|chunks"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+_CODE_SHAPED_RE = re.compile(r"[={}\[\]<>\\|]|\b[45]\d{2}\b|\b[a-z0-9]+(?:[-_][a-z0-9]+){2,}\b")
 
 # Productive Russian stems for every word used by the closed Cyrillic
 # phrase vocabulary. Accepting any continuation after one of these stems
@@ -826,21 +855,64 @@ _CYRILLIC_WORD_FORMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Audited matching alternants: productive stems cover open-ended Russian
-# derivation, while the complete pinned dictionary paradigm covers every
-# lexical form that does not share a predictable stem.
-_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
-    word: tuple(dict.fromkeys((*_CYRILLIC_PRODUCTIVE_STEMS[word], *_CYRILLIC_WORD_FORMS[word])))
-    for word in _CYRILLIC_PRODUCTIVE_STEMS
+# Suppletive Russian families have no shared productive stem. The table
+# is merged automatically for any guarded word, so a future rule word
+# from one of these lexemes cannot silently bypass the matcher merely
+# because its irregular form is not derivable from the base stem.
+_CYRILLIC_SUPPLETIVE_STEMS: dict[str, tuple[str, ...]] = {
+    "человек": ("человек", "люд"),
+    "ребёнок": ("ребён", "ребен", "дет"),
+    "ребенок": ("ребён", "ребен", "дет"),
+    "год": ("год", "лет"),
+    "идти": ("идт", "шёл", "шел", "шл"),
+    "брать": ("бра", "взя", "возьм"),
+    "класть": ("клас", "полож"),
+    "ловить": ("лов", "пойма"),
+    "искать": ("иск", "ищ"),
 }
+
+
+def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
+    """Merge productive, dictionary, and suppletive alternants per word."""
+    return {
+        word: tuple(
+            dict.fromkeys(
+                (
+                    *_CYRILLIC_PRODUCTIVE_STEMS[word],
+                    *_CYRILLIC_WORD_FORMS[word],
+                    *_CYRILLIC_SUPPLETIVE_STEMS.get(word, ()),
+                )
+            )
+        )
+        for word in _CYRILLIC_PRODUCTIVE_STEMS
+    }
+
+
+# Audited matching alternants: productive stems cover open-ended Russian
+# derivation, the complete pinned dictionary paradigm covers every
+# lexical form that does not share a predictable stem, and the
+# suppletive table covers irregular families with no shared stem.
+_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = _build_cyrillic_word_roots()
 
 
 def _cyrillic_word_fragment(word: str) -> str:
     """Build one token fragment that accepts any Russian continuation."""
-    if len(word) <= 3:
+    suppletive = _CYRILLIC_SUPPLETIVE_STEMS.get(word, ())
+    if len(word) <= 3 and not suppletive:
         return re.escape(word)
-    roots = _CYRILLIC_WORD_ROOTS[word]
-    alternation = "|".join(re.escape(root) for root in roots)
+    roots = _CYRILLIC_WORD_ROOTS.get(word)
+    if roots is None:
+        roots = (
+            *_CYRILLIC_PRODUCTIVE_STEMS.get(word, ()),
+            *_CYRILLIC_WORD_FORMS.get(word, ()),
+        )
+    # Suppletion is merged at match time as well as at table build time,
+    # so an audited irregular family can never bypass the guard merely
+    # because a caller supplied only the base root.
+    alternants = tuple(dict.fromkeys((*roots, *suppletive)))
+    if not alternants:
+        raise KeyError(word)
+    alternation = "|".join(re.escape(root) for root in alternants)
     return rf"(?:{alternation})\w*"
 
 
@@ -866,11 +938,49 @@ _INTERNAL_TERM_PATTERNS = tuple(
     (term, re.compile(_internal_term_pattern_source(term)))
     for term in sorted(_INTERNAL_TERMS, key=len, reverse=True)
 )
+_UNAMBIGUOUS_TERM_PATTERNS = tuple(
+    (term, pattern)
+    for term, pattern in _INTERNAL_TERM_PATTERNS
+    if term not in _AMBIGUOUS_ENGLISH_TERMS
+)
+_AMBIGUOUS_TERM_PATTERNS = tuple(
+    (term, pattern) for term, pattern in _INTERNAL_TERM_PATTERNS if term in _AMBIGUOUS_ENGLISH_TERMS
+)
 
 
 def contains_cyrillic(text: str) -> bool:
-    """Whether user-visible text obeys the Russian-output contract."""
-    return _CYRILLIC_RE.search(text) is not None
+    """Whether user-visible text obeys the Russian-output contract.
+
+    A single Cyrillic symbol is not enough to certify a Russian answer:
+    a mostly-English draft with one Russian word must not pass the
+    language gate. Genuine Russian text (including an answer that carries
+    an English proper name or book title) has Cyrillic letters as at
+    least one third of its alphabetic letters.
+    """
+    cyrillic = len(_CYRILLIC_RE.findall(text))
+    if cyrillic == 0:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return cyrillic * 3 >= cyrillic + latin
+
+
+def _benign_english_context(lowered: str, term: str) -> bool:
+    """Whether an ambiguous English rule word is ordinary prose.
+
+    The conservative direction is preserved: anything that looks like a
+    draft answer (Cyrillic text), contains another rule or mechanics
+    vocabulary, or carries status/code-shaped material is not benign.
+    """
+    if _CYRILLIC_RE.search(lowered):
+        return False
+    if len(re.findall(r"[A-Za-z]+", lowered)) < 3:
+        return False
+    if _MECHANICS_MARKER_RE.search(lowered) or _CODE_SHAPED_RE.search(lowered):
+        return False
+    for other, pattern in _AMBIGUOUS_TERM_PATTERNS:
+        if other != term and pattern.search(lowered):
+            return False
+    return True
 
 
 def _matched_internal_rule(text: str) -> str:
@@ -882,8 +992,11 @@ def _matched_internal_rule(text: str) -> str:
     matched.
     """
     lowered = text.casefold()
-    for term, pattern in _INTERNAL_TERM_PATTERNS:
+    for term, pattern in _UNAMBIGUOUS_TERM_PATTERNS:
         if pattern.search(lowered):
+            return term
+    for term, pattern in _AMBIGUOUS_TERM_PATTERNS:
+        if pattern.search(lowered) and not _benign_english_context(lowered, term):
             return term
     return ""
 

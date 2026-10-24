@@ -9,9 +9,9 @@ collapsed into the generic `verifier_outcome=unavailable` path with zero
 repair, so the user received a `[service-error]` after a full
 planner/retrieval/answer chain.
 
-This document records the vocabulary audit, the exact post-#450
-behavior, and the known conservative limitations (separate defects,
-intentionally not fixed here).
+This document records the vocabulary audit and the exact post-#450
+behavior, including the context-sensitive handling of ordinary English
+words and the Cyrillic-ratio language gate.
 
 The live vocabulary is the closed tuple `_INTERNAL_TERMS` in
 `src/aa/conversation/turn_pipeline.py`. Matching is a casefolded,
@@ -50,6 +50,11 @@ synthetic, never real user text or canonical excerpt text.
 | `Planners and coordinators share the schedule.` | `planner` is embedded in the ordinary plural `planners`. |
 | `Qualifications for the volunteer role are simple.` | `qualification` is embedded in the ordinary plural `qualifications`. |
 | `Evidenced progress matters more than perfection.` | `evidence` is embedded in `evidenced`, not exposed as a mechanics term. |
+| `We need evidence to continue.` | Standalone `evidence` in ordinary English prose with no mechanics context. |
+| `Ask your provider about the plan.` | Standalone `provider` in ordinary English prose with no mechanics context. |
+| `The qualification process is long.` | Standalone `qualification` in ordinary English prose with no mechanics context. |
+| `The planner meets on Tuesday.` | Standalone `planner` in ordinary English prose with no mechanics context. |
+| `The index lists all chapters.` | Standalone `index` in ordinary English prose with no mechanics context. |
 
 ### A2: forbidden samples (must stay blocked)
 
@@ -100,10 +105,17 @@ historical English rules (`corpus`, `retrieval`, `grounding`,
 block. The trailing boundary means Latin plurals are not matched
 morphologically, so `embeddings` is listed explicitly rather than
 widening the family (which would also match ordinary `providers` and
-`planners`). This is the accepted product tradeoff: other Latin plurals
-such as `planners`, `qualifications` and `retrievals` remain outside the
-guard because the strict token boundary deliberately avoids blocking
-ordinary English word forms.
+`planners`). Other Latin plurals such as `planners`, `qualifications`
+and `retrievals` remain outside the guard because the strict token
+boundary deliberately avoids blocking ordinary English word forms.
+
+The five ordinary English words `evidence`, `index`, `planner`,
+`provider` and `qualification` are context-sensitive. A standalone
+occurrence in a plain multi-word English sentence is allowed only when
+the text has no Cyrillic, no other rule word, no mechanics/status
+vocabulary (`pipeline`, `status`, `failed`, `unavailable`, `429`, and
+similar) and no code-shaped token. Any mechanics context keeps the
+token blocked, so the conservative fail-closed direction is unchanged.
 
 ## Cyrillic inflection handling
 
@@ -120,21 +132,24 @@ Consequently an ending that is absent from any Russian suffix list (for
 example the diminutive `векторненькая` or the augmentative `корпусище`)
 still matches, as pinned in `test_cyrillic_unlisted_endings_blocked`.
 
-The matching table is the union of two explicit source tables. Productive
-stems in `_CYRILLIC_PRODUCTIVE_STEMS` cover open-ended derivation, and
-`_CYRILLIC_WORD_FORMS` pins the complete Russian dictionary paradigm of
-every current guarded word. Every pinned dictionary form is therefore an
-explicit matching alternant, not something derived from an assumed
-productive stem: the fleeting-vowel/comparative forms of `векторный`
-(`векторен`, `повекторнее`, `повекторней`) and any irregular full form
-are matched because they are stored directly in the matcher. The closed
-vocabulary currently contains no suppletive word, and a future addition
-with one is covered by the same mechanism as soon as its full form is
-pinned. Sync is enforced by
+The matching table is the union of three explicit source tables.
+Productive stems in `_CYRILLIC_PRODUCTIVE_STEMS` cover open-ended
+derivation, `_CYRILLIC_WORD_FORMS` pins the complete Russian dictionary
+paradigm of every current guarded word, and `_CYRILLIC_SUPPLETIVE_STEMS`
+covers irregular families whose forms do not share a stem. Every pinned
+dictionary form is therefore an explicit matching alternant, not
+something derived from an assumed productive stem: the
+fleeting-vowel/comparative forms of `векторный` (`векторен`,
+`повекторнее`, `повекторней`) and any irregular full form are matched
+because they are stored directly in the matcher. The suppletion table is
+merged automatically by `_build_cyrillic_word_roots`, so a future rule
+word from a suppletive family cannot bypass the guard merely because its
+irregular form is absent from the productive stem. Sync is enforced by
 `test_cyrillic_dictionary_forms_are_explicit_matching_alternants`,
 `test_cyrillic_dictionary_forms_are_all_covered`,
-`test_cyrillic_word_roots_cover_every_guarded_phrase_word` and
-`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`, so a
+`test_cyrillic_word_roots_cover_every_guarded_phrase_word`,
+`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word` and
+`test_cyrillic_suppletive_stems_are_merged_for_future_rule_words`, so a
 missing form fails CI instead of silently bypassing the guard. The audit
 samples found no ordinary book-grounded word that shares a guarded
 alternant, and unrelated prefix words such as `корпус здания` /
@@ -143,40 +158,17 @@ alternant, and unrelated prefix words such as `корпус здания` /
 collision would require narrowing the inflection set rather than
 removing the rule.
 
-## Documented limitations (separate defects or accepted tradeoffs; #450 scope deliberately leaves them)
+## Language gate
 
-1. **Single-Cyrillic language gate.** `contains_cyrillic` accepts any
-   text containing at least one Cyrillic symbol (`_CYRILLIC_RE`), so a
-   mostly-English draft with one Russian word passes the RU-output
-   language gate (`"Please say something. Раз."` is pinned in
-   `test_language_gate_single_cyrillic_limitation_is_documented`).
-   Fully tightening it is a separate issue inside the language policy
-   contract; #450 pins the current behavior so a future change is
-   deliberate and visible.
-2. **Standalone English words stay conservatively blocked.** Rules
-   such as `evidence`, `provider`, `qualification`, `planner`, `index`
-   are common standalone English words. The review follow-up added
-   token boundaries, so a rule embedded inside a longer ordinary word
-   (`indexing`, `providers`, `planners`, `qualifications`) no longer
-   trips the guard; those collisions are pinned in A1. A benign English
-   sentence that uses one of the rule words as a standalone token still
-   stays blocked (conservative direction), because the same tokens are
-   genuine mechanics vocabulary in draft disclosures. This behavior is
-   pinned in `test_standalone_english_rule_words_remain_conservatively_blocked`.
-3. **No live-draft knowledge in CI.** The verdicts above are pinned on
-   schematizations of the live reports; the actual live drafts after
-   #450 are only observed in the next live-side qualification run.
-4. **The Cyrillic matcher is a closed audited table, not a morphological
-   analyzer.** `_cyrillic_word_fragment` matches an explicit productive
-   stem or a pinned dictionary form and then accepts any word
-   continuation. A hypothetical suppletive form whose stem is absent
-   from `_CYRILLIC_PRODUCTIVE_STEMS` and `_CYRILLIC_WORD_FORMS` would
-   therefore not match. The current closed technical vocabulary contains
-   no suppletive word, so this is a future-addition risk rather than a
-   bypass for any guarded term. A new suppletive rule word must pin every
-   stem alternant in both tables;
-   `test_cyrillic_dictionary_forms_are_explicit_matching_alternants` and
-   `test_cyrillic_suppletive_alternant_matches_without_shared_stem` keep
-   the mechanism exercised. #450 deliberately does not add a general
-   morphological analyzer; this is an accepted tradeoff for the current
-   closed vocabulary.
+`contains_cyrillic` requires Cyrillic letters to be at least one third
+of the alphabetic letters, so a mostly-English draft with one Russian
+word cannot pass the RU-output gate. A genuine Russian answer that
+carries an English proper name or book title still passes, and pure
+English fails. This is pinned in
+`test_language_gate_rejects_single_cyrillic_in_english`.
+
+## Remaining operational note
+
+**No live-draft knowledge in CI.** The verdicts above are pinned on
+schematizations of the live reports; the actual live drafts after #450
+are only observed in the next live-side qualification run.
