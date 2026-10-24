@@ -144,6 +144,7 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      validation_command: "bash scripts/verify.sh"
       mode: "${{ inputs.mode }}"
       issue_number: "${{ inputs.issue_number }}"
       pr_number: "${{ inputs.pr_number }}"
