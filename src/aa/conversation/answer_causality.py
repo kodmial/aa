@@ -312,8 +312,10 @@ def attach_answer_failure_cause(
     The *first* cause recorded stays in ``answer_failure_cause`` and is
     never overwritten by later fallback/repair/terminal stages;
     subsequent distinct causes append to ``answer_failure_cause_chain``
-    (bounded). This preserves the earliest specific cause all the way to
-    the terminal ``clarification-unavailable`` telemetry.
+    (bounded). The first chain entry is also kept as the earliest cause
+    even when the bounded chain drops older middle entries. This
+    preserves the earliest specific cause all the way to the terminal
+    ``clarification-unavailable`` telemetry.
     """
     if not isinstance(telemetry, dict):
         return
@@ -327,13 +329,45 @@ def attach_answer_failure_cause(
     if not isinstance(chain, list):
         chain = []
     existing_record = AnswerFailureCause.from_payload(existing)
+    if not any(isinstance(item, dict) for item in chain) and existing_record is not None:
+        # Legacy/pre-seeded telemetry may carry the primary key without
+        # a chain. Seed it so the earliest-cause invariant holds for
+        # both readers and later bounded appends.
+        chain.append(existing_record.to_dict())
     same_as_latest = bool(chain) and isinstance(chain[-1], dict) and chain[-1] == record
     same_as_initial = existing_record is not None and existing_record.to_dict() == record
     if not same_as_latest and not same_as_initial:
         chain.append(record)
     if len(chain) > MAX_CHAIN_LEN:
-        del chain[: len(chain) - MAX_CHAIN_LEN]
+        # Keep the immutable first cause at index 0 and the newest tail;
+        # dropping only the oldest middle records.
+        del chain[1 : len(chain) - MAX_CHAIN_LEN + 1]
     telemetry[TELEMETRY_CHAIN_KEY] = chain
+
+
+def first_answer_failure_cause(
+    telemetry: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the earliest typed failure cause recorded for one turn.
+
+    ``attach_answer_failure_cause`` never overwrites the first cause and
+    keeps it as the first chain entry, so consumers do not need to
+    assume that one particular telemetry key stayed untouched by later
+    stages. The chain is preferred because it survives a caller that
+    replaces the primary key; the primary key remains the fallback for
+    legacy snapshots recorded without a chain. Returns ``None`` instead
+    of fabricating a cause.
+    """
+    if not isinstance(telemetry, dict):
+        return None
+    chain = telemetry.get(TELEMETRY_CHAIN_KEY)
+    if isinstance(chain, list) and chain and isinstance(chain[0], dict):
+        if _bounded(chain[0].get("reason"), MAX_REASON_LEN):
+            return chain[0]
+    existing = telemetry.get(TELEMETRY_CAUSE_KEY)
+    if isinstance(existing, dict) and _bounded(existing.get("reason"), MAX_REASON_LEN):
+        return existing
+    return None
 
 
 def cause_for_empty_candidate(
@@ -453,6 +487,7 @@ __all__ = [
     "cause_for_empty_candidate",
     "cause_from_exception",
     "failure_reason_from_telemetry",
+    "first_answer_failure_cause",
     "guard_cause_for_verifier_locale_message",
     "terminal_unknown_cause",
     "verifier_locale_reason_for_message",

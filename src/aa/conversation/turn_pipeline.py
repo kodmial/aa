@@ -19,12 +19,14 @@ import logging
 import re
 import time
 from collections.abc import Sequence
+from functools import cache
 from typing import Any
 
+import pymorphy3  # type: ignore[import-untyped]
 from langchain_core.messages import BaseMessage
 
 from aa.conversation.answer_causality import attach_answer_failure_cause as attach_failure_cause
-from aa.conversation.answer_causality import terminal_unknown_cause
+from aa.conversation.answer_causality import first_answer_failure_cause, terminal_unknown_cause
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.failures import TurnFailed
 from aa.conversation.output_limits import (
@@ -378,11 +380,17 @@ async def generate_dialogue_reply(
                 _Cause.bounded(_GUARD_LANG, "generation", "local", detail="output-language"),
             )
         return None
-    if leaks_internal_terms(text):
+    matched_rule = _matched_internal_rule(text)
+    if matched_rule:
         if telemetry is not None:
             _attach(
                 telemetry,
-                _Cause.bounded(_GUARD_TERMS, "generation", "local", detail="internal-terms"),
+                _Cause.bounded(
+                    _GUARD_TERMS,
+                    "generation",
+                    "local",
+                    detail=f"rule:{matched_rule}",
+                ),
             )
         return None
     if not envelope_passes(text):
@@ -574,6 +582,23 @@ def final_book_quote_chars(
 
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 
+# Issue #450 audit: the historical list matched only English spellings,
+# so a genuinely revealing Russian mechanics disclosure (for example
+# transliterated tooling vocabulary) passed the guard while a perfectly
+# ordinary Russian answer stayed silent-safe. Entries are additive only:
+# every new rule is unambiguous implementation jargon (no ordinary
+# book-grounded recovery wording contains it), and format variants were
+# added for the multi-word phrases so hyphen/case permutations cannot
+# bypass the prohibition (Product Contract #110 stays fail-closed).
+# Review follow-up: matching is token-bounded, not an unbounded
+# substring scan, so a rule embedded inside a longer ordinary word (for
+# example "indexing", "providers", "planners") no longer trips the
+# guard. The explicit English plural "embeddings" was added because the
+# token boundary would otherwise skip it; every other historical rule
+# is unchanged and direct leaks still match. A small closed set of
+# ordinary English words is allowed only in an unambiguously benign
+# sentence context; every mechanics-bearing use (Cyrillic text, another
+# rule, technical/status vocabulary, code-shaped tokens) stays blocked.
 _INTERNAL_TERMS = (
     "corpus",
     "retrieval",
@@ -581,30 +606,538 @@ _INTERNAL_TERMS = (
     "evidence",
     "index",
     "embedding",
+    # Latin rules stop at the token boundary, so the regular English
+    # plural is listed explicitly instead of widening the whole family
+    # (which would also block ordinary words such as "providers").
+    "embeddings",
     "planner",
     "provider",
     "qualification",
     "fail_closed",
     "fail closed",
+    "fail-closed",
     "search failure",
+    "search-failure",
     "structured output",
+    "structured-output",
     "json_schema",
     "json schema",
+    "json-schema",
     "rerank",
     "bm25",
+    "bm-25",
     "faiss",
+    # Russian mechanics jargon (issue #450): transliterated tooling names
+    # and explicit architecture phrases that never occur in ordinary
+    # book-grounded recovery answers but do occur in real implementation
+    # disclosures.
+    "эмбеддинг",
+    "риранк",
+    "фаисс",
+    "бм25",
+    "векторная база",
+    "векторное хранилище",
+    "поиск по корпусу",
+    "корпус текстов",
+)
+
+# Ordinary English words that also occur in benign prose. They are
+# evaluated contextually: a standalone rule word in an ordinary English
+# sentence is not a mechanics disclosure, while the same token in a
+# Russian draft or alongside technical/status vocabulary still blocks.
+_AMBIGUOUS_ENGLISH_TERMS = frozenset(
+    {
+        "evidence",
+        "index",
+        "planner",
+        "provider",
+        "qualification",
+    }
+)
+
+# Non-vocabulary context that makes an otherwise ambiguous English word a
+# mechanics disclosure. These markers never include the ambiguous rule
+# words themselves, so a plain benign sentence remains allowed.
+_MECHANICS_MARKER_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"pipeline|vector|query|queries|status|error|failed|failure|unavailable|"
+    r"timeout|http|api|database|dataset|ranking|ranked|rerank|schema|json|"
+    r"search|indexing|indexed|embeddings|retrieval|corpus|grounding|code|"
+    r"passage|passages|chunk|chunks"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+_CODE_SHAPED_RE = re.compile(r"[={}\[\]<>\\|]|\b[45]\d{2}\b|\b[a-z0-9]+(?:[-_][a-z0-9]+){2,}\b")
+
+# Productive Russian stems for every word used by the closed Cyrillic
+# phrase vocabulary. Accepting any continuation after one of these stems
+# keeps the guard closed against endings that are absent from the pinned
+# dictionary (diminutives, augmentatives) without any suffix-stripping
+# fallback. A future rule word must add explicit stems here.
+_CYRILLIC_PRODUCTIVE_STEMS: dict[str, tuple[str, ...]] = {
+    "база": ("баз",),
+    "бм25": ("бм25",),
+    "векторная": ("векторн", "векторен", "повекторн"),
+    "векторное": ("векторн", "векторен", "повекторн"),
+    "корпус": ("корпус",),
+    "корпусу": ("корпус",),
+    "по": ("по",),
+    "поиск": ("поиск",),
+    "риранк": ("риранк",),
+    "текстов": ("текст",),
+    "фаисс": ("фаисс",),
+    "хранилище": ("хранилищ",),
+    "эмбеддинг": ("эмбеддинг",),
+}
+
+# Complete Russian dictionary paradigm of every current rule word,
+# pinned directly in the matcher rather than derived from a productive
+# stem. A dictionary form that does not share the productive stem (a
+# fleeting vowel, a comparative alt, or a suppletive form in a future
+# addition) is therefore still an explicit matching alternant. The
+# closed vocabulary is audited in full: a new rule word extends this
+# table and the pinned audit forms together, and the regression suite
+# fails if any dictionary form is missing from the matching table.
+_CYRILLIC_WORD_FORMS: dict[str, tuple[str, ...]] = {
+    "база": (
+        "баз",
+        "база",
+        "базам",
+        "базами",
+        "базах",
+        "базе",
+        "базов",
+        "базой",
+        "базом",
+        "базою",
+        "базу",
+        "базы",
+    ),
+    "бм25": ("бм25",),
+    "векторная": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "векторное": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "корпус": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "корпусу": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "по": ("по",),
+    "поиск": (
+        "поиск",
+        "поиска",
+        "поискам",
+        "поисками",
+        "поисках",
+        "поиске",
+        "поиски",
+        "поисков",
+        "поиском",
+        "поиску",
+    ),
+    "риранк": (
+        "риранк",
+        "риранка",
+        "риранкам",
+        "риранками",
+        "риранках",
+        "риранке",
+        "риранки",
+        "риранков",
+        "риранком",
+        "риранку",
+    ),
+    "текстов": (
+        "текст",
+        "текста",
+        "текстам",
+        "текстами",
+        "текстах",
+        "тексте",
+        "текстов",
+        "текстом",
+        "тексту",
+        "тексты",
+    ),
+    "фаисс": (
+        "фаисс",
+        "фаисса",
+        "фаиссам",
+        "фаиссами",
+        "фаиссах",
+        "фаиссе",
+        "фаиссой",
+        "фаиссою",
+        "фаиссу",
+        "фаиссы",
+    ),
+    "хранилище": (
+        "хранилищ",
+        "хранилища",
+        "хранилищам",
+        "хранилищами",
+        "хранилищах",
+        "хранилище",
+        "хранилищем",
+        "хранилищу",
+    ),
+    "эмбеддинг": (
+        "эмбеддинг",
+        "эмбеддинга",
+        "эмбеддингам",
+        "эмбеддингами",
+        "эмбеддингах",
+        "эмбеддинге",
+        "эмбеддинги",
+        "эмбеддингов",
+        "эмбеддингом",
+        "эмбеддингу",
+    ),
+}
+
+# Suppletive Russian families have no shared productive stem. The table
+# is merged automatically for any guarded word, so a future rule word
+# from one of these lexemes cannot silently bypass the matcher merely
+# because its irregular form is not derivable from the base stem.
+_CYRILLIC_SUPPLETIVE_STEMS: dict[str, tuple[str, ...]] = {
+    "человек": ("человек", "люд"),
+    "ребёнок": ("ребён", "ребен", "дет"),
+    "ребенок": ("ребён", "ребен", "дет"),
+    "год": ("год", "лет"),
+    "идти": ("идт", "шёл", "шел", "шл"),
+    "брать": ("бра", "взя", "возьм"),
+    "класть": ("клас", "полож"),
+    "ловить": ("лов", "пойма"),
+    "искать": ("иск", "ищ"),
+}
+
+
+def _cyrillic_suppletive_alternants(word: str) -> tuple[str, ...]:
+    """Return audited irregular family stems for any known suppletive form.
+
+    A future guarded word may itself be an inflected suppletive form
+    rather than the dictionary lemma. The whole family is therefore
+    recognized from any audited stem, not only from an exact table key,
+    so a word such as ``люди`` inherits the ``человек``/``люд`` roots.
+    """
+    families: list[tuple[str, ...]] = []
+    for lemma, stems in _CYRILLIC_SUPPLETIVE_STEMS.items():
+        if word == lemma or word in stems:
+            families.append(stems)
+            continue
+        if len(word) < 3:
+            continue
+        related = any(word.startswith(stem) or stem.startswith(word) for stem in stems)
+        if related:
+            families.append(stems)
+    return tuple(dict.fromkeys(stem for stems in families for stem in stems))
+
+
+_MORPH_ANALYZER = pymorphy3.MorphAnalyzer()
+
+
+@cache
+def _cyrillic_morphological_forms(word: str) -> tuple[str, ...]:
+    """Return every Russian dictionary surface form of ``word``.
+
+    The analyzer supplies a complete paradigm, including suppletive
+    surface forms whose stem does not appear in the audited root tables.
+    Exact forms are matched with a trailing boundary, so a future rule
+    word cannot bypass the guard merely because an irregular form is not
+    derivable from its base root, while short analyzer forms cannot widen
+    into unrelated prefix words.
+    """
+    forms: set[str] = set()
+    for parse in _MORPH_ANALYZER.parse(word):
+        forms.add(parse.normal_form)
+        forms.update(form.word for form in parse.lexeme)
+    return tuple(sorted(forms))
+
+
+def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
+    """Merge productive, dictionary, and suppletive alternants per word."""
+    return {
+        word: tuple(
+            dict.fromkeys(
+                (
+                    *_CYRILLIC_PRODUCTIVE_STEMS[word],
+                    *_CYRILLIC_WORD_FORMS[word],
+                    *_cyrillic_suppletive_alternants(word),
+                )
+            )
+        )
+        for word in _CYRILLIC_PRODUCTIVE_STEMS
+    }
+
+
+# Audited matching alternants: productive stems cover open-ended Russian
+# derivation, the complete pinned dictionary paradigm covers every
+# lexical form that does not share a predictable stem, and the
+# suppletive table covers irregular families with no shared stem. The
+# morphological analyzer contributes exact dictionary surface forms that
+# fall outside all audited roots (including future suppletive families).
+_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = _build_cyrillic_word_roots()
+
+
+def _cyrillic_word_fragment(word: str) -> str:
+    """Build one token fragment that matches every Russian form of ``word``.
+
+    Audited alternants keep the productive ``(root)\\w*`` continuation so
+    diminutives and augmentatives stay blocked without suffix stripping.
+    The morphological analyzer adds exact dictionary forms that do not
+    share an audited root, which closes the suppletive gap for any future
+    rule word whose base word is registered here. An unregistered base
+    still raises at import instead of silently weakening the matcher.
+    """
+    suppletive = _cyrillic_suppletive_alternants(word)
+    roots = _CYRILLIC_WORD_ROOTS.get(word)
+    if roots is None:
+        roots = (
+            *_CYRILLIC_PRODUCTIVE_STEMS.get(word, ()),
+            *_CYRILLIC_WORD_FORMS.get(word, ()),
+        )
+    if not roots and not suppletive:
+        raise KeyError(word)
+    morphological = _cyrillic_morphological_forms(word)
+    if len(word) <= 3 and not suppletive and set(morphological) <= {word}:
+        return re.escape(word)
+    # Suppletion is merged at match time as well as at table build time,
+    # so an audited irregular family can never bypass the guard merely
+    # because a caller supplied only the base root or the guarded word is
+    # itself a non-lemma suppletive form.
+    alternants = tuple(dict.fromkeys((*roots, *suppletive)))
+    pieces: list[str] = []
+    if alternants:
+        alternation = "|".join(re.escape(root) for root in alternants)
+        pieces.append(rf"(?:{alternation})\w*")
+    uncovered_forms = tuple(
+        form for form in morphological if not any(form.startswith(root) for root in alternants)
+    )
+    if uncovered_forms:
+        exact = "|".join(re.escape(form) for form in uncovered_forms)
+        pieces.append(rf"(?:{exact})(?!\w)")
+    if not pieces:
+        raise KeyError(word)
+    return rf"(?:{'|'.join(pieces)})"
+
+
+def _internal_term_pattern_source(term: str) -> str:
+    """Build the bounded matcher for one closed-vocabulary rule."""
+    if not _CYRILLIC_RE.search(term):
+        return rf"(?<!\w){re.escape(term)}(?!\w)"
+    words = term.split()
+    if len(words) == 1:
+        return rf"(?<!\w){_cyrillic_word_fragment(term)}"
+    phrase = r"\s+".join(_cyrillic_word_fragment(word) for word in words)
+    return rf"(?<!\w){phrase}"
+
+
+# Compile longest terms first so specific phrases win over substrings.
+# Latin rules require a trailing word boundary so ordinary containing
+# words ("indexing", "providers") stay allowed. Cyrillic rules keep the
+# leading token boundary but allow an inflected continuation because
+# Russian mechanics disclosures naturally carry case endings
+# ("эмбеддинги"), which must not become a bypass. Multi-word Cyrillic
+# rules inflect each word, not only the final one.
+_INTERNAL_TERM_PATTERNS = tuple(
+    (term, re.compile(_internal_term_pattern_source(term)))
+    for term in sorted(_INTERNAL_TERMS, key=len, reverse=True)
+)
+_UNAMBIGUOUS_TERM_PATTERNS = tuple(
+    (term, pattern)
+    for term, pattern in _INTERNAL_TERM_PATTERNS
+    if term not in _AMBIGUOUS_ENGLISH_TERMS
+)
+_AMBIGUOUS_TERM_PATTERNS = tuple(
+    (term, pattern) for term, pattern in _INTERNAL_TERM_PATTERNS if term in _AMBIGUOUS_ENGLISH_TERMS
 )
 
 
 def contains_cyrillic(text: str) -> bool:
-    """Whether user-visible text obeys the Russian-output contract."""
-    return _CYRILLIC_RE.search(text) is not None
+    """Whether user-visible text obeys the Russian-output contract.
+
+    A single Cyrillic symbol is not enough to certify a Russian answer:
+    a mostly-English draft with one Russian word must not pass the
+    language gate. Genuine Russian text (including an answer that carries
+    an English proper name or book title) has Cyrillic letters as at
+    least one third of its alphabetic letters.
+    """
+    cyrillic = len(_CYRILLIC_RE.findall(text))
+    if cyrillic == 0:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return cyrillic * 3 >= cyrillic + latin
+
+
+def _benign_english_context(lowered: str, term: str) -> bool:
+    """Whether an ambiguous English rule word is ordinary prose.
+
+    The conservative direction is preserved: anything that looks like a
+    draft answer (Cyrillic text), contains another rule or mechanics
+    vocabulary, or carries status/code-shaped material is not benign.
+    """
+    if _CYRILLIC_RE.search(lowered):
+        return False
+    if len(re.findall(r"[A-Za-z]+", lowered)) < 3:
+        return False
+    if _MECHANICS_MARKER_RE.search(lowered) or _CODE_SHAPED_RE.search(lowered):
+        return False
+    for other, pattern in _AMBIGUOUS_TERM_PATTERNS:
+        if other != term and pattern.search(lowered):
+            return False
+    return True
+
+
+def _matched_internal_rule(text: str) -> str:
+    """Return the closed-vocabulary internal-terms rule matched by ``text``.
+
+    Issue #450 privacy contract: telemetry records only the fixed rule id
+    from this module's own vocabulary and the stage, never user text,
+    draft content or the raw matched span. Empty string means no rule
+    matched.
+    """
+    lowered = text.casefold()
+    for term, pattern in _UNAMBIGUOUS_TERM_PATTERNS:
+        if pattern.search(lowered):
+            return term
+    for term, pattern in _AMBIGUOUS_TERM_PATTERNS:
+        if pattern.search(lowered) and not _benign_english_context(lowered, term):
+            return term
+    return ""
 
 
 def leaks_internal_terms(text: str) -> bool:
     """Whether user-visible text exposes hidden mechanics."""
-    lowered = text.casefold()
-    return any(term in lowered for term in _INTERNAL_TERMS)
+    return _matched_internal_rule(text) != ""
+
+
+# Issue #450: closed vocabulary of typed causes that reject a draft
+# locally, BEFORE the semantic verifier is invoked. These rejections are
+# never verifier outages and must stay distinct in orchestration
+# telemetry from ``verifier-unavailable``, ``verifier-invalid-schema``,
+# negative verdicts, outbound-safety blocks, provider 429 and budget
+# exhaustion (the typed cause chain already distinguishes the rest).
+_LOCAL_GUARD_REJECTION_REASONS = frozenset(
+    {
+        "guard-language",
+        "guard-internal-terms",
+    }
+)
+
+# Bounded repair admission for an initial local guard rejection (issue
+# #450): at most one model regeneration, always from exactly the same
+# verified Evidence Pack, the original resolved intent and the unchanged
+# conversation history. No re-planning, no new retrieval, no third-party
+# provider, no additional unconditional calls on already-successful
+# turns, and every regenerated candidate rides the unchanged verifier +
+# final-gate contract.
+LOCAL_GUARD_REPAIR_MAX_REGENERATIONS = 1
+
+# Clearly scoped control instruction (kodmial/aa#300 channel): the
+# regeneration prompt stays the original request; the instruction travels
+# only in the separate <safety_policy> block and never becomes a search
+# query or user-visible text. Generic wording, never an exact live prompt.
+_LOCAL_GUARD_REPAIR_POLICY = (
+    "Сформулируй один естественный ответ на русском языке для пользователя "
+    "только по приведённым отрывкам книги: без упоминания внутренних "
+    "механик, источников, индексов и технических деталей устройства сервиса. "
+    "Если содержательный ответ по книге невозможен, дай краткое естественное "
+    "уточнение без технических формулировок."
+)
+
+
+def _typed_local_guard_reason(telemetry: dict[str, Any] | None) -> str:
+    """Return the typed reason when a draft was rejected before verification.
+
+    Reads the earliest recorded cause through ``first_answer_failure_cause``
+    and matches the closed local-guard vocabulary. ``attach_answer_failure_cause``
+    keeps the first cause in ``answer_failure_cause`` and as the first
+    ``answer_failure_cause_chain`` entry, so later stages cannot replace
+    the local-guard attribution (pinned by
+    ``test_first_cause_is_preserved_later_distinct_causes_extend_chain``
+    and ``test_typed_local_guard_reason_keeps_the_immutable_first_cause``).
+    Empty string means the observed failure was not a pre-verifier local
+    guard rejection.
+    """
+    if not isinstance(telemetry, dict):
+        return ""
+    cause = first_answer_failure_cause(telemetry)
+    if not isinstance(cause, dict):
+        return ""
+    reason = str(cause.get("reason", "") or "")
+    return reason if reason in _LOCAL_GUARD_REJECTION_REASONS else ""
+
+
+def _latest_failure_reason(telemetry: dict[str, Any] | None) -> str:
+    """Return the most recent bounded cause reason in the failure chain."""
+    if not isinstance(telemetry, dict):
+        return ""
+    chain = telemetry.get("answer_failure_cause_chain")
+    if isinstance(chain, list) and chain and isinstance(chain[-1], dict):
+        return str(chain[-1].get("reason", "") or "")
+    return ""
 
 
 def verdict_by_id(result: GroundingResult) -> dict[str, Any]:
@@ -1136,13 +1669,19 @@ async def _verify_draft(
                 _Cause.bounded("guard-language", "verification", "local", detail="draft-language"),
             )
         return units, None, False
-    if leaks_internal_terms(draft):
+    matched_rule = _matched_internal_rule(draft)
+    if matched_rule:
         logger.info("v2 draft failed language/leak guard")
         if telemetry is not None:
+            # Privacy-safe attribution only: the closed rule id and stage
+            # travel, never the draft text or the raw matched span.
             _attach(
                 telemetry,
                 _Cause.bounded(
-                    "guard-internal-terms", "verification", "local", detail="draft-internal-terms"
+                    "guard-internal-terms",
+                    "verification",
+                    "local",
+                    detail=f"rule:{matched_rule}",
                 ),
             )
         return units, None, False
@@ -2511,6 +3050,27 @@ async def run_v2_answer_turn(
             return None
         return max(0.0, remaining)
 
+    def _verifier_slice_ready(verifier_slice: float | None) -> bool:
+        """Whether a verifier slice can serve one call (``None`` = default)."""
+        return verifier_slice is None or verifier_slice >= TURN_VERIFIER_MIN_SLICE_S
+
+    def _local_guard_repair_admitted() -> bool:
+        """Whether one same-pack repair can afford both of its phases.
+
+        Regeneration and its mandatory re-verification share the same
+        end-to-end budget, so admission requires the answer slice and the
+        verifier slice up front. This avoids spending the verifier budget
+        on a regeneration that would then be skipped as a doomed
+        ``failed`` repair. The actual verifier slice is recomputed after
+        regeneration because the call itself consumes time; if it can no
+        longer serve a verifier call, the repair fails closed and is
+        reported as ``budget-blocked`` (not as a content failure) without
+        attempting a doomed re-verification.
+        """
+        return _remaining_budget_s() >= TURN_ANSWER_MIN_SLICE_S and _verifier_slice_ready(
+            _verifier_round_budget()
+        )
+
     def _retry_cause_for_outcome(outcome: str) -> Any:
         """Typed local cause for a skipped verifier round (no guessing)."""
         from aa.conversation.answer_causality import AnswerFailureCause as _SkipCause
@@ -2888,15 +3448,137 @@ async def run_v2_answer_turn(
     units, result, passed = await _verify_with_telemetry(draft, pack, turn_budget_s=verifier_slice)
     if result is not None:
         telemetry["verifier_unavailable_units"] = len(result.unavailable_unit_ids)
+    # Issue #450: a locally-guarded draft never reached the semantic
+    # verifier, so ``verifier_outcome`` must say so instead of flattening
+    # every ``result is None`` shape into ``unavailable``. The typed
+    # cause chain keeps the concrete boundary; only the status label
+    # changes here.
+    _initial_local_guard_reason = _typed_local_guard_reason(telemetry)
     if passed:
         telemetry["verifier_outcome"] = "passed"
     elif result is None:
-        telemetry["verifier_outcome"] = "unavailable"
+        telemetry["verifier_outcome"] = (
+            "local-guard" if _initial_local_guard_reason else "unavailable"
+        )
     elif result.unavailable_unit_ids:
         telemetry["verifier_outcome"] = "partial-unavailable"
     else:
         telemetry["verifier_outcome"] = "unsupported"
     current_draft: str = draft
+
+    # Bounded same-pack regeneration after an initial LOCAL guard
+    # rejection (issue #450): the historical path skipped all repair for
+    # every ``result is None`` turn, so a guard-rejected substantive draft
+    # collapsed to a generic service error while the already-fetched,
+    # integrity-verified Evidence Pack could still support a clean
+    # Russian answer. Admission is deliberately narrow: only a typed
+    # local-guard initial rejection, only a nonempty trustworthy pack,
+    # only when the remaining original per-turn budget permits, and at
+    # most one regeneration attempt. The regeneration reuses exactly this
+    # pack, the original resolved intent and the unchanged conversation
+    # history (no re-planning, no new retrieval, no third-party provider,
+    # no extra call on already-successful turns). The scoped instruction
+    # travels only in the separate <safety_policy> block, never merged
+    # into the user request. The regenerated candidate is reverified
+    # under the unchanged verifier and final answer gates and can fail
+    # closed like any other candidate; the original typed reason stays
+    # authoritative in the cause chain either way.
+    telemetry["local_guard_initial_rejection"] = bool(_initial_local_guard_reason)
+    telemetry["local_guard_regen_attempts"] = 0
+    telemetry["local_guard_repair_status"] = "none"
+    if (
+        not passed
+        and _initial_local_guard_reason
+        and pack
+        and telemetry["local_guard_regen_attempts"] < LOCAL_GUARD_REPAIR_MAX_REGENERATIONS
+    ):
+        if not _local_guard_repair_admitted():
+            telemetry["local_guard_repair_status"] = "budget-blocked"
+            _mark_turn_budget_exceeded()
+            logger.info(
+                "v2 local-guard repair skipped for end-to-end budget",
+                extra={
+                    "category": "local-guard-repair-budget",
+                },
+            )
+        else:
+            # ``wider`` only selects a generation window; the pre-provided
+            # pack is reused as-is and this call never re-plans or
+            # retrieves (the same-pack guarantee of issue #450).
+            _guard_regen = await _draft_with_pack(
+                pack,
+                user_message,
+                wider=True,
+                safety_policy=_LOCAL_GUARD_REPAIR_POLICY,
+            )
+            if _guard_regen is None:
+                telemetry["local_guard_regen_attempts"] = 1
+                telemetry["local_guard_repair_status"] = "attempted"
+                logger.info(
+                    "v2 local-guard repair regeneration produced no draft",
+                    extra={"category": "local-guard-repair-no-draft"},
+                )
+            else:
+                telemetry["local_guard_regen_attempts"] = 1
+                telemetry["local_guard_repair_status"] = "attempted"
+                # Admission reserved both slices up front; refresh the
+                # verifier slice for the actual call because regeneration
+                # consumed time.
+                _guard_slice = _verifier_round_budget()
+                if not _verifier_slice_ready(_guard_slice):
+                    # ``current_draft`` still holds the original leaky
+                    # draft, but ``passed`` remains False, so no
+                    # finalization path can serve it. The turn fails
+                    # closed on the original local-guard cause instead.
+                    telemetry["local_guard_repair_status"] = "budget-blocked"
+                    logger.info(
+                        "v2 local-guard repair re-verify skipped for end-to-end budget",
+                        extra={"category": "local-guard-repair-budget"},
+                    )
+                    _mark_turn_budget_exceeded()
+                else:
+                    (
+                        _guard_units,
+                        _guard_result,
+                        _guard_passed,
+                    ) = await _verify_with_telemetry(_guard_regen, pack, turn_budget_s=_guard_slice)
+                    if _guard_result is not None:
+                        telemetry["verifier_unavailable_units"] = len(
+                            _guard_result.unavailable_unit_ids
+                        )
+                    if _guard_passed:
+                        # Served subset uses the same verified pack and the
+                        # same verifier verdicts; repair counted explicitly.
+                        current_draft = _guard_regen
+                        units, result, passed = _guard_units, _guard_result, True
+                        telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
+                        telemetry["local_guard_repair_status"] = "served"
+                        logger.info(
+                            "v2 local-guard repaired via one same-pack regeneration",
+                            extra={"category": "local-guard-repair-served"},
+                        )
+                    else:
+                        # Fail closed on the regenerated candidate too:
+                        # re-map only the status label; the earliest typed
+                        # cause (the original local guard) stays first in
+                        # the causal chain and the turn never delivers the
+                        # rejected draft or an unverified rewrite.
+                        telemetry["local_guard_repair_status"] = "failed"
+                        if _guard_result is None:
+                            telemetry["verifier_outcome"] = (
+                                "local-guard"
+                                if _latest_failure_reason(telemetry)
+                                in _LOCAL_GUARD_REJECTION_REASONS
+                                else "unavailable"
+                            )
+                        elif _guard_result.unavailable_unit_ids:
+                            telemetry["verifier_outcome"] = "partial-unavailable"
+                        else:
+                            telemetry["verifier_outcome"] = "unsupported"
+                        logger.info(
+                            "v2 local-guard repair did not recover; typed failure kept",
+                            extra={"category": "local-guard-repair-failed"},
+                        )
 
     # Bounded targeted retrieval/regeneration for unsupported claims.
     # Only a glue-judged turn (planner issued zero queries, hence an
@@ -2919,6 +3601,10 @@ async def run_v2_answer_turn(
     # Grounding is preserved: without a verifier verdict the turn cannot
     # be proven grounded, so it clarifies directly instead of burning
     # latency on futile repair.
+    # Issue #450 refinement: an initial LOCAL guard rejection that did not
+    # recover above never enters this replan loop either (one bounded
+    # same-pack regeneration was already attempted; full re-planning and
+    # new retrieval stay out of scope for that admission).
     # No silent empty-evidence success (kodmial/aa#251): a planner
     # error/timeout/invalid outcome is never legitimate glue, even with
     # zero queries. Only a positively proven contentless turn with an
@@ -2947,6 +3633,7 @@ async def run_v2_answer_turn(
     repair_allowed = (
         result is not None
         and not result.unavailable_unit_ids
+        and not _initial_local_guard_reason
         and (
             (not initial_pack_empty)
             or (initial_query_count is not None and initial_query_count > 0)
@@ -2972,10 +3659,23 @@ async def run_v2_answer_turn(
         # burns slow provider calls), but telemetry keeps the real
         # planner/retrieval state so the next failure attributes to the
         # concrete stage.
-        logger.info(
-            "v2 repair skipped for verifier-unavailable turn",
-            extra={"initial_pack_empty": initial_pack_empty},
-        )
+        # Issue #450: a local-guard turn reaching here means the bounded
+        # same-pack repair was impossible (no pack / exhausted budget) or
+        # failed; the log says so instead of claiming a verifier outage
+        # that never happened (the verifier was invoked only for
+        # non-local-guard failures).
+        if _initial_local_guard_reason:
+            logger.info(
+                "v2 local-guard turn kept typed failure after bounded repair boundary",
+                extra={
+                    "initial_pack_empty": initial_pack_empty,
+                },
+            )
+        else:
+            logger.info(
+                "v2 repair skipped for verifier-unavailable turn",
+                extra={"initial_pack_empty": initial_pack_empty},
+            )
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     # Bounded repair progression (#331): repair retrieval must not repeat
@@ -5044,6 +5744,7 @@ __all__ = [
     "ANSWER_FAST_RETRY_MAX_HISTORY",
     "ANSWER_FAST_RETRY_MAX_PASSAGES",
     "ANSWER_GENERATION_MAX_PASSAGES",
+    "LOCAL_GUARD_REPAIR_MAX_REGENERATIONS",
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
     "OUTBOUND_RECOVERY_QUERIES",
