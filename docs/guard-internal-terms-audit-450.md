@@ -143,7 +143,7 @@ alternant, and unrelated prefix words such as `корпус здания` /
 collision would require narrowing the inflection set rather than
 removing the rule.
 
-## Documented limitations (separate defects; #450 scope deliberately leaves them)
+## Documented limitations (separate defects or accepted tradeoffs; #450 scope deliberately leaves them)
 
 1. **Single-Cyrillic language gate.** `contains_cyrillic` accepts any
    text containing at least one Cyrillic symbol (`_CYRILLIC_RE`), so a
@@ -161,7 +161,22 @@ removing the rule.
    trips the guard; those collisions are pinned in A1. A benign English
    sentence that uses one of the rule words as a standalone token still
    stays blocked (conservative direction), because the same tokens are
-   genuine mechanics vocabulary in draft disclosures.
+   genuine mechanics vocabulary in draft disclosures. This behavior is
+   pinned in `test_standalone_english_rule_words_remain_conservatively_blocked`.
 3. **No live-draft knowledge in CI.** The verdicts above are pinned on
    schematizations of the live reports; the actual live drafts after
    #450 are only observed in the next live-side qualification run.
+4. **The Cyrillic matcher is a closed audited table, not a morphological
+   analyzer.** `_cyrillic_word_fragment` matches an explicit productive
+   stem or a pinned dictionary form and then accepts any word
+   continuation. A hypothetical suppletive form whose stem is absent
+   from `_CYRILLIC_PRODUCTIVE_STEMS` and `_CYRILLIC_WORD_FORMS` would
+   therefore not match. The current closed technical vocabulary contains
+   no suppletive word, so this is a future-addition risk rather than a
+   bypass for any guarded term. A new suppletive rule word must pin every
+   stem alternant in both tables;
+   `test_cyrillic_dictionary_forms_are_explicit_matching_alternants` and
+   `test_cyrillic_suppletive_alternant_matches_without_shared_stem` keep
+   the mechanism exercised. #450 deliberately does not add a general
+   morphological analyzer; this is an accepted tradeoff for the current
+   closed vocabulary.

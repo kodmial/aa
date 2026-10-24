@@ -588,6 +588,23 @@ def test_unmodified_terms_keep_blocking(term: str) -> None:
     assert leaks_internal_terms(term) is True
 
 
+@pytest.mark.parametrize(
+    "blocked",
+    (
+        "We need evidence to continue.",
+        "Ask your provider about the plan.",
+        "The qualification process is long.",
+        "The planner meets on Tuesday.",
+        "The index lists all chapters.",
+    ),
+)
+def test_standalone_english_rule_words_remain_conservatively_blocked(blocked: str) -> None:
+    """Known limitation 2: benign standalone rule tokens stay blocked."""
+    from aa.conversation.turn_pipeline import leaks_internal_terms
+
+    assert leaks_internal_terms(blocked) is True
+
+
 @pytest.mark.parametrize("term", ["BM25", "FAISS", "Json-Schema", "FAIL CLOSED", "Rerank"])
 def test_mixed_case_and_format_variants_stay_blocked(term: str) -> None:
     from aa.conversation.turn_pipeline import leaks_internal_terms
