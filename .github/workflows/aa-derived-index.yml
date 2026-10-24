@@ -53,7 +53,7 @@ jobs:
       # Same promoted environment as every AA job kind (issue #429): the
       # runtime image carries the pinned dev toolchain and native deps, so
       # publish runs the exact qualified qualification/code stack.
-      image: ghcr.io/kodmial/aa-runtime@sha256:07bb64eb3f671c2db49808f40956e0fc84b3249495ea8ffc644d075f9e5c7e89
+      image: ghcr.io/kodmial/aa-runtime@sha256:40d32f5d7a4fe208b1198ab1b8c3ed3ecd75c0b15bb5b2558a84937ba7a08120
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
