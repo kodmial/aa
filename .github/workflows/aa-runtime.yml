@@ -36,7 +36,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  image-preflight:
+    # Fail clearly before any Telegram/OpenCode startup when the pinned GHCR
+    # image is missing, inaccessible, unauthorized, or inconsistent with the
+    # promoted digest record. GitHub pulls a job `container:` before its steps
+    # run, so without this hosted-runner preflight an unavailable GHCR package
+    # or bad digest would only surface as an opaque job-setup failure. A
+    # failed preflight also keeps the single-poller invariant: the runtime job
+    # (and therefore Telegram) never starts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify pinned runtime image is accessible and consistent
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          image="$(tail -n 1 docker/aa-runtime.digest | tr -d '[:space:]')"
+          if [[ ! "$image" =~ ^ghcr\.io/kodmial/aa-runtime@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Promoted AA runtime image record is malformed or an unpublished placeholder: ${image:-<empty>}"
+            exit 1
+          fi
+          workflow_image="$(grep -oE 'ghcr[.]io/kodmial/aa-runtime@sha256:[0-9a-f]{64}' .github/workflows/aa-runtime.yml | head -n 1)"
+          if [[ "$workflow_image" != "$image" ]]; then
+            echo "::error::AA runtime image digest mismatch: workflow=${workflow_image:-<missing>} promoted=$image"
+            exit 1
+          fi
+          if ! printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_ACTOR" --password-stdin; then
+            echo "::error::GHCR authentication failed; refusing to start the AA runtime."
+            exit 1
+          fi
+          if ! docker manifest inspect "$image" >/dev/null; then
+            echo "::error::Pinned AA runtime image is missing or inaccessible in GHCR (or GHCR is unavailable): $image"
+            exit 1
+          fi
+          echo "AA runtime image preflight PASS: $image"
+
   runtime:
+    needs: image-preflight
     runs-on: ubuntu-latest
     # Campaign hard bounds: 5h application runtime per session, 4 starts max,
     # 20h aggregate requested runtime max, 24h wall-clock campaign max. The

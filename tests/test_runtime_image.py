@@ -83,6 +83,15 @@ def test_runtime_preserves_single_poller_and_fail_closed_preflight() -> None:
     assert "Reject duplicate runtime" in workflow
     assert "verify_runtime_image.py" in _read(WORKFLOWS / "aa-runtime-image.yml")
     assert "git rev-parse HEAD" in workflow
+    # Missing/inaccessible GHCR images and mixed digests fail in a hosted
+    # preflight before the container job (and therefore Telegram) can start.
+    assert "image-preflight:" in workflow
+    assert "needs: image-preflight" in workflow
+    assert "docker login ghcr.io" in workflow
+    assert "docker manifest inspect" in workflow
+    assert "AA runtime image digest mismatch" in workflow
+    assert "missing or inaccessible" in workflow
+    assert workflow.index("image-preflight:") < workflow.index("  runtime:")
     # Issue #429: the pinned OpenCode CLI comes from the prepared GHCR
     # image; the workflow verifies the pin against docker/opencode.version.
     assert "uses: ./.github/actions/aa-opencode-toolchain" not in workflow

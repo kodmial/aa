@@ -173,6 +173,18 @@ def test_qualification_jobs_pin_the_promoted_digest() -> None:
     # promoted digest; neither may retain the retired digest.
     assert text.count(f"\n      image: {PROMOTED_DIGEST}\n") == 2
     assert RETIRED_DIGEST not in text
+    # Both jobs intentionally share the same prepared image. The explicit
+    # resolve-mode preflight proves that before either container pull, while
+    # the independent wall-clock job timeout expression stays unchanged.
+    assert "Verify both qualification jobs pin one accessible image" in text
+    assert "docker manifest inspect" in text
+    assert (
+        text.count(
+            "timeout-minutes: ${{ fromJSON(vars.AA_QUALIFICATION_JOB_TIMEOUT_MINUTES "
+            "|| '135') > 135"
+        )
+        == 2
+    )
 
 
 def test_promotion_script_declares_and_retains_every_consumer() -> None:
