@@ -144,12 +144,21 @@ fleeting-vowel/comparative forms of `векторный` (`векторен`,
 because they are stored directly in the matcher. The suppletion table is
 merged automatically by `_build_cyrillic_word_roots`, so a future rule
 word from a suppletive family cannot bypass the guard merely because its
-irregular form is absent from the productive stem. Sync is enforced by
+irregular form is absent from the productive stem. The family lookup also
+works in the other direction: when a future guarded word is itself a
+non-lemma suppletive form (for example `люди`), the matcher resolves the
+audited family from any stored stem and merges all of its roots, so the
+rule word does not have to be the dictionary lemma. A genuinely new
+irregular family still has to be audited into the table; an absent
+family fails closed at import instead of silently weakening the matcher.
+Sync is enforced by
 `test_cyrillic_dictionary_forms_are_explicit_matching_alternants`,
 `test_cyrillic_dictionary_forms_are_all_covered`,
 `test_cyrillic_word_roots_cover_every_guarded_phrase_word`,
-`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word` and
-`test_cyrillic_suppletive_stems_are_merged_for_future_rule_words`, so a
+`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`,
+`test_cyrillic_suppletive_stems_are_merged_for_future_rule_words`,
+`test_cyrillic_suppletive_surface_form_inherits_the_whole_family` and
+`test_cyrillic_suppletive_surface_form_roots_merge_without_base_key`, so a
 missing form fails CI instead of silently bypassing the guard. The audit
 samples found no ordinary book-grounded word that shares a guarded
 alternant, and unrelated prefix words such as `корпус здания` /

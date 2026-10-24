@@ -548,6 +548,34 @@ def test_cyrillic_suppletion_survives_a_base_only_root_table(
     assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("год"), "лет") is not None
 
 
+def test_cyrillic_suppletive_surface_form_inherits_the_whole_family() -> None:
+    """A guarded non-lemma form resolves every root of its audited family."""
+    from aa.conversation import turn_pipeline
+
+    alternants = turn_pipeline._cyrillic_suppletive_alternants("люди")
+    assert "человек" in alternants
+    assert "люд" in alternants
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("люди"), "людей") is not None
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("люди"), "человека") is not None
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("шла"), "шла") is not None
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("ищи"), "искать") is not None
+
+
+def test_cyrillic_suppletive_surface_form_roots_merge_without_base_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A future rule word may be an inflected suppletive form, not the lemma."""
+    from aa.conversation import turn_pipeline
+
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_PRODUCTIVE_STEMS, "люди", ("люди",))
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_WORD_FORMS, "люди", ("люди",))
+    roots = turn_pipeline._build_cyrillic_word_roots()
+    assert "человек" in roots["люди"]
+    assert "люд" in roots["люди"]
+    monkeypatch.setattr(turn_pipeline, "_CYRILLIC_WORD_ROOTS", roots)
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("люди"), "людей") is not None
+
+
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     """Every closed-vocabulary word has an explicit audited stable root."""
     from aa.conversation.turn_pipeline import (

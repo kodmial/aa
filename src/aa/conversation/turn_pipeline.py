@@ -872,6 +872,27 @@ _CYRILLIC_SUPPLETIVE_STEMS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _cyrillic_suppletive_alternants(word: str) -> tuple[str, ...]:
+    """Return audited irregular family stems for any known suppletive form.
+
+    A future guarded word may itself be an inflected suppletive form
+    rather than the dictionary lemma. The whole family is therefore
+    recognized from any audited stem, not only from an exact table key,
+    so a word such as ``люди`` inherits the ``человек``/``люд`` roots.
+    """
+    families: list[tuple[str, ...]] = []
+    for lemma, stems in _CYRILLIC_SUPPLETIVE_STEMS.items():
+        if word == lemma or word in stems:
+            families.append(stems)
+            continue
+        if len(word) < 3:
+            continue
+        related = any(word.startswith(stem) or stem.startswith(word) for stem in stems)
+        if related:
+            families.append(stems)
+    return tuple(dict.fromkeys(stem for stems in families for stem in stems))
+
+
 def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
     """Merge productive, dictionary, and suppletive alternants per word."""
     return {
@@ -880,7 +901,7 @@ def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
                 (
                     *_CYRILLIC_PRODUCTIVE_STEMS[word],
                     *_CYRILLIC_WORD_FORMS[word],
-                    *_CYRILLIC_SUPPLETIVE_STEMS.get(word, ()),
+                    *_cyrillic_suppletive_alternants(word),
                 )
             )
         )
@@ -897,7 +918,7 @@ _CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = _build_cyrillic_word_roots()
 
 def _cyrillic_word_fragment(word: str) -> str:
     """Build one token fragment that accepts any Russian continuation."""
-    suppletive = _CYRILLIC_SUPPLETIVE_STEMS.get(word, ())
+    suppletive = _cyrillic_suppletive_alternants(word)
     if len(word) <= 3 and not suppletive:
         return re.escape(word)
     roots = _CYRILLIC_WORD_ROOTS.get(word)
@@ -908,7 +929,8 @@ def _cyrillic_word_fragment(word: str) -> str:
         )
     # Suppletion is merged at match time as well as at table build time,
     # so an audited irregular family can never bypass the guard merely
-    # because a caller supplied only the base root.
+    # because a caller supplied only the base root or the guarded word is
+    # itself a non-lemma suppletive form.
     alternants = tuple(dict.fromkeys((*roots, *suppletive)))
     if not alternants:
         raise KeyError(word)
