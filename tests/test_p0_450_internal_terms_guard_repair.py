@@ -576,6 +576,39 @@ def test_cyrillic_suppletive_surface_form_roots_merge_without_base_key(
     assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("люди"), "людей") is not None
 
 
+def test_cyrillic_morphological_analyzer_covers_forms_outside_audited_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A future suppletive rule word cannot bypass the root tables."""
+    from aa.conversation import turn_pipeline
+
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_PRODUCTIVE_STEMS, "есть", ("есть",))
+    monkeypatch.setitem(turn_pipeline._CYRILLIC_WORD_FORMS, "есть", ("есть",))
+    roots = turn_pipeline._build_cyrillic_word_roots()
+    monkeypatch.setattr(turn_pipeline, "_CYRILLIC_WORD_ROOTS", roots)
+    fragment = turn_pipeline._cyrillic_word_fragment("есть")
+
+    assert re.fullmatch(fragment, "ел") is not None
+    assert re.fullmatch(fragment, "едят") is not None
+    assert re.fullmatch(fragment, "ешь") is not None
+    # Exact analyzer forms must never widen into unrelated prefix words.
+    assert re.fullmatch(fragment, "единый") is None
+
+
+@pytest.mark.parametrize("word", sorted(_CYRILLIC_DICTIONARY_FORMS))
+def test_cyrillic_morphological_analyzer_covers_current_vocabulary(word: str) -> None:
+    """Every analyzed form of the closed vocabulary matches its rule fragment."""
+    from aa.conversation.turn_pipeline import (
+        _cyrillic_morphological_forms,
+        _cyrillic_word_fragment,
+    )
+
+    forms = _cyrillic_morphological_forms(word)
+    assert forms
+    for form in forms:
+        assert re.fullmatch(_cyrillic_word_fragment(word), form) is not None
+
+
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     """Every closed-vocabulary word has an explicit audited stable root."""
     from aa.conversation.turn_pipeline import (

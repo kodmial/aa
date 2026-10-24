@@ -19,8 +19,10 @@ import logging
 import re
 import time
 from collections.abc import Sequence
+from functools import cache
 from typing import Any
 
+import pymorphy3  # type: ignore[import-untyped]
 from langchain_core.messages import BaseMessage
 
 from aa.conversation.answer_causality import attach_answer_failure_cause as attach_failure_cause
@@ -893,6 +895,27 @@ def _cyrillic_suppletive_alternants(word: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(stem for stems in families for stem in stems))
 
 
+_MORPH_ANALYZER = pymorphy3.MorphAnalyzer()
+
+
+@cache
+def _cyrillic_morphological_forms(word: str) -> tuple[str, ...]:
+    """Return every Russian dictionary surface form of ``word``.
+
+    The analyzer supplies a complete paradigm, including suppletive
+    surface forms whose stem does not appear in the audited root tables.
+    Exact forms are matched with a trailing boundary, so a future rule
+    word cannot bypass the guard merely because an irregular form is not
+    derivable from its base root, while short analyzer forms cannot widen
+    into unrelated prefix words.
+    """
+    forms: set[str] = set()
+    for parse in _MORPH_ANALYZER.parse(word):
+        forms.add(parse.normal_form)
+        forms.update(form.word for form in parse.lexeme)
+    return tuple(sorted(forms))
+
+
 def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
     """Merge productive, dictionary, and suppletive alternants per word."""
     return {
@@ -912,30 +935,52 @@ def _build_cyrillic_word_roots() -> dict[str, tuple[str, ...]]:
 # Audited matching alternants: productive stems cover open-ended Russian
 # derivation, the complete pinned dictionary paradigm covers every
 # lexical form that does not share a predictable stem, and the
-# suppletive table covers irregular families with no shared stem.
+# suppletive table covers irregular families with no shared stem. The
+# morphological analyzer contributes exact dictionary surface forms that
+# fall outside all audited roots (including future suppletive families).
 _CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = _build_cyrillic_word_roots()
 
 
 def _cyrillic_word_fragment(word: str) -> str:
-    """Build one token fragment that accepts any Russian continuation."""
+    """Build one token fragment that matches every Russian form of ``word``.
+
+    Audited alternants keep the productive ``(root)\\w*`` continuation so
+    diminutives and augmentatives stay blocked without suffix stripping.
+    The morphological analyzer adds exact dictionary forms that do not
+    share an audited root, which closes the suppletive gap for any future
+    rule word whose base word is registered here. An unregistered base
+    still raises at import instead of silently weakening the matcher.
+    """
     suppletive = _cyrillic_suppletive_alternants(word)
-    if len(word) <= 3 and not suppletive:
-        return re.escape(word)
     roots = _CYRILLIC_WORD_ROOTS.get(word)
     if roots is None:
         roots = (
             *_CYRILLIC_PRODUCTIVE_STEMS.get(word, ()),
             *_CYRILLIC_WORD_FORMS.get(word, ()),
         )
+    if not roots and not suppletive:
+        raise KeyError(word)
+    morphological = _cyrillic_morphological_forms(word)
+    if len(word) <= 3 and not suppletive and set(morphological) <= {word}:
+        return re.escape(word)
     # Suppletion is merged at match time as well as at table build time,
     # so an audited irregular family can never bypass the guard merely
     # because a caller supplied only the base root or the guarded word is
     # itself a non-lemma suppletive form.
     alternants = tuple(dict.fromkeys((*roots, *suppletive)))
-    if not alternants:
+    pieces: list[str] = []
+    if alternants:
+        alternation = "|".join(re.escape(root) for root in alternants)
+        pieces.append(rf"(?:{alternation})\w*")
+    uncovered_forms = tuple(
+        form for form in morphological if not any(form.startswith(root) for root in alternants)
+    )
+    if uncovered_forms:
+        exact = "|".join(re.escape(form) for form in uncovered_forms)
+        pieces.append(rf"(?:{exact})(?!\w)")
+    if not pieces:
         raise KeyError(word)
-    alternation = "|".join(re.escape(root) for root in alternants)
-    return rf"(?:{alternation})\w*"
+    return rf"(?:{'|'.join(pieces)})"
 
 
 def _internal_term_pattern_source(term: str) -> str:
@@ -944,7 +989,7 @@ def _internal_term_pattern_source(term: str) -> str:
         return rf"(?<!\w){re.escape(term)}(?!\w)"
     words = term.split()
     if len(words) == 1:
-        return rf"(?<!\w){re.escape(term)}\w*"
+        return rf"(?<!\w){_cyrillic_word_fragment(term)}"
     phrase = r"\s+".join(_cyrillic_word_fragment(word) for word in words)
     return rf"(?<!\w){phrase}"
 

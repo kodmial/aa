@@ -125,19 +125,21 @@ For a multi-word rule every word is anchored on an explicit matching
 alternant from `_CYRILLIC_WORD_ROOTS` and accepts any word
 continuation, so `векторной базе`, `корпуса текстов` and `векторною
 базою` are blocked as well as the exact phrases. There is no
-suffix-stripping path in the matcher and no generated fallback: the
-audited table is the only source of alternants, and a missing entry
-raises at import instead of silently deriving a weaker stem.
-Consequently an ending that is absent from any Russian suffix list (for
-example the diminutive `векторненькая` or the augmentative `корпусище`)
-still matches, as pinned in `test_cyrillic_unlisted_endings_blocked`.
+suffix-stripping path in the matcher: audited roots keep the productive
+`(root)\w*` continuation, a missing base entry raises at import instead
+of silently deriving a weaker stem, and a morphological analyzer
+(`pymorphy3`) supplies the exact dictionary surface forms that fall
+outside every audited root. Consequently an ending that is absent from
+any Russian suffix list (for example the diminutive
+`векторненькая` or the augmentative `корпусище`) still matches, as
+pinned in `test_cyrillic_unlisted_endings_blocked`.
 
 The matching table is the union of three explicit source tables.
 Productive stems in `_CYRILLIC_PRODUCTIVE_STEMS` cover open-ended
 derivation, `_CYRILLIC_WORD_FORMS` pins the complete Russian dictionary
 paradigm of every current guarded word, and `_CYRILLIC_SUPPLETIVE_STEMS`
-covers irregular families whose forms do not share a stem. Every pinned
-dictionary form is therefore an explicit matching alternant, not
+covers audited irregular families whose forms do not share a stem. Every
+pinned dictionary form is therefore an explicit matching alternant, not
 something derived from an assumed productive stem: the
 fleeting-vowel/comparative forms of `векторный` (`векторен`,
 `повекторнее`, `повекторней`) and any irregular full form are matched
@@ -148,17 +150,26 @@ irregular form is absent from the productive stem. The family lookup also
 works in the other direction: when a future guarded word is itself a
 non-lemma suppletive form (for example `люди`), the matcher resolves the
 audited family from any stored stem and merges all of its roots, so the
-rule word does not have to be the dictionary lemma. A genuinely new
-irregular family still has to be audited into the table; an absent
-family fails closed at import instead of silently weakening the matcher.
-Sync is enforced by
+rule word does not have to be the dictionary lemma.
+
+The remaining suppletive gap is closed at match time by
+`_cyrillic_morphological_forms`: `pymorphy3` enumerates the full
+dictionary paradigm of every registered rule word, and any surface form
+that does not share an audited root is matched exactly with a trailing
+word boundary. This covers a future rule word from an irregular family
+that is not yet listed in `_CYRILLIC_SUPPLETIVE_STEMS`, without widening
+short forms into unrelated prefix words. A base word that is not
+registered at all still fails closed at import instead of silently
+weakening the matcher. Sync is enforced by
 `test_cyrillic_dictionary_forms_are_explicit_matching_alternants`,
 `test_cyrillic_dictionary_forms_are_all_covered`,
 `test_cyrillic_word_roots_cover_every_guarded_phrase_word`,
 `test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`,
 `test_cyrillic_suppletive_stems_are_merged_for_future_rule_words`,
-`test_cyrillic_suppletive_surface_form_inherits_the_whole_family` and
-`test_cyrillic_suppletive_surface_form_roots_merge_without_base_key`, so a
+`test_cyrillic_suppletive_surface_form_inherits_the_whole_family`,
+`test_cyrillic_suppletive_surface_form_roots_merge_without_base_key`,
+`test_cyrillic_morphological_analyzer_covers_forms_outside_audited_roots`
+and `test_cyrillic_morphological_analyzer_covers_current_vocabulary`, so a
 missing form fails CI instead of silently bypassing the guard. The audit
 samples found no ordinary book-grounded word that shares a guarded
 alternant, and unrelated prefix words such as `корпус здания` /
