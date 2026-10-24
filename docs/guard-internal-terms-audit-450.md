@@ -109,33 +109,35 @@ ordinary English word forms.
 
 Unlike the Latin trailing boundary, Cyrillic rules accept Russian case
 endings so `эмбеддинги`, `риранка` and `фаиссе` cannot bypass the guard.
-For a multi-word rule every word is anchored on an explicit audited
-root from `_CYRILLIC_WORD_ROOTS` and accepts any word continuation, so
-`векторной базе`, `корпуса текстов` and `векторною базою` are blocked as
-well as the exact phrases. There is no suffix-stripping path in the
-matcher and no generated fallback: the audited table is the only source
-of roots, and a missing entry raises at import instead of silently
-deriving a weaker stem. Consequently an ending that is absent from any
-Russian suffix list (for example the diminutive `векторненькая` or the
-augmentative `корпусище`) still matches, as pinned in
-`test_cyrillic_unlisted_endings_blocked`.
+For a multi-word rule every word is anchored on an explicit matching
+alternant from `_CYRILLIC_WORD_ROOTS` and accepts any word
+continuation, so `векторной базе`, `корпуса текстов` and `векторною
+базою` are blocked as well as the exact phrases. There is no
+suffix-stripping path in the matcher and no generated fallback: the
+audited table is the only source of alternants, and a missing entry
+raises at import instead of silently deriving a weaker stem.
+Consequently an ending that is absent from any Russian suffix list (for
+example the diminutive `векторненькая` or the augmentative `корпусище`)
+still matches, as pinned in `test_cyrillic_unlisted_endings_blocked`.
 
-The audit now pins the full Russian dictionary paradigm of every current
-guarded word, not only its canonical form. The only stem alternation in
-the closed vocabulary is the fleeting vowel in the short/comparative
-forms of `векторный` (`векторен`, `повекторнее`, `повекторней`); those
-alternants are listed explicitly in `_CYRILLIC_WORD_ROOTS` and every
-dictionary form is covered by
-`test_cyrillic_dictionary_forms_are_all_covered`. No current guarded
-word has a suppletive or otherwise unlisted dictionary form. Every
-current guarded word has an explicit root and a pinned paradigm,
-enforced by
+The matching table is the union of two explicit source tables. Productive
+stems in `_CYRILLIC_PRODUCTIVE_STEMS` cover open-ended derivation, and
+`_CYRILLIC_WORD_FORMS` pins the complete Russian dictionary paradigm of
+every current guarded word. Every pinned dictionary form is therefore an
+explicit matching alternant, not something derived from an assumed
+productive stem: the fleeting-vowel/comparative forms of `векторный`
+(`векторен`, `повекторнее`, `повекторней`) and any irregular full form
+are matched because they are stored directly in the matcher. The closed
+vocabulary currently contains no suppletive word, and a future addition
+with one is covered by the same mechanism as soon as its full form is
+pinned. Sync is enforced by
+`test_cyrillic_dictionary_forms_are_explicit_matching_alternants`,
+`test_cyrillic_dictionary_forms_are_all_covered`,
 `test_cyrillic_word_roots_cover_every_guarded_phrase_word` and
-`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`; a
-future rule word with a different stem must extend both the audited
-alternants and the pinned dictionary forms in the same change. The
-audit samples found no ordinary book-grounded word that shares a
-guarded root, and unrelated prefix words such as `корпус здания` /
+`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`, so a
+missing form fails CI instead of silently bypassing the guard. The audit
+samples found no ordinary book-grounded word that shares a guarded
+alternant, and unrelated prefix words such as `корпус здания` /
 `векторный анализ` stay allowed (pinned in
 `test_cyrillic_unrelated_prefix_allowed`). A future ordinary-word
 collision would require narrowing the inflection set rather than

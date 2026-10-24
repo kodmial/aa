@@ -495,6 +495,34 @@ def test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word() -> None:
     assert guarded_words == set(_CYRILLIC_WORD_ROOTS)
 
 
+def test_cyrillic_dictionary_forms_are_explicit_matching_alternants() -> None:
+    """Every dictionary form is stored in the matcher, not derived at runtime."""
+    from aa.conversation.turn_pipeline import (
+        _CYRILLIC_WORD_FORMS,
+        _CYRILLIC_WORD_ROOTS,
+    )
+
+    assert set(_CYRILLIC_WORD_FORMS) == set(_CYRILLIC_DICTIONARY_FORMS)
+    for word, forms in _CYRILLIC_DICTIONARY_FORMS.items():
+        assert set(_CYRILLIC_WORD_FORMS[word]) == set(forms)
+        missing = [form for form in forms if form not in _CYRILLIC_WORD_ROOTS[word]]
+        assert missing == []
+
+
+def test_cyrillic_suppletive_alternant_matches_without_shared_stem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suppletive form listed as an alternant cannot bypass the guard."""
+    from aa.conversation import turn_pipeline
+
+    monkeypatch.setitem(
+        turn_pipeline._CYRILLIC_WORD_ROOTS,
+        "человек",
+        ("человек", "люд"),
+    )
+    assert re.fullmatch(turn_pipeline._cyrillic_word_fragment("человек"), "люди") is not None
+
+
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     """Every closed-vocabulary word has an explicit audited stable root."""
     from aa.conversation.turn_pipeline import (

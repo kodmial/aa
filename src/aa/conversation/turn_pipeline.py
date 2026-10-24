@@ -638,19 +638,12 @@ _INTERNAL_TERMS = (
     "корпус текстов",
 )
 
-# Audited Russian roots for every word used by the closed Cyrillic
-# phrase vocabulary. Matching anchors each word on one of these explicit
-# alternants and accepts any continuation, so regular case endings are
-# covered without any suffix-stripping fallback. The audit pins the full
-# dictionary paradigm of every current rule word, not only its canonical
-# form: a stem that alternates (fleeting vowel or suppletion) must list
-# every alternant in its tuple. The current vocabulary contains one such
-# alternation, the short/comparative forms of "векторный" ("векторен",
-# "повекторнее", "повекторней"), and those alternants are explicit
-# below. A future rule word must extend this table and the pinned
-# dictionary forms together; a missing entry raises at import instead of
-# silently deriving a weaker stem.
-_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
+# Productive Russian stems for every word used by the closed Cyrillic
+# phrase vocabulary. Accepting any continuation after one of these stems
+# keeps the guard closed against endings that are absent from the pinned
+# dictionary (diminutives, augmentatives) without any suffix-stripping
+# fallback. A future rule word must add explicit stems here.
+_CYRILLIC_PRODUCTIVE_STEMS: dict[str, tuple[str, ...]] = {
     "база": ("баз",),
     "бм25": ("бм25",),
     "векторная": ("векторн", "векторен", "повекторн"),
@@ -664,6 +657,181 @@ _CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
     "фаисс": ("фаисс",),
     "хранилище": ("хранилищ",),
     "эмбеддинг": ("эмбеддинг",),
+}
+
+# Complete Russian dictionary paradigm of every current rule word,
+# pinned directly in the matcher rather than derived from a productive
+# stem. A dictionary form that does not share the productive stem (a
+# fleeting vowel, a comparative alt, or a suppletive form in a future
+# addition) is therefore still an explicit matching alternant. The
+# closed vocabulary is audited in full: a new rule word extends this
+# table and the pinned audit forms together, and the regression suite
+# fails if any dictionary form is missing from the matching table.
+_CYRILLIC_WORD_FORMS: dict[str, tuple[str, ...]] = {
+    "база": (
+        "баз",
+        "база",
+        "базам",
+        "базами",
+        "базах",
+        "базе",
+        "базов",
+        "базой",
+        "базом",
+        "базою",
+        "базу",
+        "базы",
+    ),
+    "бм25": ("бм25",),
+    "векторная": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "векторное": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "корпус": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "корпусу": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "по": ("по",),
+    "поиск": (
+        "поиск",
+        "поиска",
+        "поискам",
+        "поисками",
+        "поисках",
+        "поиске",
+        "поиски",
+        "поисков",
+        "поиском",
+        "поиску",
+    ),
+    "риранк": (
+        "риранк",
+        "риранка",
+        "риранкам",
+        "риранками",
+        "риранках",
+        "риранке",
+        "риранки",
+        "риранков",
+        "риранком",
+        "риранку",
+    ),
+    "текстов": (
+        "текст",
+        "текста",
+        "текстам",
+        "текстами",
+        "текстах",
+        "тексте",
+        "текстов",
+        "текстом",
+        "тексту",
+        "тексты",
+    ),
+    "фаисс": (
+        "фаисс",
+        "фаисса",
+        "фаиссам",
+        "фаиссами",
+        "фаиссах",
+        "фаиссе",
+        "фаиссой",
+        "фаиссою",
+        "фаиссу",
+        "фаиссы",
+    ),
+    "хранилище": (
+        "хранилищ",
+        "хранилища",
+        "хранилищам",
+        "хранилищами",
+        "хранилищах",
+        "хранилище",
+        "хранилищем",
+        "хранилищу",
+    ),
+    "эмбеддинг": (
+        "эмбеддинг",
+        "эмбеддинга",
+        "эмбеддингам",
+        "эмбеддингами",
+        "эмбеддингах",
+        "эмбеддинге",
+        "эмбеддинги",
+        "эмбеддингов",
+        "эмбеддингом",
+        "эмбеддингу",
+    ),
+}
+
+# Audited matching alternants: productive stems cover open-ended Russian
+# derivation, while the complete pinned dictionary paradigm covers every
+# lexical form that does not share a predictable stem.
+_CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
+    word: tuple(dict.fromkeys((*_CYRILLIC_PRODUCTIVE_STEMS[word], *_CYRILLIC_WORD_FORMS[word])))
+    for word in _CYRILLIC_PRODUCTIVE_STEMS
 }
 
 
