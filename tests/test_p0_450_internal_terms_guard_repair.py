@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from typing import Any
 
 import pytest
@@ -289,6 +290,9 @@ def test_guard_allows_containing_word_collisions(allowed: str) -> None:
         "векторного хранилища",  # genitive ending on both words
         "поисками по корпусам",  # plural instrumental endings
         "корпусами текстами",  # plural instrumental endings
+        "векторен база",  # short masculine form with a fleeting vowel
+        "повекторнее база",  # comparative form outside the regular root
+        "повекторней хранилище",  # comparative form outside the regular root
     ),
 )
 def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
@@ -296,6 +300,199 @@ def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
     from aa.conversation.turn_pipeline import leaks_internal_terms
 
     assert leaks_internal_terms(blocked) is True
+
+
+# Full Russian dictionary paradigm for every word in the closed Cyrillic
+# phrase vocabulary, enumerated once with a morphological dictionary
+# (pymorphy3) and pinned here so the audit needs no runtime dependency.
+# The list includes the short/comparative forms of "векторный"
+# ("векторен", "повекторнее", "повекторней"), which do not share the
+# regular "векторн" root. If a rule word changes, regenerate this map
+# and extend the audited alternants in the same change.
+_CYRILLIC_DICTIONARY_FORMS: dict[str, tuple[str, ...]] = {
+    "база": (
+        "баз",
+        "база",
+        "базам",
+        "базами",
+        "базах",
+        "базе",
+        "базов",
+        "базой",
+        "базом",
+        "базою",
+        "базу",
+        "базы",
+    ),
+    "бм25": ("бм25",),
+    "векторная": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "векторное": (
+        "векторен",
+        "векторна",
+        "векторная",
+        "векторнее",
+        "векторней",
+        "векторно",
+        "векторного",
+        "векторное",
+        "векторной",
+        "векторном",
+        "векторному",
+        "векторною",
+        "векторную",
+        "векторны",
+        "векторные",
+        "векторный",
+        "векторным",
+        "векторными",
+        "векторных",
+        "повекторнее",
+        "повекторней",
+    ),
+    "корпус": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "корпусу": (
+        "корпус",
+        "корпуса",
+        "корпусам",
+        "корпусами",
+        "корпусах",
+        "корпусе",
+        "корпусов",
+        "корпусом",
+        "корпусу",
+        "корпусы",
+    ),
+    "по": ("по",),
+    "поиск": (
+        "поиск",
+        "поиска",
+        "поискам",
+        "поисками",
+        "поисках",
+        "поиске",
+        "поиски",
+        "поисков",
+        "поиском",
+        "поиску",
+    ),
+    "риранк": (
+        "риранк",
+        "риранка",
+        "риранкам",
+        "риранками",
+        "риранках",
+        "риранке",
+        "риранки",
+        "риранков",
+        "риранком",
+        "риранку",
+    ),
+    "текстов": (
+        "текст",
+        "текста",
+        "текстам",
+        "текстами",
+        "текстах",
+        "тексте",
+        "текстов",
+        "текстом",
+        "тексту",
+        "тексты",
+    ),
+    "фаисс": (
+        "фаисс",
+        "фаисса",
+        "фаиссам",
+        "фаиссами",
+        "фаиссах",
+        "фаиссе",
+        "фаиссой",
+        "фаиссою",
+        "фаиссу",
+        "фаиссы",
+    ),
+    "хранилище": (
+        "хранилищ",
+        "хранилища",
+        "хранилищам",
+        "хранилищами",
+        "хранилищах",
+        "хранилище",
+        "хранилищем",
+        "хранилищу",
+    ),
+    "эмбеддинг": (
+        "эмбеддинг",
+        "эмбеддинга",
+        "эмбеддингам",
+        "эмбеддингами",
+        "эмбеддингах",
+        "эмбеддинге",
+        "эмбеддинги",
+        "эмбеддингов",
+        "эмбеддингом",
+        "эмбеддингу",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("word", "form"),
+    tuple((word, form) for word, forms in _CYRILLIC_DICTIONARY_FORMS.items() for form in forms),
+)
+def test_cyrillic_dictionary_forms_are_all_covered(word: str, form: str) -> None:
+    """Every dictionary form of a guarded word matches its audited fragment."""
+    from aa.conversation.turn_pipeline import _cyrillic_word_fragment
+
+    assert re.fullmatch(_cyrillic_word_fragment(word), form) is not None
+
+
+def test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word() -> None:
+    """The pinned dictionary paradigm stays in sync with the rule vocabulary."""
+    from aa.conversation.turn_pipeline import (
+        _CYRILLIC_RE,
+        _CYRILLIC_WORD_ROOTS,
+        _INTERNAL_TERMS,
+    )
+
+    guarded_words = {
+        word for term in _INTERNAL_TERMS if _CYRILLIC_RE.search(term) for word in term.split()
+    }
+    assert guarded_words == set(_CYRILLIC_DICTIONARY_FORMS)
+    assert guarded_words == set(_CYRILLIC_WORD_ROOTS)
 
 
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:

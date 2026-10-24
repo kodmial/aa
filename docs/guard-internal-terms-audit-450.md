@@ -118,11 +118,22 @@ of roots, and a missing entry raises at import instead of silently
 deriving a weaker stem. Consequently an ending that is absent from any
 Russian suffix list (for example the diminutive `векторненькая` or the
 augmentative `корпусище`) still matches, as pinned in
-`test_cyrillic_unlisted_endings_blocked`. Every current guarded word has
-an explicit root, enforced by
-`test_cyrillic_word_roots_cover_every_guarded_phrase_word`, and an
-irregular form that does not share an audited root must add every stem
-alternant (fleeting vowel or suppletion) to that word's tuple. The
+`test_cyrillic_unlisted_endings_blocked`.
+
+The audit now pins the full Russian dictionary paradigm of every current
+guarded word, not only its canonical form. The only stem alternation in
+the closed vocabulary is the fleeting vowel in the short/comparative
+forms of `векторный` (`векторен`, `повекторнее`, `повекторней`); those
+alternants are listed explicitly in `_CYRILLIC_WORD_ROOTS` and every
+dictionary form is covered by
+`test_cyrillic_dictionary_forms_are_all_covered`. No current guarded
+word has a suppletive or otherwise unlisted dictionary form. Every
+current guarded word has an explicit root and a pinned paradigm,
+enforced by
+`test_cyrillic_word_roots_cover_every_guarded_phrase_word` and
+`test_cyrillic_dictionary_forms_cover_every_guarded_phrase_word`; a
+future rule word with a different stem must extend both the audited
+alternants and the pinned dictionary forms in the same change. The
 audit samples found no ordinary book-grounded word that shares a
 guarded root, and unrelated prefix words such as `корпус здания` /
 `векторный анализ` stay allowed (pinned in

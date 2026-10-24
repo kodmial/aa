@@ -641,16 +641,20 @@ _INTERNAL_TERMS = (
 # Audited Russian roots for every word used by the closed Cyrillic
 # phrase vocabulary. Matching anchors each word on one of these explicit
 # alternants and accepts any continuation, so regular case endings are
-# covered without any suffix-stripping fallback. A word whose stem
-# alternates (fleeting vowel or suppletion) must list every alternant in
-# its tuple; the audit test requires an explicit entry for every current
-# rule word, and a missing entry raises at import instead of silently
-# deriving a weaker stem.
+# covered without any suffix-stripping fallback. The audit pins the full
+# dictionary paradigm of every current rule word, not only its canonical
+# form: a stem that alternates (fleeting vowel or suppletion) must list
+# every alternant in its tuple. The current vocabulary contains one such
+# alternation, the short/comparative forms of "векторный" ("векторен",
+# "повекторнее", "повекторней"), and those alternants are explicit
+# below. A future rule word must extend this table and the pinned
+# dictionary forms together; a missing entry raises at import instead of
+# silently deriving a weaker stem.
 _CYRILLIC_WORD_ROOTS: dict[str, tuple[str, ...]] = {
     "база": ("баз",),
     "бм25": ("бм25",),
-    "векторная": ("векторн",),
-    "векторное": ("векторн",),
+    "векторная": ("векторн", "векторен", "повекторн"),
+    "векторное": ("векторн", "векторен", "повекторн"),
     "корпус": ("корпус",),
     "корпусу": ("корпус",),
     "по": ("по",),
