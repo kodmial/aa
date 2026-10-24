@@ -298,23 +298,6 @@ def test_cyrillic_inflected_forms_blocked(blocked: str) -> None:
     assert leaks_internal_terms(blocked) is True
 
 
-@pytest.mark.parametrize(
-    ("word", "stem"),
-    (
-        ("базою", "баз"),
-        ("векторною", "векторн"),
-        ("корпусами", "корпус"),
-        ("текстами", "текст"),
-        ("хранилищами", "хранилищ"),
-    ),
-)
-def test_cyrillic_stem_reduces_stacked_endings(word: str, stem: str) -> None:
-    """Iterative stripping reduces stacked/less common endings to the root."""
-    from aa.conversation.turn_pipeline import _cyrillic_stem
-
-    assert _cyrillic_stem(word) == stem
-
-
 def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     """Every closed-vocabulary word has an explicit audited stable root."""
     from aa.conversation.turn_pipeline import (
@@ -333,16 +316,24 @@ def test_cyrillic_word_roots_cover_every_guarded_phrase_word() -> None:
     assert missing == set()
 
 
+def test_cyrillic_missing_audited_root_fails_closed() -> None:
+    """No suffix-stripping fallback may silently widen an unaudited word."""
+    from aa.conversation.turn_pipeline import _cyrillic_word_fragment
+
+    with pytest.raises(KeyError):
+        _cyrillic_word_fragment("неаудированный")
+
+
 @pytest.mark.parametrize(
     "blocked",
     (
-        "векторненькая база",  # diminutive ending absent from the suffix table
+        "векторненькая база",  # diminutive ending absent from any suffix list
         "векторненькой базой",  # stacked diminutive/instrumental endings
-        "корпусище текстов",  # augmentative ending absent from the suffix table
+        "корпусище текстов",  # augmentative ending absent from any suffix list
         "корпусищем текстов",  # stacked augmentative/instrumental endings
     ),
 )
-def test_cyrillic_endings_outside_suffix_table_blocked(blocked: str) -> None:
+def test_cyrillic_unlisted_endings_blocked(blocked: str) -> None:
     """Matching accepts any continuation after the audited stable root."""
     from aa.conversation.turn_pipeline import leaks_internal_terms
 
