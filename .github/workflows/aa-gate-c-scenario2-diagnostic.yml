@@ -158,14 +158,21 @@ jobs:
           echo "::error::scenario2 diagnostic failed with exit code $status"
           exit "$status"
 
+      # kodmial/aa#481 evidence-path repair: this artifact is the ONLY
+      # AA-owned evidence the post-run reconciler can re-read, and a
+      # 7-day lifetime was proven too short (fingerprinted gap
+      # EVIDENCE_ARTIFACT_MISSING: green run + already-deleted artifact).
+      # Keep evidence for the maximum Actions retention (90 days) and fail
+      # the upload loudly when no files exist so a green run can never
+      # stand without its evidence artifact.
       - name: Upload diagnostic artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aa-gate-c-scenario2-diagnostic-${{ github.run_id }}-scenario2
           path: diagnostic-scenario2-out/
-          if-no-files-found: warn
-          retention-days: 7
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Notify on unpublished diagnostic lifecycle
         # Fallback only: the script itself owns the idempotent #418 comment.
