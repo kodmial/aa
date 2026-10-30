@@ -103,6 +103,9 @@ RUN set -eux; \
         "typer-slim==0.24.0" \
         "typer==0.25.1" \
         "spacy==3.8.7" \
+        "cymem==2.0.13" \
+        "murmurhash==1.0.15" \
+        "preshed==3.0.13" \
         "ru-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_sm-3.8.0/ru_core_news_sm-3.8.0-py3-none-any.whl"; \
     pytest --version; \
     ruff --version; \
