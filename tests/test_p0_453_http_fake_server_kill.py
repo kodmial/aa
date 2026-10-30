@@ -358,7 +358,16 @@ def test_watchdog_kill_of_http_hung_lane_publishes_measured_diagnostics(
 
     # --- Served model + token usage travel exactly as measured ------------
     assert metrics["served_models_by_agent"] == {"planner": ["prov-a/model-a"]}
-    assert metrics["opencode_token_usage_by_agent"] == {"input": 11, "output": 4}
+    assert metrics["opencode_token_usage_by_agent"] == {
+        "planner": {
+            "requests": 1,
+            "input_total": 11,
+            "output_total": 4,
+            "reasoning_total": 0,
+            "cache_read_total": 0,
+            "cache_write_total": 0,
+        }
+    }
 
     # --- Request latencies: real measurements, hung row excluded ----------
     latencies = metrics["opencode_request_latency_ms"]

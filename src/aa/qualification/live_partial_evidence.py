@@ -159,24 +159,40 @@ def _request_latency_audit_view(
 
 def _token_usage_view(
     audit: Sequence[Mapping[str, Any]] | None,
-) -> tuple[dict[str, int], dict[str, Any]]:
-    """Bounded per-agent token usage counters (plain numeric facts)."""
+) -> tuple[dict[str, dict[str, int]], dict[str, Any]]:
+    """Bounded per-agent token usage counters (plain numeric facts).
+
+    Mirrors the normal end-of-campaign ``opencode_token_usage_by_agent``
+    shape: one bucket per logical agent carrying the request count and
+    token-kind totals. The watchdog-FAIL lane must not swap the same metric
+    key for a flat token-kind dict, or per-agent attribution is lost.
+    """
     if audit is None:
         return {}, _coverage(COVERAGE_UNOBSERVED)
-    totals: dict[str, int] = {}
-    agents: set[str] = set()
+    usage: dict[str, dict[str, int]] = {}
     for item in audit:
         if not isinstance(item, Mapping):
             continue
         agent = _bounded_text(item.get("agent"), 128) or "unknown"
-        agents.add(agent)
+        bucket = usage.setdefault(
+            agent,
+            {
+                "requests": 0,
+                "input_total": 0,
+                "output_total": 0,
+                "reasoning_total": 0,
+                "cache_read_total": 0,
+                "cache_write_total": 0,
+            },
+        )
+        bucket["requests"] += 1
         for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
             value = item.get(key)
             if isinstance(value, (int, float)) and float(value) >= 0:
-                totals[key] = totals.get(key, 0) + int(value)
-    if not agents:
+                bucket[f"{key}_total"] += int(value)
+    if not usage:
         return {}, _coverage(COVERAGE_MISSING)
-    return totals, _coverage(COVERAGE_OBSERVED)
+    return usage, _coverage(COVERAGE_OBSERVED)
 
 
 def _served_models_view(

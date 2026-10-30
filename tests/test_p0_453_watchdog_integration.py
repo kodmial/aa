@@ -181,7 +181,16 @@ def test_watchdog_preempt_preserves_full_partial_diagnostics(
     attempts = metrics["opencode_attempt_audit"]
     assert attempts and attempts[-1]["state"] == "in-flight"
     assert metrics["served_models_by_agent"] == {"planner": ["model/alpha"]}
-    assert metrics["opencode_token_usage_by_agent"] == {"input": 7, "output": 2}
+    assert metrics["opencode_token_usage_by_agent"] == {
+        "planner": {
+            "requests": 1,
+            "input_total": 7,
+            "output_total": 2,
+            "reasoning_total": 0,
+            "cache_read_total": 0,
+            "cache_write_total": 0,
+        }
+    }
     assert metrics["opencode_request_latency_ms"]["message"]["p95"] == 640.0
     assert metrics["opencode_runtime_process"] == {"owned_by_runtime": True, "alive": True}
     assert metrics["opencode_server_events"]["state"] == "supported"

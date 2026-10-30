@@ -2744,6 +2744,10 @@ async def run_live_telegram_evidence_lane(
     # this, a 25-minute Gate C collapses 18 different failures into one
     # fingerprint and automated repair has no actionable root cause.
     scenario_diagnostics: list[dict[str, Any]] = []
+    # Initialized before the partial-evidence callback is defined so every
+    # progress write (including observer-start) can read it safely; the
+    # concrete campaign tuple is assigned once the scenarios are resolved.
+    scenarios: tuple[tuple[str, int, str], ...] = ()
     # Resolve the configurable operational wait once, before the harness can
     # fail, so timeout evidence stays available for a pre-scenario crash too.
     _policy = current_time_policy()
@@ -3017,10 +3021,7 @@ async def run_live_telegram_evidence_lane(
                 )
             except Exception:  # noqa: BLE001
                 server_evidence = None
-            try:
-                scenario_total = len(scenarios)
-            except (NameError, UnboundLocalError):
-                scenario_total = 0
+            scenario_total = len(scenarios)
             return build_partial_evidence_snapshot(
                 phase=phase,
                 scenario_index=position,

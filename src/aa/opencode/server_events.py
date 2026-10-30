@@ -288,8 +288,12 @@ class OpenCodeServerEventProbe:
             if not isinstance(payload, dict):
                 continue
             event_type = str(payload.get("type", ""))[:48]
-            self._event_type_counts[event_type] = self._event_type_counts.get(event_type, 0) + 1
-            if event_type not in SESSION_EVENT_VOCAB:
+            if event_type in SESSION_EVENT_VOCAB:
+                self._event_type_counts[event_type] = self._event_type_counts.get(event_type, 0) + 1
+            else:
+                self._event_type_counts["unrecognized-event"] = (
+                    self._event_type_counts.get("unrecognized-event", 0) + 1
+                )
                 continue
             properties = payload.get("properties")
             if not isinstance(properties, dict):

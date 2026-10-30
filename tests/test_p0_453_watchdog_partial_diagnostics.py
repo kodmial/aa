@@ -180,7 +180,16 @@ def test_timeout_lane_merges_validated_partial_evidence() -> None:
     assert metrics["opencode_attempt_in_flight_count"] == 1
     assert metrics["opencode_attempt_late_count"] == 1
     assert metrics["served_models_by_agent"] == {"planner": ["gpt/x"], "answer": ["gpt/y"]}
-    assert metrics["opencode_token_usage_by_agent"] == {"input": 10, "output": 3}
+    assert metrics["opencode_token_usage_by_agent"] == {
+        "planner": {
+            "requests": 1,
+            "input_total": 10,
+            "output_total": 3,
+            "reasoning_total": 0,
+            "cache_read_total": 0,
+            "cache_write_total": 0,
+        }
+    }
     latency_view = metrics["opencode_request_latency_ms"]
     assert latency_view["message"] == {"count": 1, "p50": 120.0, "p95": 120.0, "max": 120.0}
     assert metrics["opencode_runtime_process"] == {"owned_by_runtime": True, "alive": True}
