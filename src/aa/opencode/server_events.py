@@ -136,39 +136,58 @@ class OpenCodeServerEventProbe:
         facts collapse into aggregate counters.
         """
         counts = {"session-status": 0, "unknown-state": 0}
+        response: Any = None
         try:
-            with urllib.request.urlopen(
+            response = urllib.request.urlopen(
                 urllib.request.Request(
                     f"{self._base_url}/session/status",
                     headers={"Accept": "application/json"},
                 ),
                 timeout=self._timeout_s,
-            ) as response:
-                status = int(response.status)
-                body = response.read(_MAX_BYTES)
-            if status != 200:
-                return {**counts, "session-status-http-error": int(status)}
-            payload = json.loads(body.decode("utf-8", errors="replace"))
-            if not isinstance(payload, dict):
-                return {**counts, "session-status-shape": 1}
-            counts["session-status"] = len(payload)
-            for value in payload.values():
-                if not isinstance(value, dict):
-                    counts["unknown-state"] += 1
-                    continue
-                kind = str(value.get("type", ""))[:24]
-                if kind in SESSION_STATE_VOCAB:
-                    self._session_state_counts[kind] = self._session_state_counts.get(kind, 0) + 1
-                    self._last_session_state = kind
-                    if kind == "retry":
-                        attempt = value.get("attempt")
-                        if isinstance(attempt, int):
-                            self._retry_attempt = attempt
-                    counts[kind] = counts.get(kind, 0) + 1
-                else:
-                    counts["unknown-state"] += 1
+            )
+        except urllib.error.HTTPError as exc:
+            return {**counts, "session-status-http-error": int(exc.code)}
         except Exception:
-            counts["session-status-error"] = 1
+            # Only a failure to establish the connection is "disconnected".
+            # Once the server has answered, any later failure below is
+            # schema drift / an unobserved shape, never a dead connection.
+            return {**counts, "session-status-error": 1}
+        try:
+            status = int(response.status)
+            body = response.read(_MAX_BYTES)
+        except TimeoutError:
+            return {**counts, "session-status-body-timeout": 1}
+        except Exception:
+            return {**counts, "session-status-body-error": 1}
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if status != 200:
+            return {**counts, "session-status-http-error": int(status)}
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except ValueError:
+            return {**counts, "session-status-shape": 1}
+        if not isinstance(payload, dict):
+            return {**counts, "session-status-shape": 1}
+        counts["session-status"] = len(payload)
+        for value in payload.values():
+            if not isinstance(value, dict):
+                counts["unknown-state"] += 1
+                continue
+            kind = str(value.get("type", ""))[:24]
+            if kind in SESSION_STATE_VOCAB:
+                self._session_state_counts[kind] = self._session_state_counts.get(kind, 0) + 1
+                self._last_session_state = kind
+                if kind == "retry":
+                    attempt = value.get("attempt")
+                    if isinstance(attempt, int):
+                        self._retry_attempt = attempt
+                counts[kind] = counts.get(kind, 0) + 1
+            else:
+                counts["unknown-state"] += 1
         return counts
 
     async def session_status_snapshot(self) -> dict[str, Any]:

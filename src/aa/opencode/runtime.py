@@ -65,14 +65,14 @@ _MAX_FILTERED_EVENTS = 128
 # line can never be reported outside this vocabulary.
 _EVENT_CODES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (
-        re.compile(r"\b(?:listen(?:ing)?|bind|port)\b", re.IGNORECASE),
-        "server-listening",
-        "info",
+        re.compile(r"\b(?:panic|fatal|critical|crash|exited|exit)\b", re.IGNORECASE),
+        "server-fatal-exit",
+        "fatal",
     ),
     (
-        re.compile(r"\bversion\b", re.IGNORECASE),
-        "server-version",
-        "info",
+        re.compile(r"\b(?:denied|unauthorized|refused)\b", re.IGNORECASE),
+        "server-denied",
+        "error",
     ),
     (
         re.compile(r"\b(?:429|overloaded|rate[- ]limit|quota)\b", re.IGNORECASE),
@@ -85,19 +85,22 @@ _EVENT_CODES: tuple[tuple[re.Pattern[str], str, str], ...] = (
         "error",
     ),
     (
-        re.compile(r"\b(?:denied|unauthorized|refused)\b", re.IGNORECASE),
-        "server-denied",
-        "error",
-    ),
-    (
-        re.compile(r"\b(?:panic|fatal|critical|crash|exited|exit)\b", re.IGNORECASE),
-        "server-fatal-exit",
-        "fatal",
-    ),
-    (
-        re.compile(r"\b(?:error|failed|exception)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:error|failed|exception|cannot\s+bind|already\s+in\s+use|eaddrinuse)\b",
+            re.IGNORECASE,
+        ),
         "server-error",
         "error",
+    ),
+    (
+        re.compile(r"\b(?:listen(?:ing)?|bind|port)\b", re.IGNORECASE),
+        "server-listening",
+        "info",
+    ),
+    (
+        re.compile(r"\bversion\b", re.IGNORECASE),
+        "server-version",
+        "info",
     ),
 )
 
