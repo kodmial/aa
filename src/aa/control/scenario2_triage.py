@@ -1336,6 +1336,10 @@ def decide_dispatch(
         for run in runs:
             if not run.is_active or run.event != "workflow_dispatch":
                 continue
+            # Never attribute a run that positively declared a different
+            # target SHA to this attempt.
+            if run.declared_sha and run.declared_sha != sha:
+                continue
             created_epoch = parse_iso_epoch(run.created_at)
             if (
                 created_epoch is not None
