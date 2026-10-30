@@ -98,6 +98,7 @@ class OpenCodeServerEventProbe:
         self._last_server_error_status = -1
         self._last_server_error_retryable: bool | None = None
         self._last_observed_s = 0.0
+        self._last_evidence: dict[str, Any] = unavailable_evidence("never-observed")
 
     # ------------------------------------------------------------------
     # Bounded network reads (block in threads via ``snapshot()``)
@@ -169,6 +170,28 @@ class OpenCodeServerEventProbe:
         except Exception:
             counts["session-status-error"] = 1
         return counts
+
+    async def session_status_snapshot(self) -> dict[str, Any]:
+        """Light poll of ``GET /session/status`` for the #448 observer probe.
+
+        Runs one bounded loopback request in a thread, updates the same
+        closed-vocabulary counters as :meth:`snapshot`, and returns the
+        bounded verdict payload that the observer persists next to each
+        stall snapshot. The observer only invokes this when writing a
+        non-responding attempt snapshot, so the request rate stays tiny.
+        No session id, status payload body or server log line is retained.
+        """
+        try:
+            await asyncio.to_thread(self._read_session_status)
+        except Exception as exc:  # noqa: BLE001 - probe must never break the scan
+            payload: dict[str, Any] = {
+                "observed": False,
+                "verdict": "server-events-unobserved",
+                "error": type(exc).__name__[:64],
+                "progress_meaning": "none",
+            }
+            return payload
+        return self.session_status_probe_payload()
 
     def _read_sse_window(self) -> dict[str, int]:
         """Read a bounded window of the SSE event stream.
@@ -294,13 +317,15 @@ class OpenCodeServerEventProbe:
                 "/event": {str(k)[:48]: int(v) for k, v in sse_facts.items()},
             },
             "session_state_counts": {
-                **{name: int(self._session_state_counts.get(name, 0)) for name in SESSION_STATE_VOCAB},
+                **{
+                    name: int(self._session_state_counts.get(name, 0))
+                    for name in SESSION_STATE_VOCAB
+                },
             },
             "event_type_counts": {
-                str(k)[:48]: int(v)
-                for k, v in sorted(self._event_type_counts.items())
-                if k
-            } or {},
+                str(k)[:48]: int(v) for k, v in sorted(self._event_type_counts.items()) if k
+            }
+            or {},
             "uncertainty": {
                 "server_alive_or_busy_is_not_provider_progress": True,
             },
@@ -327,11 +352,23 @@ class OpenCodeServerEventProbe:
         """One bounded privacy-safe server-side evidence snapshot."""
         try:
             _, evidence = await asyncio.to_thread(self._probe_sync)
+            self._last_evidence = evidence
             return evidence
         except Exception as exc:  # noqa: BLE001 - evidence must never break the lane
-            snapshot = unavailable_evidence(type(exc).__name__)
+            snapshot = unavailable_evidence(f"probe-error:{type(exc).__name__}")
             snapshot["state"] = "unavailable"
             return snapshot
+
+    def cached_evidence(self) -> dict[str, Any]:
+        """The last computed evidence snapshot (fail-closed when never probed).
+
+        Used by synchronous lane callbacks (stage transitions) that must
+        not perform blocking network work: they reuse the most recent
+        probe result, or the explicit ``unobserved`` marker when no probe
+        ever ran. Absence of a fresh network look stays honest here —
+        nothing is reported as ``server_idle`` from a cached health state.
+        """
+        return self._last_evidence
 
     @property
     def last_session_state(self) -> str:
@@ -346,7 +383,7 @@ class OpenCodeServerEventProbe:
             "verdict": (
                 f"server-events-session-{self._last_session_state}"
                 if observed
-                else f"server-events-state-{self._doc_state or 'unobserved'}"
+                else "server-events-session-unobserved"
             )[:64],
             "error": "",
             "progress_meaning": "none",

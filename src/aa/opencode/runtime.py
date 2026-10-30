@@ -46,6 +46,12 @@ logger = logging.getLogger("aa.opencode.runtime")
 # drained continuously in daemon threads but only allow-listed event lines
 # are ever retained, so no prompt, reply, book text, secret, or session id
 # can leak into diagnostics.
+#
+# kodmial/aa#453: an error line may contain prompt/response/secret text,
+# so the former ``line_hint=line[:200]`` raw prefix is replaced by
+# closed-vocabulary extraction: one fixed event code, a fixed severity,
+# and at most one numeric status/exit/port value. No arbitrary substring
+# of a server line is ever retained.
 _FILTER_EVENT_RE = re.compile(
     r"(error|panic|fatal|critical|exception|denied|unauthorized|refused"
     r"|timed\s*out|timeout|failed|exited|exit|listen|bind|port|version|429"
@@ -53,7 +59,77 @@ _FILTER_EVENT_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_FILTERED_EVENTS = 128
-_MAX_EVENT_LINE_LEN = 200
+
+# One bounded record per matched line family. The regex that matches the
+# line also selects the closed-vocabulary ``event`` code, so a matched
+# line can never be reported outside this vocabulary.
+_EVENT_CODES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(r"\b(?:listen(?:ing)?|bind|port)\b", re.IGNORECASE),
+        "server-listening",
+        "info",
+    ),
+    (
+        re.compile(r"\bversion\b", re.IGNORECASE),
+        "server-version",
+        "info",
+    ),
+    (
+        re.compile(r"\b(?:429|overloaded|rate[- ]limit|quota)\b", re.IGNORECASE),
+        "server-rate-limit",
+        "error",
+    ),
+    (
+        re.compile(r"\b(?:timed\s*out|timeout)\b", re.IGNORECASE),
+        "server-timeout",
+        "error",
+    ),
+    (
+        re.compile(r"\b(?:denied|unauthorized|refused)\b", re.IGNORECASE),
+        "server-denied",
+        "error",
+    ),
+    (
+        re.compile(r"\b(?:panic|fatal|critical|crash|exited|exit)\b", re.IGNORECASE),
+        "server-fatal-exit",
+        "fatal",
+    ),
+    (
+        re.compile(r"\b(?:error|failed|exception)\b", re.IGNORECASE),
+        "server-error",
+        "error",
+    ),
+)
+
+# Only a small numeric value can still be evidence (HTTP status, exit
+# code, port). Everything else in the line — all text — is dropped.
+_NUMERIC_RE = re.compile(r"\b\d{1,5}\b")
+
+
+def _classify_event_line(line: str) -> dict[str, object]:
+    """Closed-vocabulary extraction from one matched server line."""
+    event_code = "server-error"
+    severity = "error"
+    for pattern, code, level in _EVENT_CODES:
+        if pattern.search(line):
+            event_code = code
+            severity = level
+            break
+    fact: dict[str, object] = {
+        "event": "server-line-matched-filter",
+        "bounded": True,
+        "event_code": event_code,
+        "severity": severity,
+    }
+    numbers = _NUMERIC_RE.findall(line)
+    if numbers:
+        # One bounded numeric fact per event: any extra number in the
+        # line (counters, ids, pids) is deliberately not retained.
+        try:
+            fact["numeric_value"] = int(numbers[0])
+        except ValueError:
+            pass
+    return fact
 
 
 class RuntimeEventCapture:
@@ -61,8 +137,10 @@ class RuntimeEventCapture:
 
     stdout/stderr of the spawned ``opencode serve`` process are drained via
     daemon threads; each line is dropped unless it matches the bounded
-    event filter. Process exit is recorded as an event as well. Callers
-    read only :meth:`filtered_events` — raw lines are never retained.
+    event filter, and matched lines are reduced to closed-vocabulary
+    event facts (code, severity, one numeric value, timestamp). No raw
+    line fragment, text, or substring is ever retained. Callers read only
+    :meth:`filtered_events`.
     """
 
     def __init__(self) -> None:
@@ -100,7 +178,9 @@ class RuntimeEventCapture:
                     continue
                 if not line or not _FILTER_EVENT_RE.search(line):
                     continue
-                self._record({"source": source, "line_hint": line[:_MAX_EVENT_LINE_LEN]})
+                fact = _classify_event_line(line)
+                fact["source"] = source
+                self._record(fact)
         except Exception:
             return
 

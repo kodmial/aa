@@ -662,7 +662,13 @@ def test_gate_c_missing_boundary_fails_closed(
     )
     evidence, _, _ = runner._gate_c(SHA, "run-1", PRODUCT, RUNTIME)
     assert evidence.status == "FAIL"
-    assert evidence.detail == "gate-c-boundary-missing"
+    # kodmial/aa#453: no measured latency exists for this summary shape
+    # (empty metrics), so the zero-valued latency fields stay explicitly
+    # typed as not measured instead of an ambiguous fake metric.
+    assert evidence.detail == "gate-c-boundary-missing;latency-not-measured"
+    assert evidence.latency_p50_ms == 0.0
+    assert evidence.latency_p95_ms == 0.0
+    assert evidence.max_turn_ms == 0.0
 
 
 def test_gate_c_still_blocked_without_evidence_or_env(

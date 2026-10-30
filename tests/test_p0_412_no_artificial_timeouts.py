@@ -8,6 +8,7 @@ process watchdog with typed negative evidence.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from pathlib import Path
@@ -74,7 +75,10 @@ def test_gate_c_child_has_no_fixed_scenario_or_voice_cutoff() -> None:
     assert "scenario_deadline_at=time.time() + scenario_wait_s" not in source
     assert "loop.time() + scenario_wait_s" not in source
     assert "loop.time() + 120.0" not in source
-    assert 'record_live_progress("scenario-response"' in source
+    # The delivered-response marker phase must still be persisted as real
+    # progress; the regex tolerates the repository formatter's own call
+    # wrapping (kodmial/aa#453 adds kwargs to this call).
+    assert re.search(r'record_live_progress\(\s*"scenario-response"', source, re.S)
 
 
 def test_transport_has_no_total_wait_for_and_never_mutates_shared_timeout() -> None:

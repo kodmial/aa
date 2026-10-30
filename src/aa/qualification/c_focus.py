@@ -213,6 +213,21 @@ def build_c_focus_result(
     metrics = _live_lane_metrics(live_summary)
     if metrics:
         diagnostics.update(_latency_summary(metrics))
+        # kodmial/aa#453: a watchdog-killed lane carries the explicit
+        # per-source coverage of its partial diagnostics; the c-focus
+        # artifact must state what was observed vs missing/unobserved
+        # instead of implicating silence as absent product behavior.
+        diagnostics["partial_evidence_reported"] = bool(
+            metrics.get("partial_evidence_reported", False)
+        )
+        diagnostics["watchdog_diagnostics_status"] = _truncate(
+            metrics.get("watchdog_diagnostics_status", ""), 64
+        )
+        coverage = metrics.get("partial_evidence_coverage")
+        if isinstance(coverage, Mapping):
+            diagnostics["partial_evidence_coverage"] = {
+                _truncate(name, 64): _truncate(state, 32) for name, state in coverage.items()
+            }
         diagnostics["independent_judge_unavailable"] = int(
             metrics.get("independent_judge_unavailable", 0) or 0
         )
