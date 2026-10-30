@@ -571,8 +571,20 @@ def merge_partial_into_metrics(
         metrics["opencode_attempt_audit"] = partial.get("attempt_audit", [])
         counts = partial.get("attempt_counts", {})
         if isinstance(counts, Mapping):
-            metrics["opencode_attempt_in_flight_count"] = int(counts.get("in_flight", 0) or 0)
-            metrics["opencode_attempt_late_count"] = int(counts.get("late_outcome", 0) or 0)
+
+            def _bounded_count(value: object) -> int | None:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return None
+                if value != value or value == float("inf") or float(value) < 0:
+                    return None
+                return int(value)
+
+            in_flight = _bounded_count(counts.get("in_flight"))
+            late_outcome = _bounded_count(counts.get("late_outcome"))
+            if in_flight is not None:
+                metrics["opencode_attempt_in_flight_count"] = in_flight
+            if late_outcome is not None:
+                metrics["opencode_attempt_late_count"] = late_outcome
     if coverage["served_model_audit"] == COVERAGE_OBSERVED:
         metrics["served_models_by_agent"] = partial.get("served_models_by_agent", {})
     if coverage["token_usage_audit"] == COVERAGE_OBSERVED:

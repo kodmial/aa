@@ -104,9 +104,12 @@ _EVENT_CODES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     ),
 )
 
-# Only a small numeric value can still be evidence (HTTP status, exit
-# code, port). Everything else in the line — all text — is dropped.
-_NUMERIC_RE = re.compile(r"\b\d{1,5}\b")
+# Only a small standalone numeric value can still be evidence (HTTP
+# status, exit code, port). Numbers inside dotted sequences (semver
+# versions, IPv4 addresses) are not status/exit/port facts and must not
+# be published as ``numeric_value``. Everything else — all text — is
+# dropped.
+_NUMERIC_RE = re.compile(r"(?<!\.)\b\d{1,5}\b(?!\.)")
 
 
 def _classify_event_line(line: str) -> dict[str, object]:
@@ -124,7 +127,9 @@ def _classify_event_line(line: str) -> dict[str, object]:
         "event_code": event_code,
         "severity": severity,
     }
-    numbers = _NUMERIC_RE.findall(line)
+    # A version string is not an HTTP status, exit code, or port, so none
+    # of its digits may be published as ``numeric_value``.
+    numbers = [] if event_code == "server-version" else _NUMERIC_RE.findall(line)
     if numbers:
         # One bounded numeric fact per event: any extra number in the
         # line (counters, ids, pids) is deliberately not retained.
