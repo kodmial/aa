@@ -442,6 +442,19 @@ def is_trusted_identity_author(login: str) -> bool:
     return str(login or "").strip().lower() in TRUSTED_IDENTITY_AUTHOR_LOGINS
 
 
+def is_automation_author(login: str) -> bool:
+    """True for a GitHub automation account (any ``[bot]`` login).
+
+    Triage deduplication is not an identity anchor, so it must keep matching
+    comments published by any valid automation identity, not only the one
+    repository bot that writes them today. GitHub reserves the ``[bot]``
+    login suffix for Apps and bot accounts, so this still excludes arbitrary
+    human commenters.
+    """
+    normalized = str(login or "").strip().lower()
+    return normalized in TRUSTED_IDENTITY_AUTHOR_LOGINS or normalized.endswith("[bot]")
+
+
 def parse_runs(payload: Any) -> list[DiagnosticRun]:
     """Parse unordered Actions workflow-run inventory into typed runs."""
     raw_items: Any = payload
@@ -1302,24 +1315,19 @@ def _correlate_dispatch_marker(
 
     A ``workflow_dispatch`` run record names only the dispatch-ref head, so
     an attempt marker is the sole way to bind an undeclared in-flight run
-    to a target SHA. When attempts for different SHAs are equally close to
-    the run's creation time the ownership is ambiguous: return ``None``
-    rather than let one SHA claim an unrelated run and suppress its retry.
+    to a target SHA. When attempts for different SHAs are plausible creators
+    of the run, the ownership is ambiguous: return ``None`` rather than let
+    the merely nearest marker misattribute it. Under concurrent reconciler
+    schedules another target's marker can be posted closer to this run than
+    its real attempt; choosing it would either duplicate a diagnostic for
+    the true owner or suppress the wrong SHA's retry.
     """
-    nearest: list[DispatchMarker] = []
-    nearest_distance = float("inf")
-    for marker in markers:
-        distance = abs(marker.created_epoch - run_created_epoch)
-        if distance > max_skew:
-            continue
-        if distance < nearest_distance:
-            nearest = [marker]
-            nearest_distance = distance
-        elif distance == nearest_distance:
-            nearest.append(marker)
-    if len({marker.sha for marker in nearest}) != 1:
+    candidates = [
+        marker for marker in markers if abs(marker.created_epoch - run_created_epoch) <= max_skew
+    ]
+    if len({marker.sha for marker in candidates}) != 1:
         return None
-    return max(nearest, key=lambda marker: marker.attempt)
+    return max(candidates, key=lambda marker: marker.attempt)
 
 
 def decide_dispatch(

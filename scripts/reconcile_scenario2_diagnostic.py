@@ -588,9 +588,18 @@ def _reconcile_selected_run(
     comment_pairs = [
         (comment_id, body)
         for comment_id, body, author in records
-        if triage.is_trusted_identity_author(author)
+        if triage.is_automation_author(author)
     ]
     action = triage.decide_triage_comment(comment_pairs, sha=run.identity_sha, run_id=run.run_id)
+    if action.kind == "create" and run.declared_sha and run.declared_sha != run.head_sha:
+        # Comments published before the declared-identity migration carry
+        # triage_marker(run.head_sha, run.run_id). Update that comment in
+        # place instead of minting a second one for the same (sha, run).
+        legacy_action = triage.decide_triage_comment(
+            comment_pairs, sha=run.head_sha, run_id=run.run_id
+        )
+        if legacy_action.kind != "create":
+            action = legacy_action
     summary["comment"] = {"action": action.kind, "comment_id": action.comment_id}
     if args.post:
         summary["posted"] = post_triage_comment(
