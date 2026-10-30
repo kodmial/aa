@@ -164,7 +164,7 @@ jobs:
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts || '5' }}"
-      pause_on_failure: "${{ inputs.pause_on_failure || 'false' }}"
+      pause_on_failure: "${{ inputs.pause_on_failure || 'true' }}"
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
       capability_number: "${{ inputs.capability_number }}"
