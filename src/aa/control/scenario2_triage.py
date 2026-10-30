@@ -20,11 +20,13 @@ diagnostic run inventory and that run's uploaded artifacts) and produces:
   missing;
 - declared run identity (kodmial/aa#483): a diagnostic run that checked
   out a ``target_sha`` different from the dispatch-ref head records its
-  exact diagnosed SHA as a durable ``aa-scenario2-diagnostic-declared``
-  marker on #419, so evidence selection binds the artifact to the SHA the
-  run actually diagnosed instead of the GraphQL record head_sha (the
+  exact diagnosed SHA in the server-authoritative Actions ``run-name``
+  (``target=<sha>``), so evidence selection binds the artifact to the SHA
+  the run actually diagnosed instead of the GraphQL record head_sha (the
   record of a ``workflow_dispatch`` always names the ref head and can
-  never name the requested ``target_sha``).
+  never name the requested ``target_sha``). A trusted-author
+  ``aa-scenario2-diagnostic-declared`` marker on #419 is only a legacy
+  fallback; arbitrary comments never mint identity.
 
 No external LLM/ChatGPT judgement exists anywhere in this control plane,
 and nothing here patches product semantic logic: escalation tasks repair
@@ -134,6 +136,14 @@ ACTIVE_RUN_STATUSES: frozenset[str] = frozenset(
 # Dispatch-bound retry hygiene (idempotent backoff, never terminal pause).
 MAX_DISPATCH_ATTEMPTS = 3
 DISPATCH_RETRY_BACKOFF_S = 1800.0
+# Clock-skew allowance when correlating a durable dispatch marker with the
+# workflow_dispatch run Actions created for it.
+DISPATCH_RUN_CREATED_SKEW_S = 300.0
+
+# Only the repository automation identity may mint declared run identity or
+# dispatch-attempt markers. A plain issue comment is not an identity anchor;
+# an untrusted account must never be able to forge either kind of marker.
+TRUSTED_IDENTITY_AUTHOR_LOGINS: frozenset[str] = frozenset({"github-actions[bot]"})
 
 MAX_TIMELINE_ENTRIES = 60
 MAX_FIELD_CHARS = 96
@@ -402,6 +412,36 @@ def normalize_allowed_shas(values: Sequence[Any]) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+_RUN_RECORD_TARGET_RE = re.compile(r"(?:^|\s)target=([0-9a-f]{40})(?=\s|$)")
+
+
+def _declared_sha_from_run_record(item: Mapping[str, Any]) -> str:
+    """Extract the diagnosed SHA from the server-authoritative run title.
+
+    The diagnostic workflow sets ``run-name`` to
+    ``... target=<checked-out SHA>``, which Actions exposes on the run
+    record as ``display_title`` (and sometimes ``name``). This is the
+    trusted identity anchor: unlike an issue comment, it can only be set by
+    the workflow itself.
+    """
+    for key in ("display_title", "name"):
+        title = str(item.get(key) or "").lower()
+        match = _RUN_RECORD_TARGET_RE.search(title)
+        if match and _SHA_RE.fullmatch(match.group(1)):
+            return match.group(1)
+    return ""
+
+
+def is_trusted_identity_author(login: str) -> bool:
+    """True only for the repository automation identity.
+
+    Declared-identity and dispatch markers are hints at best; accepting
+    them from arbitrary comments would let any commenter forge a mapping
+    from run_id to SHA. The workflow posts them as github-actions[bot].
+    """
+    return str(login or "").strip().lower() in TRUSTED_IDENTITY_AUTHOR_LOGINS
+
+
 def parse_runs(payload: Any) -> list[DiagnosticRun]:
     """Parse unordered Actions workflow-run inventory into typed runs."""
     raw_items: Any = payload
@@ -437,6 +477,7 @@ def parse_runs(payload: Any) -> list[DiagnosticRun]:
                 updated_at=str(item.get("updated_at") or "") or None,
                 run_number=(int(run_number_raw) if isinstance(run_number_raw, int) else 0),
                 html_url=str(item.get("html_url") or ""),
+                declared_sha=_declared_sha_from_run_record(item),
             )
         )
     return out
@@ -1145,11 +1186,17 @@ def parse_declared_targets(bodies: Sequence[str]) -> dict[int, str]:
 def attach_declared_targets(
     runs: Sequence[DiagnosticRun], declared_targets: Mapping[int, str]
 ) -> list[DiagnosticRun]:
-    """Fold declared identities into parsed runs (read-only, typed)."""
+    """Fold trusted legacy markers into parsed runs (read-only, typed).
+
+    The server-authoritative run title always wins; comment markers are
+    only a compatibility fallback for runs created before ``run-name``
+    carried the identity, and callers must pass only trusted-author
+    markers here.
+    """
     out: list[DiagnosticRun] = []
     for run in runs:
         sha = declared_targets.get(run.run_id, "")
-        if sha and sha != run.head_sha:
+        if sha and not run.declared_sha and sha != run.head_sha:
             run = dataclasses.replace(run, declared_sha=sha)
         out.append(run)
     return out
@@ -1260,6 +1307,10 @@ def decide_dispatch(
     pause and never an unbounded loop).
     """
     sha = normalize_sha(target_sha)
+    relevant = sorted(
+        [marker for marker in markers if marker.sha == sha],
+        key=lambda marker: marker.created_epoch,
+    )
     for_target = [run for run in runs if run.head_sha == sha or run.declared_sha == sha]
     if any(run.is_active for run in for_target):
         return DispatchPlan(
@@ -1275,10 +1326,27 @@ def decide_dispatch(
             "a completed diagnostic run already exists for this SHA: "
             "reconcile it instead of dispatching",
         )
-    relevant = sorted(
-        [marker for marker in markers if marker.sha == sha],
-        key=lambda marker: marker.created_epoch,
-    )
+    # A run we already dispatched may not yet have published its declared
+    # identity (and a best-effort publish can fail permanently). Its
+    # Actions record only names the dispatch-ref head, so correlate the
+    # durable attempt marker with any newer in-flight workflow_dispatch run
+    # instead of racing it with a duplicate.
+    last_epoch = relevant[-1].created_epoch if relevant else 0.0
+    if relevant:
+        for run in runs:
+            if not run.is_active or run.event != "workflow_dispatch":
+                continue
+            created_epoch = parse_iso_epoch(run.created_at)
+            if (
+                created_epoch is not None
+                and created_epoch >= last_epoch - DISPATCH_RUN_CREATED_SKEW_S
+            ):
+                return DispatchPlan(
+                    False,
+                    relevant[-1].attempt,
+                    f"dispatch attempt {relevant[-1].attempt} for this SHA is still "
+                    f"active as run {run.run_id}; never dispatch a duplicate",
+                )
     attempts = max((marker.attempt for marker in relevant), default=0)
     if attempts >= MAX_DISPATCH_ATTEMPTS:
         return DispatchPlan(
@@ -1287,7 +1355,6 @@ def decide_dispatch(
             f"bounded retry cap reached ({attempts}/{MAX_DISPATCH_ATTEMPTS}) for "
             "this SHA; a manual workflow_dispatch remains available",
         )
-    last_epoch = relevant[-1].created_epoch if relevant else 0.0
     if relevant and now_epoch < last_epoch + DISPATCH_RETRY_BACKOFF_S:
         remaining = round(last_epoch + DISPATCH_RETRY_BACKOFF_S - now_epoch, 1)
         return DispatchPlan(

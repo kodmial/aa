@@ -308,6 +308,51 @@ def test_attach_declared_targets_folds_identity_into_runs() -> None:
     assert attached[1].declared_sha == ""  # identity equals record; nothing added
 
 
+def test_server_authoritative_run_title_supplies_declared_identity() -> None:
+    runs = triage.parse_runs(
+        [
+            {
+                "id": RUN_ID,
+                "head_sha": SHA_RECORD,
+                "display_title": f"AA scenario2 diagnostic target={SHA_CHECKOUT}",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-10-29T23:14:29Z",
+                "updated_at": "2026-10-30T00:13:57Z",
+            }
+        ]
+    )
+    assert runs[0].declared_sha == SHA_CHECKOUT
+    assert runs[0].identity_sha == SHA_CHECKOUT
+    decision = triage.select_declared_run(runs, allowed_shas=(SHA_CHECKOUT,))
+    assert decision.action == "reconcile"
+
+
+def test_run_title_is_not_overridden_by_comment_marker() -> None:
+    runs = triage.parse_runs(
+        [
+            {
+                "id": RUN_ID,
+                "head_sha": SHA_RECORD,
+                "display_title": f"AA scenario2 diagnostic target={SHA_CHECKOUT}",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    )
+    attached = triage.attach_declared_targets(runs, {RUN_ID: "a" * 40})
+    assert attached[0].declared_sha == SHA_CHECKOUT
+
+
+def test_only_automation_authors_may_mint_identity_markers() -> None:
+    assert triage.is_trusted_identity_author("github-actions[bot]")
+    assert triage.is_trusted_identity_author("GitHub-Actions[bot]")
+    assert not triage.is_trusted_identity_author("random-user")
+    assert not triage.is_trusted_identity_author("")
+
+
 def test_declared_selection_accepts_target_sha_run_record_mismatch() -> None:
     runs = [_defect_run(declared_sha=SHA_CHECKOUT)]
     decision = triage.select_declared_run(runs, allowed_shas=(SHA_CHECKOUT,))
@@ -361,6 +406,37 @@ def test_dispatch_guard_skips_declared_active_run() -> None:
     )
     assert plan.should_dispatch is False
     assert "already active" in plan.reason
+
+
+def test_inflight_dispatch_without_declared_marker_never_duplicates() -> None:
+    """The dispatched run may not have published its marker yet (or ever).
+
+    Its Actions record names the dispatch-ref head, so correlate the durable
+    attempt marker with the newer active workflow_dispatch run.
+    """
+    marker_epoch = triage.parse_iso_epoch("2026-10-30T01:00:00Z")
+    assert marker_epoch is not None
+    active = triage.parse_runs(
+        [
+            {
+                "id": RUN_ID,
+                "head_sha": SHA_RECORD,
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+                "conclusion": None,
+                "created_at": "2026-10-30T01:01:00Z",
+                "updated_at": None,
+            }
+        ]
+    )
+    plan = triage.decide_dispatch(
+        active,
+        target_sha=SHA_CHECKOUT,
+        markers=[triage.DispatchMarker(SHA_CHECKOUT, marker_epoch, 1)],
+        now_epoch=marker_epoch + 7200.0,
+    )
+    assert plan.should_dispatch is False
+    assert "still active" in plan.reason
 
 
 def test_selection_precedence_record_first_declared_second_ancestor_third(
@@ -466,6 +542,7 @@ def test_cli_reconciles_declared_dispatch_run_against_target_sha(
     )
     declared_comment = {
         "id": 6510000001,
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
         "body": triage.declared_target_marker(RUN_ID, SHA_CHECKOUT)
         + "\nDiagnostic run identity declared.",
     }
@@ -554,6 +631,56 @@ def test_cli_still_dispatches_when_neither_record_nor_declared_matches(
     assert dispatch_calls == [SHA_CHECKOUT]
 
 
+def test_cli_ignores_forged_declared_marker_from_untrusted_author(
+    reconciler: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An arbitrary commenter cannot stall diagnostics for a SHA."""
+    runs_path = _write_json(
+        tmp_path / "runs.json",
+        {
+            "workflow_runs": [
+                {
+                    "id": RUN_ID,
+                    "head_sha": SHA_RECORD,
+                    "event": "workflow_dispatch",
+                    "status": "in_progress",
+                    "conclusion": None,
+                    "created_at": "2026-10-30T00:00:00Z",
+                    "updated_at": None,
+                }
+            ]
+        },
+    )
+    forged = {
+        "id": 6510000099,
+        "user": {"login": "untrusted-commenter", "type": "User"},
+        "body": triage.declared_target_marker(RUN_ID, SHA_CHECKOUT),
+    }
+    comments_path = _write_json(tmp_path / "comments.json", [forged])
+    open_issues_path = _write_json(tmp_path / "issues.json", [])
+    dispatch_calls: list[str] = []
+    monkeypatch.setattr(reconciler, "collect_main_sha", lambda owner, repo: SHA_CHECKOUT)
+    monkeypatch.setattr(
+        reconciler, "dispatch_diagnostic", lambda owner, repo, sha: dispatch_calls.append(sha)
+    )
+    monkeypatch.setattr(reconciler, "post_dispatch_marker", lambda *a, **k: None)
+    args = argparse_stub(
+        runs_file=runs_path,
+        comments_file=comments_path,
+        open_issues_file=open_issues_path,
+        main_sha=SHA_CHECKOUT,
+        post=True,
+    )
+    exit_code = reconciler.run(args)
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert exit_code == reconciler.EXIT_OK
+    assert summary["phase"] == "dispatched"
+    assert dispatch_calls == [SHA_CHECKOUT]
+
+
 # ---------------------------------------------------------------------------
 # 5. Workflow contract
 # ---------------------------------------------------------------------------
@@ -567,6 +694,13 @@ def test_diagnostic_workflow_publishes_declared_identity_step() -> None:
     assert "issue_number: 419" in text
     assert "core.warning" in text  # best-effort, never fatal
     assert "actions/checkout@v4" in text
+    # Identity is also in the server-authoritative Actions run record, so it
+    # is available before any asynchronous comment lands (and survives a
+    # failed best-effort publish).
+    assert "run-name:" in text
+    assert "github.event.inputs.target_sha || github.sha" in text
+    # Dedup scans every comment page, not just the first 100.
+    assert text.count("github.paginate(github.rest.issues.listComments") == 2
     # The declared marker format matches the reconciler's parser exactly.
     marker = triage.declared_target_marker(123, SHA_CHECKOUT)
     assert triage.parse_declared_targets([marker]) == {123: SHA_CHECKOUT}

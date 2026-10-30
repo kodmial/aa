@@ -1,5 +1,11 @@
 name: AA Gate C scenario2 diagnostic
 
+# Server-authoritative run identity (kodmial/aa#483): the exact diagnosed
+# SHA travels in the Actions run record itself. The reconciler parses this
+# title instead of trusting an issue-comment marker, which any commenter
+# could forge.
+run-name: "AA scenario2 diagnostic target=${{ github.event.inputs.target_sha || github.sha }}"
+
 # kodmial/aa#418 + kodmial/aa#424 (P0 diagnostic, progress/liveness-driven):
 # run ONLY Gate C scenario #2 (substantive-drinking) through the real
 # production path on an Actions runner to reproduce the answer flow
@@ -86,7 +92,7 @@ jobs:
           const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/" + runId;
           const marker = "<!-- aa-scenario2-diagnostic-declared run=" + runId + " sha=" + sha + " -->";
           try {
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: 419,
@@ -222,7 +228,7 @@ jobs:
             const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/" + runId;
             const sha = "${{ steps.sha.outputs.main-sha }}";
             const marker = "<!-- aa-scenario2-diagnostic run=" + runId + " -->";
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: 418,
