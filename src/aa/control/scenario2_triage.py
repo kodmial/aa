@@ -17,7 +17,16 @@ diagnostic run inventory and that run's uploaded artifacts) and produces:
 - idempotent plans: ONE triage comment per ``(sha, run)`` on #419, ONE
   repair issue per evidence-harness fingerprint, ONE bounded-careful
   diagnostic ``workflow_dispatch`` (``target_sha`` only) when a run is
-  missing.
+  missing;
+- declared run identity (kodmial/aa#483): a diagnostic run that checked
+  out a ``target_sha`` different from the dispatch-ref head records its
+  exact diagnosed SHA in the server-authoritative Actions ``run-name``
+  (``target=<sha>``), so evidence selection binds the artifact to the SHA
+  the run actually diagnosed instead of the GraphQL record head_sha (the
+  record of a ``workflow_dispatch`` always names the ref head and can
+  never name the requested ``target_sha``). A trusted-author
+  ``aa-scenario2-diagnostic-declared`` marker on #419 is only a legacy
+  fallback; arbitrary comments never mint identity.
 
 No external LLM/ChatGPT judgement exists anywhere in this control plane,
 and nothing here patches product semantic logic: escalation tasks repair
@@ -26,6 +35,7 @@ the diagnostic instrumentation only.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -126,6 +136,14 @@ ACTIVE_RUN_STATUSES: frozenset[str] = frozenset(
 # Dispatch-bound retry hygiene (idempotent backoff, never terminal pause).
 MAX_DISPATCH_ATTEMPTS = 3
 DISPATCH_RETRY_BACKOFF_S = 1800.0
+# Clock-skew allowance when correlating a durable dispatch marker with the
+# workflow_dispatch run Actions created for it.
+DISPATCH_RUN_CREATED_SKEW_S = 300.0
+
+# Only the repository automation identity may mint declared run identity or
+# dispatch-attempt markers. A plain issue comment is not an identity anchor;
+# an untrusted account must never be able to forge either kind of marker.
+TRUSTED_IDENTITY_AUTHOR_LOGINS: frozenset[str] = frozenset({"github-actions[bot]"})
 
 MAX_TIMELINE_ENTRIES = 60
 MAX_FIELD_CHARS = 96
@@ -236,6 +254,9 @@ class DiagnosticRun:
     updated_at: str | None
     run_number: int
     html_url: str = ""
+    # Exact SHA the run declared it checked out and diagnosed (kodmial/aa#483).
+    # Empty when no declared identity marker exists for this run.
+    declared_sha: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -244,6 +265,17 @@ class DiagnosticRun:
     @property
     def is_completed(self) -> bool:
         return self.status == "completed" and self.conclusion is not None
+
+    @property
+    def identity_sha(self) -> str:
+        """The SHA this run's artifact evidence is bound to.
+
+        ``workflow_dispatch`` Actions records always name the dispatch-ref
+        head, never the requested ``target_sha``, so when the run itself
+        declared its diagnosed SHA that declaration is the identity anchor;
+        otherwise the Actions record head_sha is.
+        """
+        return self.declared_sha or self.head_sha
 
 
 @dataclass(frozen=True)
@@ -380,6 +412,49 @@ def normalize_allowed_shas(values: Sequence[Any]) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+_RUN_RECORD_TARGET_RE = re.compile(r"(?:^|\s)target=([0-9a-f]{40})(?=\s|$)")
+
+
+def _declared_sha_from_run_record(item: Mapping[str, Any]) -> str:
+    """Extract the diagnosed SHA from the server-authoritative run title.
+
+    The diagnostic workflow sets ``run-name`` to
+    ``... target=<checked-out SHA>``, which Actions exposes on the run
+    record as ``display_title`` (and sometimes ``name``). This is the
+    trusted identity anchor: unlike an issue comment, it can only be set by
+    the workflow itself.
+    """
+    for key in ("display_title", "name"):
+        title = str(item.get(key) or "").lower()
+        match = _RUN_RECORD_TARGET_RE.search(title)
+        if match and _SHA_RE.fullmatch(match.group(1)):
+            return match.group(1)
+    return ""
+
+
+def is_trusted_identity_author(login: str) -> bool:
+    """True only for the repository automation identity.
+
+    Declared-identity and dispatch markers are hints at best; accepting
+    them from arbitrary comments would let any commenter forge a mapping
+    from run_id to SHA. The workflow posts them as github-actions[bot].
+    """
+    return str(login or "").strip().lower() in TRUSTED_IDENTITY_AUTHOR_LOGINS
+
+
+def is_automation_author(login: str) -> bool:
+    """True for a GitHub automation account (any ``[bot]`` login).
+
+    Triage deduplication is not an identity anchor, so it must keep matching
+    comments published by any valid automation identity, not only the one
+    repository bot that writes them today. GitHub reserves the ``[bot]``
+    login suffix for Apps and bot accounts, so this still excludes arbitrary
+    human commenters.
+    """
+    normalized = str(login or "").strip().lower()
+    return normalized in TRUSTED_IDENTITY_AUTHOR_LOGINS or normalized.endswith("[bot]")
+
+
 def parse_runs(payload: Any) -> list[DiagnosticRun]:
     """Parse unordered Actions workflow-run inventory into typed runs."""
     raw_items: Any = payload
@@ -415,6 +490,7 @@ def parse_runs(payload: Any) -> list[DiagnosticRun]:
                 updated_at=str(item.get("updated_at") or "") or None,
                 run_number=(int(run_number_raw) if isinstance(run_number_raw, int) else 0),
                 html_url=str(item.get("html_url") or ""),
+                declared_sha=_declared_sha_from_run_record(item),
             )
         )
     return out
@@ -571,15 +647,25 @@ def map_typed_outcome(
 
 
 def validate_result_identity(result: Mapping[str, Any], run: DiagnosticRun) -> str | None:
-    """Cross-check result.json identity against the selected Actions run."""
+    """Cross-check result.json identity against the run's asserted identity.
+
+    The identity anchor is ``run.identity_sha`` (the declared diagnosed SHA
+    when the run published one, else the Actions record head_sha), so a
+    ``target_sha`` dispatch run whose record head_sha can never name its
+    checkout is accepted exactly for the SHA it declared (kodmial/aa#483).
+    """
     if not isinstance(result, Mapping):
         return "result.json is not an object"
     run_id = result.get("run_id")
     if str(run_id) != str(run.run_id):
         return f"result.json run_id {run_id!r} != selected run {run.run_id}"
     sha = str(result.get("main_sha", "")).lower()
-    if sha and sha != run.head_sha:
-        return f"result.json main_sha {sha} != run head_sha {run.head_sha}"
+    identity = run.identity_sha
+    if sha and sha != identity:
+        return (
+            f"result.json main_sha {sha} != run {run.run_id} identity {identity} "
+            f"(declared {run.declared_sha or 'none'}, record head {run.head_sha})"
+        )
     schema = str(result.get("schema", ""))
     if schema and schema != DIAGNOSTIC_SCHEMA_VERSION:
         return f"unexpected result.json schema {schema!r}"
@@ -859,7 +945,7 @@ def build_triage_comment(
     repair_issue_note: str = "",
 ) -> str:
     """Privacy-safe factual triage report published on kodmial/aa#419."""
-    marker = triage_marker(run.head_sha, run.run_id)
+    marker = triage_marker(run.identity_sha, run.run_id)
     root_status = ROOT_STATUS_BY_OUTCOME.get(triage.outcome) or triage.detail
     lines: list[str] = [
         marker,
@@ -1025,7 +1111,7 @@ def build_repair_issue_plan(
         "(kodmial/aa#425 reconciler escalation)**",
         "",
         "- Source run: #" + str(run.run_id) + f" — {run.html_url}",
-        f"- Exact SHA: `{run.head_sha}`",
+        f"- Exact SHA: `{run.identity_sha}`",
         f"- Failing stage/code: `{defect}`"
         + (
             f" — members `{', '.join(f'`{m}`' for m in triage.missing_files)}`"
@@ -1081,6 +1167,94 @@ def build_repair_issue_plan(
 
 
 # ---------------------------------------------------------------------------
+# Declared run identity (kodmial/aa#483)
+# ---------------------------------------------------------------------------
+
+
+def declared_target_marker(run_id: int | str, sha: str) -> str:
+    """Durable one-per-run identity marker published by the diagnostic run."""
+    sha = normalize_sha(sha)
+    return f"<!-- aa-scenario2-diagnostic-declared run={run_id} sha={sha} -->"
+
+
+_DECLARED_TARGET_RE = re.compile(
+    r"<!--\s*aa-scenario2-diagnostic-declared\s+run=([0-9]+)\s+sha=([0-9a-f]{40})\s*-->"
+)
+
+
+def parse_declared_targets(bodies: Sequence[str]) -> dict[int, str]:
+    """Map run-id -> exact diagnosed SHA from durable #419 identity markers.
+
+    First valid marker for a run wins (comment listing order is stable).
+    Malformed/unparseable lines never mint identity.
+    """
+    out: dict[int, str] = {}
+    for body in bodies:
+        match = _DECLARED_TARGET_RE.search(body or "")
+        if match:
+            out.setdefault(int(match.group(1)), match.group(2))
+    return out
+
+
+def attach_declared_targets(
+    runs: Sequence[DiagnosticRun], declared_targets: Mapping[int, str]
+) -> list[DiagnosticRun]:
+    """Fold trusted legacy markers into parsed runs (read-only, typed).
+
+    The server-authoritative run title always wins; comment markers are
+    only a compatibility fallback for runs created before ``run-name``
+    carried the identity, and callers must pass only trusted-author
+    markers here.
+    """
+    out: list[DiagnosticRun] = []
+    for run in runs:
+        sha = declared_targets.get(run.run_id, "")
+        if sha and not run.declared_sha and sha != run.head_sha:
+            run = dataclasses.replace(run, declared_sha=sha)
+        out.append(run)
+    return out
+
+
+def select_declared_run(
+    runs: Sequence[DiagnosticRun], *, allowed_shas: Sequence[str]
+) -> SelectionDecision:
+    """Select evidence for the allowed SHAs via declared run identity.
+
+    Used when no Actions record head_sha matches the allowed SHAs: a
+    ``workflow_dispatch`` run dispatched with ``target_sha=T`` records its
+    deadline-independent identity through a declared marker, so its
+    artifact is selected for T even though the record head_sha names the
+    dispatch-ref head. Active declared runs win a ``wait``; the newest
+    completed declared run wins ``reconcile``.
+    """
+    allowed = normalize_allowed_shas(allowed_shas)
+    if not allowed:
+        return SelectionDecision("missing", None, "no allowed SHA given: cannot reconcile evidence")
+    matching = [run for run in runs if run.declared_sha in allowed]
+    for run in sorted(matching, key=_run_sort_key, reverse=True):
+        if run.is_active:
+            return SelectionDecision(
+                "wait",
+                run,
+                f"declared diagnostic run {run.run_id} still {run.status}; "
+                "reconcile once it completes (never dispatch a duplicate)",
+            )
+    for run in sorted(matching, key=_run_sort_key, reverse=True):
+        if run.is_completed:
+            return SelectionDecision(
+                "reconcile",
+                run,
+                f"newest completed diagnostic run declared for allowed SHA: "
+                f"run {run.run_id} ({run.conclusion})",
+            )
+    return SelectionDecision(
+        "missing",
+        None,
+        "no completed or active diagnostic run declared for any allowed SHA",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Missing-run dispatch planning
 # ---------------------------------------------------------------------------
 
@@ -1131,6 +1305,31 @@ def build_dispatch_inputs(target_sha: str) -> dict[str, str]:
     return inputs
 
 
+def _correlate_dispatch_marker(
+    markers: Sequence[DispatchMarker],
+    *,
+    run_created_epoch: float,
+    max_skew: float,
+) -> DispatchMarker | None:
+    """The single dispatch attempt that most plausibly created this run.
+
+    A ``workflow_dispatch`` run record names only the dispatch-ref head, so
+    an attempt marker is the sole way to bind an undeclared in-flight run
+    to a target SHA. When attempts for different SHAs are plausible creators
+    of the run, the ownership is ambiguous: return ``None`` rather than let
+    the merely nearest marker misattribute it. Under concurrent reconciler
+    schedules another target's marker can be posted closer to this run than
+    its real attempt; choosing it would either duplicate a diagnostic for
+    the true owner or suppress the wrong SHA's retry.
+    """
+    candidates = [
+        marker for marker in markers if abs(marker.created_epoch - run_created_epoch) <= max_skew
+    ]
+    if len({marker.sha for marker in candidates}) != 1:
+        return None
+    return max(candidates, key=lambda marker: marker.attempt)
+
+
 def decide_dispatch(
     runs: Sequence[DiagnosticRun],
     *,
@@ -1146,7 +1345,11 @@ def decide_dispatch(
     pause and never an unbounded loop).
     """
     sha = normalize_sha(target_sha)
-    for_target = [run for run in runs if run.head_sha == sha]
+    relevant = sorted(
+        [marker for marker in markers if marker.sha == sha],
+        key=lambda marker: marker.created_epoch,
+    )
+    for_target = [run for run in runs if run.head_sha == sha or run.declared_sha == sha]
     if any(run.is_active for run in for_target):
         return DispatchPlan(
             False,
@@ -1161,10 +1364,38 @@ def decide_dispatch(
             "a completed diagnostic run already exists for this SHA: "
             "reconcile it instead of dispatching",
         )
-    relevant = sorted(
-        [marker for marker in markers if marker.sha == sha],
-        key=lambda marker: marker.created_epoch,
-    )
+    # A run we already dispatched may not yet have published its declared
+    # identity (and a best-effort publish can fail permanently). Its
+    # Actions record only names the dispatch-ref head, so correlate the
+    # durable attempt marker with an in-flight workflow_dispatch run
+    # instead of racing it with a duplicate. Only the attempt nearest the
+    # run's creation can own it: a run created for a different target SHA
+    # must never be attributed to this marker purely because it is newer.
+    last_epoch = relevant[-1].created_epoch if relevant else 0.0
+    if relevant:
+        for run in runs:
+            if not run.is_active or run.event != "workflow_dispatch":
+                continue
+            # Never attribute a run that positively declared a different
+            # target SHA to this attempt.
+            if run.declared_sha and run.declared_sha != sha:
+                continue
+            created_epoch = parse_iso_epoch(run.created_at)
+            if created_epoch is None:
+                continue
+            claimed = _correlate_dispatch_marker(
+                markers,
+                run_created_epoch=created_epoch,
+                max_skew=DISPATCH_RUN_CREATED_SKEW_S,
+            )
+            if claimed is None or claimed.sha != sha:
+                continue
+            return DispatchPlan(
+                False,
+                claimed.attempt,
+                f"dispatch attempt {claimed.attempt} for this SHA is still "
+                f"active as run {run.run_id}; never dispatch a duplicate",
+            )
     attempts = max((marker.attempt for marker in relevant), default=0)
     if attempts >= MAX_DISPATCH_ATTEMPTS:
         return DispatchPlan(
@@ -1173,7 +1404,6 @@ def decide_dispatch(
             f"bounded retry cap reached ({attempts}/{MAX_DISPATCH_ATTEMPTS}) for "
             "this SHA; a manual workflow_dispatch remains available",
         )
-    last_epoch = relevant[-1].created_epoch if relevant else 0.0
     if relevant and now_epoch < last_epoch + DISPATCH_RETRY_BACKOFF_S:
         remaining = round(last_epoch + DISPATCH_RETRY_BACKOFF_S - now_epoch, 1)
         return DispatchPlan(
