@@ -123,8 +123,15 @@ def collect_runs(owner: str, repo: str) -> list[triage.DiagnosticRun]:
     return runs
 
 
-def collect_issue_comments(owner: str, repo: str, issue: int) -> list[tuple[int, str]]:
-    pairs: list[tuple[int, str]] = []
+def _comment_author(item: dict[str, Any]) -> str:
+    user = item.get("user")
+    if not isinstance(user, dict):
+        return ""
+    return str(user.get("login") or "")
+
+
+def collect_issue_comments(owner: str, repo: str, issue: int) -> list[tuple[int, str, str]]:
+    records: list[tuple[int, str, str]] = []
     page = 1
     while True:
         payload = _gh_api_json(
@@ -135,13 +142,13 @@ def collect_issue_comments(owner: str, repo: str, issue: int) -> list[tuple[int,
             if not isinstance(item, dict):
                 continue
             try:
-                pairs.append((int(item["id"]), str(item.get("body", ""))))
+                records.append((int(item["id"]), str(item.get("body", "")), _comment_author(item)))
             except (KeyError, TypeError, ValueError):
                 continue
         if len(items) < 100:
             break
         page += 1
-    return pairs
+    return records
 
 
 def collect_open_issue_bodies(owner: str, repo: str) -> list[str]:
@@ -466,15 +473,27 @@ def select_with_ancestor_backfill(
     target_sha: str,
     resolve_ancestor: bool,
 ) -> tuple[triage.SelectionDecision, str]:
-    """Selection, accepting a machinery-identical ancestor diagnostic run.
+    """Selection, accepting declared dispatch identity or a machinery-identical ancestor.
 
-    Backfills the diagnostic produced before this reconciler was installed:
-    a diagnostic run from an older main SHA is accepted evidence while the
-    current tree differs in NO diagnostic machinery file.
+    Backfills diagnostic evidence for the exact target SHA from two AA-owned
+    sources when no Actions record head_sha matches (kodmial/aa#483):
+
+    1. declared run identity — a ``workflow_dispatch`` run that published a
+       durable ``aa-scenario2-diagnostic-declared`` marker naming the exact
+       SHA it checked out and diagnosed (the Actions record of such a run
+       can only name the dispatch-ref head, never ``target_sha``),
+    2. a machinery-identical ancestor — a push-run diagnostic produced
+       before this reconciler was installed, accepted while the current
+       tree differs in NO diagnostic machinery file.
     """
     accepted_ancestor = ""
     selection = triage.select_diagnostic_run(runs, allowed_shas=allowed)
-    if selection.action != "missing" or not resolve_ancestor:
+    if selection.action != "missing":
+        return selection, accepted_ancestor
+    declared_decision = triage.select_declared_run(runs, allowed_shas=allowed)
+    if declared_decision.action != "missing":
+        return declared_decision, accepted_ancestor
+    if not resolve_ancestor:
         return selection, accepted_ancestor
     newest_completed = next(iter(_sorted_completed(runs)), None)
     if newest_completed is None:
@@ -510,6 +529,7 @@ def _reconcile_selected_run(
     args: argparse.Namespace,
     run: triage.DiagnosticRun,
     summary: dict[str, Any],
+    comment_records: list[tuple[int, str, str]] | None = None,
 ) -> triage.TriageOutcome:
     """Evaluate + publish triage for one completed diagnostic run."""
     artifact_name = triage.artifact_name_for_run(run.run_id)
@@ -564,8 +584,22 @@ def _reconcile_selected_run(
         evidence_gaps=gaps,
         repair_issue_note=repair_plan.reason if repair_plan.should_create else "",
     )
-    comment_pairs = _comment_input(args)
-    action = triage.decide_triage_comment(comment_pairs, sha=run.head_sha, run_id=run.run_id)
+    records = comment_records if comment_records is not None else _comment_input(args)
+    comment_pairs = [
+        (comment_id, body)
+        for comment_id, body, author in records
+        if triage.is_automation_author(author)
+    ]
+    action = triage.decide_triage_comment(comment_pairs, sha=run.identity_sha, run_id=run.run_id)
+    if action.kind == "create" and run.declared_sha and run.declared_sha != run.head_sha:
+        # Comments published before the declared-identity migration carry
+        # triage_marker(run.head_sha, run.run_id). Update that comment in
+        # place instead of minting a second one for the same (sha, run).
+        legacy_action = triage.decide_triage_comment(
+            comment_pairs, sha=run.head_sha, run_id=run.run_id
+        )
+        if legacy_action.kind != "create":
+            action = legacy_action
     summary["comment"] = {"action": action.kind, "comment_id": action.comment_id}
     if args.post:
         summary["posted"] = post_triage_comment(
@@ -583,9 +617,9 @@ def _reconcile_selected_run(
     return outcome
 
 
-def _comment_input(args: argparse.Namespace) -> list[tuple[int, str]]:
+def _comment_input(args: argparse.Namespace) -> list[tuple[int, str, str]]:
     if args.comments_file:
-        return _load_comment_pairs(args.comments_file)
+        return _load_comment_records(args.comments_file)
     return collect_issue_comments(args.owner, args.repo, args.triage_issue)
 
 
@@ -600,19 +634,19 @@ def _open_bodies(args: argparse.Namespace) -> list[str]:
     return collect_open_issue_bodies(args.owner, args.repo)
 
 
-def _load_comment_pairs(path: str) -> list[tuple[int, str]]:
+def _load_comment_records(path: str) -> list[tuple[int, str, str]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError("comments file must be a JSON list")
-    pairs: list[tuple[int, str]] = []
+    records: list[tuple[int, str, str]] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
         try:
-            pairs.append((int(item["id"]), str(item.get("body", ""))))
+            records.append((int(item["id"]), str(item.get("body", "")), _comment_author(item)))
         except (KeyError, TypeError, ValueError):
             continue
-    return pairs
+    return records
 
 
 def run(args: argparse.Namespace) -> int:
@@ -629,6 +663,20 @@ def run(args: argparse.Namespace) -> int:
         if args.runs_file
         else collect_runs(args.owner, args.repo)
     )
+    # kodmial/aa#483: fold declared identities into the runs so selection
+    # and evidence binding use the SHA each run actually diagnosed. The
+    # server-authoritative run title is the primary anchor; comment markers
+    # are a legacy fallback accepted ONLY from the trusted automation
+    # author, so an arbitrary commenter cannot forge identity or dispatch
+    # attempts. ONE fetch keeps identity/markers/comment decisions
+    # consistent.
+    comment_records = _comment_input(args)
+    trusted_bodies = [
+        body
+        for _comment_id, body, author in comment_records
+        if triage.is_trusted_identity_author(author)
+    ]
+    runs = triage.attach_declared_targets(runs, triage.parse_declared_targets(trusted_bodies))
     summary["target_sha"] = target_sha
     summary["main_sha"] = target_sha
 
@@ -652,7 +700,7 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if selection.action == "missing":
-        markers = triage.parse_dispatch_markers([body for _, body in _comment_input(args)])
+        markers = triage.parse_dispatch_markers(trusted_bodies)
         plan = triage.decide_dispatch(
             runs,
             target_sha=target_sha,
@@ -678,7 +726,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("selection resolved to reconcile without a selected run")
     summary["run_id"] = run.run_id
     summary["run_url"] = run.html_url
-    outcome = _reconcile_selected_run(args, run, summary)
+    outcome = _reconcile_selected_run(args, run, summary, comment_records)
     summary["outcome"] = outcome.outcome
     summary["blocked_code"] = outcome.blocked_code
     summary["phase"] = "reconciled"
