@@ -539,7 +539,13 @@ def test_cli_blocked_comment_shape_is_deterministic_and_idempotent(
         runs_file=runs_path,
         comments_file=_write_json(
             tmp_path / "comments2.json",
-            [{"id": 63_478, "body": hermetic_post[0]}],
+            [
+                {
+                    "id": 63_478,
+                    "user": {"login": "github-actions[bot]", "type": "Bot"},
+                    "body": hermetic_post[0],
+                }
+            ],
         ),
         open_issues_file=issues_path,
         main_sha=SOURCE_SHA,
