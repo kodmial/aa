@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+# The OpenCode checkout may not have the project installed as a package.
+# Keep both the inventory import and subprocess checks on the same src/ tree.
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
 python3 - <<'PY'
 from aa.qualification.gate_a_shell import CANONICAL_SHELL_CHECKS
 
