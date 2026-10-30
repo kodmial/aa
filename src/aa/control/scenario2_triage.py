@@ -1292,6 +1292,36 @@ def build_dispatch_inputs(target_sha: str) -> dict[str, str]:
     return inputs
 
 
+def _correlate_dispatch_marker(
+    markers: Sequence[DispatchMarker],
+    *,
+    run_created_epoch: float,
+    max_skew: float,
+) -> DispatchMarker | None:
+    """The single dispatch attempt that most plausibly created this run.
+
+    A ``workflow_dispatch`` run record names only the dispatch-ref head, so
+    an attempt marker is the sole way to bind an undeclared in-flight run
+    to a target SHA. When attempts for different SHAs are equally close to
+    the run's creation time the ownership is ambiguous: return ``None``
+    rather than let one SHA claim an unrelated run and suppress its retry.
+    """
+    nearest: list[DispatchMarker] = []
+    nearest_distance = float("inf")
+    for marker in markers:
+        distance = abs(marker.created_epoch - run_created_epoch)
+        if distance > max_skew:
+            continue
+        if distance < nearest_distance:
+            nearest = [marker]
+            nearest_distance = distance
+        elif distance == nearest_distance:
+            nearest.append(marker)
+    if len({marker.sha for marker in nearest}) != 1:
+        return None
+    return max(nearest, key=lambda marker: marker.attempt)
+
+
 def decide_dispatch(
     runs: Sequence[DiagnosticRun],
     *,
@@ -1329,8 +1359,10 @@ def decide_dispatch(
     # A run we already dispatched may not yet have published its declared
     # identity (and a best-effort publish can fail permanently). Its
     # Actions record only names the dispatch-ref head, so correlate the
-    # durable attempt marker with any newer in-flight workflow_dispatch run
-    # instead of racing it with a duplicate.
+    # durable attempt marker with an in-flight workflow_dispatch run
+    # instead of racing it with a duplicate. Only the attempt nearest the
+    # run's creation can own it: a run created for a different target SHA
+    # must never be attributed to this marker purely because it is newer.
     last_epoch = relevant[-1].created_epoch if relevant else 0.0
     if relevant:
         for run in runs:
@@ -1341,16 +1373,21 @@ def decide_dispatch(
             if run.declared_sha and run.declared_sha != sha:
                 continue
             created_epoch = parse_iso_epoch(run.created_at)
-            if (
-                created_epoch is not None
-                and created_epoch >= last_epoch - DISPATCH_RUN_CREATED_SKEW_S
-            ):
-                return DispatchPlan(
-                    False,
-                    relevant[-1].attempt,
-                    f"dispatch attempt {relevant[-1].attempt} for this SHA is still "
-                    f"active as run {run.run_id}; never dispatch a duplicate",
-                )
+            if created_epoch is None:
+                continue
+            claimed = _correlate_dispatch_marker(
+                markers,
+                run_created_epoch=created_epoch,
+                max_skew=DISPATCH_RUN_CREATED_SKEW_S,
+            )
+            if claimed is None or claimed.sha != sha:
+                continue
+            return DispatchPlan(
+                False,
+                claimed.attempt,
+                f"dispatch attempt {claimed.attempt} for this SHA is still "
+                f"active as run {run.run_id}; never dispatch a duplicate",
+            )
     attempts = max((marker.attempt for marker in relevant), default=0)
     if attempts >= MAX_DISPATCH_ATTEMPTS:
         return DispatchPlan(

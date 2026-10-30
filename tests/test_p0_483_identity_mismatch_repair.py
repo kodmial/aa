@@ -439,6 +439,68 @@ def test_inflight_dispatch_without_declared_marker_never_duplicates() -> None:
     assert "still active" in plan.reason
 
 
+def test_inflight_run_is_not_attributed_to_another_shas_marker() -> None:
+    """A pending run for SHA-U must not suppress a fresh dispatch for SHA-T.
+
+    The run's Actions record names only the dispatch-ref head, so ownership
+    follows the nearest durable attempt marker. SHA-U's marker is closer to
+    the run than SHA-T's, which therefore keeps its retry path.
+    """
+    marker_t = triage.parse_iso_epoch("2026-10-30T01:00:00Z")
+    marker_u = triage.parse_iso_epoch("2026-10-30T01:01:00Z")
+    assert marker_t is not None and marker_u is not None
+    active = triage.parse_runs(
+        [
+            {
+                "id": RUN_ID,
+                "head_sha": SHA_RECORD,
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+                "conclusion": None,
+                "created_at": "2026-10-30T01:01:10Z",
+                "updated_at": None,
+            }
+        ]
+    )
+    plan = triage.decide_dispatch(
+        active,
+        target_sha=SHA_CHECKOUT,
+        markers=[
+            triage.DispatchMarker(SHA_CHECKOUT, marker_t, 1),
+            triage.DispatchMarker("a" * 40, marker_u, 1),
+        ],
+        now_epoch=marker_t + 7200.0,
+    )
+    assert plan.should_dispatch is True
+    assert plan.attempt == 2
+
+
+def test_stale_inflight_run_outside_correlation_window_is_not_attributed() -> None:
+    marker_epoch = triage.parse_iso_epoch("2026-10-30T01:00:00Z")
+    assert marker_epoch is not None
+    stale = triage.parse_runs(
+        [
+            {
+                "id": RUN_ID,
+                "head_sha": SHA_RECORD,
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+                "conclusion": None,
+                "created_at": "2026-10-30T02:00:00Z",
+                "updated_at": None,
+            }
+        ]
+    )
+    plan = triage.decide_dispatch(
+        stale,
+        target_sha=SHA_CHECKOUT,
+        markers=[triage.DispatchMarker(SHA_CHECKOUT, marker_epoch, 1)],
+        now_epoch=marker_epoch + 7200.0,
+    )
+    assert plan.should_dispatch is True
+    assert plan.attempt == 2
+
+
 def test_selection_precedence_record_first_declared_second_ancestor_third(
     reconciler: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
