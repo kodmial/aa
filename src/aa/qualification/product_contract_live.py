@@ -33,15 +33,21 @@ import re
 import resource
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aa.opencode.errors import OpenCodeRateLimitError
+from aa.qualification.live_partial_evidence import (
+    EVENT_KIND_CHILD_TIMEOUT,
+    build_partial_evidence_snapshot,
+    stage_latency_coverage,
+)
 from aa.qualification.live_turn_repair import (
     build_timeout_attribution,
     quiesce_and_abort_stalled_turn,
+    request_state_from_audit,
 )
 from aa.qualification.live_watchdog import (
     live_total_deadline_s,
@@ -2738,6 +2744,10 @@ async def run_live_telegram_evidence_lane(
     # this, a 25-minute Gate C collapses 18 different failures into one
     # fingerprint and automated repair has no actionable root cause.
     scenario_diagnostics: list[dict[str, Any]] = []
+    # Initialized before the partial-evidence callback is defined so every
+    # progress write (including observer-start) can read it safely; the
+    # concrete campaign tuple is assigned once the scenarios are resolved.
+    scenarios: tuple[tuple[str, int, str], ...] = ()
     # Resolve the configurable operational wait once, before the harness can
     # fail, so timeout evidence stays available for a pre-scenario crash too.
     _policy = current_time_policy()
@@ -2926,6 +2936,113 @@ async def run_live_telegram_evidence_lane(
         app = Application(settings, transport=transport)
         await app.start()
 
+        # kodmial/aa#453: durable partial-diagnostics contract. The full
+        # metric assembly happens once, at the very end of the campaign —
+        # exactly the point the parent watchdog is most likely to preempt
+        # on ``total-deadline`` or ``no-real-progress``. From the first
+        # meaningful transition onward the lane therefore assembles a
+        # bounded, privacy-safe partial snapshot of the already-measured
+        # facts (attempt ledger, served models, token counters, request
+        # latencies, process state, passive server evidence, stage
+        # telemetry, scenario accounting) and merges it into every
+        # progress write, so a preempted child never loses the measured
+        # diagnostics the parent could already have had.
+        #
+        # The server-side probe (:mod:`aa.opencode.server_events`) is
+        # refreshed only at scenario boundaries — never inside synchronous
+        # stage callbacks: those reuse :meth:`cached_evidence` (no network
+        # work), so absence of a fresh probe stays explicitly typed rather
+        # than silently stale.
+        server_probe: Any = None
+        server_probe_reason = ""
+        try:
+            from aa.opencode.server_events import probe_for_runtime
+
+            server_probe = probe_for_runtime(app.opencode_runtime)
+            if server_probe is None:
+                server_probe_reason = "vantage-unavailable"
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break the lane
+            server_probe = None
+            server_probe_reason = type(exc).__name__[:64]
+
+        async def _refresh_server_evidence() -> None:
+            if server_probe is None:
+                return
+            try:
+                await server_probe.snapshot()
+            except Exception:  # noqa: BLE001 - probe must never break the lane
+                return
+
+        def _current_request_state(causality: str) -> str:
+            if not causality:
+                return ""
+            try:
+                report = request_state_from_audit(
+                    app.opencode_runtime.client.request_latency_audit,
+                    causality,
+                )
+            except Exception:  # noqa: BLE001 - diagnostics must not break the lane
+                return ""
+            return str(report.get("request_state", ""))[:48]
+
+        def _collect_partial_evidence(
+            phase: str,
+            *,
+            position: int | None = None,
+            fam: str = "",
+            causality: str = "",
+        ) -> dict[str, Any]:
+            runtime = getattr(app, "opencode_runtime", None)
+
+            def _audit(name: str) -> Sequence[Mapping[str, Any]] | None:
+                try:
+                    client = getattr(runtime, "client", None)
+                    accessor = getattr(client, name, None)
+                    value = accessor() if callable(accessor) else accessor
+                    if isinstance(value, (list, tuple)):
+                        return value
+                except Exception:  # noqa: BLE001 - diagnostics must not break the lane
+                    return None
+                return None
+
+            try:
+                attempt_entries = (
+                    _opencode_attempt_entries(runtime) if runtime is not None else None
+                )
+            except Exception:  # noqa: BLE001
+                attempt_entries = None
+            try:
+                process_state = _opencode_process_state(runtime) if runtime is not None else None
+            except Exception:  # noqa: BLE001
+                process_state = None
+            try:
+                server_evidence = (
+                    server_probe.cached_evidence() if server_probe is not None else None
+                )
+            except Exception:  # noqa: BLE001
+                server_evidence = None
+            scenario_total = len(scenarios)
+            return build_partial_evidence_snapshot(
+                phase=phase,
+                scenario_index=position,
+                family=fam,
+                causality_id=causality,
+                current_request_state=_current_request_state(causality),
+                scenario_total=scenario_total or None,
+                completed_scenario_count=len(scenario_diagnostics),
+                scenarios_started=scenarios_started,
+                scenarios_interrupted=scenarios_interrupted,
+                product_outcome_counts=product_outcome_counts,
+                delivered_service_error_count=delivered_service_error_count,
+                stage_snapshots=stage_snapshots,
+                attempt_entries=attempt_entries,
+                served_audit=_audit("served_model_audit"),
+                token_audit=_audit("token_usage_audit"),
+                request_audit=_audit("request_latency_audit"),
+                process_state=process_state,
+                server_evidence=server_evidence,
+            )
+
         # kodmial/aa#431 + #448: independent stall-snapshot sidecar. It
         # reads the OpenCode client's in-flight attempt ledger from
         # OUTSIDE the dispatcher and persists 10/25/45/75/110s snapshots
@@ -2972,6 +3089,9 @@ async def run_live_telegram_evidence_lane(
                     getattr(app, "opencode_runtime", None)
                 ),
                 event_sink=_live_attempt_event_sink,
+                session_status_probe=(
+                    server_probe.session_status_snapshot if server_probe is not None else None
+                ),
                 register_atexit_flush=True,
             )
             await attempt_observer.start()
@@ -2981,18 +3101,21 @@ async def run_live_telegram_evidence_lane(
         if attempt_observer is not None:
             print(
                 "Gate C diagnostics observer=active "
-                f"out=live-out/attempt-observer delays_s={SNAPSHOT_DELAYS_S}",
+                f"out=live-out/attempt-observer delays_s={SNAPSHOT_DELAYS_S} "
+                f"server_evidence={server_probe is not None}",
                 flush=True,
             )
             record_live_progress(
                 "observer-start",
                 attempt_observer_status="active",
                 real_progress=False,
+                partial_evidence=_collect_partial_evidence("observer-start"),
             )
         else:
             print(
                 "Gate C diagnostics observer=unavailable "
-                f"reason={attempt_observer_reason or 'unavailable'}",
+                f"reason={attempt_observer_reason or 'unavailable'} "
+                f"server_evidence_reason={server_probe_reason or 'unavailable'}",
                 flush=True,
             )
             record_live_progress(
@@ -3000,6 +3123,7 @@ async def run_live_telegram_evidence_lane(
                 attempt_observer_status="unavailable",
                 attempt_observer_reason=attempt_observer_reason,
                 real_progress=False,
+                partial_evidence=_collect_partial_evidence("observer-start"),
             )
 
         # Per-turn causality attribution (kodmial/aa#417): each dispatched
@@ -3046,6 +3170,16 @@ async def run_live_telegram_evidence_lane(
                 "scenario-stage",
                 active_stage=stage,
                 real_progress=True,
+                partial_evidence=_collect_partial_evidence(
+                    "scenario-stage",
+                    position=(
+                        cast(int, stage_progress_state.get("scenario_index"))
+                        if isinstance(stage_progress_state.get("scenario_index"), int)
+                        else None
+                    ),
+                    fam=str(stage_progress_state.get("family", ""))[:64],
+                    causality=str(stage_progress_state.get("causality_id", ""))[:64],
+                ),
             )
 
         set_stage_observer(_record_active_stage)
@@ -3256,6 +3390,7 @@ async def run_live_telegram_evidence_lane(
                 clear_active_stage=True,
                 scenario_diagnostics=scenario_diagnostics,
                 latency_samples=latency_samples,
+                partial_evidence=_collect_partial_evidence("scenarios-start"),
             )
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 # These logs contain only scenario identifiers, never the
@@ -3269,6 +3404,11 @@ async def run_live_telegram_evidence_lane(
                 # entering downstream work so a synchronous hang can still
                 # be distinguished from a healthy slow model.
                 stage_progress_state["last_monotonic"] = time.monotonic()
+                # kodmial/aa#453: the causality identity is bound BEFORE the
+                # scenario-start progress write so the persisted partial
+                # snapshot already carries the scenario's request identity.
+                scenario_causality_id = _lane_uuid.uuid4().hex
+                await _refresh_server_evidence()
                 record_live_progress(
                     "scenario-start",
                     scenario_index=position,
@@ -3279,6 +3419,12 @@ async def run_live_telegram_evidence_lane(
                     latency_samples=latency_samples,
                     active_stage="planner",
                     real_progress=True,
+                    partial_evidence=_collect_partial_evidence(
+                        "scenario-start",
+                        position=position,
+                        fam=family,
+                        causality=scenario_causality_id,
+                    ),
                 )
                 scenarios_started += 1
 
@@ -3288,7 +3434,6 @@ async def run_live_telegram_evidence_lane(
                 relevant_for_scenario: bool | None = None
                 helpful_for_scenario: bool | None = None
                 prior_prompts = list(prior_by_chat.get(chat_id, []))
-                scenario_causality_id = _lane_uuid.uuid4().hex
                 # kodmial/aa#448: one consistent causality→scenario_index
                 # identity (bounded to the current scenario) so attempt
                 # events and stage transitions resolve to the same
@@ -3299,6 +3444,7 @@ async def run_live_telegram_evidence_lane(
                 stage_progress_state["scenario_index"] = position
                 stage_progress_state["scenario_total"] = len(scenarios)
                 stage_progress_state["causality_id"] = scenario_causality_id
+                stage_progress_state["family"] = family
                 causality_by_chat[int(chat_id)] = scenario_causality_id
                 # Release the stall quarantine for this scenario: cleanup for
                 # any prior abandon has completed, so no stale task can
@@ -3366,6 +3512,12 @@ async def run_live_telegram_evidence_lane(
                             completed_scenario_count=len(scenario_diagnostics),
                             scenario_diagnostics=scenario_diagnostics,
                             latency_samples=latency_samples,
+                            partial_evidence=_collect_partial_evidence(
+                                "scenario-heartbeat",
+                                position=position,
+                                fam=family,
+                                causality=scenario_causality_id,
+                            ),
                         )
                 if len(api.sent_texts) <= before:
                     timeout_elapsed_ms = round(
@@ -3402,6 +3554,14 @@ async def run_live_telegram_evidence_lane(
                         "delivery_timeout": True,
                         "completed_scenario_count": len(scenario_diagnostics),
                         "scenario_total": len(scenarios),
+                        # kodmial/aa#453: distinct event identity so the
+                        # child's own scenario abort and any later parent
+                        # watchdog termination of the same scenario are two
+                        # separate typed records (never double counted as
+                        # one ambiguous row).
+                        "event_kind": EVENT_KIND_CHILD_TIMEOUT,
+                        "event_id": _lane_uuid.uuid4().hex,
+                        "turn_causality_id": scenario_causality_id,
                         # Preserve the actually observed elapsed wait for
                         # legacy/aggregate consumers; never cap it at the
                         # old product SLO.
@@ -3470,6 +3630,12 @@ async def run_live_telegram_evidence_lane(
                             stall_recovery_in_progress=True,
                             stall_recovery_started_monotonic=time.monotonic(),
                             real_progress=False,
+                            partial_evidence=_collect_partial_evidence(
+                                "scenario-abort-start",
+                                position=position,
+                                fam=family,
+                                causality=scenario_causality_id,
+                            ),
                         )
 
                         async def _retire_runtime(
@@ -3548,6 +3714,12 @@ async def run_live_telegram_evidence_lane(
                         ],
                         cleanup=stall_cleanup,
                         real_progress=False,
+                        partial_evidence=_collect_partial_evidence(
+                            "scenario-timeout",
+                            position=position,
+                            fam=family,
+                            causality=scenario_causality_id,
+                        ),
                     )
                     # Bounded-censored latency for this interrupted ordinary
                     # scenario was persisted above, before cleanup (#436).
@@ -3566,6 +3738,12 @@ async def run_live_telegram_evidence_lane(
                         "scenario-abort-done",
                         scenario_index=position,
                         stall_recovery_in_progress=False,
+                        partial_evidence=_collect_partial_evidence(
+                            "scenario-abort-done",
+                            position=position,
+                            fam=family,
+                            causality=scenario_causality_id,
+                        ),
                         real_progress=False,
                     )
                     continue
@@ -3577,6 +3755,12 @@ async def run_live_telegram_evidence_lane(
                     scenario_index=position,
                     family=family,
                     real_progress=True,
+                    partial_evidence=_collect_partial_evidence(
+                        "scenario-response",
+                        position=position,
+                        fam=family,
+                        causality=scenario_causality_id,
+                    ),
                 )
                 _check(
                     f"live-transport-{family}-accepted",
@@ -3801,23 +3985,31 @@ async def run_live_telegram_evidence_lane(
                         )
                     # Fixed-vocabulary outcome codes and numbers only:
                     # evidence identifies the broken pipeline stage without
-                    # exposing dialog text, prompts or excerpts.
+                    # exposing dialog text, prompts or excerpts. Stage
+                    # latencies travel measured-only (kodmial/aa#453): a
+                    # stamped 0 that the pipeline cannot prove was a real
+                    # measurement is never published as a latency; the
+                    # per-stage coverage carries the verdict instead.
+                    _stage_latency_measured = {
+                        stage: round(float(snapshot.get(field) or 0), 1)
+                        for stage, field in (
+                            ("planner", "planner_latency_ms"),
+                            ("retrieval", "retrieval_latency_ms"),
+                            ("answer", "answer_latency_ms"),
+                            ("verifier", "verifier_latency_ms"),
+                        )
+                        if isinstance(snapshot.get(field), (int, float))
+                        and not isinstance(snapshot.get(field), bool)
+                        and float(snapshot.get(field) or 0) > 0
+                    }
                     scenario_diagnostics.append(
                         {
                             "scenario_index": position,
                             "family": family,
                             "delivery_timeout": False,
                             "delivery_latency_ms": round(elapsed * 1000, 1),
-                            "stage_latency_ms": {
-                                stage: round(float(snapshot.get(field, 0) or 0), 1)
-                                for stage, field in (
-                                    ("planner", "planner_latency_ms"),
-                                    ("retrieval", "retrieval_latency_ms"),
-                                    ("answer", "answer_latency_ms"),
-                                    ("verifier", "verifier_latency_ms"),
-                                )
-                                if isinstance(snapshot.get(field), (int, float))
-                            },
+                            "stage_latency_ms": _stage_latency_measured,
+                            "stage_latency_coverage": stage_latency_coverage(snapshot),
                             "verified_book_units": int(snapshot.get("verified_book_units", 0) or 0),
                             "verifier_unavailable_units": int(
                                 snapshot.get("verifier_unavailable_units", 0) or 0
@@ -3848,6 +4040,12 @@ async def run_live_telegram_evidence_lane(
                         completed_scenario_count=len(scenario_diagnostics),
                         scenario_diagnostics=scenario_diagnostics,
                         latency_samples=latency_samples,
+                        partial_evidence=_collect_partial_evidence(
+                            "scenario-complete",
+                            position=position,
+                            fam=family,
+                            causality=scenario_causality_id,
+                        ),
                     )
                     print(
                         f"Gate C scenario {position}/{len(scenarios)} family={family} "
@@ -3866,6 +4064,7 @@ async def run_live_telegram_evidence_lane(
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
 
+            await _refresh_server_evidence()
             record_live_progress(
                 "post-scenario-checks",
                 clear_scenario_deadline=True,
@@ -3874,6 +4073,7 @@ async def run_live_telegram_evidence_lane(
                 completed_scenario_count=len(scenario_diagnostics),
                 scenario_diagnostics=scenario_diagnostics,
                 latency_samples=latency_samples,
+                partial_evidence=_collect_partial_evidence("post-scenario-checks"),
             )
 
             # Multi-turn regression families (kodmial/aa#259): raw Telegram
@@ -3951,7 +4151,11 @@ async def run_live_telegram_evidence_lane(
                 # end-quiescence: the served turn proves the recovered lane is
                 # delivering again; abandon any quarantined residue.
                 api.end_quiescence()
-                record_live_progress("scenario-response", real_progress=True)
+                record_live_progress(
+                    "scenario-response",
+                    real_progress=True,
+                    partial_evidence=_collect_partial_evidence("scenario-response-regression"),
+                )
                 elapsed_raw = time.perf_counter() - started_raw
                 latencies.append(elapsed_raw)
                 import uuid as _uuid
@@ -4847,6 +5051,12 @@ async def run_live_telegram_evidence_lane(
     if latencies:
         passed.append("live-text-latency-measured")
 
+    # kodmial/aa#453: stage latencies aggregate measured-only — a stamped
+    # zero that telemetry cannot prove was a real measurement (or an
+    # absent stamp) is excluded, and the per-stage coverage counters state
+    # which scenario turns were measured, unobserved or unproven. This
+    # keeps the p50/p95/max honest for every consumer (gate evidence, the
+    # c-focus verdict and human log readers).
     stage_latency_ms: dict[str, dict[str, float]] = {}
     for stage, key in (
         ("planner", "planner_latency_ms"),
@@ -4858,7 +5068,7 @@ async def run_live_telegram_evidence_lane(
         values: list[float] = []
         for snapshot in stage_snapshots:
             value = snapshot.get(key)
-            if isinstance(value, (int, float)) and float(value) >= 0:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) > 0:
                 values.append(float(value))
         if values:
             stage_latency_ms[stage] = {
@@ -4866,6 +5076,27 @@ async def run_live_telegram_evidence_lane(
                 "p95": round(_percentile(values, 95), 1),
                 "max": round(max(values), 1),
             }
+    stage_latency_coverage_metrics: dict[str, Any] = {}
+    stage_verdict_stages: set[str] = set()
+    for snapshot in stage_snapshots:
+        stage_verdicts = stage_latency_coverage(snapshot)
+        for stage, stage_verdict in stage_verdicts.items():
+            counts = stage_latency_coverage_metrics.setdefault(stage, {})
+            counts[stage_verdict] = counts.get(stage_verdict, 0) + 1
+            stage_verdict_stages.add(stage)
+    stage_latency_metrics = (
+        {
+            "coverage": "measured-only",
+            "turns_observed": len(stage_snapshots),
+            "stages": stage_latency_coverage_metrics,
+        }
+        if stage_verdict_stages
+        else {
+            "coverage": "unobserved",
+            "turns_observed": len(stage_snapshots),
+            "stages": {},
+        }
+    )
 
     repair_rounds = [
         int(snapshot.get("repair_rounds", 0) or 0)
@@ -5011,7 +5242,10 @@ async def run_live_telegram_evidence_lane(
         _judge_models = []
 
     metrics = {
-        "scenarios_executed": 8,
+        # kodmial/aa#453: the lagging literal ``8`` mislabeled the count
+        # for every consumer (watchdog merges, gate evidence, repair
+        # agents). The honest started-count replaces it.
+        "scenarios_executed": scenarios_started,
         "turns_executed": len(latency_samples) if latency_samples else len(latencies),
         "latency_p50_s": round(p50, 4),
         "latency_p95_s": round(p95, 4),
@@ -5076,6 +5310,7 @@ async def run_live_telegram_evidence_lane(
         "scenario_diagnostics": scenario_diagnostics,
         "stage_outcome_counts": _count_stage_outcomes(stage_snapshots),
         "stage_latency_ms": stage_latency_ms,
+        "stage_latency_coverage": stage_latency_metrics,
         "repair_metrics": repair_metrics,
         "verifier_metrics": verifier_metrics,
         "opencode_request_latency_ms": request_latency_ms,

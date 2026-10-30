@@ -1193,6 +1193,43 @@ def _union_has_distinct_stage_cover(names: list[str]) -> bool:
     return _assign(0)
 
 
+def _gate_c_latency_fields(
+    real_latencies: list[float] | None,
+    aggregate: dict[str, float] | None,
+) -> tuple[float, float, float, bool]:
+    """Honest measured latency triple for gate evidence (kodmial/aa#453).
+
+    Real per-turn samples win; the authoritatively recorded aggregate SLO
+    comes second (no sample synthesis). Returns ``(p50, p95, max,
+    measured)``; zeros also stay explicit through ``measured=False`` so
+    callers append the ``latency-not-measured`` marker instead of a fake
+    metric ever being read as a measured 0 ms turn.
+    """
+    if real_latencies:
+        ordered = sorted(v for v in real_latencies if v > 0)
+        if ordered:
+
+            def rank(p: float) -> float:
+                idx = min(len(ordered) - 1, max(0, int(round((p / 100.0) * (len(ordered) - 1)))))
+                return round(ordered[idx], 1)
+
+            return rank(50), rank(95), round(max(ordered), 1), True
+    if aggregate:
+        p50 = float(aggregate.get("p50_ms", 0.0) or 0.0)
+        p95 = float(aggregate.get("p95_ms", 0.0) or 0.0)
+        max_ms = float(aggregate.get("max_ms", 0.0) or 0.0)
+        if p50 > 0 or p95 > 0 or max_ms > 0:
+            return p50, p95, max_ms, True
+    return 0.0, 0.0, 0.0, False
+
+
+def _latency_not_measured_suffix(detail: str, measured: bool) -> str:
+    """Keep 0.0 latency fields explicitly marked when nothing was measured."""
+    if measured:
+        return detail[:160]
+    return f"{detail};latency-not-measured"[:160]
+
+
 def _gate_c_live_evidence(
     expected_sha: str, run_id: str, product: str, runtime: str
 ) -> tuple[GateEvidence, list[float], dict[str, float] | None] | None:
@@ -1362,6 +1399,7 @@ def _gate_c_live_evidence(
             None,
         )
         if live_lane is None:
+            _p50, _p95, _max, _measured = _gate_c_latency_fields(real_latencies, aggregate)
             return (
                 GateEvidence(
                     gate="C",
@@ -1373,7 +1411,12 @@ def _gate_c_live_evidence(
                     component="live-production-path",
                     run_id=run_id,
                     mocked_only=False,
-                    detail="missing-live-telegram-evidence-lane",
+                    latency_p50_ms=_p50,
+                    latency_p95_ms=_p95,
+                    max_turn_ms=_max,
+                    detail=_latency_not_measured_suffix(
+                        "missing-live-telegram-evidence-lane", _measured
+                    ),
                 ),
                 real_latencies,
                 aggregate,
@@ -1404,6 +1447,7 @@ def _gate_c_live_evidence(
         # here so Gate D can never inherit a fake network proof from C.
         lane_metrics = live_lane.get("metrics", {})
         boundary = lane_metrics.get("gate_boundary", {}) if isinstance(lane_metrics, dict) else {}
+        _p50, _p95, _max, _measured = _gate_c_latency_fields(real_latencies, aggregate)
         if not isinstance(boundary, dict) or not boundary:
             return (
                 GateEvidence(
@@ -1417,7 +1461,10 @@ def _gate_c_live_evidence(
                     run_id=run_id,
                     live_trusted=True,
                     mocked_only=False,
-                    detail="gate-c-boundary-missing",
+                    latency_p50_ms=_p50,
+                    latency_p95_ms=_p95,
+                    max_turn_ms=_max,
+                    detail=_latency_not_measured_suffix("gate-c-boundary-missing", _measured),
                 ),
                 real_latencies,
                 aggregate,
@@ -1438,7 +1485,12 @@ def _gate_c_live_evidence(
                         run_id=run_id,
                         live_trusted=True,
                         mocked_only=False,
-                        detail="gate-c-egress-must-be-simulated",
+                        latency_p50_ms=_p50,
+                        latency_p95_ms=_p95,
+                        max_turn_ms=_max,
+                        detail=_latency_not_measured_suffix(
+                            "gate-c-egress-must-be-simulated", _measured
+                        ),
                     ),
                     real_latencies,
                     aggregate,
@@ -1456,7 +1508,12 @@ def _gate_c_live_evidence(
                         run_id=run_id,
                         live_trusted=True,
                         mocked_only=False,
-                        detail="gate-c-receipt-must-be-simulated",
+                        latency_p50_ms=_p50,
+                        latency_p95_ms=_p95,
+                        max_turn_ms=_max,
+                        detail=_latency_not_measured_suffix(
+                            "gate-c-receipt-must-be-simulated", _measured
+                        ),
                     ),
                     real_latencies,
                     aggregate,
@@ -1474,7 +1531,12 @@ def _gate_c_live_evidence(
                         run_id=run_id,
                         live_trusted=True,
                         mocked_only=False,
-                        detail="gate-c-cannot-claim-external-delivery",
+                        latency_p50_ms=_p50,
+                        latency_p95_ms=_p95,
+                        max_turn_ms=_max,
+                        detail=_latency_not_measured_suffix(
+                            "gate-c-cannot-claim-external-delivery", _measured
+                        ),
                     ),
                     real_latencies,
                     aggregate,
@@ -1492,6 +1554,9 @@ def _gate_c_live_evidence(
                     run_id=run_id,
                     live_trusted=True,
                     mocked_only=False,
+                    latency_p50_ms=_p50,
+                    latency_p95_ms=_p95,
+                    max_turn_ms=_max,
                 ),
                 real_latencies,
                 aggregate,
@@ -1510,7 +1575,10 @@ def _gate_c_live_evidence(
                     run_id=run_id,
                     live_trusted=True,
                     mocked_only=False,
-                    detail="live-telegram-evidence-failed",
+                    latency_p50_ms=_p50,
+                    latency_p95_ms=_p95,
+                    max_turn_ms=_max,
+                    detail=_latency_not_measured_suffix("live-telegram-evidence-failed", _measured),
                 ),
                 real_latencies,
                 aggregate,
@@ -1527,7 +1595,10 @@ def _gate_c_live_evidence(
                 component="live-production-path",
                 run_id=run_id,
                 mocked_only=False,
-                detail=detail[:160],
+                latency_p50_ms=_p50,
+                latency_p95_ms=_p95,
+                max_turn_ms=_max,
+                detail=_latency_not_measured_suffix(detail, _measured),
             ),
             real_latencies,
             aggregate,
