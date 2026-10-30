@@ -466,15 +466,27 @@ def select_with_ancestor_backfill(
     target_sha: str,
     resolve_ancestor: bool,
 ) -> tuple[triage.SelectionDecision, str]:
-    """Selection, accepting a machinery-identical ancestor diagnostic run.
+    """Selection, accepting declared dispatch identity or a machinery-identical ancestor.
 
-    Backfills the diagnostic produced before this reconciler was installed:
-    a diagnostic run from an older main SHA is accepted evidence while the
-    current tree differs in NO diagnostic machinery file.
+    Backfills diagnostic evidence for the exact target SHA from two AA-owned
+    sources when no Actions record head_sha matches (kodmial/aa#483):
+
+    1. declared run identity — a ``workflow_dispatch`` run that published a
+       durable ``aa-scenario2-diagnostic-declared`` marker naming the exact
+       SHA it checked out and diagnosed (the Actions record of such a run
+       can only name the dispatch-ref head, never ``target_sha``),
+    2. a machinery-identical ancestor — a push-run diagnostic produced
+       before this reconciler was installed, accepted while the current
+       tree differs in NO diagnostic machinery file.
     """
     accepted_ancestor = ""
     selection = triage.select_diagnostic_run(runs, allowed_shas=allowed)
-    if selection.action != "missing" or not resolve_ancestor:
+    if selection.action != "missing":
+        return selection, accepted_ancestor
+    declared_decision = triage.select_declared_run(runs, allowed_shas=allowed)
+    if declared_decision.action != "missing":
+        return declared_decision, accepted_ancestor
+    if not resolve_ancestor:
         return selection, accepted_ancestor
     newest_completed = next(iter(_sorted_completed(runs)), None)
     if newest_completed is None:
@@ -565,7 +577,7 @@ def _reconcile_selected_run(
         repair_issue_note=repair_plan.reason if repair_plan.should_create else "",
     )
     comment_pairs = _comment_input(args)
-    action = triage.decide_triage_comment(comment_pairs, sha=run.head_sha, run_id=run.run_id)
+    action = triage.decide_triage_comment(comment_pairs, sha=run.identity_sha, run_id=run.run_id)
     summary["comment"] = {"action": action.kind, "comment_id": action.comment_id}
     if args.post:
         summary["posted"] = post_triage_comment(
@@ -629,6 +641,14 @@ def run(args: argparse.Namespace) -> int:
         if args.runs_file
         else collect_runs(args.owner, args.repo)
     )
+    # kodmial/aa#483: fold durable declared identities into the runs so
+    # selection and evidence binding use the SHA each run actually
+    # diagnosed. Comment bodies feed identity, dispatch markers and the
+    # idempotent comment decision; ONE fetch keeps them consistent.
+    comment_pairs = _comment_input(args)
+    runs = triage.attach_declared_targets(
+        runs, triage.parse_declared_targets([body for _, body in comment_pairs])
+    )
     summary["target_sha"] = target_sha
     summary["main_sha"] = target_sha
 
@@ -652,7 +672,7 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if selection.action == "missing":
-        markers = triage.parse_dispatch_markers([body for _, body in _comment_input(args)])
+        markers = triage.parse_dispatch_markers([body for _, body in comment_pairs])
         plan = triage.decide_dispatch(
             runs,
             target_sha=target_sha,

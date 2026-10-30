@@ -17,7 +17,14 @@ diagnostic run inventory and that run's uploaded artifacts) and produces:
 - idempotent plans: ONE triage comment per ``(sha, run)`` on #419, ONE
   repair issue per evidence-harness fingerprint, ONE bounded-careful
   diagnostic ``workflow_dispatch`` (``target_sha`` only) when a run is
-  missing.
+  missing;
+- declared run identity (kodmial/aa#483): a diagnostic run that checked
+  out a ``target_sha`` different from the dispatch-ref head records its
+  exact diagnosed SHA as a durable ``aa-scenario2-diagnostic-declared``
+  marker on #419, so evidence selection binds the artifact to the SHA the
+  run actually diagnosed instead of the GraphQL record head_sha (the
+  record of a ``workflow_dispatch`` always names the ref head and can
+  never name the requested ``target_sha``).
 
 No external LLM/ChatGPT judgement exists anywhere in this control plane,
 and nothing here patches product semantic logic: escalation tasks repair
@@ -26,6 +33,7 @@ the diagnostic instrumentation only.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -236,6 +244,9 @@ class DiagnosticRun:
     updated_at: str | None
     run_number: int
     html_url: str = ""
+    # Exact SHA the run declared it checked out and diagnosed (kodmial/aa#483).
+    # Empty when no declared identity marker exists for this run.
+    declared_sha: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -244,6 +255,17 @@ class DiagnosticRun:
     @property
     def is_completed(self) -> bool:
         return self.status == "completed" and self.conclusion is not None
+
+    @property
+    def identity_sha(self) -> str:
+        """The SHA this run's artifact evidence is bound to.
+
+        ``workflow_dispatch`` Actions records always name the dispatch-ref
+        head, never the requested ``target_sha``, so when the run itself
+        declared its diagnosed SHA that declaration is the identity anchor;
+        otherwise the Actions record head_sha is.
+        """
+        return self.declared_sha or self.head_sha
 
 
 @dataclass(frozen=True)
@@ -571,15 +593,25 @@ def map_typed_outcome(
 
 
 def validate_result_identity(result: Mapping[str, Any], run: DiagnosticRun) -> str | None:
-    """Cross-check result.json identity against the selected Actions run."""
+    """Cross-check result.json identity against the run's asserted identity.
+
+    The identity anchor is ``run.identity_sha`` (the declared diagnosed SHA
+    when the run published one, else the Actions record head_sha), so a
+    ``target_sha`` dispatch run whose record head_sha can never name its
+    checkout is accepted exactly for the SHA it declared (kodmial/aa#483).
+    """
     if not isinstance(result, Mapping):
         return "result.json is not an object"
     run_id = result.get("run_id")
     if str(run_id) != str(run.run_id):
         return f"result.json run_id {run_id!r} != selected run {run.run_id}"
     sha = str(result.get("main_sha", "")).lower()
-    if sha and sha != run.head_sha:
-        return f"result.json main_sha {sha} != run head_sha {run.head_sha}"
+    identity = run.identity_sha
+    if sha and sha != identity:
+        return (
+            f"result.json main_sha {sha} != run {run.run_id} identity {identity} "
+            f"(declared {run.declared_sha or 'none'}, record head {run.head_sha})"
+        )
     schema = str(result.get("schema", ""))
     if schema and schema != DIAGNOSTIC_SCHEMA_VERSION:
         return f"unexpected result.json schema {schema!r}"
@@ -859,7 +891,7 @@ def build_triage_comment(
     repair_issue_note: str = "",
 ) -> str:
     """Privacy-safe factual triage report published on kodmial/aa#419."""
-    marker = triage_marker(run.head_sha, run.run_id)
+    marker = triage_marker(run.identity_sha, run.run_id)
     root_status = ROOT_STATUS_BY_OUTCOME.get(triage.outcome) or triage.detail
     lines: list[str] = [
         marker,
@@ -1025,7 +1057,7 @@ def build_repair_issue_plan(
         "(kodmial/aa#425 reconciler escalation)**",
         "",
         "- Source run: #" + str(run.run_id) + f" — {run.html_url}",
-        f"- Exact SHA: `{run.head_sha}`",
+        f"- Exact SHA: `{run.identity_sha}`",
         f"- Failing stage/code: `{defect}`"
         + (
             f" — members `{', '.join(f'`{m}`' for m in triage.missing_files)}`"
@@ -1077,6 +1109,88 @@ def build_repair_issue_plan(
         body,
         ("priority:p0", "automation:ready"),
         f"proven instrumentation gap: create exactly one issue (fingerprint {fingerprint})",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Declared run identity (kodmial/aa#483)
+# ---------------------------------------------------------------------------
+
+
+def declared_target_marker(run_id: int | str, sha: str) -> str:
+    """Durable one-per-run identity marker published by the diagnostic run."""
+    sha = normalize_sha(sha)
+    return f"<!-- aa-scenario2-diagnostic-declared run={run_id} sha={sha} -->"
+
+
+_DECLARED_TARGET_RE = re.compile(
+    r"<!--\s*aa-scenario2-diagnostic-declared\s+run=([0-9]+)\s+sha=([0-9a-f]{40})\s*-->"
+)
+
+
+def parse_declared_targets(bodies: Sequence[str]) -> dict[int, str]:
+    """Map run-id -> exact diagnosed SHA from durable #419 identity markers.
+
+    First valid marker for a run wins (comment listing order is stable).
+    Malformed/unparseable lines never mint identity.
+    """
+    out: dict[int, str] = {}
+    for body in bodies:
+        match = _DECLARED_TARGET_RE.search(body or "")
+        if match:
+            out.setdefault(int(match.group(1)), match.group(2))
+    return out
+
+
+def attach_declared_targets(
+    runs: Sequence[DiagnosticRun], declared_targets: Mapping[int, str]
+) -> list[DiagnosticRun]:
+    """Fold declared identities into parsed runs (read-only, typed)."""
+    out: list[DiagnosticRun] = []
+    for run in runs:
+        sha = declared_targets.get(run.run_id, "")
+        if sha and sha != run.head_sha:
+            run = dataclasses.replace(run, declared_sha=sha)
+        out.append(run)
+    return out
+
+
+def select_declared_run(
+    runs: Sequence[DiagnosticRun], *, allowed_shas: Sequence[str]
+) -> SelectionDecision:
+    """Select evidence for the allowed SHAs via declared run identity.
+
+    Used when no Actions record head_sha matches the allowed SHAs: a
+    ``workflow_dispatch`` run dispatched with ``target_sha=T`` records its
+    deadline-independent identity through a declared marker, so its
+    artifact is selected for T even though the record head_sha names the
+    dispatch-ref head. Active declared runs win a ``wait``; the newest
+    completed declared run wins ``reconcile``.
+    """
+    allowed = normalize_allowed_shas(allowed_shas)
+    if not allowed:
+        return SelectionDecision("missing", None, "no allowed SHA given: cannot reconcile evidence")
+    matching = [run for run in runs if run.declared_sha in allowed]
+    for run in sorted(matching, key=_run_sort_key, reverse=True):
+        if run.is_active:
+            return SelectionDecision(
+                "wait",
+                run,
+                f"declared diagnostic run {run.run_id} still {run.status}; "
+                "reconcile once it completes (never dispatch a duplicate)",
+            )
+    for run in sorted(matching, key=_run_sort_key, reverse=True):
+        if run.is_completed:
+            return SelectionDecision(
+                "reconcile",
+                run,
+                f"newest completed diagnostic run declared for allowed SHA: "
+                f"run {run.run_id} ({run.conclusion})",
+            )
+    return SelectionDecision(
+        "missing",
+        None,
+        "no completed or active diagnostic run declared for any allowed SHA",
     )
 
 
@@ -1146,7 +1260,7 @@ def decide_dispatch(
     pause and never an unbounded loop).
     """
     sha = normalize_sha(target_sha)
-    for_target = [run for run in runs if run.head_sha == sha]
+    for_target = [run for run in runs if run.head_sha == sha or run.declared_sha == sha]
     if any(run.is_active for run in for_target):
         return DispatchPlan(
             False,

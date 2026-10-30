@@ -72,6 +72,48 @@ jobs:
           echo "job-start-epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           echo "$GITHUB_RUN_ID $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
+      # kodmial/aa#483 — durable declared run identity. A workflow_dispatch
+      # Actions record can only name the dispatch-ref head, never the
+      # requested target_sha, so the run publishes the exact SHA it checked
+      # out to the AA-owned operations tracker as a durable marker. The
+      # post-run reconciler binds artifact evidence to that declared SHA.
+      - name: Publish declared exact-SHA run identity
+        if: steps.sha.conclusion == 'success'
+        uses: actions/github-script@v7
+        script: |
+          const runId = "${{ github.run_id }}";
+          const sha = "${{ steps.sha.outputs.main-sha }}";
+          const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/" + runId;
+          const marker = "<!-- aa-scenario2-diagnostic-declared run=" + runId + " sha=" + sha + " -->";
+          try {
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 419,
+              per_page: 100
+            });
+            if (comments.some((c) => c.body && c.body.includes(marker))) {
+              core.info("Declared identity marker for run " + runId + " already exists; not duplicating.");
+              return;
+            }
+            // Sanitized notice only (identifiers only, never telemetry).
+            const body = marker +
+              "\n**Diagnostic run identity declared (kodmial/aa#483)**" +
+              "\n- Run: [" + runId + "](" + runUrl + ")" +
+              "\n- Declared exact SHA: `" + sha + "`" +
+              "\n- This run checked out, verified and diagnosed exactly the declared SHA; " +
+              "its artifact evidence is bound to that SHA (aa-gate-c-scenario2-diagnostic)." +
+              "\n_Sanitized AA-owned diagnostic identity record; not qualification evidence._";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 419,
+              body
+            });
+          } catch (error) {
+            core.warning("Declared-identity publishing failed (non-fatal): " + error);
+          }
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
