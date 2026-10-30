@@ -82,6 +82,24 @@ def _classify_error(exc: BaseException) -> str:
     return "probe-error"
 
 
+# Failure facts of one ``/session/status`` read mapped to typed verdicts.
+_SESSION_STATUS_FAILURE_TOKENS = (
+    ("session-status-http-error", "http-error"),
+    ("session-status-body-timeout", "body-timeout"),
+    ("session-status-body-error", "body-error"),
+    ("session-status-shape", "shape"),
+    ("session-status-error", "disconnected"),
+)
+
+
+def _session_status_failure(facts: dict[str, int]) -> str:
+    """Typed failure token for one read ("" when this read succeeded)."""
+    for key, token in _SESSION_STATUS_FAILURE_TOKENS:
+        if int(facts.get(key, 0) or 0) > 0:
+            return token
+    return ""
+
+
 class OpenCodeServerEventProbe:
     """Bounded passive reader of local server-side session evidence."""
 
@@ -201,7 +219,7 @@ class OpenCodeServerEventProbe:
         No session id, status payload body or server log line is retained.
         """
         try:
-            await asyncio.to_thread(self._read_session_status)
+            facts = await asyncio.to_thread(self._read_session_status)
         except Exception as exc:  # noqa: BLE001 - probe must never break the scan
             payload: dict[str, Any] = {
                 "observed": False,
@@ -210,7 +228,7 @@ class OpenCodeServerEventProbe:
                 "progress_meaning": "none",
             }
             return payload
-        return self.session_status_probe_payload()
+        return self.session_status_probe_payload(facts)
 
     def _read_sse_window(self) -> dict[str, int]:
         """Read a bounded window of the SSE event stream.
@@ -429,15 +447,31 @@ class OpenCodeServerEventProbe:
         """Latest closed-vocabulary session state seen ("" when none)."""
         return self._last_session_state
 
-    def session_status_probe_payload(self) -> dict[str, Any]:
-        """Bounded verdict payload for the #448 observer's probe seam."""
-        observed = self._last_session_state in SESSION_STATE_VOCAB
+    def session_status_probe_payload(self, facts: dict[str, int] | None = None) -> dict[str, Any]:
+        """Bounded verdict payload for the #448 observer's probe seam.
+
+        When ``facts`` carries the outcome of the current read, a failed
+        read is reported as unobserved with its typed failure token rather
+        than reusing the last previously successful cached state.
+        """
+        if facts is not None:
+            failure = _session_status_failure(facts)
+            if failure:
+                return {
+                    "observed": False,
+                    "verdict": f"server-events-session-{failure}"[:64],
+                    "error": failure[:64],
+                    "progress_meaning": "none",
+                }
+            has_state = any(int(facts.get(name, 0) or 0) > 0 for name in SESSION_STATE_VOCAB)
+            state = self._last_session_state if has_state else ""
+        else:
+            state = self._last_session_state
+        observed = state in SESSION_STATE_VOCAB
         return {
             "observed": observed,
             "verdict": (
-                f"server-events-session-{self._last_session_state}"
-                if observed
-                else "server-events-session-unobserved"
+                f"server-events-session-{state}" if observed else "server-events-session-unobserved"
             )[:64],
             "error": "",
             "progress_meaning": "none",

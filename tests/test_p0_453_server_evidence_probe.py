@@ -160,6 +160,50 @@ def _run(awaitable: object) -> dict[str, object]:
     return asyncio.run(awaitable)  # type: ignore[arg-type]
 
 
+def test_session_status_snapshot_never_reports_stale_state_after_failure() -> None:
+    """A failing read must not inherit the last successful busy verdict."""
+    state: dict[str, object] = {
+        "doc_supported": True,
+        "session_status": {"ses_1": {"type": "busy"}},
+    }
+    server = _mk_server(state)
+    try:
+        probe = _probe_for(server)
+        first = _run(probe.session_status_snapshot())
+        assert first["observed"] is True
+        assert first["verdict"] == "server-events-session-busy"
+
+        # The endpoint starts failing after the successful observation.
+        state["session_status"] = None
+        second = _run(probe.session_status_snapshot())
+        assert second == {
+            "observed": False,
+            "verdict": "server-events-session-http-error",
+            "error": "http-error",
+            "progress_meaning": "none",
+        }
+
+        # Schema drift is typed, never the cached busy state.
+        state["session_status"] = ["not", "a", "status", "map"]
+        third = _run(probe.session_status_snapshot())
+        assert third["observed"] is False
+        assert third["verdict"] == "server-events-session-shape"
+        assert third["error"] == "shape"
+
+        # A successful read with no sessions is unobserved, not stale busy.
+        state["session_status"] = {}
+        fourth = _run(probe.session_status_snapshot())
+        assert fourth == {
+            "observed": False,
+            "verdict": "server-events-session-unobserved",
+            "error": "",
+            "progress_meaning": "none",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_live_but_silent_sse_stream_is_not_disconnected() -> None:
     """A quiet open SSE stream is typed quiet, not a connection failure."""
     server = _mk_server(
