@@ -203,30 +203,60 @@ class OpenCodeServerEventProbe:
         this probe's bounded counters.
         """
         facts: dict[str, int] = {}
+        response: Any = None
+        read_state = ""
         try:
-            with urllib.request.urlopen(
+            response = urllib.request.urlopen(
                 urllib.request.Request(
                     f"{self._base_url}/event",
                     headers={"Accept": "text/event-stream"},
                 ),
                 timeout=self._timeout_s,
-            ) as response:
-                facts["event-stream-status"] = int(response.status)
-                content_type = str(response.headers.get("Content-Type", ""))[:64]
-                facts["event-stream-streamed"] = int("event-stream" in content_type)
-                self._consume_sse_frames(response)
+            )
+            facts["event-stream-status"] = int(response.status)
+            content_type = str(response.headers.get("Content-Type", ""))[:64]
+            facts["event-stream-streamed"] = int("event-stream" in content_type)
+            read_state = self._consume_sse_frames(response)
         except urllib.error.HTTPError as exc:
             facts["event-stream-http-error"] = exc.code
+        except TimeoutError:
+            # A timeout after the stream opened is a quiet window; before
+            # that it is a connection-level failure.
+            if response is not None and "event-stream-status" in facts:
+                read_state = "quiet"
+            else:
+                facts["event-stream-error"] = 1
         except Exception:
+            # A failure before the stream was opened (or before its headers
+            # arrived) is a connection-level failure.
+            facts["event-stream-error"] = 1
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        # A live-but-silent stream is a normal SSE condition, not a broken
+        # connection: keep it distinct from ``event-stream-error``.
+        if read_state == "quiet":
+            facts["event-stream-quiet"] = 1
+        elif read_state == "error":
             facts["event-stream-error"] = 1
         return facts
 
-    def _consume_sse_frames(self, stream: Any) -> None:
-        """Parse one bounded read window of SSE ``data:`` frames."""
+    def _consume_sse_frames(self, stream: Any) -> str:
+        """Parse one bounded read window of SSE ``data:`` frames.
+
+        Returns ``"ok"`` when the bounded read completed (including EOF),
+        ``"quiet"`` when a healthy open stream produced no bytes before the
+        socket timeout, and ``"error"`` for any other read failure.
+        """
         try:
             window = stream.read(_MAX_BYTES)
+        except TimeoutError:
+            return "quiet"
         except Exception:
-            return
+            return "error"
         self._last_observed_s = time.time()
         for raw_line in window.decode("utf-8", errors="replace").splitlines():
             line = raw_line.strip()
@@ -277,6 +307,7 @@ class OpenCodeServerEventProbe:
                             self._last_server_error_retryable = retryable
                 self._last_server_error_kind = kind
                 self._server_error_counts[kind] = self._server_error_counts.get(kind, 0) + 1
+        return "ok"
 
     # ------------------------------------------------------------------
     # Snapshot

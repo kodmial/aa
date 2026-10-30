@@ -49,7 +49,7 @@ class _FakeOpenCodeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/doc":
             if bool(self._state.get("doc_supported", True)):
-                self._send_json(200, {"paths": {"/session": {}}})
+                self._send_json(200, self._state.get("doc_payload", {"paths": {"/session": {}}}))
             else:
                 self._send_json(404, {"error": "not found"})
         elif self.path == "/session/status":
@@ -59,6 +59,16 @@ class _FakeOpenCodeHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json(200, payload)
         elif self.path == "/event":
+            # A live but quiet stream sends headers, then nothing until the
+            # probe's socket timeout fires.
+            if bool(self._state.get("sse_quiet")):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.flush()
+                quiet_s = self._state.get("sse_quiet_s", 0.4)
+                time.sleep(float(quiet_s) if isinstance(quiet_s, (int, float)) else 0.4)
+                return
             # Streaming surface: write the bounded window then close so the
             # probe's fixed-size read returns at EOF.
             payload = self._state.get("events")
@@ -148,6 +158,36 @@ def _run(awaitable: object) -> dict[str, object]:
     import asyncio
 
     return asyncio.run(awaitable)  # type: ignore[arg-type]
+
+
+def test_live_but_silent_sse_stream_is_not_disconnected() -> None:
+    """A quiet open SSE stream is typed quiet, not a connection failure."""
+    server = _mk_server(
+        {
+            "doc_payload": {"openapi": "3.0.0"},
+            "session_status": {"ses_1": {"type": "busy"}},
+            "sse_quiet": True,
+            "sse_quiet_s": 0.4,
+        }
+    )
+    try:
+        probe = _probe_for(server, timeout_s=0.1)
+        evidence = _run(probe.snapshot())
+        # /doc lacks the documented shape, but the server answered and the
+        # SSE stream opened: this is not a dead connection.
+        assert evidence["state"] != "disconnected"
+        assert evidence["state"] == "unsupported"
+        endpoints = cast(dict[str, object], evidence["endpoints"])
+        event_facts = cast(dict[str, int], endpoints["/event"])
+        assert event_facts.get("event-stream-status") == 200
+        assert event_facts.get("event-stream-streamed") == 1
+        assert event_facts.get("event-stream-quiet") == 1
+        assert "event-stream-error" not in event_facts
+        assert evidence["last_session_state"] == "busy"
+        assert evidence["progress_meaning"] == "none"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_sse_error_event_is_provider_confirmed_and_text_free() -> None:
