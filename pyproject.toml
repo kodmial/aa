@@ -38,6 +38,11 @@ dev = [
   "click>=8.0.0",
   "typer>=0.9.0,<0.26",
   "spacy==3.8.7",
+  # Native spaCy tokenizer stack: last green CI 40082051809; upstream
+  # transitive upgrades on 2026-10-24 broke ru_core_news_sm deserialization.
+  "cymem==2.0.13",
+  "murmurhash==1.0.15",
+  "preshed==3.0.13",
   "ru-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_sm-3.8.0/ru_core_news_sm-3.8.0-py3-none-any.whl",
 ]
 
