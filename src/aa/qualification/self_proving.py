@@ -493,7 +493,6 @@ def _is_structural_stage_outcome_counts(value: Any) -> bool:
     return True
 
 
-
 def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
     """Reject user/corpus-text-carrying keys in public evidence."""
     if isinstance(payload, dict):
