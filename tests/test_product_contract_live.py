@@ -438,6 +438,97 @@ def test_privacy_guard_allows_numeric_answer_stage_metrics() -> None:
     with pytest.raises(ProductContractLiveError):
         assert_no_text_leak({"stage_latency_ms": {"answer": {"p50": 1.0, "note": "leaked text"}}})
 
+    # Gate C partial diagnostics use a separate closed-vocabulary map whose
+    # string verdicts are structural coverage, not generated answer text.
+    scenario_coverage = {
+        "scenario_diagnostics": [
+            {
+                "stage_latency_coverage": {
+                    "planner": "measured",
+                    "retrieval": "unobserved",
+                    "answer": "zero-unproven",
+                    "verifier": "not-measured",
+                }
+            }
+        ]
+    }
+    assert_no_text_leak(scenario_coverage)
+    self_proving_mod.assert_no_text_leak(scenario_coverage)
+
+    aggregate_coverage = {
+        "metrics": {
+            "stage_latency_coverage": {
+                "coverage": "observed",
+                "stage_count": 1,
+                "turn_count": 1,
+                "stages": {"answer": {"zero-unproven": 1}},
+            }
+        }
+    }
+    assert_no_text_leak(aggregate_coverage)
+    self_proving_mod.assert_no_text_leak(aggregate_coverage)
+
+    invalid_scenario_coverage = {
+        "scenario_diagnostics": [
+            {
+                "stage_latency_coverage": {
+                    "planner": "measured",
+                    "retrieval": "unobserved",
+                    "answer": "private answer text",
+                    "verifier": "not-measured",
+                }
+            }
+        ]
+    }
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak(invalid_scenario_coverage)
+    with pytest.raises(self_proving_mod.SelfProvingError):
+        self_proving_mod.assert_no_text_leak(invalid_scenario_coverage)
+
+    invalid_aggregate_coverage = {
+        "metrics": {
+            "stage_latency_coverage": {
+                "coverage": "observed",
+                "stage_count": 1,
+                "turn_count": 1,
+                "stages": {"answer": {"private text": 1}},
+            }
+        }
+    }
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak(invalid_aggregate_coverage)
+    with pytest.raises(self_proving_mod.SelfProvingError):
+        self_proving_mod.assert_no_text_leak(invalid_aggregate_coverage)
+
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak(
+            {
+                "scenario_diagnostics": [
+                    {
+                        "stage_latency_coverage": {
+                            "planner": "measured",
+                            "retrieval": "unobserved",
+                            "answer": "private answer text",
+                            "verifier": "not-measured",
+                        }
+                    }
+                ]
+            }
+        )
+    with pytest.raises(ProductContractLiveError):
+        assert_no_text_leak(
+            {
+                "metrics": {
+                    "stage_latency_coverage": {
+                        "coverage": "observed",
+                        "stage_count": 1,
+                        "turn_count": 1,
+                        "stages": {"answer": {"unobserved": "private text"}},
+                    }
+                }
+            }
+        )
+
 
 def test_gate_c_rejects_bookless_retry_diversity() -> None:
     """Different generic replies must never qualify as book-grounded help."""
