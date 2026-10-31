@@ -346,7 +346,10 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
         return False
     if not {"coverage", "stage_count", "turn_count"}.issubset(value):
         return False
-    if not isinstance(value["coverage"], str) or value["coverage"] not in _STAGE_LATENCY_COVERAGE_STATES:
+    if (
+        not isinstance(value["coverage"], str)
+        or value["coverage"] not in _STAGE_LATENCY_COVERAGE_STATES
+    ):
         return False
     stage_count = value["stage_count"]
     turn_count = value["turn_count"]
@@ -361,7 +364,10 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
     for stage, counts in stages.items():
         if stage not in _STAGE_LATENCY_STAGES or not isinstance(counts, dict) or not counts:
             return False
-        if any(verdict not in _STAGE_LATENCY_VERDICTS or type(count) is not int or count < 0 for verdict, count in counts.items()):
+        if any(
+            verdict not in _STAGE_LATENCY_VERDICTS or type(count) is not int or count < 0
+            for verdict, count in counts.items()
+        ):
             return False
     return True
 
