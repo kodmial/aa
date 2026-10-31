@@ -441,7 +441,6 @@ def _is_structural_stage_outcome_counts(value: Any) -> bool:
     return True
 
 
-
 def assert_no_text_leak(payload: Any, owner: str = "live-summary") -> None:
     """Reject forbidden text-carrying keys in public summaries."""
     if isinstance(payload, dict):
