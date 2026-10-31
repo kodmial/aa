@@ -110,13 +110,9 @@ _STRUCTURAL_STAT_KEYS = frozenset({"p50", "p95", "max", "count"})
 # per-scenario verdicts and aggregated partial-evidence counters. The stage
 # name "answer" is structural here, not an answer payload.
 _STAGE_LATENCY_STAGES = frozenset({"planner", "retrieval", "answer", "verifier"})
-_STAGE_LATENCY_VERDICTS = frozenset(
-    {"measured", "zero-unproven", "unobserved", "not-measured"}
-)
+_STAGE_LATENCY_VERDICTS = frozenset({"measured", "zero-unproven", "unobserved", "not-measured"})
 _STAGE_LATENCY_COVERAGE_STATES = frozenset({"observed", "missing", "unobserved"})
-_STAGE_LATENCY_COVERAGE_FIELDS = frozenset(
-    {"coverage", "stage_count", "turn_count", "stages"}
-)
+_STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_count", "stages"})
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -350,7 +346,7 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
         return False
     if not {"coverage", "stage_count", "turn_count"}.issubset(value):
         return False
-    if value["coverage"] not in _STAGE_LATENCY_COVERAGE_STATES:
+    if not isinstance(value["coverage"], str) or value["coverage"] not in _STAGE_LATENCY_COVERAGE_STATES:
         return False
     stage_count = value["stage_count"]
     turn_count = value["turn_count"]
@@ -365,12 +361,7 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
     for stage, counts in stages.items():
         if stage not in _STAGE_LATENCY_STAGES or not isinstance(counts, dict) or not counts:
             return False
-        if any(
-            verdict not in _STAGE_LATENCY_VERDICTS
-            or type(count) is not int
-            or count < 0
-            for verdict, count in counts.items()
-        ):
+        if any(verdict not in _STAGE_LATENCY_VERDICTS or type(count) is not int or count < 0 for verdict, count in counts.items()):
             return False
     return True
 
