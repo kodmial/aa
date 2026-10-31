@@ -530,6 +530,46 @@ def test_privacy_guard_allows_numeric_answer_stage_metrics() -> None:
         )
 
 
+def test_privacy_guard_allows_closed_stage_outcome_counts_and_rejects_text() -> None:
+    from aa.qualification import self_proving as self_proving_mod
+
+    partial_counts = {
+        "metrics": {
+            "stage_outcome_counts": {
+                "planner": {"invoked": 1},
+                "retrieval": {"evidence-ready": 1},
+                "answer": {"served": 1},
+                "verifier": {"passed": 1},
+            }
+        }
+    }
+    completed_counts = {
+        "metrics": {
+            "stage_outcome_counts": {
+                "planner_outcome": {"invoked": 1},
+                "retrieval_outcome": {"evidence-ready": 1},
+                "answer_outcome": {"served": 1},
+                "verifier_outcome": {"passed": 1},
+            }
+        }
+    }
+    for payload in (partial_counts, completed_counts):
+        assert_no_text_leak(payload)
+        self_proving_mod.assert_no_text_leak(payload)
+
+    invalid_payloads = (
+        {"metrics": {"stage_outcome_counts": {"answer": {"private answer text": 1}}}},
+        {"metrics": {"stage_outcome_counts": {"answer": {"not-a-real-outcome": 1}}}},
+        {"metrics": {"stage_outcome_counts": {"answer": {"served": -1}}}},
+        {"metrics": {"stage_outcome_counts": {"user_text": {"served": 1}}}},
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(ProductContractLiveError):
+            assert_no_text_leak(payload)
+        with pytest.raises(self_proving_mod.SelfProvingError):
+            self_proving_mod.assert_no_text_leak(payload)
+
+
 def test_gate_c_rejects_bookless_retry_diversity() -> None:
     """Different generic replies must never qualify as book-grounded help."""
     from aa.conversation.failures import SERVICE_ERROR_REPLY
