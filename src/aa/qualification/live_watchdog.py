@@ -31,6 +31,7 @@ answers, passages or secrets are written here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -43,6 +44,12 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aa.qualification.product_contract_live import LaneResult
+
+from aa.qualification.live_partial_evidence import (
+    EVENT_KIND_WATCHDOG_TERMINATION,
+    merge_partial_into_metrics,
+    validated_partial_evidence,
+)
 
 ENV_PROGRESS_PATH = "AA_QUALIFICATION_LIVE_PROGRESS_PATH"
 ENV_TOTAL_DEADLINE_S = "AA_QUALIFICATION_LIVE_DEADLINE_S"
@@ -410,11 +417,20 @@ def _failed_lane(
     }
     if progress:
         metrics["watchdog_last_progress_phase"] = str(progress.get("phase", ""))[:64]
+        # kodmial/aa#453: a child crash before the first scenario still
+        # carries the typed diagnostics-unavailable coverage when nothing
+        # was recorded, instead of implicating silence as failure.
+        return LaneResult(
+            lane="live-telegram-evidence",
+            status="FAIL",
+            failed=(f"live-telegram-evidence:{reason}",),
+            metrics=merge_partial_into_metrics(metrics, validated_partial_evidence(progress)),
+        )
     return LaneResult(
         lane="live-telegram-evidence",
         status="FAIL",
         failed=(f"live-telegram-evidence:{reason}",),
-        metrics=metrics,
+        metrics=merge_partial_into_metrics(metrics, None),
     )
 
 
@@ -427,6 +443,31 @@ def _safe_int(value: object, default: int = 0) -> int:
         except (TypeError, ValueError):
             return default
     return default
+
+
+def _round_or_none(value: float | None) -> float | None:
+    """Round a measured aggregate, or stay explicitly absent."""
+    if value is None or value != value or value == float("inf"):
+        return None
+    return round(value, 1)
+
+
+def _percentile_ms(values: list[float], pct: float) -> float:
+    """Match the lane's own percentile convention (nearest-rank)."""
+    ordered = sorted(values)
+    rank = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    return round(ordered[rank], 1)
+
+
+def _lane_event_id(elapsed_s: float, trigger: str) -> str:
+    """Bounded opaque identity for the parent's termination event.
+
+    Never a signal dump or a reproducible artifact id; the digest binds the
+    typed trigger, the monotonic elapsed time and process entropy so two
+    terminations never share one event id silently.
+    """
+    digest = hashlib.sha256(f"{trigger}:{elapsed_s:.3f}:{os.urandom(8).hex()}".encode()).hexdigest()
+    return digest[:32]
 
 
 def _timeout_category(progress: Mapping[str, Any]) -> str:
@@ -457,7 +498,19 @@ def _timeout_lane(
     elapsed_s: float,
     deadline_s: float,
 ) -> LaneResult:
-    """Build typed FAIL evidence from persisted markers, never fake samples."""
+    """Build typed FAIL evidence from persisted markers, never fake samples.
+
+    kodmial/aa#453: the child persists a bounded, privacy-safe
+    ``partial_evidence`` snapshot of its already-measured diagnostics on
+    every meaningful transition. On a ``total-deadline`` or
+    ``no-real-progress`` kill, that marker is validated fail-closed and
+    merged into this FAIL lane's metrics under the same metric names the
+    normal end-of-campaign lane publishes, with explicit per-source
+    coverage. A scenario that the child already recorded as its own
+    timeout and the parent's termination of the same campaign are two
+    distinct typed events (``event_kind``) — never one row that double
+    counts, and never one fabricated zero replacing measured facts.
+    """
     from aa.qualification.product_contract_live import LaneResult
 
     category = _timeout_category(progress)
@@ -478,13 +531,22 @@ def _timeout_lane(
     last_index = _safe_int(progress.get("scenario_index"), 0)
     family = str(progress.get("family", "unknown"))[:64]
     last_active_stage = str(progress.get("last_active_stage", ""))[:64]
+    # kodmial/aa#453: distinct event identity. The parent's termination
+    # row carries the campaign causality identity from the child's last
+    # partial snapshot (bounded id, opaque) so repair agents can tie the
+    # two records of one preempted scenario together explicitly.
+    partial = validated_partial_evidence(progress)
+    current_scenario = partial.get("current_scenario", {}) if partial else {}
     timeout_entry = {
         "scenario_index": last_index,
         "family": family,
         "delivery_timeout": True,
         "watchdog_timeout": True,
-        "timeout_category": category,
         "watchdog_trigger": trigger,
+        "event_kind": EVENT_KIND_WATCHDOG_TERMINATION,
+        "event_id": _lane_event_id(elapsed_s, trigger),
+        "turn_causality_id": str(current_scenario.get("causality_id", ""))[:64],
+        "timeout_category": category,
         # Honest attribution: the parent publishes the bounded condition it
         # actually observed (the same closed vocabulary as the child-side
         # ``timeout_reason``). Leaving this absent forced diagnostic issues
@@ -510,10 +572,28 @@ def _timeout_lane(
         for item in samples
         if isinstance(item.get("latency_ms"), (int, float))
     ]
+    # kodmial/aa#453: honest aggregates over the persisted samples only —
+    # with zero real samples the typed empty aggregate travels, never a
+    # fabricated 0 that could be read as a measured fast turn.
+    turn_latency_p50_ms = _round_or_none(
+        _percentile_ms(turn_latencies_ms, 50) if turn_latencies_ms else None
+    )
+    turn_latency_p95_ms = _round_or_none(
+        _percentile_ms(turn_latencies_ms, 95) if turn_latencies_ms else None
+    )
+    turn_latency_max_ms = _round_or_none(max(turn_latencies_ms) if turn_latencies_ms else None)
+    # kodmial/aa#453: the child's own scenario-timeout row and the parent's
+    # termination row of the same preempted scenario share one identity
+    # (scenario_index, family) — count interrupted scenarios once.
+    interrupted_rows = [item for item in diagnostics if item.get("delivery_timeout")]
+    interrupted_distinct = len(
+        {(str(item.get("scenario_index")), str(item.get("family"))) for item in interrupted_rows}
+    )
     metrics: dict[str, Any] = {
         "scenarios_executed": completed,
         "scenario_total": scenario_total,
         "completed_scenario_count": completed,
+        "interrupted_scenarios_distinct": interrupted_distinct,
         "last_scenario_index": last_index,
         "last_scenario_family": family,
         "scenario_timeout": True,
@@ -528,6 +608,12 @@ def _timeout_lane(
         "watchdog_last_real_progress_at": progress.get("last_real_progress_at"),
         "watchdog_last_real_progress_monotonic": progress.get("last_real_progress_monotonic"),
         "watchdog_last_real_progress_phase": str(progress.get("last_real_progress_phase", ""))[:64],
+        # kodmial/aa#453: honest latency aggregates over the persisted
+        # c-series samples (measured facts only, explicit when absent).
+        "turn_latency_p50_ms": turn_latency_p50_ms,
+        "turn_latency_p95_ms": turn_latency_p95_ms,
+        "turn_latency_max_ms": turn_latency_max_ms,
+        "turn_latency_sample_count": len(turn_latencies_ms),
         # Child-owned stalled-turn recovery evidence (kodmial/aa#417): the
         # last stage, request state and bounded cleanup summary of the
         # scenario the watchdog had to preempt.
@@ -561,11 +647,17 @@ def _timeout_lane(
         "telegram_egress_label": "SIMULATED",
         "external_send_status": "external_send_unverified",
     }
+    # kodmial/aa#453: merge the validated child partial evidence last, so
+    # the parent's own verdict fields stay authoritative while every
+    # measured child diagnostic (attempt audit, served models, token
+    # counters, request latencies, process state, server evidence, stage
+    # telemetry, scenario accounting) lands under the standard metric
+    # names, with explicit per-source coverage instead of zeros.
     return LaneResult(
         lane="live-telegram-evidence",
         status="FAIL",
         failed=(f"live-scenario-watchdog-timeout-{category}",),
-        metrics=metrics,
+        metrics=merge_partial_into_metrics(metrics, partial),
     )
 
 
