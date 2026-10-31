@@ -587,6 +587,7 @@ def test_declared_identity_github_script_input_uses_valid_action_schema() -> Non
     assert "        uses: actions/github-script@v7\n        with:\n          script: |\n" in text
     assert "        uses: actions/github-script@v7\n        script: |\n" not in text
 
+
 def test_diagnostic_workflow_still_pushes_and_dispatches_evidence() -> None:
     text = DIAG_WORKFLOW_PATH.read_text(encoding="utf-8")
     assert 'aa-gate-c-scenario2-diagnostic.yml"' in text
