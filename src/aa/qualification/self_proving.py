@@ -184,7 +184,6 @@ _STAGE_LATENCY_COVERAGE_STATES = frozenset({"observed", "missing", "unobserved"}
 _STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_count", "stages"})
 
 
-
 def _dict_key_holds_text(key: Any) -> bool:
     """Whether a dict key carries text (fixed-vocabulary labels exempt)."""
     if isinstance(key, bytes):
@@ -418,9 +417,7 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
         if stage not in _STAGE_LATENCY_STAGES or not isinstance(counts, dict) or not counts:
             return False
         if any(
-            verdict not in _STAGE_LATENCY_VERDICTS
-            or type(count) is not int
-            or count < 0
+            verdict not in _STAGE_LATENCY_VERDICTS or type(count) is not int or count < 0
             for verdict, count in counts.items()
         ):
             return False
