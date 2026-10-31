@@ -176,6 +176,12 @@ class SelfProvingError(ValueError):
 # keys under a forbidden key. Every other string under a forbidden key
 # stays a leak.
 _STRUCTURAL_STAT_KEYS = frozenset({"p50", "p95", "max", "count"})
+# Closed vocabulary for privacy-safe Gate C stage coverage. The stage name
+# "answer" is structural only inside these exact schemas, never free text.
+_STAGE_LATENCY_STAGES = frozenset({"planner", "retrieval", "answer", "verifier"})
+_STAGE_LATENCY_VERDICTS = frozenset({"measured", "zero-unproven", "unobserved", "not-measured"})
+_STAGE_LATENCY_COVERAGE_STATES = frozenset({"observed", "missing", "unobserved"})
+_STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_count", "stages"})
 
 
 def _dict_key_holds_text(key: Any) -> bool:
@@ -379,11 +385,58 @@ def _subtree_holds_text(value: Any) -> bool:
     return False
 
 
+def _is_structural_stage_latency_coverage(value: Any) -> bool:
+    """Validate fixed-vocabulary Gate C stage coverage without accepting text."""
+    if not isinstance(value, dict):
+        return False
+
+    if set(value) == _STAGE_LATENCY_STAGES:
+        return all(
+            isinstance(verdict, str) and verdict in _STAGE_LATENCY_VERDICTS
+            for verdict in value.values()
+        )
+
+    if not set(value).issubset(_STAGE_LATENCY_COVERAGE_FIELDS):
+        return False
+    if not {"coverage", "stage_count", "turn_count"}.issubset(value):
+        return False
+    coverage = value["coverage"]
+    if not isinstance(coverage, str) or coverage not in _STAGE_LATENCY_COVERAGE_STATES:
+        return False
+    stage_count = value["stage_count"]
+    turn_count = value["turn_count"]
+    if type(stage_count) is not int or stage_count < 0:
+        return False
+    if type(turn_count) is not int or turn_count < 0:
+        return False
+
+    stages = value.get("stages", {})
+    if not isinstance(stages, dict) or stage_count != len(stages):
+        return False
+    for stage, counts in stages.items():
+        if stage not in _STAGE_LATENCY_STAGES or not isinstance(counts, dict) or not counts:
+            return False
+        if any(
+            verdict not in _STAGE_LATENCY_VERDICTS or type(count) is not int or count < 0
+            for verdict, count in counts.items()
+        ):
+            return False
+    return True
+
+
 def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
     """Reject user/corpus-text-carrying keys in public evidence."""
     if isinstance(payload, dict):
         for key, value in payload.items():
-            if str(key).lower() in FORBIDDEN_EVIDENCE_KEYS:
+            normalized_key = str(key).lower()
+            if normalized_key == "stage_latency_coverage":
+                if not _is_structural_stage_latency_coverage(value):
+                    raise SelfProvingError(
+                        f"{owner}: invalid fixed-vocabulary stage latency coverage"
+                    )
+                # Exact schema validation proves these labels/counters are structural.
+                continue
+            if normalized_key in FORBIDDEN_EVIDENCE_KEYS:
                 if _subtree_holds_text(value):
                     raise SelfProvingError(f"{owner}: forbidden key {key!r}")
             assert_no_text_leak(value, f"{owner}.{key}")
