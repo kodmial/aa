@@ -183,6 +183,84 @@ _STAGE_LATENCY_VERDICTS = frozenset({"measured", "zero-unproven", "unobserved", 
 _STAGE_LATENCY_COVERAGE_STATES = frozenset({"observed", "missing", "unobserved"})
 _STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_count", "stages"})
 
+# Closed vocabulary for privacy-safe stage outcome histograms. Partial snapshots
+# use stage names; completed summaries use the corresponding *_outcome fields.
+# Outcome labels are emitted by the production turn pipeline and are never
+# arbitrary user/model text.
+_STAGE_OUTCOME_STAGES = frozenset({"planner", "retrieval", "answer", "verifier"})
+_STAGE_OUTCOME_FIELDS = frozenset({f"{stage}_outcome" for stage in _STAGE_OUTCOME_STAGES})
+_STAGE_OUTCOME_VALUES = {
+    "planner": frozenset(
+        {
+            "unknown",
+            "skipped-initial",
+            "invoked",
+            "replanned",
+            "empty-replan",
+            "failed",
+            "skipped-glue",
+            "skipped-no-planner",
+        }
+    ),
+    "retrieval": frozenset(
+        {
+            "unknown",
+            "skipped-initial",
+            "preloaded",
+            "recovered",
+            "empty-after-recovery",
+            "recovery-failed",
+            "skipped-glue",
+            "empty-pack",
+            "skipped-duplicate-repair",
+            "repaired",
+            "empty",
+            "failed",
+            "evidence-ready",
+        }
+    ),
+    "answer": frozenset(
+        {
+            "unknown",
+            "failed",
+            "draft-ok",
+            "served",
+            "narrowed-supported",
+            "narrowed-compacted",
+            "narrowed-adequacy",
+            "narrowed-adequacy-regen",
+            "safety-blocked",
+            "adequacy-failed",
+            "served-split",
+            "envelope-exceeded",
+            "quote-budget-exceeded",
+            "language-guard",
+            "retry-turn-budget",
+            "unavailable-substantive-no-evidence",
+            "conversational-generated",
+            "conversational-generation-failed",
+            "clarification-unavailable",
+            "paging-guard",
+            "adequacy-repair-failed",
+        }
+    ),
+    "verifier": frozenset(
+        {
+            "unknown",
+            "skipped",
+            "skipped-turn-budget",
+            "passed",
+            "local-guard",
+            "partial-unavailable",
+            "unsupported",
+            "passed-after-repair-existing-pack",
+            "passed-after-repair",
+            "unavailable",
+            "passed-after-adequacy-repair",
+        }
+    ),
+}
+
 
 def _dict_key_holds_text(key: Any) -> bool:
     """Whether a dict key carries text (fixed-vocabulary labels exempt)."""
@@ -424,11 +502,54 @@ def _is_structural_stage_latency_coverage(value: Any) -> bool:
     return True
 
 
+def _is_structural_stage_outcome_counts(value: Any) -> bool:
+    """Validate the closed-vocabulary, numeric-only Gate C stage outcome histogram."""
+    if not isinstance(value, dict):
+        return False
+    if not value:
+        return True
+
+    # Incremental partial-evidence shape: stage -> outcome -> count.
+    if set(value).issubset(_STAGE_OUTCOME_STAGES):
+        for stage, outcomes in value.items():
+            if not isinstance(outcomes, dict):
+                return False
+            allowed = _STAGE_OUTCOME_VALUES[stage]
+            if any(
+                outcome not in allowed or type(count) is not int or count < 0
+                for outcome, count in outcomes.items()
+            ):
+                return False
+        return True
+
+    # Completed live-summary shape: *_outcome -> outcome -> count.
+    if set(value) != _STAGE_OUTCOME_FIELDS:
+        return False
+    for outcome_field in _STAGE_OUTCOME_FIELDS:
+        stage = outcome_field.removesuffix("_outcome")
+        outcomes = value[outcome_field]
+        if not isinstance(outcomes, dict):
+            return False
+        allowed = _STAGE_OUTCOME_VALUES[stage]
+        if any(
+            outcome not in allowed or type(count) is not int or count < 0
+            for outcome, count in outcomes.items()
+        ):
+            return False
+    return True
+
+
 def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
     """Reject user/corpus-text-carrying keys in public evidence."""
     if isinstance(payload, dict):
         for key, value in payload.items():
             normalized_key = str(key).lower()
+            if normalized_key == "stage_outcome_counts":
+                if not _is_structural_stage_outcome_counts(value):
+                    raise SelfProvingError(
+                        f"{owner}: invalid fixed-vocabulary stage outcome counts"
+                    )
+                continue
             if normalized_key == "stage_latency_coverage":
                 if not _is_structural_stage_latency_coverage(value):
                     raise SelfProvingError(
