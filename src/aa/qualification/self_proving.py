@@ -190,29 +190,75 @@ _STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_cou
 _STAGE_OUTCOME_STAGES = frozenset({"planner", "retrieval", "answer", "verifier"})
 _STAGE_OUTCOME_FIELDS = frozenset({f"{stage}_outcome" for stage in _STAGE_OUTCOME_STAGES})
 _STAGE_OUTCOME_VALUES = {
-    "planner": frozenset({
-        "unknown", "skipped-initial", "invoked", "replanned", "empty-replan",
-        "failed", "skipped-glue", "skipped-no-planner",
-    }),
-    "retrieval": frozenset({
-        "unknown", "skipped-initial", "preloaded", "recovered", "empty-after-recovery",
-        "recovery-failed", "skipped-glue", "empty-pack", "skipped-duplicate-repair",
-        "repaired", "empty", "failed", "evidence-ready",
-    }),
-    "answer": frozenset({
-        "unknown", "failed", "draft-ok", "served", "narrowed-supported",
-        "narrowed-compacted", "narrowed-adequacy", "narrowed-adequacy-regen",
-        "safety-blocked", "adequacy-failed", "served-split", "envelope-exceeded",
-        "quote-budget-exceeded", "language-guard", "retry-turn-budget",
-        "unavailable-substantive-no-evidence", "conversational-generated",
-        "conversational-generation-failed", "clarification-unavailable",
-        "paging-guard", "adequacy-repair-failed",
-    }),
-    "verifier": frozenset({
-        "unknown", "skipped", "skipped-turn-budget", "passed", "local-guard",
-        "partial-unavailable", "unsupported", "passed-after-repair-existing-pack",
-        "passed-after-repair", "unavailable", "passed-after-adequacy-repair",
-    }),
+    "planner": frozenset(
+        {
+            "unknown",
+            "skipped-initial",
+            "invoked",
+            "replanned",
+            "empty-replan",
+            "failed",
+            "skipped-glue",
+            "skipped-no-planner",
+        }
+    ),
+    "retrieval": frozenset(
+        {
+            "unknown",
+            "skipped-initial",
+            "preloaded",
+            "recovered",
+            "empty-after-recovery",
+            "recovery-failed",
+            "skipped-glue",
+            "empty-pack",
+            "skipped-duplicate-repair",
+            "repaired",
+            "empty",
+            "failed",
+            "evidence-ready",
+        }
+    ),
+    "answer": frozenset(
+        {
+            "unknown",
+            "failed",
+            "draft-ok",
+            "served",
+            "narrowed-supported",
+            "narrowed-compacted",
+            "narrowed-adequacy",
+            "narrowed-adequacy-regen",
+            "safety-blocked",
+            "adequacy-failed",
+            "served-split",
+            "envelope-exceeded",
+            "quote-budget-exceeded",
+            "language-guard",
+            "retry-turn-budget",
+            "unavailable-substantive-no-evidence",
+            "conversational-generated",
+            "conversational-generation-failed",
+            "clarification-unavailable",
+            "paging-guard",
+            "adequacy-repair-failed",
+        }
+    ),
+    "verifier": frozenset(
+        {
+            "unknown",
+            "skipped",
+            "skipped-turn-budget",
+            "passed",
+            "local-guard",
+            "partial-unavailable",
+            "unsupported",
+            "passed-after-repair-existing-pack",
+            "passed-after-repair",
+            "unavailable",
+            "passed-after-adequacy-repair",
+        }
+    ),
 }
 
 
@@ -479,9 +525,9 @@ def _is_structural_stage_outcome_counts(value: Any) -> bool:
     # Completed live-summary shape: *_outcome -> outcome -> count.
     if set(value) != _STAGE_OUTCOME_FIELDS:
         return False
-    for field in _STAGE_OUTCOME_FIELDS:
-        stage = field.removesuffix("_outcome")
-        outcomes = value[field]
+    for outcome_field in _STAGE_OUTCOME_FIELDS:
+        stage = outcome_field.removesuffix("_outcome")
+        outcomes = value[outcome_field]
         if not isinstance(outcomes, dict):
             return False
         allowed = _STAGE_OUTCOME_VALUES[stage]
