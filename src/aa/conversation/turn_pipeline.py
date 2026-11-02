@@ -5586,33 +5586,40 @@ async def answer_pipeline_node(
         _answer_dag = _ensure_answer_dag(state)
     except Exception:
         _answer_dag = None
-    outcome = await run_v2_answer_turn(
-        user_message=user_message,
-        summary=str(state.get("conversation_summary", "")),
-        recent=recent_history(messages, current_user_message=user_message),
-        evidence_pack=[item for item in state.get("evidence_pack", []) if isinstance(item, dict)],
-        answer_model=answer_model,
-        verifier_model=verifier_model,
-        planner_model=planner_model if planner_model is not None else answer_model,
-        retrieval_index=retrieval_index,
-        retrieval_config=retrieval_config,
-        recent_quote_ranges=[
-            item for item in state.get("recent_quote_ranges", []) if isinstance(item, dict)
-        ],
-        initial_query_count=_initial_query_count,
-        upstream_latency_ms=_upstream_latency_ms,
-        planner_reason=_prior_reason or None,
-        planner_outcome_raw=_prior_outcome_for_reason or None,
-        turn_trace_id=_prior_trace or None,
-        planner_mode=_prior_mode or None,
-        resolved_intent=_prior_intent or None,
-        whole_turn_judge_model=whole_turn_judge_model,
-        conversation_context=_canonical_ctx_d,
-        resolved_turn=_resolved_turn_d,
-        context_digest=_ctx_digest or None,
-        selection_events=_selection_events_d,
-        turn_dag=_answer_dag,
-    )
+    failed_turn: TurnFailed | None = None
+    failed_traceback: Any = None
+    try:
+        outcome = await run_v2_answer_turn(
+            user_message=user_message,
+            summary=str(state.get("conversation_summary", "")),
+            recent=recent_history(messages, current_user_message=user_message),
+            evidence_pack=[item for item in state.get("evidence_pack", []) if isinstance(item, dict)],
+            answer_model=answer_model,
+            verifier_model=verifier_model,
+            planner_model=planner_model if planner_model is not None else answer_model,
+            retrieval_index=retrieval_index,
+            retrieval_config=retrieval_config,
+            recent_quote_ranges=[
+                item for item in state.get("recent_quote_ranges", []) if isinstance(item, dict)
+            ],
+            initial_query_count=_initial_query_count,
+            upstream_latency_ms=_upstream_latency_ms,
+            planner_reason=_prior_reason or None,
+            planner_outcome_raw=_prior_outcome_for_reason or None,
+            turn_trace_id=_prior_trace or None,
+            planner_mode=_prior_mode or None,
+            resolved_intent=_prior_intent or None,
+            whole_turn_judge_model=whole_turn_judge_model,
+            conversation_context=_canonical_ctx_d,
+            resolved_turn=_resolved_turn_d,
+            context_digest=_ctx_digest or None,
+            selection_events=_selection_events_d,
+            turn_dag=_answer_dag,
+        )
+    except TurnFailed as exc:
+        failed_turn = exc
+        failed_traceback = exc.__traceback__
+        outcome = {"telemetry": dict(exc.telemetry or {})}
     telemetry = dict(outcome.get("telemetry", {}))
     # Enrich with upstream graph stages so one privacy-safe snapshot
     # distinguishes planner, retrieval, answer, verifier and repair.
@@ -5700,6 +5707,14 @@ async def answer_pipeline_node(
                 pass
     except Exception:
         pass
+    # A failed answer exits run_v2_answer_turn before the normal return path.
+    # Preserve the same upstream planner/retrieval enrichment on that path;
+    # otherwise GraphTurnRuntime records the pre-enrichment defaults as if
+    # those stages had been skipped, even though their attempts ran.
+    if failed_turn is not None:
+        failed_turn.telemetry = telemetry
+        raise failed_turn.with_traceback(failed_traceback)
+
     retry_state: dict[str, Any] = {"answer_rounds": int(outcome["rounds"])}
     if telemetry:
         # Privacy-safe stage telemetry travels in orchestration state only;
