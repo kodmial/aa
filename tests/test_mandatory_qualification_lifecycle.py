@@ -247,3 +247,16 @@ def test_no_qualification_bypass_keywords_in_mandatory_workflow() -> None:
     body = WORKFLOW.read_text(encoding="utf-8")
     assert "Closes #" not in body
     assert "Fixes #" not in body
+
+
+def test_mandatory_workflow_result_comment_trigger_requires_canonical_marker() -> None:
+    body = WORKFLOW.read_text(encoding="utf-8")
+    # Status prose may mention a missing result marker; it must not dispatch
+    # the qualification lifecycle. Only the canonical issue-7 marker prefix
+    # is an eligible event trigger.
+    assert (
+        "contains(github.event.comment.body, '<!-- continuum-qualification-result issue=7 sha=')"
+        in body
+    )
+    broad_match = "contains(github.event.comment.body, 'continuum-qualification-result')"
+    assert broad_match not in body
