@@ -258,8 +258,5 @@ def test_mandatory_workflow_result_comment_trigger_requires_canonical_marker() -
         "contains(github.event.comment.body, '<!-- continuum-qualification-result issue=7 sha=')"
         in body
     )
-    broad_match = (
-        "contains(github.event.comment.body, "
-        "'continuum-qualification-result')"
-    )
+    broad_match = "contains(github.event.comment.body, 'continuum-qualification-result')"
     assert broad_match not in body
