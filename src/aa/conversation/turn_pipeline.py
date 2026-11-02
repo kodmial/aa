@@ -5593,7 +5593,9 @@ async def answer_pipeline_node(
             user_message=user_message,
             summary=str(state.get("conversation_summary", "")),
             recent=recent_history(messages, current_user_message=user_message),
-            evidence_pack=[item for item in state.get("evidence_pack", []) if isinstance(item, dict)],
+            evidence_pack=[
+                item for item in state.get("evidence_pack", []) if isinstance(item, dict)
+            ],
             answer_model=answer_model,
             verifier_model=verifier_model,
             planner_model=planner_model if planner_model is not None else answer_model,
