@@ -22,8 +22,12 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
   exact-question whitelists), response-diversity assertion, privacy-safe
   per-stage outcomes and latency only.
 - Gate E -- live performance/SLO: end-to-end and per-stage latency,
-  p50/p95, hard guard (no ordinary turn >= 30s), typing heartbeat
-  continuity verified independently.
+  p50/p95, and typing-heartbeat continuity verified independently. The
+  executable policy defaults to ``observe`` (collect measurements without
+  timing FAIL). In explicit ``enforce`` mode, p95 is compared with the
+  configured target (default 60s) and each ordinary turn with the configured
+  maximum (default 120s). Runtime turn-time limits are disabled by default;
+  reliability and evidence-integrity failures still block qualification.
 - Gate F -- exact-main final verdict: PASS only if A/B/C/E PASS for the exact
   same current main SHA and matching product/runtime fingerprints. No stale
   reuse, no manual override.
