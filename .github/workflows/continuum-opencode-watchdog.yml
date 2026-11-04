@@ -21,6 +21,7 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      timeout_minutes: "15"
       watched_workflow: "OpenCode agent"
       max_recovery_retries: "3"
       pause_on_failure: "false"
