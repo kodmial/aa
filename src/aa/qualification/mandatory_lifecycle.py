@@ -140,11 +140,6 @@ def build_full_qualification_workflow_dispatch(sha: str) -> list[str]:
     workflow default of gate-c-focus.
     """
 
-    Direct diagnostic dispatches keep the self-proving workflow default of
-    gate-c-focus. The owner-authorized mandatory #7 lifecycle must explicitly
-    select full so A/B/C/E run on exact main instead of silently publishing
-    C-only diagnostics.
-    """
     normalized = normalize_sha(sha)
     return [
         "workflow",
