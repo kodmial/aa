@@ -133,7 +133,12 @@ def normalize_sha(value: str) -> str:
 
 
 def build_full_qualification_workflow_dispatch(sha: str) -> list[str]:
-    """Build the mandatory lifecycle explicit full A-F workflow dispatch.
+    """Build the mandatory lifecycle's explicit full A/B/C/E dispatch.
+
+    The exact-main final reducer runs only the mandatory A/B/C/E gates; Gate D
+    remains excluded. Direct diagnostic dispatches keep the self-proving
+    workflow default of gate-c-focus.
+    """
 
     Direct diagnostic dispatches keep the self-proving workflow default of
     gate-c-focus. The owner-authorized mandatory #7 lifecycle must explicitly
