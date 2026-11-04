@@ -149,7 +149,6 @@ def test_search_rejects_non_ru_scope() -> None:
     assert result.items == ()
 
 
-
 def test_search_rejects_naive_now_utc() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         search(place_id="place-moscow-city", now_utc=datetime(2026, 10, 6, 12, 0))
