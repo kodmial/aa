@@ -47,9 +47,15 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
     assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
-    # Normal implementation runs must stop after the bounded dispatch budget.
-    # Explicit caller overrides remain supported by the input passthrough.
-    assert "\"${{ inputs.pause_on_failure || 'true' }}\"" in body
+    # Scheduler-generated issue comments must match the scheduler's
+    # non-terminal convergence policy. Manual owner commands retain the
+    # bounded pause default; explicit workflow_dispatch overrides remain supported.
+    scheduler_dispatch_marker = (
+        "contains(github.event.comment.body || '', "
+        "inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->')"
+    )
+    assert scheduler_dispatch_marker in body
+    assert "&& 'false' || inputs.pause_on_failure || 'true'" in body
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
