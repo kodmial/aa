@@ -56,12 +56,13 @@ def _slot_verified_at(group_id: str, snapshot: DirectorySnapshot) -> datetime | 
     return max(stamps)
 
 
-def _resource_for_group(group: GroupRecord, snapshot: DirectorySnapshot) -> MeetingResource:
+def _resource_for_group(
+    group: GroupRecord,
+    snapshot: DirectorySnapshot,
+    now_utc: datetime,
+) -> MeetingResource:
     verified_at = _slot_verified_at(group.group_id, snapshot)
-    freshness = _freshness_note(verified_at)
-    if verified_at is not None:
-        now_utc = datetime.now(UTC)
-        freshness = _freshness_note(verified_at, now_utc)
+    freshness = _freshness_note(verified_at, now_utc)
     return MeetingResource(
         record_id=group.group_id,
         group_id=group.group_id,
@@ -113,13 +114,22 @@ def search(
     weekday: int | None = None,
     limit: int = 3,
     snapshot: DirectorySnapshot | None = None,
+    now_utc: datetime | None = None,
 ) -> DirectorySearchResult:
     """Structured typed-filter search over the validated snapshot.
 
     Only records already present in the snapshot are returned. A region
     link never satisfies a request for an exact place/time as a matched
     meeting. Never fabricates groups, times, contacts, or distances.
+    now_utc is an optional aware clock for deterministic freshness checks;
+    live callers may pass one timestamp shared with the timetable lookup.
     """
+    if now_utc is None:
+        moment = datetime.now(UTC)
+    elif now_utc.tzinfo is None:
+        raise ValueError("now_utc must be a timezone-aware datetime")
+    else:
+        moment = now_utc.astimezone(UTC)
     try:
         directory = snapshot if snapshot is not None else get_cached_snapshot()
     except DirectoryUnavailableError:
@@ -177,7 +187,7 @@ def search(
     bounded = candidates[: max(1, limit)]
 
     if bounded:
-        items = tuple(_resource_for_group(group, directory) for group in bounded)
+        items = tuple(_resource_for_group(group, directory, moment) for group in bounded)
         stale = [item for item in items if item.freshness == "stale"]
         if stale and len(stale) == len(items):
             link = _region_link_for(_place_region(resolved_place_id, directory), directory)

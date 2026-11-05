@@ -48,6 +48,7 @@ from aa.qualification.mandatory_lifecycle import (  # noqa: E402
     build_blocked_record,
     build_dispatch_record,
     build_dispatch_tuple,
+    build_full_qualification_workflow_dispatch,
     classify_runner_state,
     classify_tracker_lease,
     format_blocked_reason,
@@ -307,17 +308,7 @@ def main() -> int:
                 print(json.dumps({"single_dispatch": single.dispatch, "reason": single.reason}))
             if args.post and not args.dry_run:
                 _run_gh(["issue", "comment", "7", "--body", shared_marker])
-                _run_gh(
-                    [
-                        "workflow",
-                        "run",
-                        "aa-self-proving-qualification.yml",
-                        "--ref",
-                        "main",
-                        "-f",
-                        f"required_sha={owner_item.sha}",
-                    ]
-                )
+                _run_gh(build_full_qualification_workflow_dispatch(owner_item.sha))
         else:
             # Healthy idempotent reuse (trusted result present, already
             # dispatched, shared marker present, active lease retain) is
