@@ -50,10 +50,11 @@ def test_opencode_caller_preserves_aa_knobs() -> None:
     # Scheduler-generated issue comments must match the scheduler's
     # non-terminal convergence policy. Manual owner commands retain the
     # bounded pause default; explicit workflow_dispatch overrides remain supported.
-    assert (
-        "contains(github.event.comment.body || '', inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->')"
-        in body
+    scheduler_dispatch_marker = (
+        "contains(github.event.comment.body || '', "
+        "inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->')"
     )
+    assert scheduler_dispatch_marker in body
     assert "&& 'false' || inputs.pause_on_failure || 'true'" in body
 
 
