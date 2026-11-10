@@ -121,7 +121,7 @@ RUN set -eux; \
     want="${AA_OPENCODE_VERSION:-$(cat /opt/aa/opencode.version)}"; \
     echo "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; \
     for attempt in 1 2 3; do \
-        if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install \
+        if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/v2/install \
             | bash -s -- --version "$want"; then break; fi; \
         if [ "$attempt" -eq 3 ]; then echo "OpenCode installer failed" >&2; exit 1; fi; \
         sleep $((attempt * 10)); \
