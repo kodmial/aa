@@ -47,6 +47,9 @@ def test_aa_version_pin_is_exact_semver_and_consistent() -> None:
     assert "OPENCODE_VERSION_OVERRIDE: ${{ vars.CONTINUUM_OPENCODE_VERSION }}" in image
     assert "AA_OPENCODE_VERSION=${{ steps.meta.outputs.opencode }}" in image
     assert "opencode --version" in docker
+    if value.startswith("2."):
+        assert "https://opencode.ai/v2/install" in docker
+        assert "https://opencode.ai/install" not in docker
 
 
 def test_all_aa_live_runners_share_verified_toolchain() -> None:
