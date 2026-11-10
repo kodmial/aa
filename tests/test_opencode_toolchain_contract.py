@@ -97,7 +97,9 @@ def test_aa_toolchain_reads_only_pin_and_verifies_real_binary() -> None:
     assert "components: opencode" in text
     assert "opencode-version: ${{ steps.version.outputs.version }}" in text
     assert 'actual="$(opencode --version)"' in text
-    assert '[[ "$actual" != "$PIN" || "$RESOLVED" != "$PIN" ]]' in text
+    assert 'safe_pin=' in text
+    assert '"$RESOLVED" != "$PIN"' in text
+    assert '(^|[^0-9.])${safe_pin}([^0-9.]|$)' in text
 
 
 def test_no_workflow_embeds_an_unreviewed_cli_installer() -> None:

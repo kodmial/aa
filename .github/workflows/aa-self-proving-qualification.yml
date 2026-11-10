@@ -299,7 +299,8 @@ jobs:
           pip install -e . --no-deps
           pin="$(cat docker/opencode.version)"
           actual="$(opencode --version)"
-          if [[ "$actual" != "$pin" ]]; then
+          safe_pin="${pin//./\\.}"
+          if [[ ! "$actual" =~ (^|[^0-9.])${safe_pin}([^0-9.]|$) ]]; then
             echo "::error::OpenCode pin mismatch: image=$actual repo=$pin"
             exit 1
           fi
@@ -824,7 +825,8 @@ jobs:
           python scripts/verify_runtime_image.py --tools-only
           pin="$(cat docker/opencode.version)"
           actual="$(opencode --version)"
-          if [[ "$actual" != "$pin" ]]; then
+          safe_pin="${pin//./\\.}"
+          if [[ ! "$actual" =~ (^|[^0-9.])${safe_pin}([^0-9.]|$) ]]; then
             echo "::error::OpenCode pin mismatch: image=$actual repo=$pin"
             exit 1
           fi
