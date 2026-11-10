@@ -40,7 +40,8 @@ runs:
       run: |
         set -euo pipefail
         actual="$(opencode --version)"
-        if [[ "$actual" != "$PIN" || "$RESOLVED" != "$PIN" ]]; then
+        safe_pin="${PIN//./\\.}"
+        if [[ "$RESOLVED" != "$PIN" || ! "$actual" =~ (^|[^0-9.])${safe_pin}([^0-9.]|$) ]]; then
           echo "::error::OpenCode version mismatch: expected $PIN, resolved $RESOLVED, actual $actual"
           exit 2
         fi
