@@ -64,7 +64,8 @@ The runtime exposes these as `OPENCODE_MODEL` and
 `OPENCODE_FALLBACK_MODEL`; all six OpenCode AA agents inherit the active
 session model and **must not pin a different model in `opencode.json`**.
 Qualification uses the same AA policy independently of the Continuum coder
-model pool.
+model pool. The model-policy contract is documented in
+[`docs/opencode-model-pool.md`](docs/opencode-model-pool.md).
 
 ## AA knowledge architecture
 
