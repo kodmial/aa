@@ -1188,9 +1188,70 @@ jobs:
             echo "::error::Gate C bootstrap failed after L1/L2 attempts (strict E5 rebuild unavailable)."
             exit 1
           fi
+      - name: Gate C canary - bounded diagnostic preflight
+        # kodmial/aa#454: prove the observer/server telemetry and the real
+        # production seam on at most two existing core scenarios BEFORE the
+        # expensive unchanged 18-scenario campaign. READY only authorizes
+        # the campaign; every other typed status keeps Gate C closed. The
+        # canary is not qualification evidence and never yields a Product
+        # Contract PASS.
+        id: gate-c-canary
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+        run: |
+          set -euo pipefail
+          # A validated Gate C checkpoint already proves the campaign ran on
+          # this exact SHA; the cheap canary is not re-run on resume.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip C; then
+            echo "Gate C validated checkpoint present; canary not required (resume)."
+            exit 0
+          fi
+          set +e
+          python scripts/run_gate_c_canary.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --preflight-budget-s 600 --live-budget-s 300
+          canary_rc=$?
+          set -e
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          path = Path("self-proving-out/gate-c-canary-result.json")
+          if path.is_file():
+              try:
+                  result = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  result = {}
+              print("## Gate C canary preflight (kodmial/aa#454)\n")
+              print(f"- Status: **{str(result.get('status', 'unknown'))[:32]}**")
+              print(f"- Category: `{str(result.get('category', ''))[:64]}`")
+              print(f"- Real turns: `{result.get('real_turns', 0)}`")
+              budget = result.get("budget") or {}
+              print(f"- Budget expired: `{bool(budget.get('expired'))}`")
+              print(f"- Elapsed: `{result.get('total_time_s', 0)}` s")
+              print("- Scope: diagnostic preflight only; never qualification evidence.\n")
+          PY
+          if [[ "$canary_rc" -eq 75 ]]; then
+            echo "::error::Gate C canary provider 429: retire runner and resume on a fresh VM."
+            exit 75
+          fi
+          if [[ "$canary_rc" -ne 0 ]]; then
+            echo "::error::Gate C canary did not return READY; the 18-scenario campaign stays closed."
+            exit "$canary_rc"
+          fi
+
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
-        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
+        if: ${{ (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') && steps.gate-c-canary.outcome == 'success' }}
         shell: bash
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
@@ -1305,6 +1366,41 @@ jobs:
           from pathlib import Path
           result_path = Path("self-proving-out/c-focus-result.json")
           if not result_path.is_file():
+              canary_path = Path("self-proving-out/gate-c-canary-result.json")
+              if canary_path.is_file():
+                  try:
+                      canary = json.loads(canary_path.read_text(encoding="utf-8"))
+                  except (OSError, json.JSONDecodeError):
+                      canary = {}
+                  canary_status = str(canary.get("status", "BLOCKED")).upper()
+                  canary_category = str(canary.get("category", ""))[:64]
+                  canary_missing = str(canary.get("missing_field", ""))[:64]
+                  canary_detail = str(canary.get("detail", ""))[:96]
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                      handle.write("c_focus_status=BLOCKED\n")
+                      handle.write("c_focus_verdict=C_BLOCKED\n")
+                  summary = Path(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"))
+                  if summary.name != "/dev/null":
+                      with summary.open("a", encoding="utf-8") as handle:
+                          handle.write("## Gate C focus terminal verdict\n\n")
+                          handle.write("- Verdict: **C_BLOCKED**\n")
+                          handle.write("- Status: `BLOCKED`\n")
+                          handle.write(
+                              "- Cause: bounded Gate C canary preflight did not "
+                              "return READY; the 18-scenario campaign was not started.\n"
+                          )
+                          handle.write(
+                              f"- Canary: `{canary_status}` category=`{canary_category}` "
+                              f"missing=`{canary_missing}` detail=`{canary_detail}`\n"
+                          )
+                  print(
+                      "gate C focus BLOCKED: canary preflight "
+                      f"status={canary_status} category={canary_category or 'unknown'} "
+                      f"missing={canary_missing or 'unknown'} "
+                      f"detail={canary_detail or 'none'}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(2)
               preflight = str(os.environ.get("C_PREFLIGHT_OUTCOME") or "").lower()
               if preflight == "failure":
                   print(
@@ -1561,6 +1657,10 @@ jobs:
             self-proving-out/result.json
             self-proving-out/c-focus-result.json
             self-proving-out/gate-E-diagnostic.json
+            self-proving-out/gate-c-canary-result.json
+            self-proving-out/observer-self-test.json
+            self-proving-out/canary-progress.json
+            self-proving-out/canary-attempt-observer/
             live-out/live-watchdog-progress.json
             live-out/attempt-observer/
           retention-days: 14
