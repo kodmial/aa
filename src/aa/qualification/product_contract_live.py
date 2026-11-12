@@ -4247,6 +4247,7 @@ async def run_live_telegram_evidence_lane(
                         # second turn and never start the 18-case campaign.
                         from aa.qualification.gate_c_canary import (
                             TYPED_CANARY_FAILURE_CAUSES,
+                            _server_state_observed,
                             server_endpoints_compatible,
                         )
                         from aa.qualification.live_partial_evidence import (
@@ -4274,8 +4275,15 @@ async def run_live_telegram_evidence_lane(
                                 causality=scenario_causality_id,
                             )
                             first_coverage = coverage_from_partial(first_partial)
-                            server_ok = server_probe is not None and server_endpoints_compatible(
+                            server_evidence_cached = (
                                 server_probe.cached_evidence()
+                                if server_probe is not None
+                                else None
+                            )
+                            server_ok = bool(
+                                server_probe is not None
+                                and server_endpoints_compatible(server_evidence_cached)
+                                and _server_state_observed(server_evidence_cached)
                             )
                             if (
                                 first_coverage.get("client_attempt_ledger") != "observed"
@@ -4287,6 +4295,7 @@ async def run_live_telegram_evidence_lane(
             if canary_mode:
                 await _refresh_server_evidence()
                 from aa.opencode.server_events import unavailable_evidence
+                from aa.qualification.gate_c_canary import TYPED_CANARY_FAILURE_CAUSES
 
                 attempt_entries = _opencode_attempt_entries(getattr(app, "opencode_runtime", None))
                 server_evidence = (
@@ -4306,15 +4315,19 @@ async def run_live_telegram_evidence_lane(
                 # decide the bounded canary. Quality checks stay in ``failed``
                 # as diagnostic context but never become a Product verdict.
                 canary_failed = [name for name in failed if _canary_infrastructure_failure(name)]
-                canary_causes = [
-                    str(
+                canary_causes: list[str] = []
+                for diagnostic in scenario_diagnostics:
+                    cause = str(
                         diagnostic.get("failure_reason", "")
                         or diagnostic.get("timeout_reason", "")
                         or ""
                     )[:64]
-                    for diagnostic in scenario_diagnostics
-                ]
-                canary_causes = [cause for cause in canary_causes if cause]
+                    if not cause:
+                        production = str(diagnostic.get("production_outcome", "") or "")
+                        if production in TYPED_CANARY_FAILURE_CAUSES:
+                            cause = production[:64]
+                    if cause:
+                        canary_causes.append(cause)
                 if budget_expiration_category != "none":
                     canary_status = "INCOMPLETE"
                 elif canary_failed or canary_causes:

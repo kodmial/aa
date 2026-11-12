@@ -355,10 +355,7 @@ async def run_observer_self_test(
     coverage: dict[str, Any] = {}
     previous_progress_env = os.environ.get(ENV_PROGRESS_PATH)
     try:
-        from aa.conversation.turn_causality import (
-            clear_turn_causality,
-            set_turn_causality,
-        )
+        from aa.conversation.turn_causality import set_turn_causality
         from aa.opencode.client import HttpOpenCodeClient
         from aa.opencode.observer import StallSnapshotObserver
 
@@ -1270,8 +1267,12 @@ __all__ = [
     "CATEGORY_DIAGNOSTIC_MISSING",
     "CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED",
     "CATEGORY_OPENCODE_UNAVAILABLE",
+    "CATEGORY_ORPHAN_WORK",
     "CATEGORY_PRECONDITION_FAILED",
+    "CATEGORY_PRIVACY_VIOLATION",
     "CATEGORY_READY",
+    "CATEGORY_REAL_PATH_INCOMPLETE",
+    "CATEGORY_REAL_PATH_NOT_EXECUTED",
     "CATEGORY_REAL_PATH_TYPED_FAILURE",
     "CATEGORY_SELF_TEST_FAILED",
     "CATEGORY_UNSUPPORTED_SERVER",
@@ -1279,6 +1280,7 @@ __all__ = [
     "DEFAULT_LIVE_BUDGET_S",
     "DEFAULT_PREFLIGHT_BUDGET_S",
     "EXIT_BY_STATUS",
+    "MIN_BUDGET_S",
     "NOMINAL_SNAPSHOT_DELAYS_S",
     "SCHEMA_GATE_C_CANARY_RESULT",
     "SCHEMA_OBSERVER_SELF_TEST",

@@ -34,6 +34,7 @@ from aa.qualification.gate_c_canary import (  # noqa: E402
     CATEGORY_OPENCODE_UNAVAILABLE,
     CATEGORY_PRECONDITION_FAILED,
     CATEGORY_REAL_PATH_INCOMPLETE,
+    CATEGORY_SELF_TEST_FAILED,
     DEFAULT_LIVE_BUDGET_S,
     DEFAULT_PREFLIGHT_BUDGET_S,
     EXIT_BY_STATUS,
@@ -298,6 +299,30 @@ async def _run(args: argparse.Namespace) -> int:
             "llm_calls": 0,
         }
         _write_json(out_dir / SELF_TEST_NAME, self_test)
+
+    # Fail fast: the observer/server self-test is the cheap proof that the
+    # diagnostic chain is wired. When it fails or is incomplete, spending the
+    # live allowance on production turns cannot repair the missing evidence.
+    if str(self_test.get("status", "")).upper() != "PASS":
+        failed = [str(name) for name in self_test.get("failed_checks", []) if str(name)]
+        decision = CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_SELF_TEST_FAILED,
+            failed[0] if failed else "observer_self_test.status",
+            "observer/server self-test failed; live canary not started",
+        )
+        return _finish(
+            out_dir=out_dir,
+            main_sha=expected_sha,
+            run_id=run_id,
+            self_test=self_test,
+            real_path=None,
+            decision=decision,
+            preflight_budget_s=preflight_budget_s,
+            live_budget_s=live_budget_s,
+            started=started,
+            extra=extra,
+        )
 
     # 2. Pinned OpenCode binary precondition.
     pinned_version = _pinned_opencode_version()
