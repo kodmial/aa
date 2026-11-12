@@ -775,14 +775,58 @@ def _attempt_evidence_summary(
         )[:64]
         if failure:
             failure_categories.append(failure)
+    model_requests = sum(
+        count
+        for operation, count in operations.items()
+        if operation in ("message-text", "message-structured")
+    )
     return {
         "rows": len(entries),
         "state_counts": dict(sorted(states.items())),
         "operation_counts": dict(sorted(operations.items())),
         "stage_counts": dict(sorted(stages.items())),
+        "model_requests": model_requests,
         "requested_models": _bounded_str_list(models),
         "failure_categories": _bounded_str_list(failure_categories, limit=8, width=64),
     }
+
+
+def _server_state_observed(evidence: Mapping[str, Any] | None) -> bool:
+    """Whether the pinned server itself reported at least one session fact.
+
+    Endpoint availability alone (``/doc`` plus a well-shaped empty status
+    map) is not server-side evidence of the real request. A READY canary
+    requires an actual closed-vocabulary session state, an actual terminal
+    error kind, or a parsed server event, all of which are extracted by
+    the same pinned-server probe the live lane uses.
+    """
+    if not isinstance(evidence, Mapping):
+        return False
+    if str(evidence.get("last_session_state", "") or "") in (
+        "idle",
+        "busy",
+        "retry",
+    ):
+        return True
+    if str(evidence.get("server_error_kind", "") or ""):
+        return True
+    counts = evidence.get("session_state_counts")
+    if isinstance(counts, Mapping):
+        for state in ("idle", "busy", "retry"):
+            try:
+                if int(counts.get(state, 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    event_counts = evidence.get("event_type_counts")
+    if isinstance(event_counts, Mapping):
+        for event_type in ("session.status", "session.idle", "session.error"):
+            try:
+                if int(event_counts.get(event_type, 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
 
 
 def _first_attempt_typed_cause(entries: Sequence[Mapping[str, Any]]) -> str:
@@ -926,6 +970,7 @@ def build_real_path_report(lane_result: Any) -> dict[str, Any]:
         "server_evidence_state": str(server_evidence.get("state", "unobserved")),
         "server_evidence": dict(server_evidence),
         "server_endpoints_compatible": server_endpoints_compatible(server_evidence),
+        "server_state_observed": _server_state_observed(server_evidence),
         "attempt_in_flight_count": in_flight,
         "in_flight_attempt_preserved": bool(in_flight > 0),
         "attempt_evidence": _attempt_evidence_summary(attempt_audit),
@@ -1030,6 +1075,13 @@ def evaluate_canary(
             "real_path.server_endpoints_compatible",
             "the actual pinned server did not expose /doc, /session/status and SSE /event together",
         )
+    if not bool(real_path.get("server_state_observed")):
+        return CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_UNSUPPORTED_SERVER,
+            "real_path.server_state_observed",
+            "the actual pinned server reported no session status/event fact for the real turn",
+        )
     if str(real_path.get("attempt_coverage", "")) != COVERAGE_OBSERVED:
         return CanaryDecision(
             STATUS_BLOCKED,
@@ -1051,6 +1103,20 @@ def evaluate_canary(
             CATEGORY_REAL_PATH_TYPED_FAILURE,
             "real_path.typed_cause",
             f"first real-path turn returned typed cause {cause}",
+        )
+    attempt_evidence = real_path.get("attempt_evidence")
+    model_requests = 0
+    if isinstance(attempt_evidence, Mapping):
+        try:
+            model_requests = int(attempt_evidence.get("model_requests", 0) or 0)
+        except (TypeError, ValueError):
+            model_requests = 0
+    if model_requests < 1:
+        return CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_DIAGNOSTIC_MISSING,
+            "real_path.attempt_evidence.model_requests",
+            "no real OpenCode model-message attempt was observed",
         )
     lane_status = str(real_path.get("status", "")).upper()
     if lane_status == "FAIL":
@@ -1156,6 +1222,7 @@ def build_canary_result(
             "server_endpoints_compatible": bool(
                 (real_path or {}).get("server_endpoints_compatible")
             ),
+            "server_state_observed": bool((real_path or {}).get("server_state_observed")),
             # Persist the bounded server-side facts (including a typed
             # session.error name/status when one was really observed) so an
             # operator can see the causality -> attempt -> server chain

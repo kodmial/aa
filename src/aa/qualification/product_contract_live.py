@@ -4263,6 +4263,10 @@ async def run_live_telegram_evidence_lane(
                             # FIRST real turn is already a diagnostic-chain
                             # BLOCKED; spending the remaining observation
                             # budget on a second turn cannot repair it.
+                            # Refresh the bounded server probe first: the
+                            # cached evidence may still be the explicit
+                            # never-observed marker from before the turn.
+                            await _refresh_server_evidence()
                             first_partial = _collect_partial_evidence(
                                 "canary-first-turn",
                                 position=position,

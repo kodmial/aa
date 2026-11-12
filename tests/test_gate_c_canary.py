@@ -92,6 +92,8 @@ def _real_path(**overrides: Any) -> dict[str, Any]:
         "server_coverage": "observed",
         "server_evidence_state": "supported",
         "server_endpoints_compatible": True,
+        "server_state_observed": True,
+        "attempt_evidence": {"rows": 1, "model_requests": 1},
         "in_flight_attempt_preserved": False,
         "scenario_diagnostics": [
             {
@@ -198,6 +200,24 @@ def test_missing_attempt_or_empty_cause_fails_closed() -> None:
     no_turn = _decision(self_test, _real_path(real_turns=0))
     assert no_turn.status == STATUS_BLOCKED
 
+    # A scenario can complete without a real model-message attempt (for
+    # example a deterministic fast path). That is not proof of the
+    # diagnostic chain and must never authorize the 18-case campaign.
+    no_model = _decision(
+        self_test,
+        _real_path(attempt_evidence={"rows": 2, "model_requests": 0}),
+    )
+    assert no_model.status == STATUS_BLOCKED
+    assert no_model.category == CATEGORY_DIAGNOSTIC_MISSING
+    assert no_model.missing_field == "real_path.attempt_evidence.model_requests"
+
+    # Endpoint availability without an actual session status/event fact is
+    # not server-side evidence of the real turn.
+    no_server_fact = _decision(self_test, _real_path(server_state_observed=False))
+    assert no_server_fact.status == STATUS_BLOCKED
+    assert no_server_fact.category == CATEGORY_UNSUPPORTED_SERVER
+    assert no_server_fact.missing_field == "real_path.server_state_observed"
+
 
 @pytest.mark.asyncio
 async def test_unresponsive_http_is_bounded_inconclusive() -> None:
@@ -298,6 +318,12 @@ def test_workflow_runs_canary_before_gate_c_and_gates_on_ready() -> None:
     assert "self-proving-out/canary-progress.json" in text
     assert "self-proving-out/canary-attempt-observer/" in text
     assert "Gate C validated checkpoint present; canary not required (resume)." in text
+    # The short canary shares the prepared image, corpus and L2 index with
+    # the campaign: no per-job dependency install or E5 rebuild.
+    canary_block = text[canary:gate_c]
+    assert "pip install" not in canary_block
+    assert "build_retrieval_index.py" not in canary_block
+    assert "manage_derived_cache.py" not in canary_block
 
 
 def test_canary_result_artifact_is_not_qualification_evidence() -> None:
@@ -343,6 +369,12 @@ def test_canary_result_artifact_is_not_qualification_evidence() -> None:
     )
     assert result["schema_version"] == "aa-gate-c-canary-result/1"
     assert result["ready"] is True
+    assert result["run_sha"] == "a" * 40
+    assert result["main_sha"] == "a" * 40
+    assert result["stage_attempt_evidence_coverage"]["client_attempt_ledger"] == "observed"
+    assert result["stage_attempt_evidence_coverage"]["stage_telemetry"] == "observed"
+    assert result["budget_expiration_category"] == "none"
+    assert result["privacy_safe_paths"] == ["gate-c-canary-result.json"]
     assert result["product_qualified"] is False
     assert result["qualification_evidence"] is False
     assert result["gate_scenarios_executed"] == 0
@@ -480,6 +512,80 @@ def test_doc_alone_does_not_prove_server_telemetry_compatibility() -> None:
     assert server_endpoints_compatible(unknown_status_shape) is False
 
 
+def test_real_path_lane_evidence_with_observed_model_request_is_ready() -> None:
+    lane_result = LaneResult(
+        lane="gate-c-canary-real-path",
+        status="PASS",
+        metrics={
+            "real_turns": 1,
+            "scenario_diagnostics": [
+                {
+                    "scenario_index": 1,
+                    "family": "meta-capability",
+                    "delivery_timeout": False,
+                    "delivery_status": "delivered",
+                    "product_outcome": "answer_success",
+                    "failure_reason": "",
+                }
+            ],
+            "attempt_audit": [
+                {
+                    "attempt_id": "a" * 32,
+                    "operation": "message-text",
+                    "state": "completed",
+                    "stage": "answer",
+                    "agent": "aa",
+                    "model": "provider/model-primary",
+                    "causality_id": "c" * 32,
+                }
+            ],
+            "partial_evidence": {
+                "coverage": {
+                    "client_attempt_ledger": "observed",
+                    "stage_telemetry": "observed",
+                    "server_events": "observed",
+                    "served_model_audit": "observed",
+                    "runtime_process_state": "observed",
+                },
+                "served_models_by_agent": {"aa": ["provider/model-primary"]},
+                "stage_outcome_counts": {"answer": {"answered": 1}},
+            },
+            "server_evidence": {
+                "state": "supported",
+                "endpoints": {
+                    "/doc": {"state": "supported", "http_status": 200},
+                    "/session/status": {"session-status": 1, "unknown-state": 0},
+                    "/event": {
+                        "event-stream-status": 200,
+                        "event-stream-streamed": 1,
+                        "event-stream-quiet": 1,
+                    },
+                },
+                "last_session_state": "idle",
+                "session_state_counts": {"idle": 1, "busy": 0, "retry": 0},
+            },
+        },
+    )
+
+    report = build_real_path_report(lane_result)
+    assert report["attempt_evidence"]["model_requests"] == 1
+    assert report["server_state_observed"] is True
+    decision = _decision(
+        {
+            "schema_version": "aa-gate-c-canary-observer-self-test/1",
+            "status": "PASS",
+            "checks": {"server-telemetry-supported": True},
+            "failed_checks": [],
+            "server_telemetry": {"state": "supported"},
+            "privacy_safe": True,
+            "no_orphan": True,
+        },
+        report,
+    )
+    assert decision.status == STATUS_READY
+    assert decision.category == CATEGORY_READY
+
+
 def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> None:
     lane_result = LaneResult(
         lane="gate-c-canary-real-path",
@@ -533,12 +639,16 @@ def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> Non
                 },
                 "server_error_kind": "APIError",
                 "server_error_status_code": 503,
+                "last_session_state": "busy",
+                "session_state_counts": {"idle": 0, "busy": 1, "retry": 0},
             },
         },
     )
 
     report = build_real_path_report(lane_result)
     assert report["typed_cause"] == "conversational-generation-failed"
+    assert report["server_state_observed"] is True
+    assert report["attempt_evidence"]["model_requests"] == 1
     assert report["attempt_coverage"] == "observed"
     assert report["served_model_coverage"] == "observed"
     assert report["attempt_evidence"]["state_counts"] == {"failed": 1}
