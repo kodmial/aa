@@ -4,11 +4,11 @@
     "commands": [
       {
         "command": "bash scripts/verify.sh",
-        "duration_ms": 15641,
+        "duration_ms": 15726,
         "exit_code": 1,
         "name": "validation",
-        "output_sha256": "25271bd67a943201e5380978dcba6f0dc860863a8af725054a7e4aa393665e15",
-        "output_tail": "+00:00\", \"level\": \"INFO\", \"logger\": \"aa.app\", \"message\": \"starting worker\", \"extra\": {\"config\": {\"telegram_bot_token\": \"\", \"opencode_base_url\": \"http://127.0.0.1:4096\", \"opencode_command\": \"opencode\", \"opencode_workdir\": \".\", \"bot_session_duration_seconds\": 0.0, \"aa_corpus_path\": \"./corpus\", \"aa_corpus_version\": \"local\", \"opencode_agent\": \"aa\", \"opencode_model\": \"opencode/deepseek-v4.1-flash-free\", \"opencode_fallback_model\": \"opencode/nemotron-3-ultra-free\", \"opencode_context_limit_tokens\": 0, \"opencode_max_output_tokens\": 0, \"max_concurrent_turns\": 4, \"per_chat_queue_size\": 8, \"typing_heartbeat_seconds\": 4.0, \"aa_voice_model_dir\": \"./models/gigaam\", \"aa_tts_model_path\": \"./models/tts/v5_5_ru.pt\", \"aa_voice_presentation_model_path\": \"./models/voice-presentation/model_quantized.onnx\", \"log_level\": \"INFO\", \"time_policy\": {\"turn_time_limits_enabled\": false, \"latency_gate_mode\": \"observe\", \"latency_p95_target_ms\": 60000.0, \"latency_max_turn_ms\": 120000.0, \"transport_timeout_s\": 1800.0, \"transport_connect_timeout_s\": 30.0, \"qualification_campaign_s\": 8100.0, \"qualification_finalisation_reserve_s\": 900.0, \"qualification_scenario_wait_s\": 8100.0, \"qualification_scenario_inactivity_s\": 1800.0}}}}\n{\"timestamp\": \"2026-11-10T14:53:56.574242+00:00\", \"level\": \"INFO\", \"logger\": \"aa.opencode.runtime\", \"message\": \"launched opencode serve\"}\n{\"timestamp\": \"2026-11-10T14:54:11.742397+00:00\", \"level\": \"INFO\", \"logger\": \"aa.app\", \"message\": \"readiness marker kept local-only (publish not enabled)\"}\n{\"timestamp\": \"2026-11-10T14:54:11.742521+00:00\", \"level\": \"WARNING\", \"logger\": \"aa.app\", \"message\": \"worker startup failed\", \"extra\": {\"category\": \"opencode-not-ready\"}}\n{\"timestamp\": \"2026-11-10T14:54:11.742601+00:00\", \"level\": \"INFO\", \"logger\": \"aa.opencode.runtime\", \"message\": \"opencode runtime stopped\"}\nTraceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/home/runner/work/aa/aa/src/aa/__main__.py\", line 90, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/home/runner/work/aa/aa/src/aa/__main__.py\", line 72, in main\n    asyncio.run(_check())\n    ~~~~~~~~~~~^^^^^^^^^^\n  File \"/usr/lib/python3.14/asyncio/runners.py\", line 204, in run\n    return runner.run(main)\n           ~~~~~~~~~~^^^^^^\n  File \"/usr/lib/python3.14/asyncio/runners.py\", line 127, in run\n    return self._loop.run_until_complete(task)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"/usr/lib/python3.14/asyncio/base_events.py\", line 719, in run_until_complete\n    return future.result()\n           ~~~~~~~~~~~~~^^\n  File \"/home/runner/work/aa/aa/src/aa/__main__.py\", line 69, in _check\n    await app.start()\n  File \"/home/runner/work/aa/aa/src/aa/app.py\", line 586, in start\n    await self.opencode_runtime.start()\n  File \"/home/runner/work/aa/aa/src/aa/opencode/runtime.py\", line 444, in start\n    await self.ensure_ready(self._ready_timeout)\n  File \"/home/runner/work/aa/aa/src/aa/opencode/runtime.py\", line 491, in ensure_ready\n    raise OpenCodeTimeoutError(\"opencode server did not become ready in time\")\naa.opencode.errors.OpenCodeTimeoutError: opencode server did not become ready in time\n[gate-a-shell] a-shell-aa-check FAIL exit=1 duration_ms=15483\n[gate-a-shell] a-shell-pytest\n/usr/bin/python3: No module named pytest\n[gate-a-shell] a-shell-pytest FAIL exit=1 duration_ms=11\n[gate-a-shell] a-shell-ruff-check\n/usr/bin/python3: No module named ruff\n[gate-a-shell] a-shell-ruff-check FAIL exit=1 duration_ms=10\n[gate-a-shell] a-shell-ruff-format\n/usr/bin/python3: No module named ruff\n[gate-a-shell] a-shell-ruff-format FAIL exit=1 duration_ms=10\n[gate-a-shell] a-shell-mypy\n/usr/bin/python3: No module named mypy\n[gate-a-shell] a-shell-mypy FAIL exit=1 duration_ms=10\n{\"checks\": 5, \"failed_checks\": [\"a-shell-aa-check\", \"a-shell-pytest\", \"a-shell-ruff-check\", \"a-shell-ruff-format\", \"a-shell-mypy\"], \"out\": \"/tmp/aa-gate-a-shell-results-canonical.json\", \"profile\": \"canonical\"}\n",
+        "output_sha256": "6f212de07844bd33ef459258ee6676b9360bd0854b17175bc48e392cda04fe3e",
+        "output_tail": "xtra\": {\"config\": {\"telegram_bot_token\": \"\", \"opencode_base_url\": \"http://127.0.0.1:4096\", \"opencode_command\": \"opencode\", \"opencode_workdir\": \".\", \"bot_session_duration_seconds\": 0.0, \"aa_corpus_path\": \"./corpus\", \"aa_corpus_version\": \"local\", \"opencode_agent\": \"aa\", \"opencode_model\": \"opencode/deepseek-v4.1-flash-free\", \"opencode_fallback_model\": \"opencode/nemotron-3-ultra-free\", \"opencode_context_limit_tokens\": 0, \"opencode_max_output_tokens\": 0, \"max_concurrent_turns\": 4, \"per_chat_queue_size\": 8, \"typing_heartbeat_seconds\": 4.0, \"aa_voice_model_dir\": \"./models/gigaam\", \"aa_tts_model_path\": \"./models/tts/v5_5_ru.pt\", \"aa_voice_presentation_model_path\": \"./models/voice-presentation/model_quantized.onnx\", \"log_level\": \"INFO\", \"time_policy\": {\"turn_time_limits_enabled\": false, \"latency_gate_mode\": \"observe\", \"latency_p95_target_ms\": 60000.0, \"latency_max_turn_ms\": 120000.0, \"transport_timeout_s\": 1800.0, \"transport_connect_timeout_s\": 30.0, \"qualification_campaign_s\": 8100.0, \"qualification_finalisation_reserve_s\": 900.0, \"qualification_scenario_wait_s\": 8100.0, \"qualification_scenario_inactivity_s\": 1800.0}}}}\n{\"timestamp\": \"2026-11-12T04:56:22.251491+00:00\", \"level\": \"INFO\", \"logger\": \"aa.opencode.runtime\", \"message\": \"launched opencode serve\"}\n{\"timestamp\": \"2026-11-12T04:56:37.453627+00:00\", \"level\": \"INFO\", \"logger\": \"aa.app\", \"message\": \"readiness marker kept local-only (publish not enabled)\"}\n{\"timestamp\": \"2026-11-12T04:56:37.453744+00:00\", \"level\": \"WARNING\", \"logger\": \"aa.app\", \"message\": \"worker startup failed\", \"extra\": {\"category\": \"opencode-not-ready\"}}\n{\"timestamp\": \"2026-11-12T04:56:37.453809+00:00\", \"level\": \"INFO\", \"logger\": \"aa.opencode.runtime\", \"message\": \"opencode runtime stopped\"}\nTraceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/__main__.py\", line 90, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/__main__.py\", line 72, in main\n    asyncio.run(_check())\n    ~~~~~~~~~~~^^^^^^^^^^\n  File \"/usr/lib/python3.14/asyncio/runners.py\", line 204, in run\n    return runner.run(main)\n           ~~~~~~~~~~^^^^^^\n  File \"/usr/lib/python3.14/asyncio/runners.py\", line 127, in run\n    return self._loop.run_until_complete(task)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"/usr/lib/python3.14/asyncio/base_events.py\", line 719, in run_until_complete\n    return future.result()\n           ~~~~~~~~~~~~~^^\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/__main__.py\", line 69, in _check\n    await app.start()\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/app.py\", line 586, in start\n    await self.opencode_runtime.start()\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/opencode/runtime.py\", line 444, in start\n    await self.ensure_ready(self._ready_timeout)\n  File \"/tmp/continuum-verification-1r15p0lu/src/aa/opencode/runtime.py\", line 491, in ensure_ready\n    raise OpenCodeTimeoutError(\"opencode server did not become ready in time\")\naa.opencode.errors.OpenCodeTimeoutError: opencode server did not become ready in time\n[gate-a-shell] a-shell-aa-check FAIL exit=1 duration_ms=15536\n[gate-a-shell] a-shell-pytest\n/usr/bin/python3: No module named pytest\n[gate-a-shell] a-shell-pytest FAIL exit=1 duration_ms=13\n[gate-a-shell] a-shell-ruff-check\n/usr/bin/python3: No module named ruff\n[gate-a-shell] a-shell-ruff-check FAIL exit=1 duration_ms=12\n[gate-a-shell] a-shell-ruff-format\n/usr/bin/python3: No module named ruff\n[gate-a-shell] a-shell-ruff-format FAIL exit=1 duration_ms=12\n[gate-a-shell] a-shell-mypy\n/usr/bin/python3: No module named mypy\n[gate-a-shell] a-shell-mypy FAIL exit=1 duration_ms=12\n{\"checks\": 5, \"failed_checks\": [\"a-shell-aa-check\", \"a-shell-pytest\", \"a-shell-ruff-check\", \"a-shell-ruff-format\", \"a-shell-mypy\"], \"out\": \"/tmp/aa-gate-a-shell-results-canonical.json\", \"profile\": \"canonical\"}\n",
         "source": "CONTINUUM_VALIDATION_COMMAND"
       }
     ],
@@ -26,12 +26,14 @@
       "state": "configured"
     },
     "environment_fingerprint": "c24e4d0959b62ddb31e1a870f7c982ebe74608c4e57df7a905817f8d82a06f82",
+    "environment_rebaselined": true,
     "failed_commands": [
       "validation"
     ],
     "head_sha": "d0fe97af1388b7d4429d147722591ec5cc72c424",
     "phase": "baseline",
-    "recorded_at": "2026-11-10T14:54:11Z",
+    "previous_environment_fingerprint": "c24e4d0959b62ddb31e1a870f7c982ebe74608c4e57df7a905817f8d82a06f82",
+    "recorded_at": "2026-11-12T04:56:37Z",
     "state": "failed"
   },
   "contract": {
@@ -46,6 +48,31 @@
     "fingerprint": "958cf1894d314a60928f1bc2d2b95e1f54ec6740a2d26cc6e81a85da2c812f05",
     "source": "repository-variables",
     "state": "configured"
+  },
+  "resume_provenance": {
+    "base_ref": "main",
+    "base_sha": "d0fe97af1388b7d4429d147722591ec5cc72c424",
+    "checkpoint_ref": "opencode/checkpoint-issue454",
+    "checkpoint_sha": "ddd76c466d85a61c319b9e10fc8337f4bdfc7f99",
+    "evidence_file": ".continuum-verification.json",
+    "evidence_sha256": "0f1b3eedaa83e26a59436efef31df0fd2311342fd9379f3e4a844411018581b2",
+    "legacy_evidence_untrusted": true,
+    "metadata_file": ".continuum-429-recovery.json",
+    "metadata_sha256": "783bb6417521500a87f490dbedf4774fa9f5dd2309c615ab2f38b2652af9f240",
+    "operation": "opencode-429-issue-issue454",
+    "request": {
+      "base_sha": "d0fe97af1388b7d4429d147722591ec5cc72c424",
+      "checkpoint_ref": "opencode/checkpoint-issue454",
+      "checkpoint_sha": "ddd76c466d85a61c319b9e10fc8337f4bdfc7f99",
+      "generation": 1,
+      "issue": 454,
+      "mode": "issue",
+      "operation": "opencode-429-issue-issue454",
+      "repository": "kodmial/aa",
+      "snapshot_spec": "05100fa7f0a41e7353c99610c5b0d68f32671f0363b488480bb9886a093c7fdb"
+    },
+    "snapshot_bound_to_checkpoint": false,
+    "snapshot_spec": "05100fa7f0a41e7353c99610c5b0d68f32671f0363b488480bb9886a093c7fdb"
   },
   "schema_version": 1
 }
