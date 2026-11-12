@@ -284,17 +284,30 @@ async def _wait_for_attempt(client: Any, *, state: str, timeout_s: float) -> dic
     return last
 
 
-def _privacy_scan(out_dir: Path, markers: Sequence[str]) -> tuple[bool, str]:
-    for path in sorted(out_dir.rglob("*")):
-        if not path.is_file():
+def _privacy_scan(paths: Sequence[Path], markers: Sequence[str]) -> tuple[bool, str]:
+    """Scan only the artifacts owned by the self-test.
+
+    The shared qualification output directory also contains downloaded A/B
+    evidence in a full campaign. Scanning unrelated files there would make
+    the canary's privacy verdict depend on evidence it did not produce.
+    """
+    for root in paths:
+        if root.is_file():
+            candidates = [root]
+        elif root.is_dir():
+            candidates = sorted(root.rglob("*"))
+        else:
             continue
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False, path.name
-        for marker in markers:
-            if marker and marker in content:
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
                 return False, path.name
+            for marker in markers:
+                if marker and marker in content:
+                    return False, path.name
     return True, ""
 
 
@@ -533,6 +546,11 @@ async def run_observer_self_test(
             if start_events
             else ""
         )
+        if formatted_event:
+            # Real stdout proof for the Actions log: the same allow-listed
+            # renderer the live lane uses, with the preflight's scenario
+            # correlation. It never carries the sentinel prompt or raw SSE.
+            print(f"Gate C canary opencode-attempt {formatted_event}", flush=True)
         check(
             "stdout-attempt-stage-scenario",
             "stage=answer" in formatted_event
@@ -601,7 +619,10 @@ async def run_observer_self_test(
 
         check("no-orphan-observer", observer_stopped and task is None)
         check("no-orphan-client-worker", bool(client.quiescence_proven(SELF_TEST_CAUSALITY)))
-        privacy_ok, _privacy_path = _privacy_scan(out, SELF_TEST_FORBIDDEN_MARKERS)
+        privacy_ok, _privacy_path = _privacy_scan(
+            [observer_dir, out / "self-test-progress.json"],
+            SELF_TEST_FORBIDDEN_MARKERS,
+        )
         check("privacy-safe-artifacts", privacy_ok)
     except Exception as exc:  # noqa: BLE001 - report a typed self-test failure
         check("self-test-completed", False)
@@ -1063,6 +1084,16 @@ def build_canary_result(
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the persisted ``gate-c-canary-result.json`` payload."""
+    real_path_budget = str((real_path or {}).get("budget_expiration_category", "none"))
+    budget_category = real_path_budget
+    if decision.status == STATUS_INCONCLUSIVE and decision.missing_field.startswith("budget."):
+        # The outer preflight allowance can expire before/around the live
+        # lane, in which case the lane itself has no category to report.
+        budget_category = "preflight-budget"
+    budget_expired = bool(
+        decision.status == STATUS_INCONCLUSIVE
+        and budget_category in ("campaign-budget", "no-real-progress", "preflight-budget")
+    )
     result: dict[str, Any] = {
         "schema_version": SCHEMA_GATE_C_CANARY_RESULT,
         "status": decision.status,
@@ -1071,6 +1102,7 @@ def build_canary_result(
         "missing_field": decision.missing_field,
         "detail": decision.detail,
         "main_sha": main_sha,
+        "run_sha": main_sha,
         "run_id": str(run_id)[:64],
         "stage": "gate-c-canary",
         "stage_attempt_evidence_coverage": {
@@ -1124,6 +1156,11 @@ def build_canary_result(
             "server_endpoints_compatible": bool(
                 (real_path or {}).get("server_endpoints_compatible")
             ),
+            # Persist the bounded server-side facts (including a typed
+            # session.error name/status when one was really observed) so an
+            # operator can see the causality -> attempt -> server chain
+            # without any raw payload or session id.
+            "server_evidence": dict((real_path or {}).get("server_evidence") or {}),
             "in_flight_attempt_preserved": bool(
                 (real_path or {}).get("in_flight_attempt_preserved")
             ),
@@ -1133,9 +1170,7 @@ def build_canary_result(
             "observer": dict((real_path or {}).get("observer") or {}),
             "scenario_diagnostics": list((real_path or {}).get("scenario_diagnostics", [])),
         },
-        "budget_expiration_category": str(
-            (real_path or {}).get("budget_expiration_category", "none")
-        ),
+        "budget_expiration_category": budget_category,
         "real_turns": int((real_path or {}).get("real_turns", 0) or 0),
         "delivered_turns": int((real_path or {}).get("delivered_turns", 0) or 0),
         "typed_cause": str((real_path or {}).get("typed_cause", "")),
@@ -1144,12 +1179,8 @@ def build_canary_result(
             "preflight_budget_s": float(preflight_budget_s),
             "live_budget_s": float(live_budget_s),
             "elapsed_s": round(float(elapsed_s), 3),
-            "category": str((real_path or {}).get("budget_expiration_category", "none")),
-            "expired": bool(
-                decision.status == STATUS_INCONCLUSIVE
-                and str((real_path or {}).get("budget_expiration_category", "none"))
-                in ("campaign-budget", "no-real-progress")
-            ),
+            "category": budget_category,
+            "expired": budget_expired,
         },
         "privacy_safe_paths": [str(path)[:200] for path in privacy_safe_paths],
         "total_time_s": round(float(elapsed_s), 3),

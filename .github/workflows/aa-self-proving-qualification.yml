@@ -1196,6 +1196,10 @@ jobs:
         # canary is not qualification evidence and never yields a Product
         # Contract PASS.
         id: gate-c-canary
+        # Hard wall clock for the diagnostic preflight, independent of the
+        # script's internal 600s budget: a wedged cleanup can never turn the
+        # short canary into a second long campaign.
+        timeout-minutes: 10
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
         env:
@@ -1659,6 +1663,8 @@ jobs:
             self-proving-out/gate-E-diagnostic.json
             self-proving-out/gate-c-canary-result.json
             self-proving-out/observer-self-test.json
+            self-proving-out/self-test-progress.json
+            self-proving-out/attempt-observer/
             self-proving-out/canary-progress.json
             self-proving-out/canary-attempt-observer/
             live-out/live-watchdog-progress.json

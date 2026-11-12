@@ -120,8 +120,16 @@ def _decision(self_test: dict[str, Any], real_path: dict[str, Any] | None) -> An
 @pytest.mark.asyncio
 async def test_observable_self_test_and_approved_real_turn_are_ready(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     report = await run_observer_self_test(tmp_path)
+    stdout = capsys.readouterr().out
+
+    assert "Gate C canary opencode-attempt" in stdout
+    assert "stage=answer" in stdout
+    assert "scenario_index=1" in stdout
+    assert "GATECCANARYPROMPTSENTINEL454" not in stdout
+    assert "GATECCANARYSSESENTINEL454" not in stdout
 
     assert report["schema_version"] == "aa-gate-c-canary-observer-self-test/1"
     assert report["status"] == "PASS", report["failed_checks"]
@@ -279,18 +287,28 @@ def test_workflow_runs_canary_before_gate_c_and_gates_on_ready() -> None:
     gate_c = text.index("Gate C - LIVE exact production conversation path")
     assert canary < gate_c
     assert "id: gate-c-canary" in text
+    assert "timeout-minutes: 10" in text
     assert "scripts/run_gate_c_canary.py" in text
     assert "--preflight-budget-s 600" in text
     assert "--live-budget-s 300" in text
     assert "steps.gate-c-canary.outcome == 'success'" in text
     assert "self-proving-out/gate-c-canary-result.json" in text
     assert "self-proving-out/observer-self-test.json" in text
+    assert "self-proving-out/attempt-observer/" in text
     assert "self-proving-out/canary-progress.json" in text
     assert "self-proving-out/canary-attempt-observer/" in text
     assert "Gate C validated checkpoint present; canary not required (resume)." in text
 
 
 def test_canary_result_artifact_is_not_qualification_evidence() -> None:
+    from aa.qualification.gate_c_canary import EXIT_BY_STATUS
+
+    assert EXIT_BY_STATUS == {
+        STATUS_READY: 0,
+        STATUS_FAIL: 1,
+        STATUS_BLOCKED: 2,
+        STATUS_INCONCLUSIVE: 3,
+    }
     # The persisted payload shape carries an explicit non-qualification
     # marker and no prompt/reply fields.
     decision = evaluate_canary(
@@ -333,6 +351,41 @@ def test_canary_result_artifact_is_not_qualification_evidence() -> None:
     assert result["total_time_s"] == 12.5
     serialized = json.dumps(result, ensure_ascii=False)
     assert "GATECCANARYPROMPTSENTINEL454" not in serialized
+
+
+def test_preflight_budget_expiry_is_persisted_as_typed_inconclusive() -> None:
+    from aa.qualification.gate_c_canary import (
+        CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED,
+        CanaryDecision,
+    )
+
+    decision = CanaryDecision(
+        STATUS_INCONCLUSIVE,
+        CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED,
+        "budget.preflight_budget_s",
+        "preflight budget expired before the real-path canary",
+    )
+    result = build_canary_result(
+        main_sha="a" * 40,
+        run_id="123",
+        self_test={
+            "schema_version": "aa-gate-c-canary-observer-self-test/1",
+            "status": "PASS",
+            "server_telemetry": {"state": "supported"},
+        },
+        real_path=None,
+        decision=decision,
+        preflight_budget_s=600.0,
+        live_budget_s=300.0,
+        elapsed_s=601.0,
+        privacy_safe_paths=["gate-c-canary-result.json"],
+    )
+    assert result["status"] == STATUS_INCONCLUSIVE
+    assert result["ready"] is False
+    assert result["budget_expiration_category"] == "preflight-budget"
+    assert result["budget"]["category"] == "preflight-budget"
+    assert result["budget"]["expired"] is True
+    assert result["product_qualified"] is False
 
 
 def test_unsupported_server_privacy_and_orphan_fail_closed() -> None:
@@ -478,6 +531,8 @@ def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> Non
                         "event-stream-quiet": 1,
                     },
                 },
+                "server_error_kind": "APIError",
+                "server_error_status_code": 503,
             },
         },
     )
@@ -489,6 +544,8 @@ def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> Non
     assert report["attempt_evidence"]["state_counts"] == {"failed": 1}
     assert report["attempt_evidence"]["requested_models"] == ["provider/model-primary"]
     assert report["served_models_by_agent"] == {"aa": ["provider/model-primary"]}
+    assert report["server_evidence"]["server_error_kind"] == "APIError"
+    assert report["server_evidence"]["server_error_status_code"] == 503
 
     decision = _decision(
         {
@@ -518,6 +575,8 @@ def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> Non
     )
     assert result["real_path"]["attempt_evidence"]["state_counts"] == {"failed": 1}
     assert result["real_path"]["served_models_by_agent"] == {"aa": ["provider/model-primary"]}
+    assert result["real_path"]["server_evidence"]["server_error_kind"] == "APIError"
+    assert result["real_path"]["server_evidence"]["server_error_status_code"] == 503
     assert result["stage_attempt_evidence_coverage"]["served_model_audit"] == "observed"
     assert "conversational-generation-failed" in result["real_path"]["typed_cause"]
 

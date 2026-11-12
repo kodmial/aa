@@ -4247,6 +4247,10 @@ async def run_live_telegram_evidence_lane(
                         # second turn and never start the 18-case campaign.
                         from aa.qualification.gate_c_canary import (
                             TYPED_CANARY_FAILURE_CAUSES,
+                            server_endpoints_compatible,
+                        )
+                        from aa.qualification.live_partial_evidence import (
+                            coverage_from_partial,
                         )
 
                         scenario_cause = str(_delivered_fr or snapshot.get("answer_outcome") or "")
@@ -4254,6 +4258,27 @@ async def run_live_telegram_evidence_lane(
                             _delivered_fr or scenario_cause in TYPED_CANARY_FAILURE_CAUSES
                         ):
                             break
+                        if position == 1:
+                            # Missing attempt/stage/server evidence on the
+                            # FIRST real turn is already a diagnostic-chain
+                            # BLOCKED; spending the remaining observation
+                            # budget on a second turn cannot repair it.
+                            first_partial = _collect_partial_evidence(
+                                "canary-first-turn",
+                                position=position,
+                                fam=family,
+                                causality=scenario_causality_id,
+                            )
+                            first_coverage = coverage_from_partial(first_partial)
+                            server_ok = server_probe is not None and server_endpoints_compatible(
+                                server_probe.cached_evidence()
+                            )
+                            if (
+                                first_coverage.get("client_attempt_ledger") != "observed"
+                                or first_coverage.get("stage_telemetry") != "observed"
+                                or not server_ok
+                            ):
+                                break
 
             if canary_mode:
                 await _refresh_server_evidence()
