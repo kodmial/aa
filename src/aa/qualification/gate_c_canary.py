@@ -80,8 +80,12 @@ SELF_TEST_CAUSALITY = "canary-observer-selftest"
 # A distinctive prompt crosses the real HTTP boundary once. It must never
 # appear in any snapshot, trace, event, progress marker or result file.
 SELF_TEST_PROMPT_SENTINEL = "GATECCANARYPROMPTSENTINEL454"
+# A raw SSE text part crosses the same boundary. The bounded probe must
+# extract only typed facts and never persist the raw event payload.
+SELF_TEST_SSE_SENTINEL = "GATECCANARYSSESENTINEL454"
 SELF_TEST_FORBIDDEN_MARKERS: tuple[str, ...] = (
     SELF_TEST_PROMPT_SENTINEL,
+    SELF_TEST_SSE_SENTINEL,
     "Authorization",
     "Bearer ",
     "sk-",
@@ -151,6 +155,7 @@ class _CanaryHttpState:
 def _default_event_body() -> bytes:
     return (
         b'data: {"type":"session.status","properties":{"status":{"type":"busy"}}}\n\n'
+        b'data: {"type":"message.part","properties":{"text":"GATECCANARYSSESENTINEL454"}}\n\n'
         b'data: {"type":"session.error","properties":{"error":{"name":"APIError",'
         b'"data":{"statusCode":503,"isRetryable":true}}}}\n\n'
     )
@@ -509,6 +514,39 @@ async def run_observer_self_test(
             "attempt-trace-event",
             any(event.get("event") == "attempt-trace" for event in events),
         )
+        start_events = [event for event in events if event.get("event") == "attempt-start"]
+        check(
+            "attempt-event-stage-field",
+            bool(start_events)
+            and str(start_events[0].get("stage", "")) == "answer"
+            and str(start_events[0].get("causality_id", "")) == SELF_TEST_CAUSALITY,
+        )
+        # The real live lane renders these allow-listed fields to stdout.
+        # Prove the renderer carries stage + scenario identity while still
+        # never emitting the prompt or a raw event line.
+        from aa.qualification.product_contract_live import (
+            _format_bounded_attempt_event,
+        )
+
+        formatted_event = (
+            _format_bounded_attempt_event(start_events[0], {SELF_TEST_CAUSALITY: 1})
+            if start_events
+            else ""
+        )
+        check(
+            "stdout-attempt-stage-scenario",
+            "stage=answer" in formatted_event
+            and "scenario_index=1" in formatted_event
+            and SELF_TEST_PROMPT_SENTINEL not in formatted_event
+            and SELF_TEST_SSE_SENTINEL not in formatted_event,
+        )
+        check(
+            "raw-sse-payload-not-retained",
+            all(
+                SELF_TEST_SSE_SENTINEL not in json.dumps(event, ensure_ascii=False)
+                for event in events
+            ),
+        )
 
         progress_path = out / "self-test-progress.json"
         os.environ[ENV_PROGRESS_PATH] = str(progress_path)
@@ -679,14 +717,121 @@ async def run_bounded_real_path(lane_runner: Any, *, budget_s: float) -> Any:
     return replace(result, metrics=metrics)
 
 
+def _bounded_str_list(values: Sequence[Any], *, limit: int = 8, width: int = 128) -> list[str]:
+    """Deduplicate and bound privacy-safe identifier lists."""
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")[:width]
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _attempt_evidence_summary(
+    entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bounded attempt/state/model projection for the canary artifact."""
+    states: dict[str, int] = {}
+    operations: dict[str, int] = {}
+    stages: dict[str, int] = {}
+    models: list[str] = []
+    failure_categories: list[str] = []
+    for entry in entries:
+        state = str(entry.get("state", "") or "")[:24]
+        if state:
+            states[state] = states.get(state, 0) + 1
+        operation = str(entry.get("operation", "") or "")[:48]
+        if operation:
+            operations[operation] = operations.get(operation, 0) + 1
+        stage = str(entry.get("stage", "") or "")[:48]
+        if stage:
+            stages[stage] = stages.get(stage, 0) + 1
+        models.append(str(entry.get("model") or ""))
+        failure = str(
+            entry.get("failure_category", "") or entry.get("late_failure_category", "") or ""
+        )[:64]
+        if failure:
+            failure_categories.append(failure)
+    return {
+        "rows": len(entries),
+        "state_counts": dict(sorted(states.items())),
+        "operation_counts": dict(sorted(operations.items())),
+        "stage_counts": dict(sorted(stages.items())),
+        "requested_models": _bounded_str_list(models),
+        "failure_categories": _bounded_str_list(failure_categories, limit=8, width=64),
+    }
+
+
+def _first_attempt_typed_cause(entries: Sequence[Mapping[str, Any]]) -> str:
+    """First typed failure on a real model-message attempt, if any."""
+    for entry in entries:
+        operation = str(entry.get("operation", "") or "")
+        if operation not in ("message-text", "message-structured"):
+            continue
+        cause = str(
+            entry.get("failure_category", "") or entry.get("late_failure_category", "") or ""
+        ).strip()
+        if cause:
+            return cause[:64]
+    return ""
+
+
+_SESSION_STATUS_FAILURE_KEYS: tuple[str, ...] = (
+    "session-status-http-error",
+    "session-status-body-timeout",
+    "session-status-body-error",
+    "session-status-shape",
+    "session-status-error",
+)
+
+
+def server_endpoints_compatible(evidence: Mapping[str, Any] | None) -> bool:
+    """Whether the pinned server exposes the exact canary telemetry surface.
+
+    ``/doc`` alone is not enough: a documented OpenAPI page can coexist with
+    broken ``/session/status`` or SSE routes. Canary readiness therefore
+    requires an observed, parseable status map and a streamed ``/event``
+    response with no failure token. An empty (but well-shaped) status map is
+    still compatible; absence of a route or an unparsed shape is not.
+    """
+    if not isinstance(evidence, Mapping):
+        return False
+    endpoints = evidence.get("endpoints")
+    if not isinstance(endpoints, Mapping):
+        return False
+    try:
+        doc = endpoints.get("/doc")
+        if not isinstance(doc, Mapping) or str(doc.get("state", "")) != "supported":
+            return False
+        session = endpoints.get("/session/status")
+        if not isinstance(session, Mapping) or "session-status" not in session:
+            return False
+        if any(int(session.get(key, 0) or 0) > 0 for key in _SESSION_STATUS_FAILURE_KEYS):
+            return False
+        if int(session.get("unknown-state", 0) or 0) > 0:
+            return False
+        event = endpoints.get("/event")
+        if not isinstance(event, Mapping):
+            return False
+        if int(event.get("event-stream-status", 0) or 0) != 200:
+            return False
+        if int(event.get("event-stream-streamed", 0) or 0) != 1:
+            return False
+        if int(event.get("event-stream-http-error", 0) or 0) > 0:
+            return False
+        return int(event.get("event-stream-error", 0) or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def build_real_path_report(lane_result: Any) -> dict[str, Any]:
     """Project a canary-mode ``LaneResult`` into a privacy-safe report."""
     metrics = getattr(lane_result, "metrics", {}) or {}
     diagnostics = metrics.get("scenario_diagnostics") or []
     diagnostics = [dict(item) for item in diagnostics if isinstance(item, Mapping)]
     partial = metrics.get("partial_evidence")
-    # The lane writes its last partial marker through the watchdog env path;
-    # the script passes it back here when available.
     coverage = coverage_from_partial(partial if isinstance(partial, Mapping) else None)
     server_evidence = metrics.get("server_evidence")
     if not isinstance(server_evidence, Mapping):
@@ -708,15 +853,46 @@ def build_real_path_report(lane_result: Any) -> dict[str, Any]:
             typed_cause = reason[:64]
         if reason in ("campaign-budget", "no-real-progress"):
             budget_category = reason
+    if not typed_cause:
+        # The scenario diagnostic remains the primary attribution. When it
+        # carries no cause, the client attempt ledger is the next honest
+        # source: a failed real message attempt is a typed cause, never an
+        # empty success. Timeout reasons stay in the budget category.
+        attempt_cause = _first_attempt_typed_cause(attempt_audit)
+        if attempt_cause and attempt_cause not in ("campaign-budget", "no-real-progress"):
+            typed_cause = attempt_cause
     families: list[str] = []
     for diagnostic in diagnostics:
         family = str(diagnostic.get("family", "") or "")[:64]
         if family and family not in families:
             families.append(family)
+    delivered_turns = sum(
+        1
+        for diagnostic in diagnostics
+        if not bool(diagnostic.get("delivery_timeout"))
+        and str(diagnostic.get("delivery_status", "")) == "delivered"
+    )
+    served_models: dict[str, list[str]] = {}
+    if isinstance(partial, Mapping):
+        raw_served = partial.get("served_models_by_agent")
+        if isinstance(raw_served, Mapping):
+            for agent, models in sorted(raw_served.items()):
+                if isinstance(models, (list, tuple)):
+                    served_models[str(agent)[:128]] = _bounded_str_list(models)
+    stage_outcomes: dict[str, Any] = {}
+    if isinstance(partial, Mapping):
+        raw_outcomes = partial.get("stage_outcome_counts")
+        if isinstance(raw_outcomes, Mapping):
+            stage_outcomes = {
+                str(stage)[:48]: dict(sorted(counts.items()))
+                for stage, counts in sorted(raw_outcomes.items())
+                if isinstance(counts, Mapping)
+            }
     return {
         "status": str(getattr(lane_result, "status", "INCOMPLETE")),
         "lane": str(getattr(lane_result, "lane", "gate-c-canary-real-path")),
         "real_turns": len(diagnostics),
+        "delivered_turns": delivered_turns,
         "families": families,
         "scenario_diagnostics": diagnostics,
         "typed_cause": typed_cause,
@@ -724,10 +900,16 @@ def build_real_path_report(lane_result: Any) -> dict[str, Any]:
         "attempt_coverage": coverage.get("client_attempt_ledger", COVERAGE_MISSING),
         "stage_coverage": coverage.get("stage_telemetry", COVERAGE_MISSING),
         "server_coverage": coverage.get("server_events", COVERAGE_MISSING),
+        "served_model_coverage": coverage.get("served_model_audit", COVERAGE_MISSING),
+        "runtime_process_coverage": coverage.get("runtime_process_state", COVERAGE_MISSING),
         "server_evidence_state": str(server_evidence.get("state", "unobserved")),
         "server_evidence": dict(server_evidence),
+        "server_endpoints_compatible": server_endpoints_compatible(server_evidence),
         "attempt_in_flight_count": in_flight,
         "in_flight_attempt_preserved": bool(in_flight > 0),
+        "attempt_evidence": _attempt_evidence_summary(attempt_audit),
+        "served_models_by_agent": served_models,
+        "stage_outcome_counts": stage_outcomes,
         "attempt_audit": attempt_audit[-48:],
         "observer": dict(metrics.get("observer") or {}),
         "product_outcome_counts": dict(metrics.get("product_outcome_counts") or {}),
@@ -820,6 +1002,13 @@ def evaluate_canary(
             "real_path.server_evidence_state",
             "the actual pinned server did not expose the documented telemetry",
         )
+    if not bool(real_path.get("server_endpoints_compatible")):
+        return CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_UNSUPPORTED_SERVER,
+            "real_path.server_endpoints_compatible",
+            "the actual pinned server did not expose /doc, /session/status and SSE /event together",
+        )
     if str(real_path.get("attempt_coverage", "")) != COVERAGE_OBSERVED:
         return CanaryDecision(
             STATUS_BLOCKED,
@@ -888,9 +1077,13 @@ def build_canary_result(
             "client_attempt_ledger": (real_path or {}).get("attempt_coverage", COVERAGE_MISSING),
             "stage_telemetry": (real_path or {}).get("stage_coverage", COVERAGE_MISSING),
             "server_events": (real_path or {}).get("server_coverage", COVERAGE_MISSING),
+            "served_model_audit": (real_path or {}).get("served_model_coverage", COVERAGE_MISSING),
             "runtime_process_state": (
-                (self_test.get("partial_evidence_coverage") or {}).get(
-                    "runtime_process_state", COVERAGE_MISSING
+                (real_path or {}).get(
+                    "runtime_process_coverage",
+                    (self_test.get("partial_evidence_coverage") or {}).get(
+                        "runtime_process_state", COVERAGE_MISSING
+                    ),
                 )
             ),
         },
@@ -917,6 +1110,7 @@ def build_canary_result(
         "real_path": {
             "status": str((real_path or {}).get("status", "not-executed")),
             "real_turns": int((real_path or {}).get("real_turns", 0) or 0),
+            "delivered_turns": int((real_path or {}).get("delivered_turns", 0) or 0),
             "families": list((real_path or {}).get("families", [])),
             "typed_cause": str((real_path or {}).get("typed_cause", "")),
             "budget_expiration_category": str(
@@ -927,15 +1121,25 @@ def build_canary_result(
             "server_evidence_state": str(
                 (real_path or {}).get("server_evidence_state", "unobserved")
             ),
+            "server_endpoints_compatible": bool(
+                (real_path or {}).get("server_endpoints_compatible")
+            ),
             "in_flight_attempt_preserved": bool(
                 (real_path or {}).get("in_flight_attempt_preserved")
             ),
+            "attempt_evidence": dict((real_path or {}).get("attempt_evidence") or {}),
+            "served_models_by_agent": dict((real_path or {}).get("served_models_by_agent") or {}),
+            "stage_outcome_counts": dict((real_path or {}).get("stage_outcome_counts") or {}),
             "observer": dict((real_path or {}).get("observer") or {}),
             "scenario_diagnostics": list((real_path or {}).get("scenario_diagnostics", [])),
         },
         "budget_expiration_category": str(
             (real_path or {}).get("budget_expiration_category", "none")
         ),
+        "real_turns": int((real_path or {}).get("real_turns", 0) or 0),
+        "delivered_turns": int((real_path or {}).get("delivered_turns", 0) or 0),
+        "typed_cause": str((real_path or {}).get("typed_cause", "")),
+        "families": list((real_path or {}).get("families", [])),
         "budget": {
             "preflight_budget_s": float(preflight_budget_s),
             "live_budget_s": float(live_budget_s),
@@ -990,4 +1194,5 @@ __all__ = [
     "evaluate_canary",
     "run_bounded_real_path",
     "run_observer_self_test",
+    "server_endpoints_compatible",
 ]

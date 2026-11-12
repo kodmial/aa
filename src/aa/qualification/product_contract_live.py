@@ -2269,6 +2269,29 @@ def gate_c_canary_scenarios() -> tuple[tuple[str, int, str], ...]:
     return tuple(by_family[family] for family in GATE_C_CANARY_SCENARIO_FAMILIES)
 
 
+# Infrastructure checks that prove the bounded canary actually exercised the
+# production seam. Answer-quality checks (grounding, relevance, envelope,
+# independent judge) are deliberately absent: the canary never assigns a
+# Product Contract PASS/FAIL (kodmial/aa#454).
+_CANARY_REQUIRED_INFRASTRUCTURE_CHECKS = frozenset(
+    {
+        "live-raw-telegram-transport-boundary",
+        "live-real-opencode-runtime-ready",
+        "live-real-retrieval-index-loaded",
+        "c-canary-scenario-count",
+    }
+)
+
+
+def _canary_infrastructure_failure(name: str) -> bool:
+    """Return whether one failed check is a canary infrastructure failure."""
+    if name in _CANARY_REQUIRED_INFRASTRUCTURE_CHECKS:
+        return True
+    if name.startswith("live-transport-") and name.endswith("-accepted"):
+        return True
+    return name.startswith("live-delivery-") and name.endswith("-timeout")
+
+
 def _blocked_provenance_for_lane(
     *, reason: str, evaluator_sha: str, rubric_hex: str, run_id: str
 ) -> Any:
@@ -4218,11 +4241,19 @@ async def run_live_telegram_evidence_lane(
                         flush=True,
                     )
                     prior_by_chat.setdefault(chat_id, []).append(prompt)
-                    if canary_mode and str(_delivered_fr or ""):
+                    if canary_mode:
                         # A delivered but failed first real-path turn is a
                         # typed canary FAIL; do not spend the budget on a
                         # second turn and never start the 18-case campaign.
-                        break
+                        from aa.qualification.gate_c_canary import (
+                            TYPED_CANARY_FAILURE_CAUSES,
+                        )
+
+                        scenario_cause = str(_delivered_fr or snapshot.get("answer_outcome") or "")
+                        if scenario_cause and (
+                            _delivered_fr or scenario_cause in TYPED_CANARY_FAILURE_CAUSES
+                        ):
+                            break
 
             if canary_mode:
                 await _refresh_server_evidence()
@@ -4242,10 +4273,22 @@ async def run_live_telegram_evidence_lane(
                     if reason in ("campaign-budget", "no-real-progress"):
                         budget_expiration_category = reason
                         break
-                canary_failed = list(failed)
+                # Only infrastructure checks and typed pipeline causes may
+                # decide the bounded canary. Quality checks stay in ``failed``
+                # as diagnostic context but never become a Product verdict.
+                canary_failed = [name for name in failed if _canary_infrastructure_failure(name)]
+                canary_causes = [
+                    str(
+                        diagnostic.get("failure_reason", "")
+                        or diagnostic.get("timeout_reason", "")
+                        or ""
+                    )[:64]
+                    for diagnostic in scenario_diagnostics
+                ]
+                canary_causes = [cause for cause in canary_causes if cause]
                 if budget_expiration_category != "none":
                     canary_status = "INCOMPLETE"
-                elif canary_failed:
+                elif canary_failed or canary_causes:
                     canary_status = "FAIL"
                 else:
                     canary_status = "PASS"

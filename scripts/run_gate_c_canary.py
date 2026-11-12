@@ -116,6 +116,10 @@ def _artifact_paths(out_dir: Path) -> list[str]:
                 names.append(str(path.relative_to(out_dir)))
             except ValueError:
                 names.append(path.name)
+    for directory in ("attempt-observer", "canary-attempt-observer"):
+        path = out_dir / directory
+        if path.is_dir():
+            names.append(f"{directory}/")
     # The result file is written immediately after this list is assembled.
     names.append(CANARY_RESULT_NAME)
     return names

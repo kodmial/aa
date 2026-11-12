@@ -15,8 +15,11 @@ from aa.opencode.client import HttpOpenCodeClient
 from aa.qualification.gate_c_canary import (
     CATEGORY_DIAGNOSTIC_MISSING,
     CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED,
+    CATEGORY_ORPHAN_WORK,
+    CATEGORY_PRIVACY_VIOLATION,
     CATEGORY_READY,
     CATEGORY_REAL_PATH_TYPED_FAILURE,
+    CATEGORY_UNSUPPORTED_SERVER,
     STATUS_BLOCKED,
     STATUS_FAIL,
     STATUS_INCONCLUSIVE,
@@ -26,7 +29,9 @@ from aa.qualification.gate_c_canary import (
     evaluate_canary,
     run_bounded_real_path,
     run_observer_self_test,
+    server_endpoints_compatible,
 )
+from aa.qualification.product_contract_live import LaneResult
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
@@ -78,6 +83,7 @@ def _real_path(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": "PASS",
         "real_turns": 1,
+        "delivered_turns": 1,
         "families": ["meta-capability"],
         "typed_cause": "",
         "budget_expiration_category": "none",
@@ -85,6 +91,7 @@ def _real_path(**overrides: Any) -> dict[str, Any]:
         "stage_coverage": "observed",
         "server_coverage": "observed",
         "server_evidence_state": "supported",
+        "server_endpoints_compatible": True,
         "in_flight_attempt_preserved": False,
         "scenario_diagnostics": [
             {
@@ -128,6 +135,8 @@ async def test_observable_self_test_and_approved_real_turn_are_ready(
     assert report["partial_evidence_coverage"]["client_attempt_ledger"] == "observed"
     assert report["partial_evidence_coverage"]["server_events"] == "observed"
     assert report["partial_evidence_coverage"]["stage_telemetry"] == "observed"
+    assert report["checks"]["stdout-attempt-stage-scenario"] is True
+    assert report["checks"]["raw-sse-payload-not-retained"] is True
 
     decision = _decision(report, _real_path())
     assert decision.status == STATUS_READY
@@ -141,6 +150,7 @@ async def test_observable_self_test_and_approved_real_turn_are_ready(
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         assert "GATECCANARYPROMPTSENTINEL454" not in text
+        assert "GATECCANARYSSESENTINEL454" not in text
         assert "Authorization" not in text
         assert "Bearer " not in text
 
@@ -318,6 +328,205 @@ def test_canary_result_artifact_is_not_qualification_evidence() -> None:
     assert result["product_qualified"] is False
     assert result["qualification_evidence"] is False
     assert result["gate_scenarios_executed"] == 0
+    assert result["real_turns"] == 1
+    assert result["delivered_turns"] == 1
     assert result["total_time_s"] == 12.5
     serialized = json.dumps(result, ensure_ascii=False)
     assert "GATECCANARYPROMPTSENTINEL454" not in serialized
+
+
+def test_unsupported_server_privacy_and_orphan_fail_closed() -> None:
+    base_self_test = {
+        "schema_version": "aa-gate-c-canary-observer-self-test/1",
+        "status": "PASS",
+        "checks": {"server-telemetry-supported": True},
+        "failed_checks": [],
+        "server_telemetry": {"state": "supported"},
+        "privacy_safe": True,
+        "no_orphan": True,
+    }
+
+    unsupported = _decision(
+        {**base_self_test, "server_telemetry": {"state": "unsupported"}},
+        _real_path(),
+    )
+    assert unsupported.status == STATUS_BLOCKED
+    assert unsupported.category == CATEGORY_UNSUPPORTED_SERVER
+
+    privacy = _decision({**base_self_test, "privacy_safe": False}, _real_path())
+    assert privacy.status == STATUS_BLOCKED
+    assert privacy.category == CATEGORY_PRIVACY_VIOLATION
+
+    orphan = _decision({**base_self_test, "no_orphan": False}, _real_path())
+    assert orphan.status == STATUS_BLOCKED
+    assert orphan.category == CATEGORY_ORPHAN_WORK
+
+    # The actual pinned server must expose the documented surface too.
+    real_unsupported = _decision(
+        base_self_test,
+        _real_path(server_evidence_state="unsupported"),
+    )
+    assert real_unsupported.status == STATUS_BLOCKED
+    assert real_unsupported.category == CATEGORY_UNSUPPORTED_SERVER
+
+    no_endpoints = _decision(
+        base_self_test,
+        _real_path(server_endpoints_compatible=False),
+    )
+    assert no_endpoints.status == STATUS_BLOCKED
+    assert no_endpoints.category == CATEGORY_UNSUPPORTED_SERVER
+    assert no_endpoints.missing_field == "real_path.server_endpoints_compatible"
+
+
+def test_doc_alone_does_not_prove_server_telemetry_compatibility() -> None:
+    doc_only = {
+        "state": "supported",
+        "endpoints": {"/doc": {"state": "supported", "http_status": 200}},
+    }
+    assert server_endpoints_compatible(doc_only) is False
+
+    missing_sse = {
+        "state": "supported",
+        "endpoints": {
+            "/doc": {"state": "supported", "http_status": 200},
+            "/session/status": {"session-status": 0},
+        },
+    }
+    assert server_endpoints_compatible(missing_sse) is False
+
+    compatible: dict[str, Any] = {
+        "state": "supported",
+        "endpoints": {
+            "/doc": {"state": "supported", "http_status": 200},
+            "/session/status": {"session-status": 0, "unknown-state": 0},
+            "/event": {
+                "event-stream-status": 200,
+                "event-stream-streamed": 1,
+                "event-stream-quiet": 1,
+            },
+        },
+    }
+    assert server_endpoints_compatible(compatible) is True
+
+    broken_sse: dict[str, Any] = {
+        **compatible,
+        "endpoints": {
+            **compatible["endpoints"],
+            "/event": {"event-stream-status": 404, "event-stream-http-error": 404},
+        },
+    }
+    assert server_endpoints_compatible(broken_sse) is False
+
+    unknown_status_shape: dict[str, Any] = {
+        **compatible,
+        "endpoints": {
+            **compatible["endpoints"],
+            "/session/status": {"session-status": 1, "unknown-state": 1},
+        },
+    }
+    assert server_endpoints_compatible(unknown_status_shape) is False
+
+
+def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> None:
+    lane_result = LaneResult(
+        lane="gate-c-canary-real-path",
+        status="PASS",
+        metrics={
+            "real_turns": 1,
+            "scenario_diagnostics": [
+                {
+                    "scenario_index": 1,
+                    "family": "substantive-drinking",
+                    "delivery_timeout": False,
+                    "delivery_status": "delivered",
+                    "product_outcome": "answer_success",
+                    "failure_reason": "",
+                }
+            ],
+            "attempt_audit": [
+                {
+                    "attempt_id": "a" * 32,
+                    "operation": "message-text",
+                    "state": "failed",
+                    "stage": "answer",
+                    "agent": "aa",
+                    "model": "provider/model-primary",
+                    "fallback_model": "provider/model-fallback",
+                    "failure_category": "conversational-generation-failed",
+                    "causality_id": "c" * 32,
+                }
+            ],
+            "partial_evidence": {
+                "coverage": {
+                    "client_attempt_ledger": "observed",
+                    "stage_telemetry": "observed",
+                    "server_events": "observed",
+                    "served_model_audit": "observed",
+                    "runtime_process_state": "observed",
+                },
+                "served_models_by_agent": {"aa": ["provider/model-primary"]},
+                "stage_outcome_counts": {"answer": {"answered": 1}},
+            },
+            "server_evidence": {
+                "state": "supported",
+                "endpoints": {
+                    "/doc": {"state": "supported", "http_status": 200},
+                    "/session/status": {"session-status": 0, "unknown-state": 0},
+                    "/event": {
+                        "event-stream-status": 200,
+                        "event-stream-streamed": 1,
+                        "event-stream-quiet": 1,
+                    },
+                },
+            },
+        },
+    )
+
+    report = build_real_path_report(lane_result)
+    assert report["typed_cause"] == "conversational-generation-failed"
+    assert report["attempt_coverage"] == "observed"
+    assert report["served_model_coverage"] == "observed"
+    assert report["attempt_evidence"]["state_counts"] == {"failed": 1}
+    assert report["attempt_evidence"]["requested_models"] == ["provider/model-primary"]
+    assert report["served_models_by_agent"] == {"aa": ["provider/model-primary"]}
+
+    decision = _decision(
+        {
+            "schema_version": "aa-gate-c-canary-observer-self-test/1",
+            "status": "PASS",
+            "checks": {"server-telemetry-supported": True},
+            "failed_checks": [],
+            "server_telemetry": {"state": "supported"},
+            "privacy_safe": True,
+            "no_orphan": True,
+        },
+        report,
+    )
+    assert decision.status == STATUS_FAIL
+    assert decision.category == CATEGORY_REAL_PATH_TYPED_FAILURE
+
+    result = build_canary_result(
+        main_sha="a" * 40,
+        run_id="123",
+        self_test={"schema_version": "aa-gate-c-canary-observer-self-test/1"},
+        real_path=report,
+        decision=decision,
+        preflight_budget_s=600.0,
+        live_budget_s=300.0,
+        elapsed_s=3.0,
+        privacy_safe_paths=["gate-c-canary-result.json"],
+    )
+    assert result["real_path"]["attempt_evidence"]["state_counts"] == {"failed": 1}
+    assert result["real_path"]["served_models_by_agent"] == {"aa": ["provider/model-primary"]}
+    assert result["stage_attempt_evidence_coverage"]["served_model_audit"] == "observed"
+    assert "conversational-generation-failed" in result["real_path"]["typed_cause"]
+
+    # Quality checks record diagnosis but never turn into a canary failure.
+    from aa.qualification.product_contract_live import _canary_infrastructure_failure
+
+    assert _canary_infrastructure_failure("live-real-opencode-runtime-ready") is True
+    assert _canary_infrastructure_failure("live-transport-meta-capability-accepted") is True
+    assert _canary_infrastructure_failure("live-delivery-meta-capability-timeout") is True
+    assert _canary_infrastructure_failure("live-book-grounding-meta-capability-1") is False
+    assert _canary_infrastructure_failure("live-answer-relevance-meta-capability-1") is False
+    assert _canary_infrastructure_failure("live-meta-direct-1") is False
