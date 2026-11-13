@@ -125,26 +125,32 @@ def classify_http_status(status: int, *, session_id: str = "") -> OpenCodeError:
 def classify_provider_error(error: Mapping[str, Any] | None) -> OpenCodeError:
     """Classify an OpenCode assistant-message ``error`` payload.
 
-    The observed shape is ``{"name": ..., "data": {"statusCode": int,
-    "isRetryable": bool, ...}}``. The human-readable provider message is
-    deliberately *not* propagated: it may echo request content, so only the
-    status code and retryability flag drive the classification.
+    Two observed shapes are supported:
+
+    - v1: ``{"name": ..., "data": {"statusCode": int,
+      "isRetryable": bool, ...}}``;
+    - v2: ``{"type": ..., "message": ..., "status": int,
+      "retryAfterMs": int, ...}``.
+
+    The human-readable provider message is deliberately *not* propagated:
+    it may echo request content, so only the status code and retryability
+    flags drive the classification.
     """
     if not isinstance(error, Mapping):
         return OpenCodeDeterministicError("opencode returned an unsuccessful result")
-    data = error.get("data")
     retryable = False
     status_code = 0
+    retry_after = error.get("retryAfterMs")
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+        retryable = retry_after >= 0
+    data = error.get("data")
     if isinstance(data, Mapping):
-        raw_retryable = data.get("isRetryable")
-        retryable = raw_retryable is True
+        retryable = retryable or data.get("isRetryable") is True
         raw_status = data.get("statusCode")
-        if isinstance(raw_status, bool):
-            status_code = 0
-        elif isinstance(raw_status, int):
-            status_code = raw_status
-        elif isinstance(raw_status, str) and raw_status.isdigit():
-            status_code = int(raw_status)
+        status_code = _coerce_status(raw_status)
+    raw_status = error.get("status")
+    if status_code == 0:
+        status_code = _coerce_status(raw_status)
     if status_code == 429:
         return OpenCodeRateLimitError("opencode provider rate-limited: http=429")
     if retryable or (status_code >= 500) or status_code in _RETRYABLE_HTTP_STATUSES:
@@ -160,3 +166,40 @@ def classify_provider_error(error: Mapping[str, Any] | None) -> OpenCodeError:
     return OpenCodeDeterministicError(
         f"opencode provider error is deterministic: http={status_code or 'unknown'}"
     )
+
+
+def classify_structured_error(error: Mapping[str, Any] | None) -> OpenCodeError:
+    """Classify an OpenCode v2 ``Session.StructuredError`` payload.
+
+    v2 carries provider failures as ``{"type", "message", "status",
+    "retryAfterMs", "response"}`` on completed sessions and idle messages.
+    Only the numeric status and retry hint drive the taxonomy; the provider
+    message/body are never propagated because they may echo request content.
+    """
+    if not isinstance(error, Mapping):
+        return OpenCodeDeterministicError("opencode session failed without an error payload")
+    status_code = _coerce_status(error.get("status"))
+    retry_after = error.get("retryAfterMs")
+    retryable = isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+    if status_code == 429:
+        return OpenCodeRateLimitError("opencode provider rate-limited: http=429")
+    if retryable or status_code >= 500 or status_code in _RETRYABLE_HTTP_STATUSES:
+        return OpenCodeTransientError(
+            f"opencode session failed transiently: http={status_code or 'unknown'}"
+        )
+    if status_code == 403:
+        return OpenCodeProviderAccessError("opencode provider access rejected: http=403")
+    return OpenCodeDeterministicError(
+        f"opencode session failed deterministically: http={status_code or 'unknown'}"
+    )
+
+
+def _coerce_status(value: object) -> int:
+    """Return a bounded integer HTTP status, never a bool/other value."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
