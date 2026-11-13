@@ -324,7 +324,7 @@ def test_naive_now_utc_is_rejected() -> None:
 
 
 def test_consumer_contract_keys_are_stable() -> None:
-    result = search(place_id="place-moscow-city", limit=1)
+    result = search(place_id="place-moscow-city", limit=1, now_utc=TUESDAY_NOON)
     assert result.outcome == "matched_group"
     item = result.items[0]
     assert isinstance(item.record_id, str) and item.record_id
