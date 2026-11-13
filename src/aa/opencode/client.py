@@ -22,6 +22,7 @@ here and prompt text is never logged.
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
 import logging
@@ -220,7 +221,14 @@ class OpenCodeClient(ABC):
 class HttpOpenCodeClient(OpenCodeClient):
     """Real loopback HTTP client for ``opencode serve`` (stdlib only)."""
 
-    def __init__(self, base_url: str, *, request_timeout: float | None = None) -> None:
+    def __init__(
+        self, base_url: str, *, request_timeout: float | None = None,
+        protocol: str = "v1", password: str = "",
+    ) -> None:
+        if protocol not in ("v1", "v2"):
+            raise ValueError("unknown OpenCode HTTP protocol")
+        self._protocol = protocol
+        self._password = password
         self._base_url = base_url.rstrip("/")
         if request_timeout is not None and request_timeout <= 0:
             raise ValueError("request_timeout must be > 0")
@@ -247,6 +255,10 @@ class HttpOpenCodeClient(OpenCodeClient):
         """The configured loopback base URL."""
         return self._base_url
 
+    def set_auth_password(self, password: str) -> None:
+        """Bind managed v2 server authentication without emitting credentials."""
+        self._password = password
+
     def _sync_request(
         self,
         method: str,
@@ -260,9 +272,19 @@ class HttpOpenCodeClient(OpenCodeClient):
         bound. A server that keeps a request alive is never rejected by an
         arbitrary total response timer.
         """
+        if self._protocol == "v2":
+            if path.startswith("/session"):
+                path = "/api" + path
+            elif path == "/global/health":
+                path = "/api/info"
+            else:
+                raise OpenCodeDeterministicError("unsupported OpenCode v2 HTTP route")
         url = f"{self._base_url}{path}"
         data: bytes | None = None
         headers = {"Accept": "application/json"}
+        if self._protocol == "v2" and self._password:
+            token = base64.b64encode(f"opencode:{self._password}".encode("utf-8"))
+            headers["Authorization"] = "Basic " + token.decode("ascii")
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -277,7 +299,10 @@ class HttpOpenCodeClient(OpenCodeClient):
             raise classify_http_status(exc.code) from exc
         if not raw:
             return None
-        return json.loads(raw.decode("utf-8"))
+        result = json.loads(raw.decode("utf-8"))
+        if self._protocol == "v2" and isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return result
 
     def _worker_body(
         self,
@@ -589,12 +614,12 @@ class HttpOpenCodeClient(OpenCodeClient):
         payload = await self._call("GET", "/global/health")
         if not isinstance(payload, dict):
             raise OpenCodeDeterministicError("opencode health returned an invalid payload")
-        healthy = payload.get("healthy")
         version = payload.get("version")
-        return HealthInfo(
-            healthy=healthy is True,
-            version=version if isinstance(version, str) else "",
-        )
+        if self._protocol == "v2":
+            healthy = isinstance(version, str) and bool(version) and type(payload.get("pid")) is int
+        else:
+            healthy = payload.get("healthy") is True
+        return HealthInfo(healthy=healthy, version=version if isinstance(version, str) else "")
 
     async def create_session(self, title: str = "") -> SessionInfo:
         payload = await self._call("POST", "/session", {"title": title})
@@ -727,6 +752,10 @@ class HttpOpenCodeClient(OpenCodeClient):
     ) -> str:
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
+        if self._protocol == "v2":
+            raise OpenCodeDeterministicError(
+                "OpenCode v2 prompt requires completion tracking"
+            )
         quoted = urllib.parse.quote(session_id, safe="")
         body: dict[str, object] = {"parts": [{"type": "text", "text": text}]}
         if agent:
@@ -777,6 +806,10 @@ class HttpOpenCodeClient(OpenCodeClient):
         """Send one native ``json_schema`` request and return its object."""
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
+        if self._protocol == "v2":
+            raise OpenCodeDeterministicError(
+                "OpenCode v2 prompt requires completion tracking"
+            )
         if retry_count < 0:
             raise ValueError("retry_count must be >= 0")
         quoted = urllib.parse.quote(session_id, safe="")
@@ -818,6 +851,8 @@ class HttpOpenCodeClient(OpenCodeClient):
     async def list_messages(self, session_id: str, *, limit: int = 50) -> list[ChatMessage]:
         if limit < 0:
             raise ValueError("limit must be >= 0")
+        if self._protocol == "v2":
+            raise OpenCodeDeterministicError("OpenCode v2 history requires cursor adapter")
         quoted = urllib.parse.quote(session_id, safe="")
         payload = await self._call("GET", f"/session/{quoted}/message?limit={limit}")
         if not isinstance(payload, list):
@@ -840,6 +875,8 @@ class HttpOpenCodeClient(OpenCodeClient):
         This is the concrete HTTP transport implementation; the abstract
         method exists only so test fakes can share the same boundary.
         """
+        if self._protocol == "v2":
+            raise OpenCodeDeterministicError("OpenCode v2 interrupt requires native request contract")
         quoted = urllib.parse.quote(session_id, safe="")
         await self._call("POST", f"/session/{quoted}/abort")
         return True
