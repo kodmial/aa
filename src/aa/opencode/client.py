@@ -222,8 +222,12 @@ class HttpOpenCodeClient(OpenCodeClient):
     """Real loopback HTTP client for ``opencode serve`` (stdlib only)."""
 
     def __init__(
-        self, base_url: str, *, request_timeout: float | None = None,
-        protocol: str = "v1", password: str = "",
+        self,
+        base_url: str,
+        *,
+        request_timeout: float | None = None,
+        protocol: str = "v1",
+        password: str = "",
     ) -> None:
         if protocol not in ("v1", "v2"):
             raise ValueError("unknown OpenCode HTTP protocol")
@@ -283,7 +287,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         data: bytes | None = None
         headers = {"Accept": "application/json"}
         if self._protocol == "v2" and self._password:
-            token = base64.b64encode(f"opencode:{self._password}".encode("utf-8"))
+            token = base64.b64encode(f"opencode:{self._password}".encode())
             headers["Authorization"] = "Basic " + token.decode("ascii")
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -753,9 +757,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         if self._protocol == "v2":
-            raise OpenCodeDeterministicError(
-                "OpenCode v2 prompt requires completion tracking"
-            )
+            raise OpenCodeDeterministicError("OpenCode v2 prompt requires completion tracking")
         quoted = urllib.parse.quote(session_id, safe="")
         body: dict[str, object] = {"parts": [{"type": "text", "text": text}]}
         if agent:
@@ -807,9 +809,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         if self._protocol == "v2":
-            raise OpenCodeDeterministicError(
-                "OpenCode v2 prompt requires completion tracking"
-            )
+            raise OpenCodeDeterministicError("OpenCode v2 prompt requires completion tracking")
         if retry_count < 0:
             raise ValueError("retry_count must be >= 0")
         quoted = urllib.parse.quote(session_id, safe="")
@@ -876,7 +876,9 @@ class HttpOpenCodeClient(OpenCodeClient):
         method exists only so test fakes can share the same boundary.
         """
         if self._protocol == "v2":
-            raise OpenCodeDeterministicError("OpenCode v2 interrupt requires native request contract")
+            raise OpenCodeDeterministicError(
+                "OpenCode v2 interrupt requires native request contract"
+            )
         quoted = urllib.parse.quote(session_id, safe="")
         await self._call("POST", f"/session/{quoted}/abort")
         return True

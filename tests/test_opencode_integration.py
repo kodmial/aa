@@ -262,7 +262,7 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
             import base64
 
             password = self._state.get("v2_password", "")
-            token = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
+            token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
             if password and self.headers.get("Authorization") != f"Basic {token}":
                 self._send_json(401, {"error": "unauthorized"})
             else:

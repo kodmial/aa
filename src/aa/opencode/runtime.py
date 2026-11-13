@@ -22,8 +22,8 @@ import base64
 import json
 import logging
 import os
-import secrets
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -248,14 +248,12 @@ def split_base_url(base_url: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def _probe_health(
-    base_url: str, timeout: float, password: str = ""
-) -> tuple[bool, str]:
+def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
     """Blocking single health probe; returns ``(healthy, version)``."""
     url = f"{base_url.rstrip('/')}/api/info"
     headers = {"Accept": "application/json"}
     if password:
-        token = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
+        token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
     request = urllib.request.Request(url, headers=headers)
     try:
