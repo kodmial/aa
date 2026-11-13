@@ -15,6 +15,7 @@ import http.server
 import io
 import json
 import logging
+import os
 import shutil
 import socket
 import subprocess
@@ -256,8 +257,28 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
         assert isinstance(server, _FakeServeServer)
         return server.state
 
+    def _v2_authorized(self) -> bool:
+        import base64
+
+        password = self._state.get("v2_password", "")
+        if not password:
+            return True
+        token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
+        return bool(self.headers.get("Authorization") == f"Basic {token}")
+
     def do_GET(self) -> None:
-        if self.path == "/global/health":
+        if self.path == "/api/info":
+            if not self._v2_authorized():
+                self._send_json(401, {"error": "unauthorized"})
+            else:
+                self._send_json(200, {"version": "2.2.6", "pid": 1234, "urls": [], "paths": {}})
+        elif self.path.startswith("/api/session/"):
+            if not self._v2_authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            ident = self.path.split("/")[3].split("?")[0]
+            self._send_json(200, {"data": {"id": ident, "title": "v2"}})
+        elif self.path == "/global/health":
             self._send_json(200, {"healthy": True, "version": "test-1.0"})
         elif self.path.startswith("/session/ses_missing"):
             self._send_json(404, {"error": "not found"})
@@ -274,7 +295,11 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
         self._state.setdefault("requests", []).append(
             {"method": "POST", "path": self.path, "body": body}
         )
-        if self.path == "/session":
+        if self.path.startswith("/api/") and not self._v2_authorized():
+            self._send_json(401, {"error": "unauthorized"})
+        elif self.path == "/api/session":
+            self._send_json(200, {"data": {"id": "ses_v2_contract", "title": "v2"}})
+        elif self.path == "/session":
             self._send_json(200, {"id": "ses_contract01", "title": "t"})
         elif self.path.endswith("/abort"):
             self._send_json(200, True)
@@ -633,10 +658,17 @@ async def test_spawned_server_shuts_down_gracefully() -> None:
 
 
 @needs_opencode
-async def test_attach_mode_never_kills_foreign_server() -> None:
+async def test_attach_mode_never_kills_foreign_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import secrets
+
     port = _free_port()
+    password = secrets.token_urlsafe(24)
+    monkeypatch.setenv("OPENCODE_PASSWORD", password)
     proc = subprocess.Popen(
         ["opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+        env={**os.environ, "OPENCODE_PASSWORD": password},
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -645,7 +677,9 @@ async def test_attach_mode_never_kills_foreign_server() -> None:
         deadline = time.monotonic() + 30.0
         healthy = False
         while time.monotonic() < deadline:
-            healthy, _ = await asyncio.to_thread(_probe_health, f"http://127.0.0.1:{port}", 1.0)
+            healthy, _ = await asyncio.to_thread(
+                _probe_health, f"http://127.0.0.1:{port}", 1.0, password
+            )
             if healthy:
                 break
             await asyncio.sleep(0.2)
@@ -667,3 +701,61 @@ async def test_attach_mode_never_kills_foreign_server() -> None:
                 await asyncio.wait_for(asyncio.to_thread(proc.wait), 10.0)
             except TimeoutError:
                 proc.kill()
+
+
+def test_v2_health_probe_rejects_unauthorized_and_v1_shape() -> None:
+    server, thread, base_url = _run_fake_serve()
+    try:
+        server.state["v2_password"] = "test-only-secret"
+        healthy, version = _probe_health(base_url, 1.0)
+        assert not healthy
+        assert version == ""
+        healthy, version = _probe_health(base_url, 1.0, "test-only-secret")
+        assert healthy
+        assert version == "2.2.6"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+async def test_attach_mode_binds_env_password_to_injected_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, thread, base_url = _run_fake_serve()
+    try:
+        password = "test-only-secret"
+        server.state["v2_password"] = password
+        monkeypatch.setenv("OPENCODE_PASSWORD", password)
+        client = HttpOpenCodeClient(base_url, protocol="v2")
+        runtime = LocalOpenCodeRuntime(
+            OpenCodeConfig(base_url=base_url, command="opencode", workdir="."),
+            client=client,
+            manage_process=False,
+        )
+        await runtime.start()
+        assert runtime.ready
+        assert not runtime.owns_process
+        # Attach mode never spawns, so the supplied client itself must carry
+        # the environment password for every call after the readiness probe.
+        created = await runtime.client.create_session("attach-auth")
+        assert (await runtime.client.get_session(created.id)).id == created.id
+        await runtime.stop()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+async def test_v2_session_open_and_pending_prompt_never_claims_reply() -> None:
+    server, thread, base_url = _run_fake_serve()
+    try:
+        client = HttpOpenCodeClient(base_url, protocol="v2", password="test-only-secret")
+        created = await client.create_session("v2")
+        assert (await client.get_session(created.id)).id == created.id
+        with pytest.raises(OpenCodeDeterministicError, match="completion tracking"):
+            await client.send_message(created.id, "hello")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

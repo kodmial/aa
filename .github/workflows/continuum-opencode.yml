@@ -144,6 +144,8 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      # Match CI Python/dev dependencies before the unchanged verification contract.
+      prepare_command: "bash scripts/prepare_opencode_verification_env.sh"
       validation_command: "bash scripts/verify.sh"
       mode: "${{ inputs.mode }}"
       issue_number: "${{ inputs.issue_number }}"

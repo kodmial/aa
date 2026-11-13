@@ -200,7 +200,11 @@ async def run_live_child() -> None:
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
     config = OpenCodeConfig(base_url=base_url, command="opencode", workdir=".")
-    runtime = LocalOpenCodeRuntime(config, manage_process=False)
+    # Historical #453 fixture speaks the V1 wire protocol explicitly.
+    # Production runtime defaults to V2 and is verified on the actual binary.
+    runtime = LocalOpenCodeRuntime(
+        config, client=HttpOpenCodeClient(base_url, protocol="v1"), manage_process=False
+    )
     client = runtime.client
     assert isinstance(client, HttpOpenCodeClient)
     assert probe_for_runtime(runtime) is not None

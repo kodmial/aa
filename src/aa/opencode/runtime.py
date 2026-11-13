@@ -18,9 +18,12 @@ only forwards the opaque ``OPENCODE_MODEL`` pointer, if set.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -245,10 +248,14 @@ def split_base_url(base_url: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def _probe_health(base_url: str, timeout: float) -> tuple[bool, str]:
+def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
     """Blocking single health probe; returns ``(healthy, version)``."""
-    url = f"{base_url.rstrip('/')}/global/health"
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    url = f"{base_url.rstrip('/')}/api/info"
+    headers = {"Accept": "application/json"}
+    if password:
+        token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -257,7 +264,8 @@ def _probe_health(base_url: str, timeout: float) -> tuple[bool, str]:
     if not isinstance(payload, dict):
         return False, ""
     version = payload.get("version")
-    return payload.get("healthy") is True, version if isinstance(version, str) else ""
+    ready = isinstance(version, str) and bool(version) and type(payload.get("pid")) is int
+    return ready, version if isinstance(version, str) else ""
 
 
 class OpenCodeRuntime(ABC):
@@ -355,7 +363,18 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         if shutdown_timeout <= 0:
             raise ValueError("shutdown_timeout must be > 0")
         self.config = config
-        self._client = client or HttpOpenCodeClient(config.base_url)
+        self._auth_password = os.environ.get("OPENCODE_PASSWORD") or os.environ.get(
+            "OPENCODE_SERVER_PASSWORD", ""
+        )
+        self._client = client or HttpOpenCodeClient(
+            config.base_url, protocol="v2", password=self._auth_password
+        )
+        if self._auth_password and isinstance(self._client, HttpOpenCodeClient):
+            # Attach mode never calls ``_spawn``, so an injected client must be
+            # bound here too: the readiness probe authenticates with the
+            # environment password while every later call goes through the
+            # supplied client.
+            self._client.set_auth_password(self._auth_password)
         self._manage_process = manage_process
         self._ready_timeout = ready_timeout
         self._shutdown_timeout = shutdown_timeout
@@ -419,7 +438,9 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         deadline = time.monotonic() + timeout
         version = ""
         while time.monotonic() < deadline:
-            healthy, version = await asyncio.to_thread(_probe_health, self.config.base_url, 1.0)
+            healthy, version = await asyncio.to_thread(
+                _probe_health, self.config.base_url, 1.0, self._auth_password
+            )
             if healthy:
                 return True, version
             await asyncio.sleep(0.2)
@@ -430,7 +451,9 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         if self._running:
             return
         split_base_url(self.config.base_url)
-        healthy, _ = await asyncio.to_thread(_probe_health, self.config.base_url, 1.0)
+        healthy, _ = await asyncio.to_thread(
+            _probe_health, self.config.base_url, 1.0, self._auth_password
+        )
         if healthy:
             self._running = True
             self._ready = True
@@ -453,6 +476,12 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
             raise OpenCodeStartupError(f"opencode command not found: {self.config.command!r}")
         host, port = split_base_url(self.config.base_url)
         args = [binary, "serve", "--port", str(port), "--hostname", host]
+        if not self._auth_password:
+            self._auth_password = secrets.token_urlsafe(32)
+        env = os.environ.copy()
+        env["OPENCODE_PASSWORD"] = self._auth_password
+        if isinstance(self._client, HttpOpenCodeClient):
+            self._client.set_auth_password(self._auth_password)
         try:
             # Bounded filtered capture (kodmial/aa#431): the server's
             # stdout/stderr no longer vanish into DEVNULL. Daemon threads
@@ -460,6 +489,7 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
             # and only allow-listed event lines are ever retained.
             self._process = subprocess.Popen(
                 args,
+                env=env,
                 cwd=self.config.workdir or ".",
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

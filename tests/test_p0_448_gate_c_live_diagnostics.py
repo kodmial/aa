@@ -343,9 +343,9 @@ async def test_process_state_supplier_reports_real_alive_and_exit(
         def __init__(self) -> None:
             self.calls = 0
 
-        def __call__(self, base_url: str, timeout: float) -> tuple[bool, str]:
+        def __call__(self, base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
             self.calls += 1
-            _ = (base_url, timeout)
+            _ = (base_url, timeout, password)
             return (True, "p0448") if self.calls > 1 else (False, "")
 
     monkeypatch.setattr(_oc_runtime, "_probe_health", _FirstDownThenHealthyProbe())
