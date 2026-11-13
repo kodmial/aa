@@ -13,18 +13,18 @@ Token budgets are an early-stop / cost / latency guard only and never
 the product contract: character/word measurement below is authoritative
 because token/character ratios vary by language and model.
 
-Pinned-runtime finding (OpenCode 1.18.34, observed ``GET /doc``):
-``POST /session/{id}/message`` accepts only ``parts``/``agent``/``model``
-(plus ``messageID``/``noReply``/``tools``/``format``/``system``/
-``variant``); it exposes no documented per-message ``max_tokens`` /
-``maxTokens`` field, and the agent config schema exposes no output-token
-cap either (only ``model``/``variant``/``temperature``/``top_p``/
-``prompt``/``tools``/``options``/``steps``/``maxSteps``). The worker
-therefore never sends an undocumented token-cap field that the server
-could silently ignore; ``OPENCODE_MAX_OUTPUT_TOKENS`` is honored as a
-bounded prompt-advertised generation budget plus the deterministic
-character validator below. Logs carry only lengths and categories, never
-user text, corpus text, or response text.
+Pinned-runtime finding (OpenCode 2.2.6, observed ``GET /openapi.json``):
+``POST /api/session/{id}/prompt`` accepts only ``id``/``text``/``files``/
+``agents``/``skills``/``metadata``/``delivery``/``resume``; it exposes no
+documented per-message ``max_tokens`` / ``maxTokens`` field, and the agent
+config schema exposes no output-token cap either (only ``model``/
+``variant``/``temperature``/``top_p``/``prompt``/``tools``/``options``/
+``steps``/``maxSteps``). The worker therefore never sends an undocumented
+token-cap field that the server could silently ignore;
+``OPENCODE_MAX_OUTPUT_TOKENS`` is honored as a bounded prompt-advertised
+generation budget plus the deterministic character validator below. Logs
+carry only lengths and categories, never user text, corpus text, or
+response text.
 """
 
 from __future__ import annotations

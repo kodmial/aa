@@ -58,10 +58,22 @@ from aa.opencode.errors import (
 
 logger = logging.getLogger("aa.opencode.client")
 
+# A v2 prompt is admitted asynchronously. The completion loop re-checks the
+# session after ``/wait`` returns, because the wait route only observes the
+# agent loop: a prompt admitted a moment earlier may not have marked the loop
+# busy yet. The loop therefore waits for the turn's *own* terminal idle
+# message instead of treating a successful enqueue or immediate wait return as
+# a reply. A caller-supplied timeout bounds the whole wait; the fallback keeps
+# the loop finite when no timeout was configured. Polling happens inside the
+# blocking worker thread and is therefore cancellable via the attempt
+# supervisor (cancellation also issues the native interrupt).
+_V2_COMPLETION_POLL_SECONDS = 0.05
+_V2_COMPLETION_FALLBACK_TIMEOUT_SECONDS = 600.0
+
 
 @dataclass(frozen=True)
 class HealthInfo:
-    """Result of the ``GET /global/health`` readiness probe."""
+    """Result of the readiness probe (``GET /api/info`` on v2)."""
 
     healthy: bool
     version: str = ""
@@ -413,9 +425,7 @@ class HttpOpenCodeClient(OpenCodeClient):
             # The real v2 server answers known routes as JSON. An HTML SPA
             # fallback (the v1 routes do this) or any other non-JSON body is
             # a contract mismatch, never a usable protocol response.
-            raise OpenCodeDeterministicError(
-                "opencode returned a non-JSON response"
-            ) from exc
+            raise OpenCodeDeterministicError("opencode returned a non-JSON response") from exc
         if self._protocol == "v2" and isinstance(result, dict) and set(result) == {"data"}:
             # Unwrap only the single-field success envelopes. Paged
             # responses carry ``data`` plus ``cursor`` and must stay intact
@@ -952,9 +962,15 @@ class HttpOpenCodeClient(OpenCodeClient):
         order: str,
         page_limit: int,
         stop_id: str = "",
+        stop_created_ms: int = 0,
         max_pages: int = 64,
     ) -> list[dict[str, object]]:
-        """Walk v2 history pages (newest/oldest first) with a bounded guard."""
+        """Walk v2 history pages (newest/oldest first) with a bounded guard.
+
+        The walk stops at the admitted user message (by id or, when an id is
+        unavailable, by creation time) so a previous turn's terminal idle or
+        assistant message can never be mistaken for this turn's result.
+        """
         entries: list[dict[str, object]] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
@@ -968,6 +984,10 @@ class HttpOpenCodeClient(OpenCodeClient):
             )
             entries.extend(page)
             if stop_id and any(entry.get("id") == stop_id for entry in page):
+                break
+            if stop_created_ms and any(
+                0 < self._v2_created_ms(entry) <= stop_created_ms for entry in page
+            ):
                 break
             if not next_cursor or next_cursor in seen_cursors:
                 break
@@ -1012,76 +1032,130 @@ class HttpOpenCodeClient(OpenCodeClient):
 
     def _v2_wait_for_idle(self, session_id: str, timeout: float | None) -> None:
         quoted = urllib.parse.quote(session_id, safe="")
-        self._sync_request(
-            "POST", f"/api/experimental/session/{quoted}/wait", None, timeout
-        )
+        self._sync_request("POST", f"/api/experimental/session/{quoted}/wait", None, timeout)
 
-    def _v2_get_session_blocking(
-        self, session_id: str, timeout: float | None
-    ) -> dict[str, object]:
-        quoted = urllib.parse.quote(session_id, safe="")
-        payload = self._sync_request("GET", f"/api/session/{quoted}", None, timeout)
-        if not isinstance(payload, dict):
-            raise OpenCodeDeterministicError("opencode session lookup returned invalid data")
-        return payload
-
-    def _v2_completed_assistant(
+    def _v2_turn_messages(
         self,
         session_id: str,
         *,
         user_message_id: str,
+        user_created_ms: int,
         timeout: float | None,
-    ) -> dict[str, object]:
-        """Return the assistant message only after a genuinely successful turn.
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        """Return ``(newest_assistant, idle)`` belonging to this turn only.
 
-        The v2 prompt response is admission evidence. Completion requires the
-        wait endpoint to return AND the session to report ``succeeded`` AND a
-        new assistant message to be present. A queued/waiting prompt, a failed
-        or interrupted outcome, or a missing final message is never converted
-        into a reply.
+        Entries are newest-first. The walk stops at *this* turn's admitted
+        user message, so a previous turn's assistant/idle message that
+        happens to share the final history page can never be reported as
+        this turn's result. Both the admitted id and the admission
+        timestamp are enforced: the id is authoritative, while the
+        timestamp still rejects strictly older messages if the server ever
+        rewrites the id.
         """
-        session = self._v2_get_session_blocking(session_id, timeout)
-        outcome = session.get("outcome")
         entries = self._v2_history_entries(
             session_id,
             timeout=timeout,
             order="desc",
             page_limit=100,
             stop_id=user_message_id,
+            stop_created_ms=user_created_ms,
         )
         assistant: dict[str, object] | None = None
-        idle_error: dict[str, object] | None = None
+        idle: dict[str, object] | None = None
         for entry in entries:
+            # Both boundaries are enforced: the admitted id is authoritative,
+            # and creation time rejects anything strictly older than this
+            # turn even if the server rewrote the id. Equal-millisecond
+            # messages stay eligible because a fast assistant reply can share
+            # the user message's timestamp.
+            if user_message_id and entry.get("id") == user_message_id:
+                break
+            created_ms = self._v2_created_ms(entry)
+            if user_created_ms and 0 < created_ms < user_created_ms:
+                break
             entry_type = entry.get("type")
             if entry_type == "assistant" and assistant is None:
                 assistant = entry
-            if entry_type == "idle" and idle_error is None:
-                error = entry.get("error")
-                if isinstance(error, dict) and error:
-                    idle_error = error
-        if outcome != "succeeded":
-            if idle_error is not None:
-                raise classify_structured_error(idle_error)
-            if isinstance(outcome, str) and outcome:
-                raise OpenCodeDeterministicError(
-                    f"opencode session did not complete successfully: outcome={outcome}"
+            elif entry_type == "idle" and idle is None:
+                idle = entry
+        return assistant, idle
+
+    def _v2_completed_assistant(
+        self,
+        session_id: str,
+        *,
+        user_message_id: str,
+        user_created_ms: int,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        """Await and return the assistant message of a genuinely completed turn.
+
+        A v2 prompt response is durable admission, not a reply. Completion is
+        proven only by the terminal ``idle`` message created *after* this
+        turn's user message; that message carries the authoritative outcome
+        for the turn. The loop re-issues ``/wait`` because the agent loop may
+        not have started when the prompt was admitted, and it stops at a
+        caller-supplied deadline (or a finite fallback) so a queued prompt can
+        never be reported as a finished response.
+
+        A succeeded turn must also expose an assistant message; a failed or
+        interrupted turn is classified from the structured error carried by
+        its idle message. Waiting, queued, missing, or failed results are
+        never converted into a fictitious reply.
+        """
+        budget = _V2_COMPLETION_FALLBACK_TIMEOUT_SECONDS if timeout is None else timeout
+        deadline = time.monotonic() + max(0.001, budget)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OpenCodeTimeoutError(
+                    "opencode turn completion was not observed before the deadline"
                 )
-            raise OpenCodeDeterministicError(
-                "opencode session did not report a completion outcome"
+            # Bound every blocking wait by what is left of the caller's
+            # deadline. Without this, a server that never returns from
+            # /wait would outlive the finite fallback and a cancelled worker
+            # could stay blocked indefinitely.
+            self._v2_wait_for_idle(session_id, remaining)
+            assistant, idle = self._v2_turn_messages(
+                session_id,
+                user_message_id=user_message_id,
+                user_created_ms=user_created_ms,
+                timeout=remaining,
             )
-        if assistant is None:
-            raise OpenCodeDeterministicError(
-                "opencode completion produced no assistant reply"
-            )
-        error = assistant.get("error")
-        if isinstance(error, dict) and error:
-            raise classify_structured_error(error)
-        finish = assistant.get("finish")
-        if isinstance(finish, str) and finish and finish != "stop":
-            raise OpenCodeDeterministicError(
-                f"opencode assistant reply did not finish normally: {finish}"
-            )
-        return assistant
+            if idle is not None:
+                outcome = idle.get("outcome")
+                error = idle.get("error")
+                if isinstance(error, dict) and error:
+                    # A structured failure is authoritative even if the
+                    # outcome field claims success: never turn a provider
+                    # error into a PASS.
+                    raise classify_structured_error(error)
+                if outcome != "succeeded":
+                    if isinstance(outcome, str) and outcome:
+                        raise OpenCodeDeterministicError(
+                            f"opencode session did not complete successfully: outcome={outcome}"
+                        )
+                    raise OpenCodeDeterministicError(
+                        "opencode session did not report a completion outcome"
+                    )
+                if assistant is None:
+                    raise OpenCodeDeterministicError(
+                        "opencode completion produced no assistant reply"
+                    )
+                error = assistant.get("error")
+                if isinstance(error, dict) and error:
+                    raise classify_structured_error(error)
+                finish = assistant.get("finish")
+                if isinstance(finish, str) and finish and finish != "stop":
+                    raise OpenCodeDeterministicError(
+                        f"opencode assistant reply did not finish normally: {finish}"
+                    )
+                return assistant
+            if time.monotonic() >= deadline:
+                raise OpenCodeTimeoutError(
+                    "opencode turn completion was not observed before the deadline"
+                )
+            time.sleep(_V2_COMPLETION_POLL_SECONDS)
 
     def _v2_text_exchange(
         self,
@@ -1094,10 +1168,12 @@ class HttpOpenCodeClient(OpenCodeClient):
         audit_agent: str,
     ) -> str:
         prompt = _v2_system_preamble(system, text)
-        user_message_id = self._v2_enqueue_prompt(session_id, prompt, timeout)
-        self._v2_wait_for_idle(session_id, timeout)
+        user_message_id, user_created_ms = self._v2_enqueue_prompt(session_id, prompt, timeout)
         assistant = self._v2_completed_assistant(
-            session_id, user_message_id=user_message_id, timeout=timeout
+            session_id,
+            user_message_id=user_message_id,
+            user_created_ms=user_created_ms,
+            timeout=timeout,
         )
         self._validate_served_model(
             assistant, requested=model, agent=agent, audit_agent=audit_agent
@@ -1125,10 +1201,14 @@ class HttpOpenCodeClient(OpenCodeClient):
                     f"{prompt}\n\nYour previous reply was not one valid JSON object. "
                     "Return only the JSON object now."
                 )
-            user_message_id = self._v2_enqueue_prompt(session_id, current_prompt, timeout)
-            self._v2_wait_for_idle(session_id, timeout)
+            user_message_id, user_created_ms = self._v2_enqueue_prompt(
+                session_id, current_prompt, timeout
+            )
             assistant = self._v2_completed_assistant(
-                session_id, user_message_id=user_message_id, timeout=timeout
+                session_id,
+                user_message_id=user_message_id,
+                user_created_ms=user_created_ms,
+                timeout=timeout,
             )
             self._validate_served_model(
                 assistant, requested=model, agent=agent, audit_agent=audit_agent
@@ -1187,6 +1267,11 @@ class HttpOpenCodeClient(OpenCodeClient):
         if not text or not text.strip():
             raise OpenCodeDeterministicError("refusing to send an empty prompt")
         if self._protocol == "v2":
+            if format is not None:
+                raise OpenCodeDeterministicError(
+                    "OpenCode v2 send_message has no native format support; "
+                    "use send_structured_message"
+                )
             if timeout is not None and timeout <= 0:
                 raise ValueError("timeout must be > 0")
             await self._v2_configure_selectors(
@@ -1216,7 +1301,9 @@ class HttpOpenCodeClient(OpenCodeClient):
                 abort_session_id=session_id,
             )
             logger.info("opencode message completed")
-            return result if isinstance(result, str) else ""
+            if not isinstance(result, str):
+                raise OpenCodeDeterministicError("opencode message returned no text")
+            return result
         quoted = urllib.parse.quote(session_id, safe="")
         body: dict[str, object] = {"parts": [{"type": "text", "text": text}]}
         if agent:
