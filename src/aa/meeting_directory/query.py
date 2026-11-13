@@ -56,12 +56,11 @@ def _slot_verified_at(group_id: str, snapshot: DirectorySnapshot) -> datetime | 
     return max(stamps)
 
 
-def _resource_for_group(group: GroupRecord, snapshot: DirectorySnapshot) -> MeetingResource:
+def _resource_for_group(
+    group: GroupRecord, snapshot: DirectorySnapshot, *, now_utc: datetime
+) -> MeetingResource:
     verified_at = _slot_verified_at(group.group_id, snapshot)
-    freshness = _freshness_note(verified_at)
-    if verified_at is not None:
-        now_utc = datetime.now(UTC)
-        freshness = _freshness_note(verified_at, now_utc)
+    freshness = _freshness_note(verified_at, now_utc)
     return MeetingResource(
         record_id=group.group_id,
         group_id=group.group_id,
@@ -113,12 +112,16 @@ def search(
     weekday: int | None = None,
     limit: int = 3,
     snapshot: DirectorySnapshot | None = None,
+    now_utc: datetime | None = None,
 ) -> DirectorySearchResult:
     """Structured typed-filter search over the validated snapshot.
 
     Only records already present in the snapshot are returned. A region
     link never satisfies a request for an exact place/time as a matched
     meeting. Never fabricates groups, times, contacts, or distances.
+
+    An explicit aware now_utc allows deterministic historical snapshot tests;
+    production calls always use real UTC time and still flag stale schedules.
     """
     try:
         directory = snapshot if snapshot is not None else get_cached_snapshot()
@@ -134,6 +137,9 @@ def search(
         )
     if weekday is not None and (weekday < 0 or weekday > 6):
         raise ValueError("weekday must be in 0..6 (Monday=0)")
+    if now_utc is not None and now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+    moment = datetime.now(UTC) if now_utc is None else now_utc.astimezone(UTC)
 
     resolved_place_id = place_id
     if resolved_place_id is None and city:
@@ -177,7 +183,7 @@ def search(
     bounded = candidates[: max(1, limit)]
 
     if bounded:
-        items = tuple(_resource_for_group(group, directory) for group in bounded)
+        items = tuple(_resource_for_group(group, directory, now_utc=moment) for group in bounded)
         stale = [item for item in items if item.freshness == "stale"]
         if stale and len(stale) == len(items):
             link = _region_link_for(_place_region(resolved_place_id, directory), directory)

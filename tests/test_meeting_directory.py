@@ -7,7 +7,7 @@ import hashlib
 import json
 import socket
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
@@ -127,7 +127,7 @@ def test_region_only_input_does_not_invent_city() -> None:
 
 
 def test_online_results_without_city() -> None:
-    result = search(format="online")
+    result = search(format="online", now_utc=NOW)
     assert result.outcome == "matched_group"
     assert all(item.group_format in ("online", "hybrid") for item in result.items)
     upcoming = get_upcoming_meetings(format="online", now_utc=NOW)
@@ -136,7 +136,7 @@ def test_online_results_without_city() -> None:
 
 
 def test_search_distinguishes_open_and_closed() -> None:
-    result = search(place_id="place-moscow-city", limit=10)
+    result = search(place_id="place-moscow-city", limit=10, now_utc=NOW)
     assert result.outcome == "matched_group"
     access = {item.record_id: item.access for item in result.items}
     assert access.get("g-msk-nadezhda") == "closed"
@@ -147,6 +147,20 @@ def test_search_rejects_non_ru_scope() -> None:
     result = search(country="US")
     assert result.outcome == "no_coverage"
     assert result.items == ()
+
+
+def test_meeting_search_never_calls_old_snapshot_fresh_at_later_date() -> None:
+    # The October snapshot can be queried historically for deterministic tests,
+    # but an actual later clock must still fail closed on outdated schedules.
+    stale = search(place_id="place-moscow-city", now_utc=NOW + timedelta(days=120))
+    assert stale.outcome == "stale_details"
+    assert stale.items
+    assert all(item.freshness == "stale" for item in stale.items)
+
+
+def test_search_rejects_naive_verification_clock() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        search(place_id="place-moscow-city", now_utc=datetime(2026, 10, 6, 12, 0))
 
 
 def test_stale_schedule_returns_honest_navigation() -> None:
@@ -184,7 +198,7 @@ def test_no_full_region_or_city_menu_is_generated() -> None:
 
 
 def test_every_result_cites_vetted_source_url() -> None:
-    result = search(place_id="place-moscow-city", limit=10)
+    result = search(place_id="place-moscow-city", limit=10, now_utc=NOW)
     assert result.items
     for item in result.items:
         assert is_allowed_url(item.source_url)
@@ -257,7 +271,7 @@ def test_missing_snapshot_yields_typed_unavailable(
     monkeypatch.delenv("AA_MEETING_DIRECTORY_PATH")
     reset_cache()
     # Normal directory lookup recovers once the snapshot path is restored.
-    assert search(place_id="place-moscow-city").outcome == "matched_group"
+    assert search(place_id="place-moscow-city", now_utc=NOW).outcome == "matched_group"
 
 
 def test_hot_path_makes_zero_network_requests(
@@ -283,7 +297,7 @@ def test_no_llm_dependency_on_hot_path() -> None:
         "from aa.meeting_directory import search, get_upcoming_meetings;"
         "from datetime import datetime, timezone;"
         "now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc);"
-        "assert search(place_id='place-moscow-city').outcome == 'matched_group';"
+        "assert search(place_id='place-moscow-city', now_utc=now).outcome == 'matched_group';"
         "result = get_upcoming_meetings(place_id='place-moscow-city', now_utc=now);"
         "assert result.occurrences;"
         "banned = [m for m in ('langchain', 'langgraph', 'transformers', 'torch')"
@@ -312,7 +326,7 @@ def test_directory_works_when_model_clients_raise(
     monkeypatch.setattr(opencode_runtime.LocalOpenCodeRuntime, "start", _raise)
     monkeypatch.setattr(opencode_runtime.LocalOpenCodeRuntime, "ensure_ready", _raise)
     snapshot = load_snapshot(_snapshot_dir())
-    result = search(place_id="place-moscow-city", snapshot=snapshot)
+    result = search(place_id="place-moscow-city", snapshot=snapshot, now_utc=NOW)
     assert result.outcome == "matched_group"
     upcoming = get_upcoming_meetings(place_id="place-moscow-city", now_utc=NOW, snapshot=snapshot)
     assert upcoming.fallback is None

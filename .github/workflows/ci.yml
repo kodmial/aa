@@ -20,10 +20,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dev dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+      # The exact same bootstrap executes before Continuum issue verification.
+      - name: Prepare canonical AA verification environment
+        run: bash scripts/prepare_opencode_verification_env.sh
       - name: Install AA pinned OpenCode via verified Continuum toolchain
         uses: ./.github/actions/aa-opencode-toolchain
         with:
