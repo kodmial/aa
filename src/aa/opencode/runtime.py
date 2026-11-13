@@ -369,6 +369,12 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
         self._client = client or HttpOpenCodeClient(
             config.base_url, protocol="v2", password=self._auth_password
         )
+        if self._auth_password and isinstance(self._client, HttpOpenCodeClient):
+            # Attach mode never calls ``_spawn``, so an injected client must be
+            # bound here too: the readiness probe authenticates with the
+            # environment password while every later call goes through the
+            # supplied client.
+            self._client.set_auth_password(self._auth_password)
         self._manage_process = manage_process
         self._ready_timeout = ready_timeout
         self._shutdown_timeout = shutdown_timeout

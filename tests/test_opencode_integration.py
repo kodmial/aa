@@ -257,17 +257,25 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
         assert isinstance(server, _FakeServeServer)
         return server.state
 
+    def _v2_authorized(self) -> bool:
+        import base64
+
+        password = self._state.get("v2_password", "")
+        if not password:
+            return True
+        token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
+        return bool(self.headers.get("Authorization") == f"Basic {token}")
+
     def do_GET(self) -> None:
         if self.path == "/api/info":
-            import base64
-
-            password = self._state.get("v2_password", "")
-            token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
-            if password and self.headers.get("Authorization") != f"Basic {token}":
+            if not self._v2_authorized():
                 self._send_json(401, {"error": "unauthorized"})
             else:
                 self._send_json(200, {"version": "2.2.6", "pid": 1234, "urls": [], "paths": {}})
         elif self.path.startswith("/api/session/"):
+            if not self._v2_authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
             ident = self.path.split("/")[3].split("?")[0]
             self._send_json(200, {"data": {"id": ident, "title": "v2"}})
         elif self.path == "/global/health":
@@ -287,7 +295,9 @@ class _FakeServeHandler(http.server.BaseHTTPRequestHandler):
         self._state.setdefault("requests", []).append(
             {"method": "POST", "path": self.path, "body": body}
         )
-        if self.path == "/api/session":
+        if self.path.startswith("/api/") and not self._v2_authorized():
+            self._send_json(401, {"error": "unauthorized"})
+        elif self.path == "/api/session":
             self._send_json(200, {"data": {"id": "ses_v2_contract", "title": "v2"}})
         elif self.path == "/session":
             self._send_json(200, {"id": "ses_contract01", "title": "t"})
@@ -703,6 +713,34 @@ def test_v2_health_probe_rejects_unauthorized_and_v1_shape() -> None:
         healthy, version = _probe_health(base_url, 1.0, "test-only-secret")
         assert healthy
         assert version == "2.2.6"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+async def test_attach_mode_binds_env_password_to_injected_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, thread, base_url = _run_fake_serve()
+    try:
+        password = "test-only-secret"
+        server.state["v2_password"] = password
+        monkeypatch.setenv("OPENCODE_PASSWORD", password)
+        client = HttpOpenCodeClient(base_url, protocol="v2")
+        runtime = LocalOpenCodeRuntime(
+            OpenCodeConfig(base_url=base_url, command="opencode", workdir="."),
+            client=client,
+            manage_process=False,
+        )
+        await runtime.start()
+        assert runtime.ready
+        assert not runtime.owns_process
+        # Attach mode never spawns, so the supplied client itself must carry
+        # the environment password for every call after the readiness probe.
+        created = await runtime.client.create_session("attach-auth")
+        assert (await runtime.client.get_session(created.id)).id == created.id
+        await runtime.stop()
     finally:
         server.shutdown()
         server.server_close()
