@@ -3180,13 +3180,40 @@ async def run_live_telegram_evidence_lane(
             server_probe = None
             server_probe_reason = type(exc).__name__[:64]
 
+        server_probe_lock = asyncio.Lock()
+
         async def _refresh_server_evidence() -> None:
             if server_probe is None:
                 return
             try:
-                await server_probe.snapshot()
+                async with server_probe_lock:
+                    await server_probe.snapshot()
             except Exception:  # noqa: BLE001 - probe must never break the lane
                 return
+
+        async def _probe_server_session_status() -> Any:
+            """Locked light poll used by the observer and canary poller."""
+            if server_probe is None:
+                return {"observed": False, "progress_meaning": "none"}
+            async with server_probe_lock:
+                return await server_probe.session_status_snapshot()
+
+        async def _canary_server_evidence_poller() -> None:
+            """Keep observing the pinned server while the real turn runs.
+
+            A fast real-path turn can complete before the stall observer's
+            first 10s snapshot. Without a concurrent light poll the canary
+            would see only a post-turn empty status map and could not prove
+            the server-side state the pinned binary reported during the
+            request. The poll is bounded (one loopback status read every
+            0.2s) and uses the same existing probe instance.
+            """
+            while True:
+                try:
+                    await _probe_server_session_status()
+                except Exception:  # noqa: BLE001 - evidence must not break the lane
+                    pass
+                await asyncio.sleep(0.2)
 
         def _current_request_state(causality: str) -> str:
             if not causality:
@@ -3277,6 +3304,7 @@ async def run_live_telegram_evidence_lane(
         # never break the live flow itself.
         attempt_observer: Any = None
         attempt_observer_reason = ""
+        canary_server_poll_task: asyncio.Task[Any] | None = None
         causality_scenario_index: dict[str, int] = {}
 
         def _live_attempt_event_sink(payload: Mapping[str, Any]) -> None:
@@ -3309,7 +3337,7 @@ async def run_live_telegram_evidence_lane(
                 ),
                 event_sink=_live_attempt_event_sink,
                 session_status_probe=(
-                    server_probe.session_status_snapshot if server_probe is not None else None
+                    _probe_server_session_status if server_probe is not None else None
                 ),
                 register_atexit_flush=True,
             )
@@ -3544,6 +3572,11 @@ async def run_live_telegram_evidence_lane(
                 latency_samples=latency_samples,
                 partial_evidence=_collect_partial_evidence("scenarios-start"),
             )
+            if canary_mode and server_probe is not None:
+                canary_server_poll_task = asyncio.create_task(
+                    _canary_server_evidence_poller(),
+                    name="aa-gate-c-canary-server-evidence",
+                )
             for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
                 # These logs contain only scenario identifiers, never the
                 # Telegram input, delivered text or canonical-book passage.
@@ -4276,9 +4309,7 @@ async def run_live_telegram_evidence_lane(
                             )
                             first_coverage = coverage_from_partial(first_partial)
                             server_evidence_cached = (
-                                server_probe.cached_evidence()
-                                if server_probe is not None
-                                else None
+                                server_probe.cached_evidence() if server_probe is not None else None
                             )
                             server_ok = bool(
                                 server_probe is not None
@@ -5287,6 +5318,12 @@ async def run_live_telegram_evidence_lane(
                 voice_elapsed = 0.0
         finally:
             set_stage_observer(None)
+            if canary_server_poll_task is not None:
+                canary_server_poll_task.cancel()
+                try:
+                    await canary_server_poll_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown only
+                    pass
             if attempt_observer is not None:
                 try:
                     await attempt_observer.stop(flush_reason="lane-finish")

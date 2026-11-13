@@ -35,7 +35,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aa.opencode.server_events import OpenCodeServerEventProbe
 from aa.qualification.live_partial_evidence import (
@@ -54,6 +54,10 @@ from aa.qualification.live_watchdog import (
 
 SCHEMA_GATE_C_CANARY_RESULT = "aa-gate-c-canary-result/1"
 SCHEMA_OBSERVER_SELF_TEST = "aa-gate-c-canary-observer-self-test/1"
+
+# Pinned server SSE surfaces: the documented ``/event`` route and the
+# equivalent global stream. A canary is compatible with either.
+SSE_ROUTES: tuple[str, ...] = ("/event", "/global/event")
 
 STATUS_READY = "READY"
 STATUS_BLOCKED = "BLOCKED"
@@ -284,8 +288,66 @@ async def _wait_for_attempt(client: Any, *, state: str, timeout_s: float) -> dic
     return last
 
 
-def _privacy_scan(paths: Sequence[Path], markers: Sequence[str]) -> tuple[bool, str]:
-    """Scan only the artifacts owned by the self-test.
+_SECRET_ENV_NAMES: tuple[str, ...] = (
+    "AA_BOOK_AGE_IDENTITY",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_API_TOKEN",
+    "OPENCODE_SERVER_PASSWORD",
+)
+
+
+def privacy_markers() -> tuple[str, ...]:
+    """Fixed sentinels, scenario prompts and live secret values to scan for.
+
+    Prompt fragments and credentials must never cross into canary artifacts
+    or stdout. The fixed scenario prompts are public qualification inputs but
+    still must not be echoed as evidence. Environment secrets are included
+    only when set and long enough to be unambiguous.
+    """
+    markers: list[str] = list(SELF_TEST_FORBIDDEN_MARKERS)
+    try:
+        from aa.qualification.product_contract_live import (
+            GATE_C_CORE_SCENARIOS,
+            GATE_C_HELD_OUT_SCENARIOS,
+        )
+
+        markers.extend(
+            prompt
+            for _, _, prompt in (*GATE_C_CORE_SCENARIOS, *GATE_C_HELD_OUT_SCENARIOS)
+            if prompt
+        )
+    except Exception:  # noqa: BLE001 - privacy scanning stays best-effort here
+        pass
+    for name in _SECRET_ENV_NAMES:
+        value = os.environ.get(name, "").strip()
+        if len(value) >= 8:
+            markers.append(value)
+    return tuple(dict.fromkeys(markers))
+
+
+def find_privacy_marker(value: Any, markers: Sequence[str]) -> str:
+    """Return the first marker found in any key/value of ``value``."""
+    for marker in markers:
+        if not marker:
+            continue
+        if isinstance(value, str):
+            if marker in value:
+                return marker
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                if marker in str(key) or find_privacy_marker(item, (marker,)):
+                    return marker
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if find_privacy_marker(item, (marker,)):
+                    return marker
+        elif value is not None and marker in str(value):
+            return marker
+    return ""
+
+
+def privacy_scan(paths: Sequence[Path], markers: Sequence[str]) -> tuple[bool, str]:
+    """Scan only the artifacts owned by the canary.
 
     The shared qualification output directory also contains downloaded A/B
     evidence in a full campaign. Scanning unrelated files there would make
@@ -311,12 +373,56 @@ def _privacy_scan(paths: Sequence[Path], markers: Sequence[str]) -> tuple[bool, 
     return True, ""
 
 
+def _sanitize_privacy(value: Any, markers: Sequence[str]) -> Any:
+    """Recursively replace any marker-bearing string with a fixed redaction."""
+    if isinstance(value, str):
+        return "redacted" if find_privacy_marker(value, markers) else value
+    if isinstance(value, Mapping):
+        return {
+            _sanitize_privacy(key, markers): _sanitize_privacy(item, markers)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_privacy(item, markers) for item in value]
+    return value
+
+
+# Backwards-compatible private alias for the self-test call site.
+_privacy_scan = privacy_scan
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def server_sse_route_observed(evidence: Mapping[str, Any] | None) -> bool:
+    """Whether either supported SSE route was observed on the pinned server."""
+    if not isinstance(evidence, Mapping):
+        return False
+    endpoints = evidence.get("endpoints")
+    if not isinstance(endpoints, Mapping):
+        return False
+    for route in SSE_ROUTES:
+        facts = endpoints.get(route)
+        if not isinstance(facts, Mapping):
+            continue
+        try:
+            if int(facts.get("event-stream-status", 0) or 0) != 200:
+                continue
+            if int(facts.get("event-stream-streamed", 0) or 0) != 1:
+                continue
+            if int(facts.get("event-stream-http-error", 0) or 0) > 0:
+                continue
+            if int(facts.get("event-stream-error", 0) or 0) > 0:
+                continue
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 async def run_observer_self_test(
@@ -375,15 +481,7 @@ async def run_observer_self_test(
                 )
                 > 0
             ),
-            "sse_observed": bool(
-                int(
-                    (evidence.get("endpoints", {}).get("/event", {}) or {}).get(
-                        "event-stream-status", 0
-                    )
-                    or 0
-                )
-                == 200
-            ),
+            "sse_observed": server_sse_route_observed(evidence),
             "server_error_kind": str(evidence.get("server_error_kind", "")),
             "server_error_status_code": evidence.get("server_error_status_code"),
         }
@@ -618,7 +716,7 @@ async def run_observer_self_test(
         check("no-orphan-client-worker", bool(client.quiescence_proven(SELF_TEST_CAUSALITY)))
         privacy_ok, _privacy_path = _privacy_scan(
             [observer_dir, out / "self-test-progress.json"],
-            SELF_TEST_FORBIDDEN_MARKERS,
+            privacy_markers(),
         )
         check("privacy-safe-artifacts", privacy_ok)
     except Exception as exc:  # noqa: BLE001 - report a typed self-test failure
@@ -716,17 +814,35 @@ async def run_bounded_real_path(lane_runner: Any, *, budget_s: float) -> Any:
     try:
         result = await asyncio.wait_for(lane_runner(), timeout=bounded)
     except TimeoutError:
+        metrics: dict[str, Any] = {
+            "canary": True,
+            "real_turns": 0,
+            "scenario_diagnostics": [],
+            "budget_expiration_category": "campaign-budget",
+            "timeout_reason": "campaign-budget",
+        }
+        # The live lane persists durable partial evidence through the
+        # watchdog marker before the external budget can cancel it. Preserve
+        # that in-flight attempt/stage evidence in the INCONCLUSIVE result
+        # instead of reporting a fabricated zero.
+        progress_path = os.environ.get(ENV_PROGRESS_PATH, "").strip()
+        partial = validated_partial_evidence(
+            read_live_progress(Path(progress_path) if progress_path else None)
+        )
+        if partial is not None:
+            metrics["partial_evidence"] = partial
+            metrics["attempt_audit"] = list(partial.get("attempt_audit", []))
+            counts = partial.get("attempt_counts")
+            if isinstance(counts, Mapping):
+                try:
+                    metrics["attempt_in_flight_count"] = int(counts.get("in_flight", 0) or 0)
+                except (TypeError, ValueError):
+                    metrics["attempt_in_flight_count"] = 0
         return LaneResult(
             lane="gate-c-canary-real-path",
             status="INCOMPLETE",
             incomplete=("canary-budget-expired",),
-            metrics={
-                "canary": True,
-                "real_turns": 0,
-                "scenario_diagnostics": [],
-                "budget_expiration_category": "campaign-budget",
-                "timeout_reason": "campaign-budget",
-            },
+            metrics=metrics,
         )
     if not isinstance(result, LaneResult):
         return result
@@ -874,16 +990,9 @@ def server_endpoints_compatible(evidence: Mapping[str, Any] | None) -> bool:
             return False
         if int(session.get("unknown-state", 0) or 0) > 0:
             return False
-        event = endpoints.get("/event")
-        if not isinstance(event, Mapping):
+        if not server_sse_route_observed(evidence):
             return False
-        if int(event.get("event-stream-status", 0) or 0) != 200:
-            return False
-        if int(event.get("event-stream-streamed", 0) or 0) != 1:
-            return False
-        if int(event.get("event-stream-http-error", 0) or 0) > 0:
-            return False
-        return int(event.get("event-stream-error", 0) or 0) == 0
+        return True
     except (TypeError, ValueError):
         return False
 
@@ -994,7 +1103,7 @@ def evaluate_canary(
     supported pinned-server telemetry, at least one real turn, observed
     attempt+stage evidence and no typed real-path failure or budget expiry.
     """
-    del preflight_budget_s, live_budget_s, elapsed_s
+    del live_budget_s
     checks = self_test.get("checks")
     if not isinstance(checks, Mapping) or not checks:
         return CanaryDecision(
@@ -1033,12 +1142,32 @@ def evaluate_canary(
             "observer_self_test.no_orphan",
             "self-test left observer/server/client work alive",
         )
+    try:
+        preflight_limit = float(preflight_budget_s)
+        preflight_elapsed = float(elapsed_s)
+    except (TypeError, ValueError):
+        preflight_limit = 0.0
+        preflight_elapsed = 0.0
+    if preflight_limit > 0 and preflight_elapsed > preflight_limit:
+        return CanaryDecision(
+            STATUS_INCONCLUSIVE,
+            CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED,
+            "budget.preflight_budget_s",
+            "preflight budget expired before a terminal canary decision",
+        )
     if not isinstance(real_path, Mapping):
         return CanaryDecision(
             STATUS_BLOCKED,
             CATEGORY_REAL_PATH_NOT_EXECUTED,
             "real_path",
             "no real-path canary report",
+        )
+    if find_privacy_marker(real_path, privacy_markers()):
+        return CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_PRIVACY_VIOLATION,
+            "real_path.privacy",
+            "real-path canary evidence contained a prompt or credential marker",
         )
     # Budget expiry is checked before coverage: an unresponsive HTTP path is
     # an external non-completion, not a diagnostic/product failure. The
@@ -1259,7 +1388,11 @@ def build_canary_result(
     }
     if extra:
         result.update({str(key): value for key, value in extra.items()})
-    return result
+    # The finalized artifact is itself an externally uploaded file. Apply the
+    # same fixed-marker redaction to every projection (including diagnostics
+    # supplied by a caller or a mocked lane) so a leak can never be persisted
+    # even when the decision was already downgraded to a privacy BLOCK.
+    return cast("dict[str, Any]", _sanitize_privacy(result, privacy_markers()))
 
 
 __all__ = [
@@ -1284,6 +1417,7 @@ __all__ = [
     "NOMINAL_SNAPSHOT_DELAYS_S",
     "SCHEMA_GATE_C_CANARY_RESULT",
     "SCHEMA_OBSERVER_SELF_TEST",
+    "SSE_ROUTES",
     "STATUS_BLOCKED",
     "STATUS_FAIL",
     "STATUS_INCONCLUSIVE",
@@ -1292,7 +1426,11 @@ __all__ = [
     "build_canary_result",
     "build_real_path_report",
     "evaluate_canary",
+    "find_privacy_marker",
+    "privacy_markers",
+    "privacy_scan",
     "run_bounded_real_path",
     "run_observer_self_test",
     "server_endpoints_compatible",
+    "server_sse_route_observed",
 ]

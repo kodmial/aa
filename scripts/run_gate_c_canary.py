@@ -33,6 +33,7 @@ from aa.qualification.gate_c_canary import (  # noqa: E402
     CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED,
     CATEGORY_OPENCODE_UNAVAILABLE,
     CATEGORY_PRECONDITION_FAILED,
+    CATEGORY_PRIVACY_VIOLATION,
     CATEGORY_REAL_PATH_INCOMPLETE,
     CATEGORY_SELF_TEST_FAILED,
     DEFAULT_LIVE_BUDGET_S,
@@ -45,6 +46,8 @@ from aa.qualification.gate_c_canary import (  # noqa: E402
     build_canary_result,
     build_real_path_report,
     evaluate_canary,
+    privacy_markers,
+    privacy_scan,
     run_bounded_real_path,
     run_observer_self_test,
 )
@@ -140,6 +143,29 @@ def _finish(
     extra: dict[str, Any] | None = None,
 ) -> int:
     elapsed = max(0.0, time.monotonic() - started)
+    # Final defense in depth: the canary-owned artifacts are about to be
+    # uploaded. Re-scan them for prompt fragments, artificial secrets, auth
+    # headers and raw SSE text; any hit downgrades the whole preflight to a
+    # typed privacy BLOCK before the result is persisted.
+    privacy_ok, leaked_name = privacy_scan(
+        [
+            out_dir / SELF_TEST_NAME,
+            out_dir / "self-test-progress.json",
+            out_dir / "attempt-observer",
+            out_dir / PROGRESS_NAME,
+            out_dir / "canary-attempt-observer",
+        ],
+        privacy_markers(),
+    )
+    if not privacy_ok:
+        self_test = dict(self_test)
+        self_test["privacy_safe"] = False
+        decision = CanaryDecision(
+            STATUS_BLOCKED,
+            CATEGORY_PRIVACY_VIOLATION,
+            "artifacts",
+            f"privacy scan found a marker in {str(leaked_name)[:96]}",
+        )
     result = build_canary_result(
         main_sha=main_sha,
         run_id=run_id,

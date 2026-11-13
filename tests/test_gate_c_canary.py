@@ -20,6 +20,7 @@ from aa.qualification.gate_c_canary import (
     CATEGORY_READY,
     CATEGORY_REAL_PATH_TYPED_FAILURE,
     CATEGORY_UNSUPPORTED_SERVER,
+    SELF_TEST_PROMPT_SENTINEL,
     STATUS_BLOCKED,
     STATUS_FAIL,
     STATUS_INCONCLUSIVE,
@@ -27,10 +28,15 @@ from aa.qualification.gate_c_canary import (
     build_canary_result,
     build_real_path_report,
     evaluate_canary,
+    find_privacy_marker,
+    privacy_markers,
     run_bounded_real_path,
     run_observer_self_test,
     server_endpoints_compatible,
+    server_sse_route_observed,
 )
+from aa.qualification.live_partial_evidence import build_partial_evidence_snapshot
+from aa.qualification.live_watchdog import ENV_PROGRESS_PATH
 from aa.qualification.product_contract_live import LaneResult
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -699,3 +705,376 @@ def test_attempt_ledger_supplies_typed_cause_and_bounded_model_evidence() -> Non
     assert _canary_infrastructure_failure("live-book-grounding-meta-capability-1") is False
     assert _canary_infrastructure_failure("live-answer-relevance-meta-capability-1") is False
     assert _canary_infrastructure_failure("live-meta-direct-1") is False
+
+
+def test_elapsed_preflight_budget_is_typed_inconclusive() -> None:
+    decision = evaluate_canary(
+        self_test={
+            "schema_version": "aa-gate-c-canary-observer-self-test/1",
+            "status": "PASS",
+            "checks": {"server-telemetry-supported": True},
+            "failed_checks": [],
+            "server_telemetry": {"state": "supported"},
+            "privacy_safe": True,
+            "no_orphan": True,
+        },
+        real_path=_real_path(),
+        preflight_budget_s=600.0,
+        live_budget_s=300.0,
+        elapsed_s=601.0,
+    )
+    assert decision.status == STATUS_INCONCLUSIVE
+    assert decision.category == CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED
+    assert decision.missing_field == "budget.preflight_budget_s"
+    assert decision.detail
+
+
+def test_global_event_route_satisfies_canary_server_compatibility() -> None:
+    evidence = {
+        "state": "supported",
+        "endpoints": {
+            "/doc": {"state": "supported", "http_status": 200},
+            "/session/status": {"session-status": 0, "unknown-state": 0},
+            "/global/event": {
+                "event-stream-status": 200,
+                "event-stream-streamed": 1,
+                "event-stream-quiet": 1,
+            },
+        },
+    }
+    assert server_sse_route_observed(evidence) is True
+    assert server_endpoints_compatible(evidence) is True
+
+
+def test_real_path_prompt_or_secret_marker_blocks_and_is_redacted() -> None:
+    self_test = {
+        "schema_version": "aa-gate-c-canary-observer-self-test/1",
+        "status": "PASS",
+        "checks": {"server-telemetry-supported": True},
+        "failed_checks": [],
+        "server_telemetry": {"state": "supported"},
+        "privacy_safe": True,
+        "no_orphan": True,
+    }
+    leaked = _real_path(
+        scenario_diagnostics=[
+            {
+                "scenario_index": 1,
+                "family": "meta-capability",
+                "delivery_status": "delivered",
+                "product_outcome": "answered",
+                "failure_reason": SELF_TEST_PROMPT_SENTINEL,
+            }
+        ]
+    )
+    assert find_privacy_marker(leaked, privacy_markers()) == SELF_TEST_PROMPT_SENTINEL
+    decision = _decision(self_test, leaked)
+    assert decision.status == STATUS_BLOCKED
+    assert decision.category == CATEGORY_PRIVACY_VIOLATION
+    assert decision.missing_field == "real_path.privacy"
+
+    result = build_canary_result(
+        main_sha="a" * 40,
+        run_id="123",
+        self_test=self_test,
+        real_path=leaked,
+        decision=decision,
+        preflight_budget_s=600.0,
+        live_budget_s=300.0,
+        elapsed_s=3.0,
+        privacy_safe_paths=["gate-c-canary-result.json"],
+    )
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert SELF_TEST_PROMPT_SENTINEL not in serialized
+    assert "redacted" in serialized
+    assert result["status"] == STATUS_BLOCKED
+
+
+def _load_canary_script() -> Any:
+    import importlib.util
+    import sys
+
+    path = ROOT / "scripts" / "run_gate_c_canary.py"
+    name = "aa_run_gate_c_canary_test"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _self_test_pass() -> dict[str, Any]:
+    return {
+        "schema_version": "aa-gate-c-canary-observer-self-test/1",
+        "status": "PASS",
+        "checks": {"server-telemetry-supported": True},
+        "failed_checks": [],
+        "server_telemetry": {"state": "supported"},
+        "privacy_safe": True,
+        "no_orphan": True,
+        "partial_evidence_coverage": {"runtime_process_state": "observed"},
+    }
+
+
+def _lane_ready() -> LaneResult:
+    return LaneResult(
+        lane="gate-c-canary-real-path",
+        status="PASS",
+        metrics={
+            "real_turns": 1,
+            "scenario_diagnostics": [
+                {
+                    "scenario_index": 1,
+                    "family": "meta-capability",
+                    "delivery_timeout": False,
+                    "delivery_status": "delivered",
+                    "product_outcome": "answer_success",
+                    "failure_reason": "",
+                }
+            ],
+            "attempt_audit": [
+                {
+                    "attempt_id": "a" * 32,
+                    "operation": "message-text",
+                    "state": "completed",
+                    "stage": "answer",
+                }
+            ],
+            "partial_evidence": {
+                "coverage": {
+                    "client_attempt_ledger": "observed",
+                    "stage_telemetry": "observed",
+                    "server_events": "observed",
+                    "served_model_audit": "observed",
+                    "runtime_process_state": "observed",
+                }
+            },
+            "server_evidence": {
+                "state": "supported",
+                "endpoints": {
+                    "/doc": {"state": "supported", "http_status": 200},
+                    "/session/status": {"session-status": 1, "unknown-state": 0},
+                    "/global/event": {
+                        "event-stream-status": 200,
+                        "event-stream-streamed": 1,
+                        "event-stream-quiet": 1,
+                    },
+                },
+                "last_session_state": "busy",
+            },
+        },
+    )
+
+
+def _patch_canary_preconditions(module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "checked_out_sha", lambda root: "a" * 40)
+    monkeypatch.setattr(module, "working_tree_clean", lambda root: True)
+    monkeypatch.setattr(module, "_pinned_opencode_version", lambda: "1.2.3")
+    monkeypatch.setattr(module, "_installed_opencode_version", lambda: "opencode 1.2.3")
+
+
+def test_canary_cli_ready_is_not_qualification_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_canary_script()
+    _patch_canary_preconditions(module, monkeypatch)
+
+    async def _self_test(out_dir: Path | str) -> dict[str, Any]:
+        return _self_test_pass()
+
+    async def _lane(**kwargs: Any) -> LaneResult:
+        return _lane_ready()
+
+    monkeypatch.setattr(module, "run_observer_self_test", _self_test)
+    monkeypatch.setattr(module, "run_live_telegram_evidence_lane", _lane)
+
+    exit_code = module.main(["--main-sha", "a" * 40, "--out-dir", str(tmp_path), "--run-id", "42"])
+    assert exit_code == 0
+    result = json.loads((tmp_path / "gate-c-canary-result.json").read_text())
+    assert result["status"] == STATUS_READY
+    assert result["ready"] is True
+    assert result["product_qualified"] is False
+    assert result["qualification_evidence"] is False
+    assert result["gate_scenarios_executed"] == 0
+    assert result["stage_attempt_evidence_coverage"]["client_attempt_ledger"] == "observed"
+
+
+def test_canary_cli_blocks_before_real_path_when_self_test_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_canary_script()
+    _patch_canary_preconditions(module, monkeypatch)
+    lane_called = False
+
+    async def _self_test(out_dir: Path | str) -> dict[str, Any]:
+        return {
+            **_self_test_pass(),
+            "status": "FAIL",
+            "failed_checks": ["attempt-start-observed"],
+        }
+
+    async def _lane(**kwargs: Any) -> LaneResult:
+        nonlocal lane_called
+        lane_called = True
+        return _lane_ready()
+
+    monkeypatch.setattr(module, "run_observer_self_test", _self_test)
+    monkeypatch.setattr(module, "run_live_telegram_evidence_lane", _lane)
+
+    exit_code = module.main(["--main-sha", "a" * 40, "--out-dir", str(tmp_path), "--run-id", "42"])
+    assert exit_code == 2
+    assert lane_called is False
+    result = json.loads((tmp_path / "gate-c-canary-result.json").read_text())
+    assert result["status"] == STATUS_BLOCKED
+    assert result["real_path"]["status"] == "not-executed"
+    assert result["product_qualified"] is False
+
+
+def test_canary_cli_bounded_timeout_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_canary_script()
+    _patch_canary_preconditions(module, monkeypatch)
+
+    async def _self_test(out_dir: Path | str) -> dict[str, Any]:
+        return _self_test_pass()
+
+    async def _lane(**kwargs: Any) -> LaneResult:
+        return LaneResult(
+            lane="gate-c-canary-real-path",
+            status="INCOMPLETE",
+            incomplete=("canary-budget-expired",),
+            metrics={
+                "canary": True,
+                "real_turns": 0,
+                "scenario_diagnostics": [],
+                "budget_expiration_category": "campaign-budget",
+                "timeout_reason": "campaign-budget",
+            },
+        )
+
+    monkeypatch.setattr(module, "run_observer_self_test", _self_test)
+    monkeypatch.setattr(module, "run_live_telegram_evidence_lane", _lane)
+
+    exit_code = module.main(["--main-sha", "a" * 40, "--out-dir", str(tmp_path), "--run-id", "42"])
+    assert exit_code == 3
+    result = json.loads((tmp_path / "gate-c-canary-result.json").read_text())
+    assert result["status"] == STATUS_INCONCLUSIVE
+    assert result["budget"]["category"] == "campaign-budget"
+    assert result["budget"]["expired"] is True
+    assert result["product_qualified"] is False
+
+
+def test_canary_cli_provider_429_requires_fresh_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aa.opencode.errors import OpenCodeRateLimitError
+
+    module = _load_canary_script()
+    _patch_canary_preconditions(module, monkeypatch)
+
+    async def _self_test(out_dir: Path | str) -> dict[str, Any]:
+        return _self_test_pass()
+
+    async def _lane(**kwargs: Any) -> LaneResult:
+        raise OpenCodeRateLimitError("provider rate limit")
+
+    monkeypatch.setattr(module, "run_observer_self_test", _self_test)
+    monkeypatch.setattr(module, "run_live_telegram_evidence_lane", _lane)
+
+    exit_code = module.main(["--main-sha", "a" * 40, "--out-dir", str(tmp_path), "--run-id", "42"])
+    assert exit_code == 75
+    assert (tmp_path / "restart-required.json").is_file()
+    result = json.loads((tmp_path / "gate-c-canary-result.json").read_text())
+    assert result["status"] == STATUS_INCONCLUSIVE
+    assert result["product_qualified"] is False
+
+
+def test_canary_cli_final_artifact_privacy_scan_blocks_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_canary_script()
+    _patch_canary_preconditions(module, monkeypatch)
+
+    async def _self_test(out_dir: Path | str) -> dict[str, Any]:
+        leak_dir = Path(out_dir) / "attempt-observer"
+        leak_dir.mkdir(parents=True, exist_ok=True)
+        (leak_dir / "leak.txt").write_text(SELF_TEST_PROMPT_SENTINEL, encoding="utf-8")
+        return _self_test_pass()
+
+    async def _lane(**kwargs: Any) -> LaneResult:
+        return _lane_ready()
+
+    monkeypatch.setattr(module, "run_observer_self_test", _self_test)
+    monkeypatch.setattr(module, "run_live_telegram_evidence_lane", _lane)
+
+    exit_code = module.main(["--main-sha", "a" * 40, "--out-dir", str(tmp_path), "--run-id", "42"])
+    assert exit_code == 2
+    result = json.loads((tmp_path / "gate-c-canary-result.json").read_text())
+    assert result["status"] == STATUS_BLOCKED
+    assert result["category"] == CATEGORY_PRIVACY_VIOLATION
+    assert result["missing_field"] == "artifacts"
+    assert result["observer_self_test"]["privacy_safe"] is False
+    assert SELF_TEST_PROMPT_SENTINEL not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_bounded_timeout_preserves_persisted_in_flight_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial = build_partial_evidence_snapshot(
+        phase="canary-first-turn",
+        causality_id="c" * 32,
+        attempt_entries=[
+            {
+                "attempt_id": "a" * 32,
+                "operation": "message-text",
+                "state": "in-flight",
+                "stage": "answer",
+            }
+        ],
+    )
+    progress_path = tmp_path / "canary-progress.json"
+    progress_path.write_text(json.dumps({"partial_evidence": partial}), encoding="utf-8")
+    monkeypatch.setenv(ENV_PROGRESS_PATH, str(progress_path))
+
+    server = _HangingHttpServer()
+    client = HttpOpenCodeClient(server.base_url, request_timeout=30)
+
+    async def hung_request() -> Any:
+        return await client._call("GET", "/session/status")
+
+    try:
+        lane_result = await run_bounded_real_path(hung_request, budget_s=0.05)
+    finally:
+        server.stop()
+        await asyncio.sleep(0.5)
+
+    assert lane_result.status == "INCOMPLETE"
+    report = build_real_path_report(lane_result)
+    assert report["in_flight_attempt_preserved"] is True
+    assert report["attempt_in_flight_count"] == 1
+    assert report["budget_expiration_category"] == "campaign-budget"
+    decision = _decision(
+        {
+            "schema_version": "aa-gate-c-canary-observer-self-test/1",
+            "status": "PASS",
+            "checks": {"server-telemetry-supported": True},
+            "failed_checks": [],
+            "server_telemetry": {"state": "supported"},
+            "privacy_safe": True,
+            "no_orphan": True,
+        },
+        report,
+    )
+    assert decision.status == STATUS_INCONCLUSIVE
+    assert decision.category == CATEGORY_EXTERNAL_PROGRESS_UNOBSERVED

@@ -71,18 +71,30 @@ class _FakeOpenCodeHandler(http.server.BaseHTTPRequestHandler):
                 return
             # Streaming surface: write the bounded window then close so the
             # probe's fixed-size read returns at EOF.
-            payload = self._state.get("events")
+            payload = (
+                None if bool(self._state.get("global_event_only")) else self._state.get("events")
+            )
             if payload is None:
                 self._send_json(404, {"error": "not found"})
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            for frame in str(payload).splitlines():
-                if frame:
-                    self.wfile.write((frame + "\n").encode("utf-8"))
+            self._send_event_stream(payload)
+        elif self.path == "/global/event":
+            # The same events wrapped in the server's global envelope.
+            payload = self._state.get("global_events")
+            if payload is None:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._send_event_stream(payload)
         else:
             self._send_json(404, {"error": "unknown"})
+
+    def _send_event_stream(self, payload: object) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for frame in str(payload).splitlines():
+            if frame:
+                self.wfile.write((frame + "\n").encode("utf-8"))
 
 
 class _FakeServer(http.server.ThreadingHTTPServer):
@@ -283,6 +295,64 @@ def test_sse_error_event_is_provider_confirmed_and_text_free() -> None:
 
         partial = build_partial_evidence_snapshot(phase="heartbeat", server_evidence=evidence)
         assert partial["source_types"]["server_events"] == "provider-response-confirmed"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_global_event_route_is_a_supported_fallback() -> None:
+    """A server exposing only /global/event is still observed compatibly."""
+    frames = "\n".join(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "payload": {
+                        "type": "session.status",
+                        "properties": {"status": {"type": "busy"}, "sessionID": SECRET},
+                    }
+                }
+            ),
+            "data: "
+            + json.dumps(
+                {
+                    "payload": {
+                        "type": "session.error",
+                        "properties": {
+                            "error": {
+                                "name": "APIError",
+                                "data": {"statusCode": 503, "isRetryable": True},
+                                "message": SECRET,
+                            },
+                            "sessionID": SECRET,
+                        },
+                    }
+                }
+            ),
+        ]
+    )
+    server = _mk_server(
+        {
+            "session_status": {},
+            "global_event_only": True,
+            "global_events": frames,
+        }
+    )
+    try:
+        probe = _probe_for(server)
+        evidence = _run(probe.snapshot())
+        assert evidence["state"] == "supported"
+        assert evidence["last_session_state"] == "busy"
+        assert evidence["server_error_kind"] == "APIError"
+        assert evidence["server_error_status_code"] == 503
+        endpoints = cast(dict[str, object], evidence["endpoints"])
+        # The primary route was actually absent, not reported as a stream.
+        primary = cast(dict[str, int], endpoints["/event"])
+        assert primary.get("event-stream-http-error") == 404
+        global_facts = cast(dict[str, int], endpoints["/global/event"])
+        assert global_facts.get("event-stream-status") == 200
+        assert global_facts.get("event-stream-streamed") == 1
+        assert SECRET not in json.dumps(evidence)
     finally:
         server.shutdown()
         server.server_close()

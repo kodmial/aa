@@ -14,7 +14,9 @@ Probed against the pinned version ``1.19.3`` (docker/opencode.version):
 - ``GET /event`` — bounded passive read of the SSE stream, extracting only
   the ``session.status`` / ``session.error`` event types, the fixed error
   names of the documented error union and numeric ``statusCode`` /
-  ``isRetryable`` fields.
+  ``isRetryable`` fields. When the pinned server exposes only
+  ``GET /global/event`` (or ``/event`` is absent), the same bounded reader
+  transparently falls back to that wrapped SSE surface.
 
 Everything else is deliberately dropped: session ids stay in memory (or
 never leave the parsed payload at all), event payload text, provider error
@@ -230,22 +232,15 @@ class OpenCodeServerEventProbe:
             return payload
         return self.session_status_probe_payload(facts)
 
-    def _read_sse_window(self) -> dict[str, int]:
-        """Read a bounded window of the SSE event stream.
-
-        Only closed-vocabulary facts are extracted: the documented event
-        type tokens, the error union name (fixed vocabulary), the numeric
-        ``statusCode`` and the boolean ``isRetryable``. Raw payload text,
-        messages and ids are discarded. Retained facts survive only in
-        this probe's bounded counters.
-        """
+    def _read_sse_route(self, route: str) -> dict[str, int]:
+        """Read a bounded window of one SSE route (``/event`` or global)."""
         facts: dict[str, int] = {}
         response: Any = None
         read_state = ""
         try:
             response = urllib.request.urlopen(
                 urllib.request.Request(
-                    f"{self._base_url}/event",
+                    f"{self._base_url}{route}",
                     headers={"Accept": "text/event-stream"},
                 ),
                 timeout=self._timeout_s,
@@ -281,6 +276,45 @@ class OpenCodeServerEventProbe:
             facts["event-stream-error"] = 1
         return facts
 
+    @staticmethod
+    def _sse_route_usable(facts: dict[str, int]) -> bool:
+        """Whether one route produced the documented streamed SSE surface."""
+        return (
+            int(facts.get("event-stream-status", 0) or 0) == 200
+            and int(facts.get("event-stream-streamed", 0) or 0) == 1
+            and int(facts.get("event-stream-error", 0) or 0) == 0
+        )
+
+    def _read_sse_window_with_route(self) -> tuple[dict[str, int], str, dict[str, int]]:
+        """Read SSE, falling back to the server's global event route.
+
+        Returns ``(used_facts, used_route, primary_facts)``. The pinned
+        server may expose ``/event``, the wrapped ``/global/event`` surface,
+        or both. Route availability is never fabricated: the used facts stay
+        the actual status/content-type/read outcome of the route that
+        answered, and the primary attempt facts are retained for the
+        evidence report.
+        """
+        primary = self._read_sse_route("/event")
+        if self._sse_route_usable(primary):
+            return primary, "/event", primary
+        global_facts = self._read_sse_route("/global/event")
+        if self._sse_route_usable(global_facts):
+            return global_facts, "/global/event", primary
+        return primary, "/event", primary
+
+    def _read_sse_window(self) -> dict[str, int]:
+        """Read a bounded window of the SSE event stream.
+
+        Only closed-vocabulary facts are extracted: the documented event
+        type tokens, the error union name (fixed vocabulary), the numeric
+        ``statusCode`` and the boolean ``isRetryable``. Raw payload text,
+        messages and ids are discarded. Retained facts survive only in
+        this probe's bounded counters.
+        """
+        facts, _route, _primary = self._read_sse_window_with_route()
+        return facts
+
     def _consume_sse_frames(self, stream: Any) -> str:
         """Parse one bounded read window of SSE ``data:`` frames.
 
@@ -305,6 +339,12 @@ class OpenCodeServerEventProbe:
                 continue
             if not isinstance(payload, dict):
                 continue
+            # ``/global/event`` wraps the same event object in a ``payload``
+            # envelope. Unwrap it without retaining anything from the
+            # wrapper; the closed-vocabulary extraction below is unchanged.
+            wrapped = payload.get("payload")
+            if isinstance(wrapped, dict):
+                payload = wrapped
             event_type = str(payload.get("type", ""))[:48]
             if event_type in SESSION_EVENT_VOCAB:
                 self._event_type_counts[event_type] = self._event_type_counts.get(event_type, 0) + 1
@@ -358,7 +398,7 @@ class OpenCodeServerEventProbe:
         doc_state, doc_status = self._read_doc()
         self._doc_state = doc_state
         session_facts = self._read_session_status()
-        sse_facts = self._read_sse_window()
+        sse_facts, sse_route, primary_sse_facts = self._read_sse_window_with_route()
         # Fail-closed state resolution: supported only with the documented
         # OpenAPI surface; a connection-level failure (no HTTP answer) is
         # ``disconnected``; everything else is an unsupported shape, never
@@ -386,7 +426,17 @@ class OpenCodeServerEventProbe:
             "endpoints": {
                 "/doc": {"http_status": int(doc_status), "state": doc_state},
                 "/session/status": {str(k)[:48]: int(v) for k, v in session_facts.items()},
-                "/event": {str(k)[:48]: int(v) for k, v in sse_facts.items()},
+                "/event": {
+                    str(k)[:48]: int(v)
+                    for k, v in (
+                        primary_sse_facts if sse_route == "/global/event" else sse_facts
+                    ).items()
+                },
+                **(
+                    {"/global/event": {str(k)[:48]: int(v) for k, v in sse_facts.items()}}
+                    if sse_route == "/global/event"
+                    else {}
+                ),
             },
             "session_state_counts": {
                 **{
