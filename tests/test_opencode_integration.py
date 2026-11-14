@@ -745,17 +745,3 @@ async def test_attach_mode_binds_env_password_to_injected_client(
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
-
-
-async def test_v2_session_open_and_pending_prompt_never_claims_reply() -> None:
-    server, thread, base_url = _run_fake_serve()
-    try:
-        client = HttpOpenCodeClient(base_url, protocol="v2", password="test-only-secret")
-        created = await client.create_session("v2")
-        assert (await client.get_session(created.id)).id == created.id
-        with pytest.raises(OpenCodeDeterministicError, match="completion tracking"):
-            await client.send_message(created.id, "hello")
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)

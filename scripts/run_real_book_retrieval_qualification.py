@@ -285,19 +285,22 @@ def _oracle_regions(oracle_by_case: dict[str, dict[str, Any]]) -> dict[str, set[
 async def _plan_with_production_adapter(
     utterance: str,
     *,
+    client: Any,
     primary_model: str,
     fallback_model: str,
     recent_user_turns: tuple[str, ...] = (),
 ) -> list[str]:
-    """Invoke the real mandatory planner via the production adapter/profile."""
+    """Invoke the real mandatory planner via the production adapter/profile.
+
+    ``client`` is the runtime's own v2-authenticated HTTP client. Building a
+    fresh default client here would silently fall back to the removed v1
+    routes and bypass the managed ``OPENCODE_PASSWORD``.
+    """
     from langchain_core.messages import HumanMessage
 
     from aa.conversation.model_adapter import PLANNER_AGENT_V2, OpenCodeChatModel
     from aa.conversation.planner_node import query_plan_json_schema, run_planner
-    from aa.opencode.client import HttpOpenCodeClient
 
-    base_url = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
-    client = HttpOpenCodeClient(base_url)
     health = await client.health()
     if not health.healthy:
         raise RealBookRetrievalError("opencode runtime is not healthy")
@@ -606,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
                 queries = asyncio.run(
                     _plan_with_production_adapter(
                         utterance,
+                        client=runtime.client,
                         primary_model=primary_model,
                         fallback_model=fallback_model,
                         recent_user_turns=recent_user_turns,

@@ -325,7 +325,7 @@ async def quiesce_and_abort_stalled_turn(
        scenario's wait;
     2. cancel the per-chat dispatcher worker and drain its queue, awaiting
        shutdown for ``grace_s`` (the OpenCode client issues a best-effort
-       ``POST /session/{id}/abort`` on cancellation);
+       native session interrupt on cancellation);
     3. when the turn is non-cooperative, OR the abandoned turn's HTTP
        attempt is not PROVEN quiesced, retire the runtime via ``restart``
        so no task or worker thread in the process can deliver stale
