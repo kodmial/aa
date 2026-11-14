@@ -85,6 +85,10 @@ def _scheduler_dispatch_body(marker: str) -> str:
     return f"/oc\n\n{marker}\n{SCHEDULER_ORIGIN_MARKER}"
 
 
+def _quote(body: str) -> str:
+    return "\n".join(f"> {line}" for line in body.splitlines())
+
+
 def _evaluate_pause_on_failure(
     *,
     comment_body: str | None,
@@ -104,14 +108,26 @@ def _evaluate_pause_on_failure(
     py = py.replace("inputs.dispatch_marker", "DISPATCH_MARKER")
     py = py.replace("vars.AUTOMATION_DISPATCH_MARKER", "VARS_DISPATCH_MARKER")
     py = py.replace("inputs.pause_on_failure", "PAUSE_ON_FAILURE")
+    py = py.replace("!contains", "not contains")
     py = py.replace("&&", " and ").replace("||", " or ")
 
     def contains(haystack: str, needle: str) -> bool:
         return needle in haystack
 
+    def starts_with(haystack: str, needle: str) -> bool:
+        return haystack.startswith(needle)
+
+    def format_value(template: str, *args: str) -> str:
+        return template.format(*args)
+
     result: Any = eval(  # noqa: S307 - expression text comes from this repository only
         py,
-        {"__builtins__": {}, "contains": contains},
+        {
+            "__builtins__": {},
+            "contains": contains,
+            "format": format_value,
+            "startsWith": starts_with,
+        },
         {
             "COMMENT_BODY": comment_body,
             "COMMENT_USER_LOGIN": comment_user_login,
@@ -203,6 +219,23 @@ def test_opencode_caller_matches_scheduler_pause_policy() -> None:
         )
         == "true"
     )
+    # Quote-replying to a real scheduler dispatch quotes both markers; that is
+    # still a manual command and must not inherit the scheduler's policy.
+    quoted_dispatch = _quote(_scheduler_dispatch_body(scheduler_marker))
+    for comment_body in (
+        f"{quoted_dispatch}\n\n/oc",
+        f"/oc\n\n{_quote(f'{scheduler_marker}\n{SCHEDULER_ORIGIN_MARKER}')}",
+    ):
+        assert (
+            _evaluate_pause_on_failure(
+                comment_body=comment_body,
+                dispatch_marker="",
+                pause_on_failure="",
+                comment_user_login="owner",
+                repository_owner="owner",
+            )
+            == "true"
+        )
     # The public marker alone is not automation identity: a non-owner comment
     # cannot claim the scheduler's non-terminal policy merely by copying it.
     assert (
@@ -388,5 +421,7 @@ def test_opencode_caller_accepts_shared_exact_head_ci_repair_contract() -> None:
     assert "fromJSON(inputs.ci_repair_identity).ci_attempt_id" in run_name
     assert "OpenCode repair PR #{0} [ci-attempt:{1}]" in run_name
     # Keep ordinary repairs and 429 recovery working without CI identity.
-    assert "OpenCode repair PR #{0}" in run_name
+    # Assert the exact plain-repair call, not just its shared prefix (which the
+    # ci-attempt format above already contains).
+    assert "format('OpenCode repair PR #{0}', inputs.pr_number)" in run_name
     assert "OpenCode 429 recovery {0} gen {1}" in run_name

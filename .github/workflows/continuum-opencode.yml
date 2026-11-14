@@ -206,12 +206,20 @@ jobs:
       # repository marker variable, then the upstream default.
       # The public dispatch marker alone is copyable, so a comment only
       # counts as a scheduler dispatch when it is authored by the automation
-      # identity (the scheduler posts through the owner's TAP_PAT) and also
-      # carries the scheduler's own origin marker. A manual `/oc` comment
-      # that quotes the public marker therefore keeps the terminal default.
+      # identity (the scheduler posts through the owner's TAP_PAT), starts as
+      # an unquoted `/oc`, and carries both the dispatch marker and the
+      # scheduler's own origin marker outside a blockquote. A manual `/oc`
+      # comment that quote-replies to a real scheduler dispatch therefore
+      # keeps the terminal default instead of inheriting the non-terminal
+      # scheduler policy.
       pause_on_failure: >-
         ${{ (github.event.comment.user.login == 'github-actions[bot]' ||
         github.event.comment.user.login == github.repository_owner) &&
+        startsWith(github.event.comment.body || '', '/oc') &&
+        !contains(github.event.comment.body || '',
+        format('> {0}', inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')) &&
+        !contains(github.event.comment.body || '',
+        format('> {0}', '<!-- continuum-origin role=continuum component=issue-scheduler -->')) &&
         contains(github.event.comment.body || '',
         inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->') &&
         contains(github.event.comment.body || '',
