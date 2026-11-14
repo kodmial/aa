@@ -14,7 +14,10 @@ OpenCode is the sole LLM boundary. The Telegram worker owns transport and orches
 
 Local OpenCode runtime integration (loopback `opencode serve`, per-chat
 sessions, failure taxonomy, persistence/recovery) is documented in
-[`docs/opencode-runtime.md`](docs/opencode-runtime.md).
+[`docs/opencode-runtime.md`](docs/opencode-runtime.md). Continuum scheduler
+and OpenCode watchdog recovery policy, including the single promoted
+runtime-image/index pins and bounded 429 handling, is documented in
+[`docs/continuum-recovery.md`](docs/continuum-recovery.md).
 
 ## Bounded live runtime
 

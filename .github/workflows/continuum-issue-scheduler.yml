@@ -173,7 +173,11 @@ jobs:
       wip_limit: "${{ inputs.wip_limit || '3' }}"
       lease_minutes: "${{ inputs.lease_minutes }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
-      dispatch_marker: "${{ inputs.dispatch_marker }}"
+      # Make the dispatch-marker fallback explicit so the OpenCode caller's
+      # scheduler-detection contract can be tested against this caller rather
+      # than a duplicated literal. Resolution order matches the engine:
+      # explicit input, repository marker variable, upstream default.
+      dispatch_marker: "${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}"
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
       qualifying_label: "${{ inputs.qualifying_label }}"

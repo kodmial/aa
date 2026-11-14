@@ -8,6 +8,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
+# This published image was built before the OpenCode 2 move: its
+# /opt/aa/provenance.txt reports `opencode=1.19.3` while the repository pin
+# is 2.2.6. It must never be re-promoted, because consumers verify the pin
+# against the CLI baked into the image and would fail closed on every job.
+STALE_OPENCODE_1_RUNTIME_IMAGE = (
+    "ghcr.io/kodmial/aa-runtime@"
+    "sha256:c2d49cfc8f89f2e2caf8463f771fecb6db2a4e26977787867bcb6eb8c4603ffd"
+)
+
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -51,6 +60,13 @@ def test_digest_file_and_runtime_pin_are_immutable_and_consistent() -> None:
         assert digest in workflow
         assert "credentials:" in workflow
         assert "packages: read" in workflow
+
+
+def test_promoted_image_is_not_the_stale_opencode_1_build() -> None:
+    promoted = _read(ROOT / "docker" / "aa-runtime.digest").strip()
+    assert promoted != STALE_OPENCODE_1_RUNTIME_IMAGE
+    for path in (*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")):
+        assert STALE_OPENCODE_1_RUNTIME_IMAGE not in _read(path), path.name
 
 
 def test_docker_context_excludes_source_and_user_data() -> None:

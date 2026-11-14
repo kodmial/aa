@@ -5,11 +5,22 @@ name: OpenCode agent
 # and an `issue`-mode dispatch therefore report the issue number; the repair
 # modes report the pull request number.
 run-name: >-
-  ${{ github.event_name == 'issue_comment' &&
+  ${{ github.event_name == 'workflow_dispatch' &&
+      inputs.recovery_identity &&
+      format('OpenCode 429 recovery {0} gen {1}',
+        fromJSON(inputs.recovery_identity).recovery_operation_id,
+        fromJSON(inputs.recovery_identity).recovery_generation) ||
+      github.event_name == 'issue_comment' &&
       format('OpenCode issue #{0}', github.event.issue.number) ||
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'issue' &&
       format('OpenCode issue #{0}', inputs.issue_number) ||
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'ci-fix' &&
+      inputs.ci_repair_identity &&
+      fromJSON(inputs.ci_repair_identity).ci_attempt_id &&
+      format('OpenCode repair PR #{0} [ci-attempt:{1}]',
+        inputs.pr_number, fromJSON(inputs.ci_repair_identity).ci_attempt_id) ||
       github.event_name == 'workflow_dispatch' &&
       format('OpenCode repair PR #{0}', inputs.pr_number) ||
       github.event_name == 'pull_request_review_comment' &&
@@ -51,8 +62,16 @@ on:
         description: "Source CodeRabbit review id"
         required: false
         type: string
+      unresolved_items_json:
+        description: "Optional exact CodeRabbit finding batch for recovery"
+        required: false
+        type: string
       run_id:
         description: "Source failed workflow run id"
+        required: false
+        type: string
+      ci_repair_identity:
+        description: "Packed exact-HEAD CI-repair attempt identity from Continuum"
         required: false
         type: string
       ci_workflow_id:
@@ -123,6 +142,10 @@ on:
         description: "Exact main SHA a qualification run must test"
         required: false
         type: string
+      recovery_identity:
+        description: "Packed trusted Continuum 429 recovery identity (checkpoint, stage and generation)"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -152,7 +175,12 @@ jobs:
       pr_number: "${{ inputs.pr_number }}"
       head_ref: "${{ inputs.head_ref }}"
       review_id: "${{ inputs.review_id }}"
+      unresolved_items_json: "${{ inputs.unresolved_items_json }}"
       run_id: "${{ inputs.run_id }}"
+      # Keep the current Continuum single-owner CI-repair receipt identity.
+      # The consumer must unpack it into the reusable workflow inputs.
+      ci_attempt_id: "${{ inputs.ci_repair_identity && fromJSON(inputs.ci_repair_identity).ci_attempt_id || '' }}"
+      ci_head_sha: "${{ inputs.ci_repair_identity && fromJSON(inputs.ci_repair_identity).ci_head_sha || '' }}"
       ci_workflow_id: "${{ inputs.ci_workflow_id }}"
       base_ref: "${{ inputs.base_ref }}"
       knowledge_protocol_path: "${{ inputs.knowledge_protocol_path }}"
@@ -166,9 +194,46 @@ jobs:
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts || '5' }}"
-      pause_on_failure: "${{ inputs.pause_on_failure || 'true' }}"
+      # The issue scheduler is non-terminal (`pause_on_failure: "false"`).
+      # A scheduler-generated `/oc` comment must inherit that policy; with
+      # the old unconditional `'true'` default the OpenCode recovery job
+      # added `automation:paused` while the scheduler kept clearing it and
+      # re-dispatching, producing a pause/unpause loop. Manual owner `/oc`
+      # commands and explicit workflow_dispatch callers keep the bounded
+      # terminal-pause default. An issue_comment run has no
+      # `inputs.dispatch_marker` value, so the fallback must resolve exactly
+      # like the scheduler/engine: explicit input, then the configured
+      # repository marker variable, then the upstream default.
+      # The public dispatch marker alone is copyable, so a comment only
+      # counts as a scheduler dispatch when it is authored by the automation
+      # identity (the scheduler posts through the owner's TAP_PAT), starts as
+      # an unquoted `/oc`, and carries both the dispatch marker and the
+      # scheduler's own origin marker outside a blockquote. A manual `/oc`
+      # comment that quote-replies to a real scheduler dispatch therefore
+      # keeps the terminal default instead of inheriting the non-terminal
+      # scheduler policy.
+      pause_on_failure: >-
+        ${{ (github.event.comment.user.login == 'github-actions[bot]' ||
+        github.event.comment.user.login == github.repository_owner) &&
+        startsWith(github.event.comment.body || '', '/oc') &&
+        !contains(github.event.comment.body || '',
+        format('> {0}', inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')) &&
+        !contains(github.event.comment.body || '',
+        format('> {0}', '<!-- continuum-origin role=continuum component=issue-scheduler -->')) &&
+        contains(github.event.comment.body || '',
+        inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->') &&
+        contains(github.event.comment.body || '',
+        '<!-- continuum-origin role=continuum component=issue-scheduler -->')
+        && 'false' || inputs.pause_on_failure || 'true' }}
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
       capability_number: "${{ inputs.capability_number }}"
       qualification_number: "${{ inputs.qualification_number }}"
       required_sha: "${{ inputs.required_sha }}"
+      # The watchdog supplies one packed identity to fit workflow_dispatch's
+      # 25-input limit; pass explicit fields to the reusable recovery engine.
+      recovery_operation_id: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_operation_id || '' }}"
+      recovery_checkpoint_ref: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_ref || '' }}"
+      recovery_checkpoint_sha: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_sha || '' }}"
+      recovery_stage: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_stage || '' }}"
+      recovery_generation: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_generation || '' }}"

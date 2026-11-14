@@ -22,5 +22,10 @@ jobs:
     with:
       continuum_ref: main
       watched_workflow: "OpenCode agent"
+      # Pin both retry budgets instead of inheriting a mutable repository
+      # variable. The 429 value is the reviewed upstream default (3); keeping
+      # it explicit means a variable edit cannot silently disable genuine
+      # fresh-VM 429 recovery or turn the bounded retries into a loop.
       max_recovery_retries: "3"
+      max_429_runner_restarts: "3"
       pause_on_failure: "false"
