@@ -37,6 +37,21 @@ SHA = "a" * 40
 
 
 def _process_alive(pid: int) -> bool:
+    # A zombie has already terminated even though its PID still exists. The
+    # Actions job container runs ``tail -f /dev/null`` as PID 1, which never
+    # reaps orphaned grandchildren; relying on ``os.kill(pid, 0)`` alone would
+    # therefore report a successfully killed descendant as alive forever.
+    # Read the kernel process state first and treat Z (and X/x) as dead.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        stat = ""
+    if stat:
+        try:
+            state = stat.rsplit(")", 1)[1].split()[0]
+        except IndexError:
+            return False
+        return state not in {"Z", "X", "x"}
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -53,6 +68,25 @@ def _wait_dead(pid: int, timeout_s: float = 10.0) -> bool:
             return True
         time.sleep(0.05)
     return not _process_alive(pid)
+
+
+def test_unreaped_zombie_descendant_is_considered_terminated() -> None:
+    process = subprocess.Popen(["sleep", "60"])  # noqa: S607
+    try:
+        process.kill()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                stat = Path(f"/proc/{process.pid}/stat").read_text(encoding="utf-8")
+            except OSError:
+                break
+            if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                assert _wait_dead(process.pid, timeout_s=0.2)
+                return
+            time.sleep(0.01)
+        pytest.fail("descendant did not become an unreaped zombie")
+    finally:
+        process.wait(timeout=5)
 
 
 def test_blocking_scenario_8_is_preempted_with_typed_negative_evidence(
