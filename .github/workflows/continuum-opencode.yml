@@ -16,6 +16,12 @@ run-name: >-
       inputs.mode == 'issue' &&
       format('OpenCode issue #{0}', inputs.issue_number) ||
       github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'ci-fix' &&
+      inputs.ci_repair_identity &&
+      fromJSON(inputs.ci_repair_identity).ci_attempt_id &&
+      format('OpenCode repair PR #{0} [ci-attempt:{1}]',
+        inputs.pr_number, fromJSON(inputs.ci_repair_identity).ci_attempt_id) ||
+      github.event_name == 'workflow_dispatch' &&
       format('OpenCode repair PR #{0}', inputs.pr_number) ||
       github.event_name == 'pull_request_review_comment' &&
       format('OpenCode review PR #{0}', github.event.pull_request.number) ||
@@ -62,6 +68,10 @@ on:
         type: string
       run_id:
         description: "Source failed workflow run id"
+        required: false
+        type: string
+      ci_repair_identity:
+        description: "Packed exact-HEAD CI-repair attempt identity from Continuum"
         required: false
         type: string
       ci_workflow_id:
@@ -167,6 +177,10 @@ jobs:
       review_id: "${{ inputs.review_id }}"
       unresolved_items_json: "${{ inputs.unresolved_items_json }}"
       run_id: "${{ inputs.run_id }}"
+      # Keep the current Continuum single-owner CI-repair receipt identity.
+      # The consumer must unpack it into the reusable workflow inputs.
+      ci_attempt_id: "${{ inputs.ci_repair_identity && fromJSON(inputs.ci_repair_identity).ci_attempt_id || '' }}"
+      ci_head_sha: "${{ inputs.ci_repair_identity && fromJSON(inputs.ci_repair_identity).ci_head_sha || '' }}"
       ci_workflow_id: "${{ inputs.ci_workflow_id }}"
       base_ref: "${{ inputs.base_ref }}"
       knowledge_protocol_path: "${{ inputs.knowledge_protocol_path }}"

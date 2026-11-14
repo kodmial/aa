@@ -358,3 +358,35 @@ def test_opencode_caller_accepts_shared_watchdog_429_recovery_contract() -> None
     assert "OpenCode 429 recovery {0} gen {1}" in parsed["run-name"]
     assert "fromJSON(inputs.recovery_identity).recovery_operation_id" in parsed["run-name"]
     assert "fromJSON(inputs.recovery_identity).recovery_generation" in parsed["run-name"]
+
+
+def test_opencode_caller_accepts_shared_exact_head_ci_repair_contract() -> None:
+    """Keep AA's caller aligned with Continuum's serialized CI-repair dispatcher.
+
+    Continuum #446 changed the dispatch contract to include a mandatory
+    per-attempt correlation identity. A stale consumer previously rejected
+    this field as HTTP 422 before the reusable engine could start.
+    """
+    parsed = yaml.safe_load(_read(OPENCODE_CALLER))
+    triggers = parsed.get("on") or parsed.get(True)
+    dispatch = triggers["workflow_dispatch"]["inputs"]
+    assert len(dispatch) == 25  # The current caller exactly fills GitHub's limit.
+    assert "ci_repair_identity" in dispatch
+    assert dispatch["ci_repair_identity"]["type"] == "string"
+    assert dispatch["ci_repair_identity"]["required"] is False
+
+    with_inputs = parsed["jobs"]["call"]["with"]
+    for key in ("ci_attempt_id", "ci_head_sha"):
+        assert with_inputs[key] == (
+            "${{ inputs.ci_repair_identity && "
+            f"fromJSON(inputs.ci_repair_identity).{key} || '' " + "}}"
+        )
+
+    run_name = parsed["run-name"]
+    assert "inputs.mode == 'ci-fix'" in run_name
+    assert "inputs.ci_repair_identity" in run_name
+    assert "fromJSON(inputs.ci_repair_identity).ci_attempt_id" in run_name
+    assert "OpenCode repair PR #{0} [ci-attempt:{1}]" in run_name
+    # Keep ordinary repairs and 429 recovery working without CI identity.
+    assert "OpenCode repair PR #{0}" in run_name
+    assert "OpenCode 429 recovery {0} gen {1}" in run_name
