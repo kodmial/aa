@@ -417,20 +417,53 @@ class OpenCodeServerEventProbe:
             return facts
         return last
 
+    def _read_sse_bytes(self, stream: Any) -> tuple[bytes, str]:
+        """Read one bounded SSE window without waiting for a full buffer.
+
+        ``HTTPResponse.read(n)`` blocks on a chunked SSE response until it
+        collects ``n`` bytes or reaches EOF. A live pinned server sends one
+        frame (for example ``server.connected``) and then keeps the stream
+        open, so the old fixed-size read timed out and discarded the frame
+        that had already arrived. Per-chunk reads preserve every observed
+        byte; a timeout *after* a partial read is a successful bounded window,
+        while a timeout with no bytes stays an honest quiet stream.
+        """
+        window = bytearray()
+        timed_out = False
+        failed = False
+        while len(window) < _MAX_BYTES:
+            reader = getattr(stream, "read1", None)
+            try:
+                if callable(reader):
+                    chunk = reader(min(0x400, _MAX_BYTES - len(window)))
+                else:
+                    chunk = stream.read(min(0x400, _MAX_BYTES - len(window)))
+            except TimeoutError:
+                timed_out = True
+                break
+            except Exception:
+                failed = True
+                break
+            if not chunk:
+                break
+            window.extend(chunk)
+        if window:
+            self._last_observed_s = time.time()
+            return bytes(window), "ok"
+        if failed:
+            return b"", "error"
+        return b"", "quiet" if timed_out else "ok"
+
     def _consume_sse_frames(self, stream: Any) -> str:
         """Parse one bounded read window of SSE ``data:`` frames.
 
-        Returns ``"ok"`` when the bounded read completed (including EOF),
+        Returns ``"ok"`` when any bounded read completed (including EOF),
         ``"quiet"`` when a healthy open stream produced no bytes before the
-        socket timeout, and ``"error"`` for any other read failure.
+        socket timeout, and ``"error"`` for a read failure before any byte.
         """
-        try:
-            window = stream.read(_MAX_BYTES)
-        except TimeoutError:
-            return "quiet"
-        except Exception:
-            return "error"
-        self._last_observed_s = time.time()
+        window, state = self._read_sse_bytes(stream)
+        if state != "ok":
+            return state
         for raw_line in window.decode("utf-8", errors="replace").splitlines():
             line = raw_line.strip()
             if not line.startswith("data:"):
@@ -451,9 +484,10 @@ class OpenCodeServerEventProbe:
                 continue
             # v1 carries ``properties``; v2 carries ``data``. Only the
             # closed-vocabulary subset below is ever read.
-            properties = payload.get("properties")
+            properties: Any = payload.get("properties")
             if not isinstance(properties, dict):
-                properties = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                data = payload.get("data")
+                properties = data if isinstance(data, dict) else {}
             if event_type == "session.status":
                 status = properties.get("status")
                 if isinstance(status, dict):

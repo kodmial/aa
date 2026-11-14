@@ -1200,6 +1200,10 @@ jobs:
         id: gate-c-canary
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
         shell: bash
+        # Hard local cap, independent of the shared 135-minute Gate C job:
+        # the canary's own 600 s preflight plus setup must never turn into
+        # another blind multi-hour wait.
+        timeout-minutes: 12
         env:
           AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
           SELF_PROVING_LIVE: "1"

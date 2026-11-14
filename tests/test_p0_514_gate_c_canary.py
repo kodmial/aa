@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -118,6 +120,7 @@ def _real_path_ready(turns: int = 2) -> RealPathEvidence:
 @pytest.mark.asyncio
 async def test_observer_self_test_proves_the_wired_diagnostic_chain(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     evidence = await observer_self_test(tmp_path / "self-test")
     assert evidence.passed, evidence.missing_fields
@@ -131,7 +134,19 @@ async def test_observer_self_test_proves_the_wired_diagnostic_chain(
     assert evidence.server_unobserved_verified
     assert evidence.server_evidence["state"] == "supported"
     assert evidence.server_evidence["server_error_status_code"] == 503
+    assert evidence.server_evidence["server_error_kind"] == "APIError"
+    assert evidence.server_evidence["session_state_counts"]["busy"] >= 1
+    assert evidence.server_evidence["event_type_counts"]["session.status"] >= 1
+    assert evidence.server_evidence["event_type_counts"]["session.execution.failed"] >= 1
     assert evidence.privacy_validated
+
+    # The live stdout lines carry the bounded stage/attempt projection only.
+    stdout = capsys.readouterr().out
+    assert "attempt_state=in-flight" in stdout
+    assert "attempt_id=" in stdout
+    assert SELF_TEST_PROMPT_SENTINEL not in stdout
+    assert SELF_TEST_SESSION_SENTINEL not in stdout
+    assert SELF_TEST_SSE_SECRET_SENTINEL not in stdout
 
     # The controlled server deliberately embeds session ids and secret
     # markers; no persisted diagnostic file may retain them.
@@ -233,6 +248,59 @@ async def test_missing_observer_blocks_before_any_real_path_turn(
     payload = json.loads((tmp_path / "gate-c-canary-result.json").read_text(encoding="utf-8"))
     assert payload["real_path"]["error"] == "skipped-self-test-blocked"
     assert payload["gate_c_executed"] is False
+
+
+@pytest.mark.asyncio
+async def test_self_declared_passed_without_persisted_evidence_blocks_before_real_path(
+    tmp_path: Path,
+) -> None:
+    """A runner cannot claim READY while omitting the evidence contract."""
+    started = False
+
+    async def self_test_runner(_out: Path, _timeout: float) -> SelfTestEvidence:
+        # Deliberately contradictory: passed with no snapshots, attempt,
+        # watchdog marker, server facts or orphan check.
+        return SelfTestEvidence(passed=True, privacy_validated=True)
+
+    async def real_path_runner(_out: Path, _budget: float) -> RealPathEvidence:
+        nonlocal started
+        started = True
+        return _real_path_ready(2)
+
+    result = await run_canary(
+        main_sha="b" * 40,
+        run_id="514",
+        out_dir=tmp_path,
+        preflight_budget_s=10.0,
+        live_probe_budget_s=5.0,
+        self_test_runner=self_test_runner,
+        real_path_runner=real_path_runner,
+    )
+
+    assert result.status == STATUS_BLOCKED
+    assert result.reason == "diagnostic-self-test-failed"
+    assert "observer.snapshot_count" in result.missing_fields
+    assert "server_events.state" in result.missing_fields
+    assert not started
+    payload = json.loads((tmp_path / "gate-c-canary-result.json").read_text(encoding="utf-8"))
+    assert payload["real_path"]["error"] == "skipped-self-test-blocked"
+    assert payload["product_qualified"] is False
+    assert payload["gate_c_executed"] is False
+
+
+def test_unsupported_real_server_telemetry_blocks_as_infrastructure() -> None:
+    result = evaluate_canary(
+        main_sha="c" * 40,
+        run_id="514",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(error="unsupported-server-telemetry"),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=10.0,
+    )
+    assert result.status == STATUS_BLOCKED
+    assert result.reason == "unsupported-server-telemetry"
+    assert result.exit_code == 2
 
 
 def test_concrete_typed_cause_fails_without_claiming_a_product_verdict() -> None:
@@ -455,6 +523,38 @@ async def test_unresponsive_http_produces_inconclusive_with_snapshots(
             pass
 
 
+@pytest.mark.asyncio
+async def test_run_canary_bounds_an_unresponsive_real_path_runner(
+    tmp_path: Path,
+) -> None:
+    """The orchestration itself returns INCONCLUSIVE, not a product failure."""
+
+    async def ready_self_test(_out: Path, _timeout: float) -> SelfTestEvidence:
+        return _self_test_ready()
+
+    async def slow_real_path(_out: Path, _budget: float) -> RealPathEvidence:
+        await asyncio.sleep(5.0)
+        return _real_path_ready(2)
+
+    result = await run_canary(
+        main_sha="d" * 40,
+        run_id="514",
+        out_dir=tmp_path,
+        preflight_budget_s=10.0,
+        live_probe_budget_s=0.2,
+        self_test_runner=ready_self_test,
+        real_path_runner=slow_real_path,
+    )
+
+    assert result.status == STATUS_INCONCLUSIVE
+    assert result.reason == "external-progress-unobserved"
+    assert result.budget_category == BUDGET_EXPIRED
+    payload = json.loads((tmp_path / "gate-c-canary-result.json").read_text(encoding="utf-8"))
+    assert payload["real_path"]["budget_expired"] is True
+    assert payload["product_qualified"] is False
+    assert payload["gate_c_executed"] is False
+
+
 # --- Server evidence: /doc, /session/status and SSE route fallback --------
 
 
@@ -501,3 +601,106 @@ def test_artifact_rejects_text_keys_and_sentinel_leaks(tmp_path: Path) -> None:
     with pytest.raises(GateCCanaryError):
         write_canary_result(tmp_path, leaking)
     assert not (tmp_path / "gate-c-canary-result.json").exists()
+
+
+# --- Fail-closed orchestration --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_injected_self_test_exception_fails_closed_without_real_turns(
+    tmp_path: Path,
+) -> None:
+    started = False
+
+    async def self_test_runner(_out: Path, _timeout: float) -> SelfTestEvidence:
+        raise RuntimeError("observer construction failed")
+
+    async def real_path_runner(_out: Path, _budget: float) -> RealPathEvidence:
+        nonlocal started
+        started = True
+        return _real_path_ready(2)
+
+    result = await run_canary(
+        main_sha="f" * 40,
+        run_id="514",
+        out_dir=tmp_path,
+        preflight_budget_s=10.0,
+        live_probe_budget_s=5.0,
+        self_test_runner=self_test_runner,
+        real_path_runner=real_path_runner,
+    )
+
+    assert result.status == STATUS_BLOCKED
+    assert result.reason == "diagnostic-self-test-failed"
+    assert "self-test.RuntimeError" in result.missing_fields
+    assert not started
+    payload = json.loads((tmp_path / "gate-c-canary-result.json").read_text(encoding="utf-8"))
+    assert payload["real_path"]["error"] == "skipped-self-test-blocked"
+    assert payload["gate_c_executed"] is False
+    assert payload["product_qualified"] is False
+
+
+# --- Workflow and CLI integration -----------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+
+
+def test_workflow_gates_the_unchanged_campaign_behind_a_bounded_canary() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    canary_index = text.index("id: gate-c-canary")
+    gate_index = text.index("id: gate-c\n")
+    assert canary_index < gate_index
+    canary_step = text[canary_index:gate_index]
+
+    # The canary is bounded independently of the shared 135-minute job.
+    assert "timeout-minutes: 12" in canary_step
+    assert "--preflight-budget-s 600" in canary_step
+    assert "--live-probe-budget-s 300" in canary_step
+    assert "scripts/run_gate_c_canary.py" in canary_step
+    assert "aa-gate-c-canary" in text
+
+    # READY is the only authorization, and the artifact may never carry a
+    # product/Gate C verdict or a different exact-main identity.
+    assert 'payload.get("status") != "READY"' in text
+    assert 'payload.get("product_qualified") is not False' in text
+    assert 'payload.get("gate_c_executed") is not False' in text
+    assert 'payload.get("main_sha"' in text
+
+    # The diagnostic canary is not allowed to rebuild the prepared runtime,
+    # index or model environment.
+    assert "python scripts/build_retrieval_index.py" not in canary_step
+    assert "prepare_opencode_verification_env.sh" not in canary_step
+
+
+def test_cli_invalid_sha_publishes_blocked_artifact_and_never_stale_ready(
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "gate-c-canary-result.json"
+    stale.write_text('{"status": "READY"}\n', encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_gate_c_canary.py"),
+            "--main-sha",
+            "not-an-exact-sha",
+            "--out-dir",
+            str(tmp_path),
+            "--run-id",
+            "514",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 2
+    payload = json.loads(stale.read_text(encoding="utf-8"))
+    assert payload["status"] == STATUS_BLOCKED
+    assert payload["reason"] == "invalid-main-sha"
+    assert payload["gate_c_executed"] is False
+    assert payload["product_qualified"] is False
+    assert "prompt" not in json.dumps(payload).casefold()
+    assert SELF_TEST_PROMPT_SENTINEL not in proc.stdout

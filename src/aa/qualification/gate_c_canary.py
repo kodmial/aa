@@ -201,6 +201,44 @@ class SelfTestEvidence:
         }
 
 
+def self_test_contract_missing(evidence: SelfTestEvidence) -> tuple[str, ...]:
+    """Fields a self-declared ``passed`` result still has to prove.
+
+    ``observer_self_test`` derives its own missing list, but the orchestration
+    also accepts injected runners (CI doubles and future adapters). A caller
+    must never be able to set ``passed=True`` while omitting the persisted
+    in-flight/terminal evidence or the server-side facts that authorize the
+    18-case campaign. The checks are intentionally evidence-shaped, not a
+    second copy of the observer implementation.
+    """
+    missing: list[str] = []
+    if evidence.snapshot_count < 2:
+        missing.append("observer.snapshot_count")
+    if not evidence.attempt_start_observed:
+        missing.append("observer.attempt_start_event")
+    if not evidence.trace_observed:
+        missing.append("observer.terminal_trace")
+    if not evidence.flush_observed:
+        missing.append("observer.flush_index")
+    if not evidence.process_alive_observed:
+        missing.append("observer.process_alive")
+    if not evidence.scenario_correlation_observed:
+        missing.append("observer.scenario_correlation")
+    if not evidence.stage_attempt_stdout_observed:
+        missing.append("stdout.stage_attempt")
+    if not evidence.watchdog_marker_observed:
+        missing.append("watchdog.marker")
+    if str(evidence.server_evidence.get("state", "")) != "supported":
+        missing.append("server_events.state")
+    if not evidence.server_unobserved_verified:
+        missing.append("server_events.unobserved")
+    if not evidence.privacy_validated:
+        missing.append("privacy.sentinel_leak")
+    if not evidence.orphan_absent:
+        missing.append("observer.orphan_attempt")
+    return tuple(dict.fromkeys(missing))
+
+
 @dataclass(frozen=True)
 class ScenarioEvidence:
     """One real-path canary scenario outcome, privacy-safe only."""
@@ -494,9 +532,7 @@ class _CanaryHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {"data": {}})
                 return
             # Session ids stay on the server; the probe must never retain them.
-            self._send_json(
-                200, {"data": {SELF_TEST_SESSION_SENTINEL: {"type": "running"}}}
-            )
+            self._send_json(200, {"data": {SELF_TEST_SESSION_SENTINEL: {"type": "running"}}})
             return
         if path in ("/api/event", "/event", "/global/event"):
             if not self._authorized():
@@ -680,6 +716,7 @@ def _scan_for_sentinels(paths: Sequence[Path]) -> bool:
         SELF_TEST_PROMPT_SENTINEL.encode("utf-8"),
         SELF_TEST_SESSION_SENTINEL.encode("utf-8"),
         SELF_TEST_SSE_SECRET_SENTINEL.encode("utf-8"),
+        SELF_TEST_SERVER_PASSWORD.encode("utf-8"),
     )
     for path in paths:
         try:
@@ -742,6 +779,21 @@ async def observer_self_test(
         missing.append("server_events.v2_session_status")
     if error_evidence.get("event_endpoint") != "/api/event":
         missing.append("server_events.v2_event")
+    # Independent server facts rather than one blended verdict: the controlled
+    # server really reported an active drain, a session-status event and a
+    # terminal failure event, and the numeric provider status survived.
+    state_counts = error_evidence.get("session_state_counts")
+    state_counts = state_counts if isinstance(state_counts, dict) else {}
+    if int(state_counts.get("busy", 0) or 0) < 1:
+        missing.append("server_events.session_active")
+    event_counts = error_evidence.get("event_type_counts")
+    event_counts = event_counts if isinstance(event_counts, dict) else {}
+    if int(event_counts.get("session.status", 0) or 0) < 1:
+        missing.append("server_events.session_status_event")
+    if int(event_counts.get("session.execution.failed", 0) or 0) < 1:
+        missing.append("server_events.terminal_error_event")
+    if error_evidence.get("server_error_kind") != "APIError":
+        missing.append("server_events.terminal_error_kind")
 
     # (2) A second controlled server proves the explicit unobserved shape when
     # no session event is present; no stale busy/idle state is fabricated.
@@ -756,6 +808,12 @@ async def observer_self_test(
         missing.append("server_events.unobserved")
     if absent_evidence.get("event_type_counts"):
         missing.append("server_events.absent_event_shape")
+    absent_state_counts = absent_evidence.get("session_state_counts")
+    absent_state_counts = absent_state_counts if isinstance(absent_state_counts, dict) else {}
+    if int(absent_state_counts.get("busy", 0) or 0) or str(
+        absent_evidence.get("last_session_state", "")
+    ):
+        missing.append("server_events.absent_state_shape")
 
     state = _CanaryServerState()
     server, thread, base_url = _start_server(state)
@@ -869,6 +927,10 @@ async def observer_self_test(
             missing.append("stdout.stage_attempt")
         if "attempt_id=" not in event_line:
             missing.append("stdout.attempt_event")
+        # Real live stdout causality evidence: both lines are rendered from
+        # the allow-listed attempt projection, never from prompt text.
+        print(line, flush=True)
+        print(event_line, flush=True)
 
         # Watchdog marker/writer must persist the same bounded evidence.
         os.environ[ENV_PROGRESS_PATH] = str(progress_path)
@@ -991,12 +1053,19 @@ async def run_real_path_scenarios(
     from aa.app import Application
     from aa.config import Settings
     from aa.conversation.semantic_work_plan import set_stage_observer
-    from aa.conversation.turn_causality import clear_turn_causality, set_turn_causality
+    from aa.conversation.turn_causality import (
+        clear_turn_causality,
+        current_causality_id,
+        set_turn_causality,
+    )
     from aa.opencode.server_events import probe_for_runtime
     from aa.qualification.live_partial_evidence import stage_latency_coverage
     from aa.qualification.product_contract_live import (
         GATE_C_CANARY_SCENARIOS,
         QualificationTelegramApi,
+        _format_bounded_attempt_event,
+        _format_bounded_live_fields,
+        _live_attempt_snapshot_fields,
         _opencode_attempt_entries,
         _opencode_process_state,
         _snapshot_product_failure_reason,
@@ -1029,9 +1098,23 @@ async def run_real_path_scenarios(
     observer: StallSnapshotObserver | None = None
     stage_seen: set[str] = set()
     causality_by_chat: dict[int, str] = {}
+    causality_scenario_index: dict[str, int] = {}
 
     def _stage_observer(stage: str) -> None:
-        stage_seen.add(_bounded(stage, 64))
+        stage_name = _bounded(stage, 64)
+        stage_seen.add(stage_name)
+        # Live bounded stdout evidence for each production stage. The helper
+        # exports only allow-listed attempt/process fields, so no prompt,
+        # reply, passage, session id or secret can reach the log.
+        fields = _live_attempt_snapshot_fields(
+            app,
+            causality_id=current_causality_id(),
+            last_active_stage=stage_name,
+        )
+        print(
+            f"Gate C canary stage={stage_name} " + _format_bounded_live_fields(fields),
+            flush=True,
+        )
 
     def _attribute_turn(processor: Any) -> Any:
         async def attributed(incoming: Any) -> None:
@@ -1053,9 +1136,27 @@ async def run_real_path_scenarios(
         if probe is None:
             return RealPathEvidence(error="server-events-unavailable")
         server_evidence = await probe.snapshot()
+        # The real pinned server must expose the observer's native status and
+        # event surfaces before spending the live diagnostic budget on model
+        # turns. A present-but-incomplete telemetry source is a typed block,
+        # not a provider wait and not a reason to start the 18-case lane.
+        if str(server_evidence.get("state", "")) != "supported" or _server_surface_missing(
+            server_evidence
+        ):
+            return RealPathEvidence(
+                server_evidence=server_evidence,
+                error="unsupported-server-telemetry",
+            )
 
         def _entries_source() -> tuple[dict[str, Any], ...]:
             return _opencode_attempt_entries(getattr(app, "opencode_runtime", None))
+
+        def _event_sink(payload: Mapping[str, Any]) -> None:
+            print(
+                "Gate C opencode-attempt "
+                + _format_bounded_attempt_event(payload, causality_scenario_index),
+                flush=True,
+            )
 
         observer = StallSnapshotObserver(
             attempt_source=_entries_source,
@@ -1064,6 +1165,7 @@ async def run_real_path_scenarios(
                 getattr(app, "opencode_runtime", None)
             ),
             session_status_probe=probe.session_status_snapshot,
+            event_sink=_event_sink,
             register_atexit_flush=True,
         )
         await observer.start()
@@ -1076,6 +1178,7 @@ async def run_real_path_scenarios(
             stage_seen.clear()
             causality = uuid.uuid4().hex
             causality_by_chat[int(chat_id)] = causality
+            causality_scenario_index[causality] = position
             scenario_started = time.perf_counter()
             before = len(api.sent_texts)
             raw = {
@@ -1286,6 +1389,13 @@ def evaluate_canary(
 ) -> CanaryResult:
     """Reduce bounded evidence to one honest canary status (never a product PASS)."""
     missing = list(self_test.missing_fields)
+    # A self-declared ``passed`` is not enough: every required persisted and
+    # server-side fact must actually be present. This also protects direct
+    # callers that bypass ``run_canary``'s injected-runner validation.
+    self_test_contract = self_test_contract_missing(self_test) if self_test.passed else ()
+    if not self_test.passed and not missing:
+        missing.append("self-test.failed")
+    missing.extend(self_test_contract)
     server_state = str(real_path.server_evidence.get("state", ""))
     server_surfaces_missing = _server_surface_missing(real_path.server_evidence)
     if not server_state:
@@ -1297,7 +1407,7 @@ def evaluate_canary(
     status = STATUS_READY
     reason = REASON_READY
 
-    if not self_test.passed:
+    if not self_test.passed or self_test_contract:
         status = STATUS_BLOCKED
         reason = REASON_SELF_TEST_FAILED
     elif not self_test.privacy_validated:
@@ -1317,7 +1427,7 @@ def evaluate_canary(
     elif real_path.budget_expired or real_path.error == "diagnostic-budget-expired":
         status = STATUS_INCONCLUSIVE
         reason = REASON_EXTERNAL_UNOBSERVED
-    elif real_path.error == "server-events-unavailable":
+    elif real_path.error in ("server-events-unavailable", "unsupported-server-telemetry"):
         status = STATUS_BLOCKED
         reason = REASON_UNSUPPORTED_SERVER
     elif real_path.error:
@@ -1418,13 +1528,27 @@ async def run_canary(
                 missing_fields=(f"self-test.{type(exc).__name__}",),
             )
     else:
-        self_test = await self_test_runner(out_dir / "self-test", self_test_remaining)
-        # A fake/injected runner still has to satisfy the same missing-field
-        # contract; it cannot self-declare success while omitting evidence.
-        if self_test.passed and self_test.missing_fields:
+        try:
+            self_test = await asyncio.wait_for(
+                self_test_runner(out_dir / "self-test", self_test_remaining),
+                timeout=self_test_remaining,
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            self_test = SelfTestEvidence(passed=False, missing_fields=("self-test.timeout",))
+        except Exception as exc:  # noqa: BLE001 - injected runner must fail closed
             self_test = SelfTestEvidence(
                 passed=False,
-                missing_fields=self_test.missing_fields,
+                missing_fields=(f"self-test.{type(exc).__name__}",),
+            )
+    # A runner (real or injected) still has to satisfy the same evidence
+    # contract; it cannot self-declare success while omitting the persisted
+    # in-flight/terminal or server-side facts.
+    if self_test.passed:
+        contract_missing = self_test_contract_missing(self_test)
+        if contract_missing or self_test.missing_fields:
+            self_test = SelfTestEvidence(
+                passed=False,
+                missing_fields=tuple(dict.fromkeys((*self_test.missing_fields, *contract_missing))),
             )
 
     if self_test.passed and time.monotonic() < deadline:
@@ -1520,5 +1644,6 @@ __all__ = [
     "observer_self_test",
     "run_canary",
     "run_real_path_scenarios",
+    "self_test_contract_missing",
     "write_canary_result",
 ]
