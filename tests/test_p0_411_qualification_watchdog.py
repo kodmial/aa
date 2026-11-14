@@ -103,6 +103,16 @@ def test_unreaped_zombie_descendant_is_considered_terminated() -> None:
             time.sleep(0.01)
         pytest.fail("descendant did not become an unreaped zombie")
     finally:
+        # Cleanup must never mask the test's failure: the pre-kill assertion
+        # above may have failed before ``kill`` ran, so terminate the child
+        # here before reaping it. Signalling an already-killed (zombie)
+        # descendant is a harmless no-op, and a bounded ``wait`` avoids
+        # replacing the original assertion error with ``TimeoutExpired``
+        # while leaking the ``sleep 60`` child.
+        try:
+            process.kill()
+        except OSError:
+            pass  # already terminated and reaped elsewhere
         process.wait(timeout=5)
 
 
