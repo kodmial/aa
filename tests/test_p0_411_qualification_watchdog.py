@@ -35,6 +35,9 @@ from aa.qualification.product_contract_live import LaneResult, LiveSummary
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
+# Observing an unreaped zombie requires the Linux /proc interface; the
+# os.kill fallback used by _process_alive cannot distinguish a zombie.
+_PROC_STAT_AVAILABLE = Path("/proc/self/stat").exists()
 
 
 def _proc_state(pid: int) -> str | None:
@@ -51,10 +54,11 @@ def _proc_state(pid: int) -> str | None:
 
 def _process_alive(pid: int) -> bool:
     # ``kill(pid, 0)`` still succeeds for a killed-but-unreaped zombie. Some
-    # qualification runners use an init process that does not reap orphaned
-    # grandchildren, so the watchdog's kill would look like a leak even
-    # though the descendant can no longer run. Prefer the kernel state when
-    # /proc is available and only fall back to the signal probe otherwise.
+    # qualification runners (including the Actions job container's
+    # ``tail -f /dev/null`` PID 1) never reap orphaned grandchildren, so the
+    # watchdog's kill would look like a leak even though the descendant can no
+    # longer run. Prefer the kernel state when /proc is available and only
+    # fall back to the signal probe otherwise; treat Z (and X/x) as dead.
     state = _proc_state(pid)
     if state is not None:
         return state not in {"Z", "X", "x"}
@@ -74,6 +78,42 @@ def _wait_dead(pid: int, timeout_s: float = 10.0) -> bool:
             return True
         time.sleep(0.05)
     return not _process_alive(pid)
+
+
+@pytest.mark.skipif(
+    not _PROC_STAT_AVAILABLE,
+    reason="requires Linux /proc to observe an unreaped zombie descendant",
+)
+def test_unreaped_zombie_descendant_is_considered_terminated() -> None:
+    process = subprocess.Popen(["sleep", "60"])  # noqa: S607
+    try:
+        # Pin the live direction first: a helper that always reported "dead"
+        # would otherwise satisfy the zombie assertion below vacuously.
+        assert _process_alive(process.pid) is True
+        process.kill()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                stat = Path(f"/proc/{process.pid}/stat").read_text(encoding="utf-8")
+            except OSError:
+                break
+            if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                assert _wait_dead(process.pid, timeout_s=0.2)
+                return
+            time.sleep(0.01)
+        pytest.fail("descendant did not become an unreaped zombie")
+    finally:
+        # Cleanup must never mask the test's failure: the pre-kill assertion
+        # above may have failed before ``kill`` ran, so terminate the child
+        # here before reaping it. Signalling an already-killed (zombie)
+        # descendant is a harmless no-op, and a bounded ``wait`` avoids
+        # replacing the original assertion error with ``TimeoutExpired``
+        # while leaking the ``sleep 60`` child.
+        try:
+            process.kill()
+        except OSError:
+            pass  # already terminated and reaped elsewhere
+        process.wait(timeout=5)
 
 
 def test_liveness_probe_treats_unreaped_zombie_as_dead() -> None:
