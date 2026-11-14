@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -39,21 +40,27 @@ SHA = "a" * 40
 _PROC_STAT_AVAILABLE = Path("/proc/self/stat").exists()
 
 
-def _process_alive(pid: int) -> bool:
-    # A zombie has already terminated even though its PID still exists. The
-    # Actions job container runs ``tail -f /dev/null`` as PID 1, which never
-    # reaps orphaned grandchildren; relying on ``os.kill(pid, 0)`` alone would
-    # therefore report a successfully killed descendant as alive forever.
-    # Read the kernel process state first and treat Z (and X/x) as dead.
+def _proc_state(pid: int) -> str | None:
+    """Return the Linux ``/proc`` state letter for ``pid`` when available."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
-        stat = ""
-    if stat:
-        try:
-            state = stat.rsplit(")", 1)[1].split()[0]
-        except IndexError:
-            return False
+        return None
+    try:
+        return stat.rsplit(")", 1)[1].split()[0]
+    except IndexError:
+        return None
+
+
+def _process_alive(pid: int) -> bool:
+    # ``kill(pid, 0)`` still succeeds for a killed-but-unreaped zombie. Some
+    # qualification runners (including the Actions job container's
+    # ``tail -f /dev/null`` PID 1) never reap orphaned grandchildren, so the
+    # watchdog's kill would look like a leak even though the descendant can no
+    # longer run. Prefer the kernel state when /proc is available and only
+    # fall back to the signal probe otherwise; treat Z (and X/x) as dead.
+    state = _proc_state(pid)
+    if state is not None:
         return state not in {"Z", "X", "x"}
     try:
         os.kill(pid, 0)
@@ -97,6 +104,36 @@ def test_unreaped_zombie_descendant_is_considered_terminated() -> None:
         pytest.fail("descendant did not become an unreaped zombie")
     finally:
         process.wait(timeout=5)
+
+
+def test_liveness_probe_treats_unreaped_zombie_as_dead() -> None:
+    """Regression coverage for qualification #7 at ff1bf985.
+
+    A descendant killed by the watchdog can remain visible as a zombie when
+    the runner's init does not reap it. The liveness probe must report that
+    terminated process as dead instead of failing the watchdog regression.
+    """
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("requires Linux /proc process state")
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])  # noqa: S603
+    try:
+        deadline = time.monotonic() + 5.0
+        state: str | None = None
+        observed = False
+        while time.monotonic() < deadline:
+            state = _proc_state(proc.pid)
+            if state is not None:
+                observed = True
+            if state == "Z":
+                break
+            if observed and state is None:
+                pytest.skip("child was reaped before its zombie state was observable")
+            time.sleep(0.01)
+        else:
+            pytest.skip(f"could not observe an unreaped zombie: {state!r}")
+        assert _process_alive(proc.pid) is False
+    finally:
+        proc.wait()
 
 
 def test_blocking_scenario_8_is_preempted_with_typed_negative_evidence(
