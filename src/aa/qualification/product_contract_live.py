@@ -54,6 +54,9 @@ from aa.qualification.live_watchdog import (
     record_live_progress,
     scenario_grace_s,
 )
+from aa.qualification.stage_outcome_vocabulary import (
+    is_structural_stage_outcome_counts as _is_structural_stage_outcome_counts,
+)
 from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.qualification.product_contract_live")
@@ -377,6 +380,12 @@ def assert_no_text_leak(payload: Any, owner: str = "live-summary") -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
             normalized_key = str(key).lower()
+            if normalized_key == "stage_outcome_counts":
+                if not _is_structural_stage_outcome_counts(value):
+                    raise ProductContractLiveError(
+                        f"{owner}: invalid fixed-vocabulary stage outcome counts"
+                    )
+                continue
             if normalized_key == "stage_latency_coverage":
                 if not _is_structural_stage_latency_coverage(value):
                     raise ProductContractLiveError(

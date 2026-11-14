@@ -132,6 +132,28 @@ def normalize_sha(value: str) -> str:
     return normalized
 
 
+def build_full_qualification_workflow_dispatch(sha: str) -> list[str]:
+    """Build the mandatory lifecycle's explicit full A/B/C/E dispatch.
+
+    The exact-main final reducer runs only the mandatory A/B/C/E gates; Gate D
+    remains excluded. Direct diagnostic dispatches keep the self-proving
+    workflow default of gate-c-focus.
+    """
+
+    normalized = normalize_sha(sha)
+    return [
+        "workflow",
+        "run",
+        "aa-self-proving-qualification.yml",
+        "--ref",
+        "main",
+        "-f",
+        f"required_sha={normalized}",
+        "-f",
+        "qualification_mode=full",
+    ]
+
+
 def parse_automation_qualification(body: str) -> int | None:
     """Return the mandatory qualification issue number, if declared."""
     match = _AUTOMATION_QUALIFICATION_RE.search(body or "")
@@ -266,6 +288,18 @@ def format_dispatch_marker(item: MandatoryQualification) -> str:
     return (
         f"<!-- continuum-qualification-required capability={item.capability} "
         f"qualification={item.qualification} sha={item.sha} contract={item.contract} -->"
+    )
+
+
+def format_result_marker(*, sha: str, result: str) -> str:
+    """Format the canonical trusted #7 result marker comment fragment."""
+    normalized_sha = normalize_sha(sha)
+    normalized_result = (result or "").strip().lower()
+    if normalized_result not in {"pass", "fail"}:
+        raise MandatoryLifecycleError("result must be pass or fail")
+    return (
+        f"<!-- continuum-qualification-result issue={QUALIFICATION_ISSUE_NUMBER} "
+        f"sha={normalized_sha} result={normalized_result} -->"
     )
 
 
@@ -1225,12 +1259,14 @@ __all__ = [
     "build_blocked_record",
     "build_dispatch_record",
     "build_dispatch_tuple",
+    "build_full_qualification_workflow_dispatch",
     "classify_runner_state",
     "classify_tracker_lease",
     "collect_qualifying_capabilities_from_pages",
     "extract_qualifying_capabilities",
     "format_blocked_reason",
     "format_dispatch_marker",
+    "format_result_marker",
     "format_shared_dispatch_marker",
     "gate_capability_completion",
     "is_genuinely_active_run",

@@ -22,8 +22,12 @@ Authoritative Gates A-F for the exact current ``main`` SHA:
   exact-question whitelists), response-diversity assertion, privacy-safe
   per-stage outcomes and latency only.
 - Gate E -- live performance/SLO: end-to-end and per-stage latency,
-  p50/p95, hard guard (no ordinary turn >= 30s), typing heartbeat
-  continuity verified independently.
+  p50/p95, and typing-heartbeat continuity verified independently. The
+  executable policy defaults to ``observe`` (collect measurements without
+  timing FAIL). In explicit ``enforce`` mode, p95 is compared with the
+  configured target (default 60s) and each ordinary turn with the configured
+  maximum (default 120s). Runtime turn-time limits are disabled by default;
+  reliability and evidence-integrity failures still block qualification.
 - Gate F -- exact-main final verdict: PASS only if A/B/C/E PASS for the exact
   same current main SHA and matching product/runtime fingerprints. No stale
   reuse, no manual override.
@@ -53,6 +57,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from aa.config import DEFAULT_AA_AGENT
+from aa.qualification.stage_outcome_vocabulary import (
+    is_structural_stage_outcome_counts as _is_structural_stage_outcome_counts,
+)
 from aa.time_policy import current_time_policy, evaluate_latency_thresholds
 
 ISSUE_NUMBER = 146
@@ -429,6 +436,12 @@ def assert_no_text_leak(payload: Any, owner: str = "self-proving") -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
             normalized_key = str(key).lower()
+            if normalized_key == "stage_outcome_counts":
+                if not _is_structural_stage_outcome_counts(value):
+                    raise SelfProvingError(
+                        f"{owner}: invalid fixed-vocabulary stage outcome counts"
+                    )
+                continue
             if normalized_key == "stage_latency_coverage":
                 if not _is_structural_stage_latency_coverage(value):
                     raise SelfProvingError(
