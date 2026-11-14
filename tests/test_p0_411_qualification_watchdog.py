@@ -34,6 +34,9 @@ from aa.qualification.product_contract_live import LaneResult, LiveSummary
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
+# Observing an unreaped zombie requires the Linux /proc interface; the
+# os.kill fallback used by _process_alive cannot distinguish a zombie.
+_PROC_STAT_AVAILABLE = Path("/proc/self/stat").exists()
 
 
 def _process_alive(pid: int) -> bool:
@@ -70,9 +73,16 @@ def _wait_dead(pid: int, timeout_s: float = 10.0) -> bool:
     return not _process_alive(pid)
 
 
+@pytest.mark.skipif(
+    not _PROC_STAT_AVAILABLE,
+    reason="requires Linux /proc to observe an unreaped zombie descendant",
+)
 def test_unreaped_zombie_descendant_is_considered_terminated() -> None:
     process = subprocess.Popen(["sleep", "60"])  # noqa: S607
     try:
+        # Pin the live direction first: a helper that always reported "dead"
+        # would otherwise satisfy the zombie assertion below vacuously.
+        assert _process_alive(process.pid) is True
         process.kill()
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
