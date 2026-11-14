@@ -291,6 +291,18 @@ def format_dispatch_marker(item: MandatoryQualification) -> str:
     )
 
 
+def format_result_marker(*, sha: str, result: str) -> str:
+    """Format the canonical trusted #7 result marker comment fragment."""
+    normalized_sha = normalize_sha(sha)
+    normalized_result = (result or "").strip().lower()
+    if normalized_result not in {"pass", "fail"}:
+        raise MandatoryLifecycleError("result must be pass or fail")
+    return (
+        f"<!-- continuum-qualification-result issue={QUALIFICATION_ISSUE_NUMBER} "
+        f"sha={normalized_sha} result={normalized_result} -->"
+    )
+
+
 def parse_dispatch_markers(bodies: list[str]) -> list[MandatoryQualification]:
     """Parse immutable dispatch markers from comment bodies in order."""
     out: list[MandatoryQualification] = []
@@ -1254,6 +1266,7 @@ __all__ = [
     "extract_qualifying_capabilities",
     "format_blocked_reason",
     "format_dispatch_marker",
+    "format_result_marker",
     "format_shared_dispatch_marker",
     "gate_capability_completion",
     "is_genuinely_active_run",

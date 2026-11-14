@@ -555,7 +555,17 @@ def test_privacy_guard_allows_closed_stage_outcome_counts_and_rejects_text() -> 
             }
         }
     }
-    for payload in (partial_counts, completed_counts):
+    # A snapshot emitted before every stage has run legitimately carries
+    # only the stages observed so far, even in the *_outcome shape.
+    partial_completed_counts = {
+        "metrics": {
+            "stage_outcome_counts": {
+                "planner_outcome": {"invoked": 1},
+                "verifier_outcome": {"passed": 1},
+            }
+        }
+    }
+    for payload in (partial_counts, completed_counts, partial_completed_counts):
         assert_no_text_leak(payload)
         self_proving_mod.assert_no_text_leak(payload)
 

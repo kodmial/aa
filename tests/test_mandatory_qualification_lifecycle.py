@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from aa.qualification import mandatory_lifecycle as lifecycle
 
@@ -250,6 +251,22 @@ def test_mandatory_dispatch_explicitly_selects_full_qualification_mode() -> None
     reconciler = RECONCILER.read_text(encoding="utf-8")
     assert "build_full_qualification_workflow_dispatch(owner_item.sha)" in reconciler
 
+    workflow = yaml.safe_load(SELF_PROVING_WORKFLOW.read_text(encoding="utf-8"))
+    # PyYAML 1.1 interprets an unquoted GitHub Actions "on" as True.
+    triggers = workflow.get("on") or workflow.get(True)
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert {"required_sha", "qualification_mode"} <= set(inputs)
+    qualification_mode = inputs["qualification_mode"]
+    assert qualification_mode["type"] == "string"
+    assert qualification_mode["required"] is False
+    # The dispatch command must select a declared owner option, not an
+    # unknown input that would fail with GitHub's unexpected-inputs error.
+    assert "full" in qualification_mode["description"]
+    assert "gate-c-focus" in qualification_mode["description"]
+    assert "qualification_mode=full" in command
+    dispatch_inputs = {item.split("=", 1)[0] for item in command if "=" in item}
+    assert dispatch_inputs <= set(inputs)
+
     with pytest.raises(lifecycle.MandatoryLifecycleError):
         lifecycle.build_full_qualification_workflow_dispatch("not-an-exact-sha")
 
@@ -259,10 +276,10 @@ def test_mandatory_workflow_result_comment_trigger_requires_canonical_marker() -
     # Status prose may mention a missing result marker; it must not dispatch
     # the qualification lifecycle. Only the canonical issue-7 marker prefix
     # is an eligible event trigger.
-    assert (
-        "contains(github.event.comment.body, '<!-- continuum-qualification-result issue=7 sha=')"
-        in body
-    )
+    marker = lifecycle.format_result_marker(sha=SHA_A, result="pass")
+    trigger_prefix = marker.split(SHA_A, 1)[0]
+    assert trigger_prefix == "<!-- continuum-qualification-result issue=7 sha="
+    assert f"contains(github.event.comment.body, '{trigger_prefix}')" in body
     broad_match = "contains(github.event.comment.body, 'continuum-qualification-result')"
     assert broad_match not in body
 
