@@ -360,7 +360,15 @@ def _lane_source() -> str:
     from aa.qualification import product_contract_live as live_mod
 
     lines, _ = inspect.getsourcelines(live_mod.run_live_telegram_evidence_lane)
-    return "".join(lines)
+    source = "".join(lines)
+    # The deterministic Telegram seam is shared with the short Gate C canary
+    # (kodmial/aa#514) and therefore lives at module scope. Include its source
+    # so the lane wiring invariants still inspect the exact seam the lane uses.
+    seam = getattr(live_mod, "QualificationTelegramApi", None)
+    if seam is not None:
+        seam_lines, _ = inspect.getsourcelines(seam)
+        source += "".join(seam_lines)
+    return source
 
 
 def test_lane_quarantines_late_deliveries_and_resets_per_scenario() -> None:

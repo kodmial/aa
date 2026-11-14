@@ -1188,6 +1188,99 @@ jobs:
             echo "::error::Gate C bootstrap failed after L1/L2 attempts (strict E5 rebuild unavailable)."
             exit 1
           fi
+      - name: Gate C canary - bounded diagnostic preflight (kodmial/aa#514)
+        # Short, provider-aware diagnostic gate BEFORE the unchanged 18-case
+        # campaign. A deterministic observer/server self-test runs first; only
+        # then one or two existing core scenarios. READY is the only outcome
+        # that authorizes Gate C. BLOCKED/INCONCLUSIVE/FAIL publishes a typed
+        # artifact and stops here; it never becomes a product PASS or FAIL.
+        # The shared prepared image, canonical corpus and L1/L2 index from the
+        # bootstrap above are reused: no pip install, model download or E5
+        # rebuild in this step.
+        id: gate-c-canary
+        if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
+        shell: bash
+        env:
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          SELF_PROVING_LIVE: "1"
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+        run: |
+          set -euo pipefail
+          # A validated Gate C checkpoint means these scenarios already ran;
+          # the diagnostic canary is not part of the resumed gate evidence.
+          CKPT_DIR="${RUNNER_TEMP:-/tmp}/aa-self-proving-checkpoints"
+          if python scripts/run_self_proving_qualification.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir self-proving-out --run-id "${{ github.run_id }}" \
+            --checkpoint-dir "$CKPT_DIR" --check-skip C; then
+            echo "Gate C validated checkpoint present; diagnostic canary skipped (resume)."
+            exit 0
+          fi
+          canary_dir="live-out/gate-c-canary"
+          mkdir -p "$canary_dir"
+          set +e
+          python scripts/run_gate_c_canary.py \
+            --main-sha "${{ steps.sha.outputs.sha }}" \
+            --out-dir "$canary_dir" \
+            --run-id "${{ github.run_id }}" \
+            --preflight-budget-s 600 \
+            --live-probe-budget-s 300 \
+            --scenario-limit 2
+          canary_rc=$?
+          set -e
+          python - "$canary_dir/gate-c-canary-result.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              payload = {}
+          if not isinstance(payload, dict):
+              payload = {}
+          budget = payload.get("budget", {}) if isinstance(payload, dict) else {}
+          coverage = payload.get("evidence_coverage", {}) if isinstance(payload, dict) else {}
+          rows = [
+              "| Gate C diagnostic canary (kodmial/aa#514) | value |",
+              "| --- | --- |",
+              f"| status | {str(payload.get('status', 'missing'))[:32]} |",
+              f"| reason | {str(payload.get('reason', 'missing'))[:64]} |",
+              f"| real turns | {str(payload.get('real_turn_count', 0))[:8]} |",
+              f"| stage / attempt / causality | {str(coverage.get('stage', 'missing'))[:16]} / "
+              f"{str(coverage.get('attempt', 'missing'))[:16]} / "
+              f"{str(coverage.get('causality', 'missing'))[:16]} |",
+              f"| server events | {str(coverage.get('server_events', 'unobserved'))[:16]} |",
+              f"| budget | {str(budget.get('category', 'missing'))[:32]} |",
+              f"| elapsed s | {str(budget.get('elapsed_s', 0))[:12]} |",
+              "| product qualified / Gate C executed | false / false |",
+          ]
+          missing = payload.get("missing_fields") or [] if isinstance(payload, dict) else []
+          if missing:
+              rows.append(
+                  "Missing fields: " + ", ".join(str(item)[:64] for item in missing[:12]) + "."
+              )
+          print("\n".join(rows))
+          PY
+          if [[ "$canary_rc" -ne 0 ]]; then
+            echo "::error::Gate C diagnostic canary is not READY (exit ${canary_rc}); refusing the 18-case campaign."
+            exit "$canary_rc"
+          fi
+
+      - name: Upload Gate C diagnostic canary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-gate-c-canary-${{ github.run_attempt }}
+          path: |
+            live-out/gate-c-canary/gate-c-canary-result.json
+            live-out/gate-c-canary/self-test/
+            live-out/gate-c-canary/real-path/attempt-observer/
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
       - name: Gate C - LIVE exact production conversation path
         id: gate-c
         if: ${{ needs.qualify.result == 'success' || needs.qualify.result == 'skipped' }}
@@ -1213,6 +1306,43 @@ jobs:
             echo "Gate C validated checkpoint present; skipping (resume)."
             exit 0
           fi
+          # kodmial/aa#514: the 18-case campaign may only start after the short
+          # diagnostic canary explicitly reached READY on this exact SHA.
+          CANARY_RESULT="live-out/gate-c-canary/gate-c-canary-result.json"
+          python - "$CANARY_RESULT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          try:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              print(
+                  "::error::Gate C canary result is missing or unreadable; refusing the 18-case campaign.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(2)
+          if payload.get("status") != "READY":
+              print(
+                  "::error::Gate C canary is not READY; refusing the 18-case campaign.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(2)
+          if payload.get("product_qualified") is not False or payload.get("gate_c_executed") is not False:
+              print(
+                  "::error::Gate C canary artifact claims a product/Gate C verdict; refusing.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(2)
+          if str(payload.get("main_sha", "")) != "${{ steps.sha.outputs.sha }}":
+              print(
+                  "::error::Gate C canary artifact SHA does not match this exact main; refusing.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(2)
+          print("Gate C canary READY on the exact main SHA.")
+          PY
           # Repository-owned live gate: real local OpenCode process and real
           # configured runtime provider/model policy, real decrypted RU corpus
           # + real production index, synthetic Telegram Updates injected only

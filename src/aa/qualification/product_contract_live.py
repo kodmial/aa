@@ -57,6 +57,7 @@ from aa.qualification.live_watchdog import (
 from aa.qualification.stage_outcome_vocabulary import (
     is_structural_stage_outcome_counts as _is_structural_stage_outcome_counts,
 )
+from aa.telegram.transport import TelegramApi
 from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.qualification.product_contract_live")
@@ -1790,6 +1791,89 @@ def _live_prerequisites() -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
+class QualificationTelegramApi(TelegramApi):
+    """Deterministic Telegram network seam; production transport stays real.
+
+    Shared by the full live lane and the short diagnostic canary
+    (kodmial/aa#514) so both exercise the same raw-update/delivery seam
+    without duplicating a second harness.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.sent_texts: list[str] = []
+        self.sent_voices = 0
+        self.chat_actions = 0
+        self.download_count = 0
+        self.voice_fixture = b""
+        self.pending_updates: list[dict[str, Any]] = []
+        # Stalled-turn quiescence (kodmial/aa#417): while active,
+        # deliveries from an abandoned turn are diverted into a
+        # privacy-safe quarantine and can never satisfy the next
+        # scenario's wait or leak into ``sent_texts``.
+        self.quiescing_reason = ""
+        self.quarantined_texts: list[dict[str, Any]] = []
+
+    def begin_quiescence(self, reason: str) -> None:
+        self.quiescing_reason = str(reason or "unknown")[:32]
+
+    def end_quiescence(self) -> None:
+        self.quiescing_reason = ""
+
+    async def call(self, method: str, payload: dict[str, Any]) -> Any:
+        self.calls.append((method, dict(payload)))
+        if method == "getMe":
+            return {"id": 700000001, "is_bot": True, "username": "aa_qualification_bot"}
+        if method in {
+            "deleteWebhook",
+            "setMyCommands",
+            "setMyDescription",
+            "setMyShortDescription",
+        }:
+            return True
+        if method == "getUpdates":
+            if self.pending_updates:
+                batch = list(self.pending_updates)
+                self.pending_updates.clear()
+                return batch
+            await asyncio.sleep(0.01)
+            return []
+        if method == "sendChatAction":
+            self.chat_actions += 1
+            return True
+        if method == "sendMessage":
+            if self.quiescing_reason:
+                # The abandoned turn's late delivery: recorded as
+                # counts/identity only, never handed to scenario waits,
+                # never attributed to any later scenario.
+                try:
+                    chat_id = int(payload.get("chat_id", 0))
+                except (TypeError, ValueError):
+                    chat_id = 0
+                self.quarantined_texts.append({"chat_id": chat_id, "reason": self.quiescing_reason})
+                return {"message_id": 900000 + len(self.quarantined_texts)}
+            value = payload.get("text")
+            self.sent_texts.append(value if isinstance(value, str) else "")
+            return {"message_id": len(self.sent_texts)}
+        if method == "getFile":
+            return {"file_path": "qualification/voice.ogg"}
+        raise ProductContractLiveError(f"unexpected qualification Telegram method: {method}")
+
+    async def download_file(self, file_path: str) -> bytes:
+        _ = file_path
+        self.download_count += 1
+        if not self.voice_fixture:
+            raise ProductContractLiveError("qualification voice fixture is missing")
+        return bytes(self.voice_fixture)
+
+    async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
+        _ = chat_id
+        if not ogg_bytes:
+            raise ProductContractLiveError("empty qualification voice payload")
+        self.sent_voices += 1
+        return {"message_id": 1000 + self.sent_voices}
+
+
 def _is_service_link_only_text(reply: str) -> bool:
     """Whether a sent reply is only a service source link without help.
 
@@ -2161,6 +2245,23 @@ HELD_OUT_CORPUS_PATH = "qualification/held_out_v1.json"
 # ``c-regression-preserved-18`` check so old scenario coverage is never
 # silently dropped or mistaken for independent proof.
 GATE_C_REGRESSION_SCENARIO_COUNT = 18
+
+# The first two canonical core scenarios are also the short diagnostic
+# canary surface (kodmial/aa#514). They are the same literal definitions the
+# full 18-scenario campaign executes; the canary never introduces a separate
+# prompt or a prompt-specific acceptance rule.
+GATE_C_CANARY_SCENARIOS: tuple[tuple[str, int, str], ...] = (
+    (
+        "meta-capability",
+        920001,
+        "Чем ты вообще можешь быть полезен здесь?",
+    ),
+    (
+        "substantive-drinking",
+        920002,
+        "К вечеру очень тянет выпить, как с этим обходиться?",
+    ),
+)
 
 
 def _blocked_provenance_for_lane(
@@ -2896,90 +2997,9 @@ async def run_live_telegram_evidence_lane(
             contains_cyrillic,
             leaks_internal_terms,
         )
-        from aa.telegram.transport import PollingTelegramTransport, TelegramApi
+        from aa.telegram.transport import PollingTelegramTransport
 
-        class _QualificationTelegramApi(TelegramApi):
-            """Deterministic Telegram network seam; production transport stays real."""
-
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, dict[str, Any]]] = []
-                self.sent_texts: list[str] = []
-                self.sent_voices = 0
-                self.chat_actions = 0
-                self.download_count = 0
-                self.voice_fixture = b""
-                self.pending_updates: list[dict[str, Any]] = []
-                # Stalled-turn quiescence (kodmial/aa#417): while active,
-                # deliveries from an abandoned turn are diverted into a
-                # privacy-safe quarantine and can never satisfy the next
-                # scenario's wait or leak into ``sent_texts``.
-                self.quiescing_reason = ""
-                self.quarantined_texts: list[dict[str, Any]] = []
-
-            def begin_quiescence(self, reason: str) -> None:
-                self.quiescing_reason = str(reason or "unknown")[:32]
-
-            def end_quiescence(self) -> None:
-                self.quiescing_reason = ""
-
-            async def call(self, method: str, payload: dict[str, Any]) -> Any:
-                self.calls.append((method, dict(payload)))
-                if method == "getMe":
-                    return {"id": 700000001, "is_bot": True, "username": "aa_qualification_bot"}
-                if method in {
-                    "deleteWebhook",
-                    "setMyCommands",
-                    "setMyDescription",
-                    "setMyShortDescription",
-                }:
-                    return True
-                if method == "getUpdates":
-                    if self.pending_updates:
-                        batch = list(self.pending_updates)
-                        self.pending_updates.clear()
-                        return batch
-                    await asyncio.sleep(0.01)
-                    return []
-                if method == "sendChatAction":
-                    self.chat_actions += 1
-                    return True
-                if method == "sendMessage":
-                    if self.quiescing_reason:
-                        # The abandoned turn's late delivery: recorded as
-                        # counts/identity only, never handed to scenario
-                        # waits, never attributed to any later scenario.
-                        try:
-                            chat_id = int(payload.get("chat_id", 0))
-                        except (TypeError, ValueError):
-                            chat_id = 0
-                        self.quarantined_texts.append(
-                            {"chat_id": chat_id, "reason": self.quiescing_reason}
-                        )
-                        return {"message_id": 900000 + len(self.quarantined_texts)}
-                    value = payload.get("text")
-                    self.sent_texts.append(value if isinstance(value, str) else "")
-                    return {"message_id": len(self.sent_texts)}
-                if method == "getFile":
-                    return {"file_path": "qualification/voice.ogg"}
-                raise ProductContractLiveError(
-                    f"unexpected qualification Telegram method: {method}"
-                )
-
-            async def download_file(self, file_path: str) -> bytes:
-                _ = file_path
-                self.download_count += 1
-                if not self.voice_fixture:
-                    raise ProductContractLiveError("qualification voice fixture is missing")
-                return bytes(self.voice_fixture)
-
-            async def send_voice(self, chat_id: int, ogg_bytes: bytes) -> Any:
-                _ = chat_id
-                if not ogg_bytes:
-                    raise ProductContractLiveError("empty qualification voice payload")
-                self.sent_voices += 1
-                return {"message_id": 1000 + self.sent_voices}
-
-        api = _QualificationTelegramApi()
+        api = QualificationTelegramApi()
         settings = replace(
             Settings.from_env(None),
             bot_session_duration_seconds=0.0,
@@ -3315,16 +3335,7 @@ async def run_live_telegram_evidence_lane(
             # only failure categories/metrics, never this prompt corpus, so
             # implementation cannot special-case exact questions.
             core_scenarios: tuple[tuple[str, int, str], ...] = (
-                (
-                    "meta-capability",
-                    920001,
-                    "Чем ты вообще можешь быть полезен здесь?",
-                ),
-                (
-                    "substantive-drinking",
-                    920002,
-                    "К вечеру очень тянет выпить, как с этим обходиться?",
-                ),
+                *GATE_C_CANARY_SCENARIOS,
                 (
                     "family-relationship",
                     920003,
@@ -5710,8 +5721,10 @@ __all__ = [
     "CAPABILITY_ISSUE",
     "EXIT_BY_STATUS",
     "FORBIDDEN_SUMMARY_KEYS",
+    "GATE_C_CANARY_SCENARIOS",
     "GATE_C_REGRESSION_SCENARIO_COUNT",
     "LIVE_TEXT_LATENCY_BUDGET_S",
+    "QualificationTelegramApi",
     "LaneResult",
     "LiveSummary",
     "ProductContractLiveError",
