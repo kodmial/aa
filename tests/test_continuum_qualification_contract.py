@@ -327,20 +327,29 @@ def test_opencode_caller_accepts_shared_watchdog_429_recovery_contract() -> None
     assert len(dispatch) <= 25  # GitHub workflow_dispatch input limit
     # The watchdog includes unresolved_items_json even for issue-mode recoveries.
     for field in (
-        "mode", "issue_number", "pr_number", "head_ref", "review_id",
-        "unresolved_items_json", "run_id", "base_ref",
-        "capability_number", "qualification_number", "required_sha",
+        "mode",
+        "issue_number",
+        "pr_number",
+        "head_ref",
+        "review_id",
+        "unresolved_items_json",
+        "run_id",
+        "base_ref",
+        "capability_number",
+        "qualification_number",
+        "required_sha",
         "recovery_identity",
     ):
         assert field in dispatch, field
 
     call_inputs = parsed["jobs"]["call"]["with"]
-    assert call_inputs["unresolved_items_json"] == (
-        "${{ inputs.unresolved_items_json }}"
-    )
+    assert call_inputs["unresolved_items_json"] == ("${{ inputs.unresolved_items_json }}")
     for field in (
-        "recovery_operation_id", "recovery_checkpoint_ref",
-        "recovery_checkpoint_sha", "recovery_stage", "recovery_generation",
+        "recovery_operation_id",
+        "recovery_checkpoint_ref",
+        "recovery_checkpoint_sha",
+        "recovery_stage",
+        "recovery_generation",
     ):
         assert call_inputs[field] == (
             "${{ inputs.recovery_identity && "
