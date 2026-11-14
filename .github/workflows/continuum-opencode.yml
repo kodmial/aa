@@ -5,7 +5,12 @@ name: OpenCode agent
 # and an `issue`-mode dispatch therefore report the issue number; the repair
 # modes report the pull request number.
 run-name: >-
-  ${{ github.event_name == 'issue_comment' &&
+  ${{ github.event_name == 'workflow_dispatch' &&
+      inputs.recovery_identity &&
+      format('OpenCode 429 recovery {0} gen {1}',
+        fromJSON(inputs.recovery_identity).recovery_operation_id,
+        fromJSON(inputs.recovery_identity).recovery_generation) ||
+      github.event_name == 'issue_comment' &&
       format('OpenCode issue #{0}', github.event.issue.number) ||
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'issue' &&
@@ -49,6 +54,10 @@ on:
         type: string
       review_id:
         description: "Source CodeRabbit review id"
+        required: false
+        type: string
+      unresolved_items_json:
+        description: "Optional exact CodeRabbit finding batch for recovery"
         required: false
         type: string
       run_id:
@@ -123,6 +132,10 @@ on:
         description: "Exact main SHA a qualification run must test"
         required: false
         type: string
+      recovery_identity:
+        description: "Packed trusted Continuum 429 recovery identity (checkpoint, stage and generation)"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -152,6 +165,7 @@ jobs:
       pr_number: "${{ inputs.pr_number }}"
       head_ref: "${{ inputs.head_ref }}"
       review_id: "${{ inputs.review_id }}"
+      unresolved_items_json: "${{ inputs.unresolved_items_json }}"
       run_id: "${{ inputs.run_id }}"
       ci_workflow_id: "${{ inputs.ci_workflow_id }}"
       base_ref: "${{ inputs.base_ref }}"
@@ -194,3 +208,10 @@ jobs:
       capability_number: "${{ inputs.capability_number }}"
       qualification_number: "${{ inputs.qualification_number }}"
       required_sha: "${{ inputs.required_sha }}"
+      # The watchdog supplies one packed identity to fit workflow_dispatch's
+      # 25-input limit; pass explicit fields to the reusable recovery engine.
+      recovery_operation_id: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_operation_id || '' }}"
+      recovery_checkpoint_ref: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_ref || '' }}"
+      recovery_checkpoint_sha: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_sha || '' }}"
+      recovery_stage: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_stage || '' }}"
+      recovery_generation: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_generation || '' }}"
