@@ -81,6 +81,13 @@ class _FakeOpenCodeHandler(http.server.BaseHTTPRequestHandler):
             for frame in str(payload).splitlines():
                 if frame:
                     self.wfile.write((frame + "\n").encode("utf-8"))
+            self.wfile.flush()
+            # A live pinned server keeps the SSE connection open after the
+            # available frames; this double must do the same so a fixed-size
+            # blocking read cannot silently discard the already-received
+            # event window.
+            hold = self._state.get("sse_hold_s", 0.0)
+            time.sleep(float(hold) if isinstance(hold, (int, float)) else 0.0)
         else:
             self._send_json(404, {"error": "unknown"})
 
@@ -149,6 +156,43 @@ def test_snapshot_supported_and_closed_vocabulary() -> None:
             "error": "",
             "progress_meaning": "none",
         }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_live_streaming_sse_frames_are_parsed_before_the_stream_closes() -> None:
+    """Frames already sent on an open stream must not be lost to a timeout."""
+    frames = [
+        {
+            "type": "session.status",
+            "data": {"sessionID": "ses_1", "status": {"type": "busy"}},
+        },
+        {
+            "type": "session.execution.failed",
+            "data": {
+                "sessionID": "ses_1",
+                "error": {"type": "APIError", "status": 503, "message": SECRET},
+            },
+        },
+    ]
+    state: dict[str, object] = {
+        "doc_supported": True,
+        "session_status": {"ses_1": {"type": "busy"}},
+        "events": "\n".join(f"data: {json.dumps(frame)}" for frame in frames),
+        "sse_hold_s": 0.5,
+    }
+    server = _mk_server(state)
+    try:
+        evidence = _run(_probe_for(server, timeout_s=0.2).snapshot())
+        assert evidence["state"] == "supported"
+        counts = cast(dict[str, int], evidence["event_type_counts"])
+        assert counts.get("session.status") == 1
+        assert counts.get("session.execution.failed") == 1
+        assert evidence["server_error_status_code"] == 503
+        assert evidence["server_error_kind"] == "APIError"
+        # The provider message must never survive into evidence.
+        assert SECRET not in json.dumps(evidence)
     finally:
         server.shutdown()
         server.server_close()
