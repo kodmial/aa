@@ -20,7 +20,7 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 OPENCODE_CALLER = WORKFLOWS / "continuum-opencode.yml"
 OPENCODE_WATCHDOG = WORKFLOWS / "continuum-opencode-watchdog.yml"
 SCHEDULER_CALLER = WORKFLOWS / "continuum-issue-scheduler.yml"
-DEFAULT_DISPATCH_MARKER = "<!-- issue-scheduler-dispatch -->"
+SCHEDULER_ORIGIN_MARKER = "<!-- continuum-origin role=continuum component=issue-scheduler -->"
 
 TRUSTED_ASSOCIATIONS = ("'OWNER'", "'MEMBER'", "'COLLABORATOR'")
 RESULT_MARKERS = (
@@ -57,18 +57,50 @@ def _caller_pause_on_failure_expression() -> str:
     return expression
 
 
+def _scheduler_with_inputs() -> dict[str, Any]:
+    data = yaml.safe_load(_read(SCHEDULER_CALLER))
+    with_inputs = data["jobs"]["call"]["with"]
+    assert isinstance(with_inputs, dict)
+    return with_inputs
+
+
+def _scheduler_dispatch_marker() -> str:
+    expression = _scheduler_with_inputs()["dispatch_marker"]
+    assert isinstance(expression, str)
+    if "${{" not in expression:
+        return expression.strip()
+    match = re.search(r"\|\|\s*'([^']*)'\s*\}\}", expression)
+    assert match is not None, expression
+    return match.group(1)
+
+
+def _scheduler_pause_on_failure() -> str:
+    value = _scheduler_with_inputs()["pause_on_failure"]
+    assert isinstance(value, str)
+    assert value in {"true", "false"}
+    return value
+
+
+def _scheduler_dispatch_body(marker: str) -> str:
+    return f"/oc\n\n{marker}\n{SCHEDULER_ORIGIN_MARKER}"
+
+
 def _evaluate_pause_on_failure(
     *,
     comment_body: str | None,
     dispatch_marker: str,
     pause_on_failure: str,
     vars_dispatch_marker: str = "",
+    comment_user_login: str | None = "github-actions[bot]",
+    repository_owner: str = "owner",
 ) -> str:
     """Evaluate the caller's GitHub expression without a live workflow run."""
     expression = _caller_pause_on_failure_expression()
     assert expression.startswith("${{") and expression.endswith("}}")
     py = expression[3:-2].strip()
+    py = py.replace("github.event.comment.user.login", "COMMENT_USER_LOGIN")
     py = py.replace("github.event.comment.body", "COMMENT_BODY")
+    py = py.replace("github.repository_owner", "REPOSITORY_OWNER")
     py = py.replace("inputs.dispatch_marker", "DISPATCH_MARKER")
     py = py.replace("vars.AUTOMATION_DISPATCH_MARKER", "VARS_DISPATCH_MARKER")
     py = py.replace("inputs.pause_on_failure", "PAUSE_ON_FAILURE")
@@ -82,8 +114,10 @@ def _evaluate_pause_on_failure(
         {"__builtins__": {}, "contains": contains},
         {
             "COMMENT_BODY": comment_body,
+            "COMMENT_USER_LOGIN": comment_user_login,
             "DISPATCH_MARKER": dispatch_marker,
             "PAUSE_ON_FAILURE": pause_on_failure,
+            "REPOSITORY_OWNER": repository_owner,
             "VARS_DISPATCH_MARKER": vars_dispatch_marker,
         },
     )
@@ -104,45 +138,80 @@ def test_opencode_caller_matches_scheduler_pause_policy() -> None:
     # kodmial/aa#506: the scheduler is non-terminal (`pause_on_failure:
     # "false"`). A scheduler-generated `/oc` comment must inherit that policy
     # instead of adding a terminal pause the scheduler then clears, which
-    # produced a pause/unpause/re-dispatch loop.
-    assert DEFAULT_DISPATCH_MARKER in _caller_pause_on_failure_expression()
+    # produced a pause/unpause/re-dispatch loop. Read both the marker and the
+    # policy from the scheduler caller so this contract cannot silently drift.
+    scheduler_marker = _scheduler_dispatch_marker()
+    scheduler_pause = _scheduler_pause_on_failure()
+    assert scheduler_marker in _caller_pause_on_failure_expression()
+    assert SCHEDULER_ORIGIN_MARKER in _caller_pause_on_failure_expression()
     assert (
         _evaluate_pause_on_failure(
-            comment_body=f"Implementation dispatch\n{DEFAULT_DISPATCH_MARKER}",
+            comment_body=_scheduler_dispatch_body(scheduler_marker),
             dispatch_marker="",
             pause_on_failure="",
+            comment_user_login="owner",
+            repository_owner="owner",
         )
-        == "false"
+        == scheduler_pause
+    )
+    # The reusable scheduler may also post through the workflow token.
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body=_scheduler_dispatch_body(scheduler_marker),
+            dispatch_marker="",
+            pause_on_failure="",
+            comment_user_login="github-actions[bot]",
+            repository_owner="owner",
+        )
+        == scheduler_pause
     )
     # A custom repository marker is honoured on issue_comment runs, where the
     # workflow_dispatch `inputs` context is unavailable. This matches the
     # scheduler, which resolves the same AUTOMATION_DISPATCH_MARKER variable.
     assert (
         _evaluate_pause_on_failure(
-            comment_body="dispatch <!-- custom-marker -->",
+            comment_body=_scheduler_dispatch_body("<!-- custom-marker -->"),
             dispatch_marker="",
             pause_on_failure="",
             vars_dispatch_marker="<!-- custom-marker -->",
+            comment_user_login="owner",
+            repository_owner="owner",
         )
-        == "false"
+        == scheduler_pause
     )
     # An explicit dispatch marker still wins over the repository variable.
     assert (
         _evaluate_pause_on_failure(
-            comment_body="dispatch <!-- input-marker -->",
+            comment_body=_scheduler_dispatch_body("<!-- input-marker -->"),
             dispatch_marker="<!-- input-marker -->",
             pause_on_failure="",
             vars_dispatch_marker="<!-- other-marker -->",
+            comment_user_login="owner",
+            repository_owner="owner",
         )
-        == "false"
+        == scheduler_pause
     )
     # Manual owner `/oc` comments are not scheduler dispatches and keep the
-    # bounded terminal-pause default.
+    # bounded terminal-pause default, even when they quote the public marker.
     assert (
         _evaluate_pause_on_failure(
-            comment_body="/oc",
+            comment_body=f"/oc\n\n> {scheduler_marker}",
             dispatch_marker="",
             pause_on_failure="",
+            comment_user_login="owner",
+            repository_owner="owner",
+        )
+        == "true"
+    )
+    # The public marker alone is not automation identity: a non-owner comment
+    # cannot claim the scheduler's non-terminal policy merely by copying it.
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body=_scheduler_dispatch_body(scheduler_marker),
+            dispatch_marker="",
+            pause_on_failure="",
+            comment_user_login="random-user",
+            repository_owner="owner",
         )
         == "true"
     )
@@ -153,6 +222,7 @@ def test_opencode_caller_matches_scheduler_pause_policy() -> None:
             comment_body=None,
             dispatch_marker="",
             pause_on_failure="",
+            comment_user_login=None,
         )
         == "true"
     )
@@ -161,6 +231,7 @@ def test_opencode_caller_matches_scheduler_pause_policy() -> None:
             comment_body=None,
             dispatch_marker="",
             pause_on_failure="false",
+            comment_user_login=None,
         )
         == "false"
     )
@@ -186,7 +257,7 @@ def test_opencode_watchdog_bounded_and_non_terminal() -> None:
     # Duplicate watcher loops would duplicate recovery comments/dispatches.
     watching = sorted(
         path.name
-        for path in WORKFLOWS.glob("*.yml")
+        for path in (*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml"))
         if "continuum-opencode-watchdog.yml@" in path.read_text(encoding="utf-8")
     )
     assert watching == [OPENCODE_WATCHDOG.name]

@@ -42,16 +42,20 @@ proposals #505–#508.
 - The AA issue scheduler is pinned to non-terminal convergence
   (`pause_on_failure: "false"`), so a failed dispatch must return the issue
   to the scheduler lease/backoff instead of entering a human-gated pause.
-- The OpenCode caller now detects a scheduler dispatch marker on an
+- The OpenCode caller now detects a scheduler dispatch on an
   `issue_comment` run and forwards `pause_on_failure: "false"` for that run.
-  Marker resolution matches the scheduler exactly: explicit dispatch input,
-  then the `AUTOMATION_DISPATCH_MARKER` repository variable, then the
-  upstream `<!-- issue-scheduler-dispatch -->` default. Manual owner
-  `/oc`/`/opencode` comments, review comments and explicit
-  `workflow_dispatch` calls keep the bounded terminal-pause default, and an
-  explicit dispatch input still overrides it. Without this, the OpenCode
-  recovery job added `automation:paused` while the scheduler kept clearing
-  it and re-dispatching the issue: a pause/unpause/re-dispatch loop (#506).
+  The comment must be authored by the scheduler's automation identity (the
+  repository owner's `TAP_PAT` or `github-actions[bot]`) and carry both the
+  dispatch marker and the scheduler origin marker. Marker resolution matches
+  the scheduler exactly: explicit dispatch input, then the
+  `AUTOMATION_DISPATCH_MARKER` repository variable, then the upstream
+  `<!-- issue-scheduler-dispatch -->` default. Manual owner `/oc`/`/opencode`
+  comments (including ones that quote a scheduler dispatch), review comments
+  and explicit `workflow_dispatch` calls keep the bounded terminal-pause
+  default, and an explicit dispatch input still overrides it. Without this,
+  the OpenCode recovery job added `automation:paused` while the scheduler
+  kept clearing it and re-dispatching the issue: a pause/unpause/re-dispatch
+  loop (#506).
 - `max_dispatch_attempts` stays at the reviewed caller default (`5`); the
   change does not reset dispatch counters or weaken the repair budget.
 

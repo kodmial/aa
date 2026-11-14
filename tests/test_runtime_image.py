@@ -65,7 +65,7 @@ def test_digest_file_and_runtime_pin_are_immutable_and_consistent() -> None:
 def test_promoted_image_is_not_the_stale_opencode_1_build() -> None:
     promoted = _read(ROOT / "docker" / "aa-runtime.digest").strip()
     assert promoted != STALE_OPENCODE_1_RUNTIME_IMAGE
-    for path in WORKFLOWS.glob("*.yml"):
+    for path in (*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")):
         assert STALE_OPENCODE_1_RUNTIME_IMAGE not in _read(path), path.name
 
 

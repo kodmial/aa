@@ -176,7 +176,19 @@ jobs:
       # `inputs.dispatch_marker` value, so the fallback must resolve exactly
       # like the scheduler/engine: explicit input, then the configured
       # repository marker variable, then the upstream default.
-      pause_on_failure: "${{ contains(github.event.comment.body || '', inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->') && 'false' || inputs.pause_on_failure || 'true' }}"
+      # The public dispatch marker alone is copyable, so a comment only
+      # counts as a scheduler dispatch when it is authored by the automation
+      # identity (the scheduler posts through the owner's TAP_PAT) and also
+      # carries the scheduler's own origin marker. A manual `/oc` comment
+      # that quotes the public marker therefore keeps the terminal default.
+      pause_on_failure: >-
+        ${{ (github.event.comment.user.login == 'github-actions[bot]' ||
+        github.event.comment.user.login == github.repository_owner) &&
+        contains(github.event.comment.body || '',
+        inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->') &&
+        contains(github.event.comment.body || '',
+        '<!-- continuum-origin role=continuum component=issue-scheduler -->')
+        && 'false' || inputs.pause_on_failure || 'true' }}
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
       capability_number: "${{ inputs.capability_number }}"
