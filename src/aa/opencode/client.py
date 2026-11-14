@@ -370,6 +370,10 @@ class HttpOpenCodeClient(OpenCodeClient):
         self._request_timeout = request_timeout
         self._served_model_audit: list[dict[str, str]] = []
         self._token_usage_audit: list[dict[str, object]] = []
+        # Session model pins persist on the server. Track the pins this client
+        # applied so a later turn that omits the model cannot silently inherit
+        # a stale pointer instead of the documented server default.
+        self._v2_pinned_models: dict[str, str] = {}
         # Privacy-safe local transport timings: operation category, duration,
         # and success only. Never records prompts, responses, session ids, or
         # provider error text. Gate E uses this to distinguish model latency
@@ -842,6 +846,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         quoted = urllib.parse.quote(session_id, safe="")
         path = f"/api/session/{quoted}" if self._protocol == "v2" else f"/session/{quoted}"
         await self._call("DELETE", path)
+        self._v2_pinned_models.pop(session_id, None)
         logger.info("opencode session deleted")
         return True
 
@@ -971,7 +976,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         self,
         session_id: str,
         *,
-        timeout: float | None,
+        deadline: float,
         order: str,
         page_limit: int,
         stop_id: str,
@@ -991,12 +996,15 @@ class HttpOpenCodeClient(OpenCodeClient):
         seen_cursors: set[str] = set()
         boundary_found = False
         for _ in range(max_pages):
+            # Every page socket bound is derived from the one shared deadline.
+            # A fixed per-page timeout would let a slow server multiply the
+            # caller's budget by the page limit.
             page, next_cursor = self._v2_message_page(
                 session_id,
                 limit=page_limit,
                 order=order,
                 cursor=cursor,
-                timeout=timeout,
+                timeout=_v2_remaining(deadline),
             )
             entries.extend(page)
             if stop_id and any(entry.get("id") == stop_id for entry in page):
@@ -1053,7 +1061,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         *,
         user_message_id: str,
         user_created_ms: int,
-        timeout: float | None,
+        deadline: float,
     ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         """Return ``(newest_assistant, idle)`` belonging to this turn only.
 
@@ -1072,7 +1080,7 @@ class HttpOpenCodeClient(OpenCodeClient):
         """
         entries, boundary_found = self._v2_history_entries(
             session_id,
-            timeout=timeout,
+            deadline=deadline,
             order="desc",
             page_limit=100,
             stop_id=user_message_id,
@@ -1125,21 +1133,16 @@ class HttpOpenCodeClient(OpenCodeClient):
         budget = _V2_COMPLETION_FALLBACK_TIMEOUT_SECONDS if timeout is None else timeout
         deadline = time.monotonic() + max(0.001, budget)
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OpenCodeTimeoutError(
-                    "opencode turn completion was not observed before the deadline"
-                )
-            # Bound every blocking wait by what is left of the caller's
-            # deadline. Without this, a server that never returns from
-            # /wait would outlive the finite fallback and a cancelled worker
-            # could stay blocked indefinitely.
-            self._v2_wait_for_idle(session_id, remaining)
+            # Recompute the remaining budget before every blocking call. The
+            # wait route and each history page must share the caller's one
+            # deadline, otherwise a slow-but-successful call could let a
+            # single poll overshoot it by a multiple of the budget.
+            self._v2_wait_for_idle(session_id, _v2_remaining(deadline))
             assistant, idle = self._v2_turn_messages(
                 session_id,
                 user_message_id=user_message_id,
                 user_created_ms=user_created_ms,
-                timeout=remaining,
+                deadline=deadline,
             )
             if idle is not None:
                 outcome = idle.get("outcome")
@@ -1174,7 +1177,14 @@ class HttpOpenCodeClient(OpenCodeClient):
                 raise OpenCodeTimeoutError(
                     "opencode turn completion was not observed before the deadline"
                 )
-            time.sleep(_V2_COMPLETION_POLL_SECONDS)
+            # Never sleep past the deadline: the next iteration raises instead
+            # of idling beyond the caller's bound.
+            time.sleep(
+                min(
+                    _V2_COMPLETION_POLL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+            )
 
     def _v2_text_exchange(
         self,
@@ -1255,7 +1265,14 @@ class HttpOpenCodeClient(OpenCodeClient):
         model: str,
         audit_agent: str,
     ) -> None:
-        """Pin the session model/agent before a v2 prompt turn."""
+        """Pin the session model/agent before a v2 prompt turn.
+
+        A model pin is session-scoped and persists on the server. An empty
+        model hint means "server default applies", which this client cannot
+        restore through the documented v2 surface (the model route requires a
+        concrete ``Model.Ref``). Refuse the omission after a pin so the turn
+        cannot be served by a stale model pointer instead of the default.
+        """
         quoted = urllib.parse.quote(session_id, safe="")
         model_ref = model_ref_payload(model)
         if model_ref is not None:
@@ -1267,6 +1284,12 @@ class HttpOpenCodeClient(OpenCodeClient):
                 agent=agent,
                 audit_agent=audit_agent,
                 model=model,
+            )
+            self._v2_pinned_models[session_id] = model
+        elif self._v2_pinned_models.get(session_id):
+            raise OpenCodeDeterministicError(
+                "opencode session already has a pinned model; refusing to omit "
+                "the model selector after a previous pin"
             )
         if agent:
             await self._call(

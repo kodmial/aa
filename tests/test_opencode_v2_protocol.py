@@ -678,6 +678,36 @@ async def test_v2_completed_turn_pulls_reply_after_idle_with_model_and_latency()
         thread.join(timeout=3)
 
 
+async def test_v2_omitted_model_after_pin_is_rejected() -> None:
+    server, thread, base_url = _run_server()
+    try:
+        client = _client(base_url)
+        created = await client.create_session("stale-pin")
+        reply = await client.send_message(
+            created.id,
+            "pin the model",
+            model="zen/spark",
+            timeout=5.0,
+        )
+        assert reply == "Grounded answer [book:2]"
+
+        # The pin persists on the session. An empty model hint means the
+        # server default applies, which cannot be restored through the
+        # documented v2 route, so the turn must fail closed instead of being
+        # served by the previously pinned model.
+        before = len(server.state.requests)
+        with pytest.raises(OpenCodeDeterministicError, match="refusing to omit"):
+            await client.send_message(created.id, "use the default", timeout=5.0)
+        assert not any(
+            entry["path"] == f"/api/session/{created.id}/prompt"
+            for entry in server.state.requests[before:]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
 async def test_v2_failed_turn_is_classified_and_never_a_reply() -> None:
     server, thread, base_url = _run_server()
     try:
@@ -723,6 +753,7 @@ async def test_v2_structured_output_is_strict_json() -> None:
                 created.id,
                 "plan again",
                 schema={"type": "object"},
+                model="zen/spark",
                 retry_count=0,
                 timeout=5.0,
             )
