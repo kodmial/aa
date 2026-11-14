@@ -166,7 +166,17 @@ jobs:
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts || '5' }}"
-      pause_on_failure: "${{ inputs.pause_on_failure || 'true' }}"
+      # The issue scheduler is non-terminal (`pause_on_failure: "false"`).
+      # A scheduler-generated `/oc` comment must inherit that policy; with
+      # the old unconditional `'true'` default the OpenCode recovery job
+      # added `automation:paused` while the scheduler kept clearing it and
+      # re-dispatching, producing a pause/unpause loop. Manual owner `/oc`
+      # commands and explicit workflow_dispatch callers keep the bounded
+      # terminal-pause default. An issue_comment run has no
+      # `inputs.dispatch_marker` value, so the fallback must resolve exactly
+      # like the scheduler/engine: explicit input, then the configured
+      # repository marker variable, then the upstream default.
+      pause_on_failure: "${{ contains(github.event.comment.body || '', inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->') && 'false' || inputs.pause_on_failure || 'true' }}"
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
       capability_number: "${{ inputs.capability_number }}"

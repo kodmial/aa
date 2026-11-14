@@ -11,10 +11,16 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OPENCODE_CALLER = REPO_ROOT / ".github" / "workflows" / "continuum-opencode.yml"
-SCHEDULER_CALLER = REPO_ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+OPENCODE_CALLER = WORKFLOWS / "continuum-opencode.yml"
+OPENCODE_WATCHDOG = WORKFLOWS / "continuum-opencode-watchdog.yml"
+SCHEDULER_CALLER = WORKFLOWS / "continuum-issue-scheduler.yml"
+DEFAULT_DISPATCH_MARKER = "<!-- issue-scheduler-dispatch -->"
 
 TRUSTED_ASSOCIATIONS = ("'OWNER'", "'MEMBER'", "'COLLABORATOR'")
 RESULT_MARKERS = (
@@ -44,12 +50,151 @@ def test_opencode_caller_stays_on_main_without_pin() -> None:
     assert "pinned" not in body.lower()
 
 
+def _caller_pause_on_failure_expression() -> str:
+    data = yaml.safe_load(_read(OPENCODE_CALLER))
+    expression = data["jobs"]["call"]["with"]["pause_on_failure"]
+    assert isinstance(expression, str)
+    return expression
+
+
+def _evaluate_pause_on_failure(
+    *,
+    comment_body: str | None,
+    dispatch_marker: str,
+    pause_on_failure: str,
+    vars_dispatch_marker: str = "",
+) -> str:
+    """Evaluate the caller's GitHub expression without a live workflow run."""
+    expression = _caller_pause_on_failure_expression()
+    assert expression.startswith("${{") and expression.endswith("}}")
+    py = expression[3:-2].strip()
+    py = py.replace("github.event.comment.body", "COMMENT_BODY")
+    py = py.replace("inputs.dispatch_marker", "DISPATCH_MARKER")
+    py = py.replace("vars.AUTOMATION_DISPATCH_MARKER", "VARS_DISPATCH_MARKER")
+    py = py.replace("inputs.pause_on_failure", "PAUSE_ON_FAILURE")
+    py = py.replace("&&", " and ").replace("||", " or ")
+
+    def contains(haystack: str, needle: str) -> bool:
+        return needle in haystack
+
+    result: Any = eval(  # noqa: S307 - expression text comes from this repository only
+        py,
+        {"__builtins__": {}, "contains": contains},
+        {
+            "COMMENT_BODY": comment_body,
+            "DISPATCH_MARKER": dispatch_marker,
+            "PAUSE_ON_FAILURE": pause_on_failure,
+            "VARS_DISPATCH_MARKER": vars_dispatch_marker,
+        },
+    )
+    assert result in {"true", "false"}
+    return str(result)
+
+
 def test_opencode_caller_preserves_aa_knobs() -> None:
     body = _read(OPENCODE_CALLER)
     assert "\"${{ inputs.max_dispatch_attempts || '5' }}\"" in body
-    # Normal implementation runs must stop after the bounded dispatch budget.
-    # Explicit caller overrides remain supported by the input passthrough.
-    assert "\"${{ inputs.pause_on_failure || 'true' }}\"" in body
+    # Normal implementation runs keep the bounded dispatch budget. The
+    # scheduler-generated dispatch path is separately pinned non-terminal by
+    # test_opencode_caller_matches_scheduler_pause_policy.
+    assert "inputs.pause_on_failure || 'true'" in body
+
+
+def test_opencode_caller_matches_scheduler_pause_policy() -> None:
+    # kodmial/aa#506: the scheduler is non-terminal (`pause_on_failure:
+    # "false"`). A scheduler-generated `/oc` comment must inherit that policy
+    # instead of adding a terminal pause the scheduler then clears, which
+    # produced a pause/unpause/re-dispatch loop.
+    assert DEFAULT_DISPATCH_MARKER in _caller_pause_on_failure_expression()
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body=f"Implementation dispatch\n{DEFAULT_DISPATCH_MARKER}",
+            dispatch_marker="",
+            pause_on_failure="",
+        )
+        == "false"
+    )
+    # A custom repository marker is honoured on issue_comment runs, where the
+    # workflow_dispatch `inputs` context is unavailable. This matches the
+    # scheduler, which resolves the same AUTOMATION_DISPATCH_MARKER variable.
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body="dispatch <!-- custom-marker -->",
+            dispatch_marker="",
+            pause_on_failure="",
+            vars_dispatch_marker="<!-- custom-marker -->",
+        )
+        == "false"
+    )
+    # An explicit dispatch marker still wins over the repository variable.
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body="dispatch <!-- input-marker -->",
+            dispatch_marker="<!-- input-marker -->",
+            pause_on_failure="",
+            vars_dispatch_marker="<!-- other-marker -->",
+        )
+        == "false"
+    )
+    # Manual owner `/oc` comments are not scheduler dispatches and keep the
+    # bounded terminal-pause default.
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body="/oc",
+            dispatch_marker="",
+            pause_on_failure="",
+        )
+        == "true"
+    )
+    # A workflow_dispatch call has no comment body and keeps its explicit
+    # override (or the bounded default when unset).
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body=None,
+            dispatch_marker="",
+            pause_on_failure="",
+        )
+        == "true"
+    )
+    assert (
+        _evaluate_pause_on_failure(
+            comment_body=None,
+            dispatch_marker="",
+            pause_on_failure="false",
+        )
+        == "false"
+    )
+
+
+def test_opencode_watchdog_bounded_and_non_terminal() -> None:
+    data = yaml.safe_load(_read(OPENCODE_WATCHDOG))
+    call = data["jobs"]["call"]
+    assert call["uses"] == (
+        "kodmial/continuum/.github/workflows/continuum-opencode-watchdog.yml@main"
+    )
+    with_inputs = call["with"]
+    assert with_inputs["continuum_ref"] == "main"
+    assert with_inputs["watched_workflow"] == "OpenCode agent"
+    # Keep real finite retry budgets: the watchdog must never retry forever,
+    # and genuine 429 recovery must stay armed with the reviewed upstream
+    # fresh-runner restart budget.
+    assert with_inputs["max_recovery_retries"] == "3"
+    assert with_inputs["max_429_runner_restarts"] == "3"
+    # The scheduler owns the terminal/non-terminal decision and is pinned
+    # non-terminal; the watchdog must not override it with a human pause.
+    assert with_inputs["pause_on_failure"] == "false"
+    # Duplicate watcher loops would duplicate recovery comments/dispatches.
+    watching = sorted(
+        path.name
+        for path in WORKFLOWS.glob("*.yml")
+        if "continuum-opencode-watchdog.yml@" in path.read_text(encoding="utf-8")
+    )
+    assert watching == [OPENCODE_WATCHDOG.name]
+    # PR #505 proposed a 15-minute job timeout after an old stacked run was
+    # cancelled mid-recovery. Current accepted watchdog runs finish in
+    # seconds and do not hit the upstream 5-minute default; no timeout
+    # override is needed and adding one would only mask a future hang.
+    assert "timeout_minutes" not in with_inputs
 
 
 def test_scheduler_wakes_on_trusted_qualification_results() -> None:
