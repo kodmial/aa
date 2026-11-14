@@ -13,9 +13,8 @@ qualification doubles:
   response is durable-admission evidence, never proof that an assistant
   reply exists;
 - ``POST /api/experimental/session/{id}/wait`` to await the actual agent
-  loop becoming idle, then ``GET /api/session/{id}`` plus paged
-  ``GET /api/session/{id}/message`` to pull the completed assistant
-  message;
+  loop becoming idle, then paged ``GET /api/session/{id}/message`` to pull
+  the completed assistant message;
 - ``POST /api/session/{id}/interrupt`` for cancelling in-flight work.
 
 Only the standard library is used (``urllib`` executed in a worker thread),
@@ -69,6 +68,20 @@ logger = logging.getLogger("aa.opencode.client")
 # supervisor (cancellation also issues the native interrupt).
 _V2_COMPLETION_POLL_SECONDS = 0.05
 _V2_COMPLETION_FALLBACK_TIMEOUT_SECONDS = 600.0
+
+
+def _v2_budget_deadline(timeout: float | None) -> float:
+    """Resolve one whole-exchange deadline (caller timeout or finite fallback)."""
+    budget = _V2_COMPLETION_FALLBACK_TIMEOUT_SECONDS if timeout is None else timeout
+    return time.monotonic() + max(0.001, budget)
+
+
+def _v2_remaining(deadline: float) -> float:
+    """Return the remaining whole-exchange budget or raise a timeout."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise OpenCodeTimeoutError("opencode turn completion was not observed before the deadline")
+    return remaining
 
 
 @dataclass(frozen=True)
@@ -961,19 +974,22 @@ class HttpOpenCodeClient(OpenCodeClient):
         timeout: float | None,
         order: str,
         page_limit: int,
-        stop_id: str = "",
-        stop_created_ms: int = 0,
+        stop_id: str,
         max_pages: int = 64,
-    ) -> list[dict[str, object]]:
+    ) -> tuple[list[dict[str, object]], bool]:
         """Walk v2 history pages (newest/oldest first) with a bounded guard.
 
-        The walk stops at the admitted user message (by id or, when an id is
-        unavailable, by creation time) so a previous turn's terminal idle or
-        assistant message can never be mistaken for this turn's result.
+        The walk looks for the admitted user message by its authoritative id.
+        ``boundary_found`` is returned so the caller can fail closed instead
+        of treating an older turn's terminal messages as this turn's
+        completion when the admitted prompt has not been projected yet (or
+        the bounded page walk never reaches it). Creation time alone cannot
+        prove the boundary: older turns are also "older than admission".
         """
         entries: list[dict[str, object]] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        boundary_found = False
         for _ in range(max_pages):
             page, next_cursor = self._v2_message_page(
                 session_id,
@@ -984,16 +1000,13 @@ class HttpOpenCodeClient(OpenCodeClient):
             )
             entries.extend(page)
             if stop_id and any(entry.get("id") == stop_id for entry in page):
-                break
-            if stop_created_ms and any(
-                0 < self._v2_created_ms(entry) <= stop_created_ms for entry in page
-            ):
+                boundary_found = True
                 break
             if not next_cursor or next_cursor in seen_cursors:
                 break
             seen_cursors.add(next_cursor)
             cursor = next_cursor
-        return entries
+        return entries, boundary_found
 
     @staticmethod
     def _v2_created_ms(entry: object) -> int:
@@ -1051,15 +1064,21 @@ class HttpOpenCodeClient(OpenCodeClient):
         timestamp are enforced: the id is authoritative, while the
         timestamp still rejects strictly older messages if the server ever
         rewrites the id.
+
+        If the admitted user message has not appeared in history yet (or the
+        bounded page walk never reaches it), no candidate belongs to this
+        turn. Returning ``(None, None)`` keeps the caller polling until its
+        deadline rather than reusing a previous turn's completed reply.
         """
-        entries = self._v2_history_entries(
+        entries, boundary_found = self._v2_history_entries(
             session_id,
             timeout=timeout,
             order="desc",
             page_limit=100,
             stop_id=user_message_id,
-            stop_created_ms=user_created_ms,
         )
+        if not boundary_found:
+            return None, None
         assistant: dict[str, object] | None = None
         idle: dict[str, object] | None = None
         for entry in entries:
@@ -1168,12 +1187,17 @@ class HttpOpenCodeClient(OpenCodeClient):
         audit_agent: str,
     ) -> str:
         prompt = _v2_system_preamble(system, text)
-        user_message_id, user_created_ms = self._v2_enqueue_prompt(session_id, prompt, timeout)
+        # One deadline covers admission plus completion, so a slow enqueue
+        # cannot extend the caller's bound.
+        deadline = _v2_budget_deadline(timeout)
+        user_message_id, user_created_ms = self._v2_enqueue_prompt(
+            session_id, prompt, _v2_remaining(deadline)
+        )
         assistant = self._v2_completed_assistant(
             session_id,
             user_message_id=user_message_id,
             user_created_ms=user_created_ms,
-            timeout=timeout,
+            timeout=_v2_remaining(deadline),
         )
         self._validate_served_model(
             assistant, requested=model, agent=agent, audit_agent=audit_agent
@@ -1194,6 +1218,9 @@ class HttpOpenCodeClient(OpenCodeClient):
         audit_agent: str,
     ) -> dict[str, object]:
         prompt = _v2_structured_prompt(text, system=system, schema=schema)
+        # The caller's bound covers the whole structured exchange, including
+        # every JSON retry; a retry may not multiply the wall-clock budget.
+        deadline = _v2_budget_deadline(timeout)
         for attempt in range(retry_count + 1):
             current_prompt = prompt
             if attempt:
@@ -1202,13 +1229,13 @@ class HttpOpenCodeClient(OpenCodeClient):
                     "Return only the JSON object now."
                 )
             user_message_id, user_created_ms = self._v2_enqueue_prompt(
-                session_id, current_prompt, timeout
+                session_id, current_prompt, _v2_remaining(deadline)
             )
             assistant = self._v2_completed_assistant(
                 session_id,
                 user_message_id=user_message_id,
                 user_created_ms=user_created_ms,
-                timeout=timeout,
+                timeout=_v2_remaining(deadline),
             )
             self._validate_served_model(
                 assistant, requested=model, agent=agent, audit_agent=audit_agent

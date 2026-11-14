@@ -39,7 +39,7 @@ from aa.opencode.errors import (
     OpenCodeSessionNotFoundError,
     OpenCodeTimeoutError,
 )
-from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig
+from aa.opencode.runtime import LocalOpenCodeRuntime, OpenCodeConfig, _probe_health
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = (ROOT / "docker" / "opencode.version").read_text(encoding="utf-8").strip()
@@ -245,6 +245,24 @@ def test_pinned_opencode_binary_is_22x() -> None:
 
 
 @needs_opencode
+async def test_real_v2_info_requires_basic_auth(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    try:
+        await runtime.start()
+        healthy_without_password, _ = await asyncio.to_thread(
+            _probe_health, runtime.config.base_url, 2.0
+        )
+        assert not healthy_without_password
+        healthy, version = await asyncio.to_thread(
+            _probe_health, runtime.config.base_url, 2.0, runtime._auth_password
+        )
+        assert healthy
+        assert version == PIN
+    finally:
+        await runtime.stop()
+
+
+@needs_opencode
 async def test_real_v2_full_turn_completes_with_model_usage_and_latency(
     tmp_path: Path,
 ) -> None:
@@ -407,6 +425,32 @@ async def test_real_v2_bounded_wait_never_forges_a_reply(tmp_path: Path) -> None
         provider.release.set()
     finally:
         provider.release.set()
+        await runtime.stop()
+        _stop_provider(provider, thread)
+
+
+@needs_opencode
+async def test_real_v2_paged_history_follows_cursor(tmp_path: Path) -> None:
+    provider, thread = _start_provider()
+    _write_project_config(tmp_path, int(provider.server_address[1]))
+    runtime = _runtime(tmp_path)
+    try:
+        await runtime.start()
+        client = runtime.client
+        created = await client.create_session("paged-v2")
+        for prompt in ("first paged question", "second paged question"):
+            reply = await client.send_message(created.id, prompt, model=MOCK_MODEL, timeout=60.0)
+            assert reply == provider.reply_text
+        history = await client.list_messages(created.id, limit=4)
+        assert [message.role for message in history] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert history[0].text == "first paged question"
+        assert history[2].text == "second paged question"
+    finally:
         await runtime.stop()
         _stop_provider(provider, thread)
 

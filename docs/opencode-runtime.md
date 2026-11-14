@@ -41,16 +41,21 @@ the model has replied. The client therefore:
 
 1. records the admitted user-message `id` and `time.created`;
 2. calls `/wait`, then reads history newest-first and stops at that user
-   message, so a previous turn's assistant/idle message can never be
-   mistaken for this turn;
-3. treats completion as proven only by a terminal `idle` message created
+   message by its authoritative `id`, so a previous turn's assistant/idle
+   message can never be mistaken for this turn;
+3. requires that admitted id to be observed in history. If the prompt has
+   not been projected yet, or the bounded page walk never reaches it, no
+   candidate belongs to this turn: the client keeps polling and eventually
+   times out instead of returning an earlier turn's reply;
+4. treats completion as proven only by a terminal `idle` message created
    after this turn's user message, whose `outcome` is `succeeded`;
-4. re-issues `/wait` and polls until that condition holds, bounded by the
-   caller's timeout (or a 600 s finite fallback), then raises a timeout
-   rather than inventing a reply;
-5. classifies a non-`succeeded` idle message from its structured `error`
+5. re-issues `/wait` and polls until that condition holds. One deadline
+   covers admission, completion and every structured-output retry (the
+   caller's timeout, or a 600 s finite fallback); when it expires the client
+   raises a timeout rather than inventing a reply;
+6. classifies a non-`succeeded` idle message from its structured `error`
    (status taxonomy only; provider message text is never logged);
-6. requires a completed assistant message with `finish: "stop"` and extracts
+7. requires a completed assistant message with `finish: "stop"` and extracts
    its `content[type=text]` parts.
 
 Structured output has no native `format` field on the v2 prompt route, so

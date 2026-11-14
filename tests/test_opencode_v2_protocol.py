@@ -16,10 +16,12 @@ interrupted turns. Real-binary coverage lives in
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import http.server
 import json
 import threading
+import time
 import urllib.parse
 from typing import Any
 
@@ -57,6 +59,7 @@ class _V2FakeState:
         self.invalid_json = False
         self.status_override: int | None = None
         self.info_payload: dict[str, Any] | None = None
+        self.hide_admitted_user = False
 
     def next_clock(self) -> int:
         self.clock += 1
@@ -314,8 +317,19 @@ class _V2FakeHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path.endswith("/prompt"):
                 prompt = body.get("text", "") if isinstance(body, dict) else ""
-                user = self._append(current, "user", text=prompt)
-                self._complete_turn(current, prompt)
+                if self.state.hide_admitted_user:
+                    # Simulate an admitted prompt that history has not
+                    # projected yet: the response carries an id that is not
+                    # in the message timeline.
+                    user = {
+                        "id": f"msg_hidden_{len(current['messages']) + 1:04d}",
+                        "time": {"created": self.state.next_clock()},
+                        "type": "user",
+                        "text": prompt,
+                    }
+                else:
+                    user = self._append(current, "user", text=prompt)
+                    self._complete_turn(current, prompt)
                 idle_entries = [entry for entry in current["messages"] if entry["type"] == "idle"]
                 if idle_entries:
                     current["outcome"] = idle_entries[-1]["outcome"]
@@ -533,6 +547,79 @@ async def test_v2_queued_second_turn_never_reuses_previous_reply() -> None:
         ]
         assert [row["state"] for row in message_rows] == ["completed", "failed"]
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+async def test_v2_missing_admitted_turn_never_reuses_previous_reply() -> None:
+    server, thread, base_url = _run_server()
+    try:
+        client = _client(base_url)
+        created = await client.create_session("stale-history")
+        first = await client.send_message(created.id, "first question", timeout=5.0)
+        assert first == "Grounded answer [book:2]"
+
+        # The prompt route admits a new user message, but history has not
+        # projected it yet and still contains the previous turn's terminal
+        # assistant/idle entries. Those entries are older than the admission
+        # timestamp, so time alone cannot prove they are not this turn: the
+        # client must require the admitted id and fail closed.
+        server.state.mode = "queued"
+        server.state.hide_admitted_user = True
+        with pytest.raises(OpenCodeTimeoutError):
+            await client.send_message(created.id, "second question", timeout=0.4)
+
+        history = await client.list_messages(created.id)
+        assert [(message.role, message.text) for message in history] == [
+            ("user", "first question"),
+            ("assistant", "Grounded answer [book:2]"),
+        ]
+        message_rows = [
+            row for row in client.request_latency_audit if row["operation"] == "message-text"
+        ]
+        assert [row["state"] for row in message_rows] == ["completed", "failed"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+async def test_v2_cancelled_turn_issues_native_interrupt_and_proves_quiescence() -> None:
+    server, thread, base_url = _run_server()
+    turn: asyncio.Task[str] | None = None
+    try:
+        client = _client(base_url)
+        created = await client.create_session("cancel")
+        server.state.mode = "queued"
+        turn = asyncio.create_task(client.send_message(created.id, "slow question", timeout=5.0))
+        deadline = time.monotonic() + 2.0
+        while not any(
+            entry["path"] == f"/api/session/{created.id}/prompt" for entry in server.state.requests
+        ):
+            assert time.monotonic() < deadline, "prompt was never admitted"
+            await asyncio.sleep(0.01)
+
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        # The cancellation path issues the v2 native interrupt and only
+        # reports quiescence once the worker thread itself has terminated.
+        deadline = time.monotonic() + 5.0
+        while not client.quiescence_proven() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert client.quiescence_proven()
+        paths = [entry["path"] for entry in server.state.requests]
+        assert f"/api/session/{created.id}/interrupt" in paths
+        message_rows = [
+            row for row in client.request_latency_audit if row["operation"] == "message-text"
+        ]
+        assert message_rows[-1]["state"] == "cancelled"
+        assert message_rows[-1]["success"] is False
+    finally:
+        if turn is not None and not turn.done():
+            turn.cancel()
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)

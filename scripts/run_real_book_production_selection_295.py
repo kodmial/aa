@@ -93,19 +93,22 @@ def _checked_out_sha() -> str:
 async def _plan_with_production_adapter(
     utterance: str,
     *,
+    client: Any,
     primary_model: str,
     fallback_model: str,
     recent_user_turns: tuple[str, ...] = (),
 ) -> tuple[list[str], str]:
-    """Real mandatory planner; returns (queries, resolved_intent)."""
+    """Real mandatory planner; returns (queries, resolved_intent).
+
+    ``client`` is the runtime's own v2-authenticated HTTP client. A fresh
+    default client would speak the removed v1 routes and skip the managed
+    ``OPENCODE_PASSWORD``.
+    """
     from langchain_core.messages import HumanMessage
 
     from aa.conversation.model_adapter import PLANNER_AGENT_V2, OpenCodeChatModel
     from aa.conversation.planner_node import query_plan_json_schema, run_planner
-    from aa.opencode.client import HttpOpenCodeClient
 
-    base_url = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
-    client = HttpOpenCodeClient(base_url)
     health = await client.health()
     if not health.healthy:
         raise RealBookRetrievalError("opencode runtime is not healthy")
@@ -118,13 +121,10 @@ async def _plan_with_production_adapter(
     return list(plan.queries), str(plan.resolved_intent or utterance)
 
 
-def _selector_model(*, primary_model: str, fallback_model: str) -> Any:
+def _selector_model(*, client: Any, primary_model: str, fallback_model: str) -> Any:
     """Real OpenCode selector bound exactly like production graph."""
     from aa.conversation.model_adapter import PLANNER_AGENT_V2, OpenCodeChatModel
-    from aa.opencode.client import HttpOpenCodeClient
 
-    base_url = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
-    client = HttpOpenCodeClient(base_url)
     # Same agent/profile binding as build_turn_graph selection_model.
     return OpenCodeChatModel(
         client, agent=PLANNER_AGENT_V2, primary_model=primary_model, fallback_model=fallback_model
@@ -276,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     config = RetrievalConfig()
     diagnostics: list[ProductionSelectionDiagnostics] = []
     infra_failures = 0
-    selector = _selector_model(primary_model=primary_model, fallback_model=fallback_model)
+    selector = _selector_model(
+        client=runtime.client, primary_model=primary_model, fallback_model=fallback_model
+    )
     try:
         for case_id, utterance, recent_user_turns in turns:
             if not utterance.strip():
@@ -286,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                 queries, resolved_intent = asyncio.run(
                     _plan_with_production_adapter(
                         utterance,
+                        client=runtime.client,
                         primary_model=primary_model,
                         fallback_model=fallback_model,
                         recent_user_turns=recent_user_turns,
