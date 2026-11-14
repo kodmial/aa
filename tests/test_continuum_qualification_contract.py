@@ -344,7 +344,7 @@ def test_opencode_caller_accepts_shared_watchdog_429_recovery_contract() -> None
     ):
         assert call_inputs[field] == (
             "${{ inputs.recovery_identity && "
-            f"fromJSON(inputs.recovery_identity).{field} || '' }}"
+            f"fromJSON(inputs.recovery_identity).{field} || '' " + "}}"
         )
     assert "OpenCode 429 recovery {0} gen {1}" in parsed["run-name"]
     assert "fromJSON(inputs.recovery_identity).recovery_operation_id" in parsed["run-name"]
