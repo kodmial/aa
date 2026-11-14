@@ -560,21 +560,23 @@ async def test_run_canary_bounds_an_unresponsive_real_path_runner(
 
 @pytest.mark.asyncio
 async def test_server_evidence_supports_global_event_fallback_and_unobserved_shape() -> None:
-    fallback, observed = await _server_observation_checks(
+    fallback, first_unobserved = await _server_observation_checks(
         error_event=True, event_route="/global/event"
     )
-    assert observed is True
+    # The controlled fallback server reports an active drain, so real status
+    # facts must make the probe observed rather than unobserved.
+    assert first_unobserved is False
     assert fallback["state"] == "supported"
     assert fallback["event_endpoint"] == "/global/event"
     assert fallback["endpoints"]["/doc"]["state"] == "supported"
     assert fallback["server_error_status_code"] == 503
 
-    absent, unobserved = await _server_observation_checks(
+    absent, absent_unobserved = await _server_observation_checks(
         error_event=False,
         event_enabled=False,
         session_status=False,
     )
-    assert unobserved is True
+    assert absent_unobserved is True
     assert absent["state"] == "supported"
     assert not absent.get("session_state_counts", {}).get("busy")
 

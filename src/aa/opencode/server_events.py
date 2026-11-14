@@ -67,15 +67,18 @@ SESSION_ERROR_NAME_VOCAB = (
 )
 SESSION_EVENT_VOCAB = ("session.status", "session.idle", "session.error")
 # v2 reports terminal execution failures as their own durable events.
+# ``session.retry.scheduled`` is deliberately not a failure: it announces
+# that a transient provider error is being retried, not that the session
+# failed, so it must never fabricate an ``unknown`` server-error kind.
 SESSION_V2_FAILURE_EVENT_VOCAB = (
     "session.execution.failed",
     "session.step.failed",
     "session.compaction.failed",
-    "session.retry.scheduled",
 )
 SESSION_V2_EVENT_VOCAB = (
     *SESSION_EVENT_VOCAB,
     *SESSION_V2_FAILURE_EVENT_VOCAB,
+    "session.retry.scheduled",
     "session.execution.started",
     "session.execution.succeeded",
     "session.execution.interrupted",
@@ -404,6 +407,10 @@ class OpenCodeServerEventProbe:
             last = facts
             status = int(facts.get("event-stream-status", 0) or 0)
             http_error = int(facts.get("event-stream-http-error", 0) or 0)
+            if "event-stream-error" in facts:
+                # The route opened but its bounded read failed: try the next
+                # documented route before treating this one as authoritative.
+                continue
             if status == 200 and not facts.get("event-stream-not-streamed"):
                 self._event_endpoint = endpoint
                 return facts
@@ -411,8 +418,6 @@ class OpenCodeServerEventProbe:
                 # SPA shell, not an SSE surface: try the next route.
                 continue
             if http_error in (404, 405):
-                continue
-            if "event-stream-error" in facts:
                 continue
             return facts
         return last

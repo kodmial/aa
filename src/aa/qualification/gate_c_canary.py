@@ -704,7 +704,11 @@ async def _server_observation_checks(
             base_url, timeout_s=0.2, password=SELF_TEST_SERVER_PASSWORD
         )
         evidence = await probe.snapshot()
-        payload = probe.session_status_probe_payload({"session-status": 0, "unknown-state": 0})
+        endpoints = evidence.get("endpoints")
+        status_facts = endpoints.get("/session/status") if isinstance(endpoints, dict) else None
+        payload = probe.session_status_probe_payload(
+            status_facts if isinstance(status_facts, dict) else {}
+        )
         return evidence, not bool(payload.get("observed"))
     finally:
         _stop_server(server, thread)
@@ -1020,14 +1024,18 @@ async def observer_self_test(
         clear_turn_causality()
         if task is not None and not task.done():
             task.cancel()
-        if observer is not None and observer.is_running():
-            await observer.stop(flush_reason="canary-self-test-cleanup")
-        state.release.set()
-        _stop_server(server, thread)
-        if previous_progress is None:
-            os.environ.pop(ENV_PROGRESS_PATH, None)
-        else:
-            os.environ[ENV_PROGRESS_PATH] = previous_progress
+        try:
+            if observer is not None and observer.is_running():
+                await observer.stop(flush_reason="canary-self-test-cleanup")
+        finally:
+            state.release.set()
+            try:
+                _stop_server(server, thread)
+            finally:
+                if previous_progress is None:
+                    os.environ.pop(ENV_PROGRESS_PATH, None)
+                else:
+                    os.environ[ENV_PROGRESS_PATH] = previous_progress
 
 
 # ---------------------------------------------------------------------------
@@ -1371,6 +1379,9 @@ def _server_surface_missing(evidence: Mapping[str, Any]) -> list[str]:
         event_endpoint in ("", "unobserved")
         or int(event_facts.get("event-stream-status", 0) or 0) != 200
         or int(event_facts.get("event-stream-streamed", 0) or 0) != 1
+        # An opened route whose bounded read failed is not a usable event
+        # surface, even though its status headers look healthy.
+        or int(event_facts.get("event-stream-error", 0) or 0)
     ):
         missing.append("server_events.event_stream_surface")
     return missing
