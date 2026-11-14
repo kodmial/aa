@@ -381,12 +381,13 @@ async def test_probe_distinguishes_selector_rejection_from_model_rejection() -> 
 def test_production_verifier_uses_decoupled_helper_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production wiring keeps Muse-only routing with an omitted wire selector."""
+    """Production wiring follows the configured primary with no fallback."""
     import aa.conversation.graph as graph_module
     import aa.conversation.model_adapter as adapter_module
-    from aa.config import DEFAULT_PRIMARY_MODEL
     from aa.conversation.graph_runtime import _ProductionGraphRuntime
 
+    configured_primary = "opencode/deepseek-v4.1-flash-free"
+    configured_fallback = "opencode/beam-free"
     real_model = adapter_module.OpenCodeChatModel
 
     class _DummyModel:
@@ -459,23 +460,28 @@ def test_production_verifier_uses_decoupled_helper_without_fallback(
     runtime = _ProductionGraphRuntime(
         client=object(),
         settings=SimpleNamespace(
-            opencode_model="opencode/muse-spark-1.3-contributor-free",
-            opencode_fallback_model="opencode/space-bunny-free",
+            opencode_model=configured_primary,
+            opencode_fallback_model=configured_fallback,
         ),
         index=None,
     )
     wired = runtime._build_graph(object())
     planner = wired["planner_model"]
     verifier = wired["verifier_model"]
+    judge = wired["whole_turn_judge_model"]
 
-    assert planner.fallback_model == "opencode/space-bunny-free"
+    assert planner.fallback_model == configured_fallback
     assert planner.wire_agent == ""
     assert wired["answer_model"].wire_agent == ""
     assert wired["summary_model"].wire_agent == ""
     assert verifier.agent == "aa-verifier-v2"
-    assert verifier.primary_model == DEFAULT_PRIMARY_MODEL == MUSE
+    assert verifier.primary_model == configured_primary
     assert verifier.fallback_model == ""
     assert verifier.wire_agent == ""
+    assert judge.agent == "aa-judge-v2"
+    assert judge.primary_model == configured_primary
+    assert judge.fallback_model == ""
+    assert judge.wire_agent == ""
     assert real_model is not None
 
 
@@ -491,7 +497,7 @@ def test_production_verifier_never_uses_with_agent_fallback() -> None:
 
 
 def test_live_lane_locks_exact_verifier_pin() -> None:
-    """The live lane asserts requested == served == Muse for the verifier."""
+    """The live lane asserts requested == served == the configured primary."""
     source = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -500,5 +506,6 @@ def test_live_lane_locks_exact_verifier_pin() -> None:
         / "product_contract_live.py"
     ).read_text(encoding="utf-8")
     assert "check_verifier_served_exact" in source
+    assert "expected=expected_verifier_model" in source
     assert "verifier_failed" in source
     assert "verifier_muse_probe" in source

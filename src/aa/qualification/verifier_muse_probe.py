@@ -1,18 +1,19 @@
-"""Muse Spark verifier access probe (kodmial/aa#202).
+"""Verifier access probe (kodmial/aa#202).
 
-Reproduces the Muse verifier failure through the same local official
+Reproduces the verifier failure through the same local official
 ``opencode serve`` boundary used by production (ephemeral sessions via
 :class:`aa.opencode.client.OpenCodeClient`), isolating whether a
 rejection is tied to the custom ``aa-verifier-v2`` transport agent
-selector versus Muse itself.
+selector versus the requested model route itself.
 
 The verifier system prompt always travels through the native ``system``
 field; only the transport ``agent`` selector varies (custom selector vs
-omitted). Requested model stays pinned to Muse Spark on both variants.
-Every result is privacy-safe: only error categories, numeric HTTP
-statuses, model identities and wire/logical agent names are recorded.
-No prompt text, system text, or model output ever enters the result or
-the logs.
+omitted). The requested model is the owner-controlled configured primary
+(kodmial/aa#528) on both variants. Historical ``MUSE_*`` names remain as
+stable qualification vocabulary. Every result is privacy-safe: only
+error categories, numeric HTTP statuses, model identities and
+wire/logical agent names are recorded. No prompt text, system text, or
+model output ever enters the result or the logs.
 """
 
 from __future__ import annotations
@@ -143,15 +144,18 @@ async def _probe_variant(
 async def probe_verifier_muse_access(
     client: Any,
     *,
-    model: str = VERIFIER_EXPECTED_MODEL,
+    model: str,
     system: str = "",
 ) -> dict[str, Any]:
-    """Probe Muse access with and without the custom transport selector.
+    """Probe verifier access with and without the custom transport selector.
 
-    Both variants use the same pinned model and the same verifier system
-    prompt through the native ``system`` field; only the wire transport
-    agent selector differs. The result carries no prompt, system, or
-    output text -- only categories, numeric statuses, and identities.
+    Both variants request the caller-supplied configured primary model
+    (kodmial/aa#528) and the same verifier system prompt through the
+    native ``system`` field; only the wire transport agent selector
+    differs. ``model`` is required so no caller can silently keep
+    probing the retired hard-coded route. The result carries no prompt,
+    system, or output text -- only categories, numeric statuses, and
+    identities.
     """
     system_text = system
     if not system_text.strip():
@@ -214,12 +218,15 @@ def check_verifier_served_exact(
     expected: str = VERIFIER_EXPECTED_MODEL,
     forbidden: str = VERIFIER_FORBIDDEN_MODEL,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Check requested == served == Muse for the verifier (fail-closed).
+    """Check requested == served == expected for the verifier (fail-closed).
 
     Returns ``(passed, failed)`` check names using the exact live failure
-    vocabulary. An absent served verifier is the specific Muse-access
+    vocabulary. An absent served verifier is the specific verifier-access
     failure, never a generic Gate C failure. Any Space Bunny service for
-    the verifier fails with the dedicated forbidden check.
+    the verifier fails with the dedicated forbidden check. An empty
+    ``forbidden`` disables that dedicated check: it is used when the
+    configured primary is itself the historically forbidden identity,
+    which production now serves the verifier on (kodmial/aa#528).
     """
     passed: list[str] = []
     failed: list[str] = []
@@ -227,9 +234,10 @@ def check_verifier_served_exact(
     if not entries:
         failed.append(MUSE_ACCESS_FAILURE)
         return tuple(passed), tuple(failed)
-    for entry in entries:
-        if entry["served"] == forbidden or entry["requested"] == forbidden:
-            failed.append(SPACE_BUNNY_FORBIDDEN_FAILURE)
+    if forbidden:
+        for entry in entries:
+            if entry["served"] == forbidden or entry["requested"] == forbidden:
+                failed.append(SPACE_BUNNY_FORBIDDEN_FAILURE)
     if SPACE_BUNNY_FORBIDDEN_FAILURE in failed:
         return tuple(passed), tuple(failed)
     exact = [

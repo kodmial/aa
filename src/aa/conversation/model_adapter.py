@@ -54,8 +54,8 @@ RUNTIME_AGENT_V2 = "aa-runtime-v2"
 # stays ``aa-verifier-v2`` while the OpenCode transport agent selector is
 # omitted (server default applies). The verifier system prompt still
 # travels through the native ``system`` field and the requested model stays
-# pinned to Muse Spark. An empty transport agent means no ``agent`` key is
-# sent on the wire.
+# the owner-controlled configured AA primary (kodmial/aa#528). An empty
+# transport agent means no ``agent`` key is sent on the wire.
 VERIFIER_TRANSPORT_AGENT_V2 = ""
 # All hidden conversation stages use their own system prompts and logical
 # audit identities. The custom OpenCode agent selector is not part of the
@@ -1134,14 +1134,15 @@ def build_verifier_model(
     primary_model: str,
     request_timeout: float | None = None,
 ) -> OpenCodeChatModel:
-    """Build the Muse-only grounding verifier (kodmial/aa#202).
+    """Build the primary-only grounding verifier (kodmial/aa#202).
 
     The logical audit identity stays ``aa-verifier-v2`` while the
     transport agent selector is omitted so a custom-agent rejection can
-    never strand the Muse verifier. The fallback stays empty: Space Bunny
-    must never serve the verifier. The verifier system prompt still
-    travels through the native ``system`` field and the requested model
-    stays pinned to Muse Spark.
+    never strand the verifier. The fallback stays empty: a weaker
+    fallback must never serve the verifier. The verifier system prompt
+    still travels through the native ``system`` field and the requested
+    model stays the owner-controlled configured AA primary
+    (kodmial/aa#528).
     """
     from aa.config import DEFAULT_PRIMARY_MODEL
 

@@ -288,13 +288,14 @@ def test_verifier_suffix_has_explicit_example() -> None:
     assert "No other text" in VERIFIER_TEXT_JSON_SUFFIX
 
 
-def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifier is pinned to Muse Spark and never falls through to Space Bunny."""
+def test_production_verifier_uses_configured_primary_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifier follows the configured primary and never falls through."""
     from types import SimpleNamespace
 
     import aa.conversation.graph as graph_module
     import aa.conversation.model_adapter as adapter_module
-    from aa.config import DEFAULT_PRIMARY_MODEL
     from aa.conversation.graph_runtime import _ProductionGraphRuntime
 
     class _DummyModel:
@@ -336,8 +337,8 @@ def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> No
     runtime = _ProductionGraphRuntime(
         client=object(),
         settings=SimpleNamespace(
-            opencode_model="opencode/muse-spark-1.3-contributor-free",
-            opencode_fallback_model="opencode/space-bunny-free",
+            opencode_model=PRIMARY,
+            opencode_fallback_model=FALLBACK,
         ),
         index=None,
     )
@@ -345,10 +346,9 @@ def test_production_verifier_is_muse_only(monkeypatch: pytest.MonkeyPatch) -> No
     planner = wired["planner_model"]
     verifier = wired["verifier_model"]
 
-    assert planner.fallback_model == "opencode/space-bunny-free"
+    assert planner.fallback_model == FALLBACK
     assert verifier.agent == "aa-verifier-v2"
-    assert verifier.primary_model == DEFAULT_PRIMARY_MODEL
-    assert verifier.primary_model == "opencode/nemotron-3-ultra-free"
+    assert verifier.primary_model == PRIMARY
     assert verifier.fallback_model == ""
     # kodmial/aa#202: the logical audit identity stays aa-verifier-v2
     # while the transport selector is omitted on the wire.

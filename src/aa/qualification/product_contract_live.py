@@ -2534,10 +2534,11 @@ def build_live_whole_turn_judge(client: Any, settings: Any) -> Any:
     from aa.conversation.model_adapter import OpenCodeChatModel
     from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
 
-    # Grounding verifier uses Muse Spark without a Space Bunny fallback.
-    # The independent quality judge must have the same minimum model
-    # capability. In run 37884099275 the evaluator silently served Space
-    # Bunny for 16/17 invocations and overturned eight production verdicts.
+    # The grounding verifier uses the owner-controlled configured primary
+    # with no fallback. The independent quality judge must have the same
+    # minimum model capability. In run 37884099275 the evaluator silently
+    # served Space Bunny for 16/17 invocations and overturned eight
+    # production verdicts.
     # An unavailable primary is a visible fail-closed qualification blocker,
     # NOT a fabricated semantic negative returned by a weaker model.
     # Omit the wire agent just as build_verifier_model does: the logical
@@ -4928,13 +4929,43 @@ async def run_live_telegram_evidence_lane(
                 and all(model == settings.opencode_model for model in judge_served),
             )
             # Exact verifier pin (kodmial/aa#202): requested verifier
-            # model == served verifier model == Muse Spark. Space Bunny
-            # must never be recorded as serving aa-verifier-v2. An absent
-            # served verifier is the specific Muse-access failure, never
-            # a generic Gate C failure.
-            from aa.qualification.verifier_muse_probe import check_verifier_served_exact
+            # model == served verifier model == the configured AA primary.
+            # A weaker fallback must never be recorded as serving
+            # aa-verifier-v2. An absent served verifier is the specific
+            # verifier-access failure, never a generic Gate C failure.
+            # kodmial/aa#528: the expected model follows the owner-controlled
+            # deployment policy instead of a hard-coded retired route.
+            from aa.config import DEFAULT_PRIMARY_MODEL
+            from aa.qualification.verifier_muse_probe import (
+                VERIFIER_FORBIDDEN_MODEL,
+                check_verifier_served_exact,
+            )
 
-            verifier_passed, verifier_failed = check_verifier_served_exact(audit)
+            # kodmial/aa#528: resolve the expected verifier model with the
+            # same normalization and fallback the builder applies, so a
+            # blank or whitespace-padded setting cannot make this gate
+            # expect a different route than the verifier actually
+            # requests (which would produce a misleading verifier-access
+            # failure).
+            expected_verifier_model = (settings.opencode_model or "").strip() or (
+                DEFAULT_PRIMARY_MODEL
+            )
+            # The dedicated Space Bunny forbidden check stays active for
+            # every deployment whose configured primary differs from that
+            # identity. When the configured primary is itself that
+            # identity, the check is vacuous: production now serves the
+            # verifier on the owner-controlled configured primary, so
+            # qualification must not block a configuration the verifier
+            # accepts.
+            verifier_passed, verifier_failed = check_verifier_served_exact(
+                audit,
+                expected=expected_verifier_model,
+                forbidden=(
+                    VERIFIER_FORBIDDEN_MODEL
+                    if expected_verifier_model != VERIFIER_FORBIDDEN_MODEL
+                    else ""
+                ),
+            )
             for name in verifier_passed:
                 _check(name, True)
             for name in verifier_failed:
