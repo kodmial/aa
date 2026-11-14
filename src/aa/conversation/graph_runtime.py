@@ -954,22 +954,25 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
             request_timeout=planner.request_timeout,
         )
         answer = planner.with_agent(ANSWER_AGENT_V2)
-        # Product invariant (kodmial/aa#202): the grounding verifier uses
-        # Muse Spark only with no fallback. Space Bunny is deliberately
-        # excluded from this critical gate. The logical audit identity
-        # stays ``aa-verifier-v2`` while the transport agent selector is
-        # omitted (server default applies) so a custom-agent rejection can
-        # never strand the Muse verifier; the verifier system prompt still
-        # travels through the native ``system`` field. A regression test
-        # locks this routing; other agents retain the configured
-        # primary/fallback policy. Never rebuild the verifier via
+        # Product invariant (kodmial/aa#202): the grounding verifier is
+        # pinned to the configured AA primary with no fallback. A weaker
+        # fallback is deliberately excluded from this critical gate. The
+        # logical audit identity stays ``aa-verifier-v2`` while the transport
+        # agent selector is omitted (server default applies) so a
+        # custom-agent rejection can never strand the verifier; the verifier
+        # system prompt still travels through the native ``system`` field.
+        # A regression test locks this routing; other agents retain the
+        # configured primary/fallback policy. Never rebuild the verifier via
         # ``planner.with_agent(...)``: that would inherit the fallback.
-        from aa.config import DEFAULT_PRIMARY_MODEL
+        # kodmial/aa#528: use the owner-controlled configured primary rather
+        # than a hard-coded retired model. Hard-coding made verifier and
+        # judge ignore AA_BOT_PRIMARY_MODEL and deterministically fail when
+        # the deployment selected a different approved model.
         from aa.conversation.model_adapter import build_verifier_model
 
         verifier = build_verifier_model(
             self._client,
-            primary_model=DEFAULT_PRIMARY_MODEL,
+            primary_model=primary,
             request_timeout=planner.request_timeout,
         )
         # Systemic repair (kodmial/aa#372): the production graph never
@@ -979,11 +982,13 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         # Binding the same separately-identified judge here makes the
         # internal substantive delivery gate live on the exact production
         # path instead of prompt-wording alignment per scenario family.
+        # The judge also inherits the owner-controlled primary (kodmial/aa#528)
+        # with no fallback, matching the live independent-judge assertion.
         from aa.conversation.model_adapter import build_judge_model
 
         judge = build_judge_model(
             self._client,
-            primary_model=DEFAULT_PRIMARY_MODEL,
+            primary_model=primary,
             request_timeout=planner.request_timeout,
         )
         return build_turn_graph(

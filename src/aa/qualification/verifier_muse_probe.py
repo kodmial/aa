@@ -1,18 +1,19 @@
-"""Muse Spark verifier access probe (kodmial/aa#202).
+"""Verifier access probe (kodmial/aa#202).
 
-Reproduces the Muse verifier failure through the same local official
+Reproduces the verifier failure through the same local official
 ``opencode serve`` boundary used by production (ephemeral sessions via
 :class:`aa.opencode.client.OpenCodeClient`), isolating whether a
 rejection is tied to the custom ``aa-verifier-v2`` transport agent
-selector versus Muse itself.
+selector versus the requested model route itself.
 
 The verifier system prompt always travels through the native ``system``
 field; only the transport ``agent`` selector varies (custom selector vs
-omitted). Requested model stays pinned to Muse Spark on both variants.
-Every result is privacy-safe: only error categories, numeric HTTP
-statuses, model identities and wire/logical agent names are recorded.
-No prompt text, system text, or model output ever enters the result or
-the logs.
+omitted). The requested model is the owner-controlled configured primary
+(kodmial/aa#528) on both variants. Historical ``MUSE_*`` names remain as
+stable qualification vocabulary. Every result is privacy-safe: only
+error categories, numeric HTTP statuses, model identities and
+wire/logical agent names are recorded. No prompt text, system text, or
+model output ever enters the result or the logs.
 """
 
 from __future__ import annotations
@@ -146,7 +147,7 @@ async def probe_verifier_muse_access(
     model: str = VERIFIER_EXPECTED_MODEL,
     system: str = "",
 ) -> dict[str, Any]:
-    """Probe Muse access with and without the custom transport selector.
+    """Probe verifier access with and without the custom transport selector.
 
     Both variants use the same pinned model and the same verifier system
     prompt through the native ``system`` field; only the wire transport
@@ -214,10 +215,10 @@ def check_verifier_served_exact(
     expected: str = VERIFIER_EXPECTED_MODEL,
     forbidden: str = VERIFIER_FORBIDDEN_MODEL,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Check requested == served == Muse for the verifier (fail-closed).
+    """Check requested == served == expected for the verifier (fail-closed).
 
     Returns ``(passed, failed)`` check names using the exact live failure
-    vocabulary. An absent served verifier is the specific Muse-access
+    vocabulary. An absent served verifier is the specific verifier-access
     failure, never a generic Gate C failure. Any Space Bunny service for
     the verifier fails with the dedicated forbidden check.
     """

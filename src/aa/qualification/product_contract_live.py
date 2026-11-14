@@ -2534,10 +2534,11 @@ def build_live_whole_turn_judge(client: Any, settings: Any) -> Any:
     from aa.conversation.model_adapter import OpenCodeChatModel
     from aa.conversation.whole_turn_judge import WHOLE_TURN_JUDGE_AGENT_V2
 
-    # Grounding verifier uses Muse Spark without a Space Bunny fallback.
-    # The independent quality judge must have the same minimum model
-    # capability. In run 37884099275 the evaluator silently served Space
-    # Bunny for 16/17 invocations and overturned eight production verdicts.
+    # The grounding verifier uses the owner-controlled configured primary
+    # with no fallback. The independent quality judge must have the same
+    # minimum model capability. In run 37884099275 the evaluator silently
+    # served Space Bunny for 16/17 invocations and overturned eight
+    # production verdicts.
     # An unavailable primary is a visible fail-closed qualification blocker,
     # NOT a fabricated semantic negative returned by a weaker model.
     # Omit the wire agent just as build_verifier_model does: the logical
@@ -4928,13 +4929,17 @@ async def run_live_telegram_evidence_lane(
                 and all(model == settings.opencode_model for model in judge_served),
             )
             # Exact verifier pin (kodmial/aa#202): requested verifier
-            # model == served verifier model == Muse Spark. Space Bunny
-            # must never be recorded as serving aa-verifier-v2. An absent
-            # served verifier is the specific Muse-access failure, never
-            # a generic Gate C failure.
+            # model == served verifier model == the configured AA primary.
+            # A weaker fallback must never be recorded as serving
+            # aa-verifier-v2. An absent served verifier is the specific
+            # verifier-access failure, never a generic Gate C failure.
+            # kodmial/aa#528: the expected model follows the owner-controlled
+            # deployment policy instead of a hard-coded retired route.
             from aa.qualification.verifier_muse_probe import check_verifier_served_exact
 
-            verifier_passed, verifier_failed = check_verifier_served_exact(audit)
+            verifier_passed, verifier_failed = check_verifier_served_exact(
+                audit, expected=settings.opencode_model
+            )
             for name in verifier_passed:
                 _check(name, True)
             for name in verifier_failed:
