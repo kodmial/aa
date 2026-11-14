@@ -1,13 +1,13 @@
 """OpenCode session/runtime integration boundary.
 
-The worker talks to a local OpenCode runtime (``opencode serve`` over
+The worker talks to a local OpenCode 2 runtime (``opencode serve`` over
 loopback HTTP) and never implements its own LLM client. Two runtimes exist:
 
 - :class:`LocalOpenCodeRuntime`: production path. Attaches to an already
   healthy ``opencode serve`` instance or spawns one as a supervised child
-  process, polls ``GET /global/health`` until ready, and shuts the child
-  down gracefully (SIGTERM, then SIGKILL after a deadline). Attached
-  runtimes are never killed on shutdown.
+  process, polls ``GET /api/info`` (with Basic auth) until ready, and shuts
+  the child down gracefully (SIGTERM, then SIGKILL after a deadline).
+  Attached runtimes are never killed on shutdown.
 - :class:`StubOpenCodeRuntime`: offline in-memory fake implementing the same
   interface for unit tests and wiring without a real server.
 
@@ -249,7 +249,13 @@ def split_base_url(base_url: str) -> tuple[str, int]:
 
 
 def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
-    """Blocking single health probe; returns ``(healthy, version)``."""
+    """Blocking single v2 readiness probe; returns ``(healthy, version)``.
+
+    OpenCode 2 exposes ``GET /api/info`` (Basic auth, ``opencode`` username)
+    instead of the removed v1 ``/global/health`` route. A successful JSON
+    identity carrying the server ``version`` and ``pid`` is the readiness
+    signal; an unauthenticated or non-JSON response is never healthy.
+    """
     url = f"{base_url.rstrip('/')}/api/info"
     headers = {"Accept": "application/json"}
     if password:
@@ -346,7 +352,8 @@ class LocalOpenCodeRuntime(OpenCodeRuntime):
     serve`` already answers there, the worker attaches to it and never kills
     it. Otherwise -- when ``manage_process`` is true -- the configured
     command is spawned as ``opencode serve --port <port> --hostname <host>``
-    and polled until ``GET /global/health`` reports healthy.
+    with an explicit ``OPENCODE_PASSWORD`` and polled until ``GET /api/info``
+    authenticates and returns the server identity.
     """
 
     def __init__(
