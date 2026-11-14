@@ -144,15 +144,18 @@ async def _probe_variant(
 async def probe_verifier_muse_access(
     client: Any,
     *,
-    model: str = VERIFIER_EXPECTED_MODEL,
+    model: str,
     system: str = "",
 ) -> dict[str, Any]:
     """Probe verifier access with and without the custom transport selector.
 
-    Both variants use the same pinned model and the same verifier system
-    prompt through the native ``system`` field; only the wire transport
-    agent selector differs. The result carries no prompt, system, or
-    output text -- only categories, numeric statuses, and identities.
+    Both variants request the caller-supplied configured primary model
+    (kodmial/aa#528) and the same verifier system prompt through the
+    native ``system`` field; only the wire transport agent selector
+    differs. ``model`` is required so no caller can silently keep
+    probing the retired hard-coded route. The result carries no prompt,
+    system, or output text -- only categories, numeric statuses, and
+    identities.
     """
     system_text = system
     if not system_text.strip():
@@ -220,7 +223,10 @@ def check_verifier_served_exact(
     Returns ``(passed, failed)`` check names using the exact live failure
     vocabulary. An absent served verifier is the specific verifier-access
     failure, never a generic Gate C failure. Any Space Bunny service for
-    the verifier fails with the dedicated forbidden check.
+    the verifier fails with the dedicated forbidden check. An empty
+    ``forbidden`` disables that dedicated check: it is used when the
+    configured primary is itself the historically forbidden identity,
+    which production now serves the verifier on (kodmial/aa#528).
     """
     passed: list[str] = []
     failed: list[str] = []
@@ -228,9 +234,10 @@ def check_verifier_served_exact(
     if not entries:
         failed.append(MUSE_ACCESS_FAILURE)
         return tuple(passed), tuple(failed)
-    for entry in entries:
-        if entry["served"] == forbidden or entry["requested"] == forbidden:
-            failed.append(SPACE_BUNNY_FORBIDDEN_FAILURE)
+    if forbidden:
+        for entry in entries:
+            if entry["served"] == forbidden or entry["requested"] == forbidden:
+                failed.append(SPACE_BUNNY_FORBIDDEN_FAILURE)
     if SPACE_BUNNY_FORBIDDEN_FAILURE in failed:
         return tuple(passed), tuple(failed)
     exact = [

@@ -968,11 +968,26 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
         # than a hard-coded retired model. Hard-coding made verifier and
         # judge ignore AA_BOT_PRIMARY_MODEL and deterministically fail when
         # the deployment selected a different approved model.
+        # Fail closed at construction time: the verifier and judge are
+        # primary-only critical gates, so a blank setting must never
+        # silently swap the requested route for a different model inside
+        # the builder. An empty primary is the only silent-swap case: a
+        # configured primary equal to the fallback is the default
+        # deployment (both default to the same live model), and the
+        # verifier/judge builders pin ``fallback_model=""`` so no
+        # fallback route can ever serve these gates.
         from aa.conversation.model_adapter import build_verifier_model
 
+        resolved_primary = (primary or "").strip()
+        if not resolved_primary:
+            raise ValueError(
+                "verifier/judge require a configured primary; a blank "
+                "AA_BOT_PRIMARY_MODEL must not silently fall back to a "
+                "different model"
+            )
         verifier = build_verifier_model(
             self._client,
-            primary_model=primary,
+            primary_model=resolved_primary,
             request_timeout=planner.request_timeout,
         )
         # Systemic repair (kodmial/aa#372): the production graph never
@@ -988,7 +1003,7 @@ class _ProductionGraphRuntime(GraphTurnRuntime):
 
         judge = build_judge_model(
             self._client,
-            primary_model=primary,
+            primary_model=resolved_primary,
             request_timeout=planner.request_timeout,
         )
         return build_turn_graph(

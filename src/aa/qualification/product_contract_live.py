@@ -4935,10 +4935,36 @@ async def run_live_telegram_evidence_lane(
             # verifier-access failure, never a generic Gate C failure.
             # kodmial/aa#528: the expected model follows the owner-controlled
             # deployment policy instead of a hard-coded retired route.
-            from aa.qualification.verifier_muse_probe import check_verifier_served_exact
+            from aa.config import DEFAULT_PRIMARY_MODEL
+            from aa.qualification.verifier_muse_probe import (
+                VERIFIER_FORBIDDEN_MODEL,
+                check_verifier_served_exact,
+            )
 
+            # kodmial/aa#528: resolve the expected verifier model with the
+            # same normalization and fallback the builder applies, so a
+            # blank or whitespace-padded setting cannot make this gate
+            # expect a different route than the verifier actually
+            # requests (which would produce a misleading verifier-access
+            # failure).
+            expected_verifier_model = (settings.opencode_model or "").strip() or (
+                DEFAULT_PRIMARY_MODEL
+            )
+            # The dedicated Space Bunny forbidden check stays active for
+            # every deployment whose configured primary differs from that
+            # identity. When the configured primary is itself that
+            # identity, the check is vacuous: production now serves the
+            # verifier on the owner-controlled configured primary, so
+            # qualification must not block a configuration the verifier
+            # accepts.
             verifier_passed, verifier_failed = check_verifier_served_exact(
-                audit, expected=settings.opencode_model
+                audit,
+                expected=expected_verifier_model,
+                forbidden=(
+                    VERIFIER_FORBIDDEN_MODEL
+                    if expected_verifier_model != VERIFIER_FORBIDDEN_MODEL
+                    else ""
+                ),
             )
             for name in verifier_passed:
                 _check(name, True)

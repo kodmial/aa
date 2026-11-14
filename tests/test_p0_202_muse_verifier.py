@@ -506,6 +506,6 @@ def test_live_lane_locks_exact_verifier_pin() -> None:
         / "product_contract_live.py"
     ).read_text(encoding="utf-8")
     assert "check_verifier_served_exact" in source
-    assert "expected=settings.opencode_model" in source
+    assert "expected=expected_verifier_model" in source
     assert "verifier_failed" in source
     assert "verifier_muse_probe" in source
