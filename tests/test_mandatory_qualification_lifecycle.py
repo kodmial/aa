@@ -24,6 +24,7 @@ from aa.qualification import mandatory_lifecycle as lifecycle
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "aa-mandatory-qualification-lifecycle.yml"
 SELF_PROVING_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "aa-self-proving-qualification.yml"
+RECONCILER = REPO_ROOT / "scripts" / "reconcile_mandatory_qualification.py"
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -231,6 +232,39 @@ def test_mandatory_workflow_is_observable_idempotent_trigger() -> None:
     # exact SHA, never a generic no-secret runner.
     assert "aa-self-proving-qualification.yml" in body
     assert "cancel-in-progress: false" in body
+
+
+def test_mandatory_dispatch_explicitly_selects_full_qualification_mode() -> None:
+    command = lifecycle.build_full_qualification_workflow_dispatch(SHA_A)
+    assert command == [
+        "workflow",
+        "run",
+        "aa-self-proving-qualification.yml",
+        "--ref",
+        "main",
+        "-f",
+        f"required_sha={SHA_A}",
+        "-f",
+        "qualification_mode=full",
+    ]
+    reconciler = RECONCILER.read_text(encoding="utf-8")
+    assert "build_full_qualification_workflow_dispatch(owner_item.sha)" in reconciler
+
+    with pytest.raises(lifecycle.MandatoryLifecycleError):
+        lifecycle.build_full_qualification_workflow_dispatch("not-an-exact-sha")
+
+
+def test_mandatory_workflow_result_comment_trigger_requires_canonical_marker() -> None:
+    body = WORKFLOW.read_text(encoding="utf-8")
+    # Status prose may mention a missing result marker; it must not dispatch
+    # the qualification lifecycle. Only the canonical issue-7 marker prefix
+    # is an eligible event trigger.
+    assert (
+        "contains(github.event.comment.body, '<!-- continuum-qualification-result issue=7 sha=')"
+        in body
+    )
+    broad_match = "contains(github.event.comment.body, 'continuum-qualification-result')"
+    assert broad_match not in body
 
 
 def test_self_proving_lane_owns_live_secrets_and_privacy() -> None:

@@ -132,6 +132,28 @@ def normalize_sha(value: str) -> str:
     return normalized
 
 
+def build_full_qualification_workflow_dispatch(sha: str) -> list[str]:
+    """Build the mandatory lifecycle's explicit full A/B/C/E dispatch.
+
+    The exact-main final reducer runs only the mandatory A/B/C/E gates; Gate D
+    remains excluded. Direct diagnostic dispatches keep the self-proving
+    workflow default of gate-c-focus.
+    """
+
+    normalized = normalize_sha(sha)
+    return [
+        "workflow",
+        "run",
+        "aa-self-proving-qualification.yml",
+        "--ref",
+        "main",
+        "-f",
+        f"required_sha={normalized}",
+        "-f",
+        "qualification_mode=full",
+    ]
+
+
 def parse_automation_qualification(body: str) -> int | None:
     """Return the mandatory qualification issue number, if declared."""
     match = _AUTOMATION_QUALIFICATION_RE.search(body or "")
@@ -1225,6 +1247,7 @@ __all__ = [
     "build_blocked_record",
     "build_dispatch_record",
     "build_dispatch_tuple",
+    "build_full_qualification_workflow_dispatch",
     "classify_runner_state",
     "classify_tracker_lease",
     "collect_qualifying_capabilities_from_pages",
