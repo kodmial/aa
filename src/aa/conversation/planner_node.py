@@ -362,8 +362,12 @@ PLANNER_TEXT_JSON_SUFFIX = (
     '"resolved_intent": string, "queries": array of strings, '
     '"information_needs": [{"need_id": string, "text": string}]}. '
     'Use {"mode": "conversational", "resolved_intent": "", "queries": [], '
-    '"information_needs": []} only for purely conversational turns; a '
-    "greeting opener plus a substantive request is retrieval, never "
+    '"information_needs": []} only for purely conversational turns; '
+    "questions about the assistant's own identity, role or capabilities "
+    "are conversational when they ask only about the assistant, because a "
+    "truthful capability reply needs no book passage; a greeting opener "
+    "plus a substantive request, or a capability question that also asks a "
+    "substantive recovery, program or book question, is retrieval, never "
     "conversational, with the intent and queries focused on the "
     "substantive request; otherwise return "
     '{"mode": "retrieval", "resolved_intent": standalone intent, '
