@@ -116,6 +116,42 @@ class _StaticAnswer:
         return AIMessage(content=self._text)
 
 
+class _CountingPlanner:
+    """Valid repair plan that records whether a full repair round started."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+    ) -> dict[str, object]:
+        _ = (prompt, system, schema, retry_count)
+        self.calls += 1
+        return {
+            "mode": "retrieval",
+            "resolved_intent": "как справляться с тягой вечером",
+            "queries": ["тяга вечером", "справиться с тягой"],
+        }
+
+
+class _DialogueJudge:
+    """Whole-turn judge double certifying non-substantive dialogue."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 1
+    ) -> dict[str, object]:
+        _ = (prompt, system, schema, retry_count)
+        self.calls += 1
+        return {
+            "helpful": True,
+            "addresses_intent": True,
+            "contains_substantive_claim": False,
+        }
+
+
 BOOK_TEXT = "Фиктивная поддержка рядом. Тяга проходит, если обратиться за помощью."
 BAD_QUOTE_DRAFT = (
     "Вот точные слова: «Фиктивная поддержка рядом помогает». "
@@ -361,3 +397,205 @@ async def test_user_quote_in_kept_sibling_stays_exempt_after_quarantine() -> Non
 
     assert user_quote in spans
     assert "Фиктивная поддержка рядом помогает" not in spans
+
+
+async def test_partial_non_book_salvage_skips_full_repair() -> None:
+    """A rejected glue unit must not start slow re-planning over a verified sibling.
+
+    Qualification #532: before the salvage-aware admission, this exact
+    shape (relevant supported book unit plus one unsupported glue/meta
+    unit) entered the full replan/retrieve loop, burning provider rounds
+    until the Gate C canary budget expired. Retrieval cannot supply book
+    evidence for non-book wording, so the verified sibling is narrowed
+    and served without any repair call.
+    """
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    book_unit = "Тяга проходит, если обратиться за помощью."
+    glue_unit = "Понимаю, это качели."
+    draft = f"{glue_unit} {book_unit}"
+    pack = [_pack_entry(BOOK_TEXT)]
+    verifier = _UnitTextVerifier(
+        {
+            glue_unit: {
+                "requires_book_evidence": False,
+                "supported": False,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+                "claim_origin": "conversation_glue",
+            },
+            book_unit: _book_decision(pack[0]["passage_id"]),
+        }
+    )
+    planner = _CountingPlanner()
+
+    outcome = await run_v2_answer_turn(
+        user_message=USER_MESSAGE,
+        summary="",
+        recent=[],
+        evidence_pack=pack,
+        answer_model=_StaticAnswer(draft),
+        verifier_model=verifier,
+        planner_model=planner,
+        retrieval_index=object(),
+        initial_query_count=12,
+        planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent=USER_MESSAGE,
+    )
+
+    assert outcome["text"] == book_unit
+    assert planner.calls == 0
+    telemetry = dict(outcome["telemetry"])
+    assert telemetry["repair_rounds"] == 0
+    assert telemetry["repair_skipped_serveable_salvage"] is True
+    assert telemetry["answer_outcome"] == "narrowed-adequacy"
+    assert telemetry["qualified"] is True
+
+
+async def test_pure_non_book_salvage_serves_supported_sibling_without_repair() -> None:
+    """The meta-canary shape must skip repair and quarantine the rejected unit.
+
+    Qualification #532: the live meta turn had no book scope. One glue
+    unit failed a deterministic gate while a supported glue sibling
+    survived, which after #530 admitted the full repair loop and
+    exhausted the canary budget. The supported subset is judged once as
+    dialogue; the rejected unit is never served.
+    """
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    rejected_glue = "Понимаю, это «качели»."
+    supported_glue = "Я рядом и готов спокойно поддержать разговор."
+    draft = f"{rejected_glue} {supported_glue}"
+    pack = [_pack_entry(BOOK_TEXT)]
+    verifier = _UnitTextVerifier(
+        {
+            rejected_glue: {
+                "requires_book_evidence": False,
+                "supported": False,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+                "claim_origin": "conversation_glue",
+            },
+            supported_glue: _glue_decision(),
+        }
+    )
+    planner = _CountingPlanner()
+    judge = _DialogueJudge()
+
+    outcome = await run_v2_answer_turn(
+        user_message=USER_MESSAGE,
+        summary="",
+        recent=[],
+        evidence_pack=pack,
+        answer_model=_StaticAnswer(draft),
+        verifier_model=verifier,
+        planner_model=planner,
+        retrieval_index=object(),
+        whole_turn_judge_model=judge,
+        initial_query_count=12,
+        planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent=USER_MESSAGE,
+    )
+
+    assert outcome["text"] == supported_glue
+    assert "«качели»" not in outcome["text"]
+    assert planner.calls == 0
+    assert judge.calls == 1
+    telemetry = dict(outcome["telemetry"])
+    assert telemetry["repair_rounds"] == 0
+    assert telemetry["repair_skipped_serveable_salvage"] is True
+    assert telemetry["answer_outcome"] == "conversational-generated"
+    assert telemetry["technically_grounded"] is False
+    assert telemetry["qualified"] is True
+
+
+async def test_pure_non_book_salvage_without_judge_keeps_repair_path() -> None:
+    """Judge-less callers retain the historical repair opportunity.
+
+    A pure non-book salvage is serveable only by the judge-reconciled
+    dialogue boundary, so without an independent judge the turn must not
+    silently skip repair and collapse to clarification with no recovery
+    path. Book-scoped repair admission is unchanged.
+    """
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    rejected_glue = "Понимаю, это «качели»."
+    supported_glue = "Я рядом и готов спокойно поддержать разговор."
+    draft = f"{rejected_glue} {supported_glue}"
+    pack = [_pack_entry(BOOK_TEXT)]
+    verifier = _UnitTextVerifier(
+        {
+            rejected_glue: {
+                "requires_book_evidence": False,
+                "supported": False,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+                "claim_origin": "conversation_glue",
+            },
+            supported_glue: _glue_decision(),
+        }
+    )
+    planner = _CountingPlanner()
+
+    with pytest.raises(TurnFailed):
+        await run_v2_answer_turn(
+            user_message=USER_MESSAGE,
+            summary="",
+            recent=[],
+            evidence_pack=pack,
+            answer_model=_StaticAnswer(draft),
+            verifier_model=verifier,
+            planner_model=planner,
+            retrieval_index=object(),
+            initial_query_count=12,
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent=USER_MESSAGE,
+        )
+
+    assert planner.calls >= 1
+
+
+async def test_unsupported_book_unit_still_admits_full_repair() -> None:
+    """A book-scoped gap keeps the historical evidence-repair path."""
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    book_unit = "Тяга проходит, если обратиться за помощью."
+    unsupported_book_unit = "Фиктивная поддержка рядом помогает всегда."
+    draft = f"{book_unit} {unsupported_book_unit}"
+    pack = [_pack_entry(BOOK_TEXT)]
+    verifier = _UnitTextVerifier(
+        {
+            book_unit: _book_decision(pack[0]["passage_id"]),
+            unsupported_book_unit: {
+                "requires_book_evidence": True,
+                "supported": False,
+                "evidence_passage_ids": [],
+                "addresses_intent": True,
+                "claim_origin": "book_claim",
+            },
+        }
+    )
+    planner = _CountingPlanner()
+
+    outcome = await run_v2_answer_turn(
+        user_message=USER_MESSAGE,
+        summary="",
+        recent=[],
+        evidence_pack=pack,
+        answer_model=_StaticAnswer(draft),
+        verifier_model=verifier,
+        planner_model=planner,
+        retrieval_index=object(),
+        initial_query_count=12,
+        planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent=USER_MESSAGE,
+    )
+
+    assert planner.calls >= 1
+    telemetry = dict(outcome["telemetry"])
+    assert not telemetry.get("repair_skipped_serveable_salvage", False)

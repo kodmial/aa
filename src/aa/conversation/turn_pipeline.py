@@ -1361,6 +1361,38 @@ def has_supported_book_unit(result: GroundingResult | None) -> bool:
     return any(verdict.scope == "book" and bool(verdict.supported) for verdict in result.units)
 
 
+def has_supported_unit(result: GroundingResult | None) -> bool:
+    """Whether the verifier retained at least one supported unit."""
+    if result is None:
+        return False
+    return any(bool(getattr(verdict, "supported", False)) for verdict in result.units)
+
+
+def has_only_unsupported_non_book_units(result: GroundingResult | None) -> bool:
+    """Whether every unsupported verdict is conversational glue/meta.
+
+    Qualification #532 (regression after #530 per-unit salvage): a
+    deterministic gate rejection now demotes one unit instead of
+    discarding the whole draft. When the surviving failure is a
+    non-book glue/meta unit, full re-planning/retrieval cannot add book
+    evidence for that wording: the model verdict already says it needs
+    none. Classifying that salvage as a repair trigger burned several
+    slow provider rounds and exhausted the Gate C canary budget. A
+    relevant supported book sibling is served by the deterministic
+    narrowing path; an all-non-book salvage reaches the existing
+    judge-reconciled dialogue boundary. Book-scoped unsupported units
+    keep the historical repair path.
+    """
+    if result is None:
+        return False
+    unsupported = [
+        verdict for verdict in result.units if not bool(getattr(verdict, "supported", False))
+    ]
+    if not unsupported:
+        return False
+    return all(str(getattr(verdict, "scope", "")) != "book" for verdict in unsupported)
+
+
 def grounding_result_to_state(result: GroundingResult | None) -> dict[str, Any]:
     """Serialize a verifier outcome into graph state (no prompt text)."""
     if result is None:
@@ -3691,10 +3723,50 @@ async def run_v2_answer_turn(
         and _effective_reason == "legitimate-glue"
         and (initial_query_count is None or _query_hint == 0)
     )
+    # Qualification #532: a #530 partial salvage whose only unsupported
+    # units are conversational glue/meta cannot be improved by full
+    # re-planning/retrieval, because those units require no book evidence
+    # by model verdict. A relevant supported book sibling is serveable by
+    # deterministic narrowing; a pure non-book salvage (the meta canary
+    # shape) is serveable only by the judge-reconciled dialogue boundary,
+    # so it is salvage-admitted only when a whole-turn judge is available.
+    # Judge-less callers keep the historical repair opportunity instead of
+    # collapsing to clarification with no recovery path. Admitting either
+    # serveable shape to the repair loop adds slow provider rounds and
+    # exhausted the Gate C canary budget on qualification #7. Book-scoped
+    # unsupported units, and drafts that still carry book scope without a
+    # relevant supported book sibling, take the historical repair path.
+    # The negative of the book-claim signal is re-derived conservatively
+    # from the verdicts themselves: the probe above clobbers
+    # _verifier_claims_book to False on its own failure, so trusting that
+    # flag here would read a failed probe as proof that no book evidence
+    # is required and skip the repair that would re-adjudicate it. Scope
+    # is derived deterministically from the model's
+    # requires_book_evidence verdict, so a book-scoped verdict is a
+    # positive book claim.
+    _no_verifier_book_claim = (
+        result is not None
+        and not _verifier_claims_book
+        and all(str(getattr(verdict, "scope", "")) != "book" for verdict in result.units)
+    )
+    # The unavailable-unit guard mirrors repair_allowed: a verifier
+    # outage leaves undecided units that only a repair round can
+    # re-adjudicate, so an unavailable turn is never serveable salvage.
+    _serveable_partial_salvage = (
+        result is not None
+        and not result.unavailable_unit_ids
+        and has_only_unsupported_non_book_units(result)
+        and has_supported_unit(result)
+        and (
+            has_relevant_supported_book_unit(result)
+            or (_no_verifier_book_claim and whole_turn_judge_model is not None)
+        )
+    )
     repair_allowed = (
         result is not None
         and not result.unavailable_unit_ids
         and not _initial_local_guard_reason
+        and not _serveable_partial_salvage
         and (
             (not initial_pack_empty)
             or (initial_query_count is not None and initial_query_count > 0)
@@ -3702,6 +3774,12 @@ async def run_v2_answer_turn(
             or (_effective_reason in ("provider-error", "timeout", "invalid", "unknown"))
         )
     )
+    if not passed and _serveable_partial_salvage:
+        telemetry["repair_skipped_serveable_salvage"] = True
+        logger.info(
+            "v2 repair skipped for serveable non-book salvage",
+            extra={"category": "non-book-unsupported"},
+        )
     if not passed and is_glue:
         logger.info(
             "v2 repair skipped for glue-judged turn",
@@ -5513,14 +5591,37 @@ async def run_v2_answer_turn(
     # round; at most the one bounded judge call inside the helper, skipped
     # when budgets are spent. Substantive or unavailable turns still fail
     # closed to clarification.
+    #
+    # Qualification #532: for a #530 non-book partial salvage, judge the
+    # supported subset, never the original candidate. Deterministic gates
+    # already rejected the unsupported sibling, so serving the full draft
+    # here would bypass that quarantine.
     try:
         _tail_candidate = current_draft if isinstance(current_draft, str) else ""
         _tail_units = units
         _tail_result = result
+        _tail_state = grounding_result_to_state(result)
+        if _serveable_partial_salvage:
+            _tail_kept = keep_supported_units(units, result) if units and result is not None else []
+            _tail_text = keep_supported_text(units, result) if units and result is not None else ""
+            if _tail_kept and _tail_text:
+                _tail_candidate = _tail_text
+                _tail_units = _tail_kept
+                _tail_state = narrowed_grounding_state(_tail_kept, result)
+            else:
+                # Fail closed: the salvage narrowed to no usable
+                # supported text, so there is no certified subset to
+                # rescue. Leaving the full draft as the candidate would
+                # let the judge certify a unit the deterministic gates
+                # already rejected, bypassing the quarantine above.
+                _tail_candidate = ""
+                _tail_units = []
+                _tail_state = grounding_result_to_state(None)
     except NameError:
         _tail_candidate = ""
         _tail_units = []
         _tail_result = None
+        _tail_state = grounding_result_to_state(None)
     if _tail_candidate.strip() and await _judge_reconciled_dialogue(
         _tail_candidate, _tail_units, _tail_result
     ):
@@ -5534,8 +5635,8 @@ async def run_v2_answer_turn(
         _finish_telemetry()
         return {
             "text": _tail_candidate,
-            "units": units,
-            "verification": grounding_result_to_state(result),
+            "units": _tail_units,
+            "verification": _tail_state,
             "rounds": rounds,
             "recent_quote_ranges": list(recent_ranges),
             "telemetry": dict(telemetry),
@@ -5852,8 +5953,10 @@ __all__ = [
     "compact_supported_to_envelope",
     "contains_cyrillic",
     "grounding_result_to_state",
+    "has_only_unsupported_non_book_units",
     "has_relevant_supported_book_unit",
     "has_supported_book_unit",
+    "has_supported_unit",
     "keep_relevant_supported_text",
     "keep_relevant_supported_units",
     "keep_supported_text",
