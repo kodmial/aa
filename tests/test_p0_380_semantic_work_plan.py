@@ -560,7 +560,6 @@ async def test_batched_missing_extra_and_invalid_verdicts_fail_closed() -> None:
         [good],
         [good, good, good],
         [dict(good, supported="true")],
-        [dict(good, evidence_passage_ids=["no-such-passage"]), good],
         [dict(good, evidence_passage_ids=[])],
         [_decision(book=False, supported=True, cites=[str(pack[0]["passage_id"])])] * 2,
     ):
@@ -568,6 +567,20 @@ async def test_batched_missing_extra_and_invalid_verdicts_fail_closed() -> None:
         with pytest.raises(VerifierValidationError):
             await run_batched_verifier(units, pack, model=model, answer_text=TWO_UNIT_DRAFT)
         assert model.calls == 1
+
+    # A deterministic cite failure is per-unit: the offending unit is
+    # quarantined while the independently verified sibling survives.
+    mixed = [dict(good, evidence_passage_ids=["no-such-passage"]), good]
+    mixed_model = _ScriptedAAVerifier([mixed], batched=True, text_fallback=garbage_text)
+    mixed_result = await run_batched_verifier(
+        units, pack, model=mixed_model, answer_text=TWO_UNIT_DRAFT
+    )
+    assert mixed_model.calls == 1
+    assert mixed_result.all_required_supported is False
+    assert [item.unit_id for item in mixed_result.units] == ["u1", "u2"]
+    assert mixed_result.units[0].supported is False
+    assert mixed_result.units[0].evidence_passage_ids == []
+    assert mixed_result.units[1].supported is True
 
 
 async def test_batched_poisoned_evidence_makes_no_model_call() -> None:
