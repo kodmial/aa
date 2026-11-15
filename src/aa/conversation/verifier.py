@@ -374,6 +374,183 @@ def check_quote_origins(
     )
 
 
+def _compact_candidate(
+    kept_units: Sequence[ResponseUnitDraft],
+) -> tuple[str, list[ResponseUnitDraft]]:
+    """Build one contiguous candidate for a verified-unit subset.
+
+    Re-anchors draft-relative offsets so exact quote/citation gates see
+    the same text the subset would serve. The joining space is outside
+    every unit span, so spans never absorb neighbouring punctuation.
+    """
+    texts: list[str] = []
+    compact_units: list[ResponseUnitDraft] = []
+    cursor = 0
+    for unit in kept_units:
+        text = str(unit.text)
+        texts.append(text)
+        start = cursor
+        end = start + len(text)
+        compact_units.append(
+            ResponseUnitDraft(
+                unit_id=str(unit.unit_id),
+                text=text,
+                char_start=start,
+                char_end=end,
+            )
+        )
+        cursor = end + 1
+    return " ".join(texts), compact_units
+
+
+def _demote_gate_rejected_verdict(verdict: UnitVerdict) -> UnitVerdict:
+    """Fail one deterministically rejected unit closed, preserving its id.
+
+    The unit is already blocked from delivery; clearing citations and
+    relevance prevents a rejected verdict from contributing aggregate
+    relevance or borrowing support from another unit.
+    """
+    return verdict.model_copy(
+        update={
+            "supported": False,
+            "evidence_passage_ids": [],
+            "addresses_intent": False,
+        }
+    )
+
+
+def _enforce_post_round_gates(
+    *,
+    units: Sequence[ResponseUnitDraft],
+    result: GroundingResult,
+    passages: Sequence[dict[str, Any]],
+    answer_text: str | None,
+    recent: Sequence[Any] | None = None,
+    user_message: str = "",
+) -> GroundingResult:
+    """Apply deterministic gates, quarantining only rejected units.
+
+    Integrity and structural validation stay global and always raise:
+    a corrupt pack or an inconsistent verdict set can never be narrowed
+    into a served answer. Citation, exact-quote and quote-origin gates
+    are per-unit claims, so a model-side citation/quote mistake fails
+    that unit closed while independently verified units remain eligible
+    for the existing deterministic narrowing path. The preserved subset
+    is re-certified as one contiguous candidate, so cross-unit quote
+    interactions cannot borrow verification from a rejected unit. If no
+    supported unit survives, the original strict error propagates.
+    """
+    unit_list = list(units)
+    if not unit_list:
+        return result
+    pack_ids = set(_pack_index(passages).keys())
+    check_passage_checksums(passages)
+
+    def _validate_subset(
+        subset_units: Sequence[ResponseUnitDraft],
+        subset_verdicts: Sequence[UnitVerdict],
+    ) -> None:
+        candidate, compact_units = _compact_candidate(subset_units)
+        subset_result = GroundingResult(
+            units=list(subset_verdicts),
+            all_required_supported=all(verdict.supported for verdict in subset_verdicts),
+        )
+        check_cited_passage_ids(subset_result, pack_ids=pack_ids)
+        check_exact_quotes(
+            units=compact_units,
+            result=subset_result,
+            passages=passages,
+            answer_text=candidate,
+        )
+        check_quote_origins(
+            answer=candidate,
+            units=compact_units,
+            result=subset_result,
+            passages=passages,
+            recent=recent,
+            user_message=user_message,
+        )
+
+    candidate_text = (
+        answer_text if isinstance(answer_text, str) else " ".join(unit.text for unit in unit_list)
+    )
+    try:
+        check_cited_passage_ids(result, pack_ids=pack_ids)
+        check_exact_quotes(
+            units=unit_list,
+            result=result,
+            passages=passages,
+            answer_text=answer_text,
+        )
+        check_quote_origins(
+            answer=candidate_text,
+            units=unit_list,
+            result=result,
+            passages=passages,
+            recent=recent,
+            user_message=user_message,
+        )
+        return result
+    except VerifierValidationError as exc:
+        first_error = exc
+
+    verdict_by_id = {verdict.unit_id: verdict for verdict in result.units}
+    kept_units: list[ResponseUnitDraft] = []
+    kept_verdicts: list[UnitVerdict] = []
+    for unit in unit_list:
+        verdict = verdict_by_id.get(unit.unit_id)
+        if verdict is None or not verdict.supported:
+            # Already fail-closed; it cannot contribute served material.
+            continue
+        try:
+            _validate_subset([unit], [verdict])
+        except VerifierValidationError:
+            logger.info(
+                "verifier deterministic gate rejected one unit; failing it closed",
+                extra={"category": "unit-gate-rejected"},
+            )
+            continue
+        kept_units.append(unit)
+        kept_verdicts.append(verdict)
+
+    if not kept_units:
+        raise first_error
+    try:
+        _validate_subset(kept_units, kept_verdicts)
+    except VerifierValidationError:
+        # A whole-subset interaction still fails closed: never serve a
+        # candidate that cannot be certified as exactly the kept units.
+        raise first_error from None
+
+    kept_ids = {unit.unit_id for unit in kept_units}
+    final_verdicts = [
+        verdict
+        if verdict.unit_id in kept_ids or not verdict.supported
+        else _demote_gate_rejected_verdict(verdict)
+        for verdict in result.units
+    ]
+    logger.info(
+        "verifier deterministic gates narrowed rejected units",
+        extra={
+            "category": "unit-gate-quarantine",
+            "kept_units": len(kept_units),
+            "rejected_units": len(final_verdicts) - len(kept_units),
+        },
+    )
+    return validate_grounding_result(
+        {
+            "verified": bool(result.verified),
+            "units": [verdict.model_dump() for verdict in final_verdicts],
+            "all_required_supported": (
+                not result.unavailable_unit_ids
+                and all(verdict.supported for verdict in final_verdicts)
+            ),
+            "unavailable_unit_ids": list(result.unavailable_unit_ids),
+        },
+        expected_unit_ids=[unit.unit_id for unit in unit_list],
+    )
+
+
 def _reply_structured_content(reply: object) -> object:
     if isinstance(reply, BaseMessage):
         return reply.content
@@ -1869,27 +2046,21 @@ async def _verify_per_unit_concurrent(
     result = validate_grounding_result(
         assembled, expected_unit_ids=[unit.unit_id for unit in units]
     )
-    pack_ids = set(_pack_index(passages).keys())
-    check_passage_checksums(passages)
-    check_cited_passage_ids(result, pack_ids=pack_ids)
-    check_exact_quotes(units=units, result=result, passages=passages, answer_text=answer_text)
     # Candidate-level quote/origin certification (kodmial/aa#308): the
     # entire actual current answer candidate is checked through this
     # existing reachable path with exact answer/source offsets and
     # durable provenance. #304 later moves the check to the single
     # delivery boundary and rechecks after every textual modification.
-    candidate_text = (
-        answer_text if isinstance(answer_text, str) else " ".join(unit.text for unit in units)
-    )
-    check_quote_origins(
-        answer=candidate_text,
+    # Integrity failures stay global; per-unit citation/quote mistakes
+    # fail only that unit closed so independently verified units survive.
+    return _enforce_post_round_gates(
         units=units,
         result=result,
         passages=passages,
+        answer_text=answer_text,
         recent=recent,
         user_message=user_message,
     )
-    return result
 
 
 async def run_batched_verifier(
@@ -2067,18 +2238,11 @@ async def run_batched_verifier(
     result = validate_grounding_result(
         assembled, expected_unit_ids=[unit.unit_id for unit in unit_list]
     )
-    pack_ids = set(_pack_index(passages).keys())
-    check_passage_checksums(passages)
-    check_cited_passage_ids(result, pack_ids=pack_ids)
-    check_exact_quotes(units=unit_list, result=result, passages=passages, answer_text=answer_text)
-    candidate_text = (
-        answer_text if isinstance(answer_text, str) else " ".join(unit.text for unit in unit_list)
-    )
-    check_quote_origins(
-        answer=candidate_text,
+    result = _enforce_post_round_gates(
         units=unit_list,
         result=result,
         passages=passages,
+        answer_text=answer_text,
         recent=recent,
         user_message=user_message,
     )
