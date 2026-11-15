@@ -3736,12 +3736,30 @@ async def run_v2_answer_turn(
     # exhausted the Gate C canary budget on qualification #7. Book-scoped
     # unsupported units, and drafts that still carry book scope without a
     # relevant supported book sibling, take the historical repair path.
+    # The negative of the book-claim signal is re-derived conservatively
+    # from the verdicts themselves: the probe above clobbers
+    # _verifier_claims_book to False on its own failure, so trusting that
+    # flag here would read a failed probe as proof that no book evidence
+    # is required and skip the repair that would re-adjudicate it. Scope
+    # is derived deterministically from the model's
+    # requires_book_evidence verdict, so a book-scoped verdict is a
+    # positive book claim.
+    _no_verifier_book_claim = (
+        result is not None
+        and not _verifier_claims_book
+        and all(str(getattr(verdict, "scope", "")) != "book" for verdict in result.units)
+    )
+    # The unavailable-unit guard mirrors repair_allowed: a verifier
+    # outage leaves undecided units that only a repair round can
+    # re-adjudicate, so an unavailable turn is never serveable salvage.
     _serveable_partial_salvage = (
-        has_only_unsupported_non_book_units(result)
+        result is not None
+        and not result.unavailable_unit_ids
+        and has_only_unsupported_non_book_units(result)
         and has_supported_unit(result)
         and (
             has_relevant_supported_book_unit(result)
-            or (not _verifier_claims_book and whole_turn_judge_model is not None)
+            or (_no_verifier_book_claim and whole_turn_judge_model is not None)
         )
     )
     repair_allowed = (
@@ -5583,13 +5601,22 @@ async def run_v2_answer_turn(
         _tail_units = units
         _tail_result = result
         _tail_state = grounding_result_to_state(result)
-        if _serveable_partial_salvage and units and result is not None:
-            _tail_kept = keep_supported_units(units, result)
-            _tail_text = keep_supported_text(units, result)
+        if _serveable_partial_salvage:
+            _tail_kept = keep_supported_units(units, result) if units and result is not None else []
+            _tail_text = keep_supported_text(units, result) if units and result is not None else ""
             if _tail_kept and _tail_text:
                 _tail_candidate = _tail_text
                 _tail_units = _tail_kept
                 _tail_state = narrowed_grounding_state(_tail_kept, result)
+            else:
+                # Fail closed: the salvage narrowed to no usable
+                # supported text, so there is no certified subset to
+                # rescue. Leaving the full draft as the candidate would
+                # let the judge certify a unit the deterministic gates
+                # already rejected, bypassing the quarantine above.
+                _tail_candidate = ""
+                _tail_units = []
+                _tail_state = grounding_result_to_state(None)
     except NameError:
         _tail_candidate = ""
         _tail_units = []
