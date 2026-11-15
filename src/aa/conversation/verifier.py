@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -391,8 +392,13 @@ def _compact_candidate(
         texts.append(text)
         start = cursor
         end = start + len(text)
+        # Preserve the original unit (any field beyond the identity text
+        # and offsets stays intact); only the re-anchored offsets change,
+        # so the re-certified subset sees the same unit data the strict
+        # gates judged.
         compact_units.append(
-            ResponseUnitDraft(
+            dataclasses.replace(
+                unit,
                 unit_id=str(unit.unit_id),
                 text=text,
                 char_start=start,
@@ -443,10 +449,12 @@ def _enforce_post_round_gates(
     survives, the original strict error propagates.
     """
     unit_list = list(units)
+    pack_ids = set(_pack_index(passages).keys())
+    # Pack integrity is a global gate: it must raise even when there is
+    # no unit to narrow, never be bypassed by the empty early return.
+    check_passage_checksums(passages)
     if not unit_list:
         return result
-    pack_ids = set(_pack_index(passages).keys())
-    check_passage_checksums(passages)
 
     def _validate_subset(
         subset_units: Sequence[ResponseUnitDraft],
@@ -515,7 +523,16 @@ def _enforce_post_round_gates(
         kept_units.append(unit)
         kept_verdicts.append(verdict)
 
-    if not kept_units:
+    if not kept_units or (
+        all(verdict.supported for verdict in result.units) and len(kept_units) == len(unit_list)
+    ):
+        # Either nothing survived, or every unit passed its own per-unit
+        # checks so nothing was actually quarantined. In the latter case
+        # the strict failure was a whole-candidate interaction, not a
+        # single unit: returning the (unchanged, fully supported)
+        # verdict set would let the delivery boundary serve the original
+        # candidate the strict gates rejected. Never certify a narrowed
+        # candidate in its place.
         raise first_error
     try:
         _validate_subset(kept_units, kept_verdicts)

@@ -270,6 +270,7 @@ async def test_turn_serves_verified_book_sibling_without_glue_quote() -> None:
     assert "«качели»" not in outcome["text"]
     telemetry = dict(outcome["telemetry"])
     assert telemetry["answer_outcome"] == "narrowed-adequacy"
+    assert telemetry["verifier_outcome"] == "passed"
     assert telemetry["qualified"] is True
 
 
@@ -309,3 +310,54 @@ async def test_single_rejected_unit_still_fails_closed() -> None:
             user_message=USER_MESSAGE,
             answer_text=draft,
         )
+
+
+async def test_user_quote_in_kept_sibling_stays_exempt_after_quarantine() -> None:
+    """A quarantined book unit must not strip the kept sibling's exemption.
+
+    The delivery boundary re-certifies the original draft, where the
+    quarantined unit's demoted verdict (supported false, citations
+    cleared) fails the invented book quotation wholesale. The trusted
+    user-quote exemption must still be rebuilt from the kept subset so
+    the faithful user quotation does not count toward the book quota.
+    """
+    from aa.conversation.turn_pipeline import certified_user_span_texts
+    from aa.conversation.verifier_schema import NON_BOOK_SCOPE, GroundingResult, UnitVerdict
+
+    user_quote = "К вечеру очень тянет выпить"
+    draft = f"Вот точные слова: «Фиктивная поддержка рядом помогает». Вы сказали: «{user_quote}»."
+    units = split_response_units(draft)
+    assert len(units) == 2
+    result = GroundingResult(
+        units=[
+            UnitVerdict(
+                unit_id="u1",
+                scope="book",
+                supported=False,
+                evidence_passage_ids=[],
+                addresses_intent=False,
+                origin="book_claim",
+            ),
+            UnitVerdict(
+                unit_id="u2",
+                scope=NON_BOOK_SCOPE,
+                supported=True,
+                evidence_passage_ids=[],
+                addresses_intent=True,
+                origin="user_report",
+            ),
+        ],
+        all_required_supported=False,
+    )
+
+    spans = certified_user_span_texts(
+        draft=draft,
+        units=units,
+        result=result,
+        pack=[_pack_entry(BOOK_TEXT)],
+        recent=[],
+        user_message=USER_MESSAGE,
+    )
+
+    assert user_quote in spans
+    assert "Фиктивная поддержка рядом помогает" not in spans

@@ -15,6 +15,7 @@ fail-closed reply.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import re
 import time
@@ -505,25 +506,41 @@ def certified_user_span_texts(
     the checked candidate AND still anchors verbatim to a trusted
     HumanMessage slice. Anything else counts toward the book quota fail
     closed. Never raises; empty set means no trusted exemption.
+
+    When the verifier quarantined a deterministic gate rejection, the
+    retained verdict for the rejected unit is demoted (``supported``
+    false, citations cleared), so whole-candidate certification of the
+    original draft fails on the rejected unit's own quotation. The
+    trusted spans are then re-certified on exactly the still-supported
+    subset (the same compacted kept candidate the verifier itself
+    re-certified), so a faithful user quotation inside a kept sibling
+    keeps its exemption; anything that still fails stays exempt-free.
     """
     if result is None or not units or not draft.strip():
         return frozenset()
     try:
-        from aa.conversation.quote_provenance import certify_answer_candidate
+        from aa.conversation.quote_provenance import (
+            build_user_message_index,
+            certify_answer_candidate,
+            extract_answer_quotes,
+        )
+    except ImportError:
+        return frozenset()
+    user_index = build_user_message_index(list(recent or []), user_message)
+    pack_dicts = [dict(item) for item in pack if isinstance(item, dict)]
 
-        try:
-            from aa.conversation.quote_provenance import (
-                build_user_message_index,
-                extract_answer_quotes,
-            )
-        except ImportError:
-            return frozenset()
+    def _certified_spans(
+        *,
+        answer: str,
+        subset_units: Sequence[ResponseUnitDraft],
+        subset_verdicts: Sequence[Any],
+    ) -> frozenset[str]:
         certificate = certify_answer_candidate(
-            answer=draft,
-            units=units,
-            verdicts=result.units,
-            passages=[dict(item) for item in pack if isinstance(item, dict)],
-            user_index=build_user_message_index(list(recent or []), user_message),
+            answer=answer,
+            units=subset_units,
+            verdicts=subset_verdicts,
+            passages=pack_dicts,
+            user_index=user_index,
         )
         user_ranges = {
             (span.answer_char_start, span.answer_char_end)
@@ -532,9 +549,53 @@ def certified_user_span_texts(
         }
         return frozenset(
             span.span_text
-            for span in extract_answer_quotes(draft).spans
+            for span in extract_answer_quotes(answer).spans
             if (span.answer_char_start, span.answer_char_end) in user_ranges
             and span.span_text.strip()
+        )
+
+    try:
+        return _certified_spans(
+            answer=draft,
+            subset_units=list(units),
+            subset_verdicts=list(result.units),
+        )
+    except Exception:
+        pass
+    supported_verdicts = [
+        verdict for verdict in result.units if bool(getattr(verdict, "supported", False))
+    ]
+    if not supported_verdicts:
+        return frozenset()
+    supported_ids = {str(verdict.unit_id) for verdict in supported_verdicts}
+    kept_units = [unit for unit in units if str(unit.unit_id) in supported_ids]
+    # Only a genuinely narrowed subset is re-certified here: when every
+    # unit is still supported the original certification failure was not
+    # caused by a quarantined unit, so no re-anchored exemption is built.
+    if not kept_units or len(kept_units) == len(units):
+        return frozenset()
+    try:
+        texts = [str(unit.text) for unit in kept_units]
+        compact_units: list[ResponseUnitDraft] = []
+        cursor = 0
+        for unit in kept_units:
+            text = str(unit.text)
+            start = cursor
+            end = start + len(text)
+            compact_units.append(
+                dataclasses.replace(
+                    unit,
+                    unit_id=str(unit.unit_id),
+                    text=text,
+                    char_start=start,
+                    char_end=end,
+                )
+            )
+            cursor = end + 1
+        return _certified_spans(
+            answer=" ".join(texts),
+            subset_units=compact_units,
+            subset_verdicts=supported_verdicts,
         )
     except Exception:
         return frozenset()
@@ -4077,14 +4138,20 @@ async def run_v2_answer_turn(
                 _pad_state = narrowed_grounding_state(_pad_kept, result)
                 _pad_saved_unavailable = int(telemetry.get("verifier_unavailable_units", 0) or 0)
                 _pad_saved_outcome = str(telemetry.get("verifier_outcome", "unknown"))
-                # The served subset contains no unavailable units by
-                # construction (only supported units kept), so judge it
-                # with subset telemetry; restore on failure.
+                # The served subset contains no unavailable units and no
+                # gate-rejected material by construction (only supported
+                # units kept, each of which passed every deterministic
+                # verifier gate), so judge it with subset telemetry;
+                # restore on failure. ``unsupported`` belongs here too:
+                # it describes the discarded draft's rejected units (a
+                # per-unit quarantine keeps ``unavailable_unit_ids``
+                # empty), not the certified subset that is served.
                 telemetry["verifier_unavailable_units"] = 0
                 if _pad_saved_outcome in (
                     "unavailable",
                     "partial-unavailable",
                     "skipped-turn-budget",
+                    "unsupported",
                 ):
                     telemetry["verifier_outcome"] = "passed"
                 _pad_adequacy = _safe_assess_adequacy(
@@ -4100,6 +4167,7 @@ async def run_v2_answer_turn(
                         "unavailable",
                         "partial-unavailable",
                         "skipped-turn-budget",
+                        "unsupported",
                     ):
                         telemetry["verifier_outcome"] = "passed"
                     _record_adequacy(
