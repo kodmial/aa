@@ -83,10 +83,50 @@ class _PromptAwarePerUnitVerifier:
         return dict(self._decision)
 
 
+def _unit_from_prompt(prompt: str) -> str:
+    import re
+
+    match = re.search(r"<response_unit>(.*?)</response_unit>", prompt, re.S)
+    return match.group(1).strip() if match else prompt
+
+
+class _UnitTextVerifier:
+    """Per-unit verifier that selects a decision by response-unit text."""
+
+    def __init__(self, decisions: dict[str, dict[str, Any]]) -> None:
+        self._decisions = {key: dict(value) for key, value in decisions.items()}
+        self.calls = 0
+
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+    ) -> dict[str, object]:
+        _ = (system, schema, retry_count)
+        self.calls += 1
+        return dict(self._decisions[_unit_from_prompt(prompt)])
+
+
+class _StaticAnswer:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def ainvoke(self, messages: Any) -> Any:
+        from langchain_core.messages import AIMessage
+
+        _ = messages
+        return AIMessage(content=self._text)
+
+
 BOOK_TEXT = "Фиктивная поддержка рядом. Тяга проходит, если обратиться за помощью."
 BAD_QUOTE_DRAFT = (
     "Вот точные слова: «Фиктивная поддержка рядом помогает». "
     "Тяга проходит, если обратиться за помощью."
+)
+EXACT_QUOTE_SIBLING_DRAFT = (
+    "Вот неточные слова: «Фиктивная поддержка рядом помогает». "
+    "Вот точные слова: «Тяга проходит, если обратиться за помощью»."
+)
+CROSS_UNIT_QUOTE_DRAFT = (
+    "«Фиктивная поддержка рядом. Тяга проходит, если обратиться за помощью с чужой помощью»."
 )
 GLUE_QUOTE_DRAFT = "Понимаю, это «качели». Тяга проходит, если обратиться за помощью."
 USER_MESSAGE = "К вечеру очень тянет выпить, как с этим обходиться?"
@@ -117,6 +157,44 @@ async def test_batched_verifier_quarantines_invented_quote_unit() -> None:
     assert result.units[0].evidence_passage_ids == []
     assert result.units[1].supported is True
     assert result.all_required_supported is False
+
+
+async def test_batched_verifier_keeps_exact_quote_sibling() -> None:
+    """A verified exact quotation survives next to an invented quote."""
+    pack = [_pack_entry(BOOK_TEXT)]
+    units = split_response_units(EXACT_QUOTE_SIBLING_DRAFT)
+    assert len(units) == 2
+    model = _ScriptedBatchedVerifier([_book_decision(pack[0]["passage_id"])] * 2)
+
+    result = await run_batched_verifier(
+        units,
+        pack,
+        model=model,
+        user_message=USER_MESSAGE,
+        answer_text=EXACT_QUOTE_SIBLING_DRAFT,
+    )
+
+    assert result.units[0].supported is False
+    assert result.units[1].supported is True
+    assert result.units[1].evidence_passage_ids == [pack[0]["passage_id"]]
+
+
+async def test_cross_unit_quotation_still_fails_closed() -> None:
+    """A quote spanning two units never borrows support from either side."""
+    pack = [_pack_entry(BOOK_TEXT)]
+    units = split_response_units(CROSS_UNIT_QUOTE_DRAFT)
+    assert len(units) == 2
+    model = _ScriptedBatchedVerifier([_book_decision(pack[0]["passage_id"])] * 2)
+
+    with pytest.raises(VerifierValidationError):
+        await run_batched_verifier(
+            units,
+            pack,
+            model=model,
+            user_message=USER_MESSAGE,
+            answer_text=CROSS_UNIT_QUOTE_DRAFT,
+        )
+    assert model.calls == 1
 
 
 async def test_batched_verifier_quarantines_unattributed_glue_quote() -> None:
@@ -156,6 +234,43 @@ async def test_verify_draft_preserves_verified_sibling_instead_of_none() -> None
     assert passed is False
     assert result.units[0].supported is False
     assert result.units[1].supported is True
+
+
+async def test_turn_serves_verified_book_sibling_without_glue_quote() -> None:
+    """The delivery boundary serves the verified sibling, not the rejected glue."""
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    book_unit = "Тяга проходит, если обратиться за помощью."
+    glue_unit = "Понимаю, это «качели»."
+    draft = f"{glue_unit} {book_unit}"
+    pack = [_pack_entry(BOOK_TEXT)]
+    verifier = _UnitTextVerifier(
+        {
+            glue_unit: _glue_decision(),
+            book_unit: _book_decision(pack[0]["passage_id"]),
+        }
+    )
+
+    outcome = await run_v2_answer_turn(
+        user_message=USER_MESSAGE,
+        summary="",
+        recent=[],
+        evidence_pack=pack,
+        answer_model=_StaticAnswer(draft),
+        verifier_model=verifier,
+        planner_model=None,
+        retrieval_index=None,
+        initial_query_count=12,
+        planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent=USER_MESSAGE,
+    )
+
+    assert outcome["text"] == book_unit
+    assert "«качели»" not in outcome["text"]
+    telemetry = dict(outcome["telemetry"])
+    assert telemetry["answer_outcome"] == "narrowed-adequacy"
+    assert telemetry["qualified"] is True
 
 
 async def test_per_unit_verifier_quarantines_invented_quote_unit() -> None:

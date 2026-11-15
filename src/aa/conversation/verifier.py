@@ -430,15 +430,17 @@ def _enforce_post_round_gates(
 ) -> GroundingResult:
     """Apply deterministic gates, quarantining only rejected units.
 
+    Qualification #530: a model-side citation or quotation mistake in
+    one response unit must not discard independently verified siblings.
     Integrity and structural validation stay global and always raise:
     a corrupt pack or an inconsistent verdict set can never be narrowed
     into a served answer. Citation, exact-quote and quote-origin gates
-    are per-unit claims, so a model-side citation/quote mistake fails
-    that unit closed while independently verified units remain eligible
-    for the existing deterministic narrowing path. The preserved subset
-    is re-certified as one contiguous candidate, so cross-unit quote
-    interactions cannot borrow verification from a rejected unit. If no
-    supported unit survives, the original strict error propagates.
+    are per-unit claims, so a rejected unit fails closed while
+    independently verified units remain eligible for the existing
+    deterministic narrowing path. The preserved subset is re-certified
+    as one contiguous candidate, so cross-unit quote interactions cannot
+    borrow verification from a rejected unit. If no supported unit
+    survives, the original strict error propagates.
     """
     unit_list = list(units)
     if not unit_list:
