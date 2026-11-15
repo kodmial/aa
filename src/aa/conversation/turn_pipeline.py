@@ -3422,9 +3422,7 @@ async def run_v2_answer_turn(
                 return False
         else:
             try:
-                unavailable_ids = set(
-                    getattr(candidate_result, "unavailable_unit_ids", ()) or ()
-                )
+                unavailable_ids = set(getattr(candidate_result, "unavailable_unit_ids", ()) or ())
             except Exception:
                 return False
             if unavailable_ids:
@@ -4475,6 +4473,7 @@ async def run_v2_answer_turn(
                 and not str(telemetry.get("failure_category", "") or "").strip()
             ):
                 telemetry["failure_category"] = _FAIL_REPAIR
+        _adequacy_regen_result: GroundingResult | None = None
         if (
             _adequacy_now.substantive_request
             and (_adequacy_now.verdict == _ADEQ_FAIL or _judge_demands_regen)
@@ -5772,9 +5771,7 @@ async def run_v2_answer_turn(
         _tail_no_book_claim = (
             result is not None
             and not result.unavailable_unit_ids
-            and all(
-                str(getattr(verdict, "scope", "")) != "book" for verdict in result.units
-            )
+            and all(str(getattr(verdict, "scope", "")) != "book" for verdict in result.units)
         )
     except Exception:
         _tail_no_book_claim = False

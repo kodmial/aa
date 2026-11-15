@@ -365,11 +365,11 @@ PLANNER_TEXT_JSON_SUFFIX = (
     '"information_needs": []} only for purely conversational turns; '
     "questions about the assistant's own identity, role or capabilities "
     "are conversational when they ask only about the assistant, because a "
-    "truthful capability reply needs no book passage; a greeting opener "
-    "plus a substantive request, or a capability question that also asks a "
-    "substantive recovery, program or book question, is retrieval, never "
-    "conversational, with the intent and queries focused on the "
-    "substantive request; otherwise return "
+    "truthful capability reply needs no book passage, but a capability "
+    "question that also asks a substantive recovery, program or book "
+    "question is retrieval; a greeting opener plus a substantive request "
+    "is retrieval, never conversational, with the intent and queries "
+    "focused on the substantive request; otherwise return "
     '{"mode": "retrieval", "resolved_intent": standalone intent, '
     '"queries": 1 to 16 distinct useful Russian search queries '
     "(as many as genuinely help, never padded), "
