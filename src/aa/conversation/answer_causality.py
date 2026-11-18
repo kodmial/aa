@@ -111,6 +111,9 @@ GUARD_OUTBOUND_SAFETY = "guard-outbound-safety"
 SPLIT_INVALID = "split-invalid"
 EVIDENCE_INTEGRITY_INVALID = "evidence-integrity-invalid"
 VERIFIER_SCHEMA_INVALID = "verifier-invalid-schema"
+# Reserved for a verdict set with at least one unit that produced no
+# terminal decision. A complete set of negative support decisions is
+# ``VERDICT_UNSUPPORTED``, never "incomplete".
 VERIFIER_INCOMPLETE = "verifier-incomplete-verdict"
 VERIFIER_UNAVAILABLE = "verifier-unavailable"
 VERIFIER_SKIPPED_BUDGET = "verifier-skipped-turn-budget"
@@ -345,6 +348,25 @@ def attach_answer_failure_cause(
     telemetry[TELEMETRY_CHAIN_KEY] = chain
 
 
+def clear_answer_failure_cause(telemetry: dict[str, Any]) -> None:
+    """Drop intermediate rejection causes after a certified delivery.
+
+    A turn may fail verification of one candidate and still deliver a
+    different independently certified reply (for example a freshly
+    generated, judge-certified conversational rescue). The earlier cause
+    described a rejected intermediate candidate, not the delivered
+    product, so a product-success snapshot must not keep advertising it:
+    ``failure_reason_from_telemetry`` prefers this key and qualification
+    would otherwise read a stale cause as the delivered outcome. Failure
+    paths never call this helper, so their first-cause history is
+    unchanged.
+    """
+    if not isinstance(telemetry, dict):
+        return
+    telemetry.pop(TELEMETRY_CAUSE_KEY, None)
+    telemetry.pop(TELEMETRY_CHAIN_KEY, None)
+
+
 def first_answer_failure_cause(
     telemetry: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -485,6 +507,7 @@ __all__ = [
     "VERIFIER_UNAVAILABLE",
     "attach_answer_failure_cause",
     "cause_for_empty_candidate",
+    "clear_answer_failure_cause",
     "cause_from_exception",
     "failure_reason_from_telemetry",
     "first_answer_failure_cause",

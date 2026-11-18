@@ -536,7 +536,10 @@ async def test_verify_draft_negative_verdicts_stay_typed(
             unavailable_unit_ids=["u1"],
         )
 
-    async def _run_incomplete(*args: Any, **kwargs: Any) -> Any:
+    async def _run_unsupported(*args: Any, **kwargs: Any) -> Any:
+        # Complete terminal verdict: both units produced a decision, but
+        # one support decision is negative. This is not an incomplete
+        # verdict set.
         return _grounding(
             [
                 {
@@ -556,6 +559,28 @@ async def test_verify_draft_negative_verdicts_stay_typed(
             unavailable_unit_ids=[],
         )
 
+    async def _run_partial_unavailable(*args: Any, **kwargs: Any) -> Any:
+        # A unit never produced a decision, so the terminal verdict set is
+        # genuinely incomplete (but not a total outage).
+        return _grounding(
+            [
+                {
+                    "unit_id": "u1",
+                    "scope": "book",
+                    "supported": True,
+                    "addresses_intent": True,
+                },
+                {
+                    "unit_id": "u2",
+                    "scope": "book",
+                    "supported": False,
+                    "addresses_intent": False,
+                },
+            ],
+            all_required_supported=False,
+            unavailable_unit_ids=["u2"],
+        )
+
     async def _run_irrelevant(*args: Any, **kwargs: Any) -> Any:
         return _grounding(
             [
@@ -572,7 +597,8 @@ async def test_verify_draft_negative_verdicts_stay_typed(
 
     cases: tuple[tuple[Any, str], ...] = (
         (_run_all_unavailable, "verdict-missing"),
-        (_run_incomplete, "verifier-incomplete-verdict"),
+        (_run_unsupported, "verdict-unsupported"),
+        (_run_partial_unavailable, "verifier-incomplete-verdict"),
         (_run_irrelevant, "verdict-irrelevant"),
     )
     for replacement, expected_reason in cases:

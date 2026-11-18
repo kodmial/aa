@@ -1024,12 +1024,10 @@ async def test_unsupported_regeneration_fails_closed_without_replan(
     assert telemetry["qualified"] is False
     reasons = [item["reason"] for item in telemetry["answer_failure_cause_chain"]]
     assert reasons[0] == GUARD_INTERNAL_TERMS
-    # A fully-verified-but-unsupported repair draft maps to the
-    # pre-existing required-support cause (per-unit vocabulary, #450).
-    assert "verifier-incomplete-verdict" in reasons
-    for item in telemetry["answer_failure_cause_chain"]:
-        if item["reason"] == "verifier-incomplete-verdict":
-            assert item["detail"] == "required-support"
+    # A complete negative verdict is a support decision, not an
+    # incomplete verdict set: every regenerated unit was adjudicated.
+    assert "verdict-unsupported" in reasons
+    assert "verifier-incomplete-verdict" not in reasons
     assert telemetry[TELEMETRY_CAUSE_KEY]["reason"] == GUARD_INTERNAL_TERMS
 
 
