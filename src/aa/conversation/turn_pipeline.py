@@ -1870,13 +1870,15 @@ async def _verify_draft(
         if telemetry is not None:
             # Verdict *completeness* is separate from verdict *polarity*.
             # ``validate_grounding_result`` already guarantees one verdict
-            # per response unit, so a result with no unavailable units is a
-            # complete terminal verdict whose units were judged unsupported.
-            # Only units that never produced a decision (transport/schema
+            # per response unit, so a result with at least one verdict and
+            # no unavailable units is a complete terminal verdict whose
+            # units were judged unsupported. An empty verdict set produced
+            # no decision at all and is missing, never unsupported. Only
+            # units that never produced a decision (transport/schema
             # outage) make the verdict set genuinely incomplete.
             unavailable_unit_ids = tuple(getattr(result, "unavailable_unit_ids", ()) or ())
             verdict_units = tuple(getattr(result, "units", ()) or ())
-            if not unavailable_unit_ids:
+            if verdict_units and not unavailable_unit_ids:
                 _attach(
                     telemetry,
                     _Cause.bounded("verdict-unsupported", "verification", "verification"),
@@ -3559,13 +3561,14 @@ async def run_v2_answer_turn(
         evidence cannot make that wording supported, so full repair only
         spends provider rounds before the delivered reply becomes a
         service error. When the verifier reports a complete verdict set
-        with no book scope, no unavailable unit and no supported salvage,
-        one fresh dialogue reply is generated with an empty Evidence Pack
-        and admitted only when the independently instantiated whole-turn
-        judge certifies it helpful, intent-addressing and claim-free. The
-        rejected draft is never reused: it may carry the unsupported unit
-        or a leak/safety rejection. Bounded per turn and skipped when the
-        judge call cap or either budget is spent.
+        with no book scope, an explicit assistant-capability origin, no
+        unavailable unit and no supported salvage, one fresh dialogue
+        reply is generated with an empty Evidence Pack and admitted only
+        when the independently instantiated whole-turn judge certifies it
+        helpful, intent-addressing and claim-free. The rejected draft is
+        never reused: it may carry the unsupported unit or a leak/safety
+        rejection. Bounded per turn and skipped when the judge call cap
+        or either budget is spent.
         """
         nonlocal _dialogue_rescue_attempts
         if whole_turn_judge_model is None:
@@ -3892,14 +3895,19 @@ async def run_v2_answer_turn(
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
     # Qualification #7 / kodmial/aa#535: a *complete* verdict set whose
-    # every unit is non-book and unsupported is the meta-capability shape,
-    # not an incomplete verifier outage. More book evidence cannot make a
-    # claim-free unit supported, so the historical full repair loop only
-    # burns sequential provider rounds and can end in a service error. When
-    # an independent whole-turn judge is available, generate one fresh
-    # no-evidence dialogue reply and require that judge to certify it. A
-    # book-scoped verdict, an unavailable unit, a supported salvage subset,
-    # a local-guard rejection, a proven glue turn, or a judge-less caller
+    # every unit is non-book and unsupported, and which carries an explicit
+    # assistant-capability origin, is the meta-capability shape, not an
+    # incomplete verifier outage and not a generic non-book substantive
+    # reply. More book evidence cannot make a claim-free capability unit
+    # supported, so the historical full repair loop only burns sequential
+    # provider rounds and can end in a service error. Requiring the explicit
+    # origin keeps a substantive turn whose draft happens to be non-book on
+    # the historical repair path, where it can still be regenerated from
+    # book evidence. When an independent whole-turn judge is available,
+    # generate one fresh no-evidence dialogue reply and require that judge
+    # to certify it. A book-scoped verdict, a non-capability non-book
+    # origin, an unavailable unit, a supported salvage subset, a
+    # local-guard rejection, a proven glue turn, or a judge-less caller
     # keeps the historical repair path untouched.
     _complete_negative_non_book_verdict = (
         not passed
@@ -3908,6 +3916,14 @@ async def run_v2_answer_turn(
         and not result.unavailable_unit_ids
         and not has_supported_unit(result)
         and all(str(getattr(verdict, "scope", "")) != "book" for verdict in result.units)
+        and all(
+            str(getattr(verdict, "origin", "")) in ("assistant_capability", "conversation_glue")
+            for verdict in result.units
+        )
+        and any(
+            str(getattr(verdict, "origin", "")) == "assistant_capability"
+            for verdict in result.units
+        )
     )
     if (
         _complete_negative_non_book_verdict
@@ -3937,7 +3953,10 @@ async def run_v2_answer_turn(
                 "rounds": rounds,
                 "recent_quote_ranges": list(recent_ranges),
                 "telemetry": dict(telemetry),
-                "evidence_pack": list(pack),
+                # The fresh dialogue reply was generated with no Evidence
+                # Pack; never return the rejected draft's retrieval as if
+                # it supported the delivered conversation.
+                "evidence_pack": [],
             }
         telemetry["repair_skipped_non_book_unsupported"] = True
         logger.info(

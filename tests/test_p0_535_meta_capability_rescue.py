@@ -122,6 +122,16 @@ def _glue_negative_decision() -> dict[str, Any]:
     }
 
 
+def _plain_glue_negative_decision() -> dict[str, Any]:
+    return {
+        "requires_book_evidence": False,
+        "supported": False,
+        "evidence_passage_ids": [],
+        "addresses_intent": True,
+        "claim_origin": "conversation_glue",
+    }
+
+
 def _book_negative_decision() -> dict[str, Any]:
     return {
         "requires_book_evidence": True,
@@ -129,6 +139,23 @@ def _book_negative_decision() -> dict[str, Any]:
         "evidence_passage_ids": [],
         "addresses_intent": True,
         "claim_origin": "book_claim",
+    }
+
+
+def _pack_entry() -> dict[str, Any]:
+    import hashlib
+
+    text = "Синтетический фрагмент книги для проверки пустого пакета."
+    return {
+        "passage_id": "synthetic#exp0000",
+        "text": text,
+        "source_id": "synthetic-source",
+        "section_id": "synthetic-section",
+        "char_start": 0,
+        "char_end": len(text),
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_sha256": "s" * 64,
+        "corpus_version": "r" * 64,
     }
 
 
@@ -186,6 +213,46 @@ async def test_complete_negative_non_book_verdict_serves_fresh_judged_dialogue()
     assert _snapshot_product_failure_reason(telemetry) == ""
 
 
+async def test_dialogue_rescue_returns_empty_pack_for_nonempty_initial_retrieval() -> None:
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    answer = _SequencedAnswer(_SYNTHETIC_BAD_DRAFT, _SYNTHETIC_DIALOGUE)
+    verifier = _FixedBatchedVerifier(_glue_negative_decision())
+    judge = _DialogueJudge()
+    planner = _CountingPlanner()
+    kwargs = _kwargs(answer, verifier, judge, planner)
+    kwargs["evidence_pack"] = [_pack_entry()]
+
+    outcome = await run_v2_answer_turn(**kwargs)
+
+    assert outcome["text"] == _SYNTHETIC_DIALOGUE
+    # The fresh reply never used the retrieved pack, so it must not be
+    # returned as evidence for the delivered conversation.
+    assert outcome["evidence_pack"] == []
+    assert answer.calls == 2
+    assert planner.calls == 0
+
+
+async def test_non_capability_non_book_negative_verdict_keeps_repair_path() -> None:
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    answer = _SequencedAnswer(_SYNTHETIC_BAD_DRAFT, _SYNTHETIC_DIALOGUE)
+    verifier = _FixedBatchedVerifier(_plain_glue_negative_decision())
+    judge = _SubstantiveJudge()
+    planner = _CountingPlanner()
+
+    with pytest.raises(TurnFailed) as excinfo:
+        await run_v2_answer_turn(**_kwargs(answer, verifier, judge, planner))
+
+    # A generic non-book reply is not the explicit meta-capability shape:
+    # the historical repair loop still gets its chance instead of being
+    # skipped after a failed dialogue rescue.
+    assert planner.calls == 1
+    assert answer.calls == 1
+    assert "dialogue_rescue_after_verification" not in excinfo.value.telemetry
+
+
 async def test_complete_negative_non_book_verdict_fails_closed_without_judge_cert() -> None:
     from aa.conversation.failures import TurnFailed
     from aa.conversation.turn_pipeline import run_v2_answer_turn
@@ -231,29 +298,84 @@ async def test_partially_unavailable_verdict_does_not_start_dialogue_rescue(
     from aa.conversation.turn_pipeline import run_v2_answer_turn
     from aa.conversation.verifier_schema import (
         GroundingResult,
+        UnitVerdict,
         unavailable_unit_verdict,
     )
 
     async def _partial(*args: Any, **kwargs: Any) -> GroundingResult:
         units = args[0]
         _ = kwargs
-        verdicts = [unavailable_unit_verdict(unit.unit_id) for unit in units]
+        decided = UnitVerdict(
+            unit_id=units[0].unit_id,
+            scope="conversation_glue",
+            supported=False,
+            evidence_passage_ids=[],
+            addresses_intent=True,
+            origin="assistant_capability",
+        )
+        unavailable_ids = [unit.unit_id for unit in units[1:]]
+        verdicts = [decided, *(unavailable_unit_verdict(unit_id) for unit_id in unavailable_ids)]
         return GroundingResult(
             units=verdicts,
             all_required_supported=False,
-            unavailable_unit_ids=[unit.unit_id for unit in units],
+            unavailable_unit_ids=unavailable_ids,
         )
 
     monkeypatch.setattr(pipeline, "run_verifier", _partial)
-    answer = _SequencedAnswer(_SYNTHETIC_BAD_DRAFT, _SYNTHETIC_DIALOGUE)
+    answer = _SequencedAnswer(
+        "Синтетическое первое предложение. Синтетическое второе предложение.",
+        _SYNTHETIC_DIALOGUE,
+    )
     judge = _DialogueJudge()
     planner = _CountingPlanner()
 
     with pytest.raises(TurnFailed):
         await run_v2_answer_turn(**_kwargs(answer, object(), judge, planner))
 
+    # Mixed verdict: one decided non-book unit plus one unavailable unit.
+    # The undecided unit still blocks the dialogue rescue, because only a
+    # complete verdict set can prove the meta-capability shape.
     assert answer.calls == 1
     assert judge.calls == 0
+
+
+async def test_empty_verdict_set_is_missing_not_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aa.conversation.turn_pipeline as pipeline
+    from aa.conversation.answer_causality import (
+        VERDICT_MISSING,
+        VERDICT_UNSUPPORTED,
+        first_answer_failure_cause,
+    )
+    from aa.conversation.turn_pipeline import _verify_draft
+    from aa.conversation.verifier_schema import GroundingResult
+
+    async def _empty(*args: Any, **kwargs: Any) -> GroundingResult:
+        _ = (args, kwargs)
+        return GroundingResult.model_construct(
+            units=[],
+            all_required_supported=False,
+            unavailable_unit_ids=[],
+        )
+
+    monkeypatch.setattr(pipeline, "run_verifier", _empty)
+    telemetry: dict[str, Any] = {}
+    _units, result, passed = await _verify_draft(
+        "Синтетическая фраза без опоры на книгу.",
+        [],
+        verifier_model=object(),
+        telemetry=telemetry,
+    )
+
+    assert passed is False
+    assert result is not None
+    cause = first_answer_failure_cause(telemetry)
+    assert cause is not None
+    # No unit ever produced a decision, so this is a missing verdict set,
+    # never a complete negative support decision.
+    assert cause["reason"] == VERDICT_MISSING
+    assert cause["reason"] != VERDICT_UNSUPPORTED
 
 
 async def test_verifier_labels_complete_negative_verdict_as_unsupported_not_incomplete(
