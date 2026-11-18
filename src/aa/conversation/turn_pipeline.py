@@ -27,7 +27,11 @@ import pymorphy3  # type: ignore[import-untyped]
 from langchain_core.messages import BaseMessage
 
 from aa.conversation.answer_causality import attach_answer_failure_cause as attach_failure_cause
-from aa.conversation.answer_causality import first_answer_failure_cause, terminal_unknown_cause
+from aa.conversation.answer_causality import (
+    clear_answer_failure_cause,
+    first_answer_failure_cause,
+    terminal_unknown_cause,
+)
 from aa.conversation.answer_node import generate_draft, recent_history
 from aa.conversation.failures import TurnFailed
 from aa.conversation.output_limits import (
@@ -1864,10 +1868,22 @@ async def _verify_draft(
         return units, None, False
     if not result.all_required_supported:
         if telemetry is not None:
-            unavailable_units = len(getattr(result, "unavailable_unit_ids", ()) or ())
-            if unavailable_units > 0 and unavailable_units == len(
-                getattr(result, "units", ()) or ()
-            ):
+            # Verdict *completeness* is separate from verdict *polarity*.
+            # ``validate_grounding_result`` already guarantees one verdict
+            # per response unit, so a result with at least one verdict and
+            # no unavailable units is a complete terminal verdict whose
+            # units were judged unsupported. An empty verdict set produced
+            # no decision at all and is missing, never unsupported. Only
+            # units that never produced a decision (transport/schema
+            # outage) make the verdict set genuinely incomplete.
+            unavailable_unit_ids = tuple(getattr(result, "unavailable_unit_ids", ()) or ())
+            verdict_units = tuple(getattr(result, "units", ()) or ())
+            if verdict_units and not unavailable_unit_ids:
+                _attach(
+                    telemetry,
+                    _Cause.bounded("verdict-unsupported", "verification", "verification"),
+                )
+            elif len(unavailable_unit_ids) == len(verdict_units):
                 _attach(
                     telemetry,
                     _Cause.bounded("verdict-missing", "verification", "verification"),
@@ -3194,6 +3210,7 @@ async def run_v2_answer_turn(
         )
 
     _substantive_judge_calls = 0
+    _dialogue_rescue_attempts = 0
     # Deterministic per-turn verdict cache (kodmial/aa#372): regen and
     # narrowing frequently re-present byte-identical text. A cached
     # verdict for the same normalized digest is reused without a new
@@ -3369,6 +3386,8 @@ async def run_v2_answer_turn(
         candidate_text: str,
         candidate_units: list[ResponseUnitDraft] | None,
         candidate_result: GroundingResult | None,
+        *,
+        allow_absent_result: bool = False,
     ) -> bool:
         """Whether two model judgments agree the candidate is pure dialogue.
 
@@ -3394,6 +3413,12 @@ async def run_v2_answer_turn(
         exact-question, keyword, stem, step-number, token-overlap or
         handcrafted semantic predicates; only model verdicts plus
         mechanical output guards.
+
+        ``allow_absent_result`` is reserved for a freshly generated
+        no-evidence dialogue reply, which by construction has no verifier
+        verdict. Every substantive path still requires the verdict: when a
+        result is present its unavailable units and book scopes keep the
+        same fail-closed meaning.
         """
         nonlocal _substantive_judge_calls
         if whole_turn_judge_model is None:
@@ -3414,21 +3439,24 @@ async def run_v2_answer_turn(
         if not certify_outbound_safety(candidate):
             return False
         if candidate_result is None:
-            return False
-        try:
-            unavailable_ids = set(getattr(candidate_result, "unavailable_unit_ids", ()) or ())
-        except Exception:
-            return False
-        if unavailable_ids:
-            return False
-        try:
-            has_book_scope = any(
-                str(getattr(item, "scope", "")) == "book" for item in (candidate_result.units or [])
-            )
-        except Exception:
-            return False
-        if has_book_scope:
-            return False
+            if not allow_absent_result:
+                return False
+        else:
+            try:
+                unavailable_ids = set(getattr(candidate_result, "unavailable_unit_ids", ()) or ())
+            except Exception:
+                return False
+            if unavailable_ids:
+                return False
+            try:
+                has_book_scope = any(
+                    str(getattr(item, "scope", "")) == "book"
+                    for item in (candidate_result.units or [])
+                )
+            except Exception:
+                return False
+            if has_book_scope:
+                return False
         # Verifier units alone never prove dialogue: an empty unit list
         # carries no scope signal, so the judge must still certify.
         if _substantive_judge_calls >= SUBSTANTIVE_JUDGE_MAX_CALLS:
@@ -3522,6 +3550,55 @@ async def run_v2_answer_turn(
         if digest:
             _judge_rejected_digests.add(digest)
         return False
+
+    async def _fresh_dialogue_rescue() -> str | None:
+        """Generate and judge-certify one fresh no-evidence dialogue reply.
+
+        Qualification #7 / kodmial/aa#535: a truthful assistant
+        identity/capability turn can reach the substantive pipeline when
+        the planner emits retrieval, then fail verification because a
+        claim-free non-book unit was judged unsupported. Additional book
+        evidence cannot make that wording supported, so full repair only
+        spends provider rounds before the delivered reply becomes a
+        service error. When the verifier reports a complete verdict set
+        with no book scope, an explicit assistant-capability origin, no
+        unavailable unit and no supported salvage, one fresh dialogue
+        reply is generated with an empty Evidence Pack and admitted only
+        when the independently instantiated whole-turn judge certifies it
+        helpful, intent-addressing and claim-free. The rejected draft is
+        never reused: it may carry the unsupported unit or a leak/safety
+        rejection. Bounded per turn and skipped when the judge call cap
+        or either budget is spent.
+        """
+        nonlocal _dialogue_rescue_attempts
+        if whole_turn_judge_model is None:
+            return None
+        if _dialogue_rescue_attempts >= 2:
+            return None
+        if _substantive_judge_calls >= SUBSTANTIVE_JUDGE_MAX_CALLS:
+            return None
+        try:
+            if (time.perf_counter() - turn_started) > _effective_repair_budget_s():
+                return None
+            if _end_to_end_elapsed_s() > _effective_turn_budget_s():
+                return None
+        except Exception:
+            return None
+        if _remaining_budget_s() < max(TURN_ANSWER_MIN_SLICE_S, TURN_VERIFIER_MIN_SLICE_S):
+            return None
+        _dialogue_rescue_attempts += 1
+        candidate = await generate_dialogue_reply(
+            user_message=user_message,
+            summary=summary,
+            recent=list(recent or []),
+            answer_model=answer_model,
+            telemetry=telemetry,
+        )
+        if candidate is None:
+            return None
+        if await _judge_reconciled_dialogue(candidate, None, None, allow_absent_result=True):
+            return candidate
+        return None
 
     telemetry["answer_outcome"] = "draft-ok"
     verifier_slice = _verifier_round_budget()
@@ -3817,6 +3894,76 @@ async def run_v2_answer_turn(
             )
     elif not passed and initial_pack_empty:
         telemetry["retrieval_outcome"] = "empty-pack"
+    # Qualification #7 / kodmial/aa#535: a *complete* verdict set whose
+    # every unit is non-book and unsupported, and which carries an explicit
+    # assistant-capability origin, is the meta-capability shape, not an
+    # incomplete verifier outage and not a generic non-book substantive
+    # reply. More book evidence cannot make a claim-free capability unit
+    # supported, so the historical full repair loop only burns sequential
+    # provider rounds and can end in a service error. Requiring the explicit
+    # origin keeps a substantive turn whose draft happens to be non-book on
+    # the historical repair path, where it can still be regenerated from
+    # book evidence. When an independent whole-turn judge is available,
+    # generate one fresh no-evidence dialogue reply and require that judge
+    # to certify it. A book-scoped verdict, a non-capability non-book
+    # origin, an unavailable unit, a supported salvage subset, a
+    # local-guard rejection, a proven glue turn, or a judge-less caller
+    # keeps the historical repair path untouched.
+    _complete_negative_non_book_verdict = (
+        not passed
+        and result is not None
+        and bool(getattr(result, "units", ()) or ())
+        and not result.unavailable_unit_ids
+        and not has_supported_unit(result)
+        and all(str(getattr(verdict, "scope", "")) != "book" for verdict in result.units)
+        and all(
+            str(getattr(verdict, "origin", "")) in ("assistant_capability", "conversation_glue")
+            for verdict in result.units
+        )
+        and any(
+            str(getattr(verdict, "origin", "")) == "assistant_capability"
+            for verdict in result.units
+        )
+    )
+    if (
+        _complete_negative_non_book_verdict
+        and not _proven_glue
+        and not _initial_local_guard_reason
+        and whole_turn_judge_model is not None
+    ):
+        _fresh_dialogue = await _fresh_dialogue_rescue()
+        if _fresh_dialogue is not None:
+            telemetry["outbound_safety"] = "pass"
+            telemetry["answer_outcome"] = "conversational-generated"
+            telemetry["adequacy_verdict"] = _ADEQ_PASS
+            telemetry["failure_category"] = ""
+            telemetry["answers_request"] = True
+            telemetry["technically_grounded"] = False
+            telemetry["qualified"] = True
+            telemetry["dialogue_rescue_after_verification"] = True
+            # The served reply is a different, independently certified
+            # candidate; the rejected draft's typed cause is not the
+            # delivered product's failure.
+            clear_answer_failure_cause(telemetry)
+            _finish_telemetry()
+            return {
+                "text": _fresh_dialogue,
+                "units": [],
+                "verification": grounding_result_to_state(None),
+                "rounds": rounds,
+                "recent_quote_ranges": list(recent_ranges),
+                "telemetry": dict(telemetry),
+                # The fresh dialogue reply was generated with no Evidence
+                # Pack; never return the rejected draft's retrieval as if
+                # it supported the delivered conversation.
+                "evidence_pack": [],
+            }
+        telemetry["repair_skipped_non_book_unsupported"] = True
+        logger.info(
+            "v2 repair skipped for unsupported non-book verdict set",
+            extra={"category": "non-book-unsupported"},
+        )
+        repair_allowed = False
     # Bounded repair progression (#331): repair retrieval must not repeat
     # an identical query set. A duplicate re-plan fingerprint means the
     # next full select/read/assess loop would redo demonstrably redundant
@@ -5632,6 +5779,9 @@ async def run_v2_answer_turn(
         telemetry["answers_request"] = True
         telemetry["technically_grounded"] = False
         telemetry["qualified"] = True
+        # A certified dialogue delivery supersedes intermediate rejection
+        # causes; a product-success snapshot must not advertise them.
+        clear_answer_failure_cause(telemetry)
         _finish_telemetry()
         return {
             "text": _tail_candidate,
