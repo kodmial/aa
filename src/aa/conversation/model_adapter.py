@@ -45,6 +45,36 @@ from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.model_adapter")
 
+# Actual LLM HTTP-request accounting (kodmial/aa#538). One counter is
+# incremented immediately before each real provider `send_message` /
+# `send_structured_message` call, including structured-provider and
+# capability fallbacks. Retrieval telemetry reports this delta so a
+# logical node call that silently issues a second provider request is
+# never undercounted. Session lifecycle calls are not LLM requests.
+_LLM_HTTP_CALLS = 0
+_LLM_HTTP_LOCK = threading.Lock()
+
+
+def note_llm_http_call() -> None:
+    """Record one real provider LLM HTTP request (transport boundary)."""
+    global _LLM_HTTP_CALLS
+    with _LLM_HTTP_LOCK:
+        _LLM_HTTP_CALLS += 1
+
+
+def llm_http_call_count() -> int:
+    """Return the process-wide real provider LLM request count."""
+    with _LLM_HTTP_LOCK:
+        return int(_LLM_HTTP_CALLS)
+
+
+def reset_llm_http_call_count() -> None:
+    """Reset the provider LLM request counter (tests/tooling only)."""
+    global _LLM_HTTP_CALLS
+    with _LLM_HTTP_LOCK:
+        _LLM_HTTP_CALLS = 0
+
+
 PLANNER_AGENT_V2 = "aa-planner-v2"
 SUMMARIZER_AGENT_V2 = "aa-summarizer-v2"
 ANSWER_AGENT_V2 = "aa-v2"
@@ -559,6 +589,7 @@ class OpenCodeChatModel(BaseChatModel):
         wire_agent = self.wire_agent if agent == self.agent else agent
         audit_agent = agent if wire_agent != agent else ""
         try:
+            note_llm_http_call()
             return await client.send_message(
                 session.id,
                 prompt,
@@ -590,6 +621,7 @@ class OpenCodeChatModel(BaseChatModel):
         wire_agent = self.wire_agent if agent == self.agent else agent
         audit_agent = agent if wire_agent != agent else ""
         try:
+            note_llm_http_call()
             return await client.send_structured_message(
                 session.id,
                 prompt,
@@ -628,6 +660,7 @@ class OpenCodeChatModel(BaseChatModel):
         client = self._client
         session = await client.create_session(title="")
         try:
+            note_llm_http_call()
             return await client.send_message(
                 session.id,
                 prompt,
@@ -663,6 +696,7 @@ class OpenCodeChatModel(BaseChatModel):
         client = self._client
         session = await client.create_session(title="")
         try:
+            note_llm_http_call()
             return await client.send_structured_message(
                 session.id,
                 prompt,
@@ -1177,10 +1211,13 @@ __all__ = [
     "build_verifier_model",
     "clear_omitted_structured_cache",
     "clear_primary_circuit",
+    "llm_http_call_count",
     "mark_omitted_structured_unavailable",
+    "note_llm_http_call",
     "omitted_structured_unavailable",
     "record_omitted_structured_rejection",
     "record_omitted_structured_success",
     "render_messages_text",
+    "reset_llm_http_call_count",
     "split_system_and_user",
 ]

@@ -575,3 +575,88 @@ def test_merge_budget_boundary_keeps_second_need_despite_lexical_gap() -> None:
     reunited = merge_pack_dicts(dup_old, dup_new)
     assert reunited[0]["need_ids"] == ["need-1", "need-2"]
     _ = needs
+
+
+def test_one_shot_fastpath_covers_two_genuine_needs_beyond_rank_64(
+    monkeypatch: Any,
+) -> None:
+    """The bounded pack reaches independent deep candidates for both needs."""
+    import asyncio
+    import re
+
+    from aa.conversation.retrieval_node import aretrieve_with_semantic_selection
+    from aa.retrieval import evidence as evidence_mod
+
+    records: list[Any] = []
+    for pos in range(70):
+        records.append(_record(f"chapter-1:ru:bg{pos:04d}", text=f"Фон {pos}."))
+    deep_a = _record("chapter-7:ru:deep-a", section="chapter-7", text="DEEP-A: утренний разбор.")
+    deep_b = _record("chapter-7:ru:deep-b", section="chapter-7", text="DEEP-B: вечерняя поддержка.")
+    records.extend([deep_a, deep_b])
+    index = _fake_index(records)
+    fused = {
+        record.chunk_id: _fused(record.chunk_id, float(200 - pos))
+        for pos, record in enumerate(records)
+    }
+    fused[deep_a.chunk_id] = _fused(deep_a.chunk_id, 0.5)
+    fused[deep_b.chunk_id] = _fused(deep_b.chunk_id, 0.4)
+
+    def _fake_branch(index_arg: Any, queries: list[str], **kwargs: Any) -> Any:
+        _ = (index_arg, queries, kwargs)
+        return ([], [list(fused)])
+
+    def _fake_fuse(ranked: Any, per_ids: Any, **kwargs: Any) -> Any:
+        _ = (ranked, per_ids, kwargs)
+        return dict(fused), list(fused)
+
+    monkeypatch.setattr(evidence_mod, "run_branch_searches", _fake_branch)
+    monkeypatch.setattr(evidence_mod, "fuse_query_pool", _fake_fuse)
+
+    class _OneShotModel:
+        async def ainvoke_structured(
+            self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 1
+        ) -> dict[str, object]:
+            _ = (schema, retry_count)
+            assert "single retrieval coverage decision" in system
+            bodies = {
+                pid: " ".join(body.split())
+                for pid, body in re.findall(
+                    r'<passage id="([^"]+)"[^>]*>(.*?)</passage>', prompt, re.DOTALL
+                )
+            }
+            needs = []
+            for nid, marker in (("need-1", "DEEP-A"), ("need-2", "DEEP-B")):
+                supporting = [pid for pid, body in bodies.items() if marker in body]
+                needs.append(
+                    {
+                        "need_id": nid,
+                        "covered": bool(supporting),
+                        "supporting_passage_ids": supporting,
+                        "supporting_quote": marker if supporting else "",
+                        "missing": "" if supporting else f"missing {marker}",
+                    }
+                )
+            return {"needs": needs}
+
+    monkeypatch.setenv("AA_RETRIEVAL_ONE_SHOT_FASTPATH", "true")
+    needs = _needs_two()
+    pack = asyncio.run(
+        aretrieve_with_semantic_selection(
+            index,
+            ["утренний разбор", "вечерняя поддержка"],
+            resolved_intent="утренний разбор и вечерняя поддержка",
+            conversation_context="",
+            user_message="разобрать утро и вечер",
+            selection_model=_OneShotModel(),
+            information_needs=needs,
+        )
+    )
+    metadata = dict(pack.retrieval_metadata or {})
+    assert metadata["retrieval_mode"] == "one_shot"
+    assert metadata["coverage_status"] == "ready"
+    assert metadata["genuine_need_count"] == 2
+    assert metadata["LLM_call_count"] == 1
+    assert deep_a.chunk_id in metadata["read_ids"]
+    assert deep_b.chunk_id in metadata["read_ids"]
+    joined = " ".join(passage.exact_text for passage in pack.passages)
+    assert "DEEP-A" in joined and "DEEP-B" in joined

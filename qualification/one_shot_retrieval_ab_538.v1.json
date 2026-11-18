@@ -1,0 +1,120 @@
+{
+  "version": "one-shot-retrieval-ab-538.v1",
+  "note": "Synthetic hermetic A/B fixture for kodmial/aa#538. No canonical book or user text.",
+  "corpus": {
+    "source_id": "ab-538-synthetic",
+    "source_sha256": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+    "corpus_version": "ab-538-v1"
+  },
+  "cases": [
+    {
+      "case_id": "frozen-simple",
+      "split": "frozen",
+      "category": "simple",
+      "user_message": "как спокойно разобрать тягу вечером?",
+      "resolved_intent": "как спокойно разобрать тягу вечером",
+      "queries": ["спокойный разбор тяги вечером"],
+      "needs": [
+        {"need_id": "need-1", "text": "BOOK_ANSWER"}
+      ],
+      "chunks": [
+        {
+          "chunk_id": "chapter-1:core",
+          "section": "chapter-1",
+          "text": "BOOK_ANSWER: спокойный разбор тяги опирается на трезвую поддержку рядом."
+        },
+        {
+          "chunk_id": "chapter-1:neighbor",
+          "section": "chapter-1",
+          "text": "BOOK_QUALIFIER: сначала разговор с наставником, затем самостоятельные шаги."
+        }
+      ],
+      "fused_scores": {
+        "chapter-1:core": 50.0,
+        "chapter-1:neighbor": 49.0
+      },
+      "expected_covered": ["need-1"],
+      "expected_chunk_ids": ["chapter-1:core"],
+      "provider_error": false
+    },
+    {
+      "case_id": "frozen-complex",
+      "split": "frozen",
+      "category": "complex",
+      "user_message": "что помогает утром и что помогает вечером?",
+      "resolved_intent": "утренняя и вечерняя поддержка",
+      "queries": ["утренняя поддержка", "вечерняя поддержка"],
+      "needs": [
+        {"need_id": "need-1", "text": "ANSWER-MORNING"},
+        {"need_id": "need-2", "text": "ANSWER-EVENING"}
+      ],
+      "chunks": [
+        {
+          "chunk_id": "chapter-2:morning",
+          "section": "chapter-2",
+          "text": "ANSWER-MORNING: утром помогает короткий разбор и поддержка рядом."
+        },
+        {
+          "chunk_id": "chapter-3:unrelated",
+          "section": "chapter-3",
+          "text": "Фоновый отрывок без второго ответа."
+        }
+      ],
+      "fused_scores": {
+        "chapter-2:morning": 60.0,
+        "chapter-3:unrelated": 10.0
+      },
+      "expected_covered": ["need-1"],
+      "expected_chunk_ids": ["chapter-2:morning"],
+      "provider_error": false
+    },
+    {
+      "case_id": "heldout-simple",
+      "split": "held_out",
+      "category": "simple",
+      "user_message": "как пережить сильную тягу без срыва?",
+      "resolved_intent": "пережить сильную тягу без срыва",
+      "queries": ["пережить тягу без срыва"],
+      "needs": [
+        {"need_id": "need-1", "text": "HELD-ANSWER"}
+      ],
+      "chunks": [
+        {
+          "chunk_id": "chapter-4:held",
+          "section": "chapter-4",
+          "text": "HELD-ANSWER: сначала позвонить наставнику, затем переждать тягу рядом с поддержкой."
+        }
+      ],
+      "fused_scores": {
+        "chapter-4:held": 40.0
+      },
+      "expected_covered": ["need-1"],
+      "expected_chunk_ids": ["chapter-4:held"],
+      "provider_error": false
+    },
+    {
+      "case_id": "heldout-provider-error",
+      "split": "held_out",
+      "category": "provider-error",
+      "user_message": "что делать при тяге?",
+      "resolved_intent": "что делать при тяге",
+      "queries": ["что делать при тяге"],
+      "needs": [
+        {"need_id": "need-1", "text": "ERROR-ANSWER"}
+      ],
+      "chunks": [
+        {
+          "chunk_id": "chapter-5:error",
+          "section": "chapter-5",
+          "text": "ERROR-ANSWER: синтетический ответ для проверки ошибки провайдера."
+        }
+      ],
+      "fused_scores": {
+        "chapter-5:error": 30.0
+      },
+      "expected_covered": [],
+      "expected_chunk_ids": [],
+      "provider_error": true
+    }
+  ]
+}

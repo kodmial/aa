@@ -136,6 +136,11 @@ class RetrievalConfig:
     max_per_section: int = MAX_PER_SECTION
     neighbor_window: int = NEIGHBOR_WINDOW
     budget_tokens: int = RETRIEVED_PASSAGES_BUDGET_TOKENS
+    # Explicit opt-in for the bounded one-shot retrieval fast path
+    # (kodmial/aa#538). Default off: the ordinary runtime executes the
+    # existing selector -> read_exact -> coverage loop unchanged and with
+    # no additional model calls. Qualification enables it explicitly.
+    one_shot_fast_path: bool = False
 
 
 @dataclass(frozen=True)

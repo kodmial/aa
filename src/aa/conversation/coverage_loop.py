@@ -132,6 +132,16 @@ def _need_ids_from_info(needs: Any) -> list[str]:
     return out
 
 
+class CoverageDecisionError(ValueError):
+    """One coverage decision is not acceptable evidence (fail closed).
+
+    The legacy loop tolerates a partly invalid decision by degrading to
+    conservative uncovered. The one-shot retrieval fast path instead
+    treats an invalid positive claim as a typed fallback trigger, so a
+    malformed/unsupported quote can never become ``coverage=ready``.
+    """
+
+
 def _need_text(needs: Any, need_id: str) -> str:
     for entry in list(needs or []):
         try:
@@ -188,6 +198,8 @@ def coverage_prompt(
     information_needs: Any,
     original_request: str,
     repair_hint: str = "",
+    conversation_context: str = "",
+    one_shot: bool = False,
 ) -> tuple[str, str]:
     """Render the bounded coverage prompt (system, user).
 
@@ -195,6 +207,11 @@ def coverage_prompt(
     any) travels first as supplementary context and must never be
     treated as the user's intent. Control instructions and unsupported
     draft claims are untrusted data, never search intent.
+
+    ``one_shot=True`` renders the single-retrieval-decision variant used
+    by the bounded fast path (kodmial/aa#538): the model sees the full
+    canonical candidate pack once and must return a per-need verdict
+    with verbatim quotes. The legacy prompt is unchanged.
     """
     from aa.conversation.prompt_safety import (
         UNTRUSTED_DATA_POLICY_LINE,
@@ -215,6 +232,16 @@ def coverage_prompt(
         + " Judge only the listed <passage> elements against the listed "
         "<information_needs>; never invent passages or needs."
     )
+    if one_shot:
+        system += (
+            " This is the single retrieval coverage decision for this turn. "
+            "For every covered need return at least one listed passage id and "
+            "an exact non-empty quote copied from that passage. A quote about "
+            "a different subject, an empty quote, or a negation/exception "
+            "that contradicts the claimed conclusion never supports coverage. "
+            "Never use general knowledge and never emit a final answer or a "
+            "product-level PASS; only the per-need structured decision."
+        )
     lines: list[str] = [UNTRUSTED_DATA_POLICY_LINE]
     if _normalize_query(repair_hint):
         lines += [
@@ -236,6 +263,12 @@ def coverage_prompt(
         lines.append("</information_needs>")
     else:
         lines.append("<information_needs>(no typed needs)</information_needs>")
+    if one_shot and _normalize_query(conversation_context):
+        lines += [
+            "<conversation_context>",
+            escape_xml_text(_normalize_query(conversation_context)),
+            "</conversation_context>",
+        ]
     lines.append("<passages>")
     for item in list(passages or []):
         try:
@@ -249,11 +282,17 @@ def coverage_prompt(
             continue
         if not pid or not text:
             continue
+        # The legacy prompt keeps its bounded 4000-character rendering.
+        # The one-shot fast path already budgeted whole atomic passages
+        # before this call, so it must show the full canonical text: a
+        # silent here-truncation could hide the decisive qualifier while
+        # still looking like a complete prompt.
+        rendered_text = text if one_shot else text[:4000]
         lines.append(
             f"<passage id={quote_xml_attr(pid)} "
             f"source={quote_xml_attr(source)} section={quote_xml_attr(section)} "
             f"range={quote_xml_attr(f'{start}-{end}')}>"
-            f"{escape_xml_text(text[:4000])}</passage>"
+            f"{escape_xml_text(rendered_text)}</passage>"
         )
     if not passages:
         lines.append("(no passages read)")
@@ -261,6 +300,11 @@ def coverage_prompt(
     lines.append("<original_request>")
     lines.append(escape_xml_text(_normalize_query(original_request) or "(no request)"))
     lines.append("</original_request>")
+    missing_tail = (
+        "unanswered for an uncovered need, including any missing exception or qualifier."
+        if one_shot
+        else "unanswered for an uncovered need."
+    )
     lines.append(
         "Return ONLY a JSON object with exactly this key: "
         '{"needs": [{"need_id": string, "covered": boolean, '
@@ -270,8 +314,8 @@ def coverage_prompt(
         '"covered" is true only with at least one supporting passage id '
         "from <passages> whose text states the answer with conditions. "
         '"supporting_quote" must be an exact substring of a cited passage; '
-        'otherwise leave it empty. "missing" describes what remains '
-        "unanswered for an uncovered need."
+        "otherwise leave it empty. "
+        '"missing" describes what remains ' + missing_tail
     )
     return system, "\n".join(lines)
 
@@ -315,12 +359,28 @@ def _passage_text_contains(passage_text: str, quote: str) -> bool:
     return cleaned_quote[:400] in cleaned_text
 
 
+def _passage_text_contains_exact(passage_text: str, quote: str) -> bool:
+    """Verify a quote as a full whitespace-normalized substring.
+
+    Used only by the one-shot fast path (kodmial/aa#538). The legacy
+    check above intentionally tolerates a 400-character prefix; a fast
+    path success must never rest on a truncated quote that omits the
+    decisive qualifier, so the whole normalized quote must be present.
+    """
+    cleaned_text = " ".join(str(passage_text or "").split())
+    cleaned_quote = " ".join(str(quote or "").split())
+    if not cleaned_quote:
+        return False
+    return cleaned_quote in cleaned_text
+
+
 def validate_coverage_decision(
     data: object,
     *,
     known_need_ids: list[str],
     known_passage_ids: set[str],
     passages_by_id: dict[str, Any],
+    require_supporting_quote: bool = False,
 ) -> CoverageVerdict:
     """Strictly validate one coverage decision (fail-closed, never lexical).
 
@@ -328,6 +388,13 @@ def validate_coverage_decision(
     supporting quotes must verify as substrings of cited canonical text.
     A ``covered=true`` without a valid anchor fails closed to uncovered.
     Unknown need ids fail closed.
+
+    ``require_supporting_quote=True`` is the fast-path-only tightening
+    (kodmial/aa#538): a covered claim must carry a non-empty exact quote
+    verified in full against a cited canonical passage. Unknown cited
+    passage ids and unverifiable positive claims raise
+    :class:`CoverageDecisionError` so the caller can fall back instead of
+    serving an unproven PASS. Legacy semantics stay unchanged by default.
     """
     if not isinstance(data, dict):
         raise ValueError("coverage decision is not an object")
@@ -339,6 +406,8 @@ def validate_coverage_decision(
     out: list[NeedCoverage] = []
     for entry in raw_needs:
         if not isinstance(entry, dict):
+            if require_supporting_quote:
+                raise CoverageDecisionError("coverage decision entry is not an object")
             continue
         nid = str(entry.get("need_id", "") or "").strip()
         if not nid or nid not in known_set or nid in seen:
@@ -352,14 +421,23 @@ def validate_coverage_decision(
         if isinstance(raw_pids, list):
             for raw in raw_pids:
                 pid = str(raw or "").strip()
-                if pid and pid in known_passage_ids and pid not in pids:
-                    pids.append(pid)
+                if not pid or pid in pids:
+                    continue
+                if pid not in known_passage_ids:
+                    if require_supporting_quote:
+                        raise CoverageDecisionError(f"coverage cites unknown passage {pid!r}")
+                    continue
+                pids.append(pid)
         quote = str(entry.get("supporting_quote", "") or "")
         missing = str(entry.get("missing", "") or "")[:500]
         spans: list[str] = []
         anchors: list[CoverageAnchor] = []
         if covered_claim:
             if not pids:
+                if require_supporting_quote:
+                    raise CoverageDecisionError(
+                        f"covered need {nid!r} has no known supporting passage"
+                    )
                 covered_claim = False
             else:
                 verified = False
@@ -384,9 +462,27 @@ def validate_coverage_decision(
                             char_end=end,
                         )
                     )
-                    if quote.strip() and _passage_text_contains(text, quote):
+                    contains = (
+                        _passage_text_contains_exact(text, quote)
+                        if require_supporting_quote
+                        else _passage_text_contains(text, quote)
+                    )
+                    if quote.strip() and contains:
                         verified = True
                         spans.append(" ".join(quote.split())[:500])
+                if require_supporting_quote:
+                    if not quote.strip():
+                        raise CoverageDecisionError(
+                            f"covered need {nid!r} has an empty supporting quote"
+                        )
+                    if not anchors:
+                        raise CoverageDecisionError(
+                            f"covered need {nid!r} has no verifiable anchor"
+                        )
+                    if not verified:
+                        raise CoverageDecisionError(
+                            f"covered need {nid!r} has no quote verified in a cited passage"
+                        )
                 # A covered verdict needs at least one exact anchor; a
                 # quote is supporting auditability when present and
                 # verified, but an unverifiable quote never upgrades a
@@ -458,19 +554,33 @@ async def aassess_coverage(
     original_request: str,
     model: Any | None = None,
     repair_hint: str = "",
+    conversation_context: str = "",
+    require_supporting_quote: bool = False,
+    raise_on_invalid: bool = False,
 ) -> CoverageVerdict:
     """Assess full exact passages against every information need.
 
     Model-driven when a model is bound; conservative uncovered when no
     model is available or the model call fails (lexical heuristics never
     decide sufficiency). Provider 429 propagates.
+
+    ``require_supporting_quote``/``raise_on_invalid`` are the fast-path
+    strictness switches (kodmial/aa#538). Defaults preserve the legacy
+    coverage-loop semantics exactly: a malformed decision degrades to
+    conservative uncovered, while a valid decision may keep quoteless
+    anchors. The fast path raises :class:`CoverageDecisionError` so the
+    caller can execute its typed legacy fallback.
     """
     need_ids = _need_ids_from_info(information_needs)
     if not need_ids:
         return CoverageVerdict(needs=(), all_covered=True, missing_need_ids=(), used_model=False)
     if not passages:
+        if raise_on_invalid:
+            raise CoverageDecisionError("no exact passages available for coverage")
         return conservative_uncovered_verdict(information_needs)
     if model is None:
+        if raise_on_invalid:
+            raise CoverageDecisionError("no coverage model bound")
         return conservative_uncovered_verdict(information_needs)
     known_passage_ids = {str(getattr(item, "passage_id", "") or "") for item in passages}
     known_passage_ids.discard("")
@@ -480,6 +590,8 @@ async def aassess_coverage(
         information_needs=information_needs,
         original_request=original_request,
         repair_hint=repair_hint,
+        conversation_context=conversation_context,
+        one_shot=require_supporting_quote,
     )
     try:
         structured = getattr(model, "ainvoke_structured", None)
@@ -493,6 +605,8 @@ async def aassess_coverage(
         else:
             text_invoke = getattr(model, "_ainvoke_text", None) or getattr(model, "ainvoke", None)
             if not callable(text_invoke):
+                if raise_on_invalid:
+                    raise CoverageDecisionError("coverage model has no invocation path")
                 return conservative_uncovered_verdict(information_needs)
             if getattr(text_invoke, "__name__", "") == "_ainvoke_text":
                 reply = await text_invoke(user_text, system=system)
@@ -516,14 +630,17 @@ async def aassess_coverage(
             known_need_ids=need_ids,
             known_passage_ids=known_passage_ids,
             passages_by_id=passages_by_id,
+            require_supporting_quote=require_supporting_quote,
         )
     except Exception as exc:
         from aa.opencode.errors import OpenCodeRateLimitError
 
-        if isinstance(exc, OpenCodeRateLimitError):
+        if isinstance(exc, (OpenCodeRateLimitError, asyncio.CancelledError)):
             raise
-        if isinstance(exc, asyncio.CancelledError):
-            raise
+        if raise_on_invalid:
+            if isinstance(exc, CoverageDecisionError):
+                raise
+            raise CoverageDecisionError(f"coverage decision invalid: {type(exc).__name__}") from exc
         logger.info(
             "coverage assessment unavailable; conservative uncovered used",
             extra={"category": type(exc).__name__},
@@ -618,6 +735,7 @@ __all__ = [
     "STATE_SEARCH_MORE",
     "STATE_SELECT_FOR_READING",
     "CoverageAnchor",
+    "CoverageDecisionError",
     "CoverageLoopResult",
     "CoverageVerdict",
     "LoopStatus",
