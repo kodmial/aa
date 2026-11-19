@@ -3604,9 +3604,9 @@ async def run_live_telegram_evidence_lane(
                                 family=family,
                                 timeout_category="stuck-provider",
                                 timeout_reason="provider-error",
-                                last_active_stage=str(
-                                    stage_progress_state.get("last_stage", "")
-                                )[:64],
+                                last_active_stage=str(stage_progress_state.get("last_stage", ""))[
+                                    :64
+                                ],
                                 request_state=fatal_failure["request_state"],
                                 request_started=True,
                                 request_progress_observable="progress-unobservable",

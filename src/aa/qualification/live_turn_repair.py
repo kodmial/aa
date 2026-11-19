@@ -187,9 +187,7 @@ def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict
     }
 
 
-def fatal_provider_failure(
-    audit: Sequence[object], causality_id: str
-) -> dict[str, Any] | None:
+def fatal_provider_failure(audit: Sequence[object], causality_id: str) -> dict[str, Any] | None:
     """Return confirmed terminal 429 evidence for one causality, if any.
 
     Only a provider 429 is fatal to the current runner (kodmial/aa#429): the

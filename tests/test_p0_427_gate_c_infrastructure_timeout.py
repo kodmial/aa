@@ -621,9 +621,7 @@ def test_confirmed_429_reaches_the_runner_lifecycle_without_any_wall_clock(
 
     started = time.monotonic()
     with pytest.raises(OpenCodeRateLimitError):
-        supervise_live_gate_c(
-            lane, run_id="p0427-429", main_sha=SHA, progress_path=progress_path
-        )
+        supervise_live_gate_c(lane, run_id="p0427-429", main_sha=SHA, progress_path=progress_path)
     elapsed = time.monotonic() - started
     # Bounded by the event, not by the 30 s inactivity/campaign walls.
     assert 0.2 <= elapsed < 8.0, elapsed
@@ -632,10 +630,20 @@ def test_confirmed_429_reaches_the_runner_lifecycle_without_any_wall_clock(
 def test_lane_probes_the_request_audit_inside_the_await_loop() -> None:
     """Production wiring: the await loop raises the typed 429 promptly."""
     source = _lane_source()
-    loop = source[source.index("phase=awaiting-delivery") :]
-    assert "fatal_provider_failure(" in loop
+    loop = source[source.index("while len(api.sent_texts) <= before:") :]
+    # The await loop samples the already-published request audit through the
+    # exception-safe helper while a scenario is still waiting for delivery.
+    assert "_fatal_request_failure(" in loop
     assert "raise OpenCodeRateLimitError(" in loop
     assert "scenario-provider-error" in loop
-    # No fixed per-turn cutoff is introduced by the probe.
-    assert "while len(api.sent_texts) <= before:" in loop
+    # The detector itself reads the same request evidence used for stall
+    # attribution, so a later cleanup attempt cannot hide the failed turn.
+    helper = source[source.index("def _fatal_request_failure") :]
+    helper = helper[: helper.index("def _collect_partial_evidence")]
+    assert "fatal_provider_failure(" in helper
+    assert "request_latency_audit" in helper
+    # No fixed per-turn cutoff is introduced by the probe: only the existing
+    # inactivity bound and an event-driven sampling interval remain.
+    assert "_SCENARIO_PROVIDER_PROBE_INTERVAL_S" in loop
     assert "scenario_inactivity_limit_s" in loop
+    assert "await asyncio.sleep(0.02)" in loop
