@@ -30,25 +30,31 @@ from aa.opencode.observer import StallSnapshotObserver
 from aa.qualification.gate_c_canary import (
     BUDGET_EXPIRED,
     BUDGET_WITHIN,
+    DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S,
+    DEFAULT_REQUIRED_REAL_PATH_SCENARIOS,
     SCHEMA_VERSION,
     SELF_TEST_PROMPT_SENTINEL,
     SELF_TEST_SESSION_SENTINEL,
     SELF_TEST_SSE_SECRET_SENTINEL,
     STATUS_BLOCKED,
+    STATUS_FAIL,
     STATUS_INCONCLUSIVE,
     STATUS_READY,
     GateCCanaryError,
     RealPathEvidence,
     ScenarioEvidence,
     SelfTestEvidence,
+    _ordered_canary_scenarios,
     _scan_for_sentinels,
     _server_observation_checks,
+    _should_attempt_optional_scenario,
     assert_no_text_leak,
     evaluate_canary,
     observer_self_test,
     run_canary,
     write_canary_result,
 )
+from aa.qualification.product_contract_live import GATE_C_CANARY_SCENARIOS
 
 
 def _self_test_ready() -> SelfTestEvidence:
@@ -208,6 +214,192 @@ async def test_ready_path_runs_both_existing_scenarios_and_writes_privacy_safe_a
     assert payload["artifacts"]["result"] == "gate-c-canary-result.json"
     assert payload["privacy_validated"] is True
     assert "prompt" not in json.dumps(payload).casefold()
+
+
+# --- Required evidence survives an optional probe that runs out of budget --
+
+
+def test_canary_prioritizes_the_substantive_path_before_the_optional_turn() -> None:
+    ordered = _ordered_canary_scenarios(GATE_C_CANARY_SCENARIOS)
+    assert [family for family, _chat, _prompt in ordered] == [
+        "substantive-drinking",
+        "meta-capability",
+    ]
+    # Ordering never invents or rewrites the frozen literal scenarios.
+    assert {scenario for scenario in ordered} == set(GATE_C_CANARY_SCENARIOS)
+
+
+def test_one_fully_evidenced_required_turn_is_ready_with_scenario_limit_two() -> None:
+    """Regression for the budget-edge INCONCLUSIVE failure (kodmial/aa#543).
+
+    A second real-path turn is optional. When the first turn is complete, a
+    missing optional turn must not downgrade READY to
+    ``external-progress-unobserved``.
+    """
+    result = evaluate_canary(
+        main_sha="a" * 40,
+        run_id="543",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(_scenario("substantive-drinking"),),
+            server_evidence=_server_evidence_ready(),
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=210.0,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_READY
+    assert result.reason == "canary-ready"
+    assert result.required_real_turns == DEFAULT_REQUIRED_REAL_PATH_SCENARIOS
+    payload = result.to_dict()
+    assert payload["real_turn_count"] == 1
+    assert payload["required_real_turns"] == 1
+    assert payload["real_path"]["optional_scenarios_skipped"] == 0
+    assert payload["evidence_coverage"] == {
+        "stage": "observed",
+        "attempt": "observed",
+        "causality": "observed",
+        "server_events": "observed",
+    }
+
+
+def test_unfinished_optional_turn_does_not_downgrade_completed_required_turn() -> None:
+    """The exact observed shape: required delivered, optional still in flight."""
+    result = evaluate_canary(
+        main_sha="a" * 40,
+        run_id="543",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario("substantive-drinking"),
+                _scenario(
+                    "meta-capability",
+                    delivered=False,
+                    answer_outcome="",
+                    product_outcome="",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+            optional_scenarios_skipped=1,
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=288.6,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_READY
+    assert result.reason == "canary-ready"
+    assert result.budget_category == BUDGET_WITHIN
+    payload = result.to_dict()
+    assert payload["real_turn_count"] == 2
+    assert payload["real_path"]["optional_scenarios_skipped"] == 1
+    assert payload["evidence_coverage"]["stage"] == "observed"
+    assert payload["evidence_coverage"]["attempt"] == "observed"
+    assert payload["evidence_coverage"]["causality"] == "observed"
+
+
+def test_silent_required_turn_still_returns_inconclusive() -> None:
+    result = evaluate_canary(
+        main_sha="a" * 40,
+        run_id="543",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario(
+                    "substantive-drinking",
+                    delivered=False,
+                    answer_outcome="",
+                    product_outcome="",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+            budget_expired=True,
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=300.0,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_INCONCLUSIVE
+    assert result.reason == "external-progress-unobserved"
+    assert result.budget_category == BUDGET_EXPIRED
+
+
+def test_typed_failure_on_the_optional_turn_still_fails_the_canary() -> None:
+    result = evaluate_canary(
+        main_sha="a" * 40,
+        run_id="543",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario("substantive-drinking"),
+                _scenario(
+                    "meta-capability",
+                    failure_cause="verdict-irrelevant",
+                    answer_outcome="safety-blocked",
+                    product_outcome="service_error",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=120.0,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_FAIL
+    assert result.reason == "verdict-irrelevant"
+    assert result.exit_code == 4
+
+
+def test_optional_turn_starts_only_when_remaining_budget_can_fit_it() -> None:
+    # The observed failure: a 116 s first turn left too little time for a
+    # second complete turn, so it must not be started.
+    assert not _should_attempt_optional_scenario(remaining_s=164.0, observed_latency_s=116.0)
+    # The prior run's 19 s first turn left room for the slow substantive turn.
+    assert _should_attempt_optional_scenario(remaining_s=261.0, observed_latency_s=19.2)
+    # A slow required turn consumes the budget for any optional corroboration.
+    assert not _should_attempt_optional_scenario(remaining_s=80.0, observed_latency_s=200.0)
+    assert _should_attempt_optional_scenario(
+        remaining_s=DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S,
+        observed_latency_s=0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_canary_is_ready_after_one_required_turn(tmp_path: Path) -> None:
+    async def ready_self_test(_out: Path, _timeout: float) -> SelfTestEvidence:
+        return _self_test_ready()
+
+    async def one_turn_runner(_out: Path, _budget: float) -> RealPathEvidence:
+        return RealPathEvidence(
+            scenarios=(_scenario("substantive-drinking"),),
+            server_evidence=_server_evidence_ready(),
+        )
+
+    result = await run_canary(
+        main_sha="a" * 40,
+        run_id="543",
+        out_dir=tmp_path,
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        scenario_limit=2,
+        self_test_runner=ready_self_test,
+        real_path_runner=one_turn_runner,
+    )
+
+    assert result.status == STATUS_READY
+    payload = json.loads((tmp_path / "gate-c-canary-result.json").read_text(encoding="utf-8"))
+    assert payload["real_turn_count"] == 1
+    assert payload["required_real_turns"] == 1
+    assert payload["status"] == STATUS_READY
+    assert payload["gate_c_executed"] is False
+    assert payload["product_qualified"] is False
 
 
 # --- DoD case (b): missing observer / typed cause fails closed -------------
