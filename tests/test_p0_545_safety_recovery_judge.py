@@ -1,4 +1,4 @@
-"""P0 kodmial/aa#545: a judge-negative certified safety recovery is still served.
+"""P0 kodmial/aa#545: safety recovery keeps the kodmial/aa#372 judge gate.
 
 Proven failure on exact main 8bfcf7909f850199214380560a0bbf6976b6189e
 (run 44494594832, canary qualification #7): the ``substantive-drinking``
@@ -11,15 +11,15 @@ converted the turn into ``answer_outcome="safety-blocked"`` -- a marked
 service error delivered to the user. The canary failed exactly there with
 ``status=FAIL reason=service-error-delivered``.
 
-The recovery pipeline has already exhausted its bounded alternative search
-at that point, so a judge-only negative cannot manufacture a safer answer:
-it can only replace a certified safe answer with a service error. Recovery
-now carries the same practical-answer focus as the adequacy repair (so the
-candidate is less likely to substitute a generic difficulty description for
-guidance), and a judge-negative certified recovery is delivered with the
-independent verdict recorded instead of collapsing to a typed service error.
-Ordinary substantive delivery keeps the kodmial/aa#372 judge gate; that
-contract is covered by ``test_p0_372_gate_c_substantive_judge``.
+The bounded mitigation is generation quality, not removing the systemic
+gate: recovery now carries the same practical-answer focus as the adequacy
+repair, so the candidate is less likely to substitute a generic difficulty
+description for guidance and get rejected by the independent judge. A
+judge-negative certified recovery still falls through to safety-blocked;
+serving it as ``answer_outcome="served"`` with
+``independent_judge_helpful=False`` would mask a quality failure in
+telemetry and qualification. A safe but inadequate recovery is likewise
+never served as success.
 
 All fixtures below are synthetic, never the literal qualification prompt.
 """
@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 _HARMFUL_DRAFT = (
@@ -188,33 +189,80 @@ def _turn_kwargs(judge: Any, answer_model: Any) -> dict[str, Any]:
     }
 
 
-async def test_judge_negative_certified_recovery_is_served_not_service_error(
+async def test_judge_negative_certified_recovery_is_withheld_as_safety_blocked(
     monkeypatch: Any,
 ) -> None:
-    """A certified safe recovery is never collapsed into a service error."""
+    """The #372 gate still withholds a judge-negative certified recovery."""
+    from aa.conversation.failures import TurnFailed
     from aa.conversation.turn_pipeline import run_v2_answer_turn
 
     _install_retrieval(monkeypatch)
     judge = _ScriptedJudge([True, False])
     answer_model = _HarmfulThenSafeAnswer()
 
-    outcome = await run_v2_answer_turn(**_turn_kwargs(judge, answer_model))
+    with pytest.raises(TurnFailed) as excinfo:
+        await run_v2_answer_turn(**_turn_kwargs(judge, answer_model))
 
-    telemetry = dict(outcome.get("telemetry", {}))
-    assert outcome["text"] == _SAFE_RECOVERY
-    assert telemetry.get("answer_outcome") == "served"
-    assert telemetry.get("answer_outcome") != "safety-blocked"
-    assert telemetry.get("outbound_safety") == "repaired"
-    assert telemetry.get("adequacy_verdict") == "pass"
-    assert telemetry.get("answers_request") is True
-    assert telemetry.get("technically_grounded") is True
-    assert telemetry.get("failure_category") == ""
-    assert telemetry.get("answer_failure_cause") is None
+    assert excinfo.value.category == "safety-blocked"
+    telemetry = dict(excinfo.value.telemetry)
+    assert telemetry.get("answer_outcome") == "safety-blocked"
+    assert telemetry.get("answer_outcome") != "served"
+    assert telemetry.get("outbound_safety") != "repaired"
+    assert telemetry.get("adequacy_verdict") == "fail"
+    assert telemetry.get("answers_request") is False
+    assert telemetry.get("technically_grounded") is False
+    assert telemetry.get("qualified") is False
+    assert telemetry.get("failure_category") == "adequacy-repair-failed"
     assert telemetry.get("safety_recovery_judge_rejected") is True
     assert telemetry.get("independent_judge_helpful") is False
-    # The original harmful draft was never delivered.
-    assert _HARMFUL_DRAFT not in outcome["text"]
     assert judge.calls == 2
+
+
+async def test_inadequate_certified_recovery_is_withheld_as_safety_blocked(
+    monkeypatch: Any,
+) -> None:
+    """A safe but inadequate recovery falls through instead of serving."""
+    import aa.conversation.answer_adequacy as adequacy
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import run_v2_answer_turn
+
+    _install_retrieval(monkeypatch)
+    real_assess = adequacy.assess_turn_adequacy
+    safe_recovery_calls = 0
+
+    def _assess(**kwargs: Any) -> Any:
+        nonlocal safe_recovery_calls
+        if kwargs.get("reply") == _SAFE_RECOVERY:
+            safe_recovery_calls += 1
+            # First assessment certifies the recovered candidate; the
+            # second is the delivery-boundary _record_adequacy call.
+            if safe_recovery_calls >= 2:
+                return adequacy.AdequacyAssessment(
+                    substantive_request=True,
+                    technically_grounded=False,
+                    answers_request=False,
+                    verdict=adequacy.ADEQUACY_FAIL,
+                    failure_category=adequacy.FAILURE_REPAIR_FAILED,
+                    verified_book_units=0,
+                    evidence_passages=1,
+                )
+        return real_assess(**kwargs)
+
+    monkeypatch.setattr(adequacy, "assess_turn_adequacy", _assess)
+    answer_model = _HarmfulThenSafeAnswer()
+
+    with pytest.raises(TurnFailed) as excinfo:
+        await run_v2_answer_turn(**_turn_kwargs(None, answer_model))
+
+    assert excinfo.value.category == "safety-blocked"
+    telemetry = dict(excinfo.value.telemetry)
+    assert telemetry.get("answer_outcome") == "safety-blocked"
+    assert telemetry.get("answer_outcome") != "served"
+    assert telemetry.get("adequacy_verdict") == "fail"
+    assert telemetry.get("answers_request") is False
+    assert telemetry.get("technically_grounded") is False
+    assert telemetry.get("qualified") is False
+    assert safe_recovery_calls >= 2
 
 
 async def test_judge_positive_certified_recovery_is_served_without_rejection_marker(

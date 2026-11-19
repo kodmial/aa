@@ -5482,16 +5482,14 @@ async def run_v2_answer_turn(
                     verification_state=_safe_state,
                 )
                 # Systemic gate (kodmial/aa#372): the independently
-                # instantiated whole-turn judge still runs on the recovered
-                # candidate, and its verdict is recorded. Unlike ordinary
-                # substantive delivery, the bounded recovery search has
-                # already stopped on a fully certified candidate: safe,
-                # verifier-supported and whole-turn adequate. A judge-only
-                # negative therefore must not convert that certified answer
-                # into a typed service error. Safety recovery is the last
-                # delivery boundary; a safe grounded answer is always
-                # preferable to a marked service error, and the independent
-                # verdict stays visible in telemetry instead of being hidden.
+                # instantiated whole-turn judge still gates the recovered
+                # candidate exactly as it gates ordinary substantive
+                # delivery. The practical-focus regeneration above is the
+                # bounded mitigation for judge-rejected recoveries; it does
+                # not remove the gate. A judge-only negative therefore
+                # falls through to the transparent safety-blocked reply
+                # instead of being counted as a served success with
+                # ``independent_judge_helpful=False``.
                 _recovery_judge_rejects = False
                 if (
                     not _proven_glue
@@ -5501,14 +5499,25 @@ async def run_v2_answer_turn(
                     _recovery_judge_rejects = await _substantive_judge_rejects(
                         str(recovered["text"])
                     )
-                if not _proven_glue and telemetry.get("adequacy_verdict") == _ADEQ_FAIL:
-                    # A safe but inadequate recovery is no certified help:
-                    # fall through to the transparent safety-blocked reply
-                    # instead of serving it as success.
+                if _recovery_judge_rejects:
+                    telemetry["safety_recovery_judge_rejected"] = True
+                if not _proven_glue and (
+                    telemetry.get("adequacy_verdict") == _ADEQ_FAIL or _recovery_judge_rejects
+                ):
+                    # A safe but inadequate recovery is no certified help,
+                    # and an explicit whole-turn judge rejection keeps the
+                    # kodmial/aa#372 delivery gate in force: fall through to
+                    # the transparent safety-blocked reply instead of
+                    # serving it as success.
+                    if _recovery_judge_rejects:
+                        telemetry["adequacy_verdict"] = _ADEQ_FAIL
+                        if not str(telemetry.get("failure_category", "") or "").strip():
+                            telemetry["failure_category"] = _FAIL_REPAIR
+                        telemetry["answers_request"] = False
+                        telemetry["technically_grounded"] = False
+                        telemetry["qualified"] = False
                     pass
                 else:
-                    if _recovery_judge_rejects:
-                        telemetry["safety_recovery_judge_rejected"] = True
                     telemetry["outbound_safety"] = "repaired"
                     telemetry["answer_outcome"] = "served"
                     # A delivered certified recovery supersedes the unsafe
