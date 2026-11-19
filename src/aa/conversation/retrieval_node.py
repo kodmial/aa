@@ -1182,7 +1182,7 @@ async def _try_one_shot_fast_path(
         return outcome
 
 
-async def aretrieve_with_semantic_selection(
+async def _aretrieve_with_semantic_selection_impl(
     index: HybridIndex,
     queries: list[str],
     *,
@@ -1326,7 +1326,6 @@ async def aretrieve_with_semantic_selection(
     )
 
     started = time.perf_counter()
-    http_calls_start = _one_shot_http_calls()
     # ---- turn budget (#335): owned by the compiled graph, shared by all
     # stages. Direct calls start a fresh 105s turn budget; graph calls pass
     # one with upstream planner cost folded in. Model awaits below use the
@@ -2475,10 +2474,13 @@ async def aretrieve_with_semantic_selection(
         "coverage_latency_ms": round(float(cov_ms_total), 3),
     }
     try:
-        _http_delta = max(0, _one_shot_http_calls() - int(http_calls_start))
+        # The public wrapper scopes the adapter counter to this retrieval,
+        # so this is the request count for this turn even when other turns
+        # overlap in the same process.
+        _http_calls = max(0, _one_shot_http_calls())
     except Exception:
-        _http_delta = 0
-    llm_call_count = max(int(model_calls), int(_http_delta))
+        _http_calls = 0
+    llm_call_count = max(int(model_calls), int(_http_calls))
     genuine_need_count = len(set(need_ids_ordered) or set(need_id_order))
     metadata: dict[str, Any] = {
         "retrieval_mode": retrieval_mode,
@@ -2592,6 +2594,57 @@ async def aretrieve_with_semantic_selection(
         corpus_version=str(index.metadata.get("ru_artifact_sha256", "")),
         retrieval_metadata=metadata,
     )
+
+
+async def aretrieve_with_semantic_selection(
+    index: HybridIndex,
+    queries: list[str],
+    *,
+    config: RetrievalConfig | None = None,
+    resolved_intent: str = "",
+    conversation_context: str = "",
+    user_message: str = "",
+    selection_model: Any | None = None,
+    context_digest: str = "",
+    information_needs: Any | None = None,
+    query_need_map: Any | None = None,
+    coverage_model: Any | None = None,
+    repair_hint: str = "",
+    max_iterations: int = 3,
+    turn_budget: TurnBudget | None = None,
+    upstream_latency_ms: float = 0.0,
+    turn_dag: SemanticTurnDAG | None = None,
+) -> EvidencePack:
+    """Run the shared discover/read/coverage retrieval loop.
+
+    The process-wide adapter counter keeps its lifetime total, while this
+    context-local scope ensures ``LLM_call_count`` and A/B call accounting
+    never include provider requests issued by a concurrent retrieval.
+    """
+    from aa.conversation.model_adapter import _LLM_HTTP_CONTEXT
+
+    token = _LLM_HTTP_CONTEXT.set([0])
+    try:
+        return await _aretrieve_with_semantic_selection_impl(
+            index,
+            queries,
+            config=config,
+            resolved_intent=resolved_intent,
+            conversation_context=conversation_context,
+            user_message=user_message,
+            selection_model=selection_model,
+            context_digest=context_digest,
+            information_needs=information_needs,
+            query_need_map=query_need_map,
+            coverage_model=coverage_model,
+            repair_hint=repair_hint,
+            max_iterations=max_iterations,
+            turn_budget=turn_budget,
+            upstream_latency_ms=upstream_latency_ms,
+            turn_dag=turn_dag,
+        )
+    finally:
+        _LLM_HTTP_CONTEXT.reset(token)
 
 
 def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

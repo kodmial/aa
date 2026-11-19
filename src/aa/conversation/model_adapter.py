@@ -21,6 +21,7 @@ outputs; only operation counts and error categories are emitted.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import threading
 import time
@@ -48,10 +49,15 @@ logger = logging.getLogger("aa.conversation.model_adapter")
 # Actual LLM HTTP-request accounting (kodmial/aa#538). One counter is
 # incremented immediately before each real provider `send_message` /
 # `send_structured_message` call, including structured-provider and
-# capability fallbacks. Retrieval telemetry reports this delta so a
-# logical node call that silently issues a second provider request is
-# never undercounted. Session lifecycle calls are not LLM requests.
+# capability fallbacks. Retrieval telemetry must report only its own
+# requests, so an active retrieval/context gets an isolated counter while
+# the process-wide total remains available outside that scope. A global
+# start/delta pair would otherwise mix concurrent turns in one process.
+# Session lifecycle calls are not LLM requests.
 _LLM_HTTP_CALLS = 0
+_LLM_HTTP_CONTEXT: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "aa_llm_http_calls", default=None
+)
 _LLM_HTTP_LOCK = threading.Lock()
 
 
@@ -60,11 +66,17 @@ def note_llm_http_call() -> None:
     global _LLM_HTTP_CALLS
     with _LLM_HTTP_LOCK:
         _LLM_HTTP_CALLS += 1
+        context_calls = _LLM_HTTP_CONTEXT.get()
+        if context_calls is not None:
+            context_calls[0] += 1
 
 
 def llm_http_call_count() -> int:
-    """Return the process-wide real provider LLM request count."""
+    """Return the current context count, else the process-wide total."""
+    context_calls = _LLM_HTTP_CONTEXT.get()
     with _LLM_HTTP_LOCK:
+        if context_calls is not None:
+            return int(context_calls[0])
         return int(_LLM_HTTP_CALLS)
 
 
@@ -73,6 +85,9 @@ def reset_llm_http_call_count() -> None:
     global _LLM_HTTP_CALLS
     with _LLM_HTTP_LOCK:
         _LLM_HTTP_CALLS = 0
+        context_calls = _LLM_HTTP_CONTEXT.get()
+        if context_calls is not None:
+            context_calls[0] = 0
 
 
 PLANNER_AGENT_V2 = "aa-planner-v2"

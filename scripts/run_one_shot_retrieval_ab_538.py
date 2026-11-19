@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Hermetic A/B for the kodmial/aa#538 one-shot retrieval fast path.
+"""Synthetic packing/coverage harness for kodmial/aa#538.
 
-Runs the real ``aretrieve_with_semantic_selection`` code over one frozen
-synthetic corpus/index/model configuration with the feature flag off and
-on. Discovery, canonical reading, prompt packing, strict quote validation
-and the legacy fallback are the production code paths; only the provider
-transport is an in-process deterministic scripted model. Every logical
-model invocation increments the same real-HTTP counter used by the
-production adapter, so call counts are directly comparable.
+This is deliberately a harness, not a real-corpus retrieval A/B. It runs
+the real ``aretrieve_with_semantic_selection`` orchestration over a frozen
+synthetic fixture with the feature flag off and on, but local discovery is
+replaced by the fixture's fused-candidate map and the provider transport is
+an in-process scripted model. It therefore exercises canonical reading,
+prompt packing, strict quote validation, fallback handling and scripted
+call accounting; it does not measure BM25+E5/FAISS/RRF discovery recall or
+real provider HTTP counts, tokens or latency. Those require the production
+index/corpus and provider qualification lane.
 
 The fixture contains synthetic text only. Report output carries IDs,
-counts, token estimates and latencies, never prompt or passage text.
+counts, scripted token estimates and harness latencies, never prompt or
+passage text. Metrics are labelled synthetic: ``retrieval_recall`` is only
+the recall of expected fixture chunk ids in the served pack, and
+``scripted_http_calls`` mirrors the adapter counter through a scripted
+provider, not real HTTP.
 
 Usage:
     python3 scripts/run_one_shot_retrieval_ab_538.py \
@@ -126,7 +132,12 @@ def _passage_texts(prompt: str) -> dict[str, str]:
 
 
 class _ScriptedProvider:
-    """Deterministic provider whose one logical call is one HTTP request."""
+    """Deterministic in-process provider; calls are scripted, not HTTP.
+
+    ``note_llm_http_call`` mirrors the production adapter boundary so the
+    harness can exercise retrieval call accounting, but no network request
+    or real token usage occurs.
+    """
 
     def __init__(self, case: dict[str, Any]) -> None:
         self._case = case
@@ -193,11 +204,14 @@ async def _run_case(case: dict[str, Any], corpus: dict[str, Any], mode: str) -> 
         for item in case.get("needs", [])
     ]
 
-    def _fake_branch(index_arg: Any, queries: list[str], **kwargs: Any) -> Any:
+    # Harness boundary: discovery is the fixture's frozen fused map. The
+    # real local BM25+E5/FAISS/RRF stack is not executed here, so recall
+    # and source metrics below are fixture assertions, not discovery proof.
+    def _fixture_branch(index_arg: Any, queries: list[str], **kwargs: Any) -> Any:
         _ = (index_arg, queries, kwargs)
         return ([], [list(fused)])
 
-    def _fake_fuse(ranked: Any, per_ids: Any, **kwargs: Any) -> Any:
+    def _fixture_fuse(ranked: Any, per_ids: Any, **kwargs: Any) -> Any:
         _ = (ranked, per_ids, kwargs)
         return dict(fused), list(fused)
 
@@ -212,8 +226,8 @@ async def _run_case(case: dict[str, Any], corpus: dict[str, Any], mode: str) -> 
     with ExitStack() as stack:
         from aa.retrieval import evidence as evidence_mod
 
-        stack.enter_context(patch.object(evidence_mod, "run_branch_searches", _fake_branch))
-        stack.enter_context(patch.object(evidence_mod, "fuse_query_pool", _fake_fuse))
+        stack.enter_context(patch.object(evidence_mod, "run_branch_searches", _fixture_branch))
+        stack.enter_context(patch.object(evidence_mod, "fuse_query_pool", _fixture_fuse))
         try:
             pack = await aretrieve_with_semantic_selection(
                 index,
@@ -247,9 +261,14 @@ async def _run_case(case: dict[str, Any], corpus: dict[str, Any], mode: str) -> 
     expected_chunks = sorted(str(item) for item in case.get("expected_chunk_ids", []))
     served_set = set(served_chunk_ids)
     expected_set = set(expected_chunks)
-    source_match = expected_set.issubset(served_set) if expected_set else not error_type
+    # Empty expected sets and provider-error rows are not recall evidence.
+    # Keeping them out of the denominator prevents an error that retrieved
+    # nothing from contributing a perfect score to the aggregate.
+    source_match = expected_set.issubset(served_set) if expected_set else None
     retrieval_recall = (
-        round(len(expected_set & served_set) / len(expected_set), 4) if expected_set else 1.0
+        round(len(expected_set & served_set) / len(expected_set), 4)
+        if expected_set and not error_type
+        else None
     )
     provider_error_case = bool(case.get("provider_error"))
     safe_outcome = (
@@ -277,8 +296,11 @@ async def _run_case(case: dict[str, Any], corpus: dict[str, Any], mode: str) -> 
         "actual_needs_coverage_match": coverage_match,
         "safe_outcome": safe_outcome,
         "logical_model_calls": int(provider.logical_calls),
-        "real_http_calls": int(llm_http_call_count()),
+        # Scripted logical calls at the adapter accounting boundary, not
+        # real provider HTTP requests.
+        "scripted_http_calls": int(llm_http_call_count()),
         "input_tokens": int(provider.input_tokens),
+        "input_tokens_kind": "scripted-estimate",
         "latency_ms": round(
             float(metadata.get("total_ms", elapsed_ms) or elapsed_ms),
             3,
@@ -302,6 +324,8 @@ def _percentile(values: list[float], percentile: int) -> float:
 def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     errors = [row for row in rows if row["error_type"]]
     compared = [row for row in rows if row["coverage_match"] is not None]
+    recall_rows = [row for row in rows if row.get("retrieval_recall") is not None]
+    source_rows = [row for row in rows if row.get("source_match") is not None]
     latencies = [float(row["latency_ms"]) for row in rows]
     fallback_rows = [row for row in rows if row["fallback_reason"] or row["error_type"]]
     return {
@@ -309,19 +333,24 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "errors": len(errors),
         "coverage_matches": sum(1 for row in compared if row["coverage_match"]),
         "coverage_compared": len(compared),
-        "source_matches": sum(1 for row in rows if row["source_match"]),
-        "source_compared": len(rows),
+        "source_matches": sum(1 for row in source_rows if row["source_match"]),
+        "source_compared": len(source_rows),
+        "source_unavailable": len(rows) - len(source_rows),
         "retrieval_recall": round(
-            sum(float(row["retrieval_recall"]) for row in rows) / len(rows), 4
+            sum(float(row["retrieval_recall"]) for row in recall_rows) / len(recall_rows), 4
         )
-        if rows
-        else 0.0,
+        if recall_rows
+        else None,
+        "retrieval_recall_compared": len(recall_rows),
+        "retrieval_recall_skipped": len(rows) - len(recall_rows),
         "safe_outcomes": sum(1 for row in rows if row["safe_outcome"]),
         "ready_cases": sum(1 for row in rows if row["coverage_status"] == "ready"),
         "fallback_cases": len(fallback_rows),
-        "fallback_real_http_calls": sum(int(row["real_http_calls"]) for row in fallback_rows),
+        "fallback_scripted_http_calls": sum(
+            int(row["scripted_http_calls"]) for row in fallback_rows
+        ),
         "logical_model_calls": sum(int(row["logical_model_calls"]) for row in rows),
-        "real_http_calls": sum(int(row["real_http_calls"]) for row in rows),
+        "scripted_http_calls": sum(int(row["scripted_http_calls"]) for row in rows),
         "input_tokens": sum(int(row["input_tokens"]) for row in rows),
         "latency_ms": round(sum(latencies), 3),
         "latency_p50_ms": _percentile(latencies, 50),
@@ -364,7 +393,16 @@ def run_ab(fixture_path: Path, split: str = "all") -> dict[str, Any]:
         "fixture": str(fixture_path),
         "fixture_version": str(fixture.get("version", "")),
         "split": split,
+        "harness": "synthetic-packing-coverage",
+        "real_corpus_index_model_config": False,
+        "same_fixture_corpus_index_model_config": True,
+        # Retained for existing consumers: both modes use the same
+        # synthetic fixture index/model configuration, never a real corpus.
         "same_corpus_index_model_config": True,
+        "discovery": "fixture-fused-candidates",
+        "provider_transport": "scripted-in-process",
+        "http_call_metric": "scripted-logical-calls",
+        "recall_metric": "fixture-expected-chunk-recall",
         "results": rows,
         "summary": {
             "by_category": _summaries(by_category),

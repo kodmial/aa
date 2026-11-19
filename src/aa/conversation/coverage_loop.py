@@ -219,6 +219,10 @@ def coverage_prompt(
         quote_xml_attr,
     )
 
+    # This is the legacy system prompt, including the untrusted-data policy
+    # and "Judge only..." instruction that predate #538. It is intentionally
+    # byte-identical when one_shot=False; only the block below is the new
+    # fast-path text and it is gated on one_shot.
     system = (
         "You are a book-evidence coverage judge. Read the FULL exact "
         "canonical passages below and decide, for EVERY information need, "

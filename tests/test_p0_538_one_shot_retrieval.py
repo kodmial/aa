@@ -908,6 +908,57 @@ def test_coverage_prompt_is_not_a_product_pass() -> None:
     assert "<passages>" in user
 
 
+def test_legacy_coverage_prompt_does_not_receive_fast_path_text() -> None:
+    """Flag-off keeps the existing system/user prompt additions gated."""
+    from aa.conversation.coverage_loop import coverage_prompt
+
+    system, user = coverage_prompt(
+        passages=[],
+        information_needs=[InformationNeed(need_id="need-1", text="synthetic")],
+        original_request="synthetic request",
+        conversation_context="previous synthetic turn",
+        one_shot=False,
+    )
+    assert "single retrieval coverage decision" not in system
+    assert "product-level PASS" not in system
+    assert "exact non-empty quote copied from that passage" not in system
+    assert "previous synthetic turn" not in user
+
+
+async def test_llm_http_call_accounting_is_isolated_per_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlapping retrievals each report only their own provider calls."""
+    import asyncio
+
+    from aa.conversation import retrieval_node as retrieval_mod
+    from aa.conversation.model_adapter import (
+        llm_http_call_count,
+        note_llm_http_call,
+        reset_llm_http_call_count,
+    )
+
+    async def _fake(index: Any, queries: list[str], **kwargs: Any) -> Any:
+        _ = (index, queries, kwargs)
+        note_llm_http_call()
+        await asyncio.sleep(0.01)
+        note_llm_http_call()
+        return llm_http_call_count()
+
+    from aa.retrieval.index import HybridIndex
+
+    monkeypatch.setattr(retrieval_mod, "_aretrieve_with_semantic_selection_impl", _fake)
+    reset_llm_http_call_count()
+    fake_index = cast("HybridIndex", SimpleNamespace())
+    first, second = await asyncio.gather(
+        retrieval_mod.aretrieve_with_semantic_selection(fake_index, []),
+        retrieval_mod.aretrieve_with_semantic_selection(fake_index, []),
+    )
+    assert cast("int", first) == 2
+    assert cast("int", second) == 2
+    assert llm_http_call_count() == 4
+
+
 async def test_one_shot_long_qualifier_and_short_continuation_keep_context(
     monkeypatch: Any,
 ) -> None:
@@ -1148,6 +1199,8 @@ def test_hermetic_ab_reproducibly_reports_ground_truth_and_calls(tmp_path: Any) 
         text=True,
     )
     report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["harness"] == "synthetic-packing-coverage"
+    assert report["real_corpus_index_model_config"] is False
     assert report["same_corpus_index_model_config"] is True
     assert report["fixture_version"] == "one-shot-retrieval-ab-538.v1"
     assert set(report["summary"]["by_split"]) == {"frozen", "held_out"}
@@ -1160,8 +1213,8 @@ def test_hermetic_ab_reproducibly_reports_ground_truth_and_calls(tmp_path: Any) 
     assert simple_on["retrieval_mode"] == "one_shot"
     assert simple_off["coverage_match"] is True
     assert simple_on["coverage_match"] is True
-    assert simple_on["real_http_calls"] == 1
-    assert simple_off["real_http_calls"] > simple_on["real_http_calls"]
+    assert simple_on["scripted_http_calls"] == 1
+    assert simple_off["scripted_http_calls"] > simple_on["scripted_http_calls"]
 
     complex_off = rows[("frozen-complex", "off")]
     complex_on = rows[("frozen-complex", "on")]
@@ -1174,18 +1227,27 @@ def test_hermetic_ab_reproducibly_reports_ground_truth_and_calls(tmp_path: Any) 
     for mode in ("off", "on"):
         error = rows[("heldout-provider-error", mode)]
         assert error["error_type"] == "OpenCodeRateLimitError"
+        assert error["retrieval_recall"] is None
+        assert error["source_match"] is None
+
+    error_summary = report["summary"]["by_category"]["provider-error"]
+    for mode in ("off", "on"):
+        assert error_summary[mode]["retrieval_recall"] is None
+        assert error_summary[mode]["retrieval_recall_compared"] == 0
+        assert error_summary[mode]["retrieval_recall_skipped"] == 1
 
     simple = report["summary"]["by_category"]["simple"]
     assert simple["on"]["logical_model_calls"] < simple["off"]["logical_model_calls"]
     assert simple["on"]["input_tokens"] < simple["off"]["input_tokens"]
     assert simple["on"]["source_matches"] == simple["on"]["source_compared"]
     assert simple["off"]["source_matches"] == simple["off"]["source_compared"]
+    assert simple["on"]["retrieval_recall_compared"] == simple["on"]["cases"]
     assert simple["on"]["latency_p50_ms"] >= 0.0
     assert simple["on"]["latency_p95_ms"] >= simple["on"]["latency_p50_ms"]
     assert simple["on"]["safe_outcomes"] == simple["on"]["cases"]
     complex_summary = report["summary"]["by_category"]["complex"]
     assert complex_summary["on"]["fallback_cases"] == 1
-    assert complex_summary["on"]["fallback_real_http_calls"] > 0
+    assert complex_summary["on"]["fallback_scripted_http_calls"] > 0
 
 
 async def test_modern_cancellation_propagates_from_one_shot(monkeypatch: Any) -> None:
