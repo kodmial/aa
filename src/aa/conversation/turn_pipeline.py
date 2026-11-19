@@ -448,6 +448,71 @@ def anchored_repair_focus(user_message: str, missing_texts: Sequence[str]) -> st
     return f"{MISSING_SUPPORT_PREFIX}: {joined}\n{user_message}"
 
 
+RELEVANCE_REPAIR_INSTRUCTION = (
+    "Дайте один практичный ответ по существу запроса пользователя: "
+    "конкретное объяснение и ближайший шаг только из приведённых отрывков. "
+    "Общие сведения о теме вместо ответа на сам вопрос не подходят."
+)
+
+
+def anchored_relevance_repair_prompt(user_message: str) -> str:
+    """Build the relevance-only repair prompt with the live request last.
+
+    Qualification #7 (kodmial/aa#539): a draft can be fully supported by
+    the pack yet answer only the background of the request, so the
+    verifier rejects the whole turn as ``verdict-irrelevant``. Historical
+    repair regeneration reused the raw request, which asks for exactly
+    the background the model had already produced and repeated the same
+    verified-but-irrelevant draft until the turn collapsed. The generic
+    practical-guidance instruction travels first and the live request
+    travels last, matching the answer contract. Instruction ordering
+    only, never an exact-question special case.
+    """
+    return f"{RELEVANCE_REPAIR_INSTRUCTION}\n{user_message}"
+
+
+def is_relevance_only_failure(result: GroundingResult | None) -> bool:
+    """Whether verification failed only on whole-turn relevance.
+
+    Structural predicate over verifier fields only: a complete verdict
+    set (no unavailable units), every unit supported, at least one
+    supported book unit, and the derived ``answer_relevant`` false. That
+    is the background-only shape: book evidence was found and verified,
+    but it does not address the resolved intent. Unsupported or
+    partially undecided verdicts keep the historical unsupported-claim
+    repair focus, which can still be improved by more evidence.
+    """
+    if result is None:
+        return False
+    if list(getattr(result, "unavailable_unit_ids", ()) or ()):
+        return False
+    units = tuple(getattr(result, "units", ()) or ())
+    if not units:
+        return False
+    if not all(bool(getattr(verdict, "supported", False)) for verdict in units):
+        return False
+    if bool(getattr(result, "answer_relevant", False)):
+        return False
+    return any(str(getattr(verdict, "scope", "")) == "book" for verdict in units)
+
+
+def repair_focus_for_result(
+    user_message: str,
+    result: GroundingResult | None,
+    missing_texts: Sequence[str],
+) -> str:
+    """Choose the anchored repair focus for the concrete verification failure.
+
+    A relevance-only failure gets the practical-guidance focus, because
+    the unsupported-text supplement is empty by construction (every unit
+    is supported) and the raw request alone reproduces the background
+    answer. Every other failure keeps the missing-support focus.
+    """
+    if is_relevance_only_failure(result):
+        return anchored_relevance_repair_prompt(user_message)
+    return anchored_repair_focus(user_message, missing_texts)
+
+
 def anchored_adequacy_regen_prompt(resolved_request: str) -> str:
     """Build the adequacy-regeneration prompt with the request last.
 
@@ -3964,6 +4029,56 @@ async def run_v2_answer_turn(
             extra={"category": "non-book-unsupported"},
         )
         repair_allowed = False
+    # Relevance-only composition repair (kodmial/aa#539). When the
+    # verifier supports every unit but the whole turn is irrelevant, the
+    # pack already contains the evidence the draft relied on; the defect
+    # is that the draft answers only the background. Additional
+    # re-planning and retrieval cannot change that composition, and in
+    # the live canary the full repair round consumed the remaining turn
+    # budget before another answer could be attempted. Regenerate once
+    # from the same pack with the practical-guidance focus (request last)
+    # and re-verify with the unchanged relevance contract. If the
+    # composition repair still fails, the historical bounded repair loop
+    # below keeps its chance to add evidence.
+    if (
+        not passed
+        and repair_allowed
+        and rounds == 0
+        and pack
+        and is_relevance_only_failure(result)
+        and (time.perf_counter() - turn_started) <= _effective_repair_budget_s()
+        and _end_to_end_elapsed_s() <= _effective_turn_budget_s()
+    ):
+        _relevance_focus = anchored_relevance_repair_prompt(user_message)
+        _relevance_draft = await _draft_with_pack(pack, _relevance_focus, wider=True)
+        if _relevance_draft is not None:
+            _relevance_slice = _verifier_round_budget()
+            _relevance_ok = not (
+                _relevance_slice is not None and _relevance_slice < TURN_VERIFIER_MIN_SLICE_S
+            )
+            if _relevance_ok:
+                (
+                    _relevance_units,
+                    _relevance_result,
+                    _relevance_passed,
+                ) = await _verify_with_telemetry(
+                    _relevance_draft, pack, turn_budget_s=_relevance_slice
+                )
+                if _relevance_result is not None:
+                    telemetry["verifier_unavailable_units"] = len(
+                        _relevance_result.unavailable_unit_ids
+                    )
+                if _relevance_passed and _relevance_units and _relevance_result is not None:
+                    current_draft = _relevance_draft
+                    units, result, passed = (
+                        _relevance_units,
+                        _relevance_result,
+                        True,
+                    )
+                    telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
+                    rounds += 1
+            else:
+                _mark_turn_budget_exceeded()
     # Bounded repair progression (#331): repair retrieval must not repeat
     # an identical query set. A duplicate re-plan fingerprint means the
     # next full select/read/assess loop would redo demonstrably redundant
@@ -4177,8 +4292,8 @@ async def run_v2_answer_turn(
                     _missing_now = (
                         unsupported_unit_texts(units, result) if units else [current_draft]
                     )
-                    _fallback_focus = anchored_repair_focus(
-                        user_message, [text for text in _missing_now if text.strip()]
+                    _fallback_focus = repair_focus_for_result(
+                        user_message, result, [text for text in _missing_now if text.strip()]
                     )
                 except Exception:
                     pass
@@ -4224,8 +4339,8 @@ async def run_v2_answer_turn(
                     _missing_dup = (
                         unsupported_unit_texts(units, result) if units else [current_draft]
                     )
-                    _dup_focus = anchored_repair_focus(
-                        user_message, [text for text in _missing_dup if text.strip()]
+                    _dup_focus = repair_focus_for_result(
+                        user_message, result, [text for text in _missing_dup if text.strip()]
                     )
                 except Exception:
                     pass
@@ -4254,7 +4369,13 @@ async def run_v2_answer_turn(
             break
         pack = merged
         rounds += 1
-        next_draft = await _draft_with_pack(pack, user_message, wider=True)
+        # The regeneration focus follows the concrete failure: a
+        # relevance-only rejection gets the practical-guidance prompt
+        # (the request last) instead of the raw request that reproduced
+        # the background-only draft. Unsupported-claim failures keep the
+        # missing-support focus.
+        next_focus = repair_focus_for_result(user_message, result, missing)
+        next_draft = await _draft_with_pack(pack, next_focus, wider=True)
         if next_draft is None:
             break
         current_draft = next_draft
@@ -6089,12 +6210,16 @@ __all__ = [
     "TURN_REPAIR_TIME_BUDGET_S",
     "TURN_VERIFIER_MIN_SLICE_S",
     "TurnFailed",
+    "RELEVANCE_REPAIR_INSTRUCTION",
     "anchored_adequacy_regen_prompt",
+    "anchored_relevance_repair_prompt",
     "anchored_repair_focus",
     "build_safety_recovery_queries",
     "certified_user_span_texts",
     "final_book_quote_chars",
     "generate_dialogue_reply",
+    "is_relevance_only_failure",
+    "repair_focus_for_result",
     "safety_candidate_fingerprint",
     "safety_recovery_request",
     "answer_pipeline_node",
