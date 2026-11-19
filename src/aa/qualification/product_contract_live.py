@@ -124,6 +124,20 @@ def _as_float(value: object, default: float = 0.0) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+def _raise_if_runtime_fatal(app: Any) -> None:
+    """Re-raise a worker-lifecycle failure recorded by the application.
+
+    The live lane drives ``Application.start()`` directly instead of
+    ``Application.run()``, so it must observe the same fatal signal the run
+    loop would. Provider 429 retires the runner for fresh-VM checkpoint
+    recovery; waiting out the scenario inactivity watchdog would instead
+    misclassify it as a stuck provider and consume the campaign budget.
+    """
+    fatal = getattr(app, "fatal_error", None)
+    if isinstance(fatal, BaseException):
+        raise fatal
+
+
 def _dict_key_holds_text(key: Any) -> bool:
     """Whether a dict key carries text (fixed-vocabulary labels exempt)."""
     if isinstance(key, bytes):
@@ -3549,6 +3563,7 @@ async def run_live_telegram_evidence_lane(
                 last_progress_tick = time.monotonic()
                 stop_reason = ""
                 while len(api.sent_texts) <= before:
+                    _raise_if_runtime_fatal(app)
                     now = time.monotonic()
                     if now >= campaign_deadline:
                         stop_reason = "campaign-budget"
@@ -4182,6 +4197,7 @@ async def run_live_telegram_evidence_lane(
                 stage_progress_state["last_monotonic"] = time.monotonic()
                 raw_stop_reason = ""
                 while len(api.sent_texts) <= before:
+                    _raise_if_runtime_fatal(app)
                     if time.monotonic() >= campaign_deadline:
                         raw_stop_reason = "campaign-budget"
                         break
@@ -5054,6 +5070,7 @@ async def run_live_telegram_evidence_lane(
                     api.pending_updates.append(raw_voice)
                     stage_progress_state["last_monotonic"] = time.monotonic()
                     while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:
+                        _raise_if_runtime_fatal(app)
                         if time.monotonic() >= campaign_deadline:
                             break
                         if (
