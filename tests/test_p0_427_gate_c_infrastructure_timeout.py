@@ -627,10 +627,39 @@ def test_confirmed_429_reaches_the_runner_lifecycle_without_any_wall_clock(
     assert 0.2 <= elapsed < 8.0, elapsed
 
 
+def _first_scenario_await_loop(source: str) -> str:
+    """Extract only the main scenario await loop from the lane source.
+
+    A slice that runs to the end of the function also contains the later
+    multi-turn and voice await loops, so a probe moved out of the main
+    scenario loop would still satisfy the assertions. Bound the extraction
+    by indentation so only the first loop's body is inspected.
+    """
+    lines = source.splitlines(keepends=True)
+    start = next(
+        index for index, line in enumerate(lines) if "while len(api.sent_texts) <= before:" in line
+    )
+    loop_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if stripped:
+            line_indent = len(lines[end]) - len(lines[end].lstrip())
+            if line_indent <= loop_indent:
+                break
+        end += 1
+    return "".join(lines[start:end])
+
+
 def test_lane_probes_the_request_audit_inside_the_await_loop() -> None:
     """Production wiring: the await loop raises the typed 429 promptly."""
     source = _lane_source()
-    loop = source[source.index("while len(api.sent_texts) <= before:") :]
+    loop = _first_scenario_await_loop(source)
+    # The bounded slice must be the main scenario loop, never a later
+    # multi-turn/voice loop that happens to contain the same wait shape.
+    assert "while len(api.sent_texts) <= before:" in loop
+    assert loop.count("while len(api.sent_texts) <= before:") == 1
+    assert "_send_raw_text" not in loop
     # The await loop samples the already-published request audit through the
     # exception-safe helper while a scenario is still waiting for delivery.
     assert "_fatal_request_failure(" in loop
