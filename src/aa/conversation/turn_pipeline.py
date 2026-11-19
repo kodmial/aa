@@ -5260,6 +5260,14 @@ async def run_v2_answer_turn(
                 resolved_intent=_resolved_intent, user_message=user_message
             )
             _recovery_policy = SAFE_RECOVERY_INSTRUCTION
+            # Safety recovery is a delivery path, not a refusal path. The
+            # independent judge rejects replies that substitute a generic
+            # difficulty description for practical guidance, so the safe
+            # regeneration carries the same practical-answer focus that
+            # the adequacy repair uses. The focus is generic instruction
+            # text; the live resolved request stays last and the safety
+            # policy stays a separate control block.
+            _recovery_generation_request = anchored_adequacy_regen_prompt(_recovery_request)
             _seen_recovery: set[str] = {safety_candidate_fingerprint(final)}
             _recovery_recent_texts: list[str] = list(_recent_texts[-4:])
             _recovery_attempts = 0
@@ -5319,7 +5327,7 @@ async def run_v2_answer_turn(
                         break
                     candidate = await _draft_with_pack(
                         active_pack,
-                        _recovery_request,
+                        _recovery_generation_request,
                         wider=True,
                         safety_policy=_recovery_policy,
                     )
@@ -5412,7 +5420,7 @@ async def run_v2_answer_turn(
                         break
                     candidate = await _draft_with_pack(
                         active_pack,
-                        _recovery_request,
+                        _recovery_generation_request,
                         wider=True,
                         safety_policy=_recovery_policy,
                     )
@@ -5473,9 +5481,15 @@ async def run_v2_answer_turn(
                     reply_text=str(recovered["text"]),
                     verification_state=_safe_state,
                 )
-                # Systemic gate (kodmial/aa#372): a safe adequate
-                # recovery the independent judge still finds unhelpful
-                # falls through to safety-blocked instead of serving.
+                # Systemic gate (kodmial/aa#372): the independently
+                # instantiated whole-turn judge still gates the recovered
+                # candidate exactly as it gates ordinary substantive
+                # delivery. The practical-focus regeneration above is the
+                # bounded mitigation for judge-rejected recoveries; it does
+                # not remove the gate. A judge-only negative therefore
+                # falls through to the transparent safety-blocked reply
+                # instead of being counted as a served success with
+                # ``independent_judge_helpful=False``.
                 _recovery_judge_rejects = False
                 if (
                     not _proven_glue
@@ -5485,12 +5499,16 @@ async def run_v2_answer_turn(
                     _recovery_judge_rejects = await _substantive_judge_rejects(
                         str(recovered["text"])
                     )
+                if _recovery_judge_rejects:
+                    telemetry["safety_recovery_judge_rejected"] = True
                 if not _proven_glue and (
                     telemetry.get("adequacy_verdict") == _ADEQ_FAIL or _recovery_judge_rejects
                 ):
-                    # A safe but inadequate recovery is no certified help:
-                    # fall through to the transparent safety-blocked reply
-                    # instead of serving it as success.
+                    # A safe but inadequate recovery is no certified help,
+                    # and an explicit whole-turn judge rejection keeps the
+                    # kodmial/aa#372 delivery gate in force: fall through to
+                    # the transparent safety-blocked reply instead of
+                    # serving it as success.
                     if _recovery_judge_rejects:
                         telemetry["adequacy_verdict"] = _ADEQ_FAIL
                         if not str(telemetry.get("failure_category", "") or "").strip():
@@ -5502,6 +5520,9 @@ async def run_v2_answer_turn(
                 else:
                     telemetry["outbound_safety"] = "repaired"
                     telemetry["answer_outcome"] = "served"
+                    # A delivered certified recovery supersedes the unsafe
+                    # original draft's intermediate typed cause.
+                    clear_answer_failure_cause(telemetry)
                     _finish_telemetry()
                     return {
                         "text": str(recovered["text"]),
