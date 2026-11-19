@@ -21,6 +21,7 @@ outputs; only operation counts and error categories are emitted.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import threading
 import time
@@ -44,6 +45,50 @@ from aa.opencode.errors import (
 from aa.time_policy import current_time_policy
 
 logger = logging.getLogger("aa.conversation.model_adapter")
+
+# Actual LLM HTTP-request accounting (kodmial/aa#538). One counter is
+# incremented immediately before each real provider `send_message` /
+# `send_structured_message` call, including structured-provider and
+# capability fallbacks. Retrieval telemetry must report only its own
+# requests, so an active retrieval/context gets an isolated counter while
+# the process-wide total remains available outside that scope. A global
+# start/delta pair would otherwise mix concurrent turns in one process.
+# Session lifecycle calls are not LLM requests.
+_LLM_HTTP_CALLS = 0
+_LLM_HTTP_CONTEXT: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "aa_llm_http_calls", default=None
+)
+_LLM_HTTP_LOCK = threading.Lock()
+
+
+def note_llm_http_call() -> None:
+    """Record one real provider LLM HTTP request (transport boundary)."""
+    global _LLM_HTTP_CALLS
+    with _LLM_HTTP_LOCK:
+        _LLM_HTTP_CALLS += 1
+        context_calls = _LLM_HTTP_CONTEXT.get()
+        if context_calls is not None:
+            context_calls[0] += 1
+
+
+def llm_http_call_count() -> int:
+    """Return the current context count, else the process-wide total."""
+    context_calls = _LLM_HTTP_CONTEXT.get()
+    with _LLM_HTTP_LOCK:
+        if context_calls is not None:
+            return int(context_calls[0])
+        return int(_LLM_HTTP_CALLS)
+
+
+def reset_llm_http_call_count() -> None:
+    """Reset the provider LLM request counter (tests/tooling only)."""
+    global _LLM_HTTP_CALLS
+    with _LLM_HTTP_LOCK:
+        _LLM_HTTP_CALLS = 0
+        context_calls = _LLM_HTTP_CONTEXT.get()
+        if context_calls is not None:
+            context_calls[0] = 0
+
 
 PLANNER_AGENT_V2 = "aa-planner-v2"
 SUMMARIZER_AGENT_V2 = "aa-summarizer-v2"
@@ -559,6 +604,7 @@ class OpenCodeChatModel(BaseChatModel):
         wire_agent = self.wire_agent if agent == self.agent else agent
         audit_agent = agent if wire_agent != agent else ""
         try:
+            note_llm_http_call()
             return await client.send_message(
                 session.id,
                 prompt,
@@ -590,6 +636,7 @@ class OpenCodeChatModel(BaseChatModel):
         wire_agent = self.wire_agent if agent == self.agent else agent
         audit_agent = agent if wire_agent != agent else ""
         try:
+            note_llm_http_call()
             return await client.send_structured_message(
                 session.id,
                 prompt,
@@ -628,6 +675,7 @@ class OpenCodeChatModel(BaseChatModel):
         client = self._client
         session = await client.create_session(title="")
         try:
+            note_llm_http_call()
             return await client.send_message(
                 session.id,
                 prompt,
@@ -663,6 +711,7 @@ class OpenCodeChatModel(BaseChatModel):
         client = self._client
         session = await client.create_session(title="")
         try:
+            note_llm_http_call()
             return await client.send_structured_message(
                 session.id,
                 prompt,
@@ -1177,10 +1226,13 @@ __all__ = [
     "build_verifier_model",
     "clear_omitted_structured_cache",
     "clear_primary_circuit",
+    "llm_http_call_count",
     "mark_omitted_structured_unavailable",
+    "note_llm_http_call",
     "omitted_structured_unavailable",
     "record_omitted_structured_rejection",
     "record_omitted_structured_success",
     "render_messages_text",
+    "reset_llm_http_call_count",
     "split_system_and_user",
 ]

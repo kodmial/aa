@@ -28,7 +28,9 @@ import asyncio
 import functools
 import hashlib
 import logging
+import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from aa.conversation.graph_state import TurnState
@@ -113,6 +115,19 @@ RETRIEVAL_SEMANTIC_STAGE_BUDGET_S = max(
     1.0,
     float(TURN_P95_TARGET_MS) / 1000.0 - RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S,
 )
+
+# Bounded one-shot retrieval fast path (kodmial/aa#538). Explicitly
+# opt-in: default off reproduces the existing selector -> read_exact ->
+# coverage loop with no additional model calls. When enabled, the local
+# discovery pool is prepared into one bounded canonical candidate pack and
+# a single retrieval coverage model call decides every genuine need. The
+# legacy loop remains the fallback and is never bypassed by an unproven
+# verdict. No new model, prompt platform or lexical sufficiency rule.
+ONE_SHOT_FASTPATH_ENV = "AA_RETRIEVAL_ONE_SHOT_FASTPATH"
+# Bounded fast-path candidate set. 96 keeps the fused pool's genuinely
+# deep candidates (rank >64) inspectable while remaining a small,
+# explicit local bound before token budgeting.
+FASTPATH_MAX_CANDIDATES = 96
 
 # Bounded canonical read cache (kodmial/aa#331): exact expanded
 # passages keyed by stable child id + neighbor window. Content is
@@ -789,6 +804,18 @@ def _exhausted_pack_for_local_timeout(
         "primary_query_digest": _digest(cleaned[0]) if cleaned else "",
         "retrieval_backend": "rrf-only/1+semantic-selection+coverage-loop",
         "retrieval_loop": "discover/select_for_reading/read_exact/assess_coverage",
+        # The bounded one-shot fast path is never entered when local
+        # discovery itself cannot serve; record that explicitly so the
+        # switch state and call accounting stay observable (#538).
+        "retrieval_mode": "legacy",
+        "fastpath_attempted": False,
+        "fallback_reason": "local-retrieval-timeout",
+        "LLM_call_count": 0,
+        "selector_ms": 0.0,
+        "coverage_ms": 0.0,
+        "total_ms": round(elapsed_ms, 3),
+        "genuine_need_count": len(set(need_id_order or [])),
+        "uncovered_need_count": len(set(need_id_order or [])),
         "turn_deadline_s": float(budget.deadline_s),
         "turn_elapsed_ms": round(elapsed_ms, 3),
         "turn_remaining_ms": round(finite_remaining_ms(budget), 3),
@@ -833,7 +860,329 @@ def _exhausted_pack_for_local_timeout(
     )
 
 
-async def aretrieve_with_semantic_selection(
+@dataclass
+class _OneShotOutcome:
+    """Typed result of one bounded one-shot retrieval attempt (#538)."""
+
+    attempted: bool = False
+    ready: bool = False
+    fallback_reason: str = ""
+    selected: list[Any] | None = None
+    total: int = 0
+    read_ids: list[str] | None = None
+    previews: list[Any] | None = None
+    verdict: Any = None
+    model_calls: int = 0
+    duration_ms: float = 0.0
+
+
+def one_shot_fast_path_enabled(config: Any | None = None) -> bool:
+    """Whether the bounded one-shot retrieval fast path is explicitly on.
+
+    The ordinary runtime defaults to off. Configuration may opt in
+    explicitly or the environment may enable the qualification mode; an
+    absent/empty/negative value always preserves the existing path.
+    """
+    try:
+        if config is not None and bool(getattr(config, "one_shot_fast_path", False)):
+            return True
+    except Exception:
+        pass
+    raw = str(os.environ.get(ONE_SHOT_FASTPATH_ENV, "") or "").strip().casefold()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _one_shot_http_calls() -> int:
+    """Real provider LLM request count at the model-adapter boundary."""
+    try:
+        from aa.conversation.model_adapter import llm_http_call_count as _count
+
+        return int(_count())
+    except Exception:
+        return 0
+
+
+def _fastpath_passage_integrity(passage: Any, index: Any) -> bool:
+    """Checksum/provenance integrity for one full canonical passage.
+
+    The fast path never sends a passage whose exact bytes do not match its
+    stored content hash, whose stable identity does not derive from that
+    content/range, or whose child chunks are absent from the live index.
+    """
+    try:
+        from aa.retrieval.evidence import stable_passage_id
+
+        text = str(getattr(passage, "exact_text", "") or "")
+        pid = str(getattr(passage, "passage_id", "") or "")
+        source = str(getattr(passage, "source_id", "") or "")
+        section = str(getattr(passage, "section_id", "") or "")
+        text_sha = str(getattr(passage, "text_sha256", "") or "")
+        source_sha = str(getattr(passage, "source_sha256", "") or "")
+        child_ids = [str(c) for c in list(getattr(passage, "child_chunk_ids", ()) or ())]
+        if not text or not pid or not source or not section or not text_sha:
+            return False
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != text_sha:
+            return False
+        expected = stable_passage_id(
+            source_sha256=source_sha,
+            section_id=section,
+            char_start=int(getattr(passage, "char_start", 0) or 0),
+            char_end=int(getattr(passage, "char_end", 0) or 0),
+            text_sha256=text_sha,
+        )
+        if expected != pid:
+            return False
+        chunks = getattr(index, "chunks", None)
+        if chunks is None or not child_ids:
+            return False
+        for cid in child_ids:
+            record = chunks.get(cid)
+            if record is None:
+                return False
+            if str(getattr(record, "text", "") or "") != "" and (
+                str(getattr(record, "text_sha256", "") or "")
+                != hashlib.sha256(str(getattr(record, "text", "")).encode("utf-8")).hexdigest()
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+async def _try_one_shot_fast_path(
+    *,
+    index: Any,
+    active: Any,
+    fused: dict[str, Any],
+    candidate_query_map: dict[str, list[str]],
+    candidate_need_map: dict[str, list[str]],
+    needs_for_selection: list[Any],
+    need_id_order: list[str],
+    original_request: str,
+    conversation_context: str,
+    repair_hint_clean: str,
+    coverage_assessor: Any,
+    budget: TurnBudget,
+    turn_dag: SemanticTurnDAG | None,
+    need_digest: str,
+) -> _OneShotOutcome:
+    """One bounded local pack + one coverage-model decision (kodmial/aa#538).
+
+    Discovery stays local: the existing need-aware broad previews pick a
+    bounded candidate set from the current fused pool, full canonical
+    passages plus adjacent paragraphs are read exactly, and the pack is
+    budgeted atomically *before* the model call. If the pack does not fit,
+    no reliable candidates exist, or the single verdict is not fully
+    verified with a non-empty exact quote per covered need, the caller
+    continues into the unchanged legacy selector/coverage loop. No second
+    attempt is made over the same unchanged pack.
+    """
+    from aa.conversation.coverage_loop import (
+        CoverageDecisionError,
+        aassess_coverage,
+        coverage_prompt,
+    )
+    from aa.conversation.semantic_selection import (
+        MAX_SELECTION_CANDIDATES,
+        select_need_aware_previews,
+    )
+    from aa.corpus.budget import estimate_text_tokens
+    from aa.retrieval.evidence import select_passages_under_budget
+
+    outcome = _OneShotOutcome()
+    if not need_id_order:
+        outcome.fallback_reason = "no-genuine-needs"
+        return outcome
+    if coverage_assessor is None:
+        outcome.fallback_reason = "no-model"
+        return outcome
+    outcome.attempted = True
+    try:
+        ordered = sorted(
+            (item for item in fused.values() if item.chunk_id in index.chunks),
+            key=lambda item: item.fused_score,
+            reverse=True,
+        )
+        fused_ordered = [(item.chunk_id, item.fused_score) for item in ordered]
+        texts = {cid: str(getattr(index.chunks[cid], "text", "") or "") for cid, _ in fused_ordered}
+        sections = {
+            cid: str(getattr(index.chunks[cid], "section", "") or "") for cid, _ in fused_ordered
+        }
+        sources = {
+            cid: str(getattr(index.chunks[cid], "source_id", "") or "") for cid, _ in fused_ordered
+        }
+        previews = select_need_aware_previews(
+            fused_ordered=fused_ordered,
+            texts=texts,
+            sections=sections,
+            sources=sources,
+            candidate_query_map=candidate_query_map,
+            candidate_need_map=candidate_need_map,
+            information_needs=needs_for_selection,
+            limit=max(MAX_SELECTION_CANDIDATES, FASTPATH_MAX_CANDIDATES),
+        )
+        outcome.previews = list(previews)
+        if not previews:
+            outcome.fallback_reason = "no-candidates"
+            return outcome
+        winners = [fused[p.chunk_id] for p in previews if p.chunk_id in fused]
+        if not winners:
+            outcome.fallback_reason = "no-candidates"
+            return outcome
+        try:
+            expanded = await asyncio.to_thread(
+                _cached_expand_small_to_big,
+                index,
+                winners,
+                neighbor_window=active.neighbor_window,
+            )
+        except Exception:
+            outcome.fallback_reason = "read-failed"
+            return outcome
+        trusted = [p for p in expanded if _fastpath_passage_integrity(p, index)]
+        if not trusted:
+            outcome.fallback_reason = "no-candidates"
+            return outcome
+        # Real prompt-size check before any model call: the pack must fit
+        # the same token budget together with intent, context, needs and
+        # instructions. Only atomic passages/chunks enter the pack.
+        try:
+            system0, user0 = coverage_prompt(
+                passages=[],
+                information_needs=needs_for_selection,
+                original_request=original_request,
+                repair_hint=repair_hint_clean,
+                conversation_context=conversation_context,
+                one_shot=True,
+            )
+            overhead_tokens = estimate_text_tokens(system0) + estimate_text_tokens(user0)
+            pack_budget = int(active.budget_tokens) - int(overhead_tokens)
+        except Exception:
+            outcome.fallback_reason = "prompt-oversize"
+            return outcome
+        if pack_budget <= 0:
+            outcome.fallback_reason = "prompt-oversize"
+            return outcome
+        try:
+            selected_pack, total = select_passages_under_budget(
+                list(trusted),
+                budget_tokens=pack_budget,
+                index=index,
+                priority_child_ids=tuple(p.chunk_id for p in previews),
+            )
+        except Exception:
+            outcome.fallback_reason = "pack-oversize"
+            return outcome
+        if not selected_pack:
+            outcome.fallback_reason = "pack-oversize"
+            return outcome
+        try:
+            system, user_text = coverage_prompt(
+                passages=selected_pack,
+                information_needs=needs_for_selection,
+                original_request=original_request,
+                repair_hint=repair_hint_clean,
+                conversation_context=conversation_context,
+                one_shot=True,
+            )
+            prompt_tokens = estimate_text_tokens(system) + estimate_text_tokens(user_text)
+        except Exception:
+            outcome.fallback_reason = "prompt-oversize"
+            return outcome
+        if prompt_tokens > int(active.budget_tokens):
+            outcome.fallback_reason = "prompt-oversize"
+            return outcome
+        if _retrieval_semantic_stage_remaining_s(budget) <= 0:
+            outcome.fallback_reason = "latency-budget"
+            return outcome
+        call_started = time.perf_counter()
+        if turn_dag is not None:
+            turn_dag.provider_attempt("retrieval-one-shot")
+        try:
+            verdict = await _await_model_under_turn_deadline(
+                functools.partial(
+                    aassess_coverage,
+                    list(selected_pack),
+                    needs_for_selection,
+                    original_request=original_request,
+                    conversation_context=conversation_context,
+                    model=coverage_assessor,
+                    repair_hint=repair_hint_clean,
+                    require_supporting_quote=True,
+                    raise_on_invalid=True,
+                ),
+                budget,
+                stage=STAGE_PROVIDER_SEMANTIC_TIMEOUT,
+                id_digest=need_digest,
+                max_timeout_s=_retrieval_semantic_stage_remaining_s(budget),
+            )
+        except _InteractiveBudgetTimeout:
+            outcome.model_calls = 1
+            outcome.duration_ms = (time.perf_counter() - call_started) * 1000.0
+            outcome.fallback_reason = "latency-budget"
+            if turn_dag is not None:
+                turn_dag.provider_timeout("retrieval-one-shot")
+            return outcome
+        except OpenCodeRateLimitError:
+            outcome.model_calls = 1
+            outcome.duration_ms = (time.perf_counter() - call_started) * 1000.0
+            if turn_dag is not None:
+                turn_dag.provider_rate_limited("retrieval-one-shot")
+            raise
+        except CoverageDecisionError:
+            outcome.model_calls = 1
+            outcome.duration_ms = (time.perf_counter() - call_started) * 1000.0
+            outcome.fallback_reason = "invalid-evidence"
+            return outcome
+        outcome.model_calls = 1
+        outcome.duration_ms = (time.perf_counter() - call_started) * 1000.0
+        if not bool(getattr(verdict, "used_model", False)):
+            outcome.fallback_reason = "invalid-schema"
+            return outcome
+        try:
+            judged_ids = {str(item.need_id) for item in list(verdict.needs or [])}
+        except Exception:
+            judged_ids = set()
+        if judged_ids != set(need_id_order):
+            outcome.fallback_reason = "incomplete-needs"
+            return outcome
+        if not bool(getattr(verdict, "all_covered", False)):
+            outcome.fallback_reason = "uncovered-needs"
+            return outcome
+        selected_ids = {str(getattr(item, "passage_id", "") or "") for item in selected_pack}
+        for item in list(verdict.needs or []):
+            if not bool(getattr(item, "covered", False)):
+                outcome.fallback_reason = "uncovered-needs"
+                return outcome
+            spans = [str(span) for span in list(getattr(item, "supporting_spans", []) or [])]
+            anchors = list(getattr(item, "anchors", []) or [])
+            if not spans or not anchors:
+                outcome.fallback_reason = "invalid-evidence"
+                return outcome
+            if not any(
+                str(getattr(anchor, "passage_id", "") or "") in selected_ids for anchor in anchors
+            ):
+                outcome.fallback_reason = "invalid-evidence"
+                return outcome
+        covered_child_ids = {
+            cid for passage in selected_pack for cid in list(passage.child_chunk_ids or ())
+        }
+        outcome.ready = True
+        outcome.selected = list(selected_pack)
+        outcome.total = int(total)
+        outcome.read_ids = [p.chunk_id for p in previews if p.chunk_id in covered_child_ids]
+        outcome.verdict = verdict
+        return outcome
+    except (OpenCodeRateLimitError, asyncio.CancelledError):
+        raise
+    except Exception:
+        outcome.ready = False
+        outcome.selected = None
+        outcome.fallback_reason = outcome.fallback_reason or "fastpath-error"
+        return outcome
+
+
+async def _aretrieve_with_semantic_selection_impl(
     index: HybridIndex,
     queries: list[str],
     *,
@@ -1108,6 +1457,9 @@ async def aretrieve_with_semantic_selection(
     coverage_status = "exhausted"
     exhaustion_reason = "no-iterations"
     typed_stage = ""
+    retrieval_mode = "legacy"
+    fastpath_attempted = False
+    fallback_reason = ""
     read_ids: list[str] = []
     previewed_ids_all: list[str] = []
     previewed_set_all: set[str] = set()
@@ -1139,6 +1491,90 @@ async def aretrieve_with_semantic_selection(
     def _turn_budget_exceeded() -> bool:
         """Alias for the graph-owned turn-deadline check."""
         return _interactive_budget_exceeded()
+
+    # ---- bounded one-shot fast path (kodmial/aa#538), explicit opt-in.
+    # Default off reproduces the legacy sequence exactly and adds no model
+    # call. When on, one locally prepared canonical pack is judged by one
+    # retrieval coverage call; only a fully verified verdict (every need
+    # covered, exact non-empty quote per need) becomes ready, otherwise
+    # the unchanged selector/read/coverage loop below is the fallback.
+    if one_shot_fast_path_enabled(active):
+        one_shot = await _try_one_shot_fast_path(
+            index=index,
+            active=active,
+            fused=fused,
+            candidate_query_map=candidate_query_map,
+            candidate_need_map=candidate_need_map,
+            needs_for_selection=needs_for_selection,
+            need_id_order=list(need_id_order or []),
+            original_request=original_request,
+            conversation_context=conversation_context,
+            repair_hint_clean=repair_hint_clean,
+            coverage_assessor=coverage_assessor,
+            budget=budget,
+            turn_dag=turn_dag,
+            need_digest=need_digest,
+        )
+        fastpath_attempted = bool(one_shot.attempted)
+        fallback_reason = str(one_shot.fallback_reason or "")
+        if one_shot.model_calls:
+            model_calls += int(one_shot.model_calls)
+            cov_ms_total += float(one_shot.duration_ms)
+            provider_durations_ms.append(float(one_shot.duration_ms))
+        if one_shot.ready and one_shot.selected:
+            selected = list(one_shot.selected)
+            expanded = list(one_shot.selected)
+            total = int(one_shot.total)
+            read_ids = list(one_shot.read_ids or [])
+            for cid in read_ids:
+                if cid not in read_child_set:
+                    read_child_set.add(cid)
+                    read_child_order.append(cid)
+            for passage in selected:
+                pid = str(getattr(passage, "passage_id", "") or "")
+                if pid and pid not in cumulative_expanded:
+                    cumulative_expanded[pid] = passage
+                    cumulative_expanded_order.append(pid)
+            last_previews = list(one_shot.previews or [])
+            last_verdict = one_shot.verdict
+            for seen_preview in last_previews:
+                if seen_preview.chunk_id not in previewed_set_all:
+                    previewed_set_all.add(seen_preview.chunk_id)
+                    previewed_ids_all.append(seen_preview.chunk_id)
+            try:
+                last_preview_statuses, _ = assess_need_preview_coverage(
+                    last_previews, needs_for_selection
+                )
+            except Exception:
+                last_preview_statuses = []
+            try:
+                from aa.conversation.semantic_selection import SemanticSelection as _Sel
+
+                _fast_selection = _Sel(
+                    selected_chunk_ids=list(read_ids),
+                    need_more_detail=False,
+                    followup_queries=[],
+                    uncovered_need_ids=[],
+                )
+                _fast_selection._used_model = True
+                last_selection = _fast_selection
+                for map_entry in serialize_preview_coverage(last_previews, _fast_selection):
+                    cid = str(map_entry.get("chunk_id", ""))
+                    if cid:
+                        preview_map_merged[cid] = dict(map_entry)
+            except Exception:
+                last_selection = None
+            coverage_status = "ready"
+            exhaustion_reason = ""
+            typed_stage = ""
+            retrieval_mode = "one_shot"
+            progress_events.append("one-shot-coverage-ready")
+        else:
+            progress_events.append(f"one-shot-fallback:{fallback_reason or 'not-ready'}")
+        if coverage_status == "ready":
+            # A fully verified one-shot pack needs no selector, read,
+            # coverage, expand or search round.
+            bounded_iterations = 0
 
     for iteration in range(bounded_iterations):
         if iteration > 0 and _interactive_budget_exceeded():
@@ -2037,7 +2473,25 @@ async def aretrieve_with_semantic_selection(
         "selection_latency_ms": round(float(sel_ms_total), 3),
         "coverage_latency_ms": round(float(cov_ms_total), 3),
     }
+    try:
+        # The public wrapper scopes the adapter counter to this retrieval,
+        # so this is the request count for this turn even when other turns
+        # overlap in the same process.
+        _http_calls = max(0, _one_shot_http_calls())
+    except Exception:
+        _http_calls = 0
+    llm_call_count = max(int(model_calls), int(_http_calls))
+    genuine_need_count = len(set(need_ids_ordered) or set(need_id_order))
     metadata: dict[str, Any] = {
+        "retrieval_mode": retrieval_mode,
+        "fastpath_attempted": bool(fastpath_attempted),
+        "fallback_reason": str(fallback_reason or ""),
+        "LLM_call_count": int(llm_call_count),
+        "selector_ms": round(float(sel_ms_total), 3),
+        "coverage_ms": round(float(cov_ms_total), 3),
+        "total_ms": round(elapsed_ms, 3),
+        "genuine_need_count": int(genuine_need_count),
+        "uncovered_need_count": int(len(final_missing)),
         "planner_query_count": len(cleaned),
         "primary_query_digest": _digest(cleaned[0]),
         "branch_lists": len(ranked_lists),
@@ -2142,6 +2596,57 @@ async def aretrieve_with_semantic_selection(
     )
 
 
+async def aretrieve_with_semantic_selection(
+    index: HybridIndex,
+    queries: list[str],
+    *,
+    config: RetrievalConfig | None = None,
+    resolved_intent: str = "",
+    conversation_context: str = "",
+    user_message: str = "",
+    selection_model: Any | None = None,
+    context_digest: str = "",
+    information_needs: Any | None = None,
+    query_need_map: Any | None = None,
+    coverage_model: Any | None = None,
+    repair_hint: str = "",
+    max_iterations: int = 3,
+    turn_budget: TurnBudget | None = None,
+    upstream_latency_ms: float = 0.0,
+    turn_dag: SemanticTurnDAG | None = None,
+) -> EvidencePack:
+    """Run the shared discover/read/coverage retrieval loop.
+
+    The process-wide adapter counter keeps its lifetime total, while this
+    context-local scope ensures ``LLM_call_count`` and A/B call accounting
+    never include provider requests issued by a concurrent retrieval.
+    """
+    from aa.conversation.model_adapter import _LLM_HTTP_CONTEXT
+
+    token = _LLM_HTTP_CONTEXT.set([0])
+    try:
+        return await _aretrieve_with_semantic_selection_impl(
+            index,
+            queries,
+            config=config,
+            resolved_intent=resolved_intent,
+            conversation_context=conversation_context,
+            user_message=user_message,
+            selection_model=selection_model,
+            context_digest=context_digest,
+            information_needs=information_needs,
+            query_need_map=query_need_map,
+            coverage_model=coverage_model,
+            repair_hint=repair_hint,
+            max_iterations=max_iterations,
+            turn_budget=turn_budget,
+            upstream_latency_ms=upstream_latency_ms,
+            turn_dag=turn_dag,
+        )
+    finally:
+        _LLM_HTTP_CONTEXT.reset(token)
+
+
 def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Return a privacy-safe selection/coverage snapshot (no text).
 
@@ -2191,6 +2696,15 @@ def sanitize_retrieval_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "typed_stage",
         "need_id_digest",
         "source_id_digest",
+        "retrieval_mode",
+        "fastpath_attempted",
+        "fallback_reason",
+        "LLM_call_count",
+        "selector_ms",
+        "coverage_ms",
+        "total_ms",
+        "genuine_need_count",
+        "uncovered_need_count",
         "provider_p50_ms",
         "provider_p95_ms",
         "provider_max_ms",
@@ -2632,6 +3146,8 @@ def make_retrieval_node(
 
 __all__ = [
     "COVERAGE_PER_CALL_BUDGET_S",
+    "FASTPATH_MAX_CANDIDATES",
+    "ONE_SHOT_FASTPATH_ENV",
     "RETRIEVAL_SEMANTIC_DOWNSTREAM_RESERVE_S",
     "RETRIEVAL_SEMANTIC_MAX_MODEL_CALLS",
     "RETRIEVAL_SEMANTIC_STAGE_BUDGET_S",
@@ -2640,6 +3156,7 @@ __all__ = [
     "aretrieve_with_semantic_selection",
     "clear_canonical_read_cache",
     "make_retrieval_node",
+    "one_shot_fast_path_enabled",
     "pack_to_state",
     "retrieval_node",
     "sanitize_retrieval_metadata",

@@ -26,6 +26,8 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from aa.conversation.conversation_context import InformationNeed
 from aa.retrieval.fusion import FusedCandidate
 
@@ -1183,3 +1185,63 @@ def test_narrowing_that_drops_condition_invalidates_coverage() -> None:
     assert full.all_covered is True
     assert narrowed.all_covered is False
     assert narrowed.missing_need_ids == ("need-1",)
+
+
+def test_one_shot_strict_quote_rejects_legacy_anchor_only_coverage() -> None:
+    """Strict fast-path validation never accepts an unproven positive claim.
+
+    The legacy loop keeps its exact-range-anchor semantics when a quote is
+    empty and tolerates a 400-character quote prefix. The one-shot fast
+    path must instead require a non-empty full exact quote, so a truncated
+    quote that drops the decisive qualifier cannot become READY.
+    """
+    from aa.conversation.coverage_loop import (
+        CoverageDecisionError,
+        validate_coverage_decision,
+    )
+
+    text = ("A" * 400) + " QUALIFIER: only with a mentor."
+    passage = SimpleNamespace(
+        passage_id="chapter-1#strict",
+        exact_text=text,
+        source_id="ru-fourth-edition-txt",
+        section_id="chapter-1",
+        char_start=0,
+        char_end=len(text),
+    )
+    truncating_quote = ("A" * 400) + " WRONG-TAIL"
+    data = {
+        "needs": [
+            {
+                "need_id": "need-1",
+                "covered": True,
+                "supporting_passage_ids": ["chapter-1#strict"],
+                "supporting_quote": truncating_quote,
+                "missing": "",
+            }
+        ]
+    }
+    kwargs: dict[str, Any] = {
+        "known_need_ids": ["need-1"],
+        "known_passage_ids": {"chapter-1#strict"},
+        "passages_by_id": {"chapter-1#strict": passage},
+    }
+    legacy = validate_coverage_decision(data, **kwargs)
+    assert legacy.all_covered is True
+    with pytest.raises(CoverageDecisionError):
+        validate_coverage_decision(data, require_supporting_quote=True, **kwargs)
+
+    quoteless = {
+        "needs": [
+            {
+                "need_id": "need-1",
+                "covered": True,
+                "supporting_passage_ids": ["chapter-1#strict"],
+                "supporting_quote": "",
+                "missing": "",
+            }
+        ]
+    }
+    assert validate_coverage_decision(quoteless, **kwargs).all_covered is True
+    with pytest.raises(CoverageDecisionError):
+        validate_coverage_decision(quoteless, require_supporting_quote=True, **kwargs)

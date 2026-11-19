@@ -693,3 +693,22 @@ def test_quote_budget_blocks_transport_split_bypass() -> None:
     over = "Обычный текст. " * 60 + "«" + "ц" * 301 + "»"
     with _pytest.raises(ValueError):
         split_text_to_envelope_segments(over)
+
+
+def test_one_shot_fast_path_is_off_by_default_and_config_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded one-shot path never runs unless explicitly enabled."""
+    from aa.conversation.retrieval_node import one_shot_fast_path_enabled
+
+    monkeypatch.delenv("AA_RETRIEVAL_ONE_SHOT_FASTPATH", raising=False)
+    assert RetrievalConfig().one_shot_fast_path is False
+    assert one_shot_fast_path_enabled(RetrievalConfig()) is False
+    assert one_shot_fast_path_enabled(RetrievalConfig(one_shot_fast_path=True)) is True
+
+    for raw in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("AA_RETRIEVAL_ONE_SHOT_FASTPATH", raw)
+        assert one_shot_fast_path_enabled(RetrievalConfig()) is True
+    for raw in ("", "0", "false", "no", "off", "unexpected"):
+        monkeypatch.setenv("AA_RETRIEVAL_ONE_SHOT_FASTPATH", raw)
+        assert one_shot_fast_path_enabled(RetrievalConfig()) is False
