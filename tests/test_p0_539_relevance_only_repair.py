@@ -26,6 +26,7 @@ _SYNTHETIC_RESOLVED_INTENT = "синтетическое намерение сп
 _SYNTHETIC_BACKGROUND = "Изобретение описывает общее свойство вечерней привычки."
 _SYNTHETIC_BACKGROUND_ALT = "Изобретение упоминает ещё одно общее свойство вечерней привычки."
 _SYNTHETIC_PRACTICAL = "Изобретение предлагает спокойный вечерний распорядок как ближайший шаг."
+_SYNTHETIC_UNSUPPORTED = "Изобретение утверждает неподтверждённое свойство вечерней привычки."
 _SYNTHETIC_PASSAGE_ID = "synthetic#exp0000"
 _SYNTHETIC_SECOND_PASSAGE_ID = "synthetic#exp0001"
 
@@ -106,6 +107,33 @@ class _PracticalAwareVerifier:
         }
 
 
+class _UnsupportedCompositionVerifier(_PracticalAwareVerifier):
+    """Verifier double: one scripted draft is unsupported, others as before."""
+
+    def __init__(self, unsupported_marker: str) -> None:
+        super().__init__()
+        self._unsupported_marker = unsupported_marker
+
+    async def ainvoke_structured(
+        self, prompt: str, *, system: str, schema: dict[str, object], retry_count: int = 2
+    ) -> dict[str, object]:
+        if self._unsupported_marker in _unit_from_prompt(prompt):
+            self.calls += 1
+            return {
+                "verdicts": [
+                    {
+                        "requires_book_evidence": True,
+                        "supported": False,
+                        "evidence_passage_ids": [],
+                        "addresses_intent": False,
+                    }
+                ]
+            }
+        return await super().ainvoke_structured(
+            prompt, system=system, schema=schema, retry_count=retry_count
+        )
+
+
 class _RepairPlanner:
     def __init__(self) -> None:
         self.calls = 0
@@ -174,7 +202,7 @@ def test_relevance_only_failure_is_derived_from_verifier_fields_only() -> None:
     )
     # A non-book unit makes relevance vacuous by construction.
     assert not is_relevance_only_failure(
-        result(scope="conversation_glue", supported=True, addresses_intent=True, relevant=True)
+        result(scope="conversation_glue", supported=True, addresses_intent=False, relevant=False)
     )
     assert not is_relevance_only_failure(None)
 
@@ -284,22 +312,8 @@ async def test_relevance_only_repair_uses_same_pack_without_retrieval() -> None:
     assert telemetry["verifier_outcome"] == "passed-after-repair-existing-pack"
 
 
-@pytest.mark.parametrize(
-    ("retrieval_mode", "practical_passage_id", "expected_outcome"),
-    [
-        ("new-evidence", _SYNTHETIC_SECOND_PASSAGE_ID, "passed-after-repair"),
-        (
-            "duplicate-evidence",
-            _SYNTHETIC_PASSAGE_ID,
-            "passed-after-repair-existing-pack",
-        ),
-    ],
-)
 async def test_failed_composition_repair_keeps_relevance_focus_in_full_repair(
     monkeypatch: pytest.MonkeyPatch,
-    retrieval_mode: str,
-    practical_passage_id: str,
-    expected_outcome: str,
 ) -> None:
     import aa.conversation.planner_node as planner_node
     import aa.conversation.retrieval_node as retrieval_node
@@ -318,16 +332,14 @@ async def test_failed_composition_repair_keeps_relevance_focus_in_full_repair(
 
     def _fake_pack_to_state(pack: Any) -> tuple[list[Any], list[dict[str, Any]]]:
         _ = pack
-        if retrieval_mode == "new-evidence":
-            return [], [
-                dict(
-                    _pack_entry(
-                        _SYNTHETIC_SECOND_PASSAGE_ID,
-                        "Синтетический дополнительный фрагмент книги.",
-                    )
+        return [], [
+            dict(
+                _pack_entry(
+                    _SYNTHETIC_SECOND_PASSAGE_ID,
+                    "Синтетический дополнительный фрагмент книги.",
                 )
-            ]
-        return [], [dict(_pack_entry())]
+            )
+        ]
 
     async def _fake_retrieve(*args: Any, **kwargs: Any) -> object:
         _ = (args, kwargs)
@@ -343,7 +355,7 @@ async def test_failed_composition_repair_keeps_relevance_focus_in_full_repair(
     answer = _SequencedRecordingAnswer(
         [_SYNTHETIC_BACKGROUND, _SYNTHETIC_BACKGROUND_ALT, _SYNTHETIC_PRACTICAL]
     )
-    verifier = _PracticalAwareVerifier(practical_passage_id=practical_passage_id)
+    verifier = _PracticalAwareVerifier(practical_passage_id=_SYNTHETIC_SECOND_PASSAGE_ID)
 
     outcome = await run_v2_answer_turn(
         user_message=_SYNTHETIC_USER_MESSAGE,
@@ -369,4 +381,133 @@ async def test_failed_composition_repair_keeps_relevance_focus_in_full_repair(
     assert verifier.calls == 3
     telemetry = dict(outcome["telemetry"])
     assert telemetry["repair_rounds"] == 1
-    assert telemetry["verifier_outcome"] == expected_outcome
+    assert telemetry["verifier_outcome"] == "passed-after-repair"
+
+
+@pytest.mark.parametrize("retrieval_mode", ["empty", "duplicate"])
+async def test_failed_composition_repair_is_not_repeated_by_same_pack_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    retrieval_mode: str,
+) -> None:
+    import aa.conversation.planner_node as planner_node
+    import aa.conversation.retrieval_node as retrieval_node
+    from aa.conversation.failures import TurnFailed
+    from aa.conversation.turn_pipeline import (
+        RELEVANCE_REPAIR_INSTRUCTION,
+        run_v2_answer_turn,
+    )
+
+    planner_calls = 0
+
+    async def _fake_planner(*args: Any, **kwargs: Any) -> _Plan:
+        nonlocal planner_calls
+        _ = (args, kwargs)
+        planner_calls += 1
+        return _Plan()
+
+    def _fake_pack_to_state(pack: Any) -> tuple[list[Any], list[dict[str, Any]]]:
+        _ = pack
+        if retrieval_mode == "empty":
+            return [], []
+        return [], [dict(_pack_entry())]
+
+    async def _fake_retrieve(*args: Any, **kwargs: Any) -> object:
+        _ = (args, kwargs)
+        return object()
+
+    monkeypatch.setattr(planner_node, "run_planner", _fake_planner)
+    monkeypatch.setattr(retrieval_node, "aretrieve_with_semantic_selection", _fake_retrieve)
+    monkeypatch.setattr(retrieval_node, "pack_to_state", _fake_pack_to_state)
+
+    # The composition repair already regenerated from this pack with the
+    # relevance focus and failed; repair retrieval adds no new evidence.
+    # The empty/duplicate fallbacks must not repeat the identical
+    # same-pack composition call, even though the turn then fails closed.
+    answer = _SequencedRecordingAnswer([_SYNTHETIC_BACKGROUND, _SYNTHETIC_BACKGROUND_ALT])
+    verifier = _PracticalAwareVerifier()
+
+    with pytest.raises(TurnFailed) as excinfo:
+        await run_v2_answer_turn(
+            user_message=_SYNTHETIC_USER_MESSAGE,
+            summary="",
+            recent=[],
+            evidence_pack=[_pack_entry()],
+            answer_model=answer,
+            verifier_model=verifier,
+            planner_model=_RepairPlanner(),
+            retrieval_index=object(),
+            initial_query_count=12,
+            planner_reason="substantive-with-queries",
+            planner_mode="retrieval",
+            resolved_intent=_SYNTHETIC_RESOLVED_INTENT,
+        )
+
+    assert planner_calls == 1
+    # Initial draft plus the one composition repair; no repeated
+    # same-pack regeneration from the fallbacks.
+    assert answer.calls == 2
+    assert RELEVANCE_REPAIR_INSTRUCTION not in answer.prompts[0]
+    assert RELEVANCE_REPAIR_INSTRUCTION in answer.prompts[1]
+    assert verifier.calls == 2
+    assert excinfo.value.telemetry.get("verifier_outcome") != "passed-after-repair-existing-pack"
+
+
+async def test_failed_composition_repair_focus_uses_latest_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aa.conversation.planner_node as planner_node
+    import aa.conversation.retrieval_node as retrieval_node
+    from aa.conversation.turn_pipeline import (
+        MISSING_SUPPORT_PREFIX,
+        RELEVANCE_REPAIR_INSTRUCTION,
+        run_v2_answer_turn,
+    )
+
+    async def _fake_planner(*args: Any, **kwargs: Any) -> _Plan:
+        _ = (args, kwargs)
+        return _Plan()
+
+    def _fake_pack_to_state(pack: Any) -> tuple[list[Any], list[dict[str, Any]]]:
+        _ = pack
+        return [], [dict(_pack_entry())]
+
+    async def _fake_retrieve(*args: Any, **kwargs: Any) -> object:
+        _ = (args, kwargs)
+        return object()
+
+    monkeypatch.setattr(planner_node, "run_planner", _fake_planner)
+    monkeypatch.setattr(retrieval_node, "aretrieve_with_semantic_selection", _fake_retrieve)
+    monkeypatch.setattr(retrieval_node, "pack_to_state", _fake_pack_to_state)
+
+    # The composition repair no longer answers only the background: its
+    # new draft carries an unsupported claim. The duplicate-retrieval
+    # fallback must choose its focus from that latest verdict (missing
+    # support), not from the stale initial relevance-only verdict.
+    answer = _SequencedRecordingAnswer(
+        [_SYNTHETIC_BACKGROUND, _SYNTHETIC_UNSUPPORTED, _SYNTHETIC_PRACTICAL]
+    )
+    verifier = _UnsupportedCompositionVerifier(_SYNTHETIC_UNSUPPORTED)
+
+    outcome = await run_v2_answer_turn(
+        user_message=_SYNTHETIC_USER_MESSAGE,
+        summary="",
+        recent=[],
+        evidence_pack=[_pack_entry()],
+        answer_model=answer,
+        verifier_model=verifier,
+        planner_model=_RepairPlanner(),
+        retrieval_index=object(),
+        initial_query_count=12,
+        planner_reason="substantive-with-queries",
+        planner_mode="retrieval",
+        resolved_intent=_SYNTHETIC_RESOLVED_INTENT,
+    )
+
+    assert outcome["text"].strip() == _SYNTHETIC_PRACTICAL
+    assert answer.calls == 3
+    assert RELEVANCE_REPAIR_INSTRUCTION in answer.prompts[1]
+    assert RELEVANCE_REPAIR_INSTRUCTION not in answer.prompts[2]
+    assert MISSING_SUPPORT_PREFIX in answer.prompts[2]
+    assert verifier.calls == 3
+    telemetry = dict(outcome["telemetry"])
+    assert telemetry["verifier_outcome"] == "passed-after-repair-existing-pack"

@@ -491,7 +491,10 @@ def is_relevance_only_failure(result: GroundingResult | None) -> bool:
         return False
     if not all(bool(getattr(verdict, "supported", False)) for verdict in units):
         return False
-    if bool(getattr(result, "answer_relevant", False)):
+    # Require an explicit relevance verdict. An unset or undecided
+    # ``answer_relevant`` (``None`` on a duck-typed/partial result) is not
+    # a confirmed irrelevance, so it must not select the relevance repair.
+    if getattr(result, "answer_relevant", None) is not False:
         return False
     return any(str(getattr(verdict, "scope", "")) == "book" for verdict in units)
 
@@ -4042,7 +4045,10 @@ async def run_v2_answer_turn(
     # practical-guidance focus (request last) and re-verify with the
     # unchanged relevance contract. If the composition repair still
     # fails, the historical bounded repair loop below keeps its chance to
-    # add evidence.
+    # add evidence. Record the same-pack composition focus that was already
+    # generated so the later empty/duplicate-retrieval fallbacks do not
+    # repeat that exact provider call when their focus is still the same.
+    _composition_repair_focus: str | None = None
     if (
         not passed
         and repair_allowed
@@ -4055,6 +4061,7 @@ async def run_v2_answer_turn(
         _relevance_focus = anchored_relevance_repair_prompt(user_message)
         _relevance_draft = await _draft_with_pack(pack, _relevance_focus, wider=True)
         if _relevance_draft is not None:
+            _composition_repair_focus = _relevance_focus
             _relevance_slice = _verifier_round_budget()
             _relevance_ok = not (
                 _relevance_slice is not None and _relevance_slice < TURN_VERIFIER_MIN_SLICE_S
@@ -4080,6 +4087,13 @@ async def run_v2_answer_turn(
                     )
                     telemetry["verifier_outcome"] = "passed-after-repair-existing-pack"
                     rounds += 1
+                elif not _relevance_passed and _relevance_result is not None:
+                    # Keep the latest repair verdict and draft. A repair
+                    # that now fails on unsupported claims must select the
+                    # missing-support focus in the fallbacks below, not the
+                    # stale initial relevance verdict.
+                    current_draft = _relevance_draft
+                    units, result = _relevance_units, _relevance_result
             else:
                 _mark_turn_budget_exceeded()
     # Bounded repair progression (#331): repair retrieval must not repeat
@@ -4300,6 +4314,11 @@ async def run_v2_answer_turn(
                     )
                 except Exception:
                     pass
+                if _fallback_focus == _composition_repair_focus:
+                    # The composition repair already issued this exact
+                    # same-pack generation; repeating it cannot add
+                    # evidence and only repeats the provider call.
+                    break
                 _fallback_draft = await _draft_with_pack(pack, _fallback_focus, wider=True)
                 if _fallback_draft is not None:
                     _fallback_slice = _verifier_round_budget()
@@ -4347,6 +4366,11 @@ async def run_v2_answer_turn(
                     )
                 except Exception:
                     pass
+                if _dup_focus == _composition_repair_focus:
+                    # Same exact same-pack composition generation was
+                    # already issued; do not repeat it on a duplicate
+                    # retrieval that added no new evidence.
+                    break
                 _dup_draft = await _draft_with_pack(pack, _dup_focus, wider=True)
                 if _dup_draft is not None:
                     _dup_slice = _verifier_round_budget()
