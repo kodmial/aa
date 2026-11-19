@@ -1084,12 +1084,20 @@ def _ordered_canary_scenarios(
 ) -> tuple[tuple[str, int, str], ...]:
     """Stable-priority order so the slow substantive path runs first."""
     priority = {family: index for index, family in enumerate(CANARY_PRIORITY_FAMILIES)}
-    return tuple(
+    ordered = tuple(
         sorted(
             scenarios,
             key=lambda scenario: priority.get(scenario[0], len(priority)),
         )
     )
+    if ordered and priority and ordered[0][0] not in priority:
+        # Required-versus-optional is inferred from this order, so a renamed
+        # or missing priority family must fail closed rather than silently
+        # promoting the cheap turn to required.
+        raise GateCCanaryError(
+            "canary priority scenario family is missing from the frozen scenarios"
+        )
+    return ordered
 
 
 def _should_attempt_optional_scenario(*, remaining_s: float, observed_latency_s: float) -> bool:
@@ -1257,8 +1265,9 @@ async def run_real_path_scenarios(
                 break
             if not required:
                 observed_latency_s = max(delivered_latencies_s, default=0.0)
+                remaining_s = deadline - time.monotonic() - DEFAULT_REAL_PATH_CLEANUP_RESERVE_S
                 if not _should_attempt_optional_scenario(
-                    remaining_s=deadline - time.monotonic(),
+                    remaining_s=remaining_s,
                     observed_latency_s=observed_latency_s,
                 ):
                     # The required turn is already fully evidenced. Do not
@@ -1562,8 +1571,14 @@ def evaluate_canary(
                 and scenario.stage_observed
                 and scenario.causality_observed
             ):
-                status = STATUS_BLOCKED
-                reason = REASON_MISSING_DIAGNOSTIC_CHAIN
+                if real_path.budget_expired:
+                    # A mid-turn deadline is external silence, not proof that
+                    # the diagnostic chain is unwired.
+                    status = STATUS_INCONCLUSIVE
+                    reason = REASON_EXTERNAL_UNOBSERVED
+                else:
+                    status = STATUS_BLOCKED
+                    reason = REASON_MISSING_DIAGNOSTIC_CHAIN
                 if not scenario.attempt_observed:
                     missing.append("real_path.attempt_observed")
                 if not scenario.stage_observed:
