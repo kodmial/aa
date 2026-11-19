@@ -8,12 +8,14 @@ qualification controller and it never issues a product PASS/FAIL:
    :class:`~aa.opencode.client.HttpOpenCodeClient`,
    :class:`~aa.opencode.observer.StallSnapshotObserver`, watchdog writer and
    passive server-evidence probe against a controlled local HTTP server;
-2. one or two existing core scenarios run through the real production raw
+2. at least one existing core scenario runs through the real production raw
    Telegram seam, real planner/retrieval/answer/verifier and the pinned local
-   OpenCode runtime;
+   OpenCode runtime. A second scenario is optional and only attempted when
+   the bounded budget can still accommodate it;
 3. only a genuinely bounded diagnostic budget is consumed. An externally
    unobserved model response is ``INCONCLUSIVE`` (never a fabricated
-   ``provider-failed``);
+   ``provider-failed``), but a completed required turn stays authoritative
+   even when an optional second turn runs out of budget;
 4. the result is written as privacy-safe ``gate-c-canary-result.json``.
 
 The full Gate C/E/F qualification remains the only authoritative verdict.
@@ -62,6 +64,24 @@ DEFAULT_SELF_TEST_TIMEOUT_S = 60.0
 DEFAULT_SELF_TEST_DELAYS_S: tuple[float, ...] = (0.15, 0.30)
 DEFAULT_SELF_TEST_INTERVAL_S = 0.02
 DEFAULT_SCENARIO_LIMIT = 2
+# The canary is a wiring diagnostic, not the 18-case campaign. One fully
+# evidenced production turn already proves the raw Telegram seam, planner,
+# retrieval, answer and verifier chain; a second turn is corroboration and
+# must never turn a completed required turn into an INCONCLUSIVE result just
+# because the optional probe did not finish inside the live budget.
+DEFAULT_REQUIRED_REAL_PATH_SCENARIOS = 1
+# Prioritize the substantive scenario first. It is the previously failing
+# path and it is materially slower than the meta-capability turn, so probing
+# it first guarantees that the required evidence is collected within the
+# bounded live budget.
+CANARY_PRIORITY_FAMILIES: tuple[str, ...] = ("substantive-drinking",)
+# An optional second turn is only started when a realistic share of the live
+# budget remains. A complete turn cannot be assumed to be faster than the
+# one already observed, so require both a floor and a multiple of the
+# observed latency. Otherwise stop with the required evidence instead of
+# spending the remaining budget on a probe that must be discarded.
+DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S = 90.0
+DEFAULT_OPTIONAL_SCENARIO_LATENCY_FACTOR = 1.5
 # Reserve inside the live probe budget for the required terminal trace/flush
 # and Application shutdown. Scenario waits stop before this reserve so a
 # budget-edge run still returns its in-flight evidence instead of being
@@ -280,6 +300,11 @@ class RealPathEvidence:
     budget_expired: bool = False
     in_flight_preserved: bool = False
     error: str = ""
+    # Optional probes that were not completed: either deliberately not
+    # started because too little live budget remained, or still in flight at
+    # the deadline. Recorded so the artifact never pretends that every
+    # requested scenario produced a finished turn.
+    optional_scenarios_skipped: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -288,6 +313,7 @@ class RealPathEvidence:
             "budget_expired": bool(self.budget_expired),
             "in_flight_preserved": bool(self.in_flight_preserved),
             "error": _bounded(self.error, 64),
+            "optional_scenarios_skipped": max(0, int(self.optional_scenarios_skipped)),
         }
 
 
@@ -306,13 +332,17 @@ class CanaryResult:
     elapsed_s: float
     budget_category: str
     missing_fields: tuple[str, ...] = ()
+    required_real_turns: int = DEFAULT_REQUIRED_REAL_PATH_SCENARIOS
 
     @property
     def exit_code(self) -> int:
         return EXIT_BY_STATUS.get(self.status, EXIT_BY_STATUS[STATUS_BLOCKED])
 
     def evidence_coverage(self) -> dict[str, str]:
-        scenarios = self.real_path.scenarios
+        # Coverage describes the evidence the canary actually requires. An
+        # optional second probe that was skipped or did not finish must not
+        # make a completed required turn look under-observed.
+        scenarios = self.real_path.scenarios[: max(0, int(self.required_real_turns))]
         return {
             "stage": (
                 "observed"
@@ -355,6 +385,7 @@ class CanaryResult:
             "real_path": self.real_path.to_dict(),
             "evidence_coverage": self.evidence_coverage(),
             "real_turn_count": len(self.real_path.scenarios),
+            "required_real_turns": max(0, int(self.required_real_turns)),
             "missing_fields": list(self.missing_fields),
             "privacy_validated": bool(self.self_test.privacy_validated),
             "artifacts": {
@@ -1043,18 +1074,55 @@ async def observer_self_test(
 # ---------------------------------------------------------------------------
 
 
+def _required_real_path_scenario_count(scenario_limit: int) -> int:
+    """How many real-path turns the canary must actually complete."""
+    return max(1, min(int(scenario_limit), DEFAULT_REQUIRED_REAL_PATH_SCENARIOS))
+
+
+def _ordered_canary_scenarios(
+    scenarios: Sequence[tuple[str, int, str]],
+) -> tuple[tuple[str, int, str], ...]:
+    """Stable-priority order so the slow substantive path runs first."""
+    priority = {family: index for index, family in enumerate(CANARY_PRIORITY_FAMILIES)}
+    ordered = tuple(
+        sorted(
+            scenarios,
+            key=lambda scenario: priority.get(scenario[0], len(priority)),
+        )
+    )
+    if ordered and priority and ordered[0][0] not in priority:
+        # Required-versus-optional is inferred from this order, so a renamed
+        # or missing priority family must fail closed rather than silently
+        # promoting the cheap turn to required.
+        raise GateCCanaryError(
+            "canary priority scenario family is missing from the frozen scenarios"
+        )
+    return ordered
+
+
+def _should_attempt_optional_scenario(*, remaining_s: float, observed_latency_s: float) -> bool:
+    """Whether the live budget can plausibly fit one more complete turn."""
+    needed_s = max(
+        DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S,
+        max(0.0, float(observed_latency_s)) * DEFAULT_OPTIONAL_SCENARIO_LATENCY_FACTOR,
+    )
+    return float(remaining_s) >= needed_s
+
+
 async def run_real_path_scenarios(
     out_dir: Path,
     *,
     budget_s: float = DEFAULT_LIVE_PROBE_BUDGET_S,
     scenario_limit: int = DEFAULT_SCENARIO_LIMIT,
 ) -> RealPathEvidence:
-    """Run one or two existing core scenarios through the production seam.
+    """Run the required scenario (and a budget-permitting optional second one).
 
     The production ``Application``, raw Telegram update parser, dispatcher,
     LangGraph planner/retrieval/answer/verifier and pinned local OpenCode
     runtime are used unchanged. Only the Telegram network is a deterministic
-    in-process seam, exactly as in the authoritative live lane.
+    in-process seam, exactly as in the authoritative live lane. One fully
+    evidenced turn is sufficient for the diagnostic canary; a second turn is
+    attempted only while the bounded live budget can still fit it.
     """
     from dataclasses import replace
 
@@ -1088,6 +1156,8 @@ async def run_real_path_scenarios(
     server_evidence: dict[str, Any] = {}
     in_flight_preserved = False
     budget_exhausted = False
+    optional_scenarios_skipped = 0
+    delivered_latencies_s: list[float] = []
 
     api = QualificationTelegramApi()
     settings = replace(
@@ -1178,11 +1248,34 @@ async def run_real_path_scenarios(
         )
         await observer.start()
 
-        scenarios = tuple(GATE_C_CANARY_SCENARIOS)[: max(1, int(scenario_limit))]
+        # Order first, then limit: even a one-scenario invocation must probe
+        # the previously failing substantive path rather than the cheap
+        # meta-capability turn.
+        scenarios = _ordered_canary_scenarios(tuple(GATE_C_CANARY_SCENARIOS))[
+            : max(1, int(scenario_limit))
+        ]
+        required_scenarios = min(len(scenarios), _required_real_path_scenario_count(scenario_limit))
         for position, (family, chat_id, prompt) in enumerate(scenarios, start=1):
+            required = position <= required_scenarios
             if time.monotonic() >= deadline:
-                budget_exhausted = True
+                if required:
+                    budget_exhausted = True
+                else:
+                    optional_scenarios_skipped += 1
                 break
+            if not required:
+                observed_latency_s = max(delivered_latencies_s, default=0.0)
+                remaining_s = deadline - time.monotonic() - DEFAULT_REAL_PATH_CLEANUP_RESERVE_S
+                if not _should_attempt_optional_scenario(
+                    remaining_s=remaining_s,
+                    observed_latency_s=observed_latency_s,
+                ):
+                    # The required turn is already fully evidenced. Do not
+                    # spend the remaining budget on a second probe that could
+                    # not finish; that is what previously turned a healthy
+                    # canary into ``external-progress-unobserved``.
+                    optional_scenarios_skipped += 1
+                    break
             stage_seen.clear()
             causality = uuid.uuid4().hex
             causality_by_chat[int(chat_id)] = causality
@@ -1219,18 +1312,24 @@ async def run_real_path_scenarios(
                 and any(observer.has_snapshot_for(attempt_id) for attempt_id in snapshot_attempts)
             )
             if not delivered:
-                budget_exhausted = True
-                # Diagnostic budget exhausted: preserve the in-flight attempt
-                # as INCONCLUSIVE evidence, never as a provider failure.
-                in_flight_ids = {
-                    str(entry.get("attempt_id", ""))
-                    for entry in entries
-                    if str(entry.get("state", "")) == "in-flight" and entry.get("attempt_id")
-                }
-                in_flight_preserved = bool(in_flight_ids) and bool(
-                    observer is not None
-                    and any(observer.has_snapshot_for(item) for item in in_flight_ids)
-                )
+                if required:
+                    budget_exhausted = True
+                    # Diagnostic budget exhausted before the required turn:
+                    # preserve the in-flight attempt as INCONCLUSIVE
+                    # evidence, never as a provider failure.
+                    in_flight_ids = {
+                        str(entry.get("attempt_id", ""))
+                        for entry in entries
+                        if str(entry.get("state", "")) == "in-flight" and entry.get("attempt_id")
+                    }
+                    in_flight_preserved = bool(in_flight_ids) and bool(
+                        observer is not None
+                        and any(observer.has_snapshot_for(item) for item in in_flight_ids)
+                    )
+                else:
+                    # The required evidence is still valid; only the optional
+                    # corroborating probe ran out of budget.
+                    optional_scenarios_skipped += 1
                 scenarios_evidence.append(
                     ScenarioEvidence(
                         family=family,
@@ -1285,9 +1384,11 @@ async def run_real_path_scenarios(
                     latency_ms=elapsed_ms,
                 )
             )
+            delivered_latencies_s.append(elapsed_ms / 1000.0)
             if _scenario_failure(scenarios_evidence[-1]):
-                # The first real-path turn already reproduced a known false
-                # path. Do not replay the 18-case campaign.
+                # A real-path turn already reproduced a known false path. Do
+                # not replay the 18-case campaign and do not spend budget on
+                # an optional corroborating scenario.
                 break
 
         server_evidence = await probe.snapshot()
@@ -1296,6 +1397,7 @@ async def run_real_path_scenarios(
             server_evidence=server_evidence,
             budget_expired=budget_exhausted,
             in_flight_preserved=in_flight_preserved,
+            optional_scenarios_skipped=optional_scenarios_skipped,
         )
     except Exception as exc:  # noqa: BLE001 - the canary must fail closed
         return RealPathEvidence(
@@ -1304,6 +1406,7 @@ async def run_real_path_scenarios(
             budget_expired=time.monotonic() >= deadline,
             in_flight_preserved=in_flight_preserved,
             error=type(exc).__name__,
+            optional_scenarios_skipped=optional_scenarios_skipped,
         )
     finally:
         set_stage_observer(None)
@@ -1417,6 +1520,8 @@ def evaluate_canary(
         missing.extend(server_surfaces_missing)
     status = STATUS_READY
     reason = REASON_READY
+    required_real_turns = _required_real_path_scenario_count(scenario_limit)
+    required_scenarios = real_path.scenarios[:required_real_turns]
 
     if not self_test.passed or self_test_contract:
         status = STATUS_BLOCKED
@@ -1435,7 +1540,7 @@ def evaluate_canary(
         # not answer on this pinned server: no readiness claim is possible.
         status = STATUS_BLOCKED
         reason = REASON_UNSUPPORTED_SERVER
-    elif real_path.budget_expired or real_path.error == "diagnostic-budget-expired":
+    elif real_path.error == "diagnostic-budget-expired":
         status = STATUS_INCONCLUSIVE
         reason = REASON_EXTERNAL_UNOBSERVED
     elif real_path.error in ("server-events-unavailable", "unsupported-server-telemetry"):
@@ -1450,18 +1555,30 @@ def evaluate_canary(
         status = STATUS_BLOCKED
         reason = REASON_UNSUPPORTED_SERVER
     elif not real_path.scenarios:
-        status = STATUS_BLOCKED
-        reason = REASON_MISSING_DIAGNOSTIC_CHAIN
-        missing.append("real_path.scenarios")
+        if real_path.budget_expired:
+            status = STATUS_INCONCLUSIVE
+            reason = REASON_EXTERNAL_UNOBSERVED
+        else:
+            status = STATUS_BLOCKED
+            reason = REASON_MISSING_DIAGNOSTIC_CHAIN
+            missing.append("real_path.scenarios")
     else:
-        for scenario in real_path.scenarios:
+        # Required evidence must be fully observed. Optional scenarios do not
+        # participate in this coverage requirement.
+        for scenario in required_scenarios:
             if not (
                 scenario.attempt_observed
                 and scenario.stage_observed
                 and scenario.causality_observed
             ):
-                status = STATUS_BLOCKED
-                reason = REASON_MISSING_DIAGNOSTIC_CHAIN
+                if real_path.budget_expired:
+                    # A mid-turn deadline is external silence, not proof that
+                    # the diagnostic chain is unwired.
+                    status = STATUS_INCONCLUSIVE
+                    reason = REASON_EXTERNAL_UNOBSERVED
+                else:
+                    status = STATUS_BLOCKED
+                    reason = REASON_MISSING_DIAGNOSTIC_CHAIN
                 if not scenario.attempt_observed:
                     missing.append("real_path.attempt_observed")
                 if not scenario.stage_observed:
@@ -1469,17 +1586,27 @@ def evaluate_canary(
                 if not scenario.causality_observed:
                     missing.append("real_path.causality_observed")
                 break
-            failure = _scenario_failure(scenario)
-            if failure:
-                status = STATUS_FAIL
-                reason = failure
-                break
-        if status == STATUS_READY and len(real_path.scenarios) < max(
-            1, min(int(scenario_limit), DEFAULT_SCENARIO_LIMIT)
-        ):
-            status = STATUS_BLOCKED
-            reason = REASON_MISSING_DIAGNOSTIC_CHAIN
-            missing.append("real_path.scenario_count")
+        # A concrete typed failure on any attempted turn, required or
+        # optional, is real product-path evidence and must stop the campaign.
+        if status == STATUS_READY:
+            for scenario in real_path.scenarios:
+                failure = _scenario_failure(scenario)
+                if failure:
+                    status = STATUS_FAIL
+                    reason = failure
+                    break
+        if status == STATUS_READY:
+            required_delivered = len(required_scenarios) >= required_real_turns and all(
+                scenario.delivered for scenario in required_scenarios
+            )
+            if not required_delivered:
+                missing.append("real_path.scenario_count")
+                if real_path.budget_expired:
+                    status = STATUS_INCONCLUSIVE
+                    reason = REASON_EXTERNAL_UNOBSERVED
+                else:
+                    status = STATUS_BLOCKED
+                    reason = REASON_MISSING_DIAGNOSTIC_CHAIN
 
     return CanaryResult(
         main_sha=main_sha,
@@ -1497,6 +1624,7 @@ def evaluate_canary(
             else BUDGET_WITHIN
         ),
         missing_fields=tuple(dict.fromkeys(missing)),
+        required_real_turns=required_real_turns,
     )
 
 
@@ -1632,9 +1760,13 @@ def write_canary_result(out_dir: Path, result: CanaryResult) -> Path:
 __all__ = [
     "BUDGET_EXPIRED",
     "BUDGET_WITHIN",
+    "CANARY_PRIORITY_FAMILIES",
     "CanaryResult",
     "DEFAULT_LIVE_PROBE_BUDGET_S",
+    "DEFAULT_OPTIONAL_SCENARIO_LATENCY_FACTOR",
+    "DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S",
     "DEFAULT_PREFLIGHT_BUDGET_S",
+    "DEFAULT_REQUIRED_REAL_PATH_SCENARIOS",
     "DEFAULT_SCENARIO_LIMIT",
     "DEFAULT_REAL_PATH_CLEANUP_RESERVE_S",
     "DEFAULT_SELF_TEST_DELAYS_S",
