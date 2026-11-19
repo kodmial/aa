@@ -4033,13 +4033,16 @@ async def run_v2_answer_turn(
     # verifier supports every unit but the whole turn is irrelevant, the
     # pack already contains the evidence the draft relied on; the defect
     # is that the draft answers only the background. Additional
-    # re-planning and retrieval cannot change that composition, and in
-    # the live canary the full repair round consumed the remaining turn
-    # budget before another answer could be attempted. Regenerate once
-    # from the same pack with the practical-guidance focus (request last)
-    # and re-verify with the unchanged relevance contract. If the
-    # composition repair still fails, the historical bounded repair loop
-    # below keeps its chance to add evidence.
+    # re-planning and retrieval cannot change that composition: in the
+    # live canary the historical repair round re-planned and regenerated
+    # from the raw request, which reproduced the background-only
+    # composition. The turn then reached repair-exhausted narrowing of
+    # supported but irrelevant text and hit the outbound-safety boundary
+    # (``safety-blocked``). Regenerate once from the same pack with the
+    # practical-guidance focus (request last) and re-verify with the
+    # unchanged relevance contract. If the composition repair still
+    # fails, the historical bounded repair loop below keeps its chance to
+    # add evidence.
     if (
         not passed
         and repair_allowed
@@ -6205,12 +6208,12 @@ __all__ = [
     "MAX_PACK_PASSAGES",
     "MAX_TARGETED_REPAIR_ROUNDS",
     "OUTBOUND_RECOVERY_QUERIES",
+    "RELEVANCE_REPAIR_INSTRUCTION",
     "TURN_ANSWER_MIN_SLICE_S",
     "TURN_END_TO_END_BUDGET_S",
     "TURN_REPAIR_TIME_BUDGET_S",
     "TURN_VERIFIER_MIN_SLICE_S",
     "TurnFailed",
-    "RELEVANCE_REPAIR_INSTRUCTION",
     "anchored_adequacy_regen_prompt",
     "anchored_relevance_repair_prompt",
     "anchored_repair_focus",

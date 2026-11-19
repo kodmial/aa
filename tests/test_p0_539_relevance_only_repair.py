@@ -4,8 +4,8 @@ Failure class: a draft can be fully supported by the Evidence Pack yet
 answer only the background of the request, so the verifier rejects the
 whole turn as ``verdict-irrelevant``. Historical repair regeneration
 reused the raw request, which asks for exactly the background the model
-had already produced, and the same verified-but-irrelevant draft was
-regenerated until the turn collapsed. The relevance-only repair focus
+had already produced, so it reproduced the same background-only
+composition until the turn collapsed. The relevance-only repair focus
 carries a generic practical-guidance instruction first and the live
 request last; it is chosen from verifier fields only, never from text
 heuristics or an exact qualification prompt.
