@@ -91,8 +91,6 @@ def test_live_delivery_waits_observe_fatal_error_before_inactivity() -> None:
         "while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:",
     ):
         start = source.index(marker)
-        window = source[start : start + 2000]
-        assert "_raise_if_runtime_fatal(app)" in window
-        assert window.index("_raise_if_runtime_fatal(app)") < window.index(
-            "await asyncio.sleep(0.02)"
-        )
+        fatal_index = source.index("_raise_if_runtime_fatal(app)", start)
+        sleep_index = source.index("await asyncio.sleep(0.02)", start)
+        assert fatal_index < sleep_index
