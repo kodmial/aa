@@ -1,13 +1,13 @@
 {
   "base_ref": "main",
   "base_sha": "2dabd809bbca23a3f67f29e14e86b0f7c1c06218",
-  "branch": "opencode/issue550-44664739505",
+  "branch": "opencode/issue550-44669097092",
   "capability_number": "",
-  "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue550-gen-3",
+  "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue550-gen-4",
   "failure_kind": "quota_429",
-  "generation": 3,
-  "head_ref": "opencode/issue550-44664739505",
-  "head_sha": "7ec9ee329f11ec020cf0063912696b71fc327eec",
+  "generation": 4,
+  "head_ref": "opencode/issue550-44669097092",
+  "head_sha": "8d2a7ac01ef81ec5563eece97f4f478d0f09e115",
   "issue_number": "550",
   "mode": "issue",
   "operation_id": "opencode-429-issue-issue550",
@@ -18,6 +18,6 @@
   "review_id": "",
   "run_id": "",
   "schema_version": 1,
-  "stage": "implementation-incomplete",
+  "stage": "implementation-complete",
   "unresolved_items_json": ""
 }
