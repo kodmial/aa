@@ -74,6 +74,16 @@ _ATTEMPT_STATES = ("in-flight", "completed", "failed", "cancelled", "aborted")
 _PROVIDER_ERROR_KINDS = frozenset(
     {"rate-limit", "deterministic", "provider-access", "transient", "session-not-found"}
 )
+# Provider 429 is the one classified provider failure the product treats as
+# a runner-lifecycle failure: it is re-raised instead of being converted to
+# a delivered temporary-error reply. A confirmed terminal 429 for the
+# current turn therefore proves no reply can still arrive for it.
+_FATAL_PROVIDER_ERROR_KINDS = frozenset({"rate-limit"})
+# The provider turn lives on the message request; session-create/model/
+# delete/history/abort requests are setup or cleanup around it. A later
+# successful session-delete must never stand in as proof that the failed
+# message request delivered an answer.
+_TURN_OPERATION_PREFIX = "message-"
 _DELIVERY_STAGES = frozenset({"delivery", "telegram", "seam", "post", "transport"})
 _UNKNOWN_STATE = "none"
 
@@ -95,21 +105,35 @@ def derive_timeout_category(stage: str) -> str:
     return "unknown"
 
 
+def _is_turn_operation(entry: Mapping[str, Any]) -> bool:
+    """Whether an attempt row is the provider turn, not its setup/cleanup."""
+    return str(entry.get("operation", "")).startswith(_TURN_OPERATION_PREFIX)
+
+
 def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict[str, Any]:
     """Classify OpenCode request evidence for one causality id.
 
     ``audit`` is the OpenCode client's privacy-safe per-request attempt
-    audit. The NEWEST attempt always wins: an earlier completed request
-    never stands in as proof that the newest (still running) request is
-    finished (kodmial/aa#431). Rows recorded by the current client carry
-    ``attempt_id`` plus an explicit ``state``; a row that touched the
-    ``attempt-start`` boundary with no terminal state is honestly reported
-    as ``http-in-flight``. Legacy rows without attempt ids keep the old
-    conservative classification. The classification is honest about
-    observability: the pinned synchronous request API exposes only local
-    completion/failure — not server-side streaming — so when nothing
-    directly proves a request state the report says
+    audit. The NEWEST attempt wins WITHIN the provider turn request stream:
+    an earlier completed request never stands in as proof that the newest
+    (still running) request is finished (kodmial/aa#431). Rows recorded by
+    the current client carry ``attempt_id`` plus an explicit ``state``; a
+    row that touched the ``attempt-start`` boundary with no terminal state
+    is honestly reported as ``http-in-flight``. Legacy rows without attempt
+    ids keep the old conservative classification. The classification is
+    honest about observability: the pinned synchronous request API exposes
+    only local completion/failure — not server-side streaming — so when
+    nothing directly proves a request state the report says
     ``progress-unobservable`` instead of guessing an upstream cause.
+
+    The turn's outcome is owned by its message request, never by the
+    session-control requests around it. A ``session-delete`` that completes
+    after a failed ``message-structured`` verifier call does not prove the
+    turn succeeded (confirmed 2026-11-19 incident: a provider 429 was
+    masked that way and the harness waited out the full inactivity bound).
+    When any turn-bearing attempt exists, the newest one is authoritative;
+    control/cleanup attempts only decide the state when no turn attempt was
+    recorded at all.
     """
     entries = [item for item in audit if isinstance(item, Mapping)]
     matched = [
@@ -129,7 +153,8 @@ def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict
             attempt_rows,
             key=lambda pair: (pair[1].get("attempt_started_monotonic", pair[0]), pair[0]),
         )
-        _index, newest = ordered[-1]
+        turn_rows = [(index, item) for index, item in ordered if _is_turn_operation(item)]
+        _index, newest = turn_rows[-1] if turn_rows else ordered[-1]
         state = str(newest.get("state", "in-flight"))
         if state == "in-flight":
             state_name = "http-in-flight"
@@ -159,6 +184,37 @@ def request_state_from_audit(audit: Sequence[object], causality_id: str) -> dict
         "last_request_error_kind": str(last.get("error_kind", ""))[:48],
         "last_request_latency_ms": last.get("latency_ms"),
         _OBSERVABILITY: _PROGRESS_UNOBSERVABLE,
+    }
+
+
+def fatal_provider_failure(audit: Sequence[object], causality_id: str) -> dict[str, Any] | None:
+    """Return confirmed terminal 429 evidence for one causality, if any.
+
+    Only a provider 429 is fatal to the current runner (kodmial/aa#429): the
+    production handler re-raises it instead of delivering a temporary-error
+    reply, so a terminal failed turn request with ``error_kind=rate-limit``
+    proves no reply can still arrive for this scenario. Other provider
+    errors are intentionally not surfaced here: the product converts them
+    into a delivered service-error reply, which the scenario loop must let
+    through rather than aborting early.
+
+    The evidence is privacy-safe (operation/attempt identity, classified
+    kind only) and uses the same authoritative turn-request selection as
+    :func:`request_state_from_audit`, so a later successful cleanup request
+    cannot hide the failure.
+    """
+    report = request_state_from_audit(audit, causality_id)
+    if str(report.get("request_state", "")) != "request-failed":
+        return None
+    error_kind = str(report.get("last_request_error_kind", ""))
+    if error_kind not in _FATAL_PROVIDER_ERROR_KINDS:
+        return None
+    return {
+        "request_state": "request-failed",
+        "error_kind": error_kind[:48],
+        "failure_category": str(report.get("last_request_failure_category", ""))[:64],
+        "operation": str(report.get("last_confirmed_request", ""))[:64],
+        "attempt_id": str(report.get("last_attempt_id", ""))[:64],
     }
 
 
@@ -441,6 +497,7 @@ __all__ = [
     "build_timeout_attribution",
     "classify_stall_kind",
     "derive_timeout_category",
+    "fatal_provider_failure",
     "quiesce_and_abort_stalled_turn",
     "request_state_from_audit",
 ]

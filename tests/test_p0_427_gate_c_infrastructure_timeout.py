@@ -33,6 +33,12 @@ from typing import Any
 
 import pytest
 
+from aa.opencode.errors import OpenCodeRateLimitError
+from aa.qualification.live_turn_repair import (
+    build_timeout_attribution,
+    fatal_provider_failure,
+    request_state_from_audit,
+)
 from aa.qualification.live_watchdog import (
     ENV_RECOVERY_ALLOWANCE_S,
     ENV_SCENARIO_INACTIVITY_S,
@@ -75,6 +81,31 @@ def _lane_source() -> str:
 
     lines, _ = inspect.getsourcelines(live_mod.run_live_telegram_evidence_lane)
     return "".join(lines)
+
+
+def _attempt_row(
+    operation: str,
+    causality_id: str,
+    *,
+    state: str,
+    started: float,
+    error_kind: str = "",
+    failure_category: str = "",
+) -> dict[str, Any]:
+    """Build one realistic privacy-safe OpenCode attempt-ledger row."""
+    row: dict[str, Any] = {
+        "attempt_id": f"att-{operation}-{started}",
+        "operation": operation,
+        "causality_id": causality_id,
+        "state": state,
+        "attempt_started_monotonic": started,
+        "latency_ms": 12.5,
+    }
+    if error_kind:
+        row["error_kind"] = error_kind
+    if failure_category:
+        row["failure_category"] = failure_category
+    return row
 
 
 # --- Honest parent attribution ------------------------------------------
@@ -446,3 +477,202 @@ def test_timeout_lane_entry_carries_trigger_and_preserved_diagnostics() -> None:
     assert any(item.get("delivery_latency_ms") == 123.0 for item in diagnostics)
     assert result.metrics["watchdog_stall_cleanup"] == {"skipped": "campaign-budget"}
     assert result.metrics["watchdog_request_state"] == "unconfirmed-in-flight"
+
+
+# --- Terminal provider failure is observable, never masked ----------------
+
+
+def test_cleanup_completion_never_masks_a_terminal_turn_failure() -> None:
+    """A later session-delete success must not rewrite a failed turn as done.
+
+    Confirmed incident shape (run 44611952510): the verifier's
+    ``message-structured`` request failed with a provider 429, then the
+    turn's ``session-delete`` cleanup completed. The newest-attempt rule
+    picked the cleanup and published ``request-completed``, so the lane
+    waited out the full inactivity bound and fabricated an unobservable
+    infrastructure timeout.
+    """
+    causality = "turn-429"
+    audit = [
+        _attempt_row(
+            "message-structured",
+            causality,
+            state="failed",
+            started=1.0,
+            error_kind="rate-limit",
+            failure_category="OpenCodeRateLimitError",
+        ),
+        _attempt_row("session-delete", causality, state="completed", started=2.0),
+    ]
+    report = request_state_from_audit(audit, causality)
+    assert report["request_state"] == "request-failed"
+    assert report["last_request_state"] == "failed"
+    assert report["last_confirmed_request"] == "message-structured"
+    assert report["last_request_error_kind"] == "rate-limit"
+    assert report["last_request_failure_category"] == "OpenCodeRateLimitError"
+    # The timeout attribution therefore names a confirmed provider error,
+    # never "server alive but session unobserved".
+    attribution = build_timeout_attribution(
+        causality_id=causality,
+        family="ordinary-text",
+        last_active_stage="opencode",
+        stage_changed_at=time.monotonic() - 1.0,
+        started_monotonic=time.monotonic() - 2.0,
+        request_audit=audit,
+        timeout_reason="no-real-progress",
+    )
+    assert attribution["stall_kind"] == "provider-error-confirmed"
+    assert attribution["request_state"] == "request-failed"
+    fatal = fatal_provider_failure(audit, causality)
+    assert fatal is not None
+    assert fatal["error_kind"] == "rate-limit"
+    assert fatal["operation"] == "message-structured"
+
+
+def test_newer_turn_attempt_supersedes_an_earlier_terminal_failure() -> None:
+    """A retry still running or completed stays authoritative for the turn."""
+    causality = "turn-retry"
+    failed = _attempt_row(
+        "message-structured",
+        causality,
+        state="failed",
+        started=1.0,
+        error_kind="rate-limit",
+    )
+    recovered = _attempt_row("message-structured", causality, state="completed", started=2.0)
+    completed = request_state_from_audit([failed, recovered], causality)
+    assert completed["request_state"] == "request-completed"
+    assert fatal_provider_failure([failed, recovered], causality) is None
+
+    in_flight = _attempt_row("message-structured", causality, state="in-flight", started=2.0)
+    running = request_state_from_audit([failed, in_flight], causality)
+    assert running["request_state"] == "http-in-flight"
+    assert fatal_provider_failure([failed, in_flight], causality) is None
+
+
+def test_non_fatal_provider_errors_are_not_surfaced_as_fatal() -> None:
+    """Only a 429 is non-deliverable; other errors still produce a reply."""
+    causality = "turn-soft-error"
+    for kind in ("transient", "deterministic", "provider-access", "session-not-found"):
+        audit = [
+            _attempt_row(
+                "message-structured",
+                causality,
+                state="failed",
+                started=1.0,
+                error_kind=kind,
+                failure_category="OpenCodeError",
+            )
+        ]
+        assert request_state_from_audit(audit, causality)["request_state"] == "request-failed"
+        assert fatal_provider_failure(audit, causality) is None
+
+
+def test_confirmed_429_reaches_the_runner_lifecycle_without_any_wall_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Real timing: a terminal 429 exits promptly, not after the silence bound.
+
+    The synthetic lane owns a realistic attempt ledger: the turn is
+    in-flight first, then the verifier's message request terminally fails
+    with a 429 while a later session-delete completes. The same pure
+    detector the production await loop uses must surface the failure in
+    about a probe period, long before the deliberately huge inactivity
+    bound, and the existing parent lifecycle must re-raise the provider
+    error unchanged.
+    """
+    progress_path = _watchdog_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(ENV_TOTAL_DEADLINE_S, "30")
+    monkeypatch.setenv(ENV_SCENARIO_INACTIVITY_S, "30")
+    causality = "turn-live-429"
+    audit: list[dict[str, Any]] = [
+        _attempt_row("message-structured", causality, state="in-flight", started=1.0)
+    ]
+
+    async def lane(run_id: str) -> LaneResult:
+        _ = run_id
+        record_live_progress(
+            "scenario-start",
+            scenario_index=1,
+            family="ordinary-text",
+            scenario_total=2,
+            completed_scenario_count=0,
+            active_stage="opencode",
+            real_progress=True,
+        )
+        started = time.monotonic()
+        while time.monotonic() - started < 20.0:
+            await asyncio.sleep(0.02)
+            if time.monotonic() - started >= 0.3:
+                audit[0] = _attempt_row(
+                    "message-structured",
+                    causality,
+                    state="failed",
+                    started=1.0,
+                    error_kind="rate-limit",
+                    failure_category="OpenCodeRateLimitError",
+                )
+                audit.append(
+                    _attempt_row("session-delete", causality, state="completed", started=2.0)
+                )
+            if fatal_provider_failure(audit, causality) is not None:
+                raise OpenCodeRateLimitError("opencode provider rate-limited")
+        return LaneResult(lane="live-telegram-evidence", status="FAIL")
+
+    started = time.monotonic()
+    with pytest.raises(OpenCodeRateLimitError):
+        supervise_live_gate_c(lane, run_id="p0427-429", main_sha=SHA, progress_path=progress_path)
+    elapsed = time.monotonic() - started
+    # Bounded by the event, not by the 30 s inactivity/campaign walls.
+    assert 0.2 <= elapsed < 8.0, elapsed
+
+
+def _first_scenario_await_loop(source: str) -> str:
+    """Extract only the main scenario await loop from the lane source.
+
+    A slice that runs to the end of the function also contains the later
+    multi-turn and voice await loops, so a probe moved out of the main
+    scenario loop would still satisfy the assertions. Bound the extraction
+    by indentation so only the first loop's body is inspected.
+    """
+    lines = source.splitlines(keepends=True)
+    start = next(
+        index for index, line in enumerate(lines) if "while len(api.sent_texts) <= before:" in line
+    )
+    loop_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if stripped:
+            line_indent = len(lines[end]) - len(lines[end].lstrip())
+            if line_indent <= loop_indent:
+                break
+        end += 1
+    return "".join(lines[start:end])
+
+
+def test_lane_probes_the_request_audit_inside_the_await_loop() -> None:
+    """Production wiring: the await loop raises the typed 429 promptly."""
+    source = _lane_source()
+    loop = _first_scenario_await_loop(source)
+    # The bounded slice must be the main scenario loop, never a later
+    # multi-turn/voice loop that happens to contain the same wait shape.
+    assert "while len(api.sent_texts) <= before:" in loop
+    assert loop.count("while len(api.sent_texts) <= before:") == 1
+    assert "_send_raw_text" not in loop
+    # The await loop samples the already-published request audit through the
+    # exception-safe helper while a scenario is still waiting for delivery.
+    assert "_fatal_request_failure(" in loop
+    assert "raise OpenCodeRateLimitError(" in loop
+    assert "scenario-provider-error" in loop
+    # The detector itself reads the same request evidence used for stall
+    # attribution, so a later cleanup attempt cannot hide the failed turn.
+    helper = source[source.index("def _fatal_request_failure") :]
+    helper = helper[: helper.index("def _collect_partial_evidence")]
+    assert "fatal_provider_failure(" in helper
+    assert "request_latency_audit" in helper
+    # No fixed per-turn cutoff is introduced by the probe: only the existing
+    # inactivity bound and an event-driven sampling interval remain.
+    assert "_SCENARIO_PROVIDER_PROBE_INTERVAL_S" in loop
+    assert "scenario_inactivity_limit_s" in loop
+    assert "await asyncio.sleep(0.02)" in loop
