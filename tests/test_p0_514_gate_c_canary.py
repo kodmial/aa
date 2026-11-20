@@ -32,6 +32,7 @@ from aa.qualification.gate_c_canary import (
     BUDGET_WITHIN,
     DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S,
     DEFAULT_REQUIRED_REAL_PATH_SCENARIOS,
+    PRODUCT_VERDICT_REASONS,
     SCHEMA_VERSION,
     SELF_TEST_PROMPT_SENTINEL,
     SELF_TEST_SESSION_SENTINEL,
@@ -339,7 +340,7 @@ def test_typed_failure_on_the_optional_turn_still_fails_the_canary() -> None:
                 _scenario("substantive-drinking"),
                 _scenario(
                     "meta-capability",
-                    failure_cause="verdict-irrelevant",
+                    failure_cause="verifier-unavailable",
                     answer_outcome="safety-blocked",
                     product_outcome="service_error",
                 ),
@@ -353,7 +354,86 @@ def test_typed_failure_on_the_optional_turn_still_fails_the_canary() -> None:
     )
 
     assert result.status == STATUS_FAIL
-    assert result.reason == "verdict-irrelevant"
+    assert result.reason == "verifier-unavailable"
+    assert result.exit_code == 4
+
+
+@pytest.mark.parametrize("cause", sorted(PRODUCT_VERDICT_REASONS))
+def test_complete_negative_verdict_is_product_evidence_not_a_canary_failure(
+    cause: str,
+) -> None:
+    """Regression for qualification #7 at ``2dabd809`` (kodmial/aa#550).
+
+    The observed ``substantive-drinking`` turn completed planner, retrieval,
+    answer and verifier, then delivered the marked service error because the
+    verifier issued a complete negative verdict. That is answer-quality
+    evidence for the unchanged Gate C scorer (which still fails delivered
+    service errors), not a broken diagnostic chain: the canary must reach
+    READY and let the 18-case campaign run.
+    """
+    result = evaluate_canary(
+        main_sha="2dabd809bbca23a3f67f29e14e86b0f7c1c06218",
+        run_id="550",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario(
+                    "substantive-drinking",
+                    failure_cause=cause,
+                    answer_outcome="safety-blocked",
+                    product_outcome="service_error",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=65.3,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_READY
+    assert result.reason == "canary-ready"
+    assert result.exit_code == 0
+    assert result.budget_category == BUDGET_WITHIN
+    payload = result.to_dict()
+    assert payload["product_qualified"] is False
+    assert payload["gate_c_executed"] is False
+    assert payload["real_path"]["scenarios"][0]["failure_cause"] == cause
+    assert payload["real_path"]["scenarios"][0]["product_outcome"] == "service_error"
+    assert payload["evidence_coverage"] == {
+        "stage": "observed",
+        "attempt": "observed",
+        "causality": "observed",
+        "server_events": "observed",
+    }
+
+
+def test_terminal_clarification_outcome_is_not_masked_by_a_verdict_cause() -> None:
+    """A verdict cause must not hide the explicit #514 terminal stop path."""
+    result = evaluate_canary(
+        main_sha="2dabd809bbca23a3f67f29e14e86b0f7c1c06218",
+        run_id="550",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario(
+                    "substantive-drinking",
+                    failure_cause="verdict-unsupported",
+                    answer_outcome="clarification-unavailable",
+                    product_outcome="service_error",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=65.3,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_FAIL
+    assert result.reason == "clarification-unavailable"
     assert result.exit_code == 4
 
 
