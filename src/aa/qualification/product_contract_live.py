@@ -46,6 +46,7 @@ from aa.qualification.live_partial_evidence import (
 )
 from aa.qualification.live_turn_repair import (
     build_timeout_attribution,
+    fatal_provider_failure,
     quiesce_and_abort_stalled_turn,
     request_state_from_audit,
 )
@@ -117,6 +118,12 @@ _STAGE_LATENCY_STAGES = frozenset({"planner", "retrieval", "answer", "verifier"}
 _STAGE_LATENCY_VERDICTS = frozenset({"measured", "zero-unproven", "unobserved", "not-measured"})
 _STAGE_LATENCY_COVERAGE_STATES = frozenset({"observed", "missing", "unobserved"})
 _STAGE_LATENCY_COVERAGE_FIELDS = frozenset({"coverage", "stage_count", "turn_count", "stages"})
+
+# Sampling period for the awaiting-delivery provider-failure probe. This is
+# not a turn deadline: it only decides how often the harness looks at the
+# already-published request audit. A positive terminal 429 raises through
+# the normal runner-retire lifecycle; a healthy slow turn is never cut by it.
+_SCENARIO_PROVIDER_PROBE_INTERVAL_S = 0.5
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -3075,6 +3082,27 @@ async def run_live_telegram_evidence_lane(
                 return ""
             return str(report.get("request_state", ""))[:48]
 
+        def _fatal_request_failure(causality: str) -> dict[str, Any] | None:
+            """Confirmed terminal provider 429 for this scenario, if any.
+
+            The request audit is already the privacy-safe source of truth
+            for stall attribution. Reading the same evidence while the
+            scenario awaits delivery lets the lane hand a real 429 to the
+            existing runner-retire lifecycle immediately instead of waiting
+            out the unobservable-silence bound and publishing a fabricated
+            infrastructure timeout (kodmial/aa#427).
+            """
+            if not causality:
+                return None
+            try:
+                runtime = getattr(app, "opencode_runtime", None)
+                client = getattr(runtime, "client", None)
+                if client is None:
+                    return None
+                return fatal_provider_failure(client.request_latency_audit, causality)
+            except Exception:  # noqa: BLE001 - diagnostics must not break the lane
+                return None
+
         def _collect_partial_evidence(
             phase: str,
             *,
@@ -3547,9 +3575,50 @@ async def run_live_telegram_evidence_lane(
                 scenario_started_monotonic = time.monotonic()
                 api.pending_updates.append(raw)
                 last_progress_tick = time.monotonic()
+                last_provider_probe = 0.0
                 stop_reason = ""
                 while len(api.sent_texts) <= before:
                     now = time.monotonic()
+                    # A confirmed terminal provider 429 is observable evidence,
+                    # not unobservable silence. Surface it through the existing
+                    # runner-retire lifecycle immediately instead of waiting
+                    # out the inactivity bound and publishing a fabricated
+                    # infrastructure timeout (kodmial/aa#427). This is an
+                    # event-driven probe, never a per-turn deadline: a healthy
+                    # slow request keeps running untouched.
+                    if now - last_provider_probe >= _SCENARIO_PROVIDER_PROBE_INTERVAL_S:
+                        last_provider_probe = now
+                        fatal_failure = _fatal_request_failure(scenario_causality_id)
+                        if fatal_failure is not None:
+                            print(
+                                f"Gate C scenario {position}/{len(scenarios)} "
+                                f"family={family} phase=provider-error "
+                                f"category=stuck-provider "
+                                f"request_state={fatal_failure['request_state']} "
+                                f"error_kind={fatal_failure['error_kind']}",
+                                flush=True,
+                            )
+                            record_live_progress(
+                                "scenario-provider-error",
+                                scenario_index=position,
+                                family=family,
+                                timeout_category="stuck-provider",
+                                timeout_reason="provider-error",
+                                last_active_stage=str(stage_progress_state.get("last_stage", ""))[
+                                    :64
+                                ],
+                                request_state=fatal_failure["request_state"],
+                                request_started=True,
+                                request_progress_observable="progress-unobservable",
+                                stall_kind="provider-error-confirmed",
+                                completed_scenario_count=len(scenario_diagnostics),
+                                scenario_diagnostics=scenario_diagnostics,
+                                latency_samples=latency_samples,
+                                real_progress=False,
+                            )
+                            raise OpenCodeRateLimitError(
+                                "opencode provider rate-limited during live scenario turn"
+                            )
                     if now >= campaign_deadline:
                         stop_reason = "campaign-budget"
                         break
