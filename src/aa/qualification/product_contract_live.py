@@ -140,7 +140,9 @@ def _raise_if_runtime_fatal(app: Any) -> None:
     recovery; waiting out the scenario inactivity watchdog would instead
     misclassify it as a stuck provider and consume the campaign budget.
     """
-    fatal = getattr(app, "fatal_error", None)
+    if not hasattr(app, "fatal_error"):
+        raise AttributeError("live lane app must expose fatal_error")
+    fatal = app.fatal_error
     if isinstance(fatal, BaseException):
         raise fatal
 
@@ -3684,6 +3686,7 @@ async def run_live_telegram_evidence_lane(
                                 causality=scenario_causality_id,
                             ),
                         )
+                _raise_if_runtime_fatal(app)
                 if len(api.sent_texts) <= before:
                     timeout_elapsed_ms = round(
                         (time.perf_counter() - started) * 1000.0,
@@ -4277,6 +4280,7 @@ async def run_live_telegram_evidence_lane(
                         raw_stop_reason = "no-real-progress"
                         break
                     await asyncio.sleep(0.02)
+                _raise_if_runtime_fatal(app)
                 if len(api.sent_texts) <= before:
                     # The same no-orphan-work contract applies to the folded
                     # multi-turn checks (kodmial/aa#417): quarantine and
@@ -5148,6 +5152,7 @@ async def run_live_telegram_evidence_lane(
                         ):
                             break
                         await asyncio.sleep(0.02)
+                    _raise_if_runtime_fatal(app)
                     voice_elapsed = time.perf_counter() - voice_started
                     _check(
                         "live-voice-raw-transport-accepted",

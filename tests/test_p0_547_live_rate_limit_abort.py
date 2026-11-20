@@ -17,7 +17,9 @@ delivery wait and re-raises it, so the existing 429 runner-retire contract
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -76,21 +78,56 @@ def test_live_lane_fatal_check_is_a_noop_without_failure() -> None:
     from aa.qualification.product_contract_live import _raise_if_runtime_fatal
 
     _raise_if_runtime_fatal(SimpleNamespace(fatal_error=None))
-    _raise_if_runtime_fatal(SimpleNamespace())
+
+
+def test_live_lane_fatal_check_fails_fast_without_signal() -> None:
+    from aa.qualification.product_contract_live import _raise_if_runtime_fatal
+
+    with pytest.raises(AttributeError, match="fatal_error"):
+        _raise_if_runtime_fatal(SimpleNamespace())
+
+
+def _is_fatal_check(node: ast.stmt) -> bool:
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "_raise_if_runtime_fatal"
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Name)
+    )
+
+
+def _contains_sleep(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == "sleep"
+        for child in ast.walk(node)
+    )
 
 
 def test_live_delivery_waits_observe_fatal_error_before_inactivity() -> None:
-    """Every live delivery wait must check the fatal signal before sleeping."""
+    """Every live wait checks fatal before sleeping and again after it exits."""
     from aa.qualification.product_contract_live import run_live_telegram_evidence_lane
 
-    source = inspect.getsource(run_live_telegram_evidence_lane)
-    assert source.count("_raise_if_runtime_fatal(app)") == 3
-    for marker in (
-        'stop_reason = ""\n                while len(api.sent_texts) <= before:',
-        'raw_stop_reason = ""\n                while len(api.sent_texts) <= before:',
-        "while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:",
-    ):
-        start = source.index(marker)
-        fatal_index = source.index("_raise_if_runtime_fatal(app)", start)
-        sleep_index = source.index("await asyncio.sleep(0.02)", start)
-        assert fatal_index < sleep_index
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_live_telegram_evidence_lane)))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    wait_loops = [
+        node for node in ast.walk(tree) if isinstance(node, ast.While) and _contains_sleep(node)
+    ]
+    assert wait_loops
+    for loop in wait_loops:
+        assert _is_fatal_check(loop.body[0])
+        parent = parents[loop]
+        siblings: list[ast.stmt] | None = None
+        for field in ("body", "orelse", "finalbody"):
+            candidate = getattr(parent, field, None)
+            if isinstance(candidate, list) and loop in candidate:
+                siblings = candidate
+                break
+        assert siblings is not None
+        index = siblings.index(loop)
+        assert index + 1 < len(siblings), "wait loop must re-check fatal after exit"
+        assert _is_fatal_check(siblings[index + 1])
