@@ -131,6 +131,22 @@ def _as_float(value: object, default: float = 0.0) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+def _raise_if_runtime_fatal(app: Any) -> None:
+    """Re-raise a worker-lifecycle failure recorded by the application.
+
+    The live lane drives ``Application.start()`` directly instead of
+    ``Application.run()``, so it must observe the same fatal signal the run
+    loop would. Provider 429 retires the runner for fresh-VM checkpoint
+    recovery; waiting out the scenario inactivity watchdog would instead
+    misclassify it as a stuck provider and consume the campaign budget.
+    """
+    if not hasattr(app, "fatal_error"):
+        raise AttributeError("live lane app must expose fatal_error")
+    fatal = app.fatal_error
+    if isinstance(fatal, BaseException):
+        raise fatal
+
+
 def _dict_key_holds_text(key: Any) -> bool:
     """Whether a dict key carries text (fixed-vocabulary labels exempt)."""
     if isinstance(key, bytes):
@@ -3578,6 +3594,7 @@ async def run_live_telegram_evidence_lane(
                 last_provider_probe = 0.0
                 stop_reason = ""
                 while len(api.sent_texts) <= before:
+                    _raise_if_runtime_fatal(app)
                     now = time.monotonic()
                     # A confirmed terminal provider 429 is observable evidence,
                     # not unobservable silence. Surface it through the existing
@@ -3669,6 +3686,7 @@ async def run_live_telegram_evidence_lane(
                                 causality=scenario_causality_id,
                             ),
                         )
+                _raise_if_runtime_fatal(app)
                 if len(api.sent_texts) <= before:
                     timeout_elapsed_ms = round(
                         (time.perf_counter() - started) * 1000.0,
@@ -4251,6 +4269,7 @@ async def run_live_telegram_evidence_lane(
                 stage_progress_state["last_monotonic"] = time.monotonic()
                 raw_stop_reason = ""
                 while len(api.sent_texts) <= before:
+                    _raise_if_runtime_fatal(app)
                     if time.monotonic() >= campaign_deadline:
                         raw_stop_reason = "campaign-budget"
                         break
@@ -4261,6 +4280,7 @@ async def run_live_telegram_evidence_lane(
                         raw_stop_reason = "no-real-progress"
                         break
                     await asyncio.sleep(0.02)
+                _raise_if_runtime_fatal(app)
                 if len(api.sent_texts) <= before:
                     # The same no-orphan-work contract applies to the folded
                     # multi-turn checks (kodmial/aa#417): quarantine and
@@ -5123,6 +5143,7 @@ async def run_live_telegram_evidence_lane(
                     api.pending_updates.append(raw_voice)
                     stage_progress_state["last_monotonic"] = time.monotonic()
                     while api.sent_voices <= before_voice and len(api.sent_texts) <= before_text:
+                        _raise_if_runtime_fatal(app)
                         if time.monotonic() >= campaign_deadline:
                             break
                         if (
@@ -5131,6 +5152,7 @@ async def run_live_telegram_evidence_lane(
                         ):
                             break
                         await asyncio.sleep(0.02)
+                    _raise_if_runtime_fatal(app)
                     voice_elapsed = time.perf_counter() - voice_started
                     _check(
                         "live-voice-raw-transport-accepted",

@@ -279,6 +279,19 @@ class Application:
         return self._runtime_state
 
     @property
+    def fatal_error(self) -> BaseException | None:
+        """Worker-lifecycle failure recorded for the run loop to re-raise.
+
+        A provider 429 is recorded by the per-chat dispatcher turn so the
+        runtime stops accepting work and the hosted workflow can replace this
+        runner for fresh-VM checkpoint recovery. In-process supervisors that
+        drive ``start()`` directly instead of ``run()`` must observe and
+        re-raise this signal promptly rather than waiting out an inactivity
+        watchdog and misclassifying the 429 as a stuck provider.
+        """
+        return self._fatal_error
+
+    @property
     def graph_runtime(self) -> GraphTurnRuntime | None:
         """The bound LangGraph turn runtime (``None`` before start)."""
         return self._graph_runtime
