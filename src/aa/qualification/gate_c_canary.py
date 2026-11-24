@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from aa.conversation.answer_causality import KNOWN_REASONS
+from aa.conversation.answer_causality import KNOWN_REASONS, VERDICT_IRRELEVANT, VERDICT_UNSUPPORTED
 from aa.conversation.answer_causality import UNKNOWN as UNKNOWN_FAILURE_CAUSE
 from aa.opencode.client import HttpOpenCodeClient
 from aa.opencode.observer import StallSnapshotObserver
@@ -99,15 +99,44 @@ REASON_EXTERNAL_UNOBSERVED = "external-progress-unobserved"
 REASON_FAILED_TYPED = "typed-product-path-failure"
 REASON_ERROR = "surface-error"
 
-FAIL_CLOSED_REASONS = frozenset(KNOWN_REASONS - {UNKNOWN_FAILURE_CAUSE})
-"""Every typed product failure cause, except the literal ``unknown``.
+PRODUCT_VERDICT_REASONS = frozenset({VERDICT_UNSUPPORTED, VERDICT_IRRELEVANT})
+"""Complete verifier verdicts about answer quality, not diagnostic wiring.
 
-The canary only stops the full campaign for a *concrete* typed cause. An
-unattributed ``unknown`` stays a missing-diagnostic / Gate C concern and is
-never promoted into a fabricated canary failure.
+A delivered turn whose verifier rejected every candidate (``unsupported``)
+or found the answer irrelevant proves that planner, retrieval, answer,
+verification and the typed telemetry chain really ran. The resulting
+service-error reply is a product-quality failure owned by the unchanged
+Gate C scorer, which still fails delivered service errors. Replaying the
+18-case campaign is therefore required, not skipped: the canary only stops
+for infrastructure/diagnostic causes that make that replay pointless.
+"""
+
+FAIL_CLOSED_REASONS = frozenset(KNOWN_REASONS - {UNKNOWN_FAILURE_CAUSE} - PRODUCT_VERDICT_REASONS)
+"""Causes that still stop the preflight and withhold the campaign.
+
+Every typed product-path cause except the literal ``unknown`` and the
+complete negative verifier verdicts in :data:`PRODUCT_VERDICT_REASONS`.
+Provider/verifier outages, missing evidence, local guards and the explicit
+kodmial/aa#514 terminal causes remain preflight-stopping; only a completed
+verifier verdict about answer quality is left to the unchanged Gate C
+scorer. An unattributed ``unknown`` stays a missing-diagnostic / Gate C
+concern and is never promoted into a fabricated canary failure.
 """
 
 SERVICE_ERROR_DELIVERED = "service-error-delivered"
+
+# kodmial/aa#514 requires the preflight to stop on these explicit terminal
+# outcomes even when an earlier typed cause was a complete verifier verdict.
+# Otherwise a verdict-unsupported draft that later fell through to
+# ``clarification-unavailable`` would be misread as product-quality evidence
+# and authorize the 18-case campaign.
+TERMINAL_ANSWER_OUTCOMES = frozenset(
+    {
+        "conversational-generation-failed",
+        "clarification-unavailable",
+        "guard-internal-terms",
+    }
+)
 
 # Privacy: no prompt, reply, passage, session id or credential may enter
 # canary artifacts. The self-test embeds explicit sentinels in the fake
@@ -1428,7 +1457,27 @@ async def run_real_path_scenarios(
 
 
 def _scenario_failure(scenario: ScenarioEvidence) -> str:
-    """Concrete typed failure of one real-path turn ("" when none)."""
+    """Concrete preflight-stopping failure of one real-path turn ("" when none)."""
+    if scenario.failure_cause in PRODUCT_VERDICT_REASONS:
+        # The verifier reached a complete negative product verdict. That is
+        # answer-quality evidence for Gate C, not a broken diagnostic chain;
+        # Gate C still fails the delivered service error on its own. An
+        # explicit terminal outcome still wins and stops the campaign.
+        if scenario.answer_outcome in TERMINAL_ANSWER_OUTCOMES:
+            return scenario.answer_outcome
+        # Negative verdict evidence must describe a delivered, fully
+        # observed service-error turn, even on an optional probe.
+        if not (
+            scenario.delivered
+            and scenario.attempt_observed
+            and scenario.stage_observed
+            and scenario.causality_observed
+            and scenario.server_evidence_state == "supported"
+            and scenario.answer_outcome == "safety-blocked"
+            and scenario.product_outcome == "service_error"
+        ):
+            return scenario.failure_cause
+        return ""
     if scenario.failure_cause in FAIL_CLOSED_REASONS:
         return scenario.failure_cause
     if not scenario.delivered:
@@ -1586,8 +1635,10 @@ def evaluate_canary(
                 if not scenario.causality_observed:
                     missing.append("real_path.causality_observed")
                 break
-        # A concrete typed failure on any attempted turn, required or
-        # optional, is real product-path evidence and must stop the campaign.
+        # A concrete preflight-stopping failure on any attempted turn,
+        # required or optional, is real evidence that the campaign cannot be
+        # trusted and must stop. Complete negative verifier verdicts stay
+        # product-quality evidence for Gate C instead.
         if status == STATUS_READY:
             for scenario in real_path.scenarios:
                 failure = _scenario_failure(scenario)
@@ -1773,6 +1824,7 @@ __all__ = [
     "EXIT_BY_STATUS",
     "FAIL_CLOSED_REASONS",
     "GateCCanaryError",
+    "PRODUCT_VERDICT_REASONS",
     "RealPathEvidence",
     "SCHEMA_VERSION",
     "SERVICE_ERROR_DELIVERED",
@@ -1782,6 +1834,7 @@ __all__ = [
     "STATUS_READY",
     "ScenarioEvidence",
     "SelfTestEvidence",
+    "TERMINAL_ANSWER_OUTCOMES",
     "assert_no_text_leak",
     "evaluate_canary",
     "observer_self_test",
