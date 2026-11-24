@@ -41,6 +41,7 @@ from aa.qualification.gate_c_canary import (
     STATUS_FAIL,
     STATUS_INCONCLUSIVE,
     STATUS_READY,
+    TERMINAL_ANSWER_OUTCOMES,
     GateCCanaryError,
     RealPathEvidence,
     ScenarioEvidence,
@@ -380,6 +381,7 @@ def test_complete_negative_verdict_is_product_evidence_not_a_canary_failure(
                 _scenario(
                     "substantive-drinking",
                     failure_cause=cause,
+                    failure_chain=(cause,),
                     answer_outcome="safety-blocked",
                     product_outcome="service_error",
                 ),
@@ -400,6 +402,7 @@ def test_complete_negative_verdict_is_product_evidence_not_a_canary_failure(
     assert payload["product_qualified"] is False
     assert payload["gate_c_executed"] is False
     assert payload["real_path"]["scenarios"][0]["failure_cause"] == cause
+    assert payload["real_path"]["scenarios"][0]["failure_chain"] == [cause]
     assert payload["real_path"]["scenarios"][0]["product_outcome"] == "service_error"
     assert payload["evidence_coverage"] == {
         "stage": "observed",
@@ -417,11 +420,10 @@ def test_complete_negative_verdict_is_product_evidence_not_a_canary_failure(
         {"stage_observed": False},
         {"causality_observed": False},
         {"server_evidence_state": "unobserved"},
-        {"answer_outcome": "guard-internal-terms"},
         {"product_outcome": "rejected"},
     ],
 )
-def test_optional_negative_verdict_cannot_hide_incomplete_or_terminal_evidence(
+def test_optional_negative_verdict_cannot_hide_incomplete_evidence(
     overrides: dict[str, Any],
 ) -> None:
     values: dict[str, Any] = {
@@ -449,10 +451,11 @@ def test_optional_negative_verdict_cannot_hide_incomplete_or_terminal_evidence(
 
     assert result.status == STATUS_FAIL
     assert result.exit_code == 4
-    assert result.reason in {"verdict-unsupported", "guard-internal-terms"}
+    assert result.reason == "verdict-unsupported"
 
 
-def test_terminal_clarification_outcome_is_not_masked_by_a_verdict_cause() -> None:
+@pytest.mark.parametrize("terminal_outcome", sorted(TERMINAL_ANSWER_OUTCOMES))
+def test_terminal_outcome_is_not_masked_by_a_verdict_cause(terminal_outcome: str) -> None:
     """A verdict cause must not hide the explicit #514 terminal stop path."""
     result = evaluate_canary(
         main_sha="2dabd809bbca23a3f67f29e14e86b0f7c1c06218",
@@ -463,7 +466,8 @@ def test_terminal_clarification_outcome_is_not_masked_by_a_verdict_cause() -> No
                 _scenario(
                     "substantive-drinking",
                     failure_cause="verdict-unsupported",
-                    answer_outcome="clarification-unavailable",
+                    failure_chain=("verdict-unsupported", terminal_outcome),
+                    answer_outcome=terminal_outcome,
                     product_outcome="service_error",
                 ),
             ),
@@ -476,7 +480,45 @@ def test_terminal_clarification_outcome_is_not_masked_by_a_verdict_cause() -> No
     )
 
     assert result.status == STATUS_FAIL
-    assert result.reason == "clarification-unavailable"
+    assert result.reason == terminal_outcome
+    assert result.exit_code == 4
+
+
+@pytest.mark.parametrize(
+    "later_cause",
+    [
+        "guard-internal-terms",
+        "verifier-unavailable",
+        "provider-timeout",
+        "provider-transient",
+    ],
+)
+def test_later_concrete_cause_is_not_masked_by_the_earliest_verdict(later_cause: str) -> None:
+    """A complete verdict must not hide a later guard/outage in its cause chain."""
+    result = evaluate_canary(
+        main_sha="2dabd809bbca23a3f67f29e14e86b0f7c1c06218",
+        run_id="550",
+        self_test=_self_test_ready(),
+        real_path=RealPathEvidence(
+            scenarios=(
+                _scenario(
+                    "substantive-drinking",
+                    failure_cause="verdict-unsupported",
+                    failure_chain=("verdict-unsupported", later_cause),
+                    answer_outcome="safety-blocked",
+                    product_outcome="service_error",
+                ),
+            ),
+            server_evidence=_server_evidence_ready(),
+        ),
+        preflight_budget_s=600.0,
+        live_probe_budget_s=300.0,
+        elapsed_s=65.3,
+        scenario_limit=2,
+    )
+
+    assert result.status == STATUS_FAIL
+    assert result.reason == later_cause
     assert result.exit_code == 4
 
 
