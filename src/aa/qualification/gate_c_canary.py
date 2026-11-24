@@ -38,7 +38,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from aa.conversation.answer_causality import KNOWN_REASONS
+from aa.conversation.answer_causality import (
+    KNOWN_REASONS,
+    TELEMETRY_CHAIN_KEY,
+    VERDICT_IRRELEVANT,
+    VERDICT_UNSUPPORTED,
+)
 from aa.conversation.answer_causality import UNKNOWN as UNKNOWN_FAILURE_CAUSE
 from aa.opencode.client import HttpOpenCodeClient
 from aa.opencode.observer import StallSnapshotObserver
@@ -99,6 +104,18 @@ REASON_EXTERNAL_UNOBSERVED = "external-progress-unobserved"
 REASON_FAILED_TYPED = "typed-product-path-failure"
 REASON_ERROR = "surface-error"
 
+PRODUCT_VERDICT_REASONS = frozenset({VERDICT_UNSUPPORTED, VERDICT_IRRELEVANT})
+"""Complete verifier verdicts about answer quality, not diagnostic wiring.
+
+A delivered turn whose verifier rejected every candidate (``unsupported``)
+or found the answer irrelevant proves that planner, retrieval, answer,
+verification and the typed telemetry chain really ran. The resulting
+service-error reply is a product-quality failure owned by the unchanged
+Gate C scorer, which still fails delivered service errors. Replaying the
+18-case campaign is therefore required, not skipped: the canary only stops
+for infrastructure/diagnostic causes that make that replay pointless.
+"""
+
 FAIL_CLOSED_REASONS = frozenset(KNOWN_REASONS - {UNKNOWN_FAILURE_CAUSE})
 """Every typed product failure cause, except the literal ``unknown``.
 
@@ -108,6 +125,19 @@ never promoted into a fabricated canary failure.
 """
 
 SERVICE_ERROR_DELIVERED = "service-error-delivered"
+
+# kodmial/aa#514 requires the preflight to stop on these explicit terminal
+# outcomes even when an earlier typed cause was a complete verifier verdict.
+# Otherwise a verdict-unsupported draft that later fell through to
+# ``clarification-unavailable`` would be misread as product-quality evidence
+# and authorize the 18-case campaign.
+TERMINAL_ANSWER_OUTCOMES = frozenset(
+    {
+        "conversational-generation-failed",
+        "clarification-unavailable",
+        "guard-internal-terms",
+    }
+)
 
 # Privacy: no prompt, reply, passage, session id or credential may enter
 # canary artifacts. The self-test embeds explicit sentinels in the fake
@@ -268,6 +298,10 @@ class ScenarioEvidence:
     answer_outcome: str = ""
     product_outcome: str = ""
     failure_cause: str = ""
+    # Bounded typed reasons from the turn's causal chain, earliest first.
+    # ``failure_cause`` alone is the earliest cause, so later guard/provider
+    # failures must remain visible to the preflight decision.
+    failure_chain: tuple[str, ...] = ()
     attempt_observed: bool = False
     stage_observed: bool = False
     causality_observed: bool = False
@@ -282,6 +316,7 @@ class ScenarioEvidence:
             "answer_outcome": _bounded(self.answer_outcome, 64),
             "product_outcome": _bounded(self.product_outcome, 64),
             "failure_cause": _bounded(self.failure_cause, 64),
+            "failure_chain": [_bounded(cause, 64) for cause in self.failure_chain],
             "attempt_observed": bool(self.attempt_observed),
             "stage_observed": bool(self.stage_observed),
             "causality_observed": bool(self.causality_observed),
@@ -1353,6 +1388,7 @@ async def run_real_path_scenarios(
                 snapshot = {}
             product_outcome, failure_reason = delivered_product_accounting(reply, snapshot)
             answer_outcome = _bounded(snapshot.get("answer_outcome", ""), 64)
+            failure_chain = _snapshot_failure_chain(snapshot)
             failure_cause = _bounded(
                 failure_reason or _snapshot_product_failure_reason(snapshot), 64
             )
@@ -1376,6 +1412,7 @@ async def run_real_path_scenarios(
                     answer_outcome=answer_outcome,
                     product_outcome=product_outcome,
                     failure_cause=failure_cause,
+                    failure_chain=failure_chain,
                     attempt_observed=attempt_observed,
                     stage_observed=stage_observed,
                     causality_observed=bool(matching),
@@ -1427,8 +1464,53 @@ async def run_real_path_scenarios(
 # ---------------------------------------------------------------------------
 
 
+def _snapshot_failure_chain(snapshot: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """Bounded typed cause reasons for one turn, earliest first."""
+    if not isinstance(snapshot, dict):
+        return ()
+    chain = snapshot.get(TELEMETRY_CHAIN_KEY)
+    if not isinstance(chain, list):
+        return ()
+    reasons: list[str] = []
+    for item in chain:
+        if not isinstance(item, dict):
+            continue
+        reason = _bounded(item.get("reason", ""), 64)
+        if reason:
+            reasons.append(reason)
+    return tuple(reasons)
+
+
 def _scenario_failure(scenario: ScenarioEvidence) -> str:
-    """Concrete typed failure of one real-path turn ("" when none)."""
+    """Concrete preflight-stopping failure of one real-path turn ("" when none)."""
+    if scenario.failure_cause in PRODUCT_VERDICT_REASONS:
+        # The verifier reached a complete negative product verdict. That is
+        # answer-quality evidence for Gate C, not a broken diagnostic chain;
+        # Gate C still fails the delivered service error on its own. An
+        # explicit terminal outcome still wins and stops the campaign.
+        if scenario.answer_outcome in TERMINAL_ANSWER_OUTCOMES:
+            return scenario.answer_outcome
+        # The earliest cause is not the whole story: a turn that first hit a
+        # negative verdict and then a local guard or provider/verifier outage
+        # during bounded repair must still stop the campaign (#514). Only the
+        # complete verdicts themselves are product evidence.
+        for cause in scenario.failure_chain:
+            if cause in PRODUCT_VERDICT_REASONS:
+                continue
+            if cause in FAIL_CLOSED_REASONS:
+                return cause
+        # Negative verdict evidence must describe a delivered, fully
+        # observed service-error turn, even on an optional probe.
+        if not (
+            scenario.delivered
+            and scenario.attempt_observed
+            and scenario.stage_observed
+            and scenario.causality_observed
+            and scenario.server_evidence_state == "supported"
+            and scenario.product_outcome == "service_error"
+        ):
+            return scenario.failure_cause
+        return ""
     if scenario.failure_cause in FAIL_CLOSED_REASONS:
         return scenario.failure_cause
     if not scenario.delivered:
@@ -1586,8 +1668,10 @@ def evaluate_canary(
                 if not scenario.causality_observed:
                     missing.append("real_path.causality_observed")
                 break
-        # A concrete typed failure on any attempted turn, required or
-        # optional, is real product-path evidence and must stop the campaign.
+        # A concrete preflight-stopping failure on any attempted turn,
+        # required or optional, is real evidence that the campaign cannot be
+        # trusted and must stop. Complete negative verifier verdicts stay
+        # product-quality evidence for Gate C instead.
         if status == STATUS_READY:
             for scenario in real_path.scenarios:
                 failure = _scenario_failure(scenario)
@@ -1773,6 +1857,7 @@ __all__ = [
     "EXIT_BY_STATUS",
     "FAIL_CLOSED_REASONS",
     "GateCCanaryError",
+    "PRODUCT_VERDICT_REASONS",
     "RealPathEvidence",
     "SCHEMA_VERSION",
     "SERVICE_ERROR_DELIVERED",
@@ -1782,6 +1867,7 @@ __all__ = [
     "STATUS_READY",
     "ScenarioEvidence",
     "SelfTestEvidence",
+    "TERMINAL_ANSWER_OUTCOMES",
     "assert_no_text_leak",
     "evaluate_canary",
     "observer_self_test",
