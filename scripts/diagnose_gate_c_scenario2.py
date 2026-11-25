@@ -18,6 +18,13 @@ runtime on the exact checked-out SHA:
   in-process Telegram ``getUpdates``/``sendMessage`` seam (NO external
   Telegram network) and the unchanged scenario #2 prompt.
 
+A separate opt-in mode (``--mode one-shot-ab``, kodmial/aa#553) is
+validation wiring only: it runs the same frozen production scenario #2
+twice, sequentially, with the explicit per-child
+``AA_RETRIEVAL_ONE_SHOT_FASTPATH=0`` then ``=1`` and the existing bounded
+canary budget. Its evidence supports a controller decision; it is never a
+qualification verdict and never changes a production default.
+
 kodmial/aa#424 policy (hard contract):
 
 - There is **NO per-answer wall-clock cutoff anywhere**: no 45s message
@@ -143,6 +150,8 @@ MIN_AB_PREFLIGHT_S = 60.0
 ONE_SHOT_FASTPATH_ENV = "AA_RETRIEVAL_ONE_SHOT_FASTPATH"
 AB_TRIGGER_FILE = "qualification/one_shot_retrieval_ab_553.trigger"
 AB_MARKER_PREFIX = "<!-- aa-one-shot-retrieval-ab-553"
+# Bounded per-call retrieval trace kept in the arm evidence (never text).
+MAX_AB_RETRIEVAL_CALLS = 16
 
 # kodmial/aa#424: campaign-level finite operational boundary (ONE ceiling for
 # both probes; there is NO per-answer wall-clock cutoff). Mirrors the AA
@@ -1612,6 +1621,22 @@ def _ab_budget(
     }
 
 
+def ab_cleanup_timeout_s(
+    *,
+    ab_mode: bool,
+    bootstrap_timeout_s: float,
+    budget: dict[str, float],
+) -> float:
+    """Teardown bound: the A/B arm keeps it inside the cleanup reserve.
+
+    The standalone scenario2 diagnostic keeps its original bootstrap bound;
+    an A/B arm must not spend the next arm's live budget on shutdown.
+    """
+    if ab_mode:
+        return max(1.0, float(budget.get("cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)))
+    return max(1.0, float(bootstrap_timeout_s))
+
+
 def _install_ab_retrieval_probe() -> tuple[dict[str, Any], Any]:
     """Capture the real retrieval call path without touching ``src/``.
 
@@ -1622,7 +1647,12 @@ def _install_ab_retrieval_probe() -> tuple[dict[str, Any], Any]:
     from aa.conversation import retrieval_node
 
     original = retrieval_node.aretrieve_with_semantic_selection
-    capture: dict[str, Any] = {"calls": 0, "metadata": {}, "error_type": ""}
+    capture: dict[str, Any] = {
+        "calls": 0,
+        "metadata": {},
+        "error_type": "",
+        "per_call": [],
+    }
 
     async def _wrapped(*args: Any, **kwargs: Any) -> Any:
         capture["calls"] = int(capture.get("calls", 0)) + 1
@@ -1633,7 +1663,35 @@ def _install_ab_retrieval_probe() -> tuple[dict[str, Any], Any]:
             raise
         try:
             metadata = dict(getattr(pack, "retrieval_metadata", {}) or {})
-            capture["metadata"] = retrieval_node.sanitize_retrieval_metadata(metadata)
+            safe = retrieval_node.sanitize_retrieval_metadata(metadata)
+            capture["metadata"] = safe
+            # The sanitizer intentionally drops the budget snapshot; keep
+            # only its bounded stage names (typed markers, never text).
+            budget_snapshot = metadata.get("turn_budget_snapshot")
+            if isinstance(budget_snapshot, dict):
+                stages = [
+                    str(item.get("stage", ""))[:64]
+                    for item in list(budget_snapshot.get("stages", []) or [])
+                    if isinstance(item, dict)
+                ]
+                capture["budget_stages"] = stages[:32]
+            per_call = capture.get("per_call")
+            if isinstance(per_call, list) and len(per_call) < MAX_AB_RETRIEVAL_CALLS:
+                per_call.append(
+                    {
+                        key: safe[key]
+                        for key in (
+                            "retrieval_mode",
+                            "fastpath_attempted",
+                            "fallback_reason",
+                            "LLM_call_count",
+                            "coverage_status",
+                            "selection_route",
+                            "total_ms",
+                        )
+                        if key in safe
+                    }
+                )
         except Exception:
             capture["metadata"] = {}
         return pack
@@ -1693,17 +1751,50 @@ def _ab_retrieval_evidence(capture: dict[str, Any] | None) -> dict[str, Any]:
     durations = metadata.get("provider_call_durations_ms")
     if isinstance(durations, list):
         safe["provider_call_durations_ms_count"] = len(durations)
-    budget_snapshot = metadata.get("turn_budget_snapshot")
-    if isinstance(budget_snapshot, dict):
-        stages = [
-            str(item.get("stage", ""))[:64]
-            for item in list(budget_snapshot.get("stages", []) or [])
-            if isinstance(item, dict)
+    per_call = capture.get("per_call")
+    if isinstance(per_call, list):
+        safe["call_trace"] = [
+            dict(item) for item in per_call[:MAX_AB_RETRIEVAL_CALLS] if isinstance(item, dict)
         ]
-        safe["budget_stages"] = stages[:32]
-        safe["provider_429"] = "provider_429" in stages
-        safe["provider_semantic_timeout"] = "provider_semantic_timeout" in stages
+        total_llm = 0
+        observed = False
+        for item in safe["call_trace"]:
+            count = item.get("LLM_call_count")
+            if isinstance(count, int):
+                total_llm += count
+                observed = True
+        if observed:
+            safe["llm_calls_total"] = total_llm
+    stages = capture.get("budget_stages")
+    if isinstance(stages, list):
+        bounded = [str(item)[:64] for item in stages[:32]]
+        safe["budget_stages"] = bounded
+        safe["provider_429"] = "provider_429" in bounded
+        safe["provider_semantic_timeout"] = "provider_semantic_timeout" in bounded
     return safe
+
+
+def _looks_like_provider_429(text: str) -> bool:
+    """Confirmed provider 429 marker (bounded, case-insensitive).
+
+    Accepts the shapes actually emitted by the existing audit: HTTP ``429``,
+    ``OpenCodeRateLimitError`` / ``rate-limit`` / ``rate_limit`` and the
+    provider phrase ``too many requests``.
+    """
+    folded = str(text or "").casefold()
+    return (
+        "429" in folded
+        or "ratelimit" in folded
+        or "rate_limit" in folded
+        or "rate-limit" in folded
+        or "too many requests" in folded
+    )
+
+
+def _looks_like_active_backoff(text: str) -> bool:
+    """Active retry/backoff marker from the existing audit categories."""
+    folded = str(text or "").casefold()
+    return "backoff" in folded or "retry" in folded
 
 
 def _ab_attempt_summary(
@@ -1721,9 +1812,7 @@ def _ab_attempt_summary(
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        agent = str(entry.get("audit_agent") or entry.get("agent") or "")[:64]
-        if not agent:
-            continue
+        agent = str(entry.get("audit_agent") or entry.get("agent") or "unknown")[:64]
         total += 1
         bucket = by_agent.setdefault(
             agent,
@@ -1762,15 +1851,14 @@ def _ab_attempt_summary(
         combined = (failure + " " + error_kind).casefold()
         if failure and failure not in failure_categories:
             failure_categories.append(failure)
-        if "429" in combined or "ratelimit" in combined or "rate_limit" in combined:
+        if _looks_like_provider_429(combined):
             provider_429 = True
-        if "backoff" in combined or "retry" in combined:
+        if _looks_like_active_backoff(combined):
             active_backoff = True
     for failure in failure_categories:
-        folded = failure.casefold()
-        if "429" in folded or "ratelimit" in folded or "rate_limit" in folded:
+        if _looks_like_provider_429(failure):
             provider_429 = True
-        if "backoff" in folded:
+        if _looks_like_active_backoff(failure):
             active_backoff = True
     return {
         "present": bool(entries),
@@ -2025,7 +2113,9 @@ def _emit_ab_arm_result(
             "reply_signature": "",
         }
     provider_429 = bool(retrieval.get("provider_429") or attempt_summary.get("provider_429"))
-    active_backoff = bool(attempt_summary.get("active_backoff") or provider_429)
+    # Keep the two typed markers independent in evidence; the stop logic
+    # already treats a confirmed 429 as terminal on its own.
+    active_backoff = bool(attempt_summary.get("active_backoff"))
     payload: dict[str, Any] = {
         "arm": arm,
         "probe": probe_label,
@@ -2341,7 +2431,15 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
                         pass
             if ab_original is not None:
                 _restore_ab_retrieval_probe(ab_original)
-        stopped = await _bounded_async_stop(app, bootstrap_timeout)
+        # The A/B arm keeps teardown inside the existing cleanup reserve so
+        # one arm can never consume the other arm's live budget. The
+        # standalone scenario2 diagnostic keeps its original bound.
+        stop_timeout_s = ab_cleanup_timeout_s(
+            ab_mode=ab_mode,
+            bootstrap_timeout_s=bootstrap_timeout,
+            budget=ab_budget,
+        )
+        stopped = await _bounded_async_stop(app, stop_timeout_s)
         anchor.set()
         sink.emit("child-exit", probe=probe_label, exit_code=exit_code, cleanup_done=stopped)
         watchdog.stop()
@@ -2513,9 +2611,9 @@ class IssueProgressPublisher:
                 raise ValueError("comment body carries a text-keyed line")
         except ValueError:
             body = "- text-free renditions only:\n- [text suppressed by sanitizer]\n"
-            stamped = f"{comment_marker(self.run_id)}\n**{safe_title}**\n\n{body}\n"
+            stamped = f"{self.marker}\n**{safe_title}**\n\n{body}\n"
         now = time.monotonic()
-        if now - self._last_post < self.MIN_INTERVAL_S:
+        if not force and now - self._last_post < self.MIN_INTERVAL_S:
             return True
         self._last_post = now
         comment_id = self.ensure_comment()
@@ -3399,7 +3497,13 @@ def _evidence_dict(evidence: ProbeEvidence) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _ab_arm_fallback(evidence: ProbeEvidence, arm: str) -> dict[str, Any]:
+def _ab_arm_fallback(
+    evidence: ProbeEvidence,
+    arm: str,
+    *,
+    scenario: dict[str, Any] | None = None,
+    budget: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Explicit unknown arm evidence when the child emitted no A/B result.
 
     Nothing is inferred: absent telemetry stays missing and the arm can never
@@ -3416,8 +3520,8 @@ def _ab_arm_fallback(evidence: ProbeEvidence, arm: str) -> dict[str, Any]:
         "env_flag_raw": "",
         "expected_env_flag": expected_ab_env_flag(arm),
         "effective_flag": None,
-        "scenario": ab_scenario_identity(),
-        "budget": _ab_budget(),
+        "scenario": dict(scenario) if scenario else ab_scenario_identity(),
+        "budget": dict(budget) if budget else _ab_budget(),
         "preflight_elapsed_ms": None,
         "live_elapsed_ms": evidence.delivered_elapsed_ms,
         "delivery_ms": evidence.delivered_elapsed_ms,
@@ -3493,6 +3597,16 @@ def _ab_arm_report_lines(arm: dict[str, Any]) -> list[str]:
         lines.append(f"- retrieval_llm_call_count: {retrieval['LLM_call_count']}")
     if "calls_observed" in retrieval:
         lines.append(f"- retrieval_calls_observed: {retrieval['calls_observed']}")
+    call_trace = retrieval.get("call_trace")
+    if isinstance(call_trace, list) and call_trace:
+        modes = ", ".join(
+            str(item.get("retrieval_mode", "unknown"))[:32]
+            for item in call_trace
+            if isinstance(item, dict)
+        )
+        lines.append(f"- retrieval_call_modes: `{modes}`")
+    if "llm_calls_total" in retrieval:
+        lines.append(f"- retrieval_llm_calls_total: {retrieval['llm_calls_total']}")
     lines.append(f"- model_http_attempts: {attempts.get('model_http_attempts', 'unobserved')}")
     lines.append(f"- attempts_by_agent: {agent_counts or 'unobserved'}")
     for key in (
@@ -3781,7 +3895,7 @@ def _parent_ab_main(
             arm_result = (
                 dict(evidence.ab_result)
                 if isinstance(evidence.ab_result, dict) and evidence.ab_result
-                else _ab_arm_fallback(evidence, arm)
+                else _ab_arm_fallback(evidence, arm, scenario=scenario, budget=budget)
             )
             arm_result["arm"] = arm
             arm_result["probe"] = probe_label
@@ -3817,7 +3931,9 @@ def _parent_ab_main(
                 + "\n"
                 + report
             )
-        publisher.publish(f"One-shot retrieval A/B {status}", body)
+        # force: the terminal A/B evidence must never be throttled away, even
+        # when both arms finish inside the progress-comment interval.
+        publisher.publish(f"One-shot retrieval A/B {status}", body, force=True)
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
     if step_summary:
         try:

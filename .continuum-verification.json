@@ -4,11 +4,11 @@
     "commands": [
       {
         "command": "bash scripts/verify.sh",
-        "duration_ms": 226471,
+        "duration_ms": 285839,
         "exit_code": 0,
         "name": "validation",
-        "output_sha256": "cd39c4061361c9c679337aa4a97376e99970ec14ff7f36de8b0c03e7d22a4bc8",
-        "output_tail": "langgraph.constants is deprecated. Please use 'from langgraph.types import Send' instead. Deprecated in LangGraph V1.0 to be removed in V2.0.\n    from langgraph.constants import Send\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type swigvarlink has no __module__ attribute\n\ntests/test_aa_retrieval_qualification.py::test_all_evidence_resolves_to_exact_ru\ntests/test_aa_retrieval_qualification.py::test_all_evidence_resolves_to_exact_ru\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/huggingface_hub/file_download.py:1727: DeprecationWarning: hf_xet.download_files() is deprecated. Use XetSession().new_file_download_group().start_download_file() instead.\n    xet_get(\n\ntests/test_graph_foundation.py::test_langmem_node_compacts_when_trigger_hit\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/langmem/short_term/summarization.py:246: RuntimeWarning: Failed to trim messages to fit within max_tokens limit before summarization - falling back to the original message list. This may lead to exceeding the context window of the summarization LLM.\n    warnings.warn(\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/typer/__init__.py:24: DeprecationWarning: 'click.utils.get_binary_stream' is deprecated and will be removed in Click 9.0.\n    from click.utils import get_binary_stream as get_binary_stream\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/typer/__init__.py:25: DeprecationWarning: 'click.utils.get_text_stream' is deprecated and will be removed in Click 9.0.\n    from click.utils import get_text_stream as get_text_stream\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/spacy/cli/_util.py:23: DeprecationWarning: Importing 'parser.split_arg_string' is deprecated, it will only be available in 'shell_completion' in Click 9.0.\n    from click.parser import split_arg_string\n\ntests/test_p0_411_qualification_watchdog.py: 5 warnings\ntests/test_p0_412_no_artificial_timeouts.py: 2 warnings\ntests/test_p0_417_gate_c_stall_recovery.py: 2 warnings\ntests/test_p0_427_gate_c_infrastructure_timeout.py: 6 warnings\ntests/test_p0_453_http_fake_server_kill.py: 1 warning\ntests/test_p0_453_watchdog_integration.py: 1 warning\ntests/test_qualification_gate_split.py: 2 warnings\n  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=3254) is multi-threaded, use of fork() may lead to deadlocks in the child.\n    self.pid = os.fork()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2999 passed, 2 skipped, 29 warnings in 193.70s (0:03:13)\n[gate-a-shell] a-shell-pytest PASS exit=0 duration_ms=196010\n[gate-a-shell] a-shell-ruff-check\nAll checks passed!\n[gate-a-shell] a-shell-ruff-check PASS exit=0 duration_ms=25\n[gate-a-shell] a-shell-ruff-format\n406 files already formatted\n[gate-a-shell] a-shell-ruff-format PASS exit=0 duration_ms=25\n[gate-a-shell] a-shell-mypy\nSuccess: no issues found in 341 source files\n[gate-a-shell] a-shell-mypy PASS exit=0 duration_ms=28816\n{\"checks\": 5, \"failed_checks\": [], \"out\": \"/tmp/aa-gate-a-shell-results-canonical.json\", \"profile\": \"canonical\"}\n",
+        "output_sha256": "6b50ca1224d2148e146cc77accee3cf402ff2d28793c7a164e02994f7be5b84c",
+        "output_tail": "langgraph.constants is deprecated. Please use 'from langgraph.types import Send' instead. Deprecated in LangGraph V1.0 to be removed in V2.0.\n    from langgraph.constants import Send\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute\n\ntests/test_aa_production_canary.py::test_compact_canary_passes_hermetically\n  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type swigvarlink has no __module__ attribute\n\ntests/test_aa_retrieval_qualification.py::test_all_evidence_resolves_to_exact_ru\ntests/test_aa_retrieval_qualification.py::test_all_evidence_resolves_to_exact_ru\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/huggingface_hub/file_download.py:1727: DeprecationWarning: hf_xet.download_files() is deprecated. Use XetSession().new_file_download_group().start_download_file() instead.\n    xet_get(\n\ntests/test_graph_foundation.py::test_langmem_node_compacts_when_trigger_hit\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/langmem/short_term/summarization.py:246: RuntimeWarning: Failed to trim messages to fit within max_tokens limit before summarization - falling back to the original message list. This may lead to exceeding the context window of the summarization LLM.\n    warnings.warn(\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/typer/__init__.py:24: DeprecationWarning: 'click.utils.get_binary_stream' is deprecated and will be removed in Click 9.0.\n    from click.utils import get_binary_stream as get_binary_stream\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/typer/__init__.py:25: DeprecationWarning: 'click.utils.get_text_stream' is deprecated and will be removed in Click 9.0.\n    from click.utils import get_text_stream as get_text_stream\n\ntests/test_p0_2_ram_substrate.py::test_frozen_fixture_runs_against_both_and_selects_deterministically\n  /home/runner/work/_temp/aa-verification-py312/lib/python3.12/site-packages/spacy/cli/_util.py:23: DeprecationWarning: Importing 'parser.split_arg_string' is deprecated, it will only be available in 'shell_completion' in Click 9.0.\n    from click.parser import split_arg_string\n\ntests/test_p0_411_qualification_watchdog.py: 5 warnings\ntests/test_p0_412_no_artificial_timeouts.py: 2 warnings\ntests/test_p0_417_gate_c_stall_recovery.py: 2 warnings\ntests/test_p0_427_gate_c_infrastructure_timeout.py: 6 warnings\ntests/test_p0_453_http_fake_server_kill.py: 1 warning\ntests/test_p0_453_watchdog_integration.py: 1 warning\ntests/test_qualification_gate_split.py: 2 warnings\n  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=3458) is multi-threaded, use of fork() may lead to deadlocks in the child.\n    self.pid = os.fork()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2999 passed, 2 skipped, 29 warnings in 233.65s (0:03:53)\n[gate-a-shell] a-shell-pytest PASS exit=0 duration_ms=237513\n[gate-a-shell] a-shell-ruff-check\nAll checks passed!\n[gate-a-shell] a-shell-ruff-check PASS exit=0 duration_ms=32\n[gate-a-shell] a-shell-ruff-format\n406 files already formatted\n[gate-a-shell] a-shell-ruff-format PASS exit=0 duration_ms=31\n[gate-a-shell] a-shell-mypy\nSuccess: no issues found in 341 source files\n[gate-a-shell] a-shell-mypy PASS exit=0 duration_ms=45703\n{\"checks\": 5, \"failed_checks\": [], \"out\": \"/tmp/aa-gate-a-shell-results-canonical.json\", \"profile\": \"canonical\"}\n",
         "source": "CONTINUUM_VALIDATION_COMMAND"
       }
     ],
@@ -30,8 +30,8 @@
     "failed_commands": [],
     "head_sha": "f8e473dddf88c0c0717fe1ef48807dbd6d1397ce",
     "phase": "baseline",
-    "previous_environment_fingerprint": "c8d31bdfb792d934360f9cda7cd45247dc30c22b237c5be128a0f3dd6aa9b5e6",
-    "recorded_at": "2026-11-25T21:38:41Z",
+    "previous_environment_fingerprint": "c5c88713c98cd19d41895fbbc2c66e38b209da25fd440d41e5dce012c78660bb",
+    "recorded_at": "2026-11-25T22:08:39Z",
     "state": "passed"
   },
   "contract": {
@@ -50,21 +50,21 @@
   "resume_provenance": {
     "base_ref": "main",
     "base_sha": "f8e473dddf88c0c0717fe1ef48807dbd6d1397ce",
-    "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue553-gen-1",
-    "checkpoint_sha": "f40352bc7eb66e10244326a20d8d3c2c0ad128f8",
+    "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue553-gen-2",
+    "checkpoint_sha": "522e51142de684db2a76c00b4e741634be9cab6d",
     "evidence_file": ".continuum-verification.json",
-    "evidence_sha256": "3fd4780f5d2e3cd046c0481aebc337b3b7a277078d172969bdd046d927356a2c",
+    "evidence_sha256": "87fc5a9369aa89c06135f38edeb6f91889bf654f1418b9612505990fb91ecf6a",
     "legacy_evidence_untrusted": true,
     "metadata_file": ".continuum-429-recovery.json",
-    "metadata_sha256": "c55d75e3fd98f01afdcea68bff786bb4d26e42fa9115e4c39f0a8507c5ef0a1d",
+    "metadata_sha256": "c9d7ecb1e7f2ec0c02ad690e63551c426a71a04c352225433151ceee12de219e",
     "operation": "opencode-429-issue-issue553",
     "request": {
       "base_sha": "f8e473dddf88c0c0717fe1ef48807dbd6d1397ce",
-      "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue553-gen-1",
-      "checkpoint_sha": "f40352bc7eb66e10244326a20d8d3c2c0ad128f8",
-      "generation": 1,
+      "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue553-gen-2",
+      "checkpoint_sha": "522e51142de684db2a76c00b4e741634be9cab6d",
+      "generation": 2,
       "issue": 553,
-      "latest_generation": 1,
+      "latest_generation": 2,
       "mode": "issue",
       "operation": "opencode-429-issue-issue553",
       "repository": "kodmial/aa",

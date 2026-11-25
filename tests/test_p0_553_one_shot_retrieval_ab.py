@@ -20,6 +20,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -72,6 +73,7 @@ def _complete_arm(diag: Any, arm: str) -> dict[str, Any]:
             "fallback_reason": "",
             "coverage_status": "covered",
             "LLM_call_count": 1,
+            "total_tokens": 1234,
         },
         "attempts": {
             "present": True,
@@ -196,6 +198,38 @@ def test_spawn_child_sets_only_its_arm_flag(
     assert diag.ONE_SHOT_FASTPATH_ENV not in diag.os.environ
 
 
+def test_retrieval_evidence_records_per_call_trace(diag: Any) -> None:
+    capture = {
+        "calls": 3,
+        "metadata": {
+            "retrieval_mode": "one_shot",
+            "fastpath_attempted": True,
+            "fallback_reason": "",
+            "coverage_status": "covered",
+            "LLM_call_count": 1,
+            "total_tokens": 100,
+        },
+        "per_call": [
+            {"retrieval_mode": "one_shot", "LLM_call_count": 1},
+            {"retrieval_mode": "legacy", "LLM_call_count": 2},
+        ],
+        "budget_stages": ["provider_429"],
+        "error_type": "",
+    }
+    evidence = diag._ab_retrieval_evidence(capture)
+    assert evidence["calls_observed"] == 3
+    assert len(evidence["call_trace"]) == 2
+    assert evidence["llm_calls_total"] == 3
+    assert evidence["provider_429"] is True
+    assert evidence["retrieval_mode"] == "one_shot"
+    assert evidence["fastpath_attempted"] is True
+    # Missing capture stays explicit and never invents a path.
+    empty = diag._ab_retrieval_evidence(None)
+    assert empty["calls_observed"] == 0
+    assert empty["metadata_present"] is False
+    assert "retrieval_mode" not in empty
+
+
 def test_ab_identity_is_identical_for_both_arms(diag: Any) -> None:
     scenario = diag.ab_scenario_identity()
     first = diag.ab_config_identity("provider/primary", "provider/fallback")
@@ -221,6 +255,22 @@ def test_ab_budget_matches_existing_canary_and_is_bounded(diag: Any) -> None:
     clamped = diag._ab_budget(1.0, 1.0, 999.0)
     assert clamped["cleanup_reserve_s"] <= clamped["live_budget_s"] / 4.0
     assert clamped["live_model_budget_s"] >= 1.0
+
+
+def test_ab_cleanup_stays_inside_the_reserve(diag: Any) -> None:
+    budget = diag._ab_budget()
+    # The A/B arm shuts down inside its cleanup reserve, so one arm cannot
+    # spend the other arm's live budget. The standalone diagnostic keeps
+    # its original bootstrap bound.
+    assert (
+        diag.ab_cleanup_timeout_s(ab_mode=True, bootstrap_timeout_s=600.0, budget=budget)
+        == budget["cleanup_reserve_s"]
+    )
+    assert (
+        diag.ab_cleanup_timeout_s(ab_mode=False, bootstrap_timeout_s=600.0, budget=budget) == 600.0
+    )
+    # live observation + teardown never exceed the per-arm live budget.
+    assert budget["live_model_budget_s"] + budget["cleanup_reserve_s"] == 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +333,30 @@ def test_stop_before_on_arm_on_failure(diag: Any, update: dict[str, Any], expect
     assert reason == ""
 
 
+def test_confirmed_429_and_backoff_markers_are_recognized(diag: Any) -> None:
+    for marker in (
+        "http=429",
+        "OpenCodeRateLimitError",
+        "rate-limit",
+        "rate_limit",
+        "Too Many Requests",
+    ):
+        assert diag._looks_like_provider_429(marker) is True
+    assert diag._looks_like_provider_429("OpenCodeTimeoutError") is False
+    assert diag._looks_like_active_backoff("backoff") is True
+    assert diag._looks_like_active_backoff("retry-exhausted") is True
+    assert diag._looks_like_active_backoff("completed") is False
+    summary = diag._ab_attempt_summary(
+        [],
+        [
+            {"failure_category": "OpenCodeRateLimitError"},
+            {"failure_category": "backoff"},
+        ],
+    )
+    assert summary["provider_429"] is True
+    assert summary["active_backoff"] is True
+
+
 def test_classification_blocks_or_stays_inconclusive(diag: Any) -> None:
     off = _complete_arm(diag, diag.AB_ARM_OFF)
     assert (
@@ -316,6 +390,26 @@ def test_durable_complete_marker_deduplicates_same_sha_and_config(diag: Any) -> 
     assert not diag.ab_already_complete(_Publisher(marker), "b" * 40, config["config_digest"])
     assert not diag.ab_already_complete(_Publisher(marker), "a" * 40, "different-config")
     assert not diag.ab_already_complete(_Publisher("no marker"), "a" * 40, "x")
+
+
+def test_terminal_ab_report_is_never_throttled(diag: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    publisher = diag.IssueProgressPublisher(
+        "owner", "repo", diag.AB_ISSUE, "token", "12345", marker="<!-- ab-test -->"
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_request(method: str, path: str, body: Any = None) -> tuple[bool, Any]:
+        calls.append((method, path))
+        return True, {"id": 7}
+
+    monkeypatch.setattr(publisher, "_request", fake_request)
+    publisher._last_post = time.monotonic()
+    # Throttled progress update: no request is issued.
+    assert publisher.publish("progress", "- safe", force=False) is True
+    assert calls == []
+    # The terminal evidence is forced through even inside the interval.
+    assert publisher.publish("final", "- safe", force=True) is True
+    assert any(method == "POST" for method, _path in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +557,11 @@ def test_ab_evidence_contains_no_raw_text_or_secrets(diag: Any, tmp_path: pathli
     assert "SECRET_RAW_REPLY_TEXT" not in rendered
     assert "session_id" not in rendered
     assert "TELEGRAM_BOT_TOKEN" not in rendered
-    assert "token" not in rendered.casefold()
+    # Token *counts* are legitimate observed metrics; credentials are not.
+    assert "bot_token" not in rendered.casefold()
+    assert "authorization" not in rendered.casefold()
+    assert "bearer " not in rendered.casefold()
+    assert "private_key" not in rendered.casefold()
     # The complete status is evidence-only and explicitly not a product PASS.
     assert "NOT a product PASS" in report
     assert "not a qualification verdict" in report.casefold()
