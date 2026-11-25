@@ -142,6 +142,11 @@ def test_workflow_keeps_existing_scenario2_and_adds_opt_in_ab(
     assert '"src/aa/**"' not in workflow_text
     # No separate bot/token is introduced for the A/B.
     assert "TELEGRAM_BOT_TOKEN" not in workflow_text
+    # The A/B never publishes the scenario2 declared-identity marker on #419.
+    assert (
+        "if: steps.sha.conclusion == 'success' && steps.mode.outputs.mode == 'scenario2'"
+        in workflow_text
+    )
 
 
 def test_workflow_mode_selector_is_narrow(workflow_text: str) -> None:

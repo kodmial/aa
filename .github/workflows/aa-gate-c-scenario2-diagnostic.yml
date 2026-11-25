@@ -146,8 +146,12 @@ jobs:
       # requested target_sha, so the run publishes the exact SHA it checked
       # out to the AA-owned operations tracker as a durable marker. The
       # post-run reconciler binds artifact evidence to that declared SHA.
+      # kodmial/aa#553: only the scenario2 diagnostic declares this identity.
+      # The A/B run is validation-only and identifies itself through its
+      # separate artifact and #553 report, so it must not add a scenario2
+      # marker to #419.
       - name: Publish declared exact-SHA run identity
-        if: steps.sha.conclusion == 'success'
+        if: steps.sha.conclusion == 'success' && steps.mode.outputs.mode == 'scenario2'
         uses: actions/github-script@v7
         with:
           script: |

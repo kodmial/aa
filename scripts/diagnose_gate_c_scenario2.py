@@ -2728,6 +2728,10 @@ class ProbePlan:
     ab_live_budget_s: float = DEFAULT_AB_LIVE_BUDGET_S
     ab_preflight_budget_s: float = DEFAULT_AB_PREFLIGHT_BUDGET_S
     ab_cleanup_reserve_s: float = DEFAULT_AB_CLEANUP_RESERVE_S
+    # The A/B arm's bootstrap is bounded by the existing canary preflight
+    # budget, not the shorter standalone probe default. The standalone
+    # scenario2 probe keeps its own default when this is not set.
+    probe_b_bootstrap_timeout_s: float = DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
 
 
 def effective_campaign_allowance_s(
@@ -2777,6 +2781,7 @@ def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
             "ab_live_budget_s": plan.ab_live_budget_s,
             "ab_preflight_budget_s": plan.ab_preflight_budget_s,
             "ab_cleanup_reserve_s": plan.ab_cleanup_reserve_s,
+            "probe_b_bootstrap_timeout_s": plan.probe_b_bootstrap_timeout_s,
         }
     )
     env = os.environ.copy()
@@ -2819,7 +2824,8 @@ def child_argv_from_env() -> dict[str, Any]:
             or DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S
         ),
         "probe_b_bootstrap_timeout_s": float(
-            os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
+            decoded.get("probe_b_bootstrap_timeout_s")
+            or os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
             or DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
         ),
         "ab_mode": bool(decoded.get("ab_mode", False)),
@@ -3896,6 +3902,7 @@ def _parent_ab_main(
                     ab_live_budget_s=float(budget["live_budget_s"]),
                     ab_preflight_budget_s=float(budget["preflight_budget_s"]),
                     ab_cleanup_reserve_s=float(budget["cleanup_reserve_s"]),
+                    probe_b_bootstrap_timeout_s=float(budget["preflight_budget_s"]),
                 ),
                 out_dir=out_dir,
                 sink=sink,
