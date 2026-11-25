@@ -60,6 +60,16 @@ def artifact_name_for_run(run_id: int | str) -> str:
     return f"aa-gate-c-scenario2-diagnostic-{run_id}-scenario2"
 
 
+def one_shot_ab_artifact_name_for_run(run_id: int | str) -> str:
+    """Artifact name of the validation-only #553 one-shot retrieval A/B run.
+
+    The A/B reuses the diagnostic workflow, so the reconciler must be able
+    to recognize its artifact and never mistake the A/B run for a missing
+    scenario #2 diagnostic artifact.
+    """
+    return f"aa-gate-c-scenario2-diagnostic-{run_id}-one-shot-ab"
+
+
 # Artifact members consumed by the reconciler. ``final-report.md`` is an
 # expected pointer target; the other three are REQUIRED telemetry.
 REQUIRED_RESULT_MEMBER = "result.json"

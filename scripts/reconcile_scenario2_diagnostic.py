@@ -169,17 +169,45 @@ def collect_main_sha(owner: str, repo: str) -> str:
     return triage.normalize_sha(sha)
 
 
+class OneShotABRun(Exception):
+    """Selected workflow run is the validation-only #553 one-shot A/B.
+
+    The A/B deliberately reuses the diagnostic workflow, so its run is
+    visible to this reconciler. It is not a scenario #2 diagnostic: it has
+    no scenario2 artifact, no scenario2 schema and no qualification meaning.
+    Recognizing it here keeps it out of the #419 triage/repair path.
+    """
+
+
 def collect_artifact(owner: str, repo: str, run_id: int) -> tuple[int | None, bool]:
-    """(`artifact_id`, `expired`) for the AA-owned diagnostic artifact."""
+    """(`artifact_id`, `expired`) for the AA-owned diagnostic artifact.
+
+    Raises :class:`OneShotABRun` when this run published only the
+    validation-only one-shot A/B artifact. That run is never reconciled as
+    a scenario #2 diagnostic (never a missing-evidence repair).
+    """
     payload = _gh_api_json([f"repos/{owner}/{repo}/actions/runs/{run_id}/artifacts"])
     items = payload.get("artifacts") if isinstance(payload, dict) else []
     expected = triage.artifact_name_for_run(run_id)
+    ab_expected = triage.one_shot_ab_artifact_name_for_run(run_id)
+    saw_one_shot_ab = False
     for item in items or []:
-        if not isinstance(item, dict) or str(item.get("name", "")) != expected:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", ""))
+        if name == ab_expected:
+            saw_one_shot_ab = True
+            continue
+        if name != expected:
             continue
         artifact_id = item.get("id")
         if isinstance(artifact_id, int) and artifact_id > 0:
             return artifact_id, bool(item.get("expired", False))
+    if saw_one_shot_ab:
+        raise OneShotABRun(
+            f"run {run_id} published the validation-only one-shot A/B artifact; "
+            "not a scenario2 diagnostic"
+        )
     return None, False
 
 
@@ -539,7 +567,24 @@ def _reconcile_selected_run(
         )
         summary["artifact"] = {"source": "local", "name": artifact_name}
     else:
-        artifact_id, expired = collect_artifact(args.owner, args.repo, run.run_id)
+        try:
+            artifact_id, expired = collect_artifact(args.owner, args.repo, run.run_id)
+        except OneShotABRun:
+            # Validation-only A/B run: it is not a scenario2 diagnostic, so
+            # it must never produce a #419 triage comment or repair issue.
+            summary["artifact"] = {
+                "source": "one-shot-ab",
+                "name": triage.one_shot_ab_artifact_name_for_run(run.run_id),
+            }
+            summary["skipped"] = "one-shot-ab-validation-run"
+            return triage.TriageOutcome(
+                triage.OUTCOME_INCONCLUSIVE,
+                "",
+                detail=(
+                    "validation-only one-shot retrieval A/B run "
+                    "(kodmial/aa#553); not a scenario2 diagnostic"
+                ),
+            )
         if artifact_id is not None and not expired:
             outcome, timeline, gaps, crossings, banner = evaluate_artifact(
                 download_artifact(args.owner, args.repo, artifact_id), run

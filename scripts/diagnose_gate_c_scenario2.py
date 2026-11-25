@@ -1748,6 +1748,14 @@ def _ab_retrieval_evidence(capture: dict[str, Any] | None) -> dict[str, Any]:
         value = metadata.get(key)
         if isinstance(value, (str, int, float, bool)):
             safe[key] = value
+    # Derive readiness only from the observed executed path: ``one_shot`` is
+    # recorded exclusively when the single coverage call fully verified the
+    # prepared pack. An attempted-but-not-ready fast path is explicit.
+    if "retrieval_mode" in safe:
+        if str(safe["retrieval_mode"]) == "one_shot":
+            safe["fastpath_ready"] = True
+        elif safe.get("fastpath_attempted") is True:
+            safe["fastpath_ready"] = False
     durations = metadata.get("provider_call_durations_ms")
     if isinstance(durations, list):
         safe["provider_call_durations_ms_count"] = len(durations)
@@ -1826,9 +1834,10 @@ def _ab_attempt_summary(
             },
         )
         bucket["attempts"] = int(bucket["attempts"]) + 1
-        state = str(entry.get("state", ""))[:32]
-        if state in ("completed", "failed", "cancelled", "in_flight"):
-            bucket[state] = int(bucket[state]) + 1
+        # The attempt ledger records the hyphenated ``in-flight`` state.
+        state = str(entry.get("state", "")).replace("-", "_")[:32]
+        if state in ("completed", "failed", "cancelled", "aborted", "in_flight"):
+            bucket[state] = int(bucket.get(state, 0)) + 1
         latency = entry.get("latency_ms")
         if isinstance(latency, (int, float)):
             bucket["latency_ms_total"] = round(
@@ -3591,6 +3600,7 @@ def _ab_arm_report_lines(arm: dict[str, Any]) -> list[str]:
         lines.append(f"- typed_failure: `{str(arm['typed_failure'])[:64]}`")
     lines.append(f"- retrieval_mode: `{retrieval.get('retrieval_mode', 'unobserved')}`")
     lines.append(f"- fastpath_attempted: `{retrieval.get('fastpath_attempted', 'unobserved')}`")
+    lines.append(f"- fastpath_ready: `{retrieval.get('fastpath_ready', 'unobserved')}`")
     lines.append(f"- fallback_reason: `{retrieval.get('fallback_reason', '')}`")
     lines.append(f"- coverage_status: `{retrieval.get('coverage_status', 'unobserved')}`")
     if "LLM_call_count" in retrieval:

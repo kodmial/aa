@@ -29,6 +29,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "diagnose_gate_c_scenario2.py"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "aa-gate-c-scenario2-diagnostic.yml"
 TRIGGER_PATH = REPO_ROOT / "qualification" / "one_shot_retrieval_ab_553.trigger"
+RECONCILER_PATH = REPO_ROOT / "scripts" / "reconcile_scenario2_diagnostic.py"
 
 
 @pytest.fixture(scope="module")
@@ -45,6 +46,17 @@ def diag() -> Any:
 @pytest.fixture(scope="module")
 def workflow_text() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def reconciler() -> Any:
+    module_name = "reconcile_scenario2_diagnostic_553"
+    spec = importlib.util.spec_from_file_location(module_name, str(RECONCILER_PATH))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _complete_arm(diag: Any, arm: str) -> dict[str, Any]:
@@ -150,6 +162,97 @@ def test_trigger_file_is_validation_only() -> None:
     assert "never changes the" in text
 
 
+def test_ab_artifact_is_marked_before_the_script_runs(workflow_text: str) -> None:
+    # The marker step is bounded to the A/B mode and runs before the long
+    # setup, so the A/B artifact exists even when the script fails early.
+    assert "Mark one-shot A/B validation run" in workflow_text
+    assert "ab-run-marker.json" in workflow_text
+    marker_step = workflow_text.index("Mark one-shot A/B validation run")
+    setup_step = workflow_text.index("Restore offline canonical corpus")
+    assert marker_step < setup_step
+
+
+def test_scenario2_reconciler_skips_the_ab_validation_run(
+    reconciler: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aa.control import scenario2_triage as triage
+
+    run_id = 424242
+    assert (
+        triage.one_shot_ab_artifact_name_for_run(run_id)
+        == f"aa-gate-c-scenario2-diagnostic-{run_id}-one-shot-ab"
+    )
+    monkeypatch.setattr(
+        reconciler,
+        "_gh_api_json",
+        lambda args: {
+            "artifacts": [
+                {
+                    "id": 7,
+                    "name": triage.one_shot_ab_artifact_name_for_run(run_id),
+                    "expired": False,
+                }
+            ]
+        },
+    )
+    with pytest.raises(reconciler.OneShotABRun):
+        reconciler.collect_artifact("kodmial", "aa", run_id)
+
+    # A real scenario2 artifact still reconciles exactly as before.
+    monkeypatch.setattr(
+        reconciler,
+        "_gh_api_json",
+        lambda args: {
+            "artifacts": [{"id": 9, "name": triage.artifact_name_for_run(run_id), "expired": False}]
+        },
+    )
+    assert reconciler.collect_artifact("kodmial", "aa", run_id) == (9, False)
+
+
+def test_ab_run_never_posts_triage_or_repair_issue(
+    reconciler: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aa.control import scenario2_triage as triage
+
+    run = triage.DiagnosticRun(
+        run_id=424243,
+        head_sha="a" * 40,
+        event="push",
+        status="completed",
+        conclusion="success",
+        created_at=None,
+        updated_at=None,
+        run_number=1,
+    )
+    monkeypatch.setattr(
+        reconciler,
+        "collect_artifact",
+        lambda owner, repo, run_id: (_ for _ in ()).throw(reconciler.OneShotABRun("ab")),
+    )
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("A/B run must not touch the scenario2 triage path")
+
+    monkeypatch.setattr(reconciler, "post_triage_comment", forbidden)
+    monkeypatch.setattr(reconciler, "create_repair_issue", forbidden)
+    summary: dict[str, Any] = {}
+    args = argparse.Namespace(
+        owner="kodmial",
+        repo="aa",
+        triage_issue=419,
+        artifact_file="",
+        comments_file="",
+        open_issues_file="",
+        post=True,
+    )
+    outcome = reconciler._reconcile_selected_run(args, run, summary)
+    assert outcome.outcome == triage.OUTCOME_INCONCLUSIVE
+    assert summary["skipped"] == "one-shot-ab-validation-run"
+    assert summary["artifact"]["source"] == "one-shot-ab"
+    assert "comment" not in summary
+    assert "repair_issue" not in summary
+
+
 # ---------------------------------------------------------------------------
 # Identity, isolation and bounds
 # ---------------------------------------------------------------------------
@@ -228,6 +331,67 @@ def test_retrieval_evidence_records_per_call_trace(diag: Any) -> None:
     assert empty["calls_observed"] == 0
     assert empty["metadata_present"] is False
     assert "retrieval_mode" not in empty
+
+
+def test_retrieval_evidence_derives_fastpath_readiness_only_from_observed_path(
+    diag: Any,
+) -> None:
+    ready = diag._ab_retrieval_evidence(
+        {
+            "calls": 1,
+            "metadata": {
+                "retrieval_mode": "one_shot",
+                "fastpath_attempted": True,
+                "fallback_reason": "",
+                "coverage_status": "ready",
+                "LLM_call_count": 1,
+            },
+            "per_call": [],
+        }
+    )
+    assert ready["fastpath_ready"] is True
+    fallback = diag._ab_retrieval_evidence(
+        {
+            "calls": 1,
+            "metadata": {
+                "retrieval_mode": "legacy",
+                "fastpath_attempted": True,
+                "fallback_reason": "uncovered-needs",
+                "coverage_status": "exhausted",
+                "LLM_call_count": 3,
+            },
+            "per_call": [],
+        }
+    )
+    assert fallback["fastpath_ready"] is False
+    not_attempted = diag._ab_retrieval_evidence(
+        {
+            "calls": 1,
+            "metadata": {
+                "retrieval_mode": "legacy",
+                "fastpath_attempted": False,
+                "coverage_status": "ready",
+                "LLM_call_count": 2,
+            },
+            "per_call": [],
+        }
+    )
+    assert "fastpath_ready" not in not_attempted
+
+
+def test_attempt_summary_counts_ledger_in_flight_state(diag: Any) -> None:
+    summary = diag._ab_attempt_summary(
+        [
+            {"audit_agent": "retrieval", "state": "in-flight"},
+            {"audit_agent": "retrieval", "state": "completed", "latency_ms": 10.0},
+            {"audit_agent": "answer", "state": "aborted"},
+        ],
+        [],
+    )
+    assert summary["by_agent"]["retrieval"]["in_flight"] == 1
+    assert summary["by_agent"]["retrieval"]["completed"] == 1
+    assert summary["by_agent"]["answer"]["aborted"] == 1
+    assert summary["model_http_attempts"] == 3
 
 
 def test_ab_identity_is_identical_for_both_arms(diag: Any) -> None:

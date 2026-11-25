@@ -127,6 +127,20 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "diagnostic-mode=$mode" >> "$GITHUB_STEP_SUMMARY"
 
+      # kodmial/aa#553: a durable, privacy-safe marker so the A/B artifact
+      # exists even when the A/B step fails before the script writes its own
+      # evidence. The scenario2 reconciler uses the artifact name to skip
+      # this validation-only run instead of treating it as a missing
+      # scenario2 diagnostic artifact.
+      - name: Mark one-shot A/B validation run
+        if: steps.mode.outputs.mode == 'one-shot-ab'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic-scenario2-out
+          printf '{"mode":"one-shot-ab","run_id":"%s","target_issue":553}\n' \
+            "${{ github.run_id }}" > diagnostic-scenario2-out/ab-run-marker.json
+
       # kodmial/aa#483 — durable declared run identity. A workflow_dispatch
       # Actions record can only name the dispatch-ref head, never the
       # requested target_sha, so the run publishes the exact SHA it checked
