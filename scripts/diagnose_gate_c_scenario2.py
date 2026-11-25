@@ -1573,9 +1573,24 @@ def ab_run_marker(run_id: str) -> str:
 def ab_complete_marker(main_sha: str, config_digest: str) -> str:
     """Durable marker for one COMPLETE A/B result (same SHA + config)."""
     return (
-        f"{AB_MARKER_PREFIX} sha={main_sha} config={config_digest} "
-        f"status={AB_STATUS_COMPLETE} -->"
+        f"{AB_MARKER_PREFIX} sha={main_sha} config={config_digest} status={AB_STATUS_COMPLETE} -->"
     )
+
+
+def expected_ab_env_flag(arm: str) -> str:
+    """The one explicit env value each A/B arm must observe (0=OFF, 1=ON)."""
+    return "1" if str(arm) == AB_ARM_ON else "0"
+
+
+def ab_arm_environment(arm: str) -> dict[str, str]:
+    """Isolated per-child environment for one A/B arm.
+
+    The production flag is never set in the parent process; each arm child
+    receives exactly one explicit value so the two arms cannot share state.
+    """
+    if str(arm) not in (AB_ARM_OFF, AB_ARM_ON):
+        raise ValueError("unknown A/B arm")
+    return {ONE_SHOT_FASTPATH_ENV: expected_ab_env_flag(str(arm))}
 
 
 def _ab_budget(
@@ -1870,10 +1885,18 @@ def _ab_missing_fields(arm: dict[str, Any]) -> list[str]:
         missing.append("effective_flag")
     env_raw = str(arm.get("env_flag_raw", ""))
     expected = str(arm.get("expected_env_flag", ""))
+    if expected not in ("0", "1"):
+        missing.append("expected_env_flag")
     if env_raw not in ("0", "1"):
         missing.append("env_flag_raw")
-    elif expected and env_raw != expected:
+    elif expected in ("0", "1") and env_raw != expected:
         missing.append("env_flag_effective")
+    if (
+        isinstance(arm.get("effective_flag"), bool)
+        and expected in ("0", "1")
+        and bool(arm["effective_flag"]) != (expected == "1")
+    ):
+        missing.append("effective_flag_mismatch")
     retrieval = arm.get("retrieval")
     retrieval = retrieval if isinstance(retrieval, dict) else {}
     if not retrieval.get("metadata_present"):
@@ -2012,6 +2035,7 @@ def _emit_ab_arm_result(
         "timed_out": bool(state.get("timed_out", False)),
         "typed_failure": str(state.get("typed_failure", "") or "")[:64],
         "env_flag_raw": str(state.get("env_flag_raw", "") or "")[:8],
+        "expected_env_flag": expected_ab_env_flag(arm),
         "effective_flag": state.get("effective_flag"),
         "scenario": dict(scenario),
         "budget": dict(budget),
@@ -2174,9 +2198,7 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         except Exception as exc:
             ab_state["status"] = "bootstrap-failed"
             ab_state["typed_failure"] = "bootstrap:" + type(exc).__name__[:48]
-            ab_state["preflight_elapsed_ms"] = round(
-                (time.perf_counter() - started) * 1000.0, 1
-            )
+            ab_state["preflight_elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
             sink.emit(
                 "bootstrap-end",
                 ok=False,
@@ -2277,7 +2299,7 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         )
         ab_state["telemetry"] = _ab_telemetry_snapshot(graph, scenario_chat_id)
         ab_state["product"] = _ab_product_evidence(reply, ab_state["telemetry"])
-        stage_values = _collect_stage_telemetry(graph)
+        stage_values = _collect_stage_telemetry(graph, scenario_chat_id)
         sink.emit(
             "scenario-end",
             family=scenario_family,
@@ -2327,13 +2349,13 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             _forced_bounded_exit(sink, probe_label, exit_code)
 
 
-def _collect_stage_telemetry(graph: Any) -> list[dict[str, Any]]:
+def _collect_stage_telemetry(graph: Any, chat_id: int = SCENARIO_2_CHAT_ID) -> list[dict[str, Any]]:
     """Sanitized per-stage turn telemetry (values only, no stage text)."""
     values: list[dict[str, Any]] = []
     if graph is None:
         return values
     try:
-        telemetry = graph.last_telemetry_for_thread(graph.thread_id(SCENARIO_2_CHAT_ID))
+        telemetry = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
         if isinstance(telemetry, dict):
             for name, value in telemetry.items():
                 if isinstance(value, (int, float, bool)):
@@ -2695,9 +2717,7 @@ def child_argv_from_env() -> dict[str, Any]:
         ),
         "ab_mode": bool(decoded.get("ab_mode", False)),
         "ab_arm": str(decoded.get("ab_arm", "")),
-        "ab_live_budget_s": float(
-            decoded.get("ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)
-        ),
+        "ab_live_budget_s": float(decoded.get("ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)),
         "ab_preflight_budget_s": float(
             decoded.get("ab_preflight_budget_s", DEFAULT_AB_PREFLIGHT_BUDGET_S)
         ),
@@ -2810,9 +2830,9 @@ def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> 
         if payload.get("timed_out") is True:
             evidence.terminated_at_campaign_end = True
     elif kind == "ab-result-emit-failed":
-        evidence.fail_category = "ab-result-emit-failed:" + str(
-            payload.get("category", "unknown")
-        )[:32]
+        evidence.fail_category = (
+            "ab-result-emit-failed:" + str(payload.get("category", "unknown"))[:32]
+        )
     elif kind == "probe-end":
         evidence.status = str(payload.get("status", ""))[:48]
     elif kind == "child-exit":
@@ -3374,6 +3394,463 @@ def _evidence_dict(evidence: ProbeEvidence) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# kodmial/aa#553: parent-side bounded sequential A/B supervision
+# ---------------------------------------------------------------------------
+
+
+def _ab_arm_fallback(evidence: ProbeEvidence, arm: str) -> dict[str, Any]:
+    """Explicit unknown arm evidence when the child emitted no A/B result.
+
+    Nothing is inferred: absent telemetry stays missing and the arm can never
+    contribute an A/B COMPLETE or a product PASS.
+    """
+    return {
+        "arm": arm,
+        "probe": evidence.probe,
+        "mode": MODE_ONE_SHOT_AB,
+        "status": str(evidence.status or "unknown")[:48],
+        "delivered": bool(evidence.delivered),
+        "timed_out": bool(evidence.terminated_at_campaign_end),
+        "typed_failure": str(evidence.fail_category or "")[:64],
+        "env_flag_raw": "",
+        "expected_env_flag": expected_ab_env_flag(arm),
+        "effective_flag": None,
+        "scenario": ab_scenario_identity(),
+        "budget": _ab_budget(),
+        "preflight_elapsed_ms": None,
+        "live_elapsed_ms": evidence.delivered_elapsed_ms,
+        "delivery_ms": evidence.delivered_elapsed_ms,
+        "retrieval": {},
+        "attempts": {},
+        "telemetry": {},
+        "product": {},
+        "provider_429": False,
+        "active_backoff": False,
+    }
+
+
+def _ab_status_banner(status: str) -> str:
+    """Non-deceptive one-line A/B outcome; never a qualification verdict."""
+    if status == AB_STATUS_COMPLETE:
+        return (
+            "> **outcome: COMPLETE — bounded A/B evidence only; NOT a "
+            "qualification verdict, NOT a product PASS and no speedup is "
+            "inferred.**"
+        )
+    if status == AB_STATUS_DEDUPLICATED:
+        return (
+            "> **outcome: DEDUPLICATED — this exact SHA/config already has a "
+            "COMPLETE A/B result; no provider run was repeated.**"
+        )
+    if status == AB_STATUS_BLOCKED:
+        return (
+            "> **outcome: BLOCKED — an arm failed or a provider 429/backoff/"
+            "timeout stopped the A/B; NOT a success.**"
+        )
+    return (
+        f"> **outcome: {status} — incomplete/uncertain evidence; NOT a "
+        "success and no product PASS.**"
+    )
+
+
+def _ab_arm_report_lines(arm: dict[str, Any]) -> list[str]:
+    """Privacy-safe observed evidence for one arm (no prompt/reply text)."""
+    retrieval = arm.get("retrieval")
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    attempts = arm.get("attempts")
+    attempts = attempts if isinstance(attempts, dict) else {}
+    telemetry = arm.get("telemetry")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    product = arm.get("product")
+    product = product if isinstance(product, dict) else {}
+    by_agent = attempts.get("by_agent")
+    by_agent = by_agent if isinstance(by_agent, dict) else {}
+    agent_counts = ", ".join(
+        f"{str(name)[:32]}={int((value or {}).get('attempts', 0))}"
+        for name, value in sorted(by_agent.items())
+        if isinstance(value, dict)
+    )
+    lines = [
+        f"### Arm `{arm.get('arm', 'unknown')}`",
+        f"- status: `{arm.get('status', 'unknown')}`",
+        f"- env_flag_raw: `{arm.get('env_flag_raw', '')}`",
+        f"- expected_env_flag: `{arm.get('expected_env_flag', '')}`",
+        f"- effective_flag: `{arm.get('effective_flag')}`",
+        f"- delivered: `{str(bool(arm.get('delivered'))).lower()}`",
+        f"- timed_out: `{str(bool(arm.get('timed_out'))).lower()}`",
+    ]
+    for key in ("preflight_elapsed_ms", "live_elapsed_ms", "delivery_ms"):
+        if isinstance(arm.get(key), (int, float)):
+            lines.append(f"- {key}: {arm[key]}")
+    if arm.get("typed_failure"):
+        lines.append(f"- typed_failure: `{str(arm['typed_failure'])[:64]}`")
+    lines.append(f"- retrieval_mode: `{retrieval.get('retrieval_mode', 'unobserved')}`")
+    lines.append(f"- fastpath_attempted: `{retrieval.get('fastpath_attempted', 'unobserved')}`")
+    lines.append(f"- fallback_reason: `{retrieval.get('fallback_reason', '')}`")
+    lines.append(f"- coverage_status: `{retrieval.get('coverage_status', 'unobserved')}`")
+    if "LLM_call_count" in retrieval:
+        lines.append(f"- retrieval_llm_call_count: {retrieval['LLM_call_count']}")
+    if "calls_observed" in retrieval:
+        lines.append(f"- retrieval_calls_observed: {retrieval['calls_observed']}")
+    lines.append(f"- model_http_attempts: {attempts.get('model_http_attempts', 'unobserved')}")
+    lines.append(f"- attempts_by_agent: {agent_counts or 'unobserved'}")
+    for key in (
+        "planner_latency_ms",
+        "retrieval_latency_ms",
+        "answer_latency_ms",
+        "verifier_latency_ms",
+        "total_latency_ms",
+    ):
+        if isinstance(telemetry.get(key), (int, float)):
+            lines.append(f"- {key}: {telemetry[key]}")
+    for key in ("planner_outcome", "retrieval_outcome", "answer_outcome", "verifier_outcome"):
+        if telemetry.get(key) not in (None, ""):
+            lines.append(f"- {key}: `{str(telemetry[key])[:64]}`")
+    for key in ("verified_book_units", "adequacy_verdict", "all_required_supported"):
+        if key in telemetry:
+            lines.append(f"- {key}: `{str(telemetry[key])[:64]}`")
+    lines.append(f"- product_outcome: `{str(product.get('product_outcome', 'unknown'))[:64]}`")
+    lines.append(f"- grounded_substantive: `{product.get('grounded_substantive')}`")
+    if isinstance(product.get("reply_len"), int):
+        lines.append(f"- reply_len: {product['reply_len']}")
+    if attempts.get("failure_categories"):
+        categories = ", ".join(str(item)[:48] for item in attempts["failure_categories"][:8])
+        lines.append(f"- attempt_failure_categories: `{categories}`")
+    missing = arm.get("missing_fields")
+    if isinstance(missing, list) and missing:
+        lines.append("- missing_fields: `" + ", ".join(str(item)[:48] for item in missing) + "`")
+    else:
+        lines.append("- missing_fields: none")
+    return lines
+
+
+def build_ab_report(
+    meta: dict[str, Any],
+    arms: list[dict[str, Any]],
+    status: str,
+    *,
+    second_arm_skipped_reason: str = "",
+) -> str:
+    """Compact truthful A/B report; evidence only, never qualification."""
+    scenario: dict[str, Any] = dict(meta.get("scenario") or {})
+    config: dict[str, Any] = dict(meta.get("config") or {})
+    budget: dict[str, Any] = dict(meta.get("budget") or {})
+    lines = [
+        _ab_status_banner(status),
+        "",
+        "Bounded real-book one-shot retrieval A/B (`kodmial/aa#553`). This is "
+        "validation wiring only: it does not change production semantics, the "
+        "runtime flag default, Gate C acceptance rules, qualification status "
+        "or any repair/recovery cap.",
+        f"Run: `{meta.get('run_url', '')}` (exact SHA `{meta.get('main_sha', '')}`)",
+        f"- mode: `{meta.get('mode', MODE_ONE_SHOT_AB)}`",
+        f"- scenario_family: `{scenario.get('family', 'unknown')}`",
+        f"- scenario_source: `{scenario.get('source', 'unknown')}`",
+        f"- prompt_sha256: `{scenario.get('prompt_sha256', '')}`",
+        f"- config_digest: `{config.get('config_digest', '')}`",
+        f"- primary_model: `{config.get('primary_model', '')}`",
+        f"- fallback_model: `{config.get('fallback_model', '')}`",
+        f"- live_budget_s: {budget.get('live_budget_s', '')}",
+        f"- preflight_budget_s: {budget.get('preflight_budget_s', '')}",
+        f"- cleanup_reserve_s: {budget.get('cleanup_reserve_s', '')}",
+        f"- total_real_model_budget_cap_s: {budget.get('total_real_model_budget_cap_s', '')}",
+        "",
+    ]
+    for arm in arms:
+        lines.extend(_ab_arm_report_lines(arm))
+        lines.append("")
+    if second_arm_skipped_reason:
+        lines.append(f"- second_arm_skipped_reason: `{second_arm_skipped_reason}`")
+        lines.append("")
+    lines.extend(
+        [
+            "### Decision boundary",
+            "- A/B is evidence for a controller decision only; it is NOT an "
+            "authoritative qualification and cannot admit #538/#514/#7.",
+            "- No speedup, no correctness/grounding/safety PASS and no product "
+            "verdict is inferred from missing or incomplete telemetry.",
+            "- The production flag default remains OFF; only an explicit "
+            "controller admission may enable it in the trusted qualification path.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ab_already_complete(
+    publisher: IssueProgressPublisher,
+    main_sha: str,
+    config_digest: str,
+) -> bool:
+    """Whether this exact SHA/config already has a COMPLETE A/B comment."""
+    comments = publisher.list_comments()
+    if not comments:
+        return False
+    marker = ab_complete_marker(main_sha, config_digest)
+    return any(
+        isinstance(comment.get("body"), str) and marker in str(comment["body"])
+        for comment in comments
+    )
+
+
+def _ab_exit_code(status: str) -> int:
+    """Truthful process exit code for the A/B status."""
+    if status in (AB_STATUS_COMPLETE, AB_STATUS_DEDUPLICATED):
+        return EXIT_OK
+    if status == AB_STATUS_BLOCKED:
+        return EXIT_BOOTSTRAP_FAILED
+    return EXIT_INCONCLUSIVE
+
+
+def _ab_outcome(status: str) -> str:
+    return {
+        AB_STATUS_COMPLETE: "complete",
+        AB_STATUS_DEDUPLICATED: "deduplicated",
+        AB_STATUS_INCOMPLETE: "incomplete",
+        AB_STATUS_INCONCLUSIVE: "inconclusive",
+        AB_STATUS_BLOCKED: "blocked",
+    }.get(status, "unknown")
+
+
+def _write_ab_evidence(
+    out_dir: Path,
+    meta: dict[str, Any],
+    arms: list[dict[str, Any]],
+    status: str,
+    *,
+    second_arm_skipped_reason: str = "",
+) -> tuple[dict[str, Any], str]:
+    """Persist result.json + final-report.md and return (result, report)."""
+    exit_code = _ab_exit_code(status)
+    missing_fields = {
+        str(arm.get("arm", "unknown")): list(arm.get("missing_fields") or []) for arm in arms
+    }
+    report = build_ab_report(
+        meta,
+        arms,
+        status,
+        second_arm_skipped_reason=second_arm_skipped_reason,
+    )
+    (out_dir / "final-report.md").write_text(report + "\n", encoding="utf-8")
+    result = {
+        "schema": AB_SCHEMA_VERSION,
+        "mode": MODE_ONE_SHOT_AB,
+        "status": status,
+        "outcome": _ab_outcome(status),
+        "exit_code": exit_code,
+        "main_sha": meta.get("main_sha", ""),
+        "run_id": meta.get("run_id", ""),
+        "run_url": meta.get("run_url", ""),
+        "target_issue": AB_ISSUE,
+        "scenario": meta.get("scenario", {}),
+        "config": meta.get("config", {}),
+        "budget": meta.get("budget", {}),
+        "campaign_allowance_s": meta.get("effective_campaign_allowance_s"),
+        "per_answer_wall_clock_cutoff_s": None,
+        "second_arm_skipped_reason": second_arm_skipped_reason,
+        "arms": arms,
+        "missing_fields": missing_fields,
+        "diagnostic_note": (
+            "Bounded validation-only real-book A/B; not a qualification, not "
+            "a Gate C PASS/FAIL, not a product PASS and never a speedup claim."
+        ),
+    }
+    (out_dir / "result.json").write_text(
+        json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return result, report
+
+
+def _parent_ab_main(
+    args: argparse.Namespace,
+    out_dir: Path,
+    allowance: float,
+    token: str,
+) -> int:
+    """Run OFF then ON sequentially under the existing bounded canary budget."""
+    budget = _ab_budget(
+        float(getattr(args, "ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)),
+        float(getattr(args, "ab_preflight_budget_s", DEFAULT_AB_PREFLIGHT_BUDGET_S)),
+        float(getattr(args, "ab_cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)),
+    )
+    config = ab_config_identity(
+        os.environ.get("OPENCODE_MODEL", ""),
+        os.environ.get("OPENCODE_FALLBACK_MODEL", ""),
+        live_budget_s=budget["live_budget_s"],
+        preflight_budget_s=budget["preflight_budget_s"],
+        cleanup_reserve_s=budget["cleanup_reserve_s"],
+    )
+    scenario = ab_scenario_identity()
+    meta: dict[str, Any] = {
+        "schema": AB_SCHEMA_VERSION,
+        "mode": MODE_ONE_SHOT_AB,
+        "main_sha": args.main_sha or git_head_sha(),
+        "run_id": str(args.run_id),
+        "run_url": _run_url(),
+        "scenario": scenario,
+        "config": config,
+        "budget": budget,
+        "campaign_allowance_s": float(args.campaign_allowance_s),
+        "effective_campaign_allowance_s": allowance,
+        "finalisation_reserve_s": float(args.finalisation_reserve_s),
+        "job_timeout_minutes": float(args.job_timeout_minutes),
+        "per_answer_wall_clock_cutoff_s": None,
+    }
+    (out_dir / "run-meta.json").write_text(
+        json.dumps(meta, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    sink = EventSink(out_dir / "supervisor-events.jsonl", echo=False)
+    sink.emit(
+        "supervisor-start",
+        mode=MODE_ONE_SHOT_AB,
+        run_id=meta["run_id"],
+        sha=meta["main_sha"],
+        config_digest=config["config_digest"],
+        effective_campaign_allowance_s=round(allowance, 1),
+    )
+    publisher = IssueProgressPublisher(
+        args.owner,
+        args.repo,
+        int(getattr(args, "ab_issue", AB_ISSUE)),
+        token,
+        run_id=str(args.run_id),
+        marker=ab_run_marker(str(args.run_id)),
+    )
+    arms: list[dict[str, Any]] = []
+    skipped_reason = ""
+    if ab_already_complete(publisher, str(meta["main_sha"]), config["config_digest"]):
+        status = AB_STATUS_DEDUPLICATED
+        sink.emit(
+            "supervisor-ab-deduplicated",
+            sha=meta["main_sha"],
+            config_digest=config["config_digest"],
+        )
+    else:
+        if token:
+            publisher.publish(
+                "One-shot retrieval A/B started",
+                f"- run: `{meta['run_url']}`\n- sha: `{meta['main_sha']}`\n"
+                f"- mode: `{MODE_ONE_SHOT_AB}`\n"
+                f"- config_digest: `{config['config_digest']}`\n"
+                f"- arms: `off` then `on` (sequential; bounded canary budget)",
+            )
+        campaign_deadline = time.monotonic() + allowance
+        for arm in (AB_ARM_OFF, AB_ARM_ON):
+            if arm == AB_ARM_ON:
+                remaining = campaign_deadline - time.monotonic()
+                required = (
+                    MIN_AB_PREFLIGHT_S
+                    + float(budget["live_budget_s"])
+                    + float(budget["cleanup_reserve_s"])
+                )
+                sink.emit(
+                    "supervisor-ab-budget-check",
+                    next_arm=arm,
+                    remaining_s=round(remaining, 1),
+                    required_s=round(required, 1),
+                )
+                if remaining < required:
+                    skipped_reason = "insufficient-job-budget"
+                    break
+            probe_label = PROBE_SCENARIO2_OFF if arm == AB_ARM_OFF else PROBE_SCENARIO2_ON
+            sink.emit(
+                "supervisor-ab-arm-start",
+                arm=arm,
+                probe=probe_label,
+                env_flag=expected_ab_env_flag(arm),
+            )
+            evidence = _run_one_probe(
+                ProbePlan(
+                    probe=probe_label,
+                    snapshot_cadence_s=float(args.snapshot_cadence_s),
+                    max_snapshots=int(args.max_snapshots),
+                    connect_timeout_s=float(args.probe_a_connect_timeout_s),
+                    arm_env=ab_arm_environment(arm),
+                    ab_mode=True,
+                    ab_arm=arm,
+                    ab_live_budget_s=float(budget["live_budget_s"]),
+                    ab_preflight_budget_s=float(budget["preflight_budget_s"]),
+                    ab_cleanup_reserve_s=float(budget["cleanup_reserve_s"]),
+                ),
+                out_dir=out_dir,
+                sink=sink,
+                publisher=publisher,
+                campaign_deadline_s=campaign_deadline,
+            )
+            arm_result = (
+                dict(evidence.ab_result)
+                if isinstance(evidence.ab_result, dict) and evidence.ab_result
+                else _ab_arm_fallback(evidence, arm)
+            )
+            arm_result["arm"] = arm
+            arm_result["probe"] = probe_label
+            arm_result["mode"] = MODE_ONE_SHOT_AB
+            arm_result["expected_env_flag"] = expected_ab_env_flag(arm)
+            arm_result["exit_code"] = evidence.exit_code
+            arm_result["evidence_status"] = evidence.status
+            arm_result["snapshots"] = evidence.snapshots
+            arm_result["killed"] = evidence.killed
+            arm_result["terminated_at_campaign_end"] = evidence.terminated_at_campaign_end
+            arm_result["missing_fields"] = _ab_missing_fields(arm_result)
+            arms.append(arm_result)
+            stop, reason = _ab_should_stop_after_arm(arm_result)
+            if stop:
+                skipped_reason = reason
+                break
+        status = classify_ab_outcome(
+            arms,
+            second_arm_skipped_reason=skipped_reason,
+        )
+    result, report = _write_ab_evidence(
+        out_dir,
+        meta,
+        arms,
+        status,
+        second_arm_skipped_reason=skipped_reason,
+    )
+    if token:
+        body = report
+        if status == AB_STATUS_COMPLETE:
+            body = (
+                ab_complete_marker(str(meta["main_sha"]), str(config["config_digest"]))
+                + "\n"
+                + report
+            )
+        publisher.publish(f"One-shot retrieval A/B {status}", body)
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if step_summary:
+        try:
+            with Path(step_summary).open("a", encoding="utf-8") as stream:
+                stream.write("## AA one-shot retrieval A/B (validation only)\n\n")
+                stream.write(_ab_status_banner(status) + "\n\n```markdown\n")
+                stream.write(report)
+                stream.write("\n```\n")
+        except OSError:
+            pass
+    sink.emit(
+        "supervisor-report-published",
+        mode=MODE_ONE_SHOT_AB,
+        status=status,
+        target_issue=AB_ISSUE,
+    )
+    print(
+        json.dumps(
+            {
+                "mode": MODE_ONE_SHOT_AB,
+                "status": status,
+                "outcome": result["outcome"],
+                "exit_code": result["exit_code"],
+                "config_digest": config["config_digest"],
+                "final_report": str(out_dir / "final-report.md"),
+                "artifact": (f"aa-gate-c-scenario2-diagnostic-{meta['run_id']}-one-shot-ab"),
+            }
+        ),
+        flush=True,
+    )
+    return int(result["exit_code"])
+
+
 def git_head_sha() -> str:
     """Exact checked-out SHA when git metadata is available."""
     try:
@@ -3400,6 +3877,13 @@ def parent_main(args: argparse.Namespace) -> int:
         job_timeout_minutes=float(args.job_timeout_minutes),
         job_started_epoch=float(args.job_started_epoch),
     )
+    if str(getattr(args, "mode", MODE_SCENARIO2)) == MODE_ONE_SHOT_AB:
+        return _parent_ab_main(
+            args,
+            out_dir,
+            allowance,
+            (os.environ.get("GITHUB_TOKEN", "") or "").strip(),
+        )
     meta = {
         "schema": SCHEMA_VERSION,
         "main_sha": args.main_sha or git_head_sha(),
@@ -3555,6 +4039,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--mode",
+        choices=(MODE_SCENARIO2, MODE_ONE_SHOT_AB),
+        default=MODE_SCENARIO2,
+        help=(
+            "scenario2 (existing diagnostic, default) or the #553 bounded "
+            "validation-only real-book one-shot retrieval A/B."
+        ),
+    )
+    parser.add_argument(
+        "--ab-issue",
+        type=int,
+        default=AB_ISSUE,
+        help="Issue that receives the bounded A/B evidence comment.",
+    )
+    parser.add_argument(
+        "--ab-live-budget-s",
+        type=float,
+        default=DEFAULT_AB_LIVE_BUDGET_S,
+        help="Per-arm live canary budget (default 300s).",
+    )
+    parser.add_argument(
+        "--ab-preflight-budget-s",
+        type=float,
+        default=DEFAULT_AB_PREFLIGHT_BUDGET_S,
+        help="Per-arm preflight canary budget (default 600s).",
+    )
+    parser.add_argument(
+        "--ab-cleanup-reserve-s",
+        type=float,
+        default=DEFAULT_AB_CLEANUP_RESERVE_S,
+        help="Per-arm cleanup reserve kept inside the live budget.",
+    )
+    parser.add_argument(
         "--probe",
         choices=("both", PROBE_DIRECT_MODEL, PROBE_SCENARIO2),
         default="both",
@@ -3633,7 +4150,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.child:
         child = child_argv_from_env()
-        if child["probe"] not in (PROBE_DIRECT_MODEL, PROBE_SCENARIO2):
+        if child["probe"] not in (PROBE_DIRECT_MODEL, *SCENARIO2_PROBES):
             return EXIT_REPORT_FAILED
         return _child_main(child)
     return parent_main(args)
