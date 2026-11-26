@@ -18,6 +18,13 @@ runtime on the exact checked-out SHA:
   in-process Telegram ``getUpdates``/``sendMessage`` seam (NO external
   Telegram network) and the unchanged scenario #2 prompt.
 
+A separate opt-in mode (``--mode one-shot-ab``, kodmial/aa#553) is
+validation wiring only: it runs the same frozen production scenario #2
+twice, sequentially, with the explicit per-child
+``AA_RETRIEVAL_ONE_SHOT_FASTPATH=0`` then ``=1`` and the existing bounded
+canary budget. Its evidence supports a controller decision; it is never a
+qualification verdict and never changes a production default.
+
 kodmial/aa#424 policy (hard contract):
 
 - There is **NO per-answer wall-clock cutoff anywhere**: no 45s message
@@ -80,6 +87,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import faulthandler
+import hashlib
 import http.client
 import json
 import math
@@ -108,11 +116,42 @@ DEFAULT_ISSUE = 418
 SCHEMA_VERSION = "aa-gate-c-scenario2-diagnostic/2"
 PROBE_DIRECT_MODEL = "direct-model"
 PROBE_SCENARIO2 = "scenario2"
+PROBE_SCENARIO2_OFF = "scenario2-off"
+PROBE_SCENARIO2_ON = "scenario2-on"
+SCENARIO2_PROBES = frozenset({PROBE_SCENARIO2, PROBE_SCENARIO2_OFF, PROBE_SCENARIO2_ON})
 SCENARIO_2_FAMILY = "substantive-drinking"
 SCENARIO_2_CHAT_ID = 920002
 # Unchanged scenario #2 core prompt (product_contract_live core_scenarios[1]).
 # Privacy: never logged; travels only through the production update seam.
 SCENARIO_2_PROMPT = "К вечеру очень тянет выпить, как с этим обходиться?"
+
+# kodmial/aa#553: validation-only real-book one-shot retrieval A/B. This is
+# NOT a qualification mode and never changes the production flag default.
+MODE_SCENARIO2 = "scenario2"
+MODE_ONE_SHOT_AB = "one-shot-ab"
+AB_SCHEMA_VERSION = "aa-one-shot-retrieval-ab/1"
+AB_ISSUE = 553
+AB_ARM_OFF = "off"
+AB_ARM_ON = "on"
+AB_STATUS_COMPLETE = "COMPLETE"
+AB_STATUS_INCOMPLETE = "INCOMPLETE"
+AB_STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+AB_STATUS_BLOCKED = "BLOCKED"
+AB_STATUS_DEDUPLICATED = "DEDUPLICATED"
+# Existing bounded canary budget (gate_c_canary): 300 s live, 600 s preflight
+# and the 20 s in-budget cleanup reserve. The A/B runs two sequential arms, so
+# its total real-model budget can never exceed two live budgets (600 s).
+DEFAULT_AB_LIVE_BUDGET_S = 300.0
+DEFAULT_AB_PREFLIGHT_BUDGET_S = 600.0
+DEFAULT_AB_CLEANUP_RESERVE_S = 20.0
+# A second arm is only started when enough job budget remains for a meaningful
+# preflight plus the full live budget and cleanup reserve.
+MIN_AB_PREFLIGHT_S = 60.0
+ONE_SHOT_FASTPATH_ENV = "AA_RETRIEVAL_ONE_SHOT_FASTPATH"
+AB_TRIGGER_FILE = "qualification/one_shot_retrieval_ab_553.trigger"
+AB_MARKER_PREFIX = "<!-- aa-one-shot-retrieval-ab-553"
+# Bounded per-call retrieval trace kept in the arm evidence (never text).
+MAX_AB_RETRIEVAL_CALLS = 16
 
 # kodmial/aa#424: campaign-level finite operational boundary (ONE ceiling for
 # both probes; there is NO per-answer wall-clock cutoff). Mirrors the AA
@@ -1474,12 +1513,653 @@ def _emit_observation_continuity(
     )
 
 
+# ---------------------------------------------------------------------------
+# kodmial/aa#553: bounded real-book one-shot retrieval A/B helpers
+# ---------------------------------------------------------------------------
+
+
+def _ab_canonical_scenario() -> tuple[str, int, str, str]:
+    """The frozen substantive scenario and its provenance (never emitted raw).
+
+    Prefer the exact production definition in ``GATE_C_CANARY_SCENARIOS`` so
+    the A/B can never drift into a separate prompt. The local constant is the
+    fail-closed fallback when the qualification module is unavailable.
+    """
+    try:
+        from aa.qualification.product_contract_live import GATE_C_CANARY_SCENARIOS
+
+        for family, chat_id, prompt in GATE_C_CANARY_SCENARIOS:
+            if family == SCENARIO_2_FAMILY:
+                return str(family), int(chat_id), str(prompt), "GATE_C_CANARY_SCENARIOS"
+    except Exception:
+        pass
+    return SCENARIO_2_FAMILY, SCENARIO_2_CHAT_ID, SCENARIO_2_PROMPT, "scenario2-constant"
+
+
+def ab_scenario_identity() -> dict[str, Any]:
+    """Privacy-safe identity of the frozen scenario (digest, never text)."""
+    family, chat_id, prompt, source = _ab_canonical_scenario()
+    return {
+        "family": family,
+        "chat_id": chat_id,
+        "scenario_index": 2,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "source": source,
+    }
+
+
+def ab_config_identity(
+    primary_model: str,
+    fallback_model: str,
+    *,
+    live_budget_s: float = DEFAULT_AB_LIVE_BUDGET_S,
+    preflight_budget_s: float = DEFAULT_AB_PREFLIGHT_BUDGET_S,
+    cleanup_reserve_s: float = DEFAULT_AB_CLEANUP_RESERVE_S,
+) -> dict[str, Any]:
+    """Identity of one A/B configuration for dedupe (no run id, no secrets)."""
+    scenario = ab_scenario_identity()
+    payload = {
+        "schema": AB_SCHEMA_VERSION,
+        "scenario": scenario,
+        "primary_model": str(primary_model or ""),
+        "fallback_model": str(fallback_model or ""),
+        "arms": [AB_ARM_OFF, AB_ARM_ON],
+        "live_budget_s": round(float(live_budget_s), 3),
+        "preflight_budget_s": round(float(preflight_budget_s), 3),
+        "cleanup_reserve_s": round(float(cleanup_reserve_s), 3),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    return {**payload, "config_digest": digest}
+
+
+def ab_run_marker(run_id: str) -> str:
+    """Idempotence marker for one A/B run comment."""
+    return f"{AB_MARKER_PREFIX} run={run_id} -->"
+
+
+def ab_complete_marker(main_sha: str, config_digest: str) -> str:
+    """Durable marker for one COMPLETE A/B result (same SHA + config)."""
+    return (
+        f"{AB_MARKER_PREFIX} sha={main_sha} config={config_digest} status={AB_STATUS_COMPLETE} -->"
+    )
+
+
+def expected_ab_env_flag(arm: str) -> str:
+    """The one explicit env value each A/B arm must observe (0=OFF, 1=ON)."""
+    return "1" if str(arm) == AB_ARM_ON else "0"
+
+
+def ab_arm_environment(arm: str) -> dict[str, str]:
+    """Isolated per-child environment for one A/B arm.
+
+    The production flag is never set in the parent process; each arm child
+    receives exactly one explicit value so the two arms cannot share state.
+    """
+    if str(arm) not in (AB_ARM_OFF, AB_ARM_ON):
+        raise ValueError("unknown A/B arm")
+    return {ONE_SHOT_FASTPATH_ENV: expected_ab_env_flag(str(arm))}
+
+
+def _ab_budget(
+    live_budget_s: float = DEFAULT_AB_LIVE_BUDGET_S,
+    preflight_budget_s: float = DEFAULT_AB_PREFLIGHT_BUDGET_S,
+    cleanup_reserve_s: float = DEFAULT_AB_CLEANUP_RESERVE_S,
+) -> dict[str, float]:
+    """Per-arm bounded canary budget (300 s live / 600 s preflight / reserve)."""
+    live = max(1.0, float(live_budget_s))
+    preflight = max(1.0, float(preflight_budget_s))
+    reserve = max(0.0, min(float(cleanup_reserve_s), live / 4.0))
+    return {
+        "live_budget_s": round(live, 3),
+        "preflight_budget_s": round(preflight, 3),
+        "cleanup_reserve_s": round(reserve, 3),
+        "live_model_budget_s": round(max(1.0, live - reserve), 3),
+        "wall_budget_s": round(preflight + live, 3),
+        "total_real_model_budget_cap_s": round(2.0 * live, 3),
+    }
+
+
+def ab_cleanup_timeout_s(
+    *,
+    ab_mode: bool,
+    bootstrap_timeout_s: float,
+    budget: dict[str, float],
+) -> float:
+    """Teardown bound: the A/B arm keeps it inside the cleanup reserve.
+
+    The standalone scenario2 diagnostic keeps its original bootstrap bound;
+    an A/B arm must not spend the next arm's live budget on shutdown.
+    """
+    if ab_mode:
+        return max(1.0, float(budget.get("cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)))
+    return max(1.0, float(bootstrap_timeout_s))
+
+
+def _install_ab_retrieval_probe() -> tuple[dict[str, Any], Any]:
+    """Capture the real retrieval call path without touching ``src/``.
+
+    ``retrieval_node`` resolves ``aretrieve_with_semantic_selection`` as a
+    module global at call time, so wrapping that global observes the actual
+    production retrieval invocation and its sanitized metadata.
+    """
+    from aa.conversation import retrieval_node
+
+    original = retrieval_node.aretrieve_with_semantic_selection
+    capture: dict[str, Any] = {
+        "calls": 0,
+        "metadata": {},
+        "error_type": "",
+        "per_call": [],
+    }
+
+    async def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        capture["calls"] = int(capture.get("calls", 0)) + 1
+        try:
+            pack = await original(*args, **kwargs)
+        except Exception as exc:
+            capture["error_type"] = type(exc).__name__[:64]
+            raise
+        try:
+            metadata = dict(getattr(pack, "retrieval_metadata", {}) or {})
+            safe = retrieval_node.sanitize_retrieval_metadata(metadata)
+            capture["metadata"] = safe
+            # The sanitizer intentionally drops the budget snapshot; keep
+            # only its bounded stage names (typed markers, never text).
+            budget_snapshot = metadata.get("turn_budget_snapshot")
+            if isinstance(budget_snapshot, dict):
+                stages = [
+                    str(item.get("stage", ""))[:64]
+                    for item in list(budget_snapshot.get("stages", []) or [])
+                    if isinstance(item, dict)
+                ]
+                capture["budget_stages"] = stages[:32]
+            per_call = capture.get("per_call")
+            if isinstance(per_call, list) and len(per_call) < MAX_AB_RETRIEVAL_CALLS:
+                per_call.append(
+                    {
+                        key: safe[key]
+                        for key in (
+                            "retrieval_mode",
+                            "fastpath_attempted",
+                            "fallback_reason",
+                            "LLM_call_count",
+                            "coverage_status",
+                            "selection_route",
+                            "total_ms",
+                        )
+                        if key in safe
+                    }
+                )
+        except Exception:
+            capture["metadata"] = {}
+        return pack
+
+    retrieval_node.aretrieve_with_semantic_selection = _wrapped
+    return capture, original
+
+
+def _restore_ab_retrieval_probe(original: Any) -> None:
+    """Restore the production retrieval entry point after one A/B arm."""
+    try:
+        from aa.conversation import retrieval_node
+
+        retrieval_node.aretrieve_with_semantic_selection = original
+    except Exception:
+        pass
+
+
+def _ab_retrieval_evidence(capture: dict[str, Any] | None) -> dict[str, Any]:
+    """Privacy-safe observed retrieval path and model-call accounting."""
+    capture = capture if isinstance(capture, dict) else {}
+    metadata = capture.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    safe: dict[str, Any] = {
+        "calls_observed": int(capture.get("calls", 0) or 0),
+        "metadata_present": bool(metadata),
+        "error_type": str(capture.get("error_type", ""))[:64],
+    }
+    for key in (
+        "retrieval_mode",
+        "fastpath_attempted",
+        "fallback_reason",
+        "coverage_status",
+        "LLM_call_count",
+        "selector_ms",
+        "coverage_ms",
+        "total_ms",
+        "loop_model_calls",
+        "loop_iterations",
+        "loop_searches",
+        "provider_call_count",
+        "provider_p50_ms",
+        "provider_p95_ms",
+        "provider_max_ms",
+        "turn_elapsed_ms",
+        "turn_remaining_ms",
+        "local_retrieval_ms",
+        "typed_stage",
+        "retrieval_backend",
+        "selection_route",
+        "selected_passages",
+        "total_tokens",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            safe[key] = value
+    # Derive readiness only from the observed executed path: ``one_shot`` is
+    # recorded exclusively when the single coverage call fully verified the
+    # prepared pack. An attempted-but-not-ready fast path is explicit.
+    if "retrieval_mode" in safe:
+        if str(safe["retrieval_mode"]) == "one_shot":
+            safe["fastpath_ready"] = True
+        elif safe.get("fastpath_attempted") is True:
+            safe["fastpath_ready"] = False
+    durations = metadata.get("provider_call_durations_ms")
+    if isinstance(durations, list):
+        safe["provider_call_durations_ms_count"] = len(durations)
+    per_call = capture.get("per_call")
+    if isinstance(per_call, list):
+        safe["call_trace"] = [
+            dict(item) for item in per_call[:MAX_AB_RETRIEVAL_CALLS] if isinstance(item, dict)
+        ]
+        total_llm = 0
+        observed = False
+        for item in safe["call_trace"]:
+            count = item.get("LLM_call_count")
+            if isinstance(count, int):
+                total_llm += count
+                observed = True
+        if observed:
+            safe["llm_calls_total"] = total_llm
+    stages = capture.get("budget_stages")
+    if isinstance(stages, list):
+        bounded = [str(item)[:64] for item in stages[:32]]
+        safe["budget_stages"] = bounded
+        safe["provider_429"] = "provider_429" in bounded
+        safe["provider_semantic_timeout"] = "provider_semantic_timeout" in bounded
+    return safe
+
+
+def _looks_like_provider_429(text: str) -> bool:
+    """Confirmed provider 429 marker (bounded, case-insensitive).
+
+    Accepts the shapes actually emitted by the existing audit: HTTP ``429``,
+    ``OpenCodeRateLimitError`` / ``rate-limit`` / ``rate_limit`` and the
+    provider phrase ``too many requests``.
+    """
+    folded = str(text or "").casefold()
+    return (
+        "429" in folded
+        or "ratelimit" in folded
+        or "rate_limit" in folded
+        or "rate-limit" in folded
+        or "too many requests" in folded
+    )
+
+
+def _looks_like_active_backoff(text: str) -> bool:
+    """Active retry/backoff marker from the existing audit categories."""
+    folded = str(text or "").casefold()
+    return "backoff" in folded or "retry" in folded
+
+
+def _ab_attempt_summary(
+    attempts: Any,
+    request_audit: Any = None,
+) -> dict[str, Any]:
+    """Observed model HTTP attempts by logical agent (counts only)."""
+    by_agent: dict[str, dict[str, Any]] = {}
+    failure_categories: list[str] = []
+    observed_models: list[str] = []
+    total = 0
+    provider_429 = False
+    active_backoff = False
+    entries = list(attempts) if isinstance(attempts, (list, tuple)) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        agent = str(entry.get("audit_agent") or entry.get("agent") or "unknown")[:64]
+        total += 1
+        bucket = by_agent.setdefault(
+            agent,
+            {
+                "attempts": 0,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "in_flight": 0,
+                "latency_ms_total": 0.0,
+            },
+        )
+        bucket["attempts"] = int(bucket["attempts"]) + 1
+        # The attempt ledger records the hyphenated ``in-flight`` state.
+        state = str(entry.get("state", "")).replace("-", "_")[:32]
+        if state in ("completed", "failed", "cancelled", "aborted", "in_flight"):
+            bucket[state] = int(bucket.get(state, 0)) + 1
+        latency = entry.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            bucket["latency_ms_total"] = round(
+                float(bucket["latency_ms_total"]) + float(latency), 1
+            )
+        failure = str(entry.get("failure_category", "") or "")[:64]
+        if failure:
+            failure_categories.append(failure)
+        model = str(entry.get("model", "") or "")[:96]
+        fallback = str(entry.get("fallback_model", "") or "")[:96]
+        for value in (model, fallback):
+            if value and value not in observed_models:
+                observed_models.append(value)
+    rows = list(request_audit) if isinstance(request_audit, (list, tuple)) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        failure = str(row.get("failure_category", "") or "")[:64]
+        error_kind = str(row.get("error_kind", "") or "")[:64]
+        combined = (failure + " " + error_kind).casefold()
+        if failure and failure not in failure_categories:
+            failure_categories.append(failure)
+        if _looks_like_provider_429(combined):
+            provider_429 = True
+        if _looks_like_active_backoff(combined):
+            active_backoff = True
+    for failure in failure_categories:
+        if _looks_like_provider_429(failure):
+            provider_429 = True
+        if _looks_like_active_backoff(failure):
+            active_backoff = True
+    return {
+        "present": bool(entries),
+        "model_http_attempts": total,
+        "by_agent": by_agent,
+        "failure_categories": failure_categories[:16],
+        "observed_models": observed_models[:8],
+        "request_audit_present": bool(rows),
+        "provider_429": provider_429,
+        "active_backoff": active_backoff,
+    }
+
+
+_AB_TELEMETRY_KEYS: tuple[str, ...] = (
+    "planner_query_count",
+    "planner_outcome",
+    "planner_reason",
+    "planner_latency_ms",
+    "retrieval_passages",
+    "retrieval_hits",
+    "retrieval_outcome",
+    "retrieval_latency_ms",
+    "retrieval_over_budget",
+    "answer_outcome",
+    "answer_latency_ms",
+    "answer_rounds",
+    "verifier_outcome",
+    "verifier_latency_ms",
+    "verifier_unavailable_units",
+    "response_units",
+    "verified_book_units",
+    "repair_rounds",
+    "repair_budget_exceeded",
+    "turn_budget_exceeded",
+    "all_required_supported",
+    "adequacy_verdict",
+    "failure_category",
+    "failure_reason",
+    "answers_request",
+    "technically_grounded",
+    "qualified",
+    "answer_relevant",
+    "selection_route",
+    "semantic_selection_applied",
+    "pack_order",
+    "coverage_status",
+    "evidence_discovered",
+    "evidence_previewed",
+    "evidence_read",
+    "evidence_selected_in_pack",
+    "evidence_used_in_answer",
+    "evidence_quoted_to_user",
+    "delivery_status",
+    "product_outcome",
+    "total_latency_ms",
+    "reply_len",
+)
+
+
+def _ab_telemetry_snapshot(graph: Any, chat_id: int) -> dict[str, Any]:
+    """Allow-listed production turn telemetry (never prompt/reply text)."""
+    try:
+        snapshot = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
+    except Exception:
+        return {}
+    if not isinstance(snapshot, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in _AB_TELEMETRY_KEYS:
+        if key not in snapshot:
+            continue
+        value = snapshot[key]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            safe[key] = value
+    return safe
+
+
+def _ab_product_evidence(reply: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Independent product outcome and grounding evidence (no text persisted)."""
+    product_outcome = "unknown"
+    failure_reason = ""
+    try:
+        from aa.qualification.product_contract_live import delivered_product_accounting
+
+        product_outcome, failure_reason = delivered_product_accounting(reply, snapshot)
+    except Exception:
+        product_outcome, failure_reason = "unknown", ""
+    grounded: bool | None = None
+    try:
+        from aa.qualification.product_contract_live import (
+            _is_grounded_substantive_reply,
+        )
+
+        grounded = bool(_is_grounded_substantive_reply(snapshot, reply))
+    except Exception:
+        grounded = None
+    return {
+        "product_outcome": str(product_outcome or "unknown")[:64],
+        "failure_reason": str(failure_reason or "")[:64],
+        "grounded_substantive": grounded,
+        "reply_len": len(reply or ""),
+        "reply_signature": _reply_signature(reply or ""),
+    }
+
+
+def _ab_missing_fields(arm: dict[str, Any]) -> list[str]:
+    """Required observed fields; missing telemetry stays explicit, never inferred."""
+    missing: list[str] = []
+    if arm.get("delivered") is not True or arm.get("status") != "delivered":
+        missing.append("delivery")
+    if not isinstance(arm.get("effective_flag"), bool):
+        missing.append("effective_flag")
+    env_raw = str(arm.get("env_flag_raw", ""))
+    expected = str(arm.get("expected_env_flag", ""))
+    if expected not in ("0", "1"):
+        missing.append("expected_env_flag")
+    if env_raw not in ("0", "1"):
+        missing.append("env_flag_raw")
+    elif expected in ("0", "1") and env_raw != expected:
+        missing.append("env_flag_effective")
+    if (
+        isinstance(arm.get("effective_flag"), bool)
+        and expected in ("0", "1")
+        and bool(arm["effective_flag"]) != (expected == "1")
+    ):
+        missing.append("effective_flag_mismatch")
+    retrieval = arm.get("retrieval")
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    if not retrieval.get("metadata_present"):
+        missing.append("retrieval.metadata")
+    for key in ("retrieval_mode", "LLM_call_count", "coverage_status"):
+        if key not in retrieval:
+            missing.append(f"retrieval.{key}")
+    attempts = arm.get("attempts")
+    attempts = attempts if isinstance(attempts, dict) else {}
+    if not attempts.get("present"):
+        missing.append("attempts.ledger")
+    if "model_http_attempts" not in attempts:
+        missing.append("attempts.model_http_attempts")
+    telemetry = arm.get("telemetry")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    if not telemetry:
+        missing.append("telemetry.snapshot")
+    for key in (
+        "answer_outcome",
+        "verifier_outcome",
+        "verified_book_units",
+        "adequacy_verdict",
+    ):
+        if key not in telemetry:
+            missing.append(f"telemetry.{key}")
+    product = arm.get("product")
+    product = product if isinstance(product, dict) else {}
+    if str(product.get("product_outcome", "unknown")) in ("", "unknown"):
+        missing.append("product.product_outcome")
+    if product.get("grounded_substantive") is None:
+        missing.append("product.grounded_substantive")
+    if not isinstance(arm.get("delivery_ms"), (int, float)):
+        missing.append("delivery_ms")
+    return missing
+
+
+def _ab_should_stop_after_arm(arm: dict[str, Any]) -> tuple[bool, str]:
+    """Stop before the ON arm on a confirmed provider block or non-delivery."""
+    if arm.get("provider_429"):
+        return True, "confirmed-429"
+    if arm.get("active_backoff"):
+        return True, "active-backoff"
+    if arm.get("timed_out") or arm.get("status") == "timeout":
+        return True, "timeout"
+    if arm.get("status") == "bootstrap-failed":
+        return True, "bootstrap-failed"
+    if arm.get("status") != "delivered":
+        return True, "arm-not-delivered"
+    return False, ""
+
+
+_AB_BLOCKING_SKIP_REASONS = frozenset(
+    {
+        "confirmed-429",
+        "active-backoff",
+        "timeout",
+        "bootstrap-failed",
+        "insufficient-job-budget",
+    }
+)
+
+
+def classify_ab_outcome(
+    arms: list[dict[str, Any]],
+    *,
+    second_arm_skipped_reason: str = "",
+    deduplicated: bool = False,
+) -> str:
+    """Honest A/B status; no inferred speedup and no product PASS."""
+    if deduplicated:
+        return AB_STATUS_DEDUPLICATED
+    if second_arm_skipped_reason in _AB_BLOCKING_SKIP_REASONS:
+        return AB_STATUS_BLOCKED
+    if not arms:
+        return AB_STATUS_BLOCKED if second_arm_skipped_reason else AB_STATUS_INCONCLUSIVE
+    if any(
+        arm.get("provider_429")
+        or arm.get("active_backoff")
+        or arm.get("timed_out")
+        or arm.get("status") in ("timeout", "bootstrap-failed")
+        for arm in arms
+    ):
+        return AB_STATUS_BLOCKED
+    if len(arms) < 2:
+        return AB_STATUS_INCONCLUSIVE
+    if any(arm.get("status") != "delivered" for arm in arms):
+        return AB_STATUS_INCONCLUSIVE
+    if any(_ab_missing_fields(arm) for arm in arms):
+        return AB_STATUS_INCOMPLETE
+    return AB_STATUS_COMPLETE
+
+
+def _emit_ab_arm_result(
+    sink: EventSink,
+    *,
+    arm: str,
+    probe_label: str,
+    state: dict[str, Any],
+    app: Any,
+    graph: Any,
+    scenario: dict[str, Any],
+    budget: dict[str, float],
+) -> None:
+    """Emit one privacy-safe arm result (the parent's only A/B evidence)."""
+    attempts: Any = ()
+    request_audit: Any = ()
+    try:
+        client = app.opencode_runtime.client
+        attempts = getattr(client, "attempt_audit", ())
+        request_audit = getattr(client, "request_latency_audit", ())
+    except Exception:
+        attempts = ()
+        request_audit = ()
+    telemetry = state.get("telemetry")
+    if not isinstance(telemetry, dict) or not telemetry:
+        telemetry = _ab_telemetry_snapshot(graph, int(scenario.get("chat_id", SCENARIO_2_CHAT_ID)))
+    retrieval = _ab_retrieval_evidence(state.get("capture"))
+    attempt_summary = _ab_attempt_summary(attempts, request_audit)
+    product = state.get("product")
+    if not isinstance(product, dict):
+        product = {
+            "product_outcome": "unknown",
+            "failure_reason": "",
+            "grounded_substantive": None,
+            "reply_len": 0,
+            "reply_signature": "",
+        }
+    provider_429 = bool(retrieval.get("provider_429") or attempt_summary.get("provider_429"))
+    # Keep the two typed markers independent in evidence; the stop logic
+    # already treats a confirmed 429 as terminal on its own.
+    active_backoff = bool(attempt_summary.get("active_backoff"))
+    payload: dict[str, Any] = {
+        "arm": arm,
+        "probe": probe_label,
+        "mode": MODE_ONE_SHOT_AB,
+        "status": str(state.get("status", "") or "failed")[:48],
+        "delivered": bool(state.get("delivered", False)),
+        "timed_out": bool(state.get("timed_out", False)),
+        "typed_failure": str(state.get("typed_failure", "") or "")[:64],
+        "env_flag_raw": str(state.get("env_flag_raw", "") or "")[:8],
+        "expected_env_flag": expected_ab_env_flag(arm),
+        "effective_flag": state.get("effective_flag"),
+        "scenario": dict(scenario),
+        "budget": dict(budget),
+        "preflight_elapsed_ms": state.get("preflight_elapsed_ms"),
+        "live_elapsed_ms": state.get("live_elapsed_ms"),
+        "delivery_ms": state.get("delivery_ms"),
+        "retrieval": retrieval,
+        "attempts": attempt_summary,
+        "telemetry": telemetry,
+        "product": product,
+        "provider_429": provider_429,
+        "active_backoff": active_backoff,
+    }
+    payload["missing_fields"] = _ab_missing_fields(payload)
+    sink.emit("ab-arm-result", **payload)
+    state["emitted"] = True
+
+
 async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str, Any]) -> int:
     """Probe B child: exact production scenario #2 (unchanged prompt).
 
-    kodmial/aa#424: the turn observation has NO wall-clock cutoff. The
-    child observes until delivery, proven local-server non-responsiveness,
-    or the parent's campaign allowance (parent-side bounded shutdown).
+    kodmial/aa#424: the standalone scenario2 observation has NO wall-clock
+    cutoff. The kodmial/aa#553 A/B arm additionally honors the existing
+    bounded canary budget (300 s live / 600 s preflight / cleanup reserve)
+    because the owner-approved A/B is explicitly validation-only.
     """
     from dataclasses import replace
 
@@ -1488,6 +2168,23 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     from aa.conversation.semantic_work_plan import set_stage_observer
     from aa.telegram.transport import PollingTelegramTransport
 
+    probe_label = str(argv.get("probe") or PROBE_SCENARIO2)
+    ab_mode = bool(argv.get("ab_mode", False))
+    ab_arm = str(argv.get("ab_arm", "") or "")
+    ab_budget = _ab_budget(
+        float(argv.get("ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)),
+        float(argv.get("ab_preflight_budget_s", DEFAULT_AB_PREFLIGHT_BUDGET_S)),
+        float(argv.get("ab_cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)),
+    )
+    if ab_mode:
+        scenario_family, scenario_chat_id, scenario_prompt, _scenario_source = (
+            _ab_canonical_scenario()
+        )
+    else:
+        scenario_family = SCENARIO_2_FAMILY
+        scenario_chat_id = SCENARIO_2_CHAT_ID
+        scenario_prompt = SCENARIO_2_PROMPT
+    scenario_identity = ab_scenario_identity() if ab_mode else {}
     base_url = os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     out_dir = Path(argv["out_dir"])
     counters["snapshot_index"] = 0
@@ -1495,8 +2192,10 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     bootstrap_timeout = float(
         argv.get("probe_b_bootstrap_timeout_s", DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S)
     )
+    if ab_mode:
+        bootstrap_timeout = min(bootstrap_timeout, ab_budget["preflight_budget_s"])
     watchdog = ChildWatchdog(
-        probe=PROBE_SCENARIO2,
+        probe=probe_label,
         cadence_s=float(argv.get("snapshot_cadence_s", DEFAULT_SNAPSHOT_CADENCE_S)),
         max_snapshots=int(argv.get("max_snapshots", DEFAULT_MAX_SNAPSHOTS)),
         anchor=anchor,
@@ -1551,34 +2250,70 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     )
     app = Application(settings, transport=transport)
     counters["probe_start"] = time.monotonic()
-    sink.emit("probe-start", probe=PROBE_SCENARIO2, family=SCENARIO_2_FAMILY)
+    sink.emit(
+        "probe-start",
+        probe=probe_label,
+        family=scenario_family,
+        arm=ab_arm if ab_mode else "",
+    )
     counters["last_real_event"] = "probe-start"
     counters["last_real_monotonic"] = time.monotonic()
     exit_code = EXIT_OK
     continuity_state: dict[str, Any] = {"index": 0, "next_at": 0.0}
+    graph: Any = None
+    ab_capture: dict[str, Any] | None = None
+    ab_original: Any = None
+    ab_state: dict[str, Any] = {
+        "emitted": False,
+        "status": "running",
+        "delivered": False,
+        "timed_out": False,
+        "typed_failure": "",
+        "env_flag_raw": os.environ.get(ONE_SHOT_FASTPATH_ENV, ""),
+        "effective_flag": None,
+        "preflight_elapsed_ms": None,
+        "live_elapsed_ms": None,
+        "delivery_ms": None,
+        "capture": None,
+        "telemetry": {},
+        "product": {},
+    }
+    if ab_mode:
+        try:
+            ab_capture, ab_original = _install_ab_retrieval_probe()
+            ab_state["capture"] = ab_capture
+            from aa.conversation.retrieval_node import one_shot_fast_path_enabled
+
+            ab_state["effective_flag"] = bool(one_shot_fast_path_enabled())
+        except Exception as exc:
+            ab_state["typed_failure"] = "instrumentation:" + type(exc).__name__[:48]
     try:
-        sink.emit("bootstrap-start", probe=PROBE_SCENARIO2)
+        sink.emit("bootstrap-start", probe=probe_label)
         counters["last_real_event"] = "bootstrap-start"
         counters["last_real_monotonic"] = time.monotonic()
         started = time.perf_counter()
         try:
             await asyncio.wait_for(app.start(), timeout=bootstrap_timeout)
         except Exception as exc:
+            ab_state["status"] = "bootstrap-failed"
+            ab_state["typed_failure"] = "bootstrap:" + type(exc).__name__[:48]
+            ab_state["preflight_elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
             sink.emit(
                 "bootstrap-end",
                 ok=False,
-                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+                elapsed_ms=ab_state["preflight_elapsed_ms"],
                 fail_category=type(exc).__name__[:48],
             )
-            sink.emit("probe-end", probe=PROBE_SCENARIO2, status="bootstrap-failed")
+            sink.emit("probe-end", probe=probe_label, status="bootstrap-failed")
             return EXIT_BOOTSTRAP_FAILED
+        ab_state["preflight_elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
         counters["last_real_event"] = "bootstrap-end"
         counters["last_real_monotonic"] = time.monotonic()
         graph = app.graph_runtime
         sink.emit(
             "bootstrap-end",
             ok=True,
-            elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+            elapsed_ms=ab_state["preflight_elapsed_ms"],
             opencode_ready=bool(app.opencode_runtime.running and app.opencode_runtime.ready),
             graph_running=bool(graph is not None and graph.running),
         )
@@ -1587,9 +2322,10 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         before = len(api.sent_texts)
         sink.emit(
             "scenario-start",
-            family=SCENARIO_2_FAMILY,
+            family=scenario_family,
             scenario_index=2,
-            chat_id=SCENARIO_2_CHAT_ID,
+            chat_id=scenario_chat_id,
+            arm=ab_arm if ab_mode else "",
         )
         counters["last_real_event"] = "scenario-start"
         counters["last_real_monotonic"] = time.monotonic()
@@ -1598,22 +2334,45 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             "message": {
                 "message_id": 2,
                 "date": 1,
-                "chat": {"id": SCENARIO_2_CHAT_ID, "type": "private"},
-                "text": SCENARIO_2_PROMPT,
+                "chat": {"id": scenario_chat_id, "type": "private"},
+                "text": scenario_prompt,
             },
         }
         api.pending_updates.append(raw)
         scenario_started = time.monotonic()
+        live_deadline = (
+            scenario_started + float(ab_budget["live_model_budget_s"]) if ab_mode else None
+        )
         anchor.set()
-        # kodmial/aa#424: no cutoff. Observe until delivery, until the child
-        # proves the LOCAL server non-responsive, or until the parent ends
-        # the observation at the campaign allowance (bounded tidy shutdown).
+        # kodmial/aa#424: no cutoff in standalone mode. The A/B arm is the
+        # explicit exception required by #553: its existing 300 s live canary
+        # budget bounds the arm, with the cleanup reserve kept inside it.
         while len(api.sent_texts) <= before:
             counters["typing_sends"] = api.chat_actions
-            if counters.get("server_nonresponsive_sustained"):
+            if live_deadline is not None and time.monotonic() >= live_deadline:
+                ab_state["timed_out"] = True
+                ab_state["status"] = "timeout"
+                ab_state["typed_failure"] = "timeout"
+                ab_state["live_elapsed_ms"] = round(
+                    (time.monotonic() - scenario_started) * 1000.0, 1
+                )
                 sink.emit(
                     "probe-end",
-                    probe=PROBE_SCENARIO2,
+                    probe=probe_label,
+                    status="timeout",
+                    fail_category="live-budget-exhausted",
+                )
+                exit_code = EXIT_INCONCLUSIVE
+                return exit_code
+            if counters.get("server_nonresponsive_sustained"):
+                ab_state["status"] = CLASS_SERVER_ERROR_PROVEN
+                ab_state["typed_failure"] = "server-nonresponsive-sustained"
+                ab_state["live_elapsed_ms"] = round(
+                    (time.monotonic() - scenario_started) * 1000.0, 1
+                )
+                sink.emit(
+                    "probe-end",
+                    probe=probe_label,
                     status=CLASS_SERVER_ERROR_PROVEN,
                     fail_category="server-nonresponsive-sustained",
                 )
@@ -1626,6 +2385,10 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         counters["last_real_event"] = "delivery"
         counters["last_real_monotonic"] = time.monotonic()
         reply = api.sent_texts[-1]
+        ab_state["status"] = "delivered"
+        ab_state["delivered"] = True
+        ab_state["delivery_ms"] = elapsed_ms
+        ab_state["live_elapsed_ms"] = elapsed_ms
         sink.emit(
             "delivery",
             elapsed_ms=elapsed_ms,
@@ -1633,29 +2396,73 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             reply_signature=_reply_signature(reply),
             typing_sends=api.chat_actions,
         )
-        stage_values = _collect_stage_telemetry(graph)
-        sink.emit("scenario-end", family=SCENARIO_2_FAMILY, stage_values=len(stage_values))
+        ab_state["telemetry"] = _ab_telemetry_snapshot(graph, scenario_chat_id)
+        ab_state["product"] = _ab_product_evidence(reply, ab_state["telemetry"])
+        stage_values = _collect_stage_telemetry(graph, scenario_chat_id)
+        sink.emit(
+            "scenario-end",
+            family=scenario_family,
+            stage_values=len(stage_values),
+            arm=ab_arm if ab_mode else "",
+        )
 
-        sink.emit("probe-end", probe=PROBE_SCENARIO2, status="delivered")
+        sink.emit("probe-end", probe=probe_label, status="delivered")
         exit_code = EXIT_OK
         return exit_code
     finally:
         set_stage_observer(None)
-        stopped = await _bounded_async_stop(app, bootstrap_timeout)
+        if ab_mode:
+            if ab_state.get("status") in ("", "running"):
+                ab_state["status"] = "failed"
+                if not ab_state.get("typed_failure"):
+                    ab_state["typed_failure"] = "unexpected"
+            if not ab_state.get("emitted"):
+                try:
+                    _emit_ab_arm_result(
+                        sink,
+                        arm=ab_arm,
+                        probe_label=probe_label,
+                        state=ab_state,
+                        app=app,
+                        graph=graph,
+                        scenario=scenario_identity,
+                        budget=ab_budget,
+                    )
+                except Exception as exc:
+                    try:
+                        sink.emit(
+                            "ab-result-emit-failed",
+                            probe=probe_label,
+                            arm=ab_arm,
+                            category=type(exc).__name__[:48],
+                        )
+                    except Exception:
+                        pass
+            if ab_original is not None:
+                _restore_ab_retrieval_probe(ab_original)
+        # The A/B arm keeps teardown inside the existing cleanup reserve so
+        # one arm can never consume the other arm's live budget. The
+        # standalone scenario2 diagnostic keeps its original bound.
+        stop_timeout_s = ab_cleanup_timeout_s(
+            ab_mode=ab_mode,
+            bootstrap_timeout_s=bootstrap_timeout,
+            budget=ab_budget,
+        )
+        stopped = await _bounded_async_stop(app, stop_timeout_s)
         anchor.set()
-        sink.emit("child-exit", probe=PROBE_SCENARIO2, exit_code=exit_code, cleanup_done=stopped)
+        sink.emit("child-exit", probe=probe_label, exit_code=exit_code, cleanup_done=stopped)
         watchdog.stop()
         if not stopped:
-            _forced_bounded_exit(sink, PROBE_SCENARIO2, exit_code)
+            _forced_bounded_exit(sink, probe_label, exit_code)
 
 
-def _collect_stage_telemetry(graph: Any) -> list[dict[str, Any]]:
+def _collect_stage_telemetry(graph: Any, chat_id: int = SCENARIO_2_CHAT_ID) -> list[dict[str, Any]]:
     """Sanitized per-stage turn telemetry (values only, no stage text)."""
     values: list[dict[str, Any]] = []
     if graph is None:
         return values
     try:
-        telemetry = graph.last_telemetry_for_thread(graph.thread_id(SCENARIO_2_CHAT_ID))
+        telemetry = graph.last_telemetry_for_thread(graph.thread_id(chat_id))
         if isinstance(telemetry, dict):
             for name, value in telemetry.items():
                 if isinstance(value, (int, float, bool)):
@@ -1687,7 +2494,7 @@ def _child_main(argv: dict[str, Any]) -> int:
     try:
         if probe == PROBE_DIRECT_MODEL:
             return int(loop.run_until_complete(run_probe_a(argv, sink, counters)))
-        if probe == PROBE_SCENARIO2:
+        if probe in SCENARIO2_PROBES:
             return int(loop.run_until_complete(run_probe_b(argv, sink, counters)))
         return EXIT_REPORT_FAILED
     except Exception as exc:
@@ -1729,12 +2536,22 @@ class IssueProgressPublisher:
     MIN_INTERVAL_S = 20.0
     _API_ROOT = "https://api.github.com"
 
-    def __init__(self, owner: str, repo: str, issue: int, token: str, run_id: str = ""):
+    def __init__(
+        self,
+        owner: str,
+        repo: str,
+        issue: int,
+        token: str,
+        run_id: str = "",
+        *,
+        marker: str = "",
+    ):
         self.owner = owner or DEFAULT_OWNER
         self.repo = repo or DEFAULT_REPO
         self.issue = int(issue or DEFAULT_ISSUE)
         self.token = (token or "").strip()
         self.run_id = run_id or os.environ.get("GITHUB_RUN_ID", "") or "local"
+        self.marker = marker or comment_marker(self.run_id)
         self._comment_id: int | None = None
         self._last_post = 0.0
 
@@ -1766,32 +2583,36 @@ class IssueProgressPublisher:
         except (ValueError, UnicodeDecodeError):
             return True, None
 
-    def ensure_comment(self) -> int | None:
-        """Find this run's existing diagnostic comment (bounded, idempotent)."""
-        if self._comment_id is not None:
-            return self._comment_id
-        marker = comment_marker(self.run_id)
+    def list_comments(self) -> list[dict[str, Any]] | None:
+        """Bounded first page of issue comments (fail-soft)."""
         ok, comments = self._request(
             "GET",
             f"/repos/{self.owner}/{self.repo}/issues/{self.issue}/comments?per_page=100",
         )
         if not ok or not isinstance(comments, list):
             return None
-        for comment in comments[:100]:
-            if not isinstance(comment, dict):
-                continue
+        return [comment for comment in comments[:100] if isinstance(comment, dict)]
+
+    def ensure_comment(self) -> int | None:
+        """Find this run's existing diagnostic comment (bounded, idempotent)."""
+        if self._comment_id is not None:
+            return self._comment_id
+        comments = self.list_comments()
+        if comments is None:
+            return None
+        for comment in comments:
             body = comment.get("body")
-            if isinstance(body, str) and marker in body:
+            if isinstance(body, str) and self.marker in body:
                 comment_id = comment.get("id")
                 if isinstance(comment_id, int):
                     self._comment_id = comment_id
                     return comment_id
         return None
 
-    def publish(self, title: str, body: str) -> bool:
+    def publish(self, title: str, body: str, *, force: bool = False) -> bool:
         """Create once, then update the same comment (throttled, fail-soft)."""
         safe_title = title.replace("|", "/").replace("\n", " ")[:64]
-        stamped = f"{comment_marker(self.run_id)}\n**{safe_title}**\n\n{body}\n"
+        stamped = f"{self.marker}\n**{safe_title}**\n\n{body}\n"
         assert_no_text_leak({"comment_title": safe_title})
         try:
             assert_no_text_leak({"comment_body": body})
@@ -1799,9 +2620,9 @@ class IssueProgressPublisher:
                 raise ValueError("comment body carries a text-keyed line")
         except ValueError:
             body = "- text-free renditions only:\n- [text suppressed by sanitizer]\n"
-            stamped = f"{comment_marker(self.run_id)}\n**{safe_title}**\n\n{body}\n"
+            stamped = f"{self.marker}\n**{safe_title}**\n\n{body}\n"
         now = time.monotonic()
-        if now - self._last_post < self.MIN_INTERVAL_S:
+        if not force and now - self._last_post < self.MIN_INTERVAL_S:
             return True
         self._last_post = now
         comment_id = self.ensure_comment()
@@ -1873,6 +2694,9 @@ class ProbeEvidence:
     timeline: list[dict[str, Any]] = field(default_factory=list)
     snapshots: int = 0
     raw_lines: int = 0
+    # kodmial/aa#553: the child's single privacy-safe A/B arm result. Empty
+    # for the standalone scenario2 probe.
+    ab_result: dict[str, Any] = field(default_factory=dict)
 
     @property
     def exit_signal(self) -> int | None:
@@ -1896,6 +2720,18 @@ class ProbePlan:
     snapshot_cadence_s: float
     max_snapshots: int
     connect_timeout_s: float
+    # kodmial/aa#553: explicit per-child environment (the one-shot flag is
+    # set only inside the A/B child, never in the parent or production).
+    arm_env: dict[str, str] = field(default_factory=dict)
+    ab_mode: bool = False
+    ab_arm: str = ""
+    ab_live_budget_s: float = DEFAULT_AB_LIVE_BUDGET_S
+    ab_preflight_budget_s: float = DEFAULT_AB_PREFLIGHT_BUDGET_S
+    ab_cleanup_reserve_s: float = DEFAULT_AB_CLEANUP_RESERVE_S
+    # The A/B arm's bootstrap is bounded by the existing canary preflight
+    # budget, not the shorter standalone probe default. The standalone
+    # scenario2 probe keeps its own default when this is not set.
+    probe_b_bootstrap_timeout_s: float = DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
 
 
 def effective_campaign_allowance_s(
@@ -1933,18 +2769,29 @@ def effective_campaign_allowance_s(
 
 def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
     """Start one probe child in its own process group (independent)."""
-    child_argv = json.dumps(
-        {
-            "probe": plan.probe,
-            "out": str(out_dir),
-            "snapshot_cadence_s": plan.snapshot_cadence_s,
-            "max_snapshots": plan.max_snapshots,
-            "connect_timeout_s": plan.connect_timeout_s,
-        }
-    )
+    child_payload: dict[str, Any] = {
+        "probe": plan.probe,
+        "out": str(out_dir),
+        "snapshot_cadence_s": plan.snapshot_cadence_s,
+        "max_snapshots": plan.max_snapshots,
+        "connect_timeout_s": plan.connect_timeout_s,
+        "ab_mode": plan.ab_mode,
+        "ab_arm": plan.ab_arm,
+        "ab_live_budget_s": plan.ab_live_budget_s,
+        "ab_preflight_budget_s": plan.ab_preflight_budget_s,
+        "ab_cleanup_reserve_s": plan.ab_cleanup_reserve_s,
+    }
     env = os.environ.copy()
-    env["SCENARIO2_DIAG_ARGS"] = child_argv
+    # The standalone scenario2 probe must keep honoring an operator/workflow
+    # SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S override. Only an explicit
+    # A/B (or non-default) plan value owns the child's bootstrap window.
+    if plan.ab_mode or plan.probe_b_bootstrap_timeout_s != DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S:
+        child_payload["probe_b_bootstrap_timeout_s"] = plan.probe_b_bootstrap_timeout_s
+        env["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(plan.probe_b_bootstrap_timeout_s)
+    env["SCENARIO2_DIAG_ARGS"] = json.dumps(child_payload)
     env["PYTHONUNBUFFERED"] = "1"
+    # #553: each arm's flag is explicit and isolated inside the child only.
+    env.update({str(key): str(value) for key, value in plan.arm_env.items()})
     # The child inherits stdout (safe JSONL) and writes its own artifact
     # file. Never use a pipe here: a slow reader could fill the pipe buffer
     # and block the child.
@@ -1981,7 +2828,17 @@ def child_argv_from_env() -> dict[str, Any]:
         ),
         "probe_b_bootstrap_timeout_s": float(
             os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
+            or decoded.get("probe_b_bootstrap_timeout_s")
             or DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
+        ),
+        "ab_mode": bool(decoded.get("ab_mode", False)),
+        "ab_arm": str(decoded.get("ab_arm", "")),
+        "ab_live_budget_s": float(decoded.get("ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)),
+        "ab_preflight_budget_s": float(
+            decoded.get("ab_preflight_budget_s", DEFAULT_AB_PREFLIGHT_BUDGET_S)
+        ),
+        "ab_cleanup_reserve_s": float(
+            decoded.get("ab_cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)
         ),
     }
 
@@ -2076,6 +2933,22 @@ def _consume_child_line(line: str, evidence: ProbeEvidence, sink: EventSink) -> 
             evidence.fail_category = "server-nonresponsive-sustained"
     elif kind == "child-forced-exit":
         evidence.forced_exit = True
+    elif kind == "ab-arm-result":
+        # #553: one privacy-safe arm result; the parent never infers fields.
+        evidence.ab_result = {
+            key: value for key, value in payload.items() if key not in ("ts", "mono")
+        }
+        status = str(payload.get("status", "") or "")
+        if status:
+            evidence.status = status[:48]
+        if payload.get("delivered") is True:
+            evidence.delivered = True
+        if payload.get("timed_out") is True:
+            evidence.terminated_at_campaign_end = True
+    elif kind == "ab-result-emit-failed":
+        evidence.fail_category = (
+            "ab-result-emit-failed:" + str(payload.get("category", "unknown"))[:32]
+        )
     elif kind == "probe-end":
         evidence.status = str(payload.get("status", ""))[:48]
     elif kind == "child-exit":
@@ -2637,6 +3510,483 @@ def _evidence_dict(evidence: ProbeEvidence) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# kodmial/aa#553: parent-side bounded sequential A/B supervision
+# ---------------------------------------------------------------------------
+
+
+def _ab_arm_fallback(
+    evidence: ProbeEvidence,
+    arm: str,
+    *,
+    scenario: dict[str, Any] | None = None,
+    budget: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Explicit unknown arm evidence when the child emitted no A/B result.
+
+    Nothing is inferred: absent telemetry stays missing and the arm can never
+    contribute an A/B COMPLETE or a product PASS.
+    """
+    return {
+        "arm": arm,
+        "probe": evidence.probe,
+        "mode": MODE_ONE_SHOT_AB,
+        "status": str(evidence.status or "unknown")[:48],
+        "delivered": bool(evidence.delivered),
+        "timed_out": bool(evidence.terminated_at_campaign_end),
+        "typed_failure": str(evidence.fail_category or "")[:64],
+        "env_flag_raw": "",
+        "expected_env_flag": expected_ab_env_flag(arm),
+        "effective_flag": None,
+        "scenario": dict(scenario) if scenario else ab_scenario_identity(),
+        "budget": dict(budget) if budget else _ab_budget(),
+        "preflight_elapsed_ms": None,
+        "live_elapsed_ms": evidence.delivered_elapsed_ms,
+        "delivery_ms": evidence.delivered_elapsed_ms,
+        "retrieval": {},
+        "attempts": {},
+        "telemetry": {},
+        "product": {},
+        "provider_429": False,
+        "active_backoff": False,
+    }
+
+
+def _ab_status_banner(status: str) -> str:
+    """Non-deceptive one-line A/B outcome; never a qualification verdict."""
+    if status == AB_STATUS_COMPLETE:
+        return (
+            "> **outcome: COMPLETE — bounded A/B evidence only; NOT a "
+            "qualification verdict, NOT a product PASS and no speedup is "
+            "inferred.**"
+        )
+    if status == AB_STATUS_DEDUPLICATED:
+        return (
+            "> **outcome: DEDUPLICATED — this exact SHA/config already has a "
+            "COMPLETE A/B result; no provider run was repeated.**"
+        )
+    if status == AB_STATUS_BLOCKED:
+        return (
+            "> **outcome: BLOCKED — an arm failed or a provider 429/backoff/"
+            "timeout stopped the A/B; NOT a success.**"
+        )
+    return (
+        f"> **outcome: {status} — incomplete/uncertain evidence; NOT a "
+        "success and no product PASS.**"
+    )
+
+
+def _ab_arm_report_lines(arm: dict[str, Any]) -> list[str]:
+    """Privacy-safe observed evidence for one arm (no prompt/reply text)."""
+    retrieval = arm.get("retrieval")
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    attempts = arm.get("attempts")
+    attempts = attempts if isinstance(attempts, dict) else {}
+    telemetry = arm.get("telemetry")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    product = arm.get("product")
+    product = product if isinstance(product, dict) else {}
+    by_agent = attempts.get("by_agent")
+    by_agent = by_agent if isinstance(by_agent, dict) else {}
+    agent_counts = ", ".join(
+        f"{str(name)[:32]}={int((value or {}).get('attempts', 0))}"
+        for name, value in sorted(by_agent.items())
+        if isinstance(value, dict)
+    )
+    lines = [
+        f"### Arm `{arm.get('arm', 'unknown')}`",
+        f"- status: `{arm.get('status', 'unknown')}`",
+        f"- env_flag_raw: `{arm.get('env_flag_raw', '')}`",
+        f"- expected_env_flag: `{arm.get('expected_env_flag', '')}`",
+        f"- effective_flag: `{arm.get('effective_flag')}`",
+        f"- delivered: `{str(bool(arm.get('delivered'))).lower()}`",
+        f"- timed_out: `{str(bool(arm.get('timed_out'))).lower()}`",
+    ]
+    for key in ("preflight_elapsed_ms", "live_elapsed_ms", "delivery_ms"):
+        if isinstance(arm.get(key), (int, float)):
+            lines.append(f"- {key}: {arm[key]}")
+    if arm.get("typed_failure"):
+        lines.append(f"- typed_failure: `{str(arm['typed_failure'])[:64]}`")
+    lines.append(f"- retrieval_mode: `{retrieval.get('retrieval_mode', 'unobserved')}`")
+    lines.append(f"- fastpath_attempted: `{retrieval.get('fastpath_attempted', 'unobserved')}`")
+    lines.append(f"- fastpath_ready: `{retrieval.get('fastpath_ready', 'unobserved')}`")
+    lines.append(f"- fallback_reason: `{retrieval.get('fallback_reason', '')}`")
+    lines.append(f"- coverage_status: `{retrieval.get('coverage_status', 'unobserved')}`")
+    if "LLM_call_count" in retrieval:
+        lines.append(f"- retrieval_llm_call_count: {retrieval['LLM_call_count']}")
+    if "calls_observed" in retrieval:
+        lines.append(f"- retrieval_calls_observed: {retrieval['calls_observed']}")
+    call_trace = retrieval.get("call_trace")
+    if isinstance(call_trace, list) and call_trace:
+        modes = ", ".join(
+            str(item.get("retrieval_mode", "unknown"))[:32]
+            for item in call_trace
+            if isinstance(item, dict)
+        )
+        lines.append(f"- retrieval_call_modes: `{modes}`")
+    if "llm_calls_total" in retrieval:
+        lines.append(f"- retrieval_llm_calls_total: {retrieval['llm_calls_total']}")
+    lines.append(f"- model_http_attempts: {attempts.get('model_http_attempts', 'unobserved')}")
+    lines.append(f"- attempts_by_agent: {agent_counts or 'unobserved'}")
+    for key in (
+        "planner_latency_ms",
+        "retrieval_latency_ms",
+        "answer_latency_ms",
+        "verifier_latency_ms",
+        "total_latency_ms",
+    ):
+        if isinstance(telemetry.get(key), (int, float)):
+            lines.append(f"- {key}: {telemetry[key]}")
+    for key in ("planner_outcome", "retrieval_outcome", "answer_outcome", "verifier_outcome"):
+        if telemetry.get(key) not in (None, ""):
+            lines.append(f"- {key}: `{str(telemetry[key])[:64]}`")
+    for key in ("verified_book_units", "adequacy_verdict", "all_required_supported"):
+        if key in telemetry:
+            lines.append(f"- {key}: `{str(telemetry[key])[:64]}`")
+    lines.append(f"- product_outcome: `{str(product.get('product_outcome', 'unknown'))[:64]}`")
+    lines.append(f"- grounded_substantive: `{product.get('grounded_substantive')}`")
+    if isinstance(product.get("reply_len"), int):
+        lines.append(f"- reply_len: {product['reply_len']}")
+    if attempts.get("failure_categories"):
+        categories = ", ".join(str(item)[:48] for item in attempts["failure_categories"][:8])
+        lines.append(f"- attempt_failure_categories: `{categories}`")
+    missing = arm.get("missing_fields")
+    if isinstance(missing, list) and missing:
+        lines.append("- missing_fields: `" + ", ".join(str(item)[:48] for item in missing) + "`")
+    else:
+        lines.append("- missing_fields: none")
+    return lines
+
+
+def build_ab_report(
+    meta: dict[str, Any],
+    arms: list[dict[str, Any]],
+    status: str,
+    *,
+    second_arm_skipped_reason: str = "",
+) -> str:
+    """Compact truthful A/B report; evidence only, never qualification."""
+    scenario: dict[str, Any] = dict(meta.get("scenario") or {})
+    config: dict[str, Any] = dict(meta.get("config") or {})
+    budget: dict[str, Any] = dict(meta.get("budget") or {})
+    lines = [
+        _ab_status_banner(status),
+        "",
+        "Bounded real-book one-shot retrieval A/B (`kodmial/aa#553`). This is "
+        "validation wiring only: it does not change production semantics, the "
+        "runtime flag default, Gate C acceptance rules, qualification status "
+        "or any repair/recovery cap.",
+        f"Run: `{meta.get('run_url', '')}` (exact SHA `{meta.get('main_sha', '')}`)",
+        f"- mode: `{meta.get('mode', MODE_ONE_SHOT_AB)}`",
+        f"- scenario_family: `{scenario.get('family', 'unknown')}`",
+        f"- scenario_source: `{scenario.get('source', 'unknown')}`",
+        f"- prompt_sha256: `{scenario.get('prompt_sha256', '')}`",
+        f"- config_digest: `{config.get('config_digest', '')}`",
+        f"- primary_model: `{config.get('primary_model', '')}`",
+        f"- fallback_model: `{config.get('fallback_model', '')}`",
+        f"- live_budget_s: {budget.get('live_budget_s', '')}",
+        f"- preflight_budget_s: {budget.get('preflight_budget_s', '')}",
+        f"- cleanup_reserve_s: {budget.get('cleanup_reserve_s', '')}",
+        f"- total_real_model_budget_cap_s: {budget.get('total_real_model_budget_cap_s', '')}",
+        "",
+    ]
+    for arm in arms:
+        lines.extend(_ab_arm_report_lines(arm))
+        lines.append("")
+    if second_arm_skipped_reason:
+        lines.append(f"- second_arm_skipped_reason: `{second_arm_skipped_reason}`")
+        lines.append("")
+    lines.extend(
+        [
+            "### Decision boundary",
+            "- A/B is evidence for a controller decision only; it is NOT an "
+            "authoritative qualification and cannot admit #538/#514/#7.",
+            "- No speedup, no correctness/grounding/safety PASS and no product "
+            "verdict is inferred from missing or incomplete telemetry.",
+            "- The production flag default remains OFF; only an explicit "
+            "controller admission may enable it in the trusted qualification path.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ab_already_complete(
+    publisher: IssueProgressPublisher,
+    main_sha: str,
+    config_digest: str,
+) -> bool:
+    """Whether this exact SHA/config already has a COMPLETE A/B comment."""
+    comments = publisher.list_comments()
+    if not comments:
+        return False
+    marker = ab_complete_marker(main_sha, config_digest)
+    return any(
+        isinstance(comment.get("body"), str) and marker in str(comment["body"])
+        for comment in comments
+    )
+
+
+def _ab_exit_code(status: str) -> int:
+    """Truthful process exit code for the A/B status."""
+    if status in (AB_STATUS_COMPLETE, AB_STATUS_DEDUPLICATED):
+        return EXIT_OK
+    if status == AB_STATUS_BLOCKED:
+        return EXIT_BOOTSTRAP_FAILED
+    return EXIT_INCONCLUSIVE
+
+
+def _ab_outcome(status: str) -> str:
+    return {
+        AB_STATUS_COMPLETE: "complete",
+        AB_STATUS_DEDUPLICATED: "deduplicated",
+        AB_STATUS_INCOMPLETE: "incomplete",
+        AB_STATUS_INCONCLUSIVE: "inconclusive",
+        AB_STATUS_BLOCKED: "blocked",
+    }.get(status, "unknown")
+
+
+def _write_ab_evidence(
+    out_dir: Path,
+    meta: dict[str, Any],
+    arms: list[dict[str, Any]],
+    status: str,
+    *,
+    second_arm_skipped_reason: str = "",
+) -> tuple[dict[str, Any], str]:
+    """Persist result.json + final-report.md and return (result, report)."""
+    exit_code = _ab_exit_code(status)
+    missing_fields = {
+        str(arm.get("arm", "unknown")): list(arm.get("missing_fields") or []) for arm in arms
+    }
+    report = build_ab_report(
+        meta,
+        arms,
+        status,
+        second_arm_skipped_reason=second_arm_skipped_reason,
+    )
+    (out_dir / "final-report.md").write_text(report + "\n", encoding="utf-8")
+    result = {
+        "schema": AB_SCHEMA_VERSION,
+        "mode": MODE_ONE_SHOT_AB,
+        "status": status,
+        "outcome": _ab_outcome(status),
+        "exit_code": exit_code,
+        "main_sha": meta.get("main_sha", ""),
+        "run_id": meta.get("run_id", ""),
+        "run_url": meta.get("run_url", ""),
+        "target_issue": AB_ISSUE,
+        "scenario": meta.get("scenario", {}),
+        "config": meta.get("config", {}),
+        "budget": meta.get("budget", {}),
+        "campaign_allowance_s": meta.get("effective_campaign_allowance_s"),
+        "per_answer_wall_clock_cutoff_s": None,
+        "second_arm_skipped_reason": second_arm_skipped_reason,
+        "arms": arms,
+        "missing_fields": missing_fields,
+        "diagnostic_note": (
+            "Bounded validation-only real-book A/B; not a qualification, not "
+            "a Gate C PASS/FAIL, not a product PASS and never a speedup claim."
+        ),
+    }
+    (out_dir / "result.json").write_text(
+        json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return result, report
+
+
+def _parent_ab_main(
+    args: argparse.Namespace,
+    out_dir: Path,
+    allowance: float,
+    token: str,
+) -> int:
+    """Run OFF then ON sequentially under the existing bounded canary budget."""
+    budget = _ab_budget(
+        float(getattr(args, "ab_live_budget_s", DEFAULT_AB_LIVE_BUDGET_S)),
+        float(getattr(args, "ab_preflight_budget_s", DEFAULT_AB_PREFLIGHT_BUDGET_S)),
+        float(getattr(args, "ab_cleanup_reserve_s", DEFAULT_AB_CLEANUP_RESERVE_S)),
+    )
+    config = ab_config_identity(
+        os.environ.get("OPENCODE_MODEL", ""),
+        os.environ.get("OPENCODE_FALLBACK_MODEL", ""),
+        live_budget_s=budget["live_budget_s"],
+        preflight_budget_s=budget["preflight_budget_s"],
+        cleanup_reserve_s=budget["cleanup_reserve_s"],
+    )
+    scenario = ab_scenario_identity()
+    meta: dict[str, Any] = {
+        "schema": AB_SCHEMA_VERSION,
+        "mode": MODE_ONE_SHOT_AB,
+        "main_sha": args.main_sha or git_head_sha(),
+        "run_id": str(args.run_id),
+        "run_url": _run_url(),
+        "scenario": scenario,
+        "config": config,
+        "budget": budget,
+        "campaign_allowance_s": float(args.campaign_allowance_s),
+        "effective_campaign_allowance_s": allowance,
+        "finalisation_reserve_s": float(args.finalisation_reserve_s),
+        "job_timeout_minutes": float(args.job_timeout_minutes),
+        "per_answer_wall_clock_cutoff_s": None,
+    }
+    (out_dir / "run-meta.json").write_text(
+        json.dumps(meta, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    sink = EventSink(out_dir / "supervisor-events.jsonl", echo=False)
+    sink.emit(
+        "supervisor-start",
+        mode=MODE_ONE_SHOT_AB,
+        run_id=meta["run_id"],
+        sha=meta["main_sha"],
+        config_digest=config["config_digest"],
+        effective_campaign_allowance_s=round(allowance, 1),
+    )
+    publisher = IssueProgressPublisher(
+        args.owner,
+        args.repo,
+        int(getattr(args, "ab_issue", AB_ISSUE)),
+        token,
+        run_id=str(args.run_id),
+        marker=ab_run_marker(str(args.run_id)),
+    )
+    arms: list[dict[str, Any]] = []
+    skipped_reason = ""
+    if ab_already_complete(publisher, str(meta["main_sha"]), config["config_digest"]):
+        status = AB_STATUS_DEDUPLICATED
+        sink.emit(
+            "supervisor-ab-deduplicated",
+            sha=meta["main_sha"],
+            config_digest=config["config_digest"],
+        )
+    else:
+        if token:
+            publisher.publish(
+                "One-shot retrieval A/B started",
+                f"- run: `{meta['run_url']}`\n- sha: `{meta['main_sha']}`\n"
+                f"- mode: `{MODE_ONE_SHOT_AB}`\n"
+                f"- config_digest: `{config['config_digest']}`\n"
+                f"- arms: `off` then `on` (sequential; bounded canary budget)",
+            )
+        campaign_deadline = time.monotonic() + allowance
+        for arm in (AB_ARM_OFF, AB_ARM_ON):
+            if arm == AB_ARM_ON:
+                remaining = campaign_deadline - time.monotonic()
+                required = (
+                    MIN_AB_PREFLIGHT_S
+                    + float(budget["live_budget_s"])
+                    + float(budget["cleanup_reserve_s"])
+                )
+                sink.emit(
+                    "supervisor-ab-budget-check",
+                    next_arm=arm,
+                    remaining_s=round(remaining, 1),
+                    required_s=round(required, 1),
+                )
+                if remaining < required:
+                    skipped_reason = "insufficient-job-budget"
+                    break
+            probe_label = PROBE_SCENARIO2_OFF if arm == AB_ARM_OFF else PROBE_SCENARIO2_ON
+            sink.emit(
+                "supervisor-ab-arm-start",
+                arm=arm,
+                probe=probe_label,
+                env_flag=expected_ab_env_flag(arm),
+            )
+            evidence = _run_one_probe(
+                ProbePlan(
+                    probe=probe_label,
+                    snapshot_cadence_s=float(args.snapshot_cadence_s),
+                    max_snapshots=int(args.max_snapshots),
+                    connect_timeout_s=float(args.probe_a_connect_timeout_s),
+                    arm_env=ab_arm_environment(arm),
+                    ab_mode=True,
+                    ab_arm=arm,
+                    ab_live_budget_s=float(budget["live_budget_s"]),
+                    ab_preflight_budget_s=float(budget["preflight_budget_s"]),
+                    ab_cleanup_reserve_s=float(budget["cleanup_reserve_s"]),
+                    probe_b_bootstrap_timeout_s=float(budget["preflight_budget_s"]),
+                ),
+                out_dir=out_dir,
+                sink=sink,
+                publisher=publisher,
+                campaign_deadline_s=campaign_deadline,
+            )
+            arm_result = (
+                dict(evidence.ab_result)
+                if isinstance(evidence.ab_result, dict) and evidence.ab_result
+                else _ab_arm_fallback(evidence, arm, scenario=scenario, budget=budget)
+            )
+            arm_result["arm"] = arm
+            arm_result["probe"] = probe_label
+            arm_result["mode"] = MODE_ONE_SHOT_AB
+            arm_result["expected_env_flag"] = expected_ab_env_flag(arm)
+            arm_result["exit_code"] = evidence.exit_code
+            arm_result["evidence_status"] = evidence.status
+            arm_result["snapshots"] = evidence.snapshots
+            arm_result["killed"] = evidence.killed
+            arm_result["terminated_at_campaign_end"] = evidence.terminated_at_campaign_end
+            arm_result["missing_fields"] = _ab_missing_fields(arm_result)
+            arms.append(arm_result)
+            stop, reason = _ab_should_stop_after_arm(arm_result)
+            if stop:
+                skipped_reason = reason
+                break
+        status = classify_ab_outcome(
+            arms,
+            second_arm_skipped_reason=skipped_reason,
+        )
+    result, report = _write_ab_evidence(
+        out_dir,
+        meta,
+        arms,
+        status,
+        second_arm_skipped_reason=skipped_reason,
+    )
+    if token:
+        body = report
+        if status == AB_STATUS_COMPLETE:
+            body = (
+                ab_complete_marker(str(meta["main_sha"]), str(config["config_digest"]))
+                + "\n"
+                + report
+            )
+        # force: the terminal A/B evidence must never be throttled away, even
+        # when both arms finish inside the progress-comment interval.
+        publisher.publish(f"One-shot retrieval A/B {status}", body, force=True)
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if step_summary:
+        try:
+            with Path(step_summary).open("a", encoding="utf-8") as stream:
+                stream.write("## AA one-shot retrieval A/B (validation only)\n\n")
+                stream.write(_ab_status_banner(status) + "\n\n```markdown\n")
+                stream.write(report)
+                stream.write("\n```\n")
+        except OSError:
+            pass
+    sink.emit(
+        "supervisor-report-published",
+        mode=MODE_ONE_SHOT_AB,
+        status=status,
+        target_issue=AB_ISSUE,
+    )
+    print(
+        json.dumps(
+            {
+                "mode": MODE_ONE_SHOT_AB,
+                "status": status,
+                "outcome": result["outcome"],
+                "exit_code": result["exit_code"],
+                "config_digest": config["config_digest"],
+                "final_report": str(out_dir / "final-report.md"),
+                "artifact": (f"aa-gate-c-scenario2-diagnostic-{meta['run_id']}-one-shot-ab"),
+            }
+        ),
+        flush=True,
+    )
+    return int(result["exit_code"])
+
+
 def git_head_sha() -> str:
     """Exact checked-out SHA when git metadata is available."""
     try:
@@ -2663,6 +4013,13 @@ def parent_main(args: argparse.Namespace) -> int:
         job_timeout_minutes=float(args.job_timeout_minutes),
         job_started_epoch=float(args.job_started_epoch),
     )
+    if str(getattr(args, "mode", MODE_SCENARIO2)) == MODE_ONE_SHOT_AB:
+        return _parent_ab_main(
+            args,
+            out_dir,
+            allowance,
+            (os.environ.get("GITHUB_TOKEN", "") or "").strip(),
+        )
     meta = {
         "schema": SCHEMA_VERSION,
         "main_sha": args.main_sha or git_head_sha(),
@@ -2708,7 +4065,13 @@ def parent_main(args: argparse.Namespace) -> int:
     probe_b = ProbeEvidence(probe=PROBE_SCENARIO2, status="not-run")
     os.environ["SCENARIO2_DIAG_PROBE_A_PORT"] = str(args.probe_a_port)
     os.environ["SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_a_bootstrap_timeout_s)
-    os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_b_bootstrap_timeout_s)
+    # Preserve an operator/workflow bootstrap override when the CLI used its
+    # default value; an explicitly supplied CLI value still wins.
+    probe_b_timeout = float(args.probe_b_bootstrap_timeout_s)
+    if probe_b_timeout != DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S or not os.environ.get(
+        "SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"
+    ):
+        os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(probe_b_timeout)
     try:
         if args.probe in ("both", PROBE_DIRECT_MODEL):
             probe_a = _run_one_probe(
@@ -2818,6 +4181,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--mode",
+        choices=(MODE_SCENARIO2, MODE_ONE_SHOT_AB),
+        default=MODE_SCENARIO2,
+        help=(
+            "scenario2 (existing diagnostic, default) or the #553 bounded "
+            "validation-only real-book one-shot retrieval A/B."
+        ),
+    )
+    parser.add_argument(
+        "--ab-issue",
+        type=int,
+        default=AB_ISSUE,
+        help="Issue that receives the bounded A/B evidence comment.",
+    )
+    parser.add_argument(
+        "--ab-live-budget-s",
+        type=float,
+        default=DEFAULT_AB_LIVE_BUDGET_S,
+        help="Per-arm live canary budget (default 300s).",
+    )
+    parser.add_argument(
+        "--ab-preflight-budget-s",
+        type=float,
+        default=DEFAULT_AB_PREFLIGHT_BUDGET_S,
+        help="Per-arm preflight canary budget (default 600s).",
+    )
+    parser.add_argument(
+        "--ab-cleanup-reserve-s",
+        type=float,
+        default=DEFAULT_AB_CLEANUP_RESERVE_S,
+        help="Per-arm cleanup reserve kept inside the live budget.",
+    )
+    parser.add_argument(
         "--probe",
         choices=("both", PROBE_DIRECT_MODEL, PROBE_SCENARIO2),
         default="both",
@@ -2896,7 +4292,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.child:
         child = child_argv_from_env()
-        if child["probe"] not in (PROBE_DIRECT_MODEL, PROBE_SCENARIO2):
+        if child["probe"] not in (PROBE_DIRECT_MODEL, *SCENARIO2_PROBES):
             return EXIT_REPORT_FAILED
         return _child_main(child)
     return parent_main(args)

@@ -4,7 +4,16 @@ name: AA Gate C scenario2 diagnostic
 # SHA travels in the Actions run record itself. The reconciler parses this
 # title instead of trusting an issue-comment marker, which any commenter
 # could forge.
-run-name: "AA scenario2 diagnostic target=${{ github.event.inputs.target_sha || github.sha }}"
+#
+# kodmial/aa#553: the mode is also in the title, including the automatic
+# push-triggered A/B. The trigger-file change is visible in the push event
+# payload, so a push that changes only the validation entry point is titled
+# mode=one-shot-ab from the start. This lets the reconciler identify the A/B
+# even if the job is cancelled or times out before its artifact upload.
+run-name: >-
+  AA scenario2 diagnostic
+  target=${{ github.event.inputs.target_sha || github.sha }}
+  mode=${{ github.event.inputs.mode || (github.event_name == 'push' && (contains(toJSON(github.event.commits.*.added), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(toJSON(github.event.commits.*.modified), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(toJSON(github.event.commits.*.removed), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.added, 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.modified, 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.removed, 'qualification/one_shot_retrieval_ab_553.trigger')) && 'one-shot-ab') || 'scenario2' }}
 
 # kodmial/aa#418 + kodmial/aa#424 (P0 diagnostic, progress/liveness-driven):
 # run ONLY Gate C scenario #2 (substantive-drinking) through the real
@@ -36,12 +45,24 @@ on:
     paths:
       - ".github/workflows/aa-gate-c-scenario2-diagnostic.yml"
       - "scripts/diagnose_gate_c_scenario2.py"
+      # kodmial/aa#553: the narrow validation entry point. Only a push
+      # that changes this trigger file selects the bounded one-shot A/B;
+      # unrelated main pushes keep the existing scenario2 diagnostic mode.
+      - "qualification/one_shot_retrieval_ab_553.trigger"
   workflow_dispatch:
     inputs:
       target_sha:
         description: "Exact SHA to diagnose (defaults to current main)"
         required: false
         type: string
+      mode:
+        description: "Diagnostic mode (scenario2 keeps the existing behaviour)"
+        required: false
+        type: choice
+        default: scenario2
+        options:
+          - scenario2
+          - one-shot-ab
 
 permissions:
   contents: read
@@ -65,7 +86,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.target_sha || github.sha }}
-          fetch-depth: 1
+          fetch-depth: 2
 
       - name: Verify exact SHA
         id: sha
@@ -78,13 +99,68 @@ jobs:
           echo "job-start-epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           echo "$GITHUB_RUN_ID $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
+      # kodmial/aa#553: automatic A/B selection is tied to the validation
+      # entry point, never to every main push. An explicit workflow_dispatch
+      # mode always wins; a push selects one-shot-ab only when it changed the
+      # trigger file. Everything else keeps the existing scenario2 mode.
+      - name: Determine diagnostic mode
+        id: mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mode="${INPUT_MODE:-}"
+          if [ -z "$mode" ]; then
+            mode="scenario2"
+            if [ "$EVENT_NAME" = "push" ]; then
+              changed=""
+              if [ -n "${PUSH_BEFORE:-}" ] \
+                && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+                git fetch --no-tags --depth=1 origin "$PUSH_BEFORE" >/dev/null 2>&1 || true
+                if git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                  changed="$(git diff --name-only "$PUSH_BEFORE" "$PUSH_SHA" || true)"
+                fi
+              fi
+              if [ -z "$changed" ]; then
+                changed="$(git show --first-parent --name-only --pretty=format: "$PUSH_SHA" || true)"
+              fi
+              if printf '%s\n' "$changed" | grep -qx "qualification/one_shot_retrieval_ab_553.trigger"; then
+                mode="one-shot-ab"
+              fi
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "diagnostic-mode=$mode" >> "$GITHUB_STEP_SUMMARY"
+
+      # kodmial/aa#553: a durable, privacy-safe marker so the A/B artifact
+      # exists even when the A/B step fails before the script writes its own
+      # evidence. The scenario2 reconciler uses the artifact name to skip
+      # this validation-only run instead of treating it as a missing
+      # scenario2 diagnostic artifact.
+      - name: Mark one-shot A/B validation run
+        if: steps.mode.outputs.mode == 'one-shot-ab'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic-scenario2-out
+          printf '{"mode":"one-shot-ab","run_id":"%s","target_issue":553}\n' \
+            "${{ github.run_id }}" > diagnostic-scenario2-out/ab-run-marker.json
+
       # kodmial/aa#483 — durable declared run identity. A workflow_dispatch
       # Actions record can only name the dispatch-ref head, never the
       # requested target_sha, so the run publishes the exact SHA it checked
       # out to the AA-owned operations tracker as a durable marker. The
       # post-run reconciler binds artifact evidence to that declared SHA.
+      # kodmial/aa#553: only the scenario2 diagnostic declares this identity.
+      # The A/B run is validation-only and identifies itself through its
+      # separate artifact and #553 report, so it must not add a scenario2
+      # marker to #419.
       - name: Publish declared exact-SHA run identity
-        if: steps.sha.conclusion == 'success'
+        if: steps.sha.conclusion == 'success' && steps.mode.outputs.mode == 'scenario2'
         uses: actions/github-script@v7
         with:
           script: |
@@ -164,6 +240,7 @@ jobs:
 
       - name: Run scenario2 diagnostic (no per-answer cutoff; campaign allowance)
         id: diag
+        if: steps.mode.outputs.mode == 'scenario2'
         env:
           OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
           OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
@@ -207,6 +284,55 @@ jobs:
           echo "::error::scenario2 diagnostic failed with exit code $status"
           exit "$status"
 
+      # kodmial/aa#553: bounded validation-only real-book A/B. One workflow
+      # bootstrap (corpus/index/models/OpenCode) is reused by two sequential
+      # child arms; no separate bot, no parallel provider requests, no
+      # standalone probe before the arms and no full 18-case campaign.
+      - name: Run bounded one-shot retrieval A/B (OFF then ON)
+        id: ab_diag
+        if: steps.mode.outputs.mode == 'one-shot-ab'
+        env:
+          OPENCODE_MODEL: ${{ steps.bot_model.outputs.primary }}
+          OPENCODE_FALLBACK_MODEL: ${{ steps.bot_model.outputs.fallback }}
+          AA_BOOK_AGE_IDENTITY: ${{ secrets.AA_BOOK_AGE_IDENTITY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          python scripts/diagnose_gate_c_scenario2.py \
+            --mode one-shot-ab \
+            --ab-issue 553 \
+            --main-sha "${{ steps.sha.outputs.main-sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --owner kodmial \
+            --repo aa \
+            --campaign-allowance-s 1800 \
+            --finalisation-reserve-s 600 \
+            --job-timeout-minutes 60 \
+            --job-started-epoch "${{ steps.sha.outputs.job-start-epoch }}" \
+            --out-dir diagnostic-scenario2-out || status=$?
+          if [ -f diagnostic-scenario2-out/result.json ]; then
+            echo "result-published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result-published=false" >> "$GITHUB_OUTPUT"
+          fi
+          # 0 = COMPLETE or DEDUPLICATED only. 3 = INCOMPLETE/INCONCLUSIVE,
+          # 2 = BLOCKED; neither is ever reported as success.
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$status" -eq 3 ]; then
+            echo "outcome: A/B INCOMPLETE/INCONCLUSIVE — NOT a success."
+            echo "::warning::one-shot A/B ended without complete evidence; artifact holds the observed fields"
+            exit 3
+          fi
+          echo "::error::one-shot A/B failed with exit code $status"
+          exit "$status"
+
       # kodmial/aa#481 evidence-path repair: this artifact is the ONLY
       # AA-owned evidence the post-run reconciler can re-read, and a
       # 7-day lifetime was proven too short (fingerprinted gap
@@ -215,10 +341,19 @@ jobs:
       # the upload loudly when no files exist so a green run can never
       # stand without its evidence artifact.
       - name: Upload diagnostic artifacts
-        if: always()
+        if: always() && steps.mode.outputs.mode == 'scenario2'
         uses: actions/upload-artifact@v4
         with:
           name: aa-gate-c-scenario2-diagnostic-${{ github.run_id }}-scenario2
+          path: diagnostic-scenario2-out/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload one-shot A/B diagnostic artifacts
+        if: always() && steps.mode.outputs.mode == 'one-shot-ab'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-gate-c-scenario2-diagnostic-${{ github.run_id }}-one-shot-ab
           path: diagnostic-scenario2-out/
           if-no-files-found: error
           retention-days: 90
@@ -265,5 +400,50 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: 418,
+              body
+            });
+
+      - name: Notify on unpublished one-shot A/B lifecycle
+        # Fallback only: the A/B script itself owns the idempotent #553
+        # comment. Fires ONLY when no result.json could be published.
+        if: always() && steps.mode.outputs.mode == 'one-shot-ab' && steps.ab_diag.outcome == 'failure' && steps.ab_diag.outputs.result-published != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = "${{ github.run_id }}";
+            const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/" + runId;
+            const sha = "${{ steps.sha.outputs.main-sha }}";
+            const marker = "<!-- aa-one-shot-retrieval-ab-553 run=" + runId + " -->";
+            // Bounded fallback scan only; the script owns durable dedupe.
+            const listed = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 553,
+              per_page: 100
+            });
+            const comments = listed.data || [];
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              core.info("A/B comment for run " + runId + " already exists; not duplicating.");
+              return;
+            }
+            // Sanitized notice only (never log bot tokens or payloads).
+            const body = [
+              marker,
+              "**AA one-shot retrieval A/B (validation only, kodmial/aa#553)**",
+              "",
+              "Status: `workflow-degraded-before-or-around-ab` (sanitized notice).",
+              "- Run URL: " + runUrl,
+              "- Exact SHA: `" + sha + "`",
+              "- Failed step: `" + "${{ steps.ab_diag.outcome }}" + "`",
+              "",
+              "The A/B script failed to publish its own final report. Check the",
+              "run log and the uploaded artifacts for sanitized evidence.",
+              "_Validation-only: not qualification evidence._"
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 553,
               body
             });
