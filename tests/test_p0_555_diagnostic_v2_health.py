@@ -232,6 +232,21 @@ def test_internal_observation_uses_authenticated_v2_routes(diag: Any) -> None:
         assert "/global/health" not in paths
 
 
+def test_internal_observation_reads_native_v2_content_parts(diag: Any) -> None:
+    """The real v2 message shape carries parts under ``content``."""
+    with _v2_server() as (state, base_url):
+        state.messages = [
+            {
+                "id": "msg_1",
+                "content": [{"type": "text"}, {"type": "tool"}],
+            }
+        ]
+        observed = diag._opencode_internal_observation(base_url, "ses_555")
+        assert observed["responsive"] is True
+        assert observed["messages_seen"] == 1
+        assert observed["part_kinds"] == ["text", "tool"]
+
+
 def test_internal_observation_is_fail_closed_without_credential(diag: Any) -> None:
     with _v2_server() as (state, base_url):
         state.password = PASSWORD

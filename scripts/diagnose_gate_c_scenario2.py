@@ -524,7 +524,12 @@ def _summarize_messages(payload: Any) -> tuple[int | None, list[str]]:
     for message in payload:
         if not isinstance(message, dict):
             continue
+        # The retained v1 surface exposes ``parts``; the native v2 message
+        # shape exposes the same part list as ``content``. Read both so a
+        # healthy v2 server does not look like it has no observable parts.
         parts = message.get("parts")
+        if not isinstance(parts, list):
+            parts = message.get("content")
         if not isinstance(parts, list):
             continue
         for part in parts:

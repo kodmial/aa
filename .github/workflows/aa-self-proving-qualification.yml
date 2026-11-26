@@ -1229,7 +1229,7 @@ jobs:
             --out-dir "$canary_dir" \
             --run-id "${{ github.run_id }}" \
             --preflight-budget-s 600 \
-            --live-probe-budget-s 300 \
+            --live-probe-budget-s 600 \
             --scenario-limit 2
           canary_rc=$?
           set -e

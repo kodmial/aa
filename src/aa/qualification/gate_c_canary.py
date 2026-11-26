@@ -64,7 +64,15 @@ EXIT_BY_STATUS = {
 }
 
 DEFAULT_PREFLIGHT_BUDGET_S = 600.0
-DEFAULT_LIVE_PROBE_BUDGET_S = 300.0
+# A single real production turn is not bounded by a short wall clock: the
+# pinned free model can spend several minutes on planner/answer/verifier
+# rounds and still be making real progress. The 300 s probe that used to be
+# used here expired mid-turn and published ``external-progress-unobserved``
+# even though the attempt ledger showed continuous progress. The live probe
+# therefore gets the same 600 s allowance as the whole preflight; the
+# preflight deadline still caps it, and a genuinely stalled turn remains a
+# bounded INCONCLUSIVE result.
+DEFAULT_LIVE_PROBE_BUDGET_S = 600.0
 DEFAULT_SELF_TEST_TIMEOUT_S = 60.0
 DEFAULT_SELF_TEST_DELAYS_S: tuple[float, ...] = (0.15, 0.30)
 DEFAULT_SELF_TEST_INTERVAL_S = 0.02

@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         "--live-probe-budget-s",
         type=float,
         default=DEFAULT_LIVE_PROBE_BUDGET_S,
-        help="Real-path probe budget (default 300s)",
+        help="Real-path probe budget (default 600s)",
     )
     parser.add_argument(
         "--scenario-limit",
