@@ -191,8 +191,9 @@ def _sink_events(path: pathlib.Path) -> list[dict[str, Any]]:
 def test_health_probe_uses_authenticated_v2_info(diag: Any) -> None:
     with _v2_server() as (state, base_url):
         state.password = PASSWORD
-        # No credential: fail closed, never fall back to the retired v1 route.
-        assert diag._health_probe(base_url, 1.0) == (False, "")
+        # No credential: fail closed with a typed credential error, never
+        # fall back to the retired v1 route.
+        assert diag._health_probe(base_url, 1.0) == (False, "auth-error")
         healthy, version = diag._health_probe(base_url, 1.0, PASSWORD)
         assert healthy is True
         assert version == "2.2.6"

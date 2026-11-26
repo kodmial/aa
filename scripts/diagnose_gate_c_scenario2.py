@@ -587,11 +587,18 @@ def _opencode_internal_observation(
             else:
                 result["sessions_seen"] = extra.get("_sessions_seen")
             break
-        if int(timings.get("status", 0) or 0) in (404, 405):
+        status = int(timings.get("status", 0) or 0)
+        if status in (404, 405):
             continue
-        result["fail_category"] = str(timings.get("fail_category", "http-error"))[:48]
+        result["sessions_endpoint_supported"] = False
+        result["fail_category"] = str(
+            extra.get("fail_category") or timings.get("fail_category") or "http-error"
+        )[:48]
+        if status in (401, 403):
+            result["auth_error"] = True
         return result
     else:
+        result["sessions_endpoint_supported"] = False
         result["fail_category"] = str(last_timings.get("fail_category", "http-error"))[:48]
         return result
     if not session_id:
@@ -613,7 +620,9 @@ def _opencode_internal_observation(
         if int(mtimings.get("status", 0) or 0) in (404, 405):
             continue
         result["messages_endpoint_supported"] = False
-        result["messages_fail_category"] = str(mtimings.get("fail_category", ""))[:48]
+        result["messages_fail_category"] = str(
+            mextra.get("fail_category") or mtimings.get("fail_category") or ""
+        )[:48]
         return result
     result["messages_endpoint_supported"] = False
     result["messages_fail_category"] = str(last_mtimings.get("fail_category", ""))[:48]
@@ -733,20 +742,29 @@ class ChildWatchdog(threading.Thread):
             threads.append({"name": thread.name[:48], "frames": frames})
         tasks = self._collect_async_tasks()
         health_ok: Any = None
+        health_version: Any = None
         health_elapsed_ms: Any = None
         try:
             probe_start = time.monotonic()
             password = self._current_password()
             if password:
-                health_ok, _ = _health_probe(
+                health_ok, health_version = _health_probe(
                     self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S, password
                 )
             else:
-                health_ok, _ = _health_probe(self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S)
+                health_ok, health_version = _health_probe(
+                    self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S
+                )
             health_elapsed_ms = round((time.monotonic() - probe_start) * 1000.0, 1)
         except Exception:
             health_ok = None
-        if health_ok:
+        auth_error = health_version == "auth-error"
+        if auth_error:
+            # Server answered but the managed credential is missing/stale:
+            # a credential error, never a wedged-server health failure.
+            self.counters["auth_error"] = True
+            self._consecutive_health_failures = 0
+        elif health_ok:
             self._consecutive_health_failures = 0
             self.counters["last_health_ok_at_s"] = round(time.monotonic(), 2)
         else:
@@ -789,7 +807,11 @@ class ChildWatchdog(threading.Thread):
             "consecutive_health_failures": self._consecutive_health_failures,
             "threads": threads,
             "asyncio_tasks": tasks,
-            "opencode_health": {"ok": health_ok, "elapsed_ms": health_elapsed_ms},
+            "opencode_health": {
+                "ok": health_ok,
+                "elapsed_ms": health_elapsed_ms,
+                "auth_error": auth_error,
+            },
             "opencode_internal": internal,
             "opencode_request_audit": self._audit_summary(),
             "sockets": summarize_loopback_sockets(),
@@ -925,6 +947,10 @@ def _health_probe(base_url: str, timeout: float, password: str = "") -> tuple[bo
     try:
         connection.request("GET", OPENCODE_V2_INFO_PATH, headers=_opencode_auth_headers(password))
         response = connection.getresponse()
+        if response.status in (401, 403):
+            # Server answered but the managed Basic-auth credential is
+            # missing/stale: a credential error, not a wedged server.
+            return False, "auth-error"
         if response.status != 200:
             return False, ""
         payload = json.loads(response.read().decode("utf-8"))
