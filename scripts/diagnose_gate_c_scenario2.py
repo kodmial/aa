@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import concurrent.futures
 import faulthandler
 import hashlib
@@ -193,6 +194,14 @@ NONRESPONSIVE_SNAPSHOTS_REQUIRED = 4
 # A bounded loopback observation-probe bind (health/internal status only,
 # never an answer/model call).
 OBSERVATION_HTTP_TIMEOUT_S = 2.0
+# The production worker speaks the native OpenCode 2 surface. The diagnostic
+# must observe the same routes (Basic-authenticated) instead of the retired
+# v1 ``/global/health`` / ``/session`` routes, otherwise a perfectly healthy
+# v2 server is reported as nonresponsive and the watchdog aborts the run.
+OPENCODE_V2_INFO_PATH = "/api/info"
+OPENCODE_V2_SESSION_PATH = "/api/session"
+OPENCODE_V2_SESSION_ACTIVE_PATH = "/api/session/active"
+OPENCODE_V1_SESSION_PATH = "/session"
 # Observation-only cadence while a model POST is in flight. This NEVER
 # cancels or shortens the pending request; it records whether the local
 # OpenCode server still answers bounded status probes.
@@ -527,7 +536,11 @@ def _summarize_messages(payload: Any) -> tuple[int | None, list[str]]:
 
 
 def _opencode_internal_observation(
-    base_url: str, session_id: str, *, timeout: float = OBSERVATION_HTTP_TIMEOUT_S
+    base_url: str,
+    session_id: str,
+    *,
+    timeout: float = OBSERVATION_HTTP_TIMEOUT_S,
+    password: str = "",
 ) -> dict[str, Any]:
     """Sanitized OpenCode internal status snapshot (bounded, fail-soft).
 
@@ -536,35 +549,67 @@ def _opencode_internal_observation(
     sessions count and (when the diagnostic owns a session id) the
     pending assistant message part kinds. Counts and part kinds only —
     never message text, never session identifiers.
+
+    The native v2 routes are probed first (with the managed Basic-auth
+    credential), then the retained v1 routes only as a compatibility
+    fallback. Probing v1 first against a v2 server produced a false
+    ``responsive: false`` observation in the real A/B run.
     """
+
+    def request(path: str) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
+        if password:
+            return _timed_request(base_url, "GET", path, None, timeout, timeout, password)
+        return _timed_request(base_url, "GET", path, None, timeout, timeout)
+
     result: dict[str, Any] = {"responsive": False, "sessions_endpoint_supported": None}
-    ok, _provider_error, timings, extra = _timed_request(
-        base_url, "GET", "/session", None, timeout, timeout
+    session_paths = (
+        OPENCODE_V2_SESSION_PATH,
+        OPENCODE_V2_SESSION_ACTIVE_PATH,
+        OPENCODE_V1_SESSION_PATH,
     )
-    result["responsive"] = ok
-    result["sessions_endpoint_supported"] = ok
-    if not ok:
+    last_timings: dict[str, float] = {}
+    for path in session_paths:
+        ok, _provider_error, timings, extra = request(path)
+        last_timings = timings
+        if ok:
+            result["responsive"] = True
+            result["sessions_endpoint_supported"] = True
+            sessions = extra.get("_list")
+            if isinstance(sessions, list):
+                result["sessions_seen"] = len(sessions)
+            else:
+                result["sessions_seen"] = extra.get("_sessions_seen")
+            break
+        if int(timings.get("status", 0) or 0) in (404, 405):
+            continue
         result["fail_category"] = str(timings.get("fail_category", "http-error"))[:48]
         return result
-    sessions = extra.get("_list")
-    result["sessions_seen"] = len(sessions) if isinstance(sessions, list) else None
+    else:
+        result["fail_category"] = str(last_timings.get("fail_category", "http-error"))[:48]
+        return result
     if not session_id:
         return result
-    ok_messages, _err, mtimings, mextra = _timed_request(
-        base_url,
-        "GET",
-        f"/session/{urllib.parse.quote(session_id)}/message",
-        None,
-        timeout,
-        timeout,
+    quoted = urllib.parse.quote(session_id)
+    message_paths = (
+        f"{OPENCODE_V2_SESSION_PATH}/{quoted}/message",
+        f"{OPENCODE_V1_SESSION_PATH}/{quoted}/message",
     )
-    if ok_messages:
-        result["messages_endpoint_supported"] = True
-        result["messages_seen"] = mextra.get("_messages_seen")
-        result["part_kinds"] = mextra.get("_part_kinds")
-    else:
+    last_mtimings: dict[str, float] = {}
+    for path in message_paths:
+        ok_messages, _err, mtimings, mextra = request(path)
+        last_mtimings = mtimings
+        if ok_messages:
+            result["messages_endpoint_supported"] = True
+            result["messages_seen"] = mextra.get("_messages_seen")
+            result["part_kinds"] = mextra.get("_part_kinds")
+            return result
+        if int(mtimings.get("status", 0) or 0) in (404, 405):
+            continue
         result["messages_endpoint_supported"] = False
         result["messages_fail_category"] = str(mtimings.get("fail_category", ""))[:48]
+        return result
+    result["messages_endpoint_supported"] = False
+    result["messages_fail_category"] = str(last_mtimings.get("fail_category", ""))[:48]
     return result
 
 
@@ -598,6 +643,8 @@ class ChildWatchdog(threading.Thread):
         counters: dict[str, Any],
         audit_provider: Callable[[], list[dict[str, Any]]] | None = None,
         internal_probe: Callable[[], dict[str, Any]] | None = None,
+        opencode_password: str = "",
+        password_provider: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(name=f"scenario2-diag-watchdog-{probe}", daemon=True)
         self.probe = probe
@@ -611,10 +658,29 @@ class ChildWatchdog(threading.Thread):
         self.counters = counters
         self.audit_provider = audit_provider
         self.internal_probe = internal_probe
+        self._opencode_password = str(opencode_password or "")
+        self._password_provider = password_provider
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self._stop_requested = threading.Event()
         self._consecutive_health_failures = 0
         self._last_internal: dict[str, Any] = {"_baseline": None}
+
+    def set_password_provider(self, provider: Callable[[], str] | None) -> None:
+        """Bind the live runtime credential after the server is provisioned."""
+        self._password_provider = provider
+
+    def _current_password(self) -> str:
+        """Resolve the runtime Basic-auth credential without ever logging it."""
+        if self._password_provider is not None:
+            try:
+                value = str(self._password_provider() or "")
+            except Exception:
+                value = ""
+            if value:
+                return value
+        if self._opencode_password:
+            return self._opencode_password
+        return _opencode_runtime_password()
 
     def run(self) -> None:
         if not self.anchor.wait(timeout=self.anchor_wait_timeout_s):
@@ -663,7 +729,13 @@ class ChildWatchdog(threading.Thread):
         health_elapsed_ms: Any = None
         try:
             probe_start = time.monotonic()
-            health_ok, _ = _health_probe(self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S)
+            password = self._current_password()
+            if password:
+                health_ok, _ = _health_probe(
+                    self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S, password
+                )
+            else:
+                health_ok, _ = _health_probe(self.opencode_base_url, OBSERVATION_HTTP_TIMEOUT_S)
             health_elapsed_ms = round((time.monotonic() - probe_start) * 1000.0, 1)
         except Exception:
             health_ok = None
@@ -800,15 +872,54 @@ class ChildWatchdog(threading.Thread):
         return summary
 
 
-def _health_probe(base_url: str, timeout: float) -> tuple[bool, str]:
-    """One bounded health probe; returns ``(healthy, version)``."""
+def _opencode_runtime_password(runtime: Any | None = None) -> str:
+    """Resolve the managed v2 Basic-auth password without retaining it.
+
+    The production runtime generates a fresh ``OPENCODE_PASSWORD`` when it
+    spawns the server, so it is not necessarily present in the parent
+    environment. Prefer the runtime/client credential when a runtime exists,
+    then fall back to the environment for attach/standalone runs.
+    """
+    if runtime is not None:
+        password = str(getattr(runtime, "_auth_password", "") or "")
+        if not password:
+            client = getattr(runtime, "client", None)
+            password = str(getattr(client, "_password", "") or "")
+        if password:
+            return password
+    return str(
+        os.environ.get("OPENCODE_PASSWORD") or os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
+    )
+
+
+def _opencode_auth_headers(password: str = "") -> dict[str, str]:
+    """Build the v2 request headers; the credential never enters evidence."""
+    headers = {"Accept": "application/json"}
+    if password:
+        token = base64.b64encode(f"opencode:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+
+def _health_probe(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
+    """One bounded native v2 readiness probe; returns ``(healthy, version)``.
+
+    OpenCode 2 exposes Basic-authenticated ``GET /api/info`` and removed the
+    v1 ``/global/health`` route. A JSON identity carrying a non-empty
+    ``version`` and an integer ``pid`` is the readiness signal, matching the
+    production ``aa.opencode.runtime._probe_health`` contract. Probing the
+    retired v1 route made the diagnostic watchdog declare a healthy server
+    nonresponsive and abort a valid Gate C/A-B observation window.
+    """
     try:
         connection = http.client.HTTPConnection(*_split_base(base_url), timeout=timeout)
     except (ValueError, OSError):
         return False, ""
     try:
-        connection.request("GET", "/global/health", headers={"Accept": "application/json"})
+        connection.request("GET", OPENCODE_V2_INFO_PATH, headers=_opencode_auth_headers(password))
         response = connection.getresponse()
+        if response.status != 200:
+            return False, ""
         payload = json.loads(response.read().decode("utf-8"))
     except (OSError, ValueError):
         return False, ""
@@ -817,8 +928,10 @@ def _health_probe(base_url: str, timeout: float) -> tuple[bool, str]:
             connection.close()
         except Exception:
             pass
-    healthy = bool(isinstance(payload, dict) and payload.get("healthy") is True)
-    version = payload.get("version") if healthy else ""
+    if not isinstance(payload, dict):
+        return False, ""
+    version = payload.get("version")
+    healthy = isinstance(version, str) and bool(version) and type(payload.get("pid")) is int
     return healthy, version if isinstance(version, str) else ""
 
 
@@ -832,12 +945,14 @@ def _split_base(base_url: str) -> tuple[str, int]:
     return hostname, port
 
 
-def probe_health(base_url: str, timeout: float) -> tuple[bool, str]:
-    """Public alias so the diagnostic owns one health implementation."""
-    return _health_probe(base_url, timeout)
+def probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
+    """Public alias so the diagnostic owns one v2 health implementation."""
+    return _health_probe(base_url, timeout, password)
 
 
-def _health_probe_phased(base_url: str, method: str, path: str) -> dict[str, float]:
+def _health_probe_phased(
+    base_url: str, method: str, path: str, password: str = ""
+) -> dict[str, float]:
     """One health call with per-phase timing (diagnostic-only helper)."""
     started_connect = time.perf_counter()
     connection = http.client.HTTPConnection(*_split_base(base_url), timeout=2.0)
@@ -845,7 +960,7 @@ def _health_probe_phased(base_url: str, method: str, path: str) -> dict[str, flo
         connection.connect()
         connect_ms = round((time.perf_counter() - started_connect) * 1000.0, 1)
         write_start = time.perf_counter()
-        connection.request(method, path, headers={"Accept": "application/json"})
+        connection.request(method, path, headers=_opencode_auth_headers(password))
         write_ms = round((time.perf_counter() - write_start) * 1000.0, 1)
         read_start = time.perf_counter()
         response = connection.getresponse()
@@ -890,6 +1005,7 @@ def _timed_request(
     body: dict[str, object] | None,
     connect_timeout: float,
     op_timeout: float | None,
+    password: str = "",
 ) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
     """One instrumented loopback HTTP call with connect/write/read phases.
 
@@ -927,7 +1043,7 @@ def _timed_request(
         phase = "write"
         write_start = time.perf_counter()
         payload = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"Accept": "application/json"}
+        headers = _opencode_auth_headers(password)
         if payload is not None:
             headers["Content-Type"] = "application/json"
         connection.request(method, path, body=payload, headers=headers)
@@ -940,17 +1056,34 @@ def _timed_request(
         timings["status"] = int(response.status)
         ok = response.status == 200
         if ok:
-            if method == "POST" and path == "/session":
-                session = json.loads(raw.decode("utf-8"))
+            try:
+                decoded: Any = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                extra["fail_category"] = "invalid-json"
+                return False, False, timings, extra
+            if isinstance(decoded, dict) and set(decoded) == {"data"}:
+                # Single-field v2 success envelope; paged responses keep
+                # ``data`` plus ``cursor`` and must not be unwrapped here.
+                decoded = decoded["data"]
+            if method == "POST" and path in ("/session", OPENCODE_V2_SESSION_PATH):
+                session = decoded if isinstance(decoded, dict) else {}
                 session_id = session.get("id")
                 if isinstance(session_id, str) and session_id:
                     extra["_id"] = session_id
-            elif method == "GET" and path == "/session":
-                listed = json.loads(raw.decode("utf-8"))
+            elif method == "GET" and path in ("/session", OPENCODE_V2_SESSION_PATH):
+                listed = decoded.get("data") if isinstance(decoded, dict) else decoded
                 extra["_list"] = listed if isinstance(listed, list) else None
+            elif method == "GET" and path in (
+                OPENCODE_V2_SESSION_ACTIVE_PATH,
+                "/session/status",
+            ):
+                mapping = decoded if isinstance(decoded, dict) else {}
+                extra["_sessions_seen"] = len(mapping)
             elif method == "GET" and path.endswith("/message"):
-                listed = json.loads(raw.decode("utf-8"))
-                extra["_messages_seen"], extra["_part_kinds"] = _summarize_messages(listed)
+                messages = decoded
+                if isinstance(messages, dict):
+                    messages = messages.get("data")
+                extra["_messages_seen"], extra["_part_kinds"] = _summarize_messages(messages)
             decision = _classify_opencode_payload(raw)
             extra.update(decision)
             return ok, decision.get("provider_error", False), timings, extra
@@ -1024,6 +1157,7 @@ def _observe_model_in_flight_liveness(
     started_monotonic: float,
     stop_event: threading.Event,
     interval_s: float = MODEL_IN_FLIGHT_LIVENESS_INTERVAL_S,
+    password_provider: Callable[[], str] | None = None,
 ) -> None:
     """Observe local-server liveness while a model POST is pending.
 
@@ -1038,11 +1172,19 @@ def _observe_model_in_flight_liveness(
     interval = max(1.0, float(interval_s))
     while not stop_event.wait(interval):
         try:
-            health_ok, _ = _health_probe(base_url, OBSERVATION_HTTP_TIMEOUT_S)
+            try:
+                password = str(password_provider() or "") if password_provider else ""
+            except Exception:
+                password = ""
+            if password:
+                health_ok, _ = _health_probe(base_url, OBSERVATION_HTTP_TIMEOUT_S, password)
+            else:
+                health_ok, _ = _health_probe(base_url, OBSERVATION_HTTP_TIMEOUT_S)
             internal = _opencode_internal_observation(
                 base_url,
                 str(session_id_provider() or ""),
                 timeout=OBSERVATION_HTTP_TIMEOUT_S,
+                password=password,
             )
             sink.emit(
                 "model-in-flight-liveness",
@@ -1194,7 +1336,12 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         checkpoint_dir=Path(argv["out_dir"]),
         opencode_base_url=base_url,
         counters=counters,
-        internal_probe=lambda: _opencode_internal_observation(base_url, session_state["id"]),
+        internal_probe=lambda: _opencode_internal_observation(
+            base_url,
+            session_state["id"],
+            password=_opencode_runtime_password(runtime),
+        ),
+        password_provider=lambda: _opencode_runtime_password(runtime),
     )
     watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
@@ -1205,7 +1352,11 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     session_id = ""
     try:
         # 1) Pre-probe: attach vs spawn evidence (production startup path).
-        attached, _ = await asyncio.to_thread(_health_probe, base_url, 1.0)
+        probe_password = _opencode_runtime_password(runtime)
+        if probe_password:
+            attached, _ = await asyncio.to_thread(_health_probe, base_url, 1.0, probe_password)
+        else:
+            attached, _ = await asyncio.to_thread(_health_probe, base_url, 1.0)
         started = time.perf_counter()
         try:
             await asyncio.wait_for(runtime.start(), timeout=bootstrap_timeout)
@@ -1235,9 +1386,19 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
             sink.emit("probe-end", probe=PROBE_DIRECT_MODEL, status=CLASS_SERVER_ERROR_PROVEN)
             return EXIT_SERVER_ERROR_PROVEN
         try:
-            health_phases = await asyncio.to_thread(
-                _health_probe_phased, base_url, "GET", "/global/health"
-            )
+            probe_password = _opencode_runtime_password(runtime)
+            if probe_password:
+                health_phases = await asyncio.to_thread(
+                    _health_probe_phased,
+                    base_url,
+                    "GET",
+                    OPENCODE_V2_INFO_PATH,
+                    probe_password,
+                )
+            else:
+                health_phases = await asyncio.to_thread(
+                    _health_probe_phased, base_url, "GET", OPENCODE_V2_INFO_PATH
+                )
         except Exception:
             health_phases = {}
         if health_phases:
@@ -1303,6 +1464,7 @@ async def run_probe_a(argv: dict[str, Any], sink: EventSink, counters: dict[str,
                 "session_id_provider": lambda: session_state["id"],
                 "started_monotonic": time.monotonic(),
                 "stop_event": liveness_stop,
+                "password_provider": lambda: _opencode_runtime_password(runtime),
             },
             name="diag-model-in-flight-liveness",
             daemon=True,
@@ -2204,7 +2366,12 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         checkpoint_dir=out_dir,
         opencode_base_url=base_url,
         counters=counters,
-        internal_probe=lambda: _opencode_internal_observation(base_url, ""),
+        internal_probe=lambda: _opencode_internal_observation(
+            base_url,
+            "",
+            password=_opencode_runtime_password(),
+        ),
+        password_provider=lambda: _opencode_runtime_password(),
     )
     watchdog.main_loop = asyncio.get_running_loop()
     watchdog.start()
@@ -2249,6 +2416,15 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
         retry_max_delay_seconds=0.05,
     )
     app = Application(settings, transport=transport)
+    # The production runtime may generate a fresh OPENCODE_PASSWORD while
+    # spawning the v2 server, so bind the live credential after construction
+    # (the watchdog has not snapshotted yet; it waits for the scenario anchor).
+    watchdog.set_password_provider(lambda: _opencode_runtime_password(app.opencode_runtime))
+    watchdog.internal_probe = lambda: _opencode_internal_observation(
+        base_url,
+        "",
+        password=_opencode_runtime_password(app.opencode_runtime),
+    )
     counters["probe_start"] = time.monotonic()
     sink.emit(
         "probe-start",
