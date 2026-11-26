@@ -2769,23 +2769,26 @@ def effective_campaign_allowance_s(
 
 def _spawn_child(*, plan: ProbePlan, out_dir: Path) -> subprocess.Popen:
     """Start one probe child in its own process group (independent)."""
-    child_argv = json.dumps(
-        {
-            "probe": plan.probe,
-            "out": str(out_dir),
-            "snapshot_cadence_s": plan.snapshot_cadence_s,
-            "max_snapshots": plan.max_snapshots,
-            "connect_timeout_s": plan.connect_timeout_s,
-            "ab_mode": plan.ab_mode,
-            "ab_arm": plan.ab_arm,
-            "ab_live_budget_s": plan.ab_live_budget_s,
-            "ab_preflight_budget_s": plan.ab_preflight_budget_s,
-            "ab_cleanup_reserve_s": plan.ab_cleanup_reserve_s,
-            "probe_b_bootstrap_timeout_s": plan.probe_b_bootstrap_timeout_s,
-        }
-    )
+    child_payload: dict[str, Any] = {
+        "probe": plan.probe,
+        "out": str(out_dir),
+        "snapshot_cadence_s": plan.snapshot_cadence_s,
+        "max_snapshots": plan.max_snapshots,
+        "connect_timeout_s": plan.connect_timeout_s,
+        "ab_mode": plan.ab_mode,
+        "ab_arm": plan.ab_arm,
+        "ab_live_budget_s": plan.ab_live_budget_s,
+        "ab_preflight_budget_s": plan.ab_preflight_budget_s,
+        "ab_cleanup_reserve_s": plan.ab_cleanup_reserve_s,
+    }
     env = os.environ.copy()
-    env["SCENARIO2_DIAG_ARGS"] = child_argv
+    # The standalone scenario2 probe must keep honoring an operator/workflow
+    # SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S override. Only an explicit
+    # A/B (or non-default) plan value owns the child's bootstrap window.
+    if plan.ab_mode or plan.probe_b_bootstrap_timeout_s != DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S:
+        child_payload["probe_b_bootstrap_timeout_s"] = plan.probe_b_bootstrap_timeout_s
+        env["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(plan.probe_b_bootstrap_timeout_s)
+    env["SCENARIO2_DIAG_ARGS"] = json.dumps(child_payload)
     env["PYTHONUNBUFFERED"] = "1"
     # #553: each arm's flag is explicit and isolated inside the child only.
     env.update({str(key): str(value) for key, value in plan.arm_env.items()})
@@ -2824,8 +2827,8 @@ def child_argv_from_env() -> dict[str, Any]:
             or DEFAULT_PROBE_A_BOOTSTRAP_TIMEOUT_S
         ),
         "probe_b_bootstrap_timeout_s": float(
-            decoded.get("probe_b_bootstrap_timeout_s")
-            or os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
+            os.environ.get("SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S", "")
+            or decoded.get("probe_b_bootstrap_timeout_s")
             or DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S
         ),
         "ab_mode": bool(decoded.get("ab_mode", False)),
@@ -4062,7 +4065,13 @@ def parent_main(args: argparse.Namespace) -> int:
     probe_b = ProbeEvidence(probe=PROBE_SCENARIO2, status="not-run")
     os.environ["SCENARIO2_DIAG_PROBE_A_PORT"] = str(args.probe_a_port)
     os.environ["SCENARIO2_DIAG_PROBE_A_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_a_bootstrap_timeout_s)
-    os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(args.probe_b_bootstrap_timeout_s)
+    # Preserve an operator/workflow bootstrap override when the CLI used its
+    # default value; an explicitly supplied CLI value still wins.
+    probe_b_timeout = float(args.probe_b_bootstrap_timeout_s)
+    if probe_b_timeout != DEFAULT_PROBE_B_BOOTSTRAP_TIMEOUT_S or not os.environ.get(
+        "SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"
+    ):
+        os.environ["SCENARIO2_DIAG_PROBE_B_BOOTSTRAP_TIMEOUT_S"] = str(probe_b_timeout)
     try:
         if args.probe in ("both", PROBE_DIRECT_MODEL):
             probe_a = _run_one_probe(

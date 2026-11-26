@@ -53,6 +53,8 @@ DIAGNOSTIC_WORKFLOW_NAME = "AA Gate C scenario2 diagnostic"
 DIAGNOSTIC_WORKFLOW_FILE = "aa-gate-c-scenario2-diagnostic.yml"
 DIAGNOSTIC_SCHEMA_VERSION = "aa-gate-c-scenario2-diagnostic/2"
 TRIAGE_ISSUE_NUMBER = 419
+SCENARIO2_MODE = "scenario2"
+ONE_SHOT_AB_MODE = "one-shot-ab"
 
 
 def artifact_name_for_run(run_id: int | str) -> str:
@@ -267,6 +269,9 @@ class DiagnosticRun:
     # Exact SHA the run declared it checked out and diagnosed (kodmial/aa#483).
     # Empty when no declared identity marker exists for this run.
     declared_sha: str = ""
+    # Diagnostic mode from the server-authoritative run title (kodmial/aa#553).
+    # Empty when the title does not declare one (legacy run).
+    mode: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -275,6 +280,11 @@ class DiagnosticRun:
     @property
     def is_completed(self) -> bool:
         return self.status == "completed" and self.conclusion is not None
+
+    @property
+    def is_one_shot_ab(self) -> bool:
+        """True for the validation-only #553 A/B, never a scenario2 run."""
+        return self.mode == ONE_SHOT_AB_MODE
 
     @property
     def identity_sha(self) -> str:
@@ -423,6 +433,9 @@ def normalize_allowed_shas(values: Sequence[Any]) -> tuple[str, ...]:
 
 
 _RUN_RECORD_TARGET_RE = re.compile(r"(?:^|\s)target=([0-9a-f]{40})(?=\s|$)")
+_RUN_RECORD_MODE_RE = re.compile(
+    rf"(?:^|\s)mode=({re.escape(SCENARIO2_MODE)}|{re.escape(ONE_SHOT_AB_MODE)})(?=\s|$)"
+)
 
 
 def _declared_sha_from_run_record(item: Mapping[str, Any]) -> str:
@@ -438,6 +451,16 @@ def _declared_sha_from_run_record(item: Mapping[str, Any]) -> str:
         title = str(item.get(key) or "").lower()
         match = _RUN_RECORD_TARGET_RE.search(title)
         if match and _SHA_RE.fullmatch(match.group(1)):
+            return match.group(1)
+    return ""
+
+
+def mode_from_run_record(item: Mapping[str, Any]) -> str:
+    """Extract the diagnostic mode from the server-authoritative run title."""
+    for key in ("display_title", "name"):
+        title = str(item.get(key) or "").lower()
+        match = _RUN_RECORD_MODE_RE.search(title)
+        if match:
             return match.group(1)
     return ""
 
@@ -501,6 +524,7 @@ def parse_runs(payload: Any) -> list[DiagnosticRun]:
                 run_number=(int(run_number_raw) if isinstance(run_number_raw, int) else 0),
                 html_url=str(item.get("html_url") or ""),
                 declared_sha=_declared_sha_from_run_record(item),
+                mode=mode_from_run_record(item),
             )
         )
     return out
@@ -522,7 +546,7 @@ def select_diagnostic_run(
     allowed = normalize_allowed_shas(allowed_shas)
     if not allowed:
         return SelectionDecision("missing", None, "no allowed SHA given: cannot reconcile evidence")
-    matching = [run for run in runs if run.head_sha in allowed]
+    matching = [run for run in runs if run.head_sha in allowed and not run.is_one_shot_ab]
     for run in sorted(matching, key=_run_sort_key, reverse=True):
         if run.is_active:
             return SelectionDecision(
@@ -1240,7 +1264,7 @@ def select_declared_run(
     allowed = normalize_allowed_shas(allowed_shas)
     if not allowed:
         return SelectionDecision("missing", None, "no allowed SHA given: cannot reconcile evidence")
-    matching = [run for run in runs if run.declared_sha in allowed]
+    matching = [run for run in runs if run.declared_sha in allowed and not run.is_one_shot_ab]
     for run in sorted(matching, key=_run_sort_key, reverse=True):
         if run.is_active:
             return SelectionDecision(
@@ -1359,7 +1383,11 @@ def decide_dispatch(
         [marker for marker in markers if marker.sha == sha],
         key=lambda marker: marker.created_epoch,
     )
-    for_target = [run for run in runs if run.head_sha == sha or run.declared_sha == sha]
+    for_target = [
+        run
+        for run in runs
+        if (run.head_sha == sha or run.declared_sha == sha) and not run.is_one_shot_ab
+    ]
     if any(run.is_active for run in for_target):
         return DispatchPlan(
             False,
@@ -1385,6 +1413,8 @@ def decide_dispatch(
     if relevant:
         for run in runs:
             if not run.is_active or run.event != "workflow_dispatch":
+                continue
+            if run.is_one_shot_ab:
                 continue
             # Never attribute a run that positively declared a different
             # target SHA to this attempt.

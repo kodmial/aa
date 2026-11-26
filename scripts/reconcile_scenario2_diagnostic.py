@@ -179,12 +179,24 @@ class OneShotABRun(Exception):
     """
 
 
+def _run_record_mode(owner: str, repo: str, run_id: int) -> str:
+    """Diagnostic mode from the server-authoritative run title, if available."""
+    try:
+        payload = _gh_api_json([f"repos/{owner}/{repo}/actions/runs/{run_id}"])
+    except GhError:
+        return ""
+    return triage.mode_from_run_record(payload) if isinstance(payload, dict) else ""
+
+
 def collect_artifact(owner: str, repo: str, run_id: int) -> tuple[int | None, bool]:
     """(`artifact_id`, `expired`) for the AA-owned diagnostic artifact.
 
-    Raises :class:`OneShotABRun` when this run published only the
-    validation-only one-shot A/B artifact. That run is never reconciled as
-    a scenario #2 diagnostic (never a missing-evidence repair).
+    Raises :class:`OneShotABRun` when this run is the validation-only
+    one-shot A/B. The artifact name is the primary signal, but an A/B run
+    can be cancelled or hit the job timeout before its ``always()`` upload;
+    the server-authoritative run title is therefore also checked so such a
+    run is never reconciled as a scenario #2 diagnostic with missing
+    evidence.
     """
     payload = _gh_api_json([f"repos/{owner}/{repo}/actions/runs/{run_id}/artifacts"])
     items = payload.get("artifacts") if isinstance(payload, dict) else []
@@ -206,6 +218,11 @@ def collect_artifact(owner: str, repo: str, run_id: int) -> tuple[int | None, bo
     if saw_one_shot_ab:
         raise OneShotABRun(
             f"run {run_id} published the validation-only one-shot A/B artifact; "
+            "not a scenario2 diagnostic"
+        )
+    if _run_record_mode(owner, repo, run_id) == triage.ONE_SHOT_AB_MODE:
+        raise OneShotABRun(
+            f"run {run_id} is titled as the validation-only one-shot A/B; "
             "not a scenario2 diagnostic"
         )
     return None, False
@@ -486,7 +503,7 @@ def _sorted_completed(runs: list[triage.DiagnosticRun]) -> list[triage.Diagnosti
         return (0, 0.0, run.run_id)
 
     return sorted(
-        (run for run in runs if run.is_completed),
+        (run for run in runs if run.is_completed and not run.is_one_shot_ab),
         key=sort_key,
         reverse=True,
     )
@@ -553,6 +570,23 @@ def write_step_summary(_run_id: int | None, outcome: str) -> None:
         pass
 
 
+def _skip_one_shot_ab(summary: dict[str, Any], run: triage.DiagnosticRun) -> triage.TriageOutcome:
+    """Mark a validation-only A/B run as skipped, never as missing scenario2."""
+    summary["artifact"] = {
+        "source": "one-shot-ab",
+        "name": triage.one_shot_ab_artifact_name_for_run(run.run_id),
+    }
+    summary["skipped"] = "one-shot-ab-validation-run"
+    return triage.TriageOutcome(
+        triage.OUTCOME_INCONCLUSIVE,
+        "",
+        detail=(
+            "validation-only one-shot retrieval A/B run "
+            "(kodmial/aa#553); not a scenario2 diagnostic"
+        ),
+    )
+
+
 def _reconcile_selected_run(
     args: argparse.Namespace,
     run: triage.DiagnosticRun,
@@ -561,6 +595,10 @@ def _reconcile_selected_run(
 ) -> triage.TriageOutcome:
     """Evaluate + publish triage for one completed diagnostic run."""
     artifact_name = triage.artifact_name_for_run(run.run_id)
+    if run.is_one_shot_ab:
+        # The run title is available even when the A/B was cancelled or hit
+        # the job timeout before its always() artifact upload.
+        return _skip_one_shot_ab(summary, run)
     if args.artifact_file:
         outcome, timeline, gaps, crossings, banner = evaluate_artifact(
             Path(args.artifact_file), run
@@ -572,19 +610,7 @@ def _reconcile_selected_run(
         except OneShotABRun:
             # Validation-only A/B run: it is not a scenario2 diagnostic, so
             # it must never produce a #419 triage comment or repair issue.
-            summary["artifact"] = {
-                "source": "one-shot-ab",
-                "name": triage.one_shot_ab_artifact_name_for_run(run.run_id),
-            }
-            summary["skipped"] = "one-shot-ab-validation-run"
-            return triage.TriageOutcome(
-                triage.OUTCOME_INCONCLUSIVE,
-                "",
-                detail=(
-                    "validation-only one-shot retrieval A/B run "
-                    "(kodmial/aa#553); not a scenario2 diagnostic"
-                ),
-            )
+            return _skip_one_shot_ab(summary, run)
         if artifact_id is not None and not expired:
             outcome, timeline, gaps, crossings, banner = evaluate_artifact(
                 download_artifact(args.owner, args.repo, artifact_id), run

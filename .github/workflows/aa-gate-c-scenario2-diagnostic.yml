@@ -4,7 +4,16 @@ name: AA Gate C scenario2 diagnostic
 # SHA travels in the Actions run record itself. The reconciler parses this
 # title instead of trusting an issue-comment marker, which any commenter
 # could forge.
-run-name: "AA scenario2 diagnostic target=${{ github.event.inputs.target_sha || github.sha }} mode=${{ github.event.inputs.mode || 'auto' }}"
+#
+# kodmial/aa#553: the mode is also in the title, including the automatic
+# push-triggered A/B. The trigger-file change is visible in the push event
+# payload, so a push that changes only the validation entry point is titled
+# mode=one-shot-ab from the start. This lets the reconciler identify the A/B
+# even if the job is cancelled or times out before its artifact upload.
+run-name: >-
+  AA scenario2 diagnostic
+  target=${{ github.event.inputs.target_sha || github.sha }}
+  mode=${{ github.event.inputs.mode || (github.event_name == 'push' && (contains(toJSON(github.event.commits.*.added), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(toJSON(github.event.commits.*.modified), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(toJSON(github.event.commits.*.removed), 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.added, 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.modified, 'qualification/one_shot_retrieval_ab_553.trigger') || contains(github.event.head_commit.removed, 'qualification/one_shot_retrieval_ab_553.trigger')) && 'one-shot-ab') || 'scenario2' }}
 
 # kodmial/aa#418 + kodmial/aa#424 (P0 diagnostic, progress/liveness-driven):
 # run ONLY Gate C scenario #2 (substantive-drinking) through the real
