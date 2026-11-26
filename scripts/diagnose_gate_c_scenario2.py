@@ -139,9 +139,11 @@ AB_STATUS_INCOMPLETE = "INCOMPLETE"
 AB_STATUS_INCONCLUSIVE = "INCONCLUSIVE"
 AB_STATUS_BLOCKED = "BLOCKED"
 AB_STATUS_DEDUPLICATED = "DEDUPLICATED"
-# Existing bounded canary budget (gate_c_canary): 300 s live, 600 s preflight
-# and the 20 s in-budget cleanup reserve. The A/B runs two sequential arms, so
-# its total real-model budget can never exceed two live budgets (600 s).
+# The validation-only A/B keeps its own bounded budget (kodmial/aa#553):
+# 300 s live, 600 s preflight and the 20 s in-budget cleanup reserve. This is
+# independent of the Gate C canary's 600 s live probe. The A/B runs two
+# sequential arms, so its total real-model budget can never exceed two live
+# budgets (600 s).
 DEFAULT_AB_LIVE_BUDGET_S = 300.0
 DEFAULT_AB_PREFLIGHT_BUDGET_S = 600.0
 DEFAULT_AB_CLEANUP_RESERVE_S = 20.0
@@ -1774,7 +1776,7 @@ def _ab_budget(
     preflight_budget_s: float = DEFAULT_AB_PREFLIGHT_BUDGET_S,
     cleanup_reserve_s: float = DEFAULT_AB_CLEANUP_RESERVE_S,
 ) -> dict[str, float]:
-    """Per-arm bounded canary budget (300 s live / 600 s preflight / reserve)."""
+    """Per-arm bounded A/B budget (300 s live / 600 s preflight / reserve)."""
     live = max(1.0, float(live_budget_s))
     preflight = max(1.0, float(preflight_budget_s))
     reserve = max(0.0, min(float(cleanup_reserve_s), live / 4.0))
@@ -2324,9 +2326,9 @@ async def run_probe_b(argv: dict[str, Any], sink: EventSink, counters: dict[str,
     """Probe B child: exact production scenario #2 (unchanged prompt).
 
     kodmial/aa#424: the standalone scenario2 observation has NO wall-clock
-    cutoff. The kodmial/aa#553 A/B arm additionally honors the existing
-    bounded canary budget (300 s live / 600 s preflight / cleanup reserve)
-    because the owner-approved A/B is explicitly validation-only.
+    cutoff. The kodmial/aa#553 A/B arm additionally honors its own bounded
+    A/B budget (300 s live / 600 s preflight / cleanup reserve) because the
+    owner-approved A/B is explicitly validation-only.
     """
     from dataclasses import replace
 
