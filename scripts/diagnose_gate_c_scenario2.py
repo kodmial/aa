@@ -575,9 +575,11 @@ def _opencode_internal_observation(
         OPENCODE_V1_SESSION_PATH,
     )
     last_timings: dict[str, float] = {}
+    last_extra: dict[str, Any] = {}
     for path in session_paths:
         ok, _provider_error, timings, extra = request(path)
         last_timings = timings
+        last_extra = extra
         if ok:
             result["responsive"] = True
             result["sessions_endpoint_supported"] = True
@@ -599,7 +601,9 @@ def _opencode_internal_observation(
         return result
     else:
         result["sessions_endpoint_supported"] = False
-        result["fail_category"] = str(last_timings.get("fail_category", "http-error"))[:48]
+        result["fail_category"] = str(
+            last_extra.get("fail_category") or last_timings.get("fail_category") or "http-error"
+        )[:48]
         return result
     if not session_id:
         return result
@@ -609,9 +613,11 @@ def _opencode_internal_observation(
         f"{OPENCODE_V1_SESSION_PATH}/{quoted}/message",
     )
     last_mtimings: dict[str, float] = {}
+    last_mextra: dict[str, Any] = {}
     for path in message_paths:
         ok_messages, _err, mtimings, mextra = request(path)
         last_mtimings = mtimings
+        last_mextra = mextra
         if ok_messages:
             result["messages_endpoint_supported"] = True
             result["messages_seen"] = mextra.get("_messages_seen")
@@ -625,7 +631,9 @@ def _opencode_internal_observation(
         )[:48]
         return result
     result["messages_endpoint_supported"] = False
-    result["messages_fail_category"] = str(last_mtimings.get("fail_category", ""))[:48]
+    result["messages_fail_category"] = str(
+        last_mextra.get("fail_category") or last_mtimings.get("fail_category") or ""
+    )[:48]
     return result
 
 
@@ -765,6 +773,9 @@ class ChildWatchdog(threading.Thread):
             self.counters["auth_error"] = True
             self._consecutive_health_failures = 0
         elif health_ok:
+            # A later authenticated success proves the credential is valid
+            # again; do not retain a stale auth-error classification.
+            self.counters["auth_error"] = False
             self._consecutive_health_failures = 0
             self.counters["last_health_ok_at_s"] = round(time.monotonic(), 2)
         else:
@@ -1058,35 +1069,43 @@ def _timed_request(
         timings["status"] = int(response.status)
         ok = response.status == 200
         if ok:
+            decoded: Any = None
             try:
-                decoded: Any = json.loads(raw.decode("utf-8"))
+                decoded = json.loads(raw.decode("utf-8")) if raw else None
             except (UnicodeDecodeError, ValueError):
                 extra["fail_category"] = "invalid-json"
-                return False, False, timings, extra
+                if method == "POST" or path.endswith("/message"):
+                    # These paths need a decoded body to extract ids/parts.
+                    return False, False, timings, extra
             if isinstance(decoded, dict) and set(decoded) == {"data"}:
                 # Single-field v2 success envelope; paged responses keep
                 # ``data`` plus ``cursor`` and must not be unwrapped here.
                 decoded = decoded["data"]
-            if method == "POST" and path in ("/session", OPENCODE_V2_SESSION_PATH):
-                session = decoded if isinstance(decoded, dict) else {}
-                session_id = session.get("id")
-                if isinstance(session_id, str) and session_id:
-                    extra["_id"] = session_id
-            elif method == "GET" and path in ("/session", OPENCODE_V2_SESSION_PATH):
-                listed = decoded.get("data") if isinstance(decoded, dict) else decoded
-                extra["_list"] = listed if isinstance(listed, list) else None
-            elif method == "GET" and path in (
-                OPENCODE_V2_SESSION_ACTIVE_PATH,
-                "/session/status",
-            ):
-                mapping = decoded if isinstance(decoded, dict) else {}
-                extra["_sessions_seen"] = len(mapping)
-            elif method == "GET" and path.endswith("/message"):
-                messages = decoded
-                if isinstance(messages, dict):
-                    messages = messages.get("data")
-                extra["_messages_seen"], extra["_part_kinds"] = _summarize_messages(messages)
-            decision = _classify_opencode_payload(raw)
+            if decoded is not None:
+                if method == "POST" and path in ("/session", OPENCODE_V2_SESSION_PATH):
+                    session = decoded if isinstance(decoded, dict) else {}
+                    session_id = session.get("id")
+                    if isinstance(session_id, str) and session_id:
+                        extra["_id"] = session_id
+                elif method == "GET" and path in ("/session", OPENCODE_V2_SESSION_PATH):
+                    listed = decoded.get("data") if isinstance(decoded, dict) else decoded
+                    extra["_list"] = listed if isinstance(listed, list) else None
+                elif method == "GET" and path in (
+                    OPENCODE_V2_SESSION_ACTIVE_PATH,
+                    "/session/status",
+                ):
+                    mapping = decoded if isinstance(decoded, dict) else {}
+                    extra["_sessions_seen"] = len(mapping)
+                elif method == "GET" and path.endswith("/message"):
+                    messages = decoded
+                    if isinstance(messages, dict):
+                        messages = messages.get("data")
+                    extra["_messages_seen"], extra["_part_kinds"] = _summarize_messages(messages)
+            decision: dict[str, Any] = (
+                _classify_opencode_payload(raw)
+                if decoded is not None
+                else {"ok": True, "provider_error": False, "served_model": ""}
+            )
             extra.update(decision)
             return ok, decision.get("provider_error", False), timings, extra
         extra.update({"fail_category": f"http-error-{timings.get('status', '?')}"})

@@ -267,6 +267,12 @@ def probe_health(base_url: str, timeout: float, password: str = "") -> tuple[boo
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        # HTTPError owns a response/socket; close it so repeated
+        # unauthenticated or failing health probes cannot leak connections.
+        try:
+            exc.close()
+        except Exception:
+            pass
         return False, "auth-error" if exc.code in (401, 403) else ""
     except (OSError, ValueError):
         return False, ""

@@ -274,6 +274,113 @@ def test_runtime_password_prefers_runtime_then_client_then_environment(
     assert diag._opencode_runtime_password() == "env-secret"
 
 
+def test_internal_observation_preserves_session_route_mismatch_category(
+    diag: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_request(
+        base_url: str,
+        method: str,
+        path: str,
+        body: dict[str, object] | None,
+        connect_timeout: float,
+        op_timeout: float | None,
+        password: str = "",
+    ) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
+        return False, False, {"status": 404}, {"fail_category": "http-error-404"}
+
+    monkeypatch.setattr(diag, "_timed_request", fake_request)
+    observed = diag._opencode_internal_observation("http://127.0.0.1:1", "ses_555")
+    assert observed["sessions_endpoint_supported"] is False
+    assert observed["fail_category"] == "http-error-404"
+
+
+def test_internal_observation_preserves_message_route_mismatch_category(
+    diag: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_request(
+        base_url: str,
+        method: str,
+        path: str,
+        body: dict[str, object] | None,
+        connect_timeout: float,
+        op_timeout: float | None,
+        password: str = "",
+    ) -> tuple[bool, bool, dict[str, float], dict[str, Any]]:
+        if path == diag.OPENCODE_V2_SESSION_PATH:
+            return True, False, {"status": 200}, {"_list": [{"id": "ses_555"}]}
+        return False, False, {"status": 404}, {"fail_category": "http-error-404"}
+
+    monkeypatch.setattr(diag, "_timed_request", fake_request)
+    observed = diag._opencode_internal_observation("http://127.0.0.1:1", "ses_555")
+    assert observed["messages_endpoint_supported"] is False
+    assert observed["messages_fail_category"] == "http-error-404"
+
+
+class _Empty200Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args: object) -> None:
+        return
+
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def test_timed_request_accepts_empty_observation_response(diag: Any) -> None:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Empty200Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{int(server.server_address[1])}"
+        ok, provider_error, timings, _extra = diag._timed_request(
+            base_url,
+            "GET",
+            diag.OPENCODE_V2_SESSION_ACTIVE_PATH,
+            None,
+            1.0,
+            1.0,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert ok is True
+    assert provider_error is False
+    assert timings["status"] == 200
+
+
+def test_watchdog_clears_auth_error_after_credential_recovery(
+    diag: Any, tmp_path: pathlib.Path
+) -> None:
+    with _v2_server() as (state, base_url):
+        state.password = PASSWORD
+        counters: dict[str, Any] = {}
+        sink = diag.EventSink(tmp_path / "watchdog-recovery-555.jsonl", echo=False)
+        try:
+            watchdog = diag.ChildWatchdog(
+                probe=diag.PROBE_SCENARIO2,
+                cadence_s=0.05,
+                max_snapshots=1,
+                anchor=threading.Event(),
+                anchor_wait_timeout_s=1.0,
+                sink=sink,
+                checkpoint_dir=tmp_path,
+                opencode_base_url=base_url,
+                counters=counters,
+                internal_probe=None,
+                password_provider=lambda: "stale-password",
+            )
+            failed = watchdog._collect(at_s=0.0)
+            assert failed["opencode_health"]["auth_error"] is True
+            assert counters["auth_error"] is True
+            watchdog.set_password_provider(lambda: PASSWORD)
+            recovered = watchdog._collect(at_s=0.1)
+            assert recovered["opencode_health"]["auth_error"] is False
+            assert counters["auth_error"] is False
+        finally:
+            sink.close()
+
+
 def test_watchdog_stays_healthy_against_authenticated_v2_server(
     diag: Any, tmp_path: pathlib.Path
 ) -> None:
