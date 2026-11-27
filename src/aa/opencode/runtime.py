@@ -29,6 +29,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -248,7 +249,7 @@ def split_base_url(base_url: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
+def probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
     """Blocking single v2 readiness probe; returns ``(healthy, version)``.
 
     OpenCode 2 exposes ``GET /api/info`` (Basic auth, ``opencode`` username)
@@ -265,6 +266,8 @@ def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bo
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return False, "auth-error" if exc.code in (401, 403) else ""
     except (OSError, ValueError):
         return False, ""
     if not isinstance(payload, dict):
@@ -272,6 +275,11 @@ def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bo
     version = payload.get("version")
     ready = isinstance(version, str) and bool(version) and type(payload.get("pid")) is int
     return ready, version if isinstance(version, str) else ""
+
+
+def _probe_health(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
+    healthy, version = probe_health(base_url, timeout, password)
+    return healthy, "" if version == "auth-error" else version
 
 
 class OpenCodeRuntime(ABC):

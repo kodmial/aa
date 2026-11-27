@@ -141,7 +141,7 @@ AB_STATUS_BLOCKED = "BLOCKED"
 AB_STATUS_DEDUPLICATED = "DEDUPLICATED"
 # The validation-only A/B keeps its own bounded budget (kodmial/aa#553):
 # 300 s live, 600 s preflight and the 20 s in-budget cleanup reserve. This is
-# independent of the Gate C canary's 600 s live probe. The A/B runs two
+# independent of the Gate C canary. The A/B runs two
 # sequential arms, so its total real-model budget can never exceed two live
 # budgets (600 s).
 DEFAULT_AB_LIVE_BUDGET_S = 300.0
@@ -931,41 +931,10 @@ def _opencode_auth_headers(password: str = "") -> dict[str, str]:
 
 
 def _health_probe(base_url: str, timeout: float, password: str = "") -> tuple[bool, str]:
-    """One bounded native v2 readiness probe; returns ``(healthy, version)``.
+    """Use the production v2 readiness contract, including typed auth errors."""
+    from aa.opencode.runtime import probe_health as runtime_probe_health
 
-    OpenCode 2 exposes Basic-authenticated ``GET /api/info`` and removed the
-    v1 ``/global/health`` route. A JSON identity carrying a non-empty
-    ``version`` and an integer ``pid`` is the readiness signal, matching the
-    production ``aa.opencode.runtime._probe_health`` contract. Probing the
-    retired v1 route made the diagnostic watchdog declare a healthy server
-    nonresponsive and abort a valid Gate C/A-B observation window.
-    """
-    try:
-        connection = http.client.HTTPConnection(*_split_base(base_url), timeout=timeout)
-    except (ValueError, OSError):
-        return False, ""
-    try:
-        connection.request("GET", OPENCODE_V2_INFO_PATH, headers=_opencode_auth_headers(password))
-        response = connection.getresponse()
-        if response.status in (401, 403):
-            # Server answered but the managed Basic-auth credential is
-            # missing/stale: a credential error, not a wedged server.
-            return False, "auth-error"
-        if response.status != 200:
-            return False, ""
-        payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError):
-        return False, ""
-    finally:
-        try:
-            connection.close()
-        except Exception:
-            pass
-    if not isinstance(payload, dict):
-        return False, ""
-    version = payload.get("version")
-    healthy = isinstance(version, str) and bool(version) and type(payload.get("pid")) is int
-    return healthy, version if isinstance(version, str) else ""
+    return runtime_probe_health(base_url, timeout, password)
 
 
 def _split_base(base_url: str) -> tuple[str, int]:
