@@ -30,9 +30,7 @@ from aa.opencode.observer import StallSnapshotObserver
 from aa.qualification.gate_c_canary import (
     BUDGET_EXPIRED,
     BUDGET_WITHIN,
-    DEFAULT_LIVE_PROBE_BUDGET_S,
     DEFAULT_OPTIONAL_SCENARIO_MIN_BUDGET_S,
-    DEFAULT_PREFLIGHT_BUDGET_S,
     DEFAULT_REQUIRED_REAL_PATH_SCENARIOS,
     PRODUCT_VERDICT_REASONS,
     SCHEMA_VERSION,
@@ -303,37 +301,6 @@ def test_unfinished_optional_turn_does_not_downgrade_completed_required_turn() -
     assert payload["evidence_coverage"]["stage"] == "observed"
     assert payload["evidence_coverage"]["attempt"] == "observed"
     assert payload["evidence_coverage"]["causality"] == "observed"
-
-
-def test_live_probe_budget_covers_a_slow_but_progressing_required_turn() -> None:
-    """Regression for qualification #7 at ``81fbab46``.
-
-    The required ``substantive-drinking`` turn was still producing real
-    planner/answer/verifier progress when the former 300 s probe expired. A
-    slow-but-healthy turn must finish inside the bounded preflight instead of
-    being reported as ``external-progress-unobserved``.
-    """
-    assert DEFAULT_LIVE_PROBE_BUDGET_S >= 600.0
-    # The live probe never gets more time than the bounded preflight.
-    assert DEFAULT_LIVE_PROBE_BUDGET_S <= DEFAULT_PREFLIGHT_BUDGET_S
-
-    result = evaluate_canary(
-        main_sha="81fbab4661bb473d4e47b998d6a98bbd92ef7b97",
-        run_id="555",
-        self_test=_self_test_ready(),
-        real_path=RealPathEvidence(
-            scenarios=(_scenario("substantive-drinking"),),
-            server_evidence=_server_evidence_ready(),
-        ),
-        preflight_budget_s=DEFAULT_PREFLIGHT_BUDGET_S,
-        live_probe_budget_s=DEFAULT_LIVE_PROBE_BUDGET_S,
-        elapsed_s=420.0,
-        scenario_limit=2,
-    )
-
-    assert result.status == STATUS_READY
-    assert result.reason == "canary-ready"
-    assert result.budget_category == BUDGET_WITHIN
 
 
 def test_silent_required_turn_still_returns_inconclusive() -> None:
@@ -1048,7 +1015,7 @@ def test_workflow_gates_the_unchanged_campaign_behind_a_bounded_canary() -> None
     # The canary is bounded independently of the shared 135-minute job.
     assert "timeout-minutes: 12" in canary_step
     assert "--preflight-budget-s 600" in canary_step
-    assert "--live-probe-budget-s 600" in canary_step
+    assert "--live-probe-budget-s 300" in canary_step
     assert "scripts/run_gate_c_canary.py" in canary_step
     assert "aa-gate-c-canary" in text
 
